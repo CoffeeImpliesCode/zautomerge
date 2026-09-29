@@ -15,6 +15,20 @@ const std = @import("std");
 pub const error_types = @import("error.zig");
 pub const types = @import("types.zig");
 pub const value = @import("value.zig");
+pub const hexane = struct {
+    pub const rle = @import("hexane/rle.zig");
+    pub const bool_codec = @import("hexane/bool.zig");
+    pub const btree = @import("hexane/btree.zig");
+    pub const delta = @import("hexane/delta.zig");
+    pub const prefix = @import("hexane/prefix.zig");
+};
+pub const authors = @import("author.zig");
+pub const change_record = @import("change.zig");
+pub const storage = struct {
+    pub const parse = @import("storage/parse.zig");
+    pub const chunk = @import("storage/chunk.zig");
+    pub const column_spec = @import("storage/column_spec.zig");
+};
 pub const clock = @import("clock.zig");
 pub const leb128 = @import("leb128.zig");
 pub const unicode = @import("unicode.zig");
@@ -63,6 +77,8 @@ pub const version = "0.0.0";
 /// The upstream `automerge` crate version this port is written against.
 pub const upstream_version = "0.12.0";
 
+// Every module is pulled into the test root so its own tests run. A module
+// referenced only by a container-level declaration is not analyzed for tests.
 test {
     _ = @import("error.zig");
     _ = @import("types.zig");
@@ -70,4 +86,13 @@ test {
     _ = @import("clock.zig");
     _ = @import("leb128.zig");
     _ = @import("unicode.zig");
+    _ = @import("hexane/rle.zig");
+    _ = @import("hexane/bool.zig");
+    _ = @import("hexane/delta.zig");
+    _ = @import("hexane/btree.zig");
+    _ = @import("storage/parse.zig");
+    _ = @import("storage/chunk.zig");
+    _ = @import("storage/column_spec.zig");
+    _ = @import("author.zig");
+    _ = @import("change.zig");
 }

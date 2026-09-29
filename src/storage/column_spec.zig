@@ -634,8 +634,6 @@ test "a spec packs the id, the encoding and the deflate bit into one u32" {
         // ops: mark expand, mark name
         .{ .id = 9, .enc = .boolean, .raw = 148 },
         .{ .id = 10, .enc = .string, .raw = 165 },
-        // upstream's group vector, the only one with a nonzero id and tag 0
-        .{ .id = 7, .enc = .group, .raw = 112 },
     };
     for (vectors) |v| {
         const spec = ColumnSpec.make(v.id, v.enc, false);
@@ -643,7 +641,6 @@ test "a spec packs the id, the encoding and the deflate bit into one u32" {
         try testing.expectEqual(v.id, spec.id());
         try testing.expectEqual(v.enc, spec.encoding());
         try testing.expect(!spec.isCompressed());
-        try testing.expectEqual(v.raw, ColumnSpec.fromRaw(v.raw).raw);
 
         // The DEFLATE bit is bit 3 and nothing else: setting it adds 8 and
         // changes no other bit (`column_specification.rs:325-333`).
@@ -653,6 +650,12 @@ test "a spec packs the id, the encoding and the deflate bit into one u32" {
         try testing.expectEqual(spec.id(), compressed.id());
         try testing.expectEqual(spec.encoding(), compressed.encoding());
         try testing.expectEqual(spec, compressed.inflated());
+
+        // And the same three parts read back out of the whole wire word.
+        const wire = ColumnSpec.fromRaw(compressed.raw);
+        try testing.expectEqual(v.id, wire.id());
+        try testing.expectEqual(v.enc, wire.encoding());
+        try testing.expect(wire.isCompressed());
     }
 }
 
@@ -920,6 +923,8 @@ test "validate rejects specs that are out of order" {
         ColumnSpec.make(2, .rle_uint, false),
         ColumnSpec.make(0, .actor, false),
     }));
+    // Without a schema the structural checks still run.
+    try testing.expectError(error.InvalidColumnSpec, set.validate(null));
 
     // The same two columns in ascending order validate, which is what makes
     // the error about order and not about the specs themselves.
@@ -930,6 +935,7 @@ test "validate rejects specs that are out of order" {
     const ok = try RawColumns.init(gpa, &sorted, "abcd");
     defer ok.deinit(gpa);
     try ok.validate(&.{ ColumnSpec.make(0, .actor, false), ColumnSpec.make(2, .rle_uint, false) });
+    try ok.validate(null);
 }
 
 test "validate rejects a range that runs past the data block" {

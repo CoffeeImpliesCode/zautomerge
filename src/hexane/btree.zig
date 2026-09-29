@@ -211,9 +211,6 @@ pub fn Tree(comptime A: type) type {
             items_before: usize,
         };
 
-        /// How far a walk may have to go. Only used to report.
-        const max_depth: usize = 32;
-
         gpa: std.mem.Allocator,
         /// The arena. A `null` slot is a freed node, which is also on
         /// `free`.
@@ -383,10 +380,17 @@ pub fn Tree(comptime A: type) type {
             return id;
         }
 
-        /// Marks `id` dead and puts it on the free list. Cannot fail: the
+        /// Marks `id` dead, frees the node it held, and puts it on the
+        /// free list. Upstream's `free` drops the node value, so the
+        /// payload goes with it (`btree.rs:294-297`). Cannot fail: the
         /// free list is kept large enough for one entry per arena slot.
         fn release(self: *Self, id: NodeId) void {
-            self.nodes.items[id] = null;
+            const slot = &self.nodes.items[id];
+            switch (slot.*.?) {
+                .leaf => |*l| l.deinit(self.gpa),
+                .internal => |*c| c.deinit(self.gpa),
+            }
+            slot.* = null;
             self.free.appendAssumeCapacity(id);
         }
 
@@ -519,15 +523,14 @@ pub fn Tree(comptime A: type) type {
                 const reuse = if (c == 0) first_leaf_id else null;
                 const id: NodeId = if (reuse) |known|
                     known
-                else
-                    blk: {
-                        const leaf = try copyOf(self.gpa, A, chunk);
-                        break :blk self.alloc(.{ .leaf = leaf }) catch |e| {
-                            var owned = leaf;
-                            owned.deinit(self.gpa);
-                            return e;
-                        };
+                else blk: {
+                    const leaf = try copyOf(self.gpa, A, chunk);
+                    break :blk self.alloc(.{ .leaf = leaf }) catch |e| {
+                        var owned = leaf;
+                        owned.deinit(self.gpa);
+                        return e;
                     };
+                };
                 if (reuse) |known| {
                     // The node survives; its contents are replaced.
                     switch (self.nodeMut(known).*) {
@@ -1039,6 +1042,9 @@ pub fn Tree(comptime A: type) type {
                 };
                 if (new_total <= branch_factor) {
                     const summary = self.internalSummary(parent_id);
+                    // The slots are now the parent's; the list carries
+                    // only the parent itself up to the next level.
+                    replacement.clearRetainingCapacity();
                     try replacement.append(self.gpa, .{
                         .id = parent_id,
                         .agg = summary.agg,
@@ -1764,7 +1770,7 @@ fn referenceRoot(aggs: []const SlabAgg) SlabAgg {
     return acc;
 }
 
-fn expectSound(tree: *const SlabBTree) !void {
+fn expectSound(tree: anytype) !void {
     if (try tree.checkInvariants()) |v| {
         var buf: [256]u8 = undefined;
         std.debug.print("invariant violated: {s}\n", .{v.describe(&buf)});
@@ -1787,6 +1793,27 @@ test "a fresh tree is empty and finds nothing" {
     defer hit.deinit();
     try testing.expectEqual(@as(?ValueHit, null), hit.next());
     try expectSound(&tree);
+}
+
+test "a monotone column's weight spans the offsets zero to total" {
+    const w = SlabAgg.monotone(3, 7);
+    try testing.expectEqual(@as(usize, 3), w.len);
+    try testing.expectEqual(@as(i64, 7), w.total);
+    try testing.expectEqual(@as(i64, 0), w.min_offset);
+    try testing.expectEqual(@as(i64, 7), w.max_offset);
+
+    // Two of them: the right slab's offsets shift by the left's total,
+    // which is what the order-sensitive merge is for.
+    const two = SlabAgg.Aggregate.merge(w, w);
+    try testing.expectEqual(@as(usize, 6), two.len);
+    try testing.expectEqual(@as(i64, 14), two.total);
+    try testing.expectEqual(@as(i64, 0), two.min_offset);
+    try testing.expectEqual(@as(i64, 14), two.max_offset);
+    // And a negative delta is representable, which a `usize` total is not.
+    const back = SlabAgg.uniform(2, -4);
+    try testing.expect(back.contains(-4, 0));
+    try testing.expect(back.contains(0, 0));
+    try testing.expect(!back.contains(1, 0));
 }
 
 test "fromSlice builds a multi-level tree" {
@@ -2133,7 +2160,11 @@ test "a value query finds the one slab holding a rare value" {
     const first = got.next().?;
     try testing.expectEqual(@as(usize, 500), first.slab);
     try testing.expectEqual(@as(usize, 500), first.items_before);
-    // No other slab reaches that value.
+    // The next slab starts exactly where the big one ended, and the
+    // comparison is inclusive, so it is reported too — and nothing after.
+    const second = got.next().?;
+    try testing.expectEqual(@as(usize, 501), second.slab);
+    try testing.expectEqual(@as(i64, 10_500), second.prefix_before);
     try testing.expectEqual(@as(?ValueHit, null), got.next());
 }
 
@@ -2406,10 +2437,13 @@ test "the invariant checker rejects a corrupted tree" {
         defer tree.deinit();
         const first = tree.node(tree.root).internal.items[0].id;
         const second = tree.node(tree.root).internal.items[1].id;
+        // The grafted slot carries the right summary, so the depth is the
+        // only thing wrong with it.
+        const summary = tree.internalSummary(second);
         switch (tree.nodeMut(first).*) {
             .internal => |*n| {
                 _ = n.orderedRemove(0);
-                try n.insert(gpa, 0, .{ .id = second, .agg = simple(1, 1), .slab_count = 1 });
+                try n.insert(gpa, 0, .{ .id = second, .agg = summary.agg, .slab_count = summary.slab_count });
             },
             .leaf => return error.InvalidIndex,
         }
@@ -2563,11 +2597,86 @@ test "mixed splices keep the tree equal to a linear reference" {
 
 test "Splice is rejected for an out-of-range position" {
     const gpa = testing.allocator;
-    var tree = try SlabBTree.fromSlice(gpa, &[_]SlabAgg{ simple(1, 1) } ** 3);
+    var tree = try SlabBTree.fromSlice(gpa, &[_]SlabAgg{simple(1, 1)} ** 3);
     defer tree.deinit();
 
     try testing.expectError(error.InvalidIndex, tree.splice(0, 4, &.{}));
     try testing.expectError(error.InvalidIndex, tree.splice(3, 2, &.{}));
     try testing.expectEqual(3, tree.len());
     try expectSound(&tree);
+}
+
+/// A second weight, of the shape the prefix column's index needs: an item
+/// count plus the prefix sum through the end of the slab. It lives in the
+/// test because the prefix column is a later phase; what this proves is
+/// that the structural code never looks inside the weight
+/// (`btree.rs:47-54`).
+const PrefixWeight = struct {
+    len: usize,
+    prefix: usize,
+
+    pub const Aggregate = struct {
+        pub const identity: PrefixWeight = .{ .len = 0, .prefix = 0 };
+        pub fn merge(l: PrefixWeight, r: PrefixWeight) PrefixWeight {
+            return .{ .len = l.len + r.len, .prefix = l.prefix + r.prefix };
+        }
+        pub fn itemCount(w: PrefixWeight) usize {
+            return w.len;
+        }
+        pub fn eql(a: PrefixWeight, b: PrefixWeight) bool {
+            return a.len == b.len and a.prefix == b.prefix;
+        }
+    };
+};
+
+test "the tree is generic over the per-slab weight" {
+    const gpa = testing.allocator;
+    const PrefixTree = Tree(PrefixWeight);
+    var prng: std.Random.DefaultPrng = .init(0x5EED);
+    const rand = prng.random();
+
+    var weights: std.ArrayList(PrefixWeight) = .empty;
+    defer weights.deinit(gpa);
+    for (0..500) |_| {
+        try weights.append(gpa, .{
+            .len = 1 + rand.intRangeAtMost(usize, 0, 4),
+            .prefix = rand.intRangeAtMost(usize, 0, 20),
+        });
+    }
+    var tree = try PrefixTree.fromSlice(gpa, weights.items);
+    defer tree.deinit();
+    try expectSound(&tree);
+
+    // Positional lookup reads the item count, exactly as for `SlabAgg`.
+    var items: usize = 0;
+    for (weights.items, 0..) |w, i| {
+        try testing.expectEqual(
+            PrefixTree.PositionalHit{ .slab = i, .items_before = items },
+            tree.findByPrefix(items).?,
+        );
+        items += w.len;
+    }
+
+    var step: usize = 0;
+    while (step < 200) : (step += 1) {
+        const at = rand.intRangeAtMost(usize, 0, weights.items.len);
+        const w = PrefixWeight{
+            .len = 1 + rand.intRangeAtMost(usize, 0, 3),
+            .prefix = rand.intRangeAtMost(usize, 0, 10),
+        };
+        try tree.splice(at, at, &.{w});
+        try weights.insert(gpa, at, w);
+        try expectSound(&tree);
+    }
+
+    // With this weight the root aggregate is a plain sum of both fields.
+    var total_len: usize = 0;
+    var total_prefix: usize = 0;
+    for (weights.items) |w| {
+        total_len += w.len;
+        total_prefix += w.prefix;
+    }
+    try testing.expectEqual(total_len, tree.rootAgg().len);
+    try testing.expectEqual(total_prefix, tree.rootAgg().prefix);
+    try testing.expectEqual(total_len, tree.itemsBeforeSlab(weights.items.len));
 }

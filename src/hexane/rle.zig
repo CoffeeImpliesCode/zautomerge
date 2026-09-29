@@ -56,6 +56,18 @@ const leb128 = @import("../leb128.zig");
 
 const ParseError = err.ParseError;
 
+/// The most values one slab may decode to.
+///
+/// A run header is three bytes whatever its count says, so the count is not
+/// bounded by the slab's size: eight bytes can claim four billion values, and
+/// a decoder that believed them would spend its life filling the array. This
+/// is the same 2^32 the upstream tail metadata reasons about when it keeps a
+/// segment's byte length in a `u32` — "a single segment must stay under 4
+/// GiB, so blobs larger than that belong in `RawColumn`"
+/// (`rust/hexane/src/rle/mod.rs:93-104`). A slab over it is
+/// `error.TooLarge`.
+pub const maxSlabLen: usize = if (@bitSizeOf(usize) < 33) std.math.maxInt(usize) else 1 << 32;
+
 /// The codec over `T` for both the plain and the nullable column: `T` is the
 /// integer whose LEB128 form is a value payload, and `Nullable` says whether
 /// a null run is part of the format. For the plain form `Element == T`; for
@@ -104,8 +116,10 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool) type {
         /// A null run in a non-nullable column is `error.UnexpectedNull`, a
         /// count that does not fit a `usize` is `error.Overflow`, and a run
         /// that claims more values than the bytes hold is
-        /// `error.LengthExceedsInput`. Malformed bytes are whatever the LEB128
-        /// reader says they are (`error.UnexpectedEnd`, `error.InvalidLeb128`).
+        /// `error.LengthExceedsInput`, and a slab claiming more values than
+        /// `maxSlabLen` is `error.TooLarge`. Malformed bytes are whatever the
+        /// LEB128 reader says they are (`error.UnexpectedEnd`,
+        /// `error.InvalidLeb128`).
         pub fn decodeAll(bytes: []const u8, gpa: std.mem.Allocator) ParseError![]Element {
             const n = try countValues(bytes);
             const out = try gpa.alloc(Element, n);
@@ -276,6 +290,9 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool) type {
                 }
                 const hdr = try readRunHeader(self.data, self.pos);
                 if (hdr.is_repeat) {
+                    // A count the slab could never back is refused before the
+                    // value is even read.
+                    if (hdr.count > maxSlabLen) return error.TooLarge;
                     const cv = try readValue(self.data, hdr.payload_at);
                     self.pos = hdr.payload_at + cv.len;
                     self.remaining = hdr.count;
@@ -283,11 +300,13 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool) type {
                 } else if (hdr.is_null) {
                     if (!Nullable) return error.UnexpectedNull;
                     const nc = try readNullCount(self.data, hdr.payload_at);
+                    if (nc.count > maxSlabLen) return error.TooLarge;
                     self.pos = hdr.payload_at + nc.header_len;
                     self.remaining = nc.count;
                     self.run = .null_run;
                 } else {
-                    // `readRunHeader` already proved the values are present.
+                    // `readRunHeader` already proved the values are present,
+                    // and a literal run cannot outrun the slab.
                     self.pos = hdr.payload_at;
                     self.remaining = hdr.count;
                     self.run = .literal;
@@ -430,8 +449,9 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool) type {
         }
 
         /// The value count of a whole slab, walked run by run and never
-        /// materialising a value. Two null runs of `maxInt(u64)` absent values
-        /// overflow, and that is caught here, before anything is allocated.
+        /// materialising a value. A run count that is not representable, an
+        /// accumulation that overflows, and a total past `maxSlabLen` are all
+        /// caught here, before anything is allocated.
         fn countValues(bytes: []const u8) ParseError!usize {
             var pos: usize = 0;
             var total: usize = 0;
@@ -459,6 +479,7 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool) type {
                 }
                 const n = std.math.cast(usize, run) orelse return error.Overflow;
                 total = std.math.add(usize, total, n) catch return error.Overflow;
+                if (total > maxSlabLen) return error.TooLarge;
             }
             return total;
         }
@@ -592,7 +613,6 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool) type {
             lit: Element,
             null_run,
         };
-
     };
 }
 
@@ -748,10 +768,10 @@ test "encodedSize is exactly the bytes write produces" {
     // than one header byte, and a mix of the two.
     const us = [_][]const u64{
         &.{},
-        &.{ 0 },
+        &.{0},
         &.{ 0, 0 },
         &.{300},
-        &.{ std.math.maxInt(u64) },
+        &.{std.math.maxInt(u64)},
         &.{ 1, 2, 3 },
         &([_]u64{0} ** 5),
         &([_]u64{0} ** 200),
@@ -874,6 +894,38 @@ test "the wire format is what the upstream comment says" {
     );
 }
 
+test "a literal run ends where a run begins" {
+    const U = Rle(u64);
+
+    // A value that appears once, between two runs, is a literal run of its
+    // own — the shorter `literal(2, 3)` that would swallow the trailing run is
+    // canonical too, and upstream's state machine does not write it. This is
+    // the one place the format leaves a choice, so it is pinned here: the
+    // literal is flushed before every run (`RleState::append_n` emits
+    // `emit_lit` and then starts the run, `rust/hexane/src/rle/state.rs:427-455`).
+    try expectBytes(
+        U,
+        u64,
+        &.{ 1, 1, 2, 3, 3 },
+        &.{ 0x02, 0x01, 0x7f, 0x02, 0x02, 0x03 },
+    );
+    // The same choice, repeated: literal, run, literal, run, literal, run,
+    // literal. This is upstream's `roundtrip_complex` case.
+    try expectBytes(
+        U,
+        u64,
+        &.{ 1, 2, 3, 3, 3, 4, 5, 5, 6, 7, 7, 7, 7, 8 },
+        &.{ 0x7e, 0x01, 0x02, 0x03, 0x03, 0x7f, 0x04, 0x02, 0x05, 0x7f, 0x06, 0x04, 0x07, 0x7f, 0x08 },
+    );
+    // A literal that only ever grows keeps the one header it was given.
+    try expectBytes(
+        U,
+        u64,
+        &.{ 4, 5, 6, 7, 8, 9 },
+        &.{ 0x7a, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09 },
+    );
+}
+
 test "a truncated slab is rejected" {
     const gpa = testing.allocator;
     const U = Rle(u64);
@@ -946,30 +998,32 @@ test "an overlong LEB128 is rejected" {
     );
 }
 
-test "a value count that overflows is rejected" {
+test "the largest counts a header can spell are refused" {
     const gpa = testing.allocator;
     const O = RleOption(u64);
 
-    // Two null runs of maxInt(u64) absent values: each one on its own fits a
-    // usize, their sum does not. Caught in the counting pass, before anything
-    // is allocated.
+    // A null run's count is an unsigned varint, so `maxInt(u64)` is the
+    // largest a null run can claim: eleven bytes for four billion values
+    // each.
     const huge = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01 };
-    const doubled = [_]u8{0x00} ++ huge ++ [_]u8{0x00} ++ huge;
-    try testing.expectError(error.Overflow, O.decodeAll(&doubled, gpa));
-    try testing.expectError(error.Overflow, RleOption(i64).decodeAll(&doubled, gpa));
-
-    // A single run of maxInt(u64) does fit a usize, so it is the allocation
-    // that refuses it.
     const one = [_]u8{0x00} ++ huge;
-    try testing.expectError(error.OutOfMemory, O.decodeAll(&one, gpa));
-    try testing.expectError(error.OutOfMemory, RleOption(i64).decodeAll(&one, gpa));
+    try testing.expectError(error.TooLarge, O.decodeAll(&one, gpa));
+    try testing.expectError(error.TooLarge, RleOption(i64).decodeAll(&one, gpa));
+    // Two of them: the count has to notice the accumulation, and it does so
+    // in the counting pass, before anything is allocated.
+    const doubled = [_]u8{0x00} ++ huge ++ [_]u8{0x00} ++ huge;
+    try testing.expectError(error.TooLarge, O.decodeAll(&doubled, gpa));
 
-    // A repeat run is refused the same way, and by the same check: build the
-    // header rather than hand-writing it.
-    var repeat: [16]u8 = undefined;
-    var rn = leb128.writeSigned(&repeat, 1 << 40);
-    rn += leb128.writeUnsigned(repeat[rn..], 0);
-    try testing.expectError(error.OutOfMemory, Rle(u64).decodeAll(repeat[0..rn], gpa));
+    // A repeat run spells its count with a signed header, which reaches one
+    // bit lower: `maxInt(i64)`.
+    const repeat = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x07 };
+    try testing.expectError(error.TooLarge, Rle(u64).decodeAll(&repeat, gpa));
+    try testing.expectError(error.TooLarge, Rle(i64).decodeAll(&repeat, gpa));
+
+    // The cursor refuses the same slabs at the same point, before it reads a
+    // single value.
+    try testing.expectError(error.TooLarge, O.Decoder.init(&one));
+    try testing.expectError(error.TooLarge, Rle(u64).Decoder.init(&repeat));
 }
 
 test "canonical accepts what write produces" {
@@ -1087,17 +1141,44 @@ test "arbitrary bytes are refused, never a trap" {
     var prng = std.Random.DefaultPrng.init(0xc0ffee);
     const random = prng.random();
 
+    // One sweep over raw random bytes through everything that does not
+    // materialise values. The header and payload readers are what could trap
+    // here, and this is what covers them over input nobody chose.
     var bytes: [48]u8 = undefined;
     var round: usize = 0;
-    while (round < 2000) : (round += 1) {
+    while (round < 3000) : (round += 1) {
         const len = random.uintLessThan(usize, bytes.len + 1);
         for (bytes[0..len]) |*b| b.* = random.int(u8);
-        // Every entry point answers with an error or a result, never a panic,
-        // whatever the bytes are.
         U.canonical(bytes[0..len]) catch {};
         O.canonical(bytes[0..len]) catch {};
-        _ = U.Decoder.init(bytes[0..len]) catch continue;
-        _ = O.Decoder.init(bytes[0..len]) catch continue;
+        if (U.Decoder.init(bytes[0..len])) |made| {
+            var d = made;
+            // Three values is enough to cross a header boundary; counting them
+            // all is what would be unbounded.
+            var steps: usize = 0;
+            while (steps < 3) : (steps += 1) {
+                _ = d.next() catch break;
+            }
+        } else |_| {}
+        if (O.Decoder.init(bytes[0..len])) |made| {
+            var d = made;
+            var steps: usize = 0;
+            while (steps < 3) : (steps += 1) {
+                _ = d.next() catch break;
+            }
+        } else |_| {}
+    }
+
+    // A second sweep over slabs built from the run grammar, each one then
+    // flipped at a random bit. These keep the counts small enough to decode
+    // in full, so the two readers can be held against each other.
+    round = 0;
+    while (round < 2000) : (round += 1) {
+        const len = grammarSlab(random, &bytes);
+        const flip = random.uintLessThan(usize, len);
+        bytes[flip] ^= @as(u8, 1) << @intCast(random.uintLessThan(u8, 8));
+        _ = U.canonical(bytes[0..len]) catch {};
+        _ = O.canonical(bytes[0..len]) catch {};
         const back = U.decodeAll(bytes[0..len], gpa) catch continue;
         defer gpa.free(back);
         // What decoded must hold exactly what the cursor yields, value for
@@ -1109,4 +1190,59 @@ test "arbitrary bytes are refused, never a trap" {
         }
         try testing.expect((try dec.next()) == null);
     }
+}
+
+/// Writes a slab built from the run grammar — a few repeat, literal and null
+/// runs with small counts — into `out`, returning its length. The result need
+/// not be canonical: two adjacent null runs are as likely as not, and the
+/// reader has to be happy with that.
+fn grammarSlab(random: std.Random, out: []u8) usize {
+    var n: usize = 0;
+    const runs = random.uintLessThan(usize, 4) + 1;
+    for (0..runs) |_| {
+        switch (random.uintLessThan(u8, 3)) {
+            0 => {
+                n += leb128.writeSigned(out[n..], random.intRangeAtMost(i64, 1, 40));
+                n += leb128.writeUnsigned(out[n..], random.int(u8) & 0x3f);
+            },
+            1 => {
+                const count = random.uintLessThan(usize, 4) + 1;
+                n += leb128.writeSigned(out[n..], -@as(i64, @intCast(count)));
+                for (0..count) |_| n += leb128.writeUnsigned(out[n..], random.int(u8) & 0x3f);
+            },
+            else => {
+                n += leb128.writeSigned(out[n..], 0);
+                n += leb128.writeUnsigned(out[n..], random.intRangeAtMost(u64, 0, 40));
+            },
+        }
+    }
+    return n;
+}
+
+test "a slab claiming more values than a slab may hold is refused" {
+    const gpa = testing.allocator;
+    const U = Rle(u64);
+    const O = RleOption(u64);
+    var slab: [16]u8 = undefined;
+    var n: usize = 0;
+
+    // A repeat run of 2^33 values is three header bytes and one value byte.
+    n = leb128.writeSigned(&slab, 1 << 33);
+    n += leb128.writeUnsigned(slab[n..], 7);
+    try testing.expectError(error.TooLarge, U.decodeAll(slab[0..n], gpa));
+    try testing.expectError(error.TooLarge, U.Decoder.init(slab[0..n]));
+    try testing.expectError(error.TooLarge, O.decodeAll(slab[0..n], gpa));
+    // The same for a null run, whose count is unsigned.
+    n = leb128.writeSigned(&slab, 0);
+    n += leb128.writeUnsigned(slab[n..], 1 << 33);
+    try testing.expectError(error.TooLarge, O.decodeAll(slab[0..n], gpa));
+    try testing.expectError(error.TooLarge, O.Decoder.init(slab[0..n]));
+
+    // Exactly the limit is still a legal slab: the cursor serves a run that
+    // long out of memory, without materialising it.
+    n = leb128.writeSigned(&slab, @as(i64, 1) << 32);
+    n += leb128.writeUnsigned(slab[n..], 7);
+    var dec = try U.Decoder.init(slab[0..n]);
+    try testing.expectEqual(@as(?u64, 7), try dec.next());
+    try testing.expectEqual(@as(?u64, 7), try dec.next());
 }
