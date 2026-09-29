@@ -21,9 +21,18 @@ pub const hexane = struct {
     pub const btree = @import("hexane/btree.zig");
     pub const delta = @import("hexane/delta.zig");
     pub const prefix = @import("hexane/prefix.zig");
+    pub const slab = @import("hexane/slab.zig");
+    pub const column = @import("hexane/column.zig");
 };
 pub const authors = @import("author.zig");
+pub const change_graph = @import("change_graph.zig");
+pub const change_queue = @import("change_queue.zig");
+pub const sequence_tree = @import("sequence_tree.zig");
 pub const change_record = @import("change.zig");
+pub const columnar = struct {
+    pub const encoding = @import("columnar/encoding.zig");
+    pub const columns = @import("columnar/columns.zig");
+};
 pub const storage = struct {
     pub const parse = @import("storage/parse.zig");
     pub const chunk = @import("storage/chunk.zig");
@@ -89,10 +98,18 @@ test {
     _ = @import("hexane/rle.zig");
     _ = @import("hexane/bool.zig");
     _ = @import("hexane/delta.zig");
+    _ = @import("hexane/prefix.zig");
     _ = @import("hexane/btree.zig");
+    _ = @import("hexane/slab.zig");
+    _ = @import("hexane/column.zig");
     _ = @import("storage/parse.zig");
     _ = @import("storage/chunk.zig");
     _ = @import("storage/column_spec.zig");
     _ = @import("author.zig");
     _ = @import("change.zig");
+    _ = @import("change_graph.zig");
+    _ = @import("change_queue.zig");
+    _ = @import("columnar/encoding.zig");
+    _ = @import("columnar/columns.zig");
+    _ = @import("sequence_tree.zig");
 }
