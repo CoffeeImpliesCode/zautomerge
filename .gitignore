@@ -1,0 +1,6 @@
+zig-out/
+.zig-cache/
+.devenv/
+.direnv/
+graphify-out/
+codedb.snapshot
