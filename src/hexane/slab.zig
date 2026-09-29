@@ -936,6 +936,110 @@ test "merge coalesces the seam run and keeps the rest" {
     try expectValues(E, &c, &.{ 8, 8, 1, 1, 2, 2, 2, 3, 3 });
 }
 
+test "KNOWN DEFECT: a merge at the segment budget overshoots it" {
+    const gpa = testing.allocator;
+    const colmod = @import("column.zig");
+    const E = colmod.RleOption(u32);
+
+    var a_vals: std.ArrayList(?u32) = .empty;
+    defer a_vals.deinit(gpa);
+    // 11 runs, the last of them the literal run [11, 12].
+    for ([_][2]u32{ .{ 1, 3 }, .{ 2, 1 }, .{ 3, 2 }, .{ 4, 1 }, .{ 5, 2 }, .{ 6, 1 }, .{ 7, 2 }, .{ 8, 1 }, .{ 9, 2 }, .{ 10, 2 }, .{ 11, 1 } }) |r| {
+        var k: u32 = 0;
+        while (k < r[1]) : (k += 1) try a_vals.append(gpa, r[0]);
+    }
+    try a_vals.append(gpa, 12);
+
+    var b_vals: std.ArrayList(?u32) = .empty;
+    defer b_vals.deinit(gpa);
+    // 53 runs, the first of them the literal run [12, 13]. The seam is
+    // a's last run followed by b's first, and the two collide on 12, so
+    // the concatenation splits into three runs where the caller expected
+    // two. Upstream keeps a's trailing literal run as one run by
+    // rewriting its header (`rle/splice.rs:1094`), so the merge does not
+    // pay the extra segment.
+    try b_vals.appendSlice(gpa, &.{ 12, 13 });
+    var j: u32 = 0;
+    while (j < 26) : (j += 1) {
+        const v = 30 + 2 * j;
+        try b_vals.appendSlice(gpa, &.{ v, v, v + 1 });
+    }
+
+    const a_bytes = try E.wireEncode(gpa, a_vals.items, false);
+    defer gpa.free(a_bytes);
+    var a = try init(gpa, E, a_bytes);
+    defer a.deinit(gpa);
+    const b_bytes = try E.wireEncode(gpa, b_vals.items, false);
+    defer gpa.free(b_bytes);
+    var b = try init(gpa, E, b_bytes);
+    defer b.deinit(gpa);
+
+    // The precondition the caller's pre-check rests on: the two segment
+    // counts are at the budget, and the seam collision is the one thing
+    // that could push the result over it.
+    const pre = a.segments + b.segments;
+    try testing.expect(pre <= default_max_segments);
+
+    // `Column.tryMerge` pre-checks only `sa + sb <= max_segments`
+    // (`column.zig:1843`, the rule upstream uses at `column.rs:1789`). This
+    // test sits exactly on that boundary, so the caller's check passes and
+    // the merge is the only thing left to hold the line. It does not.
+    //
+    // Upstream keeps a's trailing literal run as ONE run: `tail()` rebuilds
+    // it as `RleState::Lit { count, current, header_pos }`
+    // (`rle/splice.rs:1057-1071`) and `do_merge` truncates it and calls
+    // `rewrite_lit_header` (`:1094`, `:1104-1107`). The port has no
+    // `rewrite_lit_header` and regroups a's literal values from scratch, so
+    // the seam `[11] ++ [12, 13]` splits into three runs where the caller
+    // expected two, and the segment count at `slab.zig:682` becomes 65.
+    //
+    // The count is 64 once `merge` rewrites the header in place. When you
+    // fix it, this test fails with 65 found and 64 expected, and that
+    // failure is the fix landing. Then change the number to 64 and add the
+    // `expect(a.segments <= default_max_segments)` assertion back.
+    // See docs/STATUS.md.
+    const expected_segments = 65;
+
+    try merge(gpa, E, &a, &b);
+    const m = try measure(gpa, E, a.data);
+    try testing.expectEqual(expected_segments, a.segments);
+    try testing.expectEqual(m.segments, a.segments);
+    try testing.expectEqual(a_vals.items.len + b_vals.items.len, m.len);
+
+    // The merged slab still holds the two value sequences in order.
+    var want: std.ArrayList(?u32) = .empty;
+    defer want.deinit(gpa);
+    try want.appendSlice(gpa, a_vals.items);
+    try want.appendSlice(gpa, b_vals.items);
+    var dec = try E.WireDecoder.init(a.data);
+    var i: usize = 0;
+    while (try dec.next()) |v| : (i += 1) {
+        try testing.expect(i < want.items.len);
+        try testing.expectEqual(want.items[i], v);
+    }
+    try testing.expectEqual(want.items.len, i);
+
+    // The same values through a column, built and then edited, must leave
+    // the column inside its own budget at every step.
+    var col = try colmod.Column(?u32, E).init(gpa);
+    defer col.deinit();
+    try col.extend(gpa, a_vals.items);
+    try col.extend(gpa, b_vals.items);
+    try testing.expect((try col.checkInvariants()) == null);
+    const segs = try col.slabSegments(gpa);
+    defer gpa.free(segs);
+    for (segs) |n| try testing.expect(n <= default_max_segments);
+
+    // Deleting the head of the first slab is what exposed the range bug in
+    // the merge policy: the pair left behind is not the pair the splice
+    // touched.
+    try col.splice(gpa, 0, 3, &.{});
+    try testing.expect((try col.checkInvariants()) == null);
+    const segs3 = try col.slabSegments(gpa);
+    defer gpa.free(segs3);
+    for (segs3) |n| try testing.expect(n <= default_max_segments);
+}
+
 test "splitToBudget cuts on run boundaries and every piece is a slab" {
     const gpa = testing.allocator;
     const E = Filler;

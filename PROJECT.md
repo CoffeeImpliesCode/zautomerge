@@ -12,8 +12,28 @@ file). This repository is the Zig port, not a wrapper.
 
 ## Implemented
 
-Nothing yet. The first commit is the project scaffold: the build, the Nix
-environment, and the survey and plan documents.
+279 tests pass. What exists today:
+
+- **The contract.** `error.zig` with the three error sets, `types.zig` with the
+  identity and value types, `value.zig`, `clock.zig`, `leb128.zig` written from
+  scratch because Zig's std has none, and `unicode.zig` with UAX #29 grapheme
+  clustering.
+- **The conformance harness.** The 18 upstream fixture files with a manifest of
+  what loading each must do, and a Rust oracle that drives the reference
+  implementation for byte-for-byte comparison.
+- **The storage engine.** The four slab codecs, the B=64 slab btree with its
+  invariant checker, the slab and the generic column, and the columnar
+  encoding layer that maps the document's eight column tags onto them.
+- **The change layer.** The change record, the actor table, the change graph
+  with its cached clocks, and the topological sort that puts arriving changes
+  in dependency order.
+
+`src/storage/change_chunk.zig` is half-written and does not compile; it is kept
+on disk, unwired, and [docs/STATUS.md](docs/STATUS.md) records exactly what is
+wrong with it. Everything else in the tree builds and passes.
+
+**Not yet written:** the op set, the document API, the iterators, sync, patches,
+and the C ABI. The order and the gates are in [docs/STATUS.md](docs/STATUS.md).
 
 ## Planned
 
