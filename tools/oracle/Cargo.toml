@@ -1,0 +1,16 @@
+[package]
+name = "zautomerge-oracle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Differential-testing oracle which drives the upstream automerge implementation"
+
+# The oracle is a standalone crate, not a member of any surrounding workspace.
+[workspace]
+
+[dependencies]
+# The reference implementation, wired up by tools/link-oracle.sh through
+# `vendor/automerge`. Nothing here is built by `zig build`; cargo is only
+# needed for `zig build conformance`.
+automerge = { path = "vendor/automerge" }
+serde_json = "1"
