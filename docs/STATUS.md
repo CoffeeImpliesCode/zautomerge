@@ -189,6 +189,10 @@ test.
 reposition a mid-flight iterator into a child object without allocating. Then
 the three diff iterators over the sixteen columns, and `keys`, `values`,
 `map_range`, `list_range`, `spans`, `doc`.
+Gate: the 35 upstream tests from `tests/text.rs` and `tests/text_encoding.rs`
+ported case-for-case, the encoding tests each run under all four text
+encodings, and a cursor created before a remote edit still resolves to the
+right position after it.
 
 ### 6. Sync — `src/sync/`
 
@@ -202,16 +206,72 @@ directions, and a deliberately v1-only peer still works.
 The forward-only edit cursor, the raw column, and the optional bit index. These
 are used by the op set for bulk edits and can be taken at any point after the
 codecs and the column exist, which they now do.
+Gate: the edit cursor holds one slab open across a batch of edits so a batch
+costs one partition, one byte splice, and one index update, and `Column`
+invariants hold after every edit cursor is dropped mid-batch.
 
 ### 8. Patches, marks, cursors, text diff, hydrate, serde, anonymize — P9
 
+`patches.zig` with the patch log, the builder, and the expose queue;
+`marks.zig`; `cursor.zig`, which is where the real `Cursor`, `OpCursor`, and
+`MoveCursor` live, resolved through the op set rather than through the
+sequence tree; the vendored Myers diff in `textdiff.zig`, which is Apache-2.0
+and carries its own notice; `hydrate.zig`; `autoserde.zig`; and `anonymize.zig`.
+Gate: the 37 upstream tests from `tests/diff_marks.rs` and
+`tests/test_mark_patches.rs` ported, a hydrate round trip that replays a patch
+stream into a mirror equal to the document, and the Apache-2.0 notice present
+next to the vendored diff.
+
 ### 9. The C ABI — P10
+
+`src/c/result.zig` with the `AMresult` convention and the single-destructor
+rule, `src/c/doc.zig` with the document and the map, list, and mark surfaces,
+`src/c/sync.zig`, and a hand-written `include/automerge.h` with the enum
+discriminants pinned to the exact integers the upstream header uses.
+Gate: the upstream cmocka suite, including the three files ported from the wasm
+tests, passes against the Zig library.
 
 ### 10. The bundle engine — `src/storage/bundle.zig`
 
 A second on-disk engine that shares the chunk framing. It is the one item on
 this list that no other phase depends on, so it is the right thing to defer
 last.
+Gate: a bundle written here loads in the Rust reference and a bundle the
+reference writes loads here.
+
+## Where every open item went
+
+Nothing was dropped when this list was written. Every item still open in the
+task list maps to exactly one step above.
+
+| Open item | Step |
+| --- | --- |
+| `src/storage/change_chunk.zig` | 1 |
+| `src/storage/document_chunk.zig` | 2 |
+| P3 gate: fixtures load, fuzz crashers rejected, save round trip | 1, 2, 3 |
+| `src/opset/op.zig`, `columns.zig`, `index.zig`, `parents.zig`, `op_set.zig`, `batch.zig` | 3 |
+| P5 gate: 186 ported tests, save bytes match the reference | 3 |
+| `src/doc.zig`, `read.zig`, `transact.zig`, `transaction.zig` | 4 |
+| P6 gate: every `ReadDoc` and `Transactable` method tested | 4 |
+| `src/iter/tools.zig`, `keys.zig`, `values.zig`, `map_range.zig`, `list_range.zig`, `spans.zig`, `doc.zig` | 5 |
+| P7 gate: 35 ported text and encoding tests | 5 |
+| `src/sync/state.zig`, `bloom.zig`, `message.zig`, `protocol.zig`, `v1.zig` | 6 |
+| P8 gate: convergence, cross-implementation sync, v1 peer | 6 |
+| `src/hexane/edit.zig`, `raw.zig`, `index.zig` | 7 |
+| P2 gate: codec round trips, btree invariants, hexane suite ported | 2, 3, 7 |
+| `src/patches.zig`, `marks.zig`, `cursor.zig`, `textdiff.zig`, `hydrate.zig`, `autoserde.zig`, `anonymize.zig` | 8 |
+| P9 gate: 37 ported mark and patch tests, hydrate round trip | 8 |
+| `src/c/result.zig`, `src/c/doc.zig`, `src/c/sync.zig`, `include/automerge.h` | 9 |
+| P10 gate: the upstream C test suite passes | 9 |
+| `src/storage/bundle.zig` | 10 |
+
+Two gates have no file of their own and belong to no single step: the P4 gate
+for change hashes being byte-identical to the reference, which is a property
+step 3's writer must satisfy, and the P2 btree invariant gate, which the
+already-landed btree satisfies. The one gate with no home above is **step 0**:
+the slab merge budget defect described in the previous section, which is not on
+this list because it is a defect in code that already exists, not a missing
+phase.
 
 ## How to work on this
 
