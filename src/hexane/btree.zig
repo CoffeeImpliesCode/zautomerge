@@ -33,6 +33,12 @@
 
 const std = @import("std");
 
+/// The option module `build.zig` generates for `-Dslow-path`. Read by
+/// [`SlabBTree.assertSound`](btree.zig) here and by
+/// [`check_slow_paths`](opset/op_set.zig) there, so both gated checks turn
+/// on and off with one option.
+const build_options = @import("build_options");
+
 /// Branching factor: entries per leaf, and children per internal node.
 ///
 /// Smaller means a deeper tree and cheaper per-node rebalancing; larger
@@ -375,7 +381,13 @@ pub fn Tree(comptime A: type) type {
             // Reserve the free-list room first: a release must never fail,
             // and one free entry per arena slot is always enough.
             try self.free.ensureTotalCapacity(self.gpa, self.nodes.items.len + 1);
-            const id: NodeId = @intCast(self.nodes.items.len);
+            // `NodeId` is a `u32`, so the arena cannot grow past what it
+            // addresses. Upstream mints the index unchecked
+            // (`btree.rs:284-290`) and relies on the arena being small; the
+            // port proves it instead, because a trap in Debug is worse than
+            // an error.
+            const id = std.math.cast(NodeId, self.nodes.items.len) orelse
+                return error.InvalidIndex;
             try self.nodes.append(self.gpa, new_node);
             return id;
         }
@@ -954,10 +966,18 @@ pub fn Tree(comptime A: type) type {
 
         /// The number of internal levels below `id`; 0 for a leaf
         /// (`subtree_height`, `btree.rs:761-772`).
+        ///
+        /// The `1 +` belongs to the else branch, as it does upstream: an
+        /// internal node with no children has height 0, not 1
+        /// (`btree.rs:764-770`). `else 1 + h` already parses as
+        /// `else (1 + h)`, so the value was never in doubt; the
+        /// parentheses say so, because the other reading differs from this
+        /// one by one on exactly the empty node, and lifting the addend out
+        /// of the else branch would read `n.items[0]` on it too.
         fn subtreeHeight(self: *const Self, id: NodeId) usize {
             return switch (self.node(id).*) {
                 .leaf => 0,
-                .internal => |n| if (n.items.len == 0) 0 else 1 + self.subtreeHeight(n.items[0].id),
+                .internal => |n| if (n.items.len == 0) 0 else (1 + self.subtreeHeight(n.items[0].id)),
             };
         }
 
@@ -1070,14 +1090,41 @@ pub fn Tree(comptime A: type) type {
                 },
                 else => {
                     // The root overflowed: grow a new one level up.
-                    const children = replacement;
-                    replacement = .empty;
-                    const id = self.alloc(.{ .internal = children }) catch |e| {
-                        var owned = children;
-                        owned.deinit(self.gpa);
-                        return e;
-                    };
-                    self.root = id;
+                    //
+                    // **A bulk replacement can hold more slots than one node
+                    // does, and this is where it used to be lost.**
+                    // `makeLeaves` makes one slot per leaf, so replacing a
+                    // whole tree with more than `branch_factor` slabs arrives
+                    // here with more than `branch_factor` slots — 65 for 4097
+                    // slabs, 66 for 4167, 128 for 8192. Putting all of them
+                    // into one new root made a node that was itself overfull,
+                    // and the shape a straight `fromSlice` build can never
+                    // produce, because that one adds a level at a time
+                    // (`buildLevel`). So the slots are grouped into internal
+                    // nodes first, the same way, and the new root holds the
+                    // groups. Reached through `trySingleLeafSplice`'s
+                    // overflow arm with an empty `path` — the old root was
+                    // the leaf being rewritten, and its slot is among the
+                    // groups already.
+                    if (replacement.items.len <= branch_factor) {
+                        const children = replacement;
+                        replacement = .empty;
+                        const id = self.alloc(.{ .internal = children }) catch |e| {
+                            var owned = children;
+                            owned.deinit(self.gpa);
+                            return e;
+                        };
+                        self.root = id;
+                    } else {
+                        const groups = try self.buildLevel(self.gpa, replacement.items);
+                        replacement.deinit(self.gpa);
+                        const id = self.alloc(.{ .internal = groups }) catch |e| {
+                            var owned = groups;
+                            owned.deinit(self.gpa);
+                            return e;
+                        };
+                        self.root = id;
+                    }
                 },
             }
         }
@@ -1173,6 +1220,88 @@ pub fn Tree(comptime A: type) type {
                             slab_base += c.slab_count;
                         }
                         if (!descended) return null;
+                    },
+                }
+            }
+        }
+
+        /// Where a prefix-sum search landed: the slab whose running
+        /// `incr` reaches `target`, with the running sums and the item
+        /// count before it.
+        pub const PrefixSumHit = struct {
+            /// The slab the running sum reaches `target` in, or
+            /// `len()` when the target is past the total.
+            slab: usize,
+            /// The items in the slabs before it.
+            items_before: usize,
+            /// The running sum before it.
+            prefix_before: i64,
+        };
+
+        /// The first slab whose cumulative `incr` reaches or exceeds
+        /// `target`, with the running sum and the item count before it
+        /// (`find_slab_at_prefix`, `btree.rs:1628-1667`). O(log S): one
+        /// comparison per level, against the running sums of the sibling
+        /// subtrees the descent passes.
+        ///
+        /// `incr` is the per-slab running-sum increment, and it is a
+        /// parameter because the two weights mean it by different things:
+        /// a prefix column's is the sum of its row lengths and a delta
+        /// column's is the sum of its differences, which is its realized
+        /// value at the slab's end. Upstream reaches the same place
+        /// through the index type parameter (`index.rs:43-46`).
+        ///
+        /// A target at or past the total answers `len()`, the one-past-the-
+        /// end position every caller here checks for
+        /// (`prefix.rs:615-617`).
+        pub fn findByPrefixSum(
+            self: *const Self,
+            comptime incr: fn (A) i64,
+            target: i64,
+        ) PrefixSumHit {
+            var prefix: i64 = 0;
+            var items: usize = 0;
+            var slab_base: usize = 0;
+            var cursor = self.root;
+            while (true) {
+                switch (self.node(cursor).*) {
+                    .leaf => |l| {
+                        for (l.items, 0..) |a, i| {
+                            if (target <= prefix + incr(a)) {
+                                return .{
+                                    .slab = slab_base + i,
+                                    .items_before = items,
+                                    .prefix_before = prefix,
+                                };
+                            }
+                            prefix += incr(a);
+                            items += itemCount(a);
+                        }
+                        return .{
+                            .slab = slab_base + l.items.len,
+                            .items_before = items,
+                            .prefix_before = prefix,
+                        };
+                    },
+                    .internal => |n| {
+                        var descended = false;
+                        for (n.items) |c| {
+                            if (target <= prefix + incr(c.agg)) {
+                                cursor = c.id;
+                                descended = true;
+                                break;
+                            }
+                            prefix += incr(c.agg);
+                            items += itemCount(c.agg);
+                            slab_base += c.slab_count;
+                        }
+                        if (!descended) {
+                            return .{
+                                .slab = slab_base,
+                                .items_before = items,
+                                .prefix_before = prefix,
+                            };
+                        }
                     },
                 }
             }
@@ -1325,6 +1454,48 @@ pub fn Tree(comptime A: type) type {
                 if (!live and !freed) return Violation{ .kind = .free_list_mismatch, .node = @intCast(i) };
             }
             return null;
+        }
+
+        /// [`checkInvariants`](btree.zig) as an assertion: the first
+        /// violation is `error.InvariantViolation`, a sound tree returns
+        /// void. `O(nodes)`, and this is the port's `-Dslow-path` checker.
+        ///
+        /// **Off, it checks nothing and says so by returning.** Upstream puts
+        /// the equivalent call behind `#[cfg(feature =
+        /// "slow_path_assertions")]` at the top of `SequenceTree::insert`
+        /// (`sequence_tree.rs:51-53`) and `remove` (`:113-115`), so a build
+        /// without the feature never spends the walk — and this method is the
+        /// port's version of that "without the feature" build. The gate sits
+        /// here rather than on a call site because **the port cannot put it on
+        /// a call site**: [`splice`](btree.zig) returns
+        /// [`TreeError`](btree.zig), and a check that can fail from there
+        /// would have to add `InvariantViolation` to that set, which makes the
+        /// exhaustive `switch`es over it in `column.zig:1707`, `:3332`,
+        /// `:3361` and `edit.zig:776` stop compiling — and reporting a broken
+        /// tree as `error.InvalidIndex` instead would be a lie, because every
+        /// caller maps that to "the caller passed a bad position".
+        ///
+        /// Upstream calls `check()` from `SequenceTree`, which is the old
+        /// index and a different structure, not from `SlabBTree`'s own
+        /// mutators (`btree.rs:412-438`), and hexane gates nothing of its
+        /// own: `rust/hexane/Cargo.toml:17` declares
+        /// `slow_path_assertions` and `rust/hexane/src` reads it nowhere.
+        /// So there is no upstream call site to copy here, and this method is
+        /// the gate P2's gate text names.
+        ///
+        /// The feature is off in upstream's default set — `rust/automerge/
+        /// Cargo.toml:16-17` calls it "should only be enabled when running
+        /// tests" — and this port keeps it off because the walk is linear in
+        /// the arena and the deep sweeps call this once per mutation. The
+        /// checker itself is always compiled and always tested, through
+        /// [`checkInvariants`](btree.zig): a checker that is not compiled
+        /// cannot be tested at all.
+        pub fn assertSound(self: *const Self) (TreeError || error{InvariantViolation})!void {
+            if (comptime !build_options.check_slow_paths) return;
+            const violation = (try self.checkInvariants()) orelse return;
+            var buf: [256]u8 = undefined;
+            std.debug.print("invariant violated: {s}\n", .{violation.describe(&buf)});
+            return error.InvariantViolation;
         }
 
         /// What a subtree check computes: the slab count and the merge of
@@ -1839,6 +2010,40 @@ test "fromSlice builds a multi-level tree" {
     try testing.expectEqual(@as(?SlabBTree.PositionalHit, null), tree.findByPrefix(300));
 }
 
+test "subtree height counts internal levels, and an empty internal node has none" {
+    const gpa = testing.allocator;
+    // `branch_factor` leaves need one more internal level to hold them, so
+    // `branch_factor^2 + 1` slabs is leaves under internals under the root.
+    const aggs = try gpa.alloc(SlabAgg, branch_factor * branch_factor + 1);
+    defer gpa.free(aggs);
+    for (aggs) |*a| a.* = simple(1, 1);
+    var tree = try SlabBTree.fromSlice(gpa, aggs);
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 2), tree.subtreeHeight(tree.root));
+
+    // An internal node with no children is 0, not 1 (`subtree_height`,
+    // `btree.rs:764-770`). This is the only case where
+    // `if … else 1 + h` and `(if … else 1) + h` disagree, and it is what
+    // the `1 +` living inside the else branch, rather than around the `if`,
+    // is for: the other reading returns 1 here and indexes `n.items[0]` on
+    // an empty list. No tree built by the public API holds such a node, so
+    // it is made here.
+    const empty = try tree.alloc(.{ .internal = .empty });
+    try testing.expectEqual(@as(usize, 0), tree.subtreeHeight(empty));
+
+    // A leaf is 0 and an internal node over it is 1, so the count is the
+    // first child's plus the one level the node itself is.
+    var leaf: std.ArrayList(SlabAgg) = .empty;
+    try leaf.append(gpa, simple(1, 1));
+    const leaf_id = try tree.alloc(.{ .leaf = leaf });
+    try testing.expectEqual(@as(usize, 0), tree.subtreeHeight(leaf_id));
+
+    var children: std.ArrayList(SlabBTree.ChildSlot) = .empty;
+    try children.append(gpa, .{ .id = leaf_id, .agg = simple(1, 1), .slab_count = 1 });
+    const parent = try tree.alloc(.{ .internal = children });
+    try testing.expectEqual(@as(usize, 1), tree.subtreeHeight(parent));
+}
+
 test "findByPrefix answers every item boundary" {
     const gpa = testing.allocator;
     const aggs = [_]SlabAgg{simple(5, 10)} ** 10;
@@ -2213,6 +2418,52 @@ test "deleting a whole tree, then refilling it, stays sound" {
     try expectSound(&tree);
 }
 
+test "a bulk splice that replaces the whole tree is sound at every size" {
+    // **A replacement can need more leaves than one node holds, and the root
+    // it grows has to be grouped rather than filled.** `makeLeaves` makes one
+    // slot per leaf, so replacing a whole tree with more than
+    // `branch_factor` slabs arrives at the root-overflow arm of
+    // `propagateSplits` with more than `branch_factor` slots. Putting them
+    // all into one new root produced a node that was itself overfull: at 4097
+    // slabs a root of 65 children, at 4167 a root of 66, at 8192 a root of
+    // 128. A straight `fromSlice` build cannot reach that shape, because it
+    // adds a level at a time, which is why a load-then-edit column was sound
+    // and this one was not.
+    //
+    // The sizes bracket the branch factor and its powers, where a leaf count
+    // crosses a node's capacity. Each case is also checked for *answers*, not
+    // only for structure: a sound tree that resolved the wrong slabs would
+    // pass `expectSound` and be wrong.
+    const gpa = testing.allocator;
+    const sizes = [_]usize{
+        1,   2,   63,  64,  65,  66,   127,  128,  129,  191,  192,  193,
+        255, 256, 257, 320, 321, 4095, 4096, 4097, 4167, 8192, 8193,
+    };
+    for (sizes) |n| {
+        const initial = [_]SlabAgg{ simple(1, 0), simple(1, 1) };
+        var tree = try SlabBTree.fromSlice(gpa, &initial);
+        defer tree.deinit();
+
+        const fresh = try gpa.alloc(SlabAgg, n);
+        defer gpa.free(fresh);
+        for (fresh, 0..) |*a, i| a.* = simple(1, @intCast(i));
+
+        try tree.splice(0, tree.len(), fresh);
+        try testing.expectEqual(n, tree.len());
+        try expectSound(&tree);
+
+        // The aggregate survives the regrouping: every slab holds one item,
+        // so the root's length is the whole column's item count.
+        try testing.expectEqual(n, tree.rootAgg().len);
+        // And the index still resolves a position in the middle to the slab
+        // that holds it, with the right count of items in front.
+        const mid = n / 2;
+        const hit = tree.findByPrefix(@intCast(mid)).?;
+        try testing.expectEqual(mid, hit.slab);
+        try testing.expectEqual(mid, hit.items_before);
+    }
+}
+
 test "deleting an exact internal span leaves the rest intact" {
     const gpa = testing.allocator;
     const n = branch_factor * branch_factor * 3;
@@ -2453,14 +2704,86 @@ test "the invariant checker rejects a corrupted tree" {
     }
 }
 
-test "mixed splices keep the tree equal to a linear reference" {
+test "the option decides whether a corrupted tree is reported" {
     const gpa = testing.allocator;
-    var prng: std.Random.DefaultPrng = .init(0xB7EE5);
+    const Kind = SlabBTree.ViolationKind;
+
+    var tree = try deepTree(gpa);
+    defer tree.deinit();
+    const slabs = tree.len();
+
+    // The root's second child is pointed at its first, and nothing else
+    // changes: the arena still holds every node once, the free list still
+    // agrees with it, and no accessor walks the graph looking for a node
+    // reached twice. A duplicated pointer is the corruption that survives
+    // everything the tree does besides checking itself.
+    switch (tree.nodeMut(tree.root).*) {
+        .internal => |*n| n.items[1].id = n.items[0].id,
+        .leaf => return error.InvalidIndex,
+    }
+    try testing.expectEqual(Kind.node_reachable_twice, (try tree.checkInvariants()).?.kind);
+
+    // A mutation over the corrupted tree succeeds and does not repair it.
+    // `assertSound`'s note says the mutation path does not consult the
+    // checker in either build; this is the observation of that.
+    try tree.splice(0, 1, &.{simple(1, 0)});
+    try testing.expectEqual(slabs, tree.len());
+    try testing.expectEqual(Kind.node_reachable_twice, (try tree.checkInvariants()).?.kind);
+
+    // **The gate, and both halves of it.** With `-Dslow-path` the assertion
+    // refuses the tree; without it the same call returns void. Neither half
+    // is decorative: an `assertSound` that always checked would fail this
+    // test in a build with no option, and one that never checked would fail
+    // it in a build with one, so the pair only passes when the option is
+    // read here.
+    if (build_options.check_slow_paths) {
+        try testing.expectError(error.InvariantViolation, tree.assertSound());
+    } else {
+        try tree.assertSound();
+    }
+}
+
+test "mixed splices keep the tree equal to a linear reference" {
+    try mixedSpliceSweep(testing.allocator, .{
+        .seed = 0xB7EE5,
+        .trials = 4,
+        .steps = 150,
+        .max_start = 600,
+    }, false);
+}
+
+/// How long a [`mixedSpliceSweep`](btree.zig) runs. The default suite gets
+/// the small shape and `-Dslow-path` gets upstream's `fuzz_deep_structural`
+/// one (`btree.rs:2360-2372`: 25 trials of 300 steps, over 200 to 1500
+/// slabs).
+const Sweep = struct {
+    seed: u64,
+    trials: usize,
+    steps: usize,
+    /// The widest starting slab count, less 200.
+    max_start: usize,
+};
+
+/// Every mutation `SlabBTree` has, driven against a linear reference: small
+/// and bulk inserts, deletes within a leaf and across leaf and internal
+/// boundaries, a leaf-aligned exact-span delete, a k-for-m replacement, an
+/// in-place `updateSlab`, and a rare full wipe. Every step checks the slab
+/// count, the root aggregate, one positional lookup and two value queries
+/// (`fuzz_deep_structural`, `btree.rs:2358-2450`).
+///
+/// **`gated` is which assertion each step is held to.** The default suite
+/// holds every step to [`expectSound`](btree.zig), which always checks; the
+/// `-Dslow-path` run holds every step to
+/// [`SlabBTree.assertSound`](btree.zig), which checks in that build and does
+/// not in any other. One body, so the two runs differ in scale and in which
+/// assertion they are held to, and in nothing else.
+fn mixedSpliceSweep(gpa: std.mem.Allocator, sweep: Sweep, comptime gated: bool) !void {
+    var prng: std.Random.DefaultPrng = .init(sweep.seed);
     const rand = prng.random();
 
     var trial: usize = 0;
-    while (trial < 4) : (trial += 1) {
-        const n0 = 200 + rand.intRangeAtMost(usize, 0, 600);
+    while (trial < sweep.trials) : (trial += 1) {
+        const n0 = 200 + rand.intRangeAtMost(usize, 0, sweep.max_start);
         var aggs: std.ArrayList(SlabAgg) = .empty;
         defer aggs.deinit(gpa);
         for (0..n0) |_| {
@@ -2470,7 +2793,7 @@ test "mixed splices keep the tree equal to a linear reference" {
         defer tree.deinit();
 
         var step: usize = 0;
-        while (step < 150) : (step += 1) {
+        while (step < sweep.steps) : (step += 1) {
             const len = aggs.items.len;
             const op = rand.intRangeAtMost(usize, 0, 11);
             switch (op) {
@@ -2544,7 +2867,7 @@ test "mixed splices keep the tree equal to a linear reference" {
             }
 
             try testing.expectEqual(aggs.items.len, tree.len());
-            try expectSound(&tree);
+            if (comptime gated) try tree.assertSound() else try expectSound(&tree);
             try testing.expect(SlabAgg.Aggregate.eql(tree.rootAgg(), referenceRoot(aggs.items)));
 
             const total_items: usize = blk: {
@@ -2593,6 +2916,23 @@ test "mixed splices keep the tree equal to a linear reference" {
             }
         }
     }
+}
+
+test "the deep structural sweep holds the tree sound at every mutation" {
+    // **Skipped without `-Dslow-path`**, and that skip is the price stated
+    // the other way round: this is upstream's own deep fuzz
+    // (`btree.rs:2358-2450`), twenty-five trials of three hundred steps over
+    // 200 to 1500 slabs, which is what `rust/hexane/CHANGELOG.md:45-46` means
+    // when it says the feature was added "so that slow path assertions can
+    // be disabled by default". `zig build slow-path` runs it; `zig build
+    // test` skips it and reports the skip rather than passing quietly.
+    if (!build_options.check_slow_paths) return error.SkipZigTest;
+    try mixedSpliceSweep(testing.allocator, .{
+        .seed = 0xB7EE5,
+        .trials = 25,
+        .steps = 300,
+        .max_start = 1300,
+    }, true);
 }
 
 test "Splice is rejected for an out-of-range position" {
@@ -2679,4 +3019,239 @@ test "the tree is generic over the per-slab weight" {
     try testing.expectEqual(total_len, tree.rootAgg().len);
     try testing.expectEqual(total_prefix, tree.rootAgg().prefix);
     try testing.expectEqual(total_len, tree.itemsBeforeSlab(weights.items.len));
+}
+
+// ── The differential corpus ──────────────────────────────────────────────────
+
+const corpus = @import("codec_golden.zig");
+
+/// The cases the corpus carries for the delta column's index.
+///
+/// `page_plus_one` and `two_pages` are the ones a branch factor of 64
+/// (`btree.rs:194-197`) makes interesting: 65 slabs is a root with one child
+/// that has to split, and 129 is two levels. `all_equal_100` and
+/// `all_zero_100` are the shapes where every delta after the first is zero,
+/// so a slab's `min_offset` equals its `max_offset` and the range test is as
+/// tight as it gets; `ascending_200` and `descending_200` are the two
+/// one-sided shapes a prefix sum can take.
+const btree_boundary_cases = [_][]const u8{
+    "empty",
+    "one",
+    "all_equal_100",
+    "all_zero_100",
+    "ascending_200",
+    "descending_200",
+    "page_plus_one",
+    "page_plus_one_descending",
+    "page_plus_one_constant",
+    "two_pages",
+    "random_0",
+    "random_6",
+    "random_11",
+};
+
+/// The slab partitions one case is checked under: everything in one slab,
+/// one slab per value, three values per slab, and forty.
+///
+/// **Four, and not one.** Which items a range query returns does not depend
+/// on how the column is cut, so every partition has to give the same answer
+/// as the reference — and a tree that only ever holds one slab never
+/// descends at all.
+const partitions = [_]usize{ 0, 1, 3, 40 };
+
+/// A partition of one case's values into slabs, with the tree over it.
+const Partition = struct {
+    gpa: std.mem.Allocator,
+    /// One aggregate per slab, in the order the reference would build them.
+    aggs: std.ArrayList(SlabAgg),
+    /// How many items each slab holds.
+    lens: std.ArrayList(usize),
+    tree: SlabBTree,
+
+    fn deinit(self: *Partition) void {
+        self.tree.deinit();
+        self.aggs.deinit(self.gpa);
+        self.lens.deinit(self.gpa);
+    }
+};
+
+/// The prefix sum before item `at`, which is the realized value there: a
+/// delta stream's first delta is measured from zero, so the prefix before
+/// item zero is zero (`delta/mod.rs:428-443`).
+fn prefixBefore(values: []const i64, at: usize) i64 {
+    if (at == 0) return 0;
+    return values[at - 1];
+}
+
+/// Cuts `values` into slabs of `chunk` items — one slab for the whole column
+/// when `chunk` is zero — and builds the tree over their aggregates.
+///
+/// **The aggregate is the reference's, not this port's.** The reference
+/// computes it from the slab's own deltas, tracking the smallest and largest
+/// prefix offset any *run boundary* reaches
+/// (`delta/indexed.rs:100-137`); for a column of realized values that is the
+/// smallest and largest value in the slab, measured from the prefix before
+/// it. A run of equal values puts its boundaries at the same realized value,
+/// and an arithmetic run spans the whole progression, so the endpoints are
+/// the extremes either way. The port computes the same number over its own
+/// slabs in `column.zig`; this builds it directly so the tree is tested
+/// against the reference's answers rather than against its own.
+fn buildPartition(
+    gpa: std.mem.Allocator,
+    values: []const i64,
+    chunk: usize,
+) !Partition {
+    var p: Partition = .{
+        .gpa = gpa,
+        .aggs = .empty,
+        .lens = .empty,
+        .tree = undefined,
+    };
+    errdefer {
+        p.aggs.deinit(gpa);
+        p.lens.deinit(gpa);
+    }
+    var at: usize = 0;
+    while (at < values.len) {
+        const end = if (chunk == 0) values.len else @min(at + chunk, values.len);
+        const before = prefixBefore(values, at);
+        var lo: i64 = std.math.maxInt(i64);
+        var hi: i64 = std.math.minInt(i64);
+        for (values[at..end]) |v| {
+            lo = @min(lo, std.math.sub(i64, v, before) catch return error.CorpusValueTooLarge);
+            hi = @max(hi, std.math.sub(i64, v, before) catch return error.CorpusValueTooLarge);
+        }
+        const last = values[end - 1];
+        try p.aggs.append(gpa, .{
+            .len = end - at,
+            .total = std.math.sub(i64, last, before) catch return error.CorpusValueTooLarge,
+            .min_offset = lo,
+            .max_offset = hi,
+        });
+        try p.lens.append(gpa, end - at);
+        at = end;
+    }
+    p.tree = try SlabBTree.fromSlice(gpa, p.aggs.items);
+    return p;
+}
+
+/// Compares one list of item indices with the reference's, naming the first
+/// that differs.
+fn expectSameItems(rec: corpus.Record, lo_text: []const u8, hi_text: []const u8, want: []const usize, got: []const usize, chunk: usize) !void {
+    if (std.mem.eql(usize, want, got)) return;
+    const n = @min(want.len, got.len);
+    var at: usize = 0;
+    while (at < n and want[at] == got[at]) : (at += 1) {}
+    std.debug.print(
+        \\
+        \\--- btree query mismatch ----------------------------------------------
+        \\  case       {s}
+        \\  seed       {s}
+        \\  range      [{s}, {s})
+        \\  partition  {d} items per slab
+        \\  reference  {d} items, this port {d}
+        \\  first difference at index {d}: reference {d}, this port {d}
+        \\
+    , .{ rec.case, rec.seed, lo_text, hi_text, chunk, want.len, got.len, at, want[at], got[at] });
+    return error.BtreeQueryMismatch;
+}
+
+/// Holds the tree's value-range search against the reference's
+/// `find_by_range` for every range of one case, under one partition.
+fn expectQueries(
+    gpa: std.mem.Allocator,
+    rec: corpus.Record,
+    values: []const i64,
+    chunk: usize,
+    p: *const Partition,
+) !void {
+    const queries = rec.queries orelse return error.CorpusRecordMissing;
+    for (queries) |q| {
+        const lo = std.math.cast(i64, std.fmt.parseInt(i128, q.lo, 10) catch return error.CorpusValueTooLarge) orelse return error.CorpusValueTooLarge;
+        const hi = std.math.cast(i64, std.fmt.parseInt(i128, q.hi, 10) catch return error.CorpusValueTooLarge) orelse return error.CorpusValueTooLarge;
+        // The reference's range is half open and its own walk takes the
+        // closed form one below the upper bound
+        // (`delta/indexed.rs:151-154`, `:180-186`).
+        var walk = try FindByValueRange.init(&p.tree, lo, hi -% 1);
+        defer walk.deinit();
+        var got: std.ArrayList(usize) = .empty;
+        defer got.deinit(gpa);
+        while (walk.next()) |hit| {
+            if (hit.slab >= p.lens.items.len) return error.BtreeHitOutOfRange;
+            // A hit names a slab, not an item, so the items are the slab's
+            // and the ones in range among them are the answer.
+            const from = hit.items_before;
+            const to = from + p.lens.items[hit.slab];
+            if (to > values.len or from > to) return error.BtreeHitOutOfRange;
+            for (from..to) |i| {
+                if (values[i] >= lo and values[i] < hi) try got.append(gpa, i);
+            }
+        }
+        try expectSameItems(rec, q.lo, q.hi, q.items, got.items, chunk);
+    }
+}
+
+/// Holds `findSlabAtItem` against the values themselves: every item has to
+/// land in the slab the partition puts it in, with that slab's prefix sum
+/// and item count.
+fn expectItemLookup(rec: corpus.Record, values: []const i64, p: *const Partition) !void {
+    for (0..values.len) |i| {
+        const hit = findSlabAtItem(&p.tree, i);
+        if (hit.index >= p.lens.items.len or
+            hit.items_before > i or
+            i >= hit.items_before + p.lens.items[hit.index] or
+            hit.prefix != prefixBefore(values, hit.items_before))
+        {
+            std.debug.print(
+                \\
+                \\--- btree item lookup mismatch -------------------------------------
+                \\  case       {s}
+                \\  seed       {s}
+                \\  item       {d} of {d}
+                \\  this port  slab {d} of {d}, items before {d}, sum before {d}
+                \\  the slab holding it holds items {d}..{d}, and the sum before them is {d}
+                \\
+            , .{ rec.case, rec.seed, i, values.len, hit.index, p.lens.items.len, hit.items_before, hit.prefix, hit.items_before, hit.items_before + p.lens.items[hit.index], prefixBefore(values, hit.items_before) });
+            return error.BtreeItemLookupMismatch;
+        }
+    }
+}
+
+/// One golden case, under every partition.
+fn btreeCase(rec: corpus.Record, gpa: std.mem.Allocator) !void {
+    if (!std.mem.eql(u8, rec.codec, "btree-i64")) return error.CorpusCodecUnknown;
+    const values = try corpus.expandValues(gpa, rec);
+    defer gpa.free(values);
+    for (partitions) |chunk| {
+        var p = try buildPartition(gpa, values, chunk);
+        defer p.deinit();
+        try expectQueries(gpa, rec, values, chunk, &p);
+        try expectItemLookup(rec, values, &p);
+    }
+}
+
+test "the tree answers the reference's range queries for every golden case" {
+    const gpa = testing.allocator;
+    var names = corpus.Names.init(gpa);
+    defer names.deinit();
+
+    // The btree records are their own kind rather than a `codec` record, so
+    // the count is checked by hand and the family is walked by the body
+    // rather than by `eachCase`.
+    const text = try corpus.readGolden(gpa);
+    defer gpa.free(text);
+    var cases: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(corpus.Record, gpa, line, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const rec = parsed.value;
+        if (!std.mem.eql(u8, rec.kind, "codec-btree")) continue;
+        cases += 1;
+        try names.add(rec.case);
+        try btreeCase(rec, gpa);
+    }
+    try testing.expectEqual(@as(usize, 22), cases);
+    try names.expectRequired(&btree_boundary_cases);
 }

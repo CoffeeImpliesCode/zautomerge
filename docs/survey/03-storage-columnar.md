@@ -61,13 +61,14 @@ claim below is read out of the source.
 | `rust/automerge/src/columnar/column_range/rle.rs` | 216 |
 | `rust/automerge/src/columnar/column_range/value.rs` | 547 |
 
-Total: 8 372 lines.
+Total: 10 210 lines by this table's own 47 rows (`wc -l`, 2026-10-01). The
+"8 372" never matched the table above it.
 
 ### Read for context only (outside the slice, cited where it defines slice-visible bytes)
 
 * `rust/automerge/src/automerge.rs` (2 361 lines) — public save/load entry points, `LoadOptions`,
   `SaveOptions`, `OnPartialLoad`, `StringMigration`.
-* `rust/automerge/src/lib.rs` (334) — module visibility, re-exports.
+* `rust/automerge/src/lib.rs` (333) — module visibility, re-exports.
 * `rust/automerge/src/change.rs` (428) — public `Change`, author footer, `CompressionState`.
 * `rust/automerge/src/change_graph.rs` — document-chunk change column set (`ids` module at
   `change_graph.rs:1780-1798`, `ChangeGraph::encode` at `:236-273`, `validate` at `:274-293`).

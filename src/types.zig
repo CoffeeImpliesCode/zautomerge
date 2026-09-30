@@ -94,9 +94,29 @@ pub const ActorId = struct {
         return .{ .bytes = try gpa.dupe(u8, bytes) };
     }
 
+    /// Sixteen distinct bytes copied into `gpa`.
+    ///
+    /// Upstream fills a `TinyVec` from the `getrandom` crate
+    /// ([`types.rs:63-68`](../../github-automerge-automerge/rust/automerge/src/types.rs)).
+    /// **Zig 0.16 has no source of randomness in `std`** — `std.crypto.random`
+    /// is gone and every clock is behind `std.Io`, which an identifier
+    /// generator has no business owning — so this is a `DefaultPrng` stepped by
+    /// a process-wide atomic counter.
+    ///
+    /// That is a weaker promise than upstream's, and deliberately so: an actor
+    /// id has to be **unique within a document** and never has to be
+    /// unguessable, and the counter is unique for the life of the process,
+    /// which is what [`Document.fork`](doc.zig) and
+    /// [`Document.setAuthor`](doc.zig) need. **A caller that needs
+    /// unguessable ids should draw them itself** and hand the bytes to
+    /// [`ActorId.initCopy`].
     pub fn random(gpa: std.mem.Allocator) !ActorId {
         const bytes = try gpa.alloc(u8, 16);
-        std.crypto.random.bytes(bytes);
+        errdefer gpa.free(bytes);
+        var prng = std.Random.DefaultPrng.init(
+            actor_random_counter.fetchAdd(0x9e37_79b9_7f4a_7c15, .monotonic),
+        );
+        prng.random().bytes(bytes);
         return .{ .bytes = bytes };
     }
 
@@ -129,10 +149,15 @@ pub const ActorId = struct {
     /// actor id is longer than the original, which is why the magic bytes are
     /// 0x13 0xb2 0x23 0x09 and not arbitrary.
     pub fn withConcurrency(gpa: std.mem.Allocator, self: ActorId, level: usize) !ActorId {
-        const leb = try @import("leb128.zig").unsignedSize(level);
+        // `unsignedSize` is a size, not a fallible call: it returns the width
+        // the value's LEB128 encoding needs and cannot fail
+        // (`parse/leb128.rs:15-40`, reached through `leb128::unsignedSize`).
+        const leb = @import("leb128.zig").unsignedSize(level);
         const out = try gpa.alloc(u8, 4 + leb + self.bytes.len);
         @memcpy(out[0..4], &concurrency_magic_bytes);
-        const n = try @import("leb128.zig").writeUnsigned(out[4..], level);
+        // `writeUnsigned` writes and reports how many bytes it used; it cannot
+        // fail, and its return is the width `unsignedSize` promised above.
+        const n = @import("leb128.zig").writeUnsigned(out[4..], level);
         @memcpy(out[4 + n ..], self.bytes);
         return .{ .bytes = out };
     }
@@ -141,15 +166,20 @@ pub const ActorId = struct {
 /// Random bytes prefixed to a concurrency-derived actor id.
 pub const concurrency_magic_bytes = [4]u8{ 0x13, 0xb2, 0x23, 0x09 };
 
+/// The process-wide counter [`ActorId.random`] steps. Container scope, because
+/// Zig has no function-local statics, and private because nothing else has any
+/// business advancing it.
+var actor_random_counter: std.atomic.Value(u64) = .init(0x9e37_79b9_7f4a_7c15);
+
 /// An operation id: a per-actor counter plus the actor index.
 pub const OpId = struct {
     counter: u32,
     actor: ActorIdx,
 
+    /// The root object (`ROOT`, `types.rs:30`). Not the head of a sequence:
+    /// that is an [`ElemId`], and the two are different values that happen to
+    /// share this id (`HEAD`, `types.rs:29`).
     pub const root: OpId = .{ .counter = 0, .actor = 0 };
-    /// The head of a sequence: the element id that means "inserted at the
-    /// front".
-    pub const head: OpId = root;
 
     pub fn init(counter: u32, actor: ActorIdx) OpId {
         return .{ .counter = counter, .actor = actor };
@@ -191,15 +221,77 @@ pub const OpId = struct {
         return self;
     }
 
+    /// The id with its actor index replaced by `actor_map`'s entry for it
+    /// (`OpId::map`, `types.rs:467-471`).
+    ///
+    /// An index the map does not cover is `error.InvalidActorIndex`, which is
+    /// upstream's `AutomergeError::InvalidActorIndex` (`types.rs:469`). The
+    /// mapped value has to fit an `ActorIdx`, which upstream does not check —
+    /// it writes `actor as u32` (`types.rs:470`) — because a truncated index
+    /// would name a different actor for every op the document holds.
+    pub fn map(self: OpId, actor_map: []const usize) MapError!OpId {
+        if (self.actor >= actor_map.len) return error.InvalidActorIndex;
+        const actor = actor_map[self.actor];
+        if (actor > std.math.maxInt(ActorIdx)) return error.Overflow;
+        return .{ .counter = self.counter, .actor = @intCast(actor) };
+    }
+
     pub fn toU64(self: OpId) u64 {
         return (@as(u64, self.counter) << 32) | self.actor;
     }
 };
 
-/// An object id: either the document root or an operation id.
+/// An object id: the document root, or an operation id — and, for an id a
+/// document hands out, **the same operation id plus the actor's bytes**.
+///
+/// **The third field is the whole point, and it is upstream's.** Upstream's
+/// `ExId` is `Root` or `Id(u64, ActorId, usize)` — counter, actor *bytes*,
+/// actor *index* ([`exid.rs:15-18`](../../github-automerge-automerge/rust/automerge/src/exid.rs)) —
+/// and it carries the bytes because an interned actor can **move**: the table
+/// is sorted, and interning an actor that sorts before the others renumbers
+/// every index at or above it
+/// ([`op_set.rs:1400-1405`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)).
+/// Upstream therefore *re-resolves* the index on every use
+/// ([`Automerge::exid_to_opid`, `automerge.rs:744-758`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)):
+/// the recorded index if the table still holds that actor there, and
+/// `lookup_actor` if it does not.
+///
+/// **Without the bytes an `ExId` a caller is still holding names nothing after
+/// such a move**, and the caller cannot repair it — the information is gone.
+/// The one operation that moves the table is `isolate`, which forks a
+/// concurrency actor whose magic bytes are `0x13 0xb2 0x23 0x09`
+/// ([`types.rs:23`](../../github-automerge-automerge/rust/automerge/src/types.rs))
+/// and so sort before most real actors: the fork lands at the front of the
+/// table and shifts everything.
+///
+/// **Identity is the [`OpId`] alone, in both shapes.** The actor is a repair
+/// hint, never part of what the id *is*, so a `.named` and an `.id` naming the
+/// same operation are the same value to [`ExId.eql`], [`ExId.order`] and every
+/// hash map keyed by an `ExId`. That is what keeps this addition from reaching
+/// the op set, whose own tables are keyed by [`OpId`] directly
+/// ([`ObjIndex.objectType`](opset/index.zig)).
 pub const ExId = union(enum) {
     id: OpId,
+    /// Upstream's `ExId::Id` (`exid.rs:17`): the operation and the actor's
+    /// bytes, with the index the actor had folded into the operation.
+    named: Named,
     root,
+
+    pub const Named = struct {
+        op: OpId,
+        /// Borrows the actor's bytes from the document that minted the id, the
+        /// way every [`ActorId`] in the port does. Upstream's `ExId` owns a
+        /// clone (`op_set.rs:1057-1059`); the borrow is valid as long as the
+        /// document is, because the actor table's bytes live in the document's
+        /// arena for its whole life.
+        actor: ActorId,
+    };
+
+    /// Upstream's `ExId::Id(counter, actor, actor_index)`
+    /// (`op_set.rs:1057-1059`).
+    pub fn withActor(op: OpId, who: ActorId) ExId {
+        return .{ .named = .{ .op = op, .actor = who } };
+    }
 
     pub fn fromParts(ctr: ?u64, act: ?ActorIdx) ?ExId {
         if (ctr == null and act == null) return .root;
@@ -218,6 +310,7 @@ pub const ExId = union(enum) {
         return switch (self) {
             .root => null,
             .id => |i| i,
+            .named => |n| n.op,
         };
     }
 
@@ -229,14 +322,23 @@ pub const ExId = union(enum) {
         return if (self.opId()) |i| i.actor else null;
     }
 
-    pub fn eql(a: ExId, b: ExId) bool {
-        return switch (a) {
-            .root => b == .root,
-            .id => |x| switch (b) {
-                .root => false,
-                .id => |y| x.eql(y),
-            },
+    /// The actor's bytes, or null when this id does not carry them.
+    ///
+    /// **The one thing that decides whether an id can be re-resolved**, and
+    /// why it is an accessor rather than a field: an id from
+    /// [`ExId.fromParts`] or straight off a row carries an index and no way to
+    /// check it.
+    pub fn actorBytes(self: ExId) ?ActorId {
+        return switch (self) {
+            .root, .id => null,
+            .named => |n| n.actor,
         };
+    }
+
+    pub fn eql(a: ExId, b: ExId) bool {
+        const ai = a.opId() orelse return b == .root;
+        const bi = b.opId() orelse return false;
+        return ai.eql(bi);
     }
 
     pub fn order(a: ExId, b: ExId) std.math.Order {
@@ -248,17 +350,145 @@ pub const ExId = union(enum) {
     pub fn withoutActor(self: ExId, idx: ActorIdx) ?ExId {
         const i = self.opId() orelse return self;
         const n = i.withoutActor(idx) orelse return null;
-        return .{ .id = n };
+        return switch (self) {
+            .named => |v| withActor(n, v.actor),
+            else => .{ .id = n },
+        };
     }
 
+    /// `OpId::with_new_actor` (`types.rs:447-451`) shifts the **index**; the
+    /// bytes it names are the same actor either way, so they ride along.
     pub fn withNewActor(self: ExId, idx: ActorIdx) ExId {
         const i = self.opId() orelse return self;
-        return .{ .id = i.withNewActor(idx) };
+        const n = i.withNewActor(idx);
+        return switch (self) {
+            .named => |v| withActor(n, v.actor),
+            else => .{ .id = n },
+        };
     }
 };
 
-/// The element id a sequence op is anchored to. `_head` is `OpId{0, 0}`.
-pub const ElemId = OpId;
+/// The element a sequence row is anchored to (`ElemId`, `types.rs:652-683`).
+///
+/// This is a wrapper over an [`OpId`] for exactly one reason: **the head**. The
+/// head is `OpId{0, 0}` (`HEAD`, `types.rs:29`), and a counter of zero is not
+/// an operation — an actor's first op has counter one (`types.rs:423`) — so
+/// that value means "the front of the sequence" instead of naming an element.
+/// A sequence row therefore has two shapes, and they differ in the actor column
+/// alone:
+///
+/// | anchor | `key_actor` | `key_ctr` |
+/// | --- | --- | --- |
+/// | a normal element | the element's actor | the element's counter |
+/// | the head | absent | zero |
+///
+/// Which is [`actor`] and [`icounter`], upstream's two answers, which
+/// deliberately do not agree with each other (`types.rs:663-674`,
+/// `op_set2/types.rs:616-628`). The encoder appends exactly those two
+/// (`op_set2/change/collector.rs:406-407`) and the reader reads exactly those
+/// two back (`op_set2/op_set/op_iter.rs:239-247`). `(absent, absent)` is the
+/// third shape and it is a **map key**, not a head — which is why the counter
+/// of a head anchor is a zero and not a null.
+///
+/// **`id` is the payload and the accessors below are the surface.** Zig has no
+/// field privacy, so a caller *can* reach `id` and nothing stops it; reaching
+/// for it is what loses the head, and `actor()` is the answer that keeps it.
+pub const ElemId = struct {
+    /// The operation that made the element. The head is `OpId{0, 0}`
+    /// (`types.rs:680-682`).
+    id: OpId,
+
+    /// The head of a sequence (`ElemId::head`, `types.rs:680-682`), which is
+    /// the constant `HEAD` (`types.rs:29`). This is what a row inserting at
+    /// the front of a list hangs by (`op_set2/op_set.rs:1984`).
+    pub fn head() ElemId {
+        return .{ .id = OpId.root };
+    }
+
+    /// The element an operation made (`ElemId(opid)`, `types.rs:653`).
+    ///
+    /// Upstream's field is `pub(crate)` (`types.rs:653`), so in-crate code
+    /// writes the wrapper directly wherever it has an `OpId`: an insert's
+    /// register is its own id (`op_set2/op.rs:1042`, `:1075`). This is the
+    /// same construction, and it is total — `fromOpId(OpId{0, 0})` *is* the
+    /// head, because upstream's `is_head` is `*self == HEAD` (`types.rs:676-678`)
+    /// and so there is no "almost head" for this to lose.
+    pub fn fromOpId(id: OpId) ElemId {
+        return .{ .id = id };
+    }
+
+    /// Whether this is the head rather than an element (`ElemId::is_head`,
+    /// `types.rs:676-678`).
+    pub fn isHead(self: ElemId) bool {
+        return self.id.eql(OpId.root);
+    }
+
+    /// The actor that made the element, or null for the head
+    /// (`ElemId::actor`, `types.rs:668-674`).
+    pub fn actor(self: ElemId) ?ActorIdx {
+        if (self.isHead()) return null;
+        return self.id.actor;
+    }
+
+    /// The counter the element was made at, zero for the head
+    /// (`ElemId::icounter`, `types.rs:663-666`).
+    ///
+    /// There is no head case here, unlike [`actor`]: the head's counter is a
+    /// `Some(0)` on the wire and `KeyRef::icounter` wraps this in a `Some`
+    /// without asking (`op_set2/types.rs:623-628`).
+    pub fn icounter(self: ElemId) i64 {
+        return @intCast(self.id.counter);
+    }
+
+    /// The element with its actor index remapped, and the head unchanged
+    /// (`ElemId::map`, `types.rs:656-662`).
+    ///
+    /// The head returns before the map is consulted, so an actor map with no
+    /// entry for index zero still maps a head — upstream `:657-659`.
+    pub fn map(self: ElemId, actor_map: []const usize) MapError!ElemId {
+        if (self.isHead()) return self;
+        return .{ .id = try self.id.map(actor_map) };
+    }
+
+    /// Upstream derives `PartialEq` (`types.rs:652`); the field is a plain
+    /// struct, so the comparison is `OpId`'s.
+    pub fn eql(a: ElemId, b: ElemId) bool {
+        return a.id.eql(b.id);
+    }
+
+    /// Upstream derives `Ord` over the single `OpId` field (`types.rs:652`), so
+    /// this is `OpId`'s order and nothing else: counter first, then actor
+    /// (`types.rs:440-444`).
+    ///
+    /// The head is therefore the **minimum**, because no counter is below
+    /// zero, and that is what makes "anchored at the head" the first position
+    /// in a list rather than an unordered special case. Rule R4 depends on it:
+    /// an insert is legal in a register iff it is anchored to the previous
+    /// element *or* its own id sorts before the register's anchor
+    /// (`op_set2/op.rs:1061-1063`), and with the head as the minimum an insert
+    /// anchored at the head sits in front of every other register.
+    pub fn compare(a: ElemId, b: ElemId) std.math.Order {
+        return a.id.order(b.id);
+    }
+
+    pub fn lessThan(_: void, a: ElemId, b: ElemId) bool {
+        return a.compare(b) == .lt;
+    }
+};
+
+/// What an actor remap refuses (`OpId::map`, `types.rs:467-471`).
+///
+/// Upstream returns `AutomergeError::InvalidActorIndex(self.actor())`
+/// (`types.rs:469`) and then writes `actor as u32` (`types.rs:470`), which
+/// truncates. The port refuses the truncation as well; see [`OpId.map`].
+pub const MapError = error{
+    /// The actor map has no entry for the id's actor index
+    /// (`types.rs:469`).
+    InvalidActorIndex,
+    /// The map's entry does not fit an actor index (`types.rs:470`, which does
+    /// not check).
+    Overflow,
+};
 
 /// What kind of object an id names.
 pub const ObjType = enum {
@@ -377,6 +607,70 @@ test "OpId orders by counter then actor" {
     try std.testing.expect(OpId.init(2, 0).order(OpId.init(1, 9)) == .gt);
     try std.testing.expect(OpId.init(1, 0).order(OpId.init(1, 1)) == .lt);
     try std.testing.expect(OpId.init(1, 1).order(OpId.init(1, 1)) == .eq);
+}
+
+test "ElemId's head has no actor, and a normal element has one" {
+    // The head is `OpId{0, 0}` (`types.rs:680-682`) and answers null for the
+    // actor (`types.rs:668-674`), which is what makes a head anchor's actor
+    // column absent.
+    try std.testing.expectEqual(@as(?ActorIdx, null), ElemId.head().actor());
+    // Its counter is *not* null: `icounter` has no head case
+    // (`types.rs:663-666`), and the reader's head arm is `(Some(0), None)`
+    // (`op_set2/op_set/op_iter.rs:240-242`).
+    try std.testing.expectEqual(@as(i64, 0), ElemId.head().icounter());
+
+    const one = ElemId.fromOpId(OpId.init(4, 2));
+    try std.testing.expectEqual(@as(?ActorIdx, 2), one.actor());
+    try std.testing.expectEqual(@as(i64, 4), one.icounter());
+
+    // Only the head answers that way, and an element whose actor happens to be
+    // zero is still an element.
+    try std.testing.expect(ElemId.head().isHead());
+    try std.testing.expect(!one.isHead());
+    try std.testing.expect(!ElemId.fromOpId(OpId.init(1, 0)).isHead());
+    try std.testing.expectEqual(@as(?ActorIdx, 0), ElemId.fromOpId(OpId.init(1, 0)).actor());
+    // `fromOpId` cannot build an "almost head": upstream's `is_head` is
+    // `*self == HEAD` (`types.rs:676-678`), so the one value it recognises is
+    // the head, and there is nothing between the two.
+    try std.testing.expect(ElemId.fromOpId(OpId.root).isHead());
+    try std.testing.expectEqual(@as(?ActorIdx, null), ElemId.fromOpId(OpId.root).actor());
+}
+
+test "ElemId's order is the OpId order, which makes the head the minimum" {
+    // `Ord` is derived over the single field (`types.rs:652`), and `OpId`'s is
+    // counter then actor (`types.rs:440-444`).
+    try std.testing.expectEqual(.lt, ElemId.head().compare(ElemId.fromOpId(OpId.init(1, 0))));
+    try std.testing.expectEqual(.gt, ElemId.fromOpId(OpId.init(1, 0)).compare(ElemId.head()));
+    try std.testing.expectEqual(.eq, ElemId.head().compare(ElemId.head()));
+    // Nothing sorts below a counter of zero, so the head is below every
+    // element whatever its actor is — which is what makes "anchored at the
+    // head" the first position in a list rather than an unordered case
+    // (`op_set2/op.rs:1061-1063`).
+    try std.testing.expectEqual(.lt, ElemId.head().compare(ElemId.fromOpId(OpId.init(0, 9))));
+    const biggest = ElemId.fromOpId(OpId.init(std.math.maxInt(u32), 9));
+    try std.testing.expect(ElemId.lessThan({}, ElemId.head(), biggest));
+}
+
+test "ElemId's map leaves the head alone and remaps an element" {
+    // The head returns before the map is read (`types.rs:656-659`), so an empty
+    // map — which covers no actor index at all — still maps it.
+    const none: []const usize = &.{};
+    try std.testing.expect((try ElemId.head().map(none)).isHead());
+    try std.testing.expectEqual(@as(?ActorIdx, null), (try ElemId.head().map(none)).actor());
+
+    const map = [_]usize{ 7, 8, 9 };
+    const moved = try ElemId.fromOpId(OpId.init(4, 2)).map(&map);
+    try std.testing.expectEqual(@as(ActorIdx, 9), moved.actor().?);
+    try std.testing.expectEqual(@as(i64, 4), moved.icounter());
+    try std.testing.expect(moved.eql(ElemId.fromOpId(OpId.init(4, 9))));
+    // An element whose actor the map does not cover is upstream's
+    // `InvalidActorIndex` (`types.rs:469`).
+    try std.testing.expectError(error.InvalidActorIndex, ElemId.fromOpId(OpId.init(4, 3)).map(&map));
+    // Upstream writes the mapped value with `as u32` (`types.rs:470`) and
+    // truncates it. A truncated actor index would rename this element's
+    // author for every column that names it, so the port refuses instead.
+    const wide = [_]usize{std.math.maxInt(ActorIdx) + 1};
+    try std.testing.expectError(error.Overflow, ElemId.fromOpId(OpId.init(4, 0)).map(&wide));
 }
 
 test "ExId root and remapping" {

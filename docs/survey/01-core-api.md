@@ -21,7 +21,7 @@ Primary target files, read in full:
 | `convert.rs` | 112 |
 | `author.rs` | 580 |
 | `decoding.rs` | 475 |
-| `Cargo.toml` | 51 |
+| `Cargo.toml` | 56 |
 
 Read for the trait/impl surface the assigned files depend on (signature-level):
 
@@ -350,8 +350,31 @@ The variant has **no field names**. Three call sites bind them as
 * `ExId::to_internal_obj`: `ExId::Id(ctr, _, actor) => ObjId(OpId::new(*ctr, *actor))`
   (`exid.rs:70-75`) — internal `OpId.counter = field 0`, `OpId.actor index = field 2`.
 * `Display`: `ExId::Id(ctr, actor, _) => write!(f, "{}@{}", ctr, actor)` (`exid.rs:139-144`).
-* `Automerge::exid_to_opid`: `ExId::Id(ctr, actor, idx) => OpId::new(*ctr, *idx)`
-  (`automerge.rs:744-757`).
+* `Automerge::exid_to_opid`: `ExId::Id(ctr, actor, idx)` is **not**
+  `OpId::new(*ctr, *idx)`. It re-resolves the index
+  (`automerge.rs:744-758`):
+
+  ```rust
+  let opid = if self.ops.get_actor_safe(*idx) == Some(actor) {
+      OpId::new(*ctr, *idx)
+  } else if let Some(backup_idx) = self.ops.lookup_actor(actor) {
+      OpId::new(*ctr, backup_idx)
+  } else {
+      return Err(AutomergeError::InvalidObjId(id.to_string()));
+  };
+  ```
+
+  **This is the whole reason `ExId` carries the actor at all.** The actor
+  table is sorted, so `OpSet::insert_actor` renumbers every index at or above
+  the slot it fills (`op_set2/op_set.rs:1400-1405`), and the only operation
+  that fills a slot in the middle is `isolate`, which interns a concurrency
+  actor — magic bytes `0x13 0xb2 0x23 09` (`types.rs:23`), which sort before
+  most real actors (`Automerge::isolate_actor`, `automerge.rs:1259-1281`).
+  An `ExId` minted before that isolate names nothing after it unless the index
+  is repaired, and the actor bytes are the only thing that makes the repair
+  possible. Upstream's own `PartialEq` (`exid.rs:129-133`) likewise compares
+  `(counter, actor)` and **ignores the index**, which is the same statement
+  from the other side.
 * The producer, `OpSet::id_to_exid`:
   `ExId::Id(id.counter(), self.actors[id.actor()].clone(), id.actor())`
   (`op_set2/op_set.rs:1054-1059`) — confirms field 0 = counter, field 2 = actor index.
@@ -872,7 +895,7 @@ are empty** (`change.rs:395-403`).
 pub struct PatchLogMismatch;
 ```
 
-`AutomergeError` — 30 variants, each with an explicit `Display` string
+`AutomergeError` — **31** variants, each with an explicit `Display` string
 (`error.rs:13-79`):
 
 | Line | Variant | `Display` |
@@ -2025,7 +2048,8 @@ marked `[INFERENCE]`.
 
 * `Option<T>` → `?T`; `Option<&T>` → `?*const T`.
 * `Result<T, E>` → `T!E` when `E` is a plain enum, but **`AutomergeError` cannot be a
-  Zig error set**: 15 of its 30 variants carry payloads (`error.rs:13-79`) and Zig error
+  Zig error set**: 31 variants, of which **24** declare a payload
+  (`error.rs:13-79`; the "15" and the "30" here were both wrong) and Zig error
   sets are tag-only. Two workable shapes:
   1. Tag-only error set + out-parameter payload:
      `pub fn exidToOpId(self: *const Automerge, id: ExId, out: *OpId) Error!void`.

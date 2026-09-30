@@ -224,13 +224,17 @@ pub const OpType = union(enum) {
     pub const MarkBegin = struct {
         expand: bool,
         name: []const u8,
-        value: ?ScalarValue,
+        /// Never absent: a mark begin with no value of its own carries
+        /// `null_value` (`op_set2/types.rs:59-60`).
+        value: ScalarValue,
     };
 
+    /// A mark end carries the expand flag and nothing else. Upstream's
+    /// `MarkEnd(bool)` (`op_set2/types.rs:135`) has no name and no value,
+    /// because the end row's `mark_name` column is null and the name is read
+    /// back from the begin it closes.
     pub const MarkEnd = struct {
         expand: bool,
-        name: []const u8,
-        value: ?ScalarValue,
     };
 };
 
@@ -257,17 +261,15 @@ pub fn opTypeFromActionAndValue(
             .counter => |c| .{ .increment = c.current },
             else => error.InvalidValueType,
         },
-        .mark => blk: {
-            const name = mark_name orelse return error.InvalidValue;
-            switch (value) {
-                .null_value => break :blk .{
-                    .mark_begin = .{ .expand = expand, .name = name, .value = null },
-                },
-                else => break :blk .{
-                    .mark_begin = .{ .expand = expand, .name = name, .value = value },
-                },
-            }
-        },
+        // A mark row is a begin when its `mark_name` column holds a name and
+        // an end when that column is null, so the name alone decides which.
+        // The mark_name column is nullable (`op_set2/columns.rs:32`) and the
+        // op's mark name is passed straight through
+        // (`op_set2/op.rs:1015-1017`), so `null` is an end and not a
+        // corrupt document (`op_set2/types.rs:177-186`).
+        .mark => if (mark_name) |name| .{
+            .mark_begin = .{ .expand = expand, .name = name, .value = value },
+        } else .{ .mark_end = .{ .expand = expand } },
     };
 }
 
@@ -329,13 +331,22 @@ test "op type from action and value" {
         opTypeFromActionAndValue(.increment, .{ .str = "x" }, null, false),
     );
 
-    // A mark with no name is corrupt.
-    try std.testing.expectError(
-        error.InvalidValue,
-        opTypeFromActionAndValue(.mark, .null_value, null, false),
-    );
+    // A mark row with a name is a begin, and it carries the mark's value.
+    const begin = try opTypeFromActionAndValue(.mark, .{ .int = 1 }, "bold", true);
+    try std.testing.expectEqualStrings("bold", begin.mark_begin.name);
+    try std.testing.expect(begin.mark_begin.expand);
+    try std.testing.expect(begin.mark_begin.value.eql(.{ .int = 1 }));
 
-    const mark = try opTypeFromActionAndValue(.mark, .null_value, "bold", true);
-    try std.testing.expectEqualStrings("bold", mark.mark_begin.name);
-    try std.testing.expect(mark.mark_begin.expand);
+    // A mark begin with no value of its own is not an absent value; it
+    // carries null.
+    const bare = try opTypeFromActionAndValue(.mark, .null_value, "bold", false);
+    try std.testing.expect(bare.mark_begin.value == .null_value);
+    try std.testing.expect(!bare.mark_begin.expand);
+
+    // No name is a mark end, not a corrupt document: the mark_name column is
+    // nullable and an end row leaves it null
+    // (`op_set2/columns.rs:32`, `op_set2/types.rs:177-186`).
+    const end = try opTypeFromActionAndValue(.mark, .null_value, null, true);
+    try std.testing.expect(end == .mark_end);
+    try std.testing.expect(end.mark_end.expand);
 }

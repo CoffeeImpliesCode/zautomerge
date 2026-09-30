@@ -13,4 +13,10 @@ description = "Differential-testing oracle which drives the upstream automerge i
 # `vendor/automerge`. Nothing here is built by `zig build`; cargo is only
 # needed for `zig build conformance`.
 automerge = { path = "vendor/automerge" }
+# The column codecs themselves, for the `codec` subcommand: the RLE, boolean
+# and delta encoders, the prefix column, the slab metadata and the B-tree
+# behind the delta column's value queries. `automerge` already depends on
+# `hexane`, so this costs no new compilation, and it is a path dependency on
+# the same read-only checkout `vendor/automerge` resolves to.
+hexane = { path = "vendor/hexane" }
 serde_json = "1"

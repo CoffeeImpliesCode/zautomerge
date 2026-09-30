@@ -38,13 +38,13 @@
 //! layout).
 //!
 //! Which of the fourteen a change actually carries depends on its ops: the
-//! object columns are absent from an all-root change, and the value, expand,
+//! object columns are an empty range, and so absent, for an all-root change
+//! (`change_op_columns.rs:296-306`, dropped at `:183`), and the value, expand,
 //! mark-name and predecessor-value columns are omitted when empty
-//! (`change_op_columns.rs:332-365`). So the set is a vocabulary, not a
-//! template, and a reader must treat an absent column as absent rather than as
-//! an error. A column a change has never heard of is likewise not an error: the
-//! reader keeps it and the op decoder parks it
-//! (`change_op_columns.rs:536-539`).
+//! (`:332-365`). So the set is a vocabulary, not a template, and a reader must
+//! treat an absent column as absent rather than as an error. A column a change
+//! has never heard of is likewise not an error: the reader keeps it and the op
+//! decoder parks it in `other` (`:548-551`).
 //!
 //! ## Two rules the reader enforces
 //!
@@ -74,6 +74,7 @@ const std = @import("std");
 const err = @import("../error.zig");
 const types = @import("../types.zig");
 const leb128 = @import("../leb128.zig");
+const rle = @import("../hexane/rle.zig");
 const parse = @import("parse.zig");
 const column_spec = @import("column_spec.zig");
 const chunk = @import("chunk.zig");
@@ -99,43 +100,56 @@ const RawColumns = column_spec.RawColumns;
 /// `:496-547`. They are the two halves of the wire specification, so both are
 /// fixed for the life of the format.
 pub const OpColumn = enum(u8) {
-    /// The actor index of the object the op acts on. Ids 0 and 1 are `obj`
-    /// (`change_op_columns.rs:29-30`, `:496-497`).
+    /// The actor index of the object the op acts on. `OBJ_COL_ID` is 0
+    /// (`change_op_columns.rs:29`), and the decoder pairs it with
+    /// `ColumnType::Actor` (`:496`).
     obj_actor = 0,
-    /// The op counter of the object the op acts on, run-length encoded
-    /// (`:498`).
+    /// The op counter of the object the op acts on, run-length encoded: the
+    /// same id with `ColumnType::Integer` (`:497`).
     obj_counter = 1,
-    /// The actor half of the op's key, null for a string key (`:499`).
+    /// The actor half of the op's key, null for a string key.
+    /// `KEY_COL_ID` is 1 (`change_op_columns.rs:30`), paired with
+    /// `ColumnType::Actor` (`:498`).
     key_actor = 2,
-    /// The counter half of the op's key, delta-encoded (`:500`).
+    /// The counter half of the op's key, delta-encoded (`:499`).
     key_counter = 3,
-    /// The string half of the op's key, null for an object key (`:501`).
+    /// The string half of the op's key, null for an object key (`:500`).
     key_string = 4,
-    /// Whether the op inserts rather than overwrites (`:502`).
+    /// Whether the op inserts rather than overwrites. `INSERT_COL_ID` is 3
+    /// (`change_op_columns.rs:31`), paired with `ColumnType::Boolean` (`:501`).
     insert = 5,
-    /// The op's action, run-length encoded (`:503-504`).
+    /// The op's action, run-length encoded: an action is a code, not a
+    /// counter, so it is `ColumnType::Integer` and not a delta. `ACTION_COL_ID`
+    /// is 4 (`change_op_columns.rs:32`, `:502`).
     action = 6,
     /// The metadata word of the op's value, with the value's own type code and
-    /// length bookkeeping (`:505-508`).
+    /// length bookkeeping. `VAL_COL_ID` is 5 (`change_op_columns.rs:33`),
+    /// paired with `ColumnType::ValueMetadata` (`:503-508`).
     value_metadata = 7,
-    /// The op's value payload, read according to the sibling metadata column
-    /// (`:509-517`).
+    /// The op's value payload, read according to the sibling metadata column.
+    /// The writer emits it as the same id with `ColumnType::Value` (`:334`)
+    /// and only when the payload is not empty (`:332-337`); the decoder has no
+    /// arm for it and parks it as an unrecognised column (`:548-551`).
     value = 8,
     /// One count per op: how many predecessors that op has, as a group
-    /// column (`:518-522`).
+    /// column. `PRED_COL_ID` is 7 (`change_op_columns.rs:34`), paired with
+    /// `ColumnType::Group` (`:509-512`).
     pred_group = 9,
     /// The actor indices of the predecessors of every op, flattened across the
-    /// group, run-length encoded (`:523-527`).
+    /// group, run-length encoded: the actor half of the group member pair
+    /// (`:523-525`).
     pred_actor = 10,
     /// The counters of the predecessors of every op, flattened and
     /// delta-encoded, which is why the writer requires the predecessors of an
-    /// op in ascending order (`change_actors.rs:79-82`).
+    /// op in ascending order (`change_actors.rs:79-81`). The counter half of
+    /// the group member pair (`change_op_columns.rs:526-527`).
     pred_counter = 11,
-    /// Whether the op is an expanded mark, bit-packed
-    /// (`change_op_columns.rs:528-529`).
+    /// Whether the op is an expanded mark, bit-packed. `EXPAND_COL_ID` is 9
+    /// (`change_op_columns.rs:35`), paired with `ColumnType::Boolean` (`:546`).
     expand = 12,
-    /// The name of the mark the op creates, as a string column
-    /// (`:530-531`).
+    /// The name of the mark the op creates, as a string column.
+    /// `MARK_NAME_COL_ID` is 10 (`change_op_columns.rs:36`), paired with
+    /// `ColumnType::String` (`:547`).
     mark_name = 13,
 
     /// The column id, the low-order part of the specification above bit 3.
@@ -155,8 +169,8 @@ pub const OpColumn = enum(u8) {
     /// The wire specification, uncompressed, which is the only form a change
     /// chunk ever carries.
     pub fn spec(self: OpColumn) ColumnSpec {
-        const row = self.row();
-        return ColumnSpec.make(row.col_id, row.enc, false);
+        const op_row = self.row();
+        return ColumnSpec.make(op_row.col_id, op_row.enc, false);
     }
 
     /// The column's name, which is the name upstream gives the value it holds.
@@ -167,8 +181,8 @@ pub const OpColumn = enum(u8) {
     /// The column with this name, or null when no column of a change chunk
     /// carries it. Names are the enum tags, so a lookup is a compile-time
     /// string comparison rather than a scan of the table.
-    pub fn fromName(name: []const u8) ?OpColumn {
-        return std.meta.stringToEnum(OpColumn, name);
+    pub fn fromName(col_name: []const u8) ?OpColumn {
+        return std.meta.stringToEnum(OpColumn, col_name);
     }
 
     /// The operation column with this specification, or null when the block
@@ -182,10 +196,10 @@ pub const OpColumn = enum(u8) {
     /// column rather than a column in a particular storage form. A change chunk
     /// reader rejects a deflated column outright, so in practice the bit is
     /// always clear here.
-    pub fn fromSpec(spec: ColumnSpec) ?OpColumn {
-        const want = spec.normalize();
-        for (op_column_table) |row| {
-            if (ColumnSpec.make(row.col_id, row.enc, false).eql(want)) return row.tag;
+    pub fn fromSpec(col_spec: ColumnSpec) ?OpColumn {
+        const want = col_spec.normalize();
+        for (op_column_table) |entry| {
+            if (ColumnSpec.make(entry.col_id, entry.enc, false).eql(want)) return entry.tag;
         }
         return null;
     }
@@ -209,7 +223,7 @@ const TableRow = struct {
 ///
 /// The ids are upstream's eight `ColumnId` constants
 /// (`change_op_columns.rs:29-36`); the encodings are the `ColumnType` each is
-/// read and written with (`:496-531` and `:291-367`). Nothing here is
+/// read and written with (`:496-547` and `:291-367`). Nothing here is
 /// negotiable: the change hash is taken over these bytes, so moving a column
 /// or re-encoding it changes the hash and the change stops being the same
 /// change.
@@ -351,12 +365,41 @@ pub const ChangeChunk = struct {
         return self.ops.data;
     }
 
-    /// The op metadata block's own bytes: from the end of the header to the
-    /// start of the op data block. It is not a slice of the body, because the
-    /// body's bytes hold the data block immediately after the metadata; the
-    /// block is reproducible from the column set and the writer that wrote it.
-    pub fn opCount(self: ChangeChunk) usize {
-        return self.ops.len();
+    /// How many operations the change carries: the **row** count of the op
+    /// columns, which is the number upstream's `StoredChange::len()` reports
+    /// and the number `Change::max_op()` is derived from — `start_op + len - 1`
+    /// ([`change.rs:74-76`](../../github-automerge-automerge/rust/automerge/src/change.rs)).
+    ///
+    /// **Rows, not columns.** The two are not the same number and the
+    /// difference is not visible on a one-op change: a one-op change on the
+    /// root map carries five columns and one operation
+    /// ([`change_op_columns.rs:291-331`](../../github-automerge-automerge/rust/automerge/src/storage/change/change_op_columns.rs)),
+    /// so a reader that answers with `ops.len()` is right by accident for a
+    /// large op and wrong for every other one. Upstream cannot be wrong this
+    /// way: a `Change` counts its ops as they are decoded —
+    /// `stored.verify_ops(|_| len += 1)` ([`change.rs:34-35`](../../github-automerge-automerge/rust/automerge/src/change.rs)),
+    /// so `len` is a row count by construction — and `AMchangeSize` returns
+    /// exactly that ([`automerge-c/src/change.rs:294-299`](../../github-automerge-automerge/rust/automerge-c/src/change.rs)).
+    ///
+    /// The row count is the length of the **action column**, which every
+    /// written change carries ([`change_op_columns.rs:323-326`](../../github-automerge-automerge/rust/automerge/src/storage/change/change_op_columns.rs))
+    /// and which is what ends the op walk upstream —
+    /// `self.action.done()` ([`change_op_columns.rs:396-397`](../../github-automerge-automerge/rust/automerge/src/storage/change/change_op_columns.rs)).
+    /// It is run-length encoded, so the count walks the runs rather than the
+    /// values: a hostile column claiming `maxSlabLen` rows costs one pass over
+    /// its runs, not `maxSlabLen` steps. A change with no ops carries no
+    /// columns at all — an empty range is dropped from a column set
+    /// ([`raw_column.rs:40-50`](../../github-automerge-automerge/rust/automerge/src/columnar/columns/raw_column.rs)) —
+    /// and so counts zero, which is also the answer for a change whose action
+    /// column is absent.
+    ///
+    /// What this is for: `Change.withOpCount` ([`change.zig:151-170`](../../change.zig))
+    /// is how `max_op` is filled in, and the change carries no op count
+    /// anywhere in its header ([`storage/change.rs:104-111`](../../github-automerge-automerge/rust/automerge/src/storage/change.rs)).
+    pub fn opCount(self: ChangeChunk) ParseError!usize {
+        const spec = OpColumn.action.spec();
+        const bytes = (try self.ops.bytesFor(spec)) orelse return 0;
+        return rle.RleOption(u64).countEntries(bytes);
     }
 };
 
@@ -435,7 +478,7 @@ const min_desc_size: usize = 2;
 /// * a block whose specifications are not in ascending normalized order, or
 ///   which repeats one — upstream's `NotInNormalOrder`
 ///   (`raw_column.rs:248-253`) and the duplicate check
-///   (`columns.rs:203-210`).
+///   (`columns.rs:193-198`).
 pub fn parseChangeChunk(body: []const u8, gpa: Allocator) ParseError!ChangeChunk {
     // The header reader owns the fields; this module needs only where it
     // ended. `header_len` is where the op metadata block starts, and the whole
@@ -548,7 +591,22 @@ pub fn writeOpsBlock(
     gpa: Allocator,
     ops: OpsBlock,
 ) Allocator.Error!void {
+    // The count leads the metadata block, so it cannot be known until every
+    // column that will be written has been counted. One pass counts; a second
+    // writes. Upstream writes the count from `self.0.len()` directly
+    // (`raw_column.rs:259`) because it drops empty columns at construction;
+    // here a column is dropped at write time, so the count is computed from
+    // the same filter the write uses.
     var written: usize = 0;
+    for (ops.cols.columns) |col| {
+        if (col.isEmpty()) continue;
+        written += 1;
+    }
+    try leb128.appendUnsigned(out, gpa, written);
+
+    // The last specification actually written, so the order check below
+    // compares two written columns rather than indexing back into the set.
+    var previous: ?ColumnSpec = null;
     for (ops.cols.columns) |col| {
         if (col.isEmpty()) continue;
         // A deflated column in a change chunk is not a thing this writer can
@@ -556,23 +614,19 @@ pub fn writeOpsBlock(
         // been told not to expect. Refuse it here rather than write a body no
         // reader of this format accepts.
         std.debug.assert(!col.spec.isCompressed());
-        // Order is not checked here — it is a property of the caller's set, and
-        // the writer emits what it is given — but a descending specification
-        // would be a body `parseChangeChunk` rejects, so it is worth catching
-        // at the source. A set of one column is trivially ordered.
-        std.debug.assert(written == 0 or
-            ColumnSpec.make(ops.cols.columns[written - 1].spec.id(), ops.cols.columns[written - 1].spec.encoding(), false)
-                .lessThan(col.spec));
+        // Order is not checked by the reader of this set before it is written —
+        // it is a property of the caller's set, and the writer emits what it
+        // is given — but a descending specification would be a body
+        // `parseChangeChunk` rejects, so it is worth catching at the source. A
+        // set of one column is trivially ordered.
+        if (previous) |prev| {
+            const prev_spec = ColumnSpec.make(prev.id(), prev.encoding(), false);
+            std.debug.assert(prev_spec.lessThan(col.spec));
+        }
         try leb128.appendUnsigned(out, gpa, col.spec.raw);
         try leb128.appendUnsigned(out, gpa, col.len());
-        written += 1;
+        previous = col.spec;
     }
-    // The count is written first, so the descriptors are counted in a pass
-    // before any of them goes out.
-    var count: std.ArrayList(u8) = .empty;
-    defer count.deinit(gpa);
-    try leb128.appendUnsigned(&count, gpa, written);
-    try out.appendSlice(gpa, count.items);
 
     try out.appendSlice(gpa, ops.cols.data);
     try out.appendSlice(gpa, ops.footer);
@@ -596,7 +650,7 @@ pub fn encodeBody(
 ///
 /// The checksum is the first four bytes of the change hash, and the change
 /// hash is taken over the body framed as a `ChunkType.change` chunk — the type
-/// byte, then the body's length as LEB128, then the body (`chunk.rs:300-312`).
+/// byte, then the body's length as LEB128, then the body (`chunk.rs:302-312`).
 /// Both are values, not views: they survive the body being freed.
 pub fn encode(
     gpa: Allocator,
@@ -627,7 +681,11 @@ const DescSink = struct {
 
     fn collect(self: *DescSink, count: usize) ParseError!void {
         if (count == 0) {
-            self.descs = self.gpa.alloc(ColumnDesc, 0);
+            // A zero-length allocation is legal and freeable, and it keeps
+            // `descs` non-null once the block has been read, so the caller
+            // never has to tell "no columns" from "not read yet". It can still
+            // fail, and `ParseError` carries `OutOfMemory` for that.
+            self.descs = try self.gpa.alloc(ColumnDesc, 0);
             return;
         }
         // `readCountThen` proved `count <= remaining / min_desc_size`, so this
@@ -662,9 +720,10 @@ const testing = std.testing;
 // author `da0a…d94d`, seq 1, start op 1, message "change 1", no dependencies
 // and no other actors, and one operation. The op block is five columns — the
 // string key "a", insert, the `set` action, a value metadata word, and a
-// predecessor group with no predecessors — 17 bytes of metadata and 10 of
-// data, and no footer. It is here so this port's reader is pinned to bytes
-// automerge wrote, not to bytes this port wrote.
+// predecessor group with no predecessors — and 57 bytes of body: a 36-byte
+// header, 11 bytes of metadata (a count of five plus five two-byte
+// descriptors), 10 of data, and no footer. It is here so this port's reader is
+// pinned to bytes automerge wrote, not to bytes this port wrote.
 const fixture_first_body = [_]u8{
     0x00, 0x10, 0xda, 0x0a, 0x54, 0x54, 0x42, 0x43, 0x49, 0x84, 0x85, 0x00,
     0xa5, 0xeb, 0xe1, 0xac, 0xd9, 0x4d, 0x01, 0x01, 0xc1, 0xbe, 0xc4, 0x83,
@@ -674,9 +733,11 @@ const fixture_first_body = [_]u8{
 };
 
 // The body of the second change chunk in the same fixture: the same author at
-// seq 2, depending on the first change, with two operations. The op block is
-// eight columns, including the object columns a root change does not have, a
-// value payload, and a one-byte-per-op predecessor group.
+// seq 2, depending on the first change, with one operation. The op block is
+// eight columns, including the object columns a root change does not have and
+// a value payload — a `set` of the key "a" to the one-byte string "b" on the
+// object at counter 1 — so this is a pair of numbers the row count and the
+// column count do not agree on.
 const fixture_second_body = [_]u8{
     0x01, 0x9a, 0xc3, 0xd7, 0x30, 0xf2, 0x62, 0xda, 0x35, 0xe7, 0x1d, 0xb5,
     0x91, 0xb9, 0xe8, 0x15, 0x0d, 0xe9, 0xb0, 0x28, 0x26, 0xda, 0xf7, 0x50,
@@ -692,7 +753,7 @@ const fixture_second_body = [_]u8{
 test "the operation columns are fourteen fixed ids and encodings" {
     // The format, one assertion per column. Ids and encodings come from
     // upstream's eight id constants (`change_op_columns.rs:29-36`) and the
-    // `ColumnType` each is read and written with (`:496-531`); the raw word is
+    // `ColumnType` each is read and written with (`:496-547`); the raw word is
     // `id << 4 | encoding` with the DEFLATE bit clear, the packing
     // `column_specification.rs:21-29` and the specification both describe.
     const expected = [_]struct { col: OpColumn, id: u32, enc: Encoding, raw: u32 }{
@@ -747,6 +808,70 @@ test "the operation columns are fourteen fixed ids and encodings" {
     }
 }
 
+test "each column's wire word decodes to the column the table names" {
+    // The same fourteen pairs as the test above, from the reader's direction.
+    // The literal here is the word as it stands in the metadata block, before
+    // uLEB128 encoding, and the column has to be recovered from it — the table
+    // test starts from the table and builds the word, this one starts from the
+    // word and decodes it, so a decoder that read the wrong field fails here
+    // even when the writer would have produced the right bytes.
+    //
+    // The packing is `id << 4 | encoding` with the DEFLATE bit clear
+    // (`column_specification.rs:21-29`), and the id is the 28 bits above the
+    // low nibble (`:68-70`) with the encoding the low three (`:142-143`).
+    const words = [_]struct { word: u32, id: u32, enc: Encoding, col: OpColumn }{
+        // obj: the object the op acts on, as an actor index and a counter
+        // (`change_op_columns.rs:29`, `:496-497`).
+        .{ .word = 0x01, .id = 0, .enc = .actor, .col = .obj_actor },
+        .{ .word = 0x02, .id = 0, .enc = .rle_uint, .col = .obj_counter },
+        // key: the op's key, one of three columns chosen by its variant
+        // (`change_op_columns.rs:30`, `:498-500`).
+        .{ .word = 0x11, .id = 1, .enc = .actor, .col = .key_actor },
+        .{ .word = 0x13, .id = 1, .enc = .delta, .col = .key_counter },
+        .{ .word = 0x15, .id = 1, .enc = .string, .col = .key_string },
+        // insert: `change_op_columns.rs:31`, `:501`.
+        .{ .word = 0x34, .id = 3, .enc = .boolean, .col = .insert },
+        // action: a code rather than a counter, so run-length. `:32`, `:502`.
+        .{ .word = 0x42, .id = 4, .enc = .rle_uint, .col = .action },
+        // val: a metadata word and its payload, which share one id and are
+        // read as one column. `:33`, `:503-508` and `:334`.
+        .{ .word = 0x56, .id = 5, .enc = .value_metadata, .col = .value_metadata },
+        .{ .word = 0x57, .id = 5, .enc = .value, .col = .value },
+        // pred: a group count and the flattened actor/counter pairs it
+        // indexes. `:34`, `:509-527`.
+        .{ .word = 0x70, .id = 7, .enc = .group, .col = .pred_group },
+        .{ .word = 0x71, .id = 7, .enc = .actor, .col = .pred_actor },
+        .{ .word = 0x73, .id = 7, .enc = .delta, .col = .pred_counter },
+        // expand: `change_op_columns.rs:35`, `:546`.
+        .{ .word = 0x94, .id = 9, .enc = .boolean, .col = .expand },
+        // mark_name: `change_op_columns.rs:36`, `:547`.
+        .{ .word = 0xa5, .id = 10, .enc = .string, .col = .mark_name },
+    };
+    try testing.expectEqual(op_columns.len, words.len);
+    for (words) |w| {
+        const spec = ColumnSpec.fromRaw(w.word);
+        try testing.expectEqual(w.id, spec.id());
+        try testing.expectEqual(w.enc, spec.encoding());
+        // A change chunk's columns are never deflated
+        // (`storage/change.rs:129-131`), so the word has bit 3 clear.
+        try testing.expect(!spec.isCompressed());
+        // The word names the column the table names, in both directions.
+        try testing.expectEqual(w.col, OpColumn.fromSpec(spec) orelse error.TestUnexpectedResult);
+        try testing.expectEqual(w.word, w.col.spec().raw);
+        try testing.expectEqual(w.id, w.col.id());
+        try testing.expectEqual(w.enc, w.col.encoding());
+    }
+
+    // `op_columns` is the order the writer emits, and it is ascending by
+    // normalized specification, which is the order `RawColumns::parse` requires
+    // of a change (`raw_column.rs:248-253`). A writer that emitted them in any
+    // other order would produce a body every reader of this format refuses.
+    for (op_columns, 0..) |col, i| {
+        try testing.expectEqual(words[i].word, col.spec().raw);
+        if (i > 0) try testing.expect(op_columns[i - 1].spec().lessThan(col.spec()));
+    }
+}
+
 test "the operation column set looks up by name and by specification" {
     // By name, in both directions.
     for (op_columns) |col| {
@@ -790,10 +915,12 @@ test "a change automerge wrote reads column by column" {
     try testing.expectEqualStrings("change 1", parsed.change.message);
     try testing.expectEqual(@as(usize, 0), parsed.change.other_actors.len);
 
-    // The op block is 17 bytes of metadata and 10 of data, and the header ends
-    // where the metadata begins.
+    // The op block is 11 bytes of metadata and 10 of data, and the header ends
+    // where the metadata begins. The metadata is a count of five and five
+    // descriptors of a one-byte spec and a one-byte length each
+    // (`raw_column.rs:258-263`), which is what the data block's offset pins.
     try testing.expectEqual(@as(usize, 36), parsed.change.header_len);
-    try testing.expectEqual(@as(usize, 36 + 17), parsed.ops.data.ptr - fixture_first_body[0..].ptr);
+    try testing.expectEqual(@as(usize, 36 + 11), parsed.ops.data.ptr - fixture_first_body[0..].ptr);
     try testing.expectEqual(@as(usize, 10), parsed.opData().len);
     try testing.expectEqual(@as(usize, 0), parsed.footer.len);
 
@@ -807,7 +934,12 @@ test "a change automerge wrote reads column by column" {
         .{ .col = .value_metadata, .spec = ColumnSpec.make(5, .value_metadata, false), .bytes = &[_]u8{ 0x7f, 0x00 } },
         .{ .col = .pred_group, .spec = ColumnSpec.make(7, .group, false), .bytes = &[_]u8{ 0x7f, 0x00 } },
     };
-    try testing.expectEqual(expected.len, parsed.opCount());
+    // **One operation in five columns.** `opCount` is a row count, so this is
+    // the length of the action column and not the length of `expected`; the
+    // two agree only for a change where every column holds one op, which is
+    // the coincidence that hid the defect.
+    try testing.expectEqual(@as(usize, 1), try parsed.opCount());
+    try testing.expectEqual(expected.len, parsed.ops.len());
     var it = parsed.ops.iterator();
     for (expected) |want| {
         const col = it.next() orelse return error.TestUnexpectedResult;
@@ -854,7 +986,10 @@ test "a change with an object column and a value payload reads every column" {
         .{ .col = .value, .spec = ColumnSpec.make(5, .value, false), .bytes = &[_]u8{0x62} },
         .{ .col = .pred_group, .spec = ColumnSpec.make(7, .group, false), .bytes = &[_]u8{ 0x7f, 0x00 } },
     };
-    try testing.expectEqual(expected.len, parsed.opCount());
+    // **One operation in eight columns**, which is the same distinction as the
+    // first fixture's with a different pair of numbers.
+    try testing.expectEqual(@as(usize, 1), try parsed.opCount());
+    try testing.expectEqual(expected.len, parsed.ops.len());
     try testing.expectEqual(@as(usize, 15), parsed.opData().len);
     try testing.expectEqual(@as(usize, 0), parsed.footer.len);
 
@@ -871,12 +1006,13 @@ test "a change with an object column and a value payload reads every column" {
         @memcpy(expect_data[at .. at + bytes.len], bytes);
         at += bytes.len;
     }
-    try testing.expect(at);
+    try testing.expectEqual(parsed.opData().len, at);
     try testing.expectEqualSlices(u8, &expect_data, parsed.opData());
     try testing.expect(it.next() == null);
 
-    // A two-op change still has no expand or mark_name column, and no
-    // predecessor value columns: the group says every op has no predecessors.
+    // A one-op change on a non-root object still has no expand or mark_name
+    // column, and no predecessor value columns: the group says its one op has
+    // no predecessors.
     try testing.expect((try parsed.opBytes(.expand)) == null);
     try testing.expect((try parsed.opBytes(.mark_name)) == null);
     try testing.expect((try parsed.opBytes(.pred_actor)) == null);
@@ -895,7 +1031,7 @@ test "a written body reads back with the same column specifications and bytes" {
         // The values the writer takes: the change's own fields, the op
         // columns, and the footer.
         const ops = OpsBlock.init(parsed.ops, parsed.footer);
-        const encoded = try encode(gpa, parsed.change, ops);
+        var encoded = try encode(gpa, parsed.change, ops);
         defer encoded.deinit(gpa);
 
         // The body is the bytes it came from: header, metadata, data, footer.
@@ -914,7 +1050,7 @@ test "an empty change round trips with no columns and no footer" {
     // writes a column count of zero and no data (`raw_column.rs:183`), and the
     // reader must read that back as an empty, valid op block.
     const actor = [_]u8{0xaa};
-    const header = try change_mod.parseChange(&[_]u8{
+    var header = try change_mod.parseChange(&[_]u8{
         0x00, // no dependencies
         0x01, 0xaa, // actor
         0x01, // seq 1
@@ -927,7 +1063,7 @@ test "an empty change round trips with no columns and no footer" {
     defer header.deinit(gpa);
 
     // Write it: header, a column count of zero, no data, no footer.
-    const encoded = try encode(gpa, header, OpsBlock.empty());
+    var encoded = try encode(gpa, header, OpsBlock.empty());
     defer encoded.deinit(gpa);
     try testing.expectEqualSlices(u8, &[_]u8{
         0x00, 0x01, 0xaa, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00,
@@ -936,7 +1072,7 @@ test "an empty change round trips with no columns and no footer" {
     // Read it back: the same change, with an empty op block.
     var parsed = try parseChangeChunk(encoded.body, gpa);
     defer parsed.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), parsed.opCount());
+    try testing.expectEqual(@as(usize, 0), try parsed.opCount());
     try testing.expect(parsed.ops.isEmpty());
     try testing.expectEqual(@as(usize, 0), parsed.opData().len);
     try testing.expectEqual(@as(usize, 0), parsed.footer.len);
@@ -985,29 +1121,31 @@ test "the author footer survives a round trip byte for byte" {
     // Read it: the footer is there, exactly.
     var parsed = try parseChangeChunk(body.items, gpa);
     defer parsed.deinit(gpa);
-    try testing.expectEqual(@as(usize, 1), parsed.opCount());
+    try testing.expectEqual(@as(usize, 1), try parsed.opCount());
     try testing.expectEqualSlices(u8, &data, parsed.opData());
     try testing.expectEqualSlices(u8, &footer, parsed.footer);
 
     // Write it back: the same footer, after the same columns.
-    const encoded = try encode(gpa, parsed.change, OpsBlock.init(parsed.ops, parsed.footer));
+    var encoded = try encode(gpa, parsed.change, OpsBlock.init(parsed.ops, parsed.footer));
     defer encoded.deinit(gpa);
     try testing.expectEqualSlices(u8, body.items, encoded.body);
     try testing.expectEqualSlices(u8, &footer, encoded.body[encoded.body.len - footer.len ..]);
 
     // Change the footer's bytes and only the footer changes: it is the last
     // thing in the body, and nothing in the header or the columns depends on
-    // it.
-    var other: [body.items.len]u8 = body.items;
-    const at = other.len - footer.len;
-    other[at + 3] = 'J';
-    var re_parsed = try parseChangeChunk(&other, gpa);
+    // it. The body is a runtime-sized list, so the copy comes from the
+    // allocator rather than from a comptime-known array.
+    const other = try gpa.dupe(u8, body.items);
+    defer gpa.free(other);
+    other[other.len - footer.len + 3] = 'J';
+    try testing.expectEqualSlices(u8, body.items[0 .. body.items.len - footer.len], other[0 .. other.len - footer.len]);
+    var re_parsed = try parseChangeChunk(other, gpa);
     defer re_parsed.deinit(gpa);
-    try testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x05, 'j', 'a', 'J', 'i', 's' }, re_parsed.footer);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x05, 'j', 'J', 'n', 'i', 's' }, re_parsed.footer);
     try testing.expectEqualSlices(u8, &data, re_parsed.opData());
     // The change hash covers the footer, so a different footer is a different
     // change: same columns, different hash.
-    try testing.expect(!encoded.hash.eql(chunk.changeHashOf(.change, &other)));
+    try testing.expect(!encoded.hash.eql(chunk.changeHashOf(.change, other)));
 }
 
 test "a truncated metadata block is refused" {
@@ -1016,19 +1154,21 @@ test "a truncated metadata block is refused" {
     // the count is read, and then the block runs out.
     const head: []const u8 = fixture_first_body[0..36];
 
-    // The count says five columns but only two descriptors are there. The
-    // count is larger than the remaining input could hold, so it is refused
-    // before the count sizes anything.
+    // The count says five columns but only two descriptors are there — the
+    // body stops at 41, five bytes into the metadata block. The count is
+    // larger than the remaining input could hold at two bytes a descriptor, so
+    // it is refused before the count sizes anything.
     try testing.expectError(
         error.LengthExceedsInput,
-        parseChangeChunk(head[0..41], gpa),
+        parseChangeChunk(fixture_first_body[0..41], gpa),
     );
 
-    // All five descriptors, then a data block that starts but does not
-    // complete is a data-block failure, not a metadata one; here instead the
-    // fifth descriptor's length is cut off mid-LEB128, so the descriptor
-    // itself is truncated and `takeUleb` reports the end of the input.
-    var cut = [_]u8{ head.*, 0x05, 0x15, 0x03, 0x34, 0x01, 0x42, 0x02, 0x56, 0x02, 0x70, 0x80 };
+    // All five descriptors, and then the fifth descriptor's length is cut off
+    // mid-LEB128: the descriptor itself is truncated, so `takeUleb` reports the
+    // end of the input rather than a length that is short of the data block.
+    var cut: [head.len + 11]u8 = undefined;
+    @memcpy(cut[0..head.len], head);
+    @memcpy(cut[head.len..], &[_]u8{ 0x05, 0x15, 0x03, 0x34, 0x01, 0x42, 0x02, 0x56, 0x02, 0x70, 0x80 });
     try testing.expectError(error.UnexpectedEnd, parseChangeChunk(&cut, gpa));
 
     // A metadata block cut off before its count is a header failure, and the
@@ -1043,10 +1183,11 @@ test "a truncated data block is refused" {
     const head: []const u8 = fixture_first_body[0..36];
     const meta: []const u8 = fixture_first_body[36..47];
 
-    // Zero of the ten data bytes present.
+    // Zero of the ten data bytes present: the body ends where the metadata
+    // block ends, and the declared total is ten.
     try testing.expectError(
         error.LengthExceedsInput,
-        parseChangeChunk(head[0..47], gpa),
+        parseChangeChunk(fixture_first_body[0..47], gpa),
     );
 
     // Some of them: nine declared bytes, ten present. Still short, still
@@ -1082,8 +1223,11 @@ test "a column whose declared length runs past the data block is refused" {
         0x42, // the action column
     };
 
-    // A length of ten with three bytes of data.
-    var body: [head.len + 11]u8 = undefined;
+    // A length of ten with three bytes of data: the body is the header and
+    // count, the one-column spec, the one-byte length, and the three bytes the
+    // column claims to have. Ten of them are not there, so the sum of the
+    // declared lengths is larger than what is left.
+    var body: [head.len + 4]u8 = undefined;
     @memcpy(body[0..head.len], &head);
     body[head.len] = 0x0a; // the column's declared length
     @memcpy(body[head.len + 1 ..], &[_]u8{ 0x7f, 0x00, 0x7f });
@@ -1092,28 +1236,30 @@ test "a column whose declared length runs past the data block is refused" {
     // A length of zero with a byte of data. The declared block is empty, so
     // what follows is the footer, and the reader does not reach into it for
     // the column — it takes the zero bytes the column declares and the one
-    // byte is the footer.
-    var zero: [head.len + 1]u8 = undefined;
+    // byte after them is the footer (`storage/change.rs:120-125`).
+    var zero: [head.len + 2]u8 = undefined;
     @memcpy(zero[0..head.len], &head);
-    zero[head.len] = 0x00;
+    zero[head.len] = 0x00; // the column's declared length
+    zero[head.len + 1] = 0xaa; // the one byte, which is the footer
     var parsed = try parseChangeChunk(&zero, gpa);
     defer parsed.deinit(gpa);
     // A zero-length column is dropped, as upstream drops it
-    // (`raw_column.rs:40-50`), so the block is empty and the trailing byte is
-    // the footer.
-    try testing.expectEqual(@as(usize, 0), parsed.opCount());
+    // (`raw_column.rs:40-50`), so the block is empty and the byte after the
+    // declared data block is the footer.
+    try testing.expectEqual(@as(usize, 0), try parsed.opCount());
     try testing.expectEqual(@as(usize, 0), parsed.opData().len);
-    try testing.expectEqualSlices(u8, &[_]u8{}, parsed.footer);
+    try testing.expectEqualSlices(u8, &[_]u8{0xaa}, parsed.footer);
     // With nothing to index, the column is not findable.
     try testing.expect((try parsed.bytesFor(ColumnSpec.make(4, .rle_uint, false))) == null);
 
-    // And a length that is absurd — every bit set, the maximum a u64 length
-    // can hold — is still refused as too large for the input, not treated as a
-    // number to allocate.
-    var huge: [head.len + 11]u8 = undefined;
+    // And a length that is absurd — the ten-byte LEB128 encoding of the
+    // largest `u64`, which is the most a length field can hold
+    // (`parse/leb128.rs:15-40`) — is still refused as too large for the input,
+    // not treated as a number to allocate or a sum to take.
+    var huge: [head.len + 10]u8 = undefined;
     @memcpy(huge[0..head.len], &head);
-    huge[head.len] = 0xff;
-    @memset(huge[head.len + 1 ..], 0xff);
+    @memset(huge[head.len .. head.len + 9], 0xff);
+    huge[head.len + 9] = 0x01; // the tenth byte carries the one bit that is left
     try testing.expectError(error.LengthExceedsInput, parseChangeChunk(&huge, gpa));
 }
 
@@ -1133,9 +1279,12 @@ test "a change with a compressed column is refused" {
         0x00, // no other actors
         0x01, // one column
     };
-    var body: [head.len + 3]u8 = undefined;
+    // One column whose two declared bytes are all there, so the DEFLATE bit is
+    // the only thing wrong with the body.
+    var body: [head.len + 4]u8 = undefined;
     @memcpy(body[0..head.len], &head);
-    // 0x4a is the action column with the DEFLATE bit set.
+    // 0x4a is the action column with the DEFLATE bit set
+    // (`column_specification.rs:25-27`).
     body[head.len] = 0x4a;
     body[head.len + 1] = 0x02;
     @memcpy(body[head.len + 2 ..], &[_]u8{ 0x7f, 0x00 });
@@ -1162,16 +1311,18 @@ test "columns out of order or repeated are refused" {
     try testing.expectError(error.InvalidColumnSpec, parseChangeChunk(&unsorted, gpa));
 
     // The same column twice. Upstream rejects a duplicate specification
-    // (`columns.rs:203-210`); the DEFLATE bit is ignored when comparing, so a
-    // document that carries the same column both ways is refused too.
-    var duplicated: [head.len + 4]u8 = undefined;
+    // (`columns.rs:193-198`); the DEFLATE bit is ignored when comparing, so a
+    // document that carries the same column both ways is refused too. Both
+    // columns declare two bytes and both bytes are there, so a duplicate is
+    // the only thing wrong with the body.
+    var duplicated: [head.len + 9]u8 = undefined;
     @memcpy(duplicated[0..head.len], head);
-    @memcpy(duplicated[head.len..], &[_]u8{
+    @memcpy(duplicated[head.len..][0..5], &[_]u8{
         0x02, // two columns
         0x42, 0x02, // the action column
         0x42, 0x02, // and itself again
     });
-    @memcpy(duplicated[head.len + 4 ..], &[_]u8{ 0x7f, 0x00, 0x7f, 0x00 });
+    @memcpy(duplicated[head.len + 5 ..], &[_]u8{ 0x7f, 0x00, 0x7f, 0x00 });
     try testing.expectError(error.DuplicateColumn, parseChangeChunk(&duplicated, gpa));
 }
 
@@ -1196,17 +1347,18 @@ test "a compressed change chunk is inflated and checked before it is read" {
     var owned = try parseFramedChunk(c, gpa);
     defer owned.deinit(gpa);
     try testing.expect(owned.inflated != null);
-    try testing.expectEqualSlices(u8, &fixture_first_body, owned.parsed.opData()[0..0][0..0][0..0]); // no-op
-    try testing.expectEqual(@as(usize, 5), owned.parsed.opCount());
+    // The op data block is automerge's, at offset 47 of the inflated body, and
+    // it points into the buffer the reader owns rather than into a copy of it.
+    const inflated = owned.inflated.?;
+    try testing.expectEqual(@as(usize, 1), try owned.parsed.opCount());
+    try testing.expectEqualSlices(u8, fixture_first_body[47..], owned.parsed.opData());
+    try testing.expect(owned.parsed.opData().ptr == inflated.ptr + 47);
+    try testing.expectEqualSlices(u8, &fixture_first_body, inflated);
+    try testing.expect(owned.parsed.change.bytes.ptr == inflated.ptr);
+    // The column the fixture names reads as the fixture wrote it.
     try testing.expectEqualSlices(u8, &[_]u8{ 0x7f, 0x01, 0x61 }, (try owned.parsed.opBytes(.key_string)).?);
     try testing.expectEqual(@as(u64, 1), owned.parsed.change.seq);
     try testing.expectEqualSlices(u8, "change 1", owned.parsed.change.message);
-
-    // The inflated body is owned and freed by `deinit`; the columns point into
-    // it, so a column's bytes are the fixture's bytes.
-    const inflated = owned.inflated.?;
-    try testing.expectEqualSlices(u8, &fixture_first_body, inflated);
-    try testing.expect(owned.parsed.change.bytes.ptr == inflated.ptr);
 
     // A compressed chunk whose body has been altered fails the checksum check
     // in `decompressChunk`, before any column is read. `parseChunk` alone would
@@ -1254,3 +1406,79 @@ test "a chunk that is not a change is refused" {
         parseFramedChunk(try chunk.parseChunk(bundle.items), gpa),
     );
 }
+
+test "opCount is the row count of the action column and not the column count" {
+    const gpa = testing.allocator;
+    // One change chunk, one column, and as many rows as the case asks for.
+    // **One column and N rows is the shape on which the two answers cannot be
+    // confused**, which is why this builds the action column directly instead
+    // of borrowing a fixture: every fixture in this file has one row per
+    // column's worth of luck, and the second fixture's eight columns hold one
+    // operation.
+    const header = [_]u8{
+        0x00, // no dependencies
+        0x01, 0xaa, // actor
+        0x01, // seq 1
+        0x03, // start_op 3
+        0x00, // time 0
+        0x00, // no message
+        0x00, // no other actors
+    };
+    const spec = ColumnSpec.make(4, .rle_uint, false);
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+
+    // **Three rows in one column**, written as a literal run so the count
+    // cannot come from a run header's repeat length by accident either.
+    const three = [_]?u64{ 1, 2, 3 };
+    var scratch: [32]u8 = undefined;
+    rle.RleOption(u64).write(&scratch, &three);
+    const len3 = rle.RleOption(u64).encodedSize(&three);
+    try body.appendSlice(gpa, &header);
+    {
+        const descs = [_]ColumnDesc{ColumnDesc.init(spec, len3)};
+        const cols = try RawColumns.init(gpa, &descs, scratch[0..len3]);
+        defer cols.deinit(gpa);
+        try writeOpsBlock(&body, gpa, OpsBlock.init(cols, &.{}));
+    }
+
+    var parsed = try parseChangeChunk(body.items, gpa);
+    defer parsed.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), parsed.ops.len());
+    try testing.expectEqual(@as(usize, 3), try parsed.opCount());
+    // **`max_op` is the counter of the last row**, which is what the count is
+    // for: `start_op + num_ops - 1` (`change.rs:74-76`).
+    try testing.expectEqual(@as(u64, 3), parsed.change.start_op);
+    try testing.expectEqual(@as(u64, 5), (try parsed.change.withOpCount(try parsed.opCount())).max_op);
+
+    // **A thousand identical rows, which is one run.** A count that walked the
+    // values would be right here and a count that walked the *runs* would say
+    // one; the answer is a thousand only if the run's declared length is what
+    // gets charged, which is what makes the count cheap on a hostile column
+    // as well.
+    body.clearRetainingCapacity();
+    try body.appendSlice(gpa, &header);
+    const many = [_]?u64{7} ** 1000;
+    var wide: [32]u8 = undefined;
+    rle.RleOption(u64).write(&wide, &many);
+    const len_many = rle.RleOption(u64).encodedSize(&many);
+    {
+        const descs = [_]ColumnDesc{ColumnDesc.init(spec, len_many)};
+        const cols = try RawColumns.init(gpa, &descs, wide[0..len_many]);
+        defer cols.deinit(gpa);
+        try writeOpsBlock(&body, gpa, OpsBlock.init(cols, &.{}));
+    }
+
+    var parsed2 = try parseChangeChunk(body.items, gpa);
+    defer parsed2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), parsed2.ops.len());
+    try testing.expectEqual(@as(usize, 1000), try parsed2.opCount());
+    try testing.expectEqual(@as(u64, 1002), (try parsed2.change.withOpCount(try parsed2.opCount())).max_op);
+}
+
+// ── Differences from upstream, in one place ─────────────────────────────────
+
+// | here | upstream | why |
+// | --- | --- | --- |
+// | [`ChangeChunk.opCount`] answers a row count by walking the **runs** of the action column, allocating nothing and materialising no value | [`StoredChange::len`] is a field ([`storage/change.rs:205-207`](../../github-automerge-automerge/rust/automerge/src/storage/change.rs)) that [`Change::new_from_unverified`] filled by counting as it decoded — `stored.verify_ops` ([`change.rs:30-46`](../../github-automerge-automerge/rust/automerge/src/change.rs)) — and [`Change::max_op`] is `start_op + len - 1` off it ([`change.rs:74-76`](../../github-automerge-automerge/rust/automerge/src/change.rs)) | the port's [`Change`] is a header view over borrowed bytes ([`change.zig:99-141`](../../change.zig)) and holds **no decoded op set at all**, so there is no `num_ops` field to read and the count has to come out of the columnar layer. It has to come out of the *runs* and not the values: a run may declare up to `maxSlabLen` rows, so a value-at-a-time walk of a hostile column is an unbounded loop where a run-at-a-time walk is one pass over the bytes |
+// | a change leaves this module with `max_op` **unset**, and the consumer that decoded the columns fills it in with [`Change.withOpCount`](../../change.zig) | a `Change` is materialised **with** its op count on every path, so no consumer ever sees an unset one | upstream counts while decoding and has no half-built change to leak; the port parses a header without touching the columns, so the field is not knowable at the parse. The consequence is a rule rather than a shape — and the rule has been missed at five encode-then-reparse sites so far ([`encodeOneChange`](../../doc.zig), [`applySpec`](../../anonymize.zig), [`Document.adoptChange`](../../doc.zig), `AMchangeFromBytes` and `reparseChange`), which is why [`opCount`] is public and why every consumer of a change this module parsed calls `withOpCount` rather than reading `max_op`. **The two kinds of count are not interchangeable:** a count taken from an array that was *just encoded* (`ops.len` at [`encodeOneChange`](../../doc.zig)) is a row count by construction and costs nothing, while a count *recovered from a column* has to walk runs for the reason above — passing a number of runs, or a number of bytes, to `withOpCount` is the same defect in a different costume |

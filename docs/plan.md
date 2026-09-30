@@ -40,6 +40,308 @@ encoding a document-level field and a compile-time default, so a consumer can
 build a UTF-16-indexed document. See [survey/07](survey/07-bindings.md) §Risk 2
 for the divergence this avoids in Rust.
 
+### 1.1 What the contract is checked against, and how hard
+
+This section is a statement of what a reader of this repository may rely on.
+Every claim in it was **measured by running the thing that produces it** on
+2026-10-01, and the two strongest of them were **proved by breaking them**.
+
+**The change-hash property is a property, not a hope.** `src/doc.zig:5941` and
+`:5943` hold the two expected hashes as **string literals**, and the bytes they
+are compared against (`reference_change_0` / `reference_change_1`, `:5940`,
+`:5942`) are literals too, decoded from hex. **Neither is recomputed from the
+port's own output**, which is the failure this claim is most prone to: a hash
+derived from the port is a hash that moves with it. Both literals match
+`test/golden/change.jsonl` exactly, and that file is produced by the reference
+oracle. The property is exercised **in both directions**:
+
+- **decode-and-re-encode** — a change chunk the *reference wrote* re-encodes to
+  the reference's bytes **and** the reference's 32 hash bytes,
+  `src/doc.zig:6425` (plain framing) and `:6442` (compressed).
+- **encode-what-the-reference-wrote** — `src/doc.zig:9003`, *this port's write
+  path produces the reference's own change chunks, byte for byte*. It builds the
+  oracle's document through this port's own transactions, requires
+  `changes.len == 2`, and asserts per change both
+  `expectEqualSlices(owned.parsed.change.bytes, built.body)` and
+  `expectEqualStrings(want, got)` against the reference's hash.
+
+**The golden-vector gate is not a tautology.** `addGoldenVector` in `build.zig`
+captures the oracle's output into the **build cache** and `cmp`s it against the
+committed `test/golden/<name>.jsonl`; the write path into `test/golden/` is
+reachable only under `-Dconformance-record`, which is the same function's record
+branch. Structure is not proof, so it was **proved by breaking it**: one byte of
+`test/golden/change.jsonl` was flipped and `zig build conformance -- change`
+failed, naming both files in the `cmp` —
+`cmp /home/tmp/…/o/4c715b…/change.jsonl /vol/…/test/golden/change.jsonl`,
+`Build Summary: 2/4 steps succeeded (1 failed)`. The file was then restored and
+confirmed **byte-exact by sha256** (`0689ff5d…` identical before and after), and
+the gate returned to 4/4. Full sweep: **18/18 steps, 8 vectors**, each
+regenerated from the reference and compared.
+
+**The honest caveat, which is part of the claim.** These checks cover **the
+vectors the oracle chose, not the whole format**. That is what the 8 golden
+vectors and the **18-file fixture corpus** (`test/fixtures/manifest.zig`, 5
+`.load_ok` and 13 `.load_err`, checked 6/6 by `test/fixtures_test.zig`) are for,
+and a reader should weigh the property as *strong on the vectors it covers,
+absent elsewhere*.
+
+**A falsification is only evidence when it fails for the right reason.** Every
+break in this repository — the golden vector's byte, the batch suite's key sort
+and its write-path replay — was checked the same way, because a falsification
+that fails for the wrong reason is not a falsification: **an exit code says
+something went wrong, it does not say what.**
+
+**And the count that tells you which is `FAIL`, not the exit code.** Read
+precisely:
+
+> **`FAIL=0` is not "zero tests failed". It is "the run never started."**
+
+A compile error anywhere in the library exits non-zero and produces **zero**
+`...FAIL` lines and **zero** `...OK` lines. **The `FAIL` count is the only one of
+the three signals that distinguishes a blocked run from a real failure**, because
+the other two — a non-zero exit, and an error line in the log — are compatible
+with both states. Reading a compile-blocked run as a failure in one's own slice
+has happened repeatedly today, by several agents — **three of them within one
+hour, counted in a single report** — and each time the exit code alone said
+something compatible with the wrong answer. **The figure is worth keeping only
+while it stays attached to that report.** An unenumerable tally is not a
+defensible number: the auditor's own was "four times, by four agents", and it was
+wrong before the ink was dry, having been overtaken by events rather than by any
+mistake of arithmetic.
+
+**The concrete instance of that failure mode, which cost three agents the same
+hour.** `@import("build_options")` is reached by `src/opset/op_set.zig` and
+`src/hexane/btree.zig`, so a bare `zig test` from the command line has to supply
+it, and **the `--dep` has to attach to the module that needs it** —
+`-Mzautomerge=src/root.zig` for a consumer test that imports the library by
+name, and `-Mroot` when the root *is* the library. Putting `--dep
+build_options` *before* `-Mroot=` attaches it to the root module instead and
+produces the identical `no module named 'build_options' available within module
+'zautomerge'`. All three read that message rather than counting `FAIL`, which
+is the failure mode this section is about. **Through `zig build` none of it
+arises**, and that is why a gate number from `zig build` is worth more than a
+filtered run.
+
+So a falsification, or any verification, counts only when **the `FAIL` count is
+non-zero with a diagnostic naming the fault**; a **non-zero exit** and **zero
+compile errors** corroborate it. And the symmetric reading matters just as much:
+**a green run whose `OK` count is zero has tested nothing**, which is why
+`zig build slow-path` deliberately runs with no filter — a filtered build reports
+`0 passed` and exits 0, which is a gate that passes by having stopped testing
+anything.
+
+### 1.1a A green assertion that cannot fail
+
+**Wrong because nothing verified where a claim came from has no repair path.
+Wrong because someone checked it carefully and got it wrong does.** The
+distinction is what separates "this is right" from "someone checked this", and it
+is why a claim whose instrument was never tested cannot be repaired by re-running
+it.
+
+**The instance, so this is not an abstraction.** An audit of this port produced an
+inverted gate ranking — it named P9 the weakest when P9 was the most completely
+ported — from an instrument it had never checked against the tree. It defended
+that ranking through two rounds of review and retracted it only on discovering
+that **this port renames every ported test case into English**, so counting
+upstream function names under-counted by a factor of three. **The fix was a
+retraction, not a patch.** A number derived from a bad instrument cannot be
+corrected by re-running it, because re-running it reproduces the same wrong
+number; a number derived from a good instrument that happens to be wrong can be.
+**Nothing was wrong with the reading, the arithmetic or the care — the instrument
+was unchecked**, and that is a different failure with a different repair path.
+
+**A test that cannot be shown failing has not been tested.** §1.1 says a
+falsification counts only when the `FAIL` count is non-zero with a diagnostic
+naming the fault. This is the same rule pointed the other way, and it governs
+what you write rather than what you read: **a suite that was green before the
+code was broken and green after it has verified nothing**, and nothing in that
+suite's own output can tell you so.
+
+**The cheapest demonstration, and for a method with a dispatch it is the only
+cheap one: break each arm in turn and watch the suite go red.**
+
+**The forms this port has shipped. Every one is a green assertion that cannot
+fail, and every one was found by breaking something rather than by reading a
+test — except the third, which is named and not yet shown. A form that has not
+been broken is not shipped, and this list is where that distinction has to be
+kept:**
+
+- **An assertion over only what must be absent** passes on an empty result. "The
+  mirror does not show the write the heads exclude" is satisfied just as well by
+  a mirror with nothing in it, which is why the same test must also prove the
+  excluded write **is** visible at the present and that the heads **do** include
+  what they should.
+- **An equality helper that compares less than its name claims.**
+  [`Text.eql`](../src/hydrate.zig) is `asStr()` alone, so every test that uses it
+  reads as a test of text equality and is a test of text *content*; the marks
+  are invisible to it, and a mirror holding the wrong marks compares equal.
+- **A fast path and a slow path that must agree, where only one is exercised.**
+  **IDENTIFIED, NOT YET SHIPPED — and this bullet is the one this section's own
+  rule applies to.** `OpSet.seekOpsByIndex` has a fast path and a slow path that
+  must answer identically, and until the `-Dslow-path` option existed the slow
+  one was comptime-dead, so nothing compared them. Turning the option on
+  (`zig build slow-path`) makes the comparison live and it **disagrees**:
+  `OpSet.seekOpsByIndex`'s `opsFoundEqual` arm reports `error.Invariant` on two
+  `src/cursor.zig` tests, and the op-set checker reports *right is out of row
+  order*. **Those two are option-on only, and they are not
+  `src/hexane/**`'s to fix.** A third symptom in that report — *node reachable
+  twice*, from `SlabBTree.assertSound` — **was** `src/hexane/btree.zig`'s, and it
+  is resolved; see below.
+
+  **The `column.zig` half of this, measured and closed 2026-10-01.**
+  `src/hexane/column.zig` was red in the option-**off** build too, under three
+  different test names across two runs, and it is **green in both builds now**.
+  Two independent defects accounted for all three names, and **the tree as it
+  stood could not tell them apart**, because the record of the first lived in a
+  comment in a test file rather than at the function:
+
+  - `PrefixColumn::iter_range` is `iter()` plus `advance_by(start)`, which
+    **accumulates** the skipped widths into `total` (`prefix.rs:669-676`,
+    `:903-907`), so a window opened at `s` reports **absolute** totals. The port
+    had a window-*relative* variant, and the op set compensated for it at
+    `OpSet.calculateMarks`. The compensation's symptom was not a wrong number but
+    a **refusal**: `cast(usize, 0 - base)` is `error.Overflow` for every text
+    object that does not begin at column row 0, and re-introducing the relative
+    window took the tree from 46 to **69** `...FAIL` lines, 23 of them in that
+    family. The record now sits at `prefixIterRange` itself
+    ([`src/hexane/column.zig`](../src/hexane/column.zig)) and names the second
+    half to undo, in `src/opset/op_set.zig`.
+  - `Iter::shift` is `set_max(range.end)` then `advance_to(range.start)`
+    (`column.rs:542-545`, `shift.rs:51-54`) and the port's was the first half
+    alone, while its own doc comment claimed both — **a shape error, not a
+    boundary one**: `shift(5..9)` on a fresh cursor left `pos()` at 0, and it did
+    so on five consecutive runs, so the brief's "seed-dependent" reading of it
+    was wrong. `scan_to_value_on_rle_columns` now calls `shift` alone.
+
+  **What the two tell the method.** The option-on build being green is this
+  bullet's own promotion condition and it is **not** what closed these: neither
+  defect is reachable only with the option on. What closed them is that each
+  was **falsified** — a `prefixIterRange` that reported relative sums and an
+  `Iterator.shift` that only truncated, each producing a non-zero exit, zero
+  compile errors and a `...FAIL` naming the fault — and then measured over
+  **400 seeds / 40,998 prefix windows**, **60 seeds / 2,400 random row windows**,
+  and **200 seeds / ~80,000 checked btree mutations**, clean in both builds. The
+  `node reachable twice` report was falsified the same way: an injected aliased
+  child slot in `makeLeaves` is reported by both the option-off sweep and the
+  option-on deep sweep as `node 3 is reachable twice`.
+
+  **So the promotion condition stands and is still unmet**, on the parts that
+  are not `src/hexane/**`.
+- **A dispatch whose arms are all reached through a helper rather than through
+  the method under test.** The instance is below.
+- **A condition computed correctly, adjacent to the site that needed it, with the
+  value discarded.** `Document.loadIntoWith` already asked
+  `chunks[0].typ == .document` to decide where a document's changes begin, and
+  dropped the answer **one line above** the `if` that needed it — so the first
+  conjunct of upstream's rule was being evaluated by nobody. `MissingDeps` was
+  not missing either: the port raised it from eight other sites in the same file.
+  **This is the same failure one layer up from an assertion that asserts nothing,
+  and it is the cheapest to miss, because the code that computes the condition
+  looks exactly right.** The port's other defects this session were all *a rule
+  computed in one place and applied in another*; this one is *a rule computed in
+  the right place and not connected to its consumer*.
+
+**The instance, because the evidence is what makes a rule stick.** `ReadDoc::hydrate`
+([`src/read.zig`](../src/read.zig), 2026-10-01) dispatches on the object's type —
+map, list, text (`automerge.rs:1645-1649`). Its first three tests all hydrated
+`.root`, and **a root is a map**, so the `list` and `text` arms were reached
+only through `hydrate.zig`'s own `hydrate_op` and never through the method under
+test. **Rewriting the `.text` arm to build an empty text left all three tests
+green** — `FAIL=0`, exit 0, every case `OK`.
+
+**The suite was not weak. It was aimed one layer above the thing that changed**,
+which is the part worth carrying: the assertions were about map keys, scalars
+and mark *sets*, all of which a broken text arm leaves intact. A fourth test
+that calls the method on a list and on a text — at `null` heads and at `heads` —
+closes it, and both mutations now fail it: `.text` building `""`, and `.list`
+routed to the map arm.
+
+**The generalisable form: a method whose dispatch has arms is tested by its
+arms.** A test that only ever calls it on the most common input has not tested
+the others, whatever it asserts.
+
+**And the boundary, which a citation without it would hide.** That is the same
+shape as P5's "two routes to the same rows" (`expectKeys` and
+`expectSameThroughApplyChanges`, §P5), **but a two-route comparison is not
+equivalent to a content assertion, and the difference is measured.**
+`expectSameThroughApplyChanges` pins the two routes' **agreement**; it cannot see
+a defect **both** routes share, because a shared defect is not a disagreement.
+
+**Measured on this tree, 2026-10-01.** Giving the source document an extra
+operation *before* the replay — so the replayed document inherits it and **both**
+routes end up holding the same wrong thing — the replay fired **zero** times
+across all 43 cases that carry it: `FAIL=0`, no compile errors. The one test that
+did fail was the probe's own fault, an `InvalidOp` in the single `.manual` case,
+not a detection. So a third comparison built on the assumption that a route
+comparison certifies correctness would be **blind in exactly the class that
+matters**, and the routes need a content assertion beside them and not only each
+other. `expectKeys` is the content assertion in that pair, and it is the half
+that would catch what the replay cannot.
+
+### 1.1b A measurement taken against the thing it measures
+
+**A measurement taken against the thing it measures is valid only until that
+thing changes — and the thing that changes it is usually the fix.** This is
+stronger than "re-measure stale numbers", because it says the *fix* invalidates
+the evidence *for the fix*.
+
+The instance, and it is the one above. The `43 opportunities, zero detections`
+figure was taken against an `OpSet.seekOpsByIndex` whose fast and slow paths
+**disagreed**. A clamp that repairs that disagreement changes exactly the
+agreement the probe was measuring. **Carrying the number forward would be
+recording a measurement of a tree that no longer exists** — and it would arrive
+through the most defensible route in the room, because the number *was* measured,
+by falsification, and written down with its evidence. **That is the carry-forward
+error this document has been about all day — an instrument unchecked, a stale
+numerator — arriving through a number that was true when it was written.**
+
+**So the rule is: a measurement whose subject is the thing being repaired must be
+re-taken after the repair, and if its value moves, the move is recorded with the
+reason.** A measurement that does not move is evidence the repair changed nothing
+it could see, which is worth knowing too. **The test of a fix is not the test
+that failed before it; it is the same test, run again afterwards, on the tree the
+fix produced.**
+
+### 1.2 What a reader may *not* rely on: a line number is not a stable reference
+
+**Two halves, and the second is the operative one.**
+
+**First, the survey's citations are known-drifted.** The [survey](survey/) is the
+reference for **claims**, and its `path:line` citations are wrong in **65 of 144
+sampled**, file-local and one-directional in each file. They were **deliberately
+left wrong rather than guessed**, because a known-wrong citation is visible and a
+confidently-wrong one is not. The pattern and the count are in
+[`survey/README.md`](survey/README.md).
+
+**Second — and this is the half that governs what you write — this is not a
+legacy problem to be cleaned up once. It is the standing cost of citing a line
+number at all.** The evidence is from the same hour, by the auditor who measured
+the 149 of 184 stale citations in [`API.md`](../API.md):
+
+* Three `build.zig` citations written into this plan and into `STATUS.md` were
+  **wrong within the hour**, because a neighbouring comment block grew by 28
+  lines and moved the step from `:266` to `:294`.
+* On another slice, an agent broadcast an insertion anchor three times in about
+  twenty minutes and **two of the three were stale** — once because the number
+  named the wrong step, once because the region moved after it had been
+  corrected. **Four peers had taken the number.**
+* Its `src/**` citations, re-verified against the tree the same morning —
+  twenty of them — **all landed on the function they name**, because nothing was
+  editing `src/**` at the time.
+
+**The rule that survives all three cases: cite the anchor's identity, never its
+number.** `path:line` is the right form for a file nobody is editing —
+`src/**`, and the read-only reference checkout, which is frozen by construction —
+and **the wrong form for any region under concurrent edit**. For a region under
+edit, name the declaration or the step and let the reader re-derive the number
+with a fresh read: "after `test_step.dependOn(&run_upstream_batch_insert_tests.step);`",
+not "after line 266".
+
+**And the writer's half, which is the half that is easy to skip:** a reader who
+re-derives a number protects themselves; **a document that asserted the number
+outlived the edit did not.** When a region is moving, do not write the line at
+all.
+
 ## 2. Upstream shape
 
 | Crate | Path | Lines | Port? |
@@ -51,6 +353,11 @@ for the divergence this avoids in Rust.
 | `automerge-cli` | `rust/automerge-cli` | 1,395 | out of scope |
 | `automerge-test` | `rust/automerge-test` | 487 | out of scope, it is a test DSL |
 | javascript, interop | `javascript`, `interop` | — | out of scope |
+
+Every number in that table is a **whole-crate** count (`src` + `tests` +
+benches + `build.rs`), re-measured 2026-10-01 and all six correct.
+`docs/STATUS.md` quotes a different, also-correct measure — `src` only, 54,589
+and 29,683 — and the two were being compared as if one contradicted the other.
 
 `hexane` is not optional: `automerge` stores its op set in `hexane::Column`
 instances ([survey/02](survey/02-transaction-opset.md) §Surface,
@@ -67,7 +374,15 @@ Dead upstream code that is **not** ported, verified by declaration search:
 - `indexed_cache.rs` — declared, all real methods commented out, zero uses
   outside the file.
 - `automerge-cli/src/change.rs` — not `mod`-declared in the CLI.
-- `hexane` features `deep_fuzz` and `bijou64` — no `cfg` reads them.
+- ~~`hexane` features `deep_fuzz` and `bijou64` — no `cfg` reads them.~~ **This
+  was wrong, and it was checked (2026-10-01).** `bijou64` is read at
+  `hexane/src/codec.rs:358` and `:362`, which gate a complete `Bijou64` `Codec`
+  implementation, and `Cargo.toml:20` wires it to `dep:bijoux`. `deep_fuzz` is
+  read at `hexane/src/edit_fuzz.rs:493` and `:1142` and four times in
+  `hexane/src/tests.rs`, all as `#[cfg_attr(test, ignore)]` guards. Neither is
+  dead code. `Bijou64` is a second unsigned codec that the format does not
+  currently use, so the port is still right not to have it — but the reason is
+  that nothing selects it, **not** that no `cfg` reads it.
 
 Feature gates that are part of the port's behaviour: `utf8-indexing`,
 `utf16-indexing` (mutually exclusive), `slow_path_assertions` (invariant
@@ -106,17 +421,26 @@ the `## Zig mapping notes` section of each survey file.
 
 ### 3.1 Error sets
 
-Upstream has 13 error types, 30 variants on `AutomergeError`, with hand-written
-`Display` strings. Zig has one global error namespace, so three sets:
+Upstream has 13 error types, **31** variants on `AutomergeError`
+(`automerge/src/error.rs:13-79`; this said 30, and the survey said 30 while
+listing 31 rows), with hand-written `Display` strings. Zig has one global error
+namespace, so three sets:
 
-- `Error` — the document API surface: the 30 `AutomergeError` variants that are
+- `Error` — the document API surface: the `AutomergeError` variants that are
   observable through the public API, plus `OutOfMemory`.
 - `ParseError` — anything reachable from parsing untrusted bytes: chunk
   framing, column decode, sync message decode, change decode. Every fuzz
   crasher in `tests/fuzz-crashers/` must produce a `ParseError`, never a crash
   and never a hang.
 - `InternalError` — the asserts that upstream treats as impossible. Kept
-  distinct so `-Dslow-path` can surface them instead of `unreachable`.
+  distinct so a slow-path build can surface them instead of `unreachable`.
+  **`-Dslow-path` is a build option** (`build.zig`), and the port's spelling of
+  upstream's `slow_path_assertions` feature is
+  `pub const check_slow_paths: bool = build_options.check_slow_paths`
+  (`src/opset/op_set.zig`), read by `OpSet.seekOpsByIndex` and by
+  `SlabBTree.assertSound` (`src/hexane/btree.zig`). Off by default, which is
+  upstream's default feature set; `zig build slow-path` runs the unit tests in
+  a build where it cannot be off.
 
 An upstream `panic!` that guards a reachable state becomes a `ParseError`
 variant. The `too_many_ops`, `too_many_deps`, `overflow_in_length`, and
@@ -124,7 +448,9 @@ variant. The `too_many_ops`, `too_many_deps`, `overflow_in_length`, and
 
 ### 3.2 Trait dispatch
 
-`ReadDoc` (30 methods) and `Transactable` (21 methods) exist in Rust because
+`ReadDoc` (**34** methods, `read.rs:21-311`) and `Transactable` (**20**
+methods, `transaction/transactable.rs:9-216`; this said 30 and 21) exist in
+Rust because
 `Automerge` and `AutoCommit` are two flavours of the same document, one
 requiring an explicit `Transaction` and one managing it. In Zig this is a
 single concrete `Document` plus a mode flag, and the "trait" becomes a `vtable`
@@ -310,6 +636,13 @@ ones; nothing above 5 is worth doing until they are green.
   oracle crate builds with the pinned toolchain; every fixture is listed in a
   manifest with the expected outcome (`load ok` / `load err`).
 
+**Verdict 2026-10-01 — SATISFIED.** `zig build conformance` is **18/18 steps**
+and regenerates all eight vectors into the build cache and `cmp`-s each against
+the committed copy (`addGoldenVector` in `build.zig`), so every vector is byte-identical to
+what the reference produces now. `zig build test` runs; the manifest covers all
+**18** corpus files (`5` `.load_ok`, `13` `.load_err`) and the agreement test is
+6/6. The oracle builds against the pinned toolchain.
+
 The oracle is the whole differential-testing story and it is worth building
 first: without it, "compatible with automerge" is an opinion. See
 [survey/08](survey/08-conformance-history.md) for the fixture expectations
@@ -329,6 +662,13 @@ yield an error.
   property-tested against the Rust oracle; the SHA-256 and DEFLATE round trips
   pass.
 
+**Verdict 2026-10-01 — SATISFIED.** LEB128 is checked against the reference
+through `test/golden/clock.jsonl` (110 records, `cmp`-ed on every conformance
+run) and directly by 15 tests in `src/leb128.zig`; the clock merge is exercised
+through the same vector. SHA-256 and DEFLATE round-trip in the chunk layer
+(`src/storage/chunk.zig`, and a compressed change chunk is inflated and checked
+at `src/storage/change_chunk.zig:1329`).
+
 ### P2 — hexane
 
 - `Slab`, `Column(T, Encoding)`, `SlabBTree` (B = 64), the RLE and boolean
@@ -345,6 +685,84 @@ yield an error.
   ([survey/06](survey/06-hexane.md) §2) are subtle. Budget for a second pass
   here rather than assuming a first pass converges.
 
+**Verdict 2026-10-01 — PARTLY SATISFIED, and this is the weakest gate in the
+plan.** With every upstream integration file ported bar one case of
+`block_tests.rs`, clause 3 is the largest remaining gap in the port. Three
+clauses:
+
+1. *codec round trips against the Rust encoder* — **SATISFIED**.
+   `test/golden/codec.jsonl` is 1,989 records generated by the reference and
+   `cmp`-ed on every `zig build conformance`; four tests read it, one per codec
+   (`src/hexane/{rle,bool,delta,prefix}.zig`).
+2. *`SlabBTree` passes the upstream invariant checker, ported as a `-Dslow-path
+   test* — **SATISFIED.** `-Dslow-path` is a real build option (`build.zig`),
+   carried into the library module as `build_options.check_slow_paths` and read
+   by both gated checks: `OpSet.seekOpsByIndex`'s fast/slow cross-check
+   (`src/opset/op_set.zig`) and `SlabBTree.assertSound`
+   (`src/hexane/btree.zig`), which is upstream's `check_invariants`
+   (`btree.rs:1283-1360`) as an assertion. The checker is tested ungated
+   (`btree.zig:2487` accepts a sound tree, `:2500` rejects ten corruptions),
+   the gate is tested from both sides (`btree.zig:2634`: with the option a
+   corrupted tree is `error.InvariantViolation`, without it the same tree is
+   silent), and the sweep the option buys is upstream's own deep fuzz at its
+   own scale (`btree.zig:2847`: 25 trials of 300 steps, skipped without the
+   option). `zig build slow-path` runs the unit tests in a build where the
+   option cannot be off.
+
+   **The option found a defect on its first run; fixed 2026-10-01. That arm
+   was comptime-dead until this option existed**, so no gate in the plan had
+   ever compiled it. With `-Dslow-path` off the library suite was 1229
+   passed / 1 skipped / 0 failed / 4m58s; with it on, 1228 passed / 0
+   skipped / **2 failed / 2 leaked** / 8m17s, both failures in
+   `src/cursor.zig` and both from the `seekOpsByIndex` cross-check at
+   `op_set.zig:2852` (`expected error.InvalidCursorOp, found
+   error.Invariant`). It was a defect in the port, not in the gate, and it was
+   **not** closed by turning the cross-check back off.
+
+   **Root cause: `listRegisterAtPos`'s third arm reads the element's own
+   insert out of the `insert` column, and `get_index_for_total(0)` answers
+   row 0 of the whole op set** — `get_index_for_prefix` returns `0` for a
+   target at or below zero (`prefix.rs:605-608`) and `get_index_for_total`
+   subtracts one (`:596-598`), while `pv.total()` is the number of `insert`
+   rows at or before `pos` (`prefix.rs:706-710`). A sequence register whose
+   element has no insert before it — a list's first row being a `set` hung by
+   the head, or a row keyed by a map string — therefore got the register
+   `0..pos + 1`, **rows of another object**: the fast path answered with the
+   parent object's own `make_list` row that the prefix descent had already
+   excluded. Two structures that must agree computing the same thing by
+   different rules — `index.top` says row 1 is the element at index 0 of this
+   object, the `insert` column says there is no insert before it — which is
+   **the fifth instance of this port's most repeated failure shape** (after
+   `mapKeyRow`, `SkipIter`'s skip unit, `scanForStickyMarks`' `run.value.value`
+   and `propRange`'s absent key). The fix is `@max(…, range.start)`, and it
+   is the identity wherever the write path can reach: `TxOp::list`'s key comes
+   from `Op::cursor` on a row that already exists (`inner.rs:510-514`,
+   `op.rs:1073-1082`), so it is always an earlier insert and `pv.total() >= 1`.
+
+   **Both leaks were the checker dropping the answer it was checking.**
+   `seekOpsByIndex` had no `errdefer` on the fast path's `OpsFound`, so its
+   `return error.Invariant` at `:2852` leaked the `ArrayList` buffer
+   `seekListOpsByIndexFast`'s `append` allocated — upstream's `assert_eq!`
+   aborts and never returns (`op_set.rs:648`), this port returns and carries
+   on. **The fix changed no fast-path answer on anything the default build
+   can reach**, and the evidence is the cross-check itself: it compares the
+   two answers on every `seekOpsByIndex` call in the suite and is green, and
+   a test of its own in `src/opset/op_set.zig` compares them with the option
+   **off**.
+
+   **`zig build ctest -Dslow-path` is green, 17/17.** `cabi_lib` imports
+   `zautomerge`, so the option reaches the C ABI with no wiring at all; the
+   option-off run is also 17/17, so the C surface does not move.
+3. *the 193 KB `hexane/src/tests.rs` unit suite ported case-for-case where it
+   tests behaviour* — **NOT SATISFIED.** `src/hexane/` declares 198 test blocks
+   of its own, but only **72** of that file's upstream `#[test]` names
+   (**284 distinct upstream names**, measured 2026-10-01 — **not** the 286
+   `#[test]` functions, because two cases are declared twice under a second codec
+   parameter, `BeLen` and `Bijou64`, so a tally of functions overstates the
+   denominator by two) appear in the tree. It was **1** that morning and **72**
+   an hour later, so this figure is moving. The suite is tested; upstream's cases are not
+   transcribed.
+
 ### P3 — columnar and the document format
 
 - `ColumnSpec` (`(id << 4) | type | deflate_bit`, compared on `normalize()`),
@@ -355,6 +773,16 @@ yield an error.
   document saved by the oracle loads in `zautomerge` and re-saves to a
   semantically equal document; all 8 fuzz crashers return `ParseError`.
 
+**Verdict 2026-10-01 — SATISFIED.** `test/fixtures/` holds **18** corpus files
+(the 9 upstream fixtures, the 8 fuzz crashers and `interop-exemplar`);
+`test/fixtures_test.zig` is **6/6**, including *the 8 upstream fuzz crashers are
+`load_err`* and *the manifest says `load_err` for every fixture whose name starts
+with `crash-`*. The oracle-saved document round trip is pinned by
+`src/doc.zig:6500`. **Note the gate says "every fixture in `tests/fixtures/`"
+while §7 calls the corpus 17 files**: 17 is the upstream count (9 + 8), 18 is
+what the port's directory holds once `interop/exemplar` is added. Both are
+right about different sets; the wording should say which.
+
 ### P4 — change graph, clocks, and change encoding
 
 - `ChangeGraph`, the actor table and `author.rs`, heads, and the change encoder
@@ -363,6 +791,21 @@ yield an error.
   byte-identical to the Rust hashes. This is the strongest single
   compatibility signal available, because the hash covers the whole encoded
   change.
+
+**Verdict 2026-10-01 — SATISFIED, and this is the strongest evidence in the
+port.** Re-measured, not taken on trust:
+
+- `src/doc.zig:9003` `this port's write path produces the reference's own change
+  chunks, byte for byte` builds the oracle's document through this port's own
+  transactions and asserts, per change, that the encoded body equals the
+  reference's bytes **and** that the hash equals the reference's own 32 bytes;
+  it also asserts `changes.len == 2`, so it cannot pass vacuously.
+- `src/doc.zig:6425` / `:6442` re-encode a change chunk the *reference wrote* to
+  the reference's bytes and hash, plain and compressed.
+- `src/doc.zig:6500` returns every change in the reference's own 446-byte
+  document with the reference's hashes.
+
+`zig test … --test-filter "reference"` → **20/20 pass**, including all three.
 
 ### P5 — op set and merge
 
@@ -374,6 +817,28 @@ yield an error.
   the same operation script, produce the same `save()` bytes modulo the
   DEFLATE stream.
 
+**Verdict 2026-10-01 — the named cases are now ported; one clause remains
+unasserted.** The gate names two upstream files and both counts in it are right
+(`test.rs` is 4,450 lines with 140 `#[test]`; `batch_insert.rs` is 1,065 lines
+with 46). Measured by name:
+
+- `tests/test.rs` — **140 / 140** present.
+- `tests/batch_insert.rs` — **46 / 46** present, in `test/upstream_batch_insert.zig`,
+  wired by the `upstream_batch_insert_tests` step, **47/47 passing** with no leaks. The file carries two
+  complementary row-order assertions: `expectKeys` (the keys in row order) and
+  `expectSameThroughApplyChanges` (the same document replayed through
+  `Document.applyChanges`, compared with `debugCmp` first) at **45 sites across
+  43 of the 47 cases**. `BatchInsertion::next_pos` computes each operation's row
+  from the ones before it (`inner.rs:1460-1462`) and a map reader does not sort
+  (`iter/map_range.rs:1486-1490`), so the write path and the apply path are two
+  routes to the same rows; both assertions were falsified rather than believed.
+
+**What is still open is the second clause**, not the porting: a shared document's
+`save()` bytes matching modulo the DEFLATE stream is not separately asserted
+anywhere. `save()` equivalence is checked the other way round, by loading, per §1
+— which is the right check, but a gate that says "the bytes match" should say so
+with a test rather than with an exemption.
+
 ### P6 — document API
 
 - `Document` (the `Automerge` and `AutoCommit` flavours), `Transaction`,
@@ -383,12 +848,28 @@ yield an error.
   complete and every method has a test. The `lib.rs` address-book doctest is a
   permanent test.
 
+**Verdict 2026-10-01 — SATISFIED, with three `API.md` corrections.** The
+`ReadDoc` and `Transactable` surfaces are present and the crate-root address-book
+doctest is a permanent test (`test/example_test.zig`, **3/3**). Three
+declarations in `API.md` were wrong and are now corrected: `parents` had lost
+the `Result` that `read.rs:35` and `src/read.zig:1102` both carry; §Write's
+"twenty … one for one" counts **twenty-one** declarations against upstream's
+**twenty** methods; and `mark` / `unmark` do not match
+`transaction/transactable.rs:103-117` in arity or order.
+
 ### P7 — iteration and historical reads
 
 - `iter/**`, including the `Shiftable` repositioning abstraction that avoids
   per-object allocation, the diff iterators, and `ClockRange::Diff`.
 - Gate: `tests/text.rs` and `tests/text_encoding.rs` ported case-for-case,
   including the 15 tests each run under 4 encodings.
+
+**Verdict 2026-10-01 — PARTLY SATISFIED.** The gate's numbers are themselves off:
+upstream's `tests/text.rs` has **21** `#[test]` functions and
+`tests/text_encoding.rs` has **15**, so "the 15 tests each" does not hold for the
+first file. Measured by name: `text.rs` **8 / 21** present, `text_encoding.rs`
+**10 / 15** present. The ported subset is green — the library suite is
+**1228/1228** — so this is a completeness gap, not a correctness one.
 
 ### P8 — sync
 
@@ -399,10 +880,36 @@ yield an error.
   deliberately v1-only peer. Port the five round-trip tests from
   `sync/v1_compat_test/`.
 
+**Verdict 2026-10-01 — SATISFIED, and the gate's count is wrong.** `sync/v1_compat_test/`
+holds **three** round-trip tests (`mod.rs:473`, `:496`, `:519`); `bloom.rs` and
+`state.rs` declare none, so "the five" is not a measurable number. The port's
+`src/sync/v1.zig` carries **9** tests and covers both directions and a v1-only
+peer; `src/sync/protocol.zig:3193` drives a Zig and a Rust document in both
+directions byte for byte.
+
 ### P9 — patches, marks, cursors, text diff, hydrate, serde
 
 - Gate: `tests/diff_marks.rs` (36 tests) and `tests/test_mark_patches.rs`
   ported; `hydrate` replays a patch stream into an equal mirror.
+
+**Verdict 2026-10-01 — SATISFIED, and this row was wrong for most of the day.**
+Both named files are ported: `tests/diff_marks.rs` is **36 of 36** — one
+`test "diff_marks: …"` block per upstream case, in `src/marks.zig`, every name
+upstream's own case translated (`overlapping_marks_remove_one_keep_other` →
+*overlapping marks lose one and keep the other*), and `--test-filter
+diff_marks` is green. `tests/test_mark_patches.rs` is **1 of 1** in
+`test/mark_patches_test.zig`, wired. The hydrate clause holds, with the log
+dropped before the mirror is read.
+
+**The correction, because the error was mine and it was load-bearing.** This row
+said *partly satisfied, and the weakest gate in the plan*, on a name-presence
+count of **12 of 36**. **That instrument is wrong for this port**: every ported
+case is renamed into English, so name-presence under-counts by roughly three, and
+ranking the gates on it made P9 look like the largest hole in the port when it
+was the most completely ported. The sound instrument is the port's own prefix
+convention — one `test "<upstream file>: …"` block per upstream case — and by
+that measure the whole of the upstream integration suite is ported bar **one**
+case of `block_tests.rs`. **See STATUS.md's table.**
 
 ### P10 — bindings
 
@@ -413,20 +920,43 @@ yield an error.
 - Gate: `automerge-c`'s 21 cmocka files, including the three ported-from-wasm
   suites, pass against the Zig library.
 
+**Verdict 2026-10-01 — SATISFIED; the count is wrong.** `zig build ctest` is
+**5/5 steps, 153 cmocka cases, 0 failed** (measured 2026-10-01). 136 of those
+cases are upstream's own: `test/c/suite/` is a verbatim copy of
+`rust/automerge-c/test/`, re-verified file by file on 2026-10-01 (24 of 25
+non-`CMakeLists` files identical; `main.c` lives at `test/c/main.c`, which that
+file's header explains). The other 17 are this port's `abi_coverage.c`.
+
+"21 cmocka files" is not a measurable count. Upstream's
+`rust/automerge-c/test/` holds **19** `.c` files, 5 headers, one data file and
+`CMakeLists.txt` — 26 files in all. Two upstream fixtures are worth recording:
+the suite needs `-Dcmocka-prefix=<dir>` pointing at a cmocka built against this
+host's glibc, and it needs `LD_LIBRARY_PATH` to include that prefix's `lib64`,
+because the build step sets no rpath.
+
 ## 7. Verification strategy
 
 Four independent layers, because none of them catches what the others catch.
 
 1. **Ported unit and integration tests.** The upstream suite is 293 integration
-   tests across 10 binaries plus 34 in-file test modules. Port them
-   case-for-case; a test that asserts a Rust type's layout is dropped, a test
-   that asserts behaviour is kept. Any test that cannot be ported gets its gap
-   written down in the same commit.
-2. **Fixture conformance.** 17 files. The 9 in `tests/fixtures/` have
+   tests across 10 binaries, plus in-file test modules. **293 is right**
+   (re-measured 2026-10-01: `grep -c '#\[test\]'` over the ten files sums to
+   exactly 293). **"34 in-file test modules" is not reproducible from any
+   measure I could find**: `automerge/src` holds 67 `#[cfg(test)]` attributes
+   across 42 files, `hexane/src` holds 33 across 17, and there are 47 `mod
+   test…` declarations. Whichever was meant, the number should be dropped
+   rather than restated. Port the cases case-for-case; a test that asserts a
+   Rust type's layout is dropped, a test that asserts behaviour is kept. Any
+   test that cannot be ported gets its gap written down in the same commit —
+   and **173 of the 293 names are in the tree today**, with
+   `batch_insert.rs` at zero.
+2. **Fixture conformance.** 17 upstream files, **18** in the port's
+   `test/fixtures/` (the extra one is `interop-exemplar`). The 9 in
+   `tests/fixtures/` have
    all-or-nothing load expectations; the 8 in `tests/fuzz-crashers/` must all
    return an error. `interop/exemplar` has its expected JSON in
-   `interop/README.md` and is currently unasserted anywhere — the port makes it
-   a test.
+   `interop/README.md`; the port asserts it — `test/golden/doc.jsonl` pins the
+   446-byte document chunk it produces, byte for byte.
 3. **Differential testing against the Rust reference.** The oracle crate
    generates documents, change streams, and sync transcripts; the Zig side
    replays them and compares. This is the only layer that proves wire

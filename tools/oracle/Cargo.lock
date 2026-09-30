@@ -1185,6 +1185,7 @@ name = "zautomerge-oracle"
 version = "0.1.0"
 dependencies = [
  "automerge",
+ "hexane",
  "serde_json",
 ]
 

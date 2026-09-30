@@ -226,7 +226,7 @@ pub enum DecodeError {
 }
 ```
 
-`rust/automerge/src/sync/state.rs:32-81` — 13 public fields:
+`rust/automerge/src/sync/state.rs:33-81` — **12** public fields:
 
 ```rust
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]

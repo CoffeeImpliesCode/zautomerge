@@ -1,0 +1,41 @@
+The files in this directory are copied from the upstream `automerge` C test
+suite, `rust/automerge-c/test/` at commit
+`ddbff535407e4d28cd2a82eaf6c6add08caa3bdd`, with one omission, recorded
+below. They are MIT-licensed, and that notice is carried here as `AGENTS.md`'s
+"Do not copy upstream code into this repository without carrying its licence"
+requires.
+
+The one omission: `main.c` is not here. `test/c/main.c` is it, with two
+changes and no others — the function is named `suite_main` rather than
+`main`, because Zig 0.16's build system cannot use a C file as the root of an
+executable and so `test/c/main.zig` has to own `main`; and the sum in it has
+one extra term, `run_abi_coverage_tests()`, which is this port's own group in
+`test/c/abi_coverage.c`. That group exists because `rust/automerge-c/test/`
+calls 147 of the 187 functions `include/automerge.h` declares; without it the
+other forty would be linked into the test binary and never executed, which is
+exactly what an unrun export looks like. Every other file in this directory
+is byte-for-byte upstream, so a `diff -r` against the upstream directory
+reports only that `main.c` is missing.
+
+`files/brave-ape-49.automerge` is a test input document from the same
+directory and is likewise covered.
+
+Copyright (c) 2019-2021 the Automerge contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

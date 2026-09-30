@@ -19,12 +19,21 @@
 //! An empty literal run is unrepresentable, because `signed(0)` is the null
 //! marker.
 //!
-//! Values are packed by their own integer type: `u64` as unsigned LEB128,
-//! `i64` as signed LEB128 (`rust/hexane/src/lib.rs:566-595`), so a `u64`
-//! column never spends a byte on a sign and an `i64` column gets one-byte
-//! values for −64..=63. `RleOption` is the nullable form: an absent value is
-//! carried by the header, never by a payload byte
-//! (`rust/hexane/src/lib.rs:406-437`).
+//! Values are packed by their own type: `u64` as unsigned LEB128, `i64` as
+//! signed LEB128 (`lib.rs:566-595`), so a `u64` column never spends a byte
+//! on a sign and an `i64` column gets one-byte values for −64..=63, and
+//! `String` / `Vec<u8>` as an *unsigned LEB128 length* followed by that many
+//! raw bytes (`lib.rs:694-773`). The byte payload is what makes a value's
+//! width depend on the value rather than on the column, and it is the only
+//! payload whose length is not implied by the run header's arithmetic:
+//! a literal run of 40 one-byte strings is 40 payload *headers* plus their
+//! bytes, and the byte offsets of its later values are only recoverable by
+//! walking it.
+//!
+//! `RleOption` is the nullable form: an absent value is carried by the
+//! header, never by a payload byte (`lib.rs:406-437`). **An empty `String`
+//! is therefore a present value of zero length, not a null run** — the two
+//! are different wire forms and `null` never round-trips to `""`.
 //!
 //! Canonical form — the shape `write` always produces and the shape
 //! `canonical` demands — is upstream's `RleSegment::validate_after`
@@ -41,6 +50,14 @@
 //!  8. a run's first value may not equal the previous run's value, in either
 //!     direction (repeat→literal and literal→repeat);
 //!  9. no null run at all in a non-nullable column.
+//!
+//! Rules 6, 7 and 8 say *the same value*, and for a byte payload that is
+//! **equal bytes, not the same slice**: two spellings of `"a"` borrowed from
+//! two offsets of one slab are different slices and the same value, exactly as
+//! upstream's `ColumnValueRef::eq` (`lib.rs:688-690`, `:739-741`) decides it.
+//! Every equality-sensitive path here — the segmenter's run detection, these
+//! three rules, and a caller asking whether two decoded rows are equal — goes
+//! through `Rle(T).elementEql` rather than through Zig's `==`.
 //!
 //! Together those give the load iterator's own guarantee
 //! (`rust/hexane/src/rle/load.rs:70-80`): adjacent runs never carry equal
@@ -68,11 +85,88 @@ const ParseError = err.ParseError;
 /// `error.TooLarge`.
 pub const maxSlabLen: usize = if (@bitSizeOf(usize) < 33) std.math.maxInt(usize) else 1 << 32;
 
+/// Whether `T` is one of this crate's value payloads: an integer, which
+/// packs as LEB128, or `[]const u8`, which packs as an unsigned LEB128
+/// length followed by that many raw bytes (`lib.rs:694-773`).
+fn isPayload(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .int => true,
+        // The same shape `column.zig` uses to recognise a byte payload.
+        .pointer => |p| p.size == .slice and p.child == u8,
+        else => false,
+    };
+}
+
+/// Rejects any `T` that is not a payload, with one message for both
+/// factories so the two cannot drift into accepting different types.
+fn checkPayload(comptime T: type) void {
+    if (!isPayload(T) or T == [:0]const u8) @compileError(
+        "an RLE value must be an integer type or []const u8",
+    );
+}
+
+/// One value payload read from `bytes` at `pos`, and the bytes it occupies.
+///
+/// An integer payload is LEB128, signed or unsigned by `T`'s own signedness
+/// (`lib.rs:566-637`). A byte payload is an unsigned LEB128 length followed
+/// by exactly that many bytes (`lib.rs:747-764`): a length that does not
+/// fit `usize` is `error.Overflow`, one longer than the bytes that follow is
+/// `error.LengthExceedsInput`, and a malformed length is whatever the LEB128
+/// reader says.
+///
+/// **A byte payload borrows `bytes`.** It is a window on the encoded slab,
+/// not a copy, exactly as upstream's `try_unpack` returns `&'a [u8]`
+/// (`lib.rs:756-764`); a caller that keeps it past the slab's own lifetime
+/// has to copy it.
+pub fn payloadRead(comptime T: type, bytes: []const u8, pos: usize) ParseError!struct { value: T, len: usize } {
+    if (comptime T == []const u8) {
+        const hdr = try leb128.readUnsigned(bytes[pos..]);
+        const n = std.math.cast(usize, hdr.value) orelse return error.Overflow;
+        const at = pos + hdr.len;
+        // `readUnsigned` consumed `hdr.len` bytes out of `bytes`, so `at` is
+        // inside the slice and the difference cannot underflow.
+        if (bytes.len - at < n) return error.LengthExceedsInput;
+        return .{ .value = bytes[at..][0..n], .len = hdr.len + n };
+    }
+    if (@typeInfo(T).int.signedness == .signed) {
+        const v = try leb128.readSigned(bytes[pos..]);
+        const narrow = std.math.cast(T, v.value) orelse return error.Overflow;
+        return .{ .value = narrow, .len = v.len };
+    }
+    const v = try leb128.readUnsigned(bytes[pos..]);
+    const narrow = std.math.cast(T, v.value) orelse return error.Overflow;
+    return .{ .value = narrow, .len = v.len };
+}
+
+/// Appends one value payload to `out`.
+pub fn payloadAppend(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime T: type, value: T) std.mem.Allocator.Error!void {
+    if (comptime T == []const u8) {
+        try leb128.appendUnsigned(out, gpa, value.len);
+        try out.appendSlice(gpa, value);
+        return;
+    }
+    if (@typeInfo(T).int.signedness == .signed) return leb128.appendSigned(out, gpa, value);
+    return leb128.appendUnsigned(out, gpa, value);
+}
+
+/// Whether two value payloads are **the same value**.
+///
+/// An integer compares by its own `==`. A byte payload compares by content,
+/// which is upstream's `ColumnValueRef::eq` for `Vec<u8>` (`lib.rs:739-741`)
+/// and `String` (`lib.rs:688-690`) — and *not* Zig's `==` on a slice, which
+/// compares the pointer and the length. Every run boundary and every
+/// canonicality rule in this file goes through here rather than through `==`.
+pub fn payloadEql(comptime T: type, a: T, b: T) bool {
+    if (comptime T == []const u8) return std.mem.eql(u8, a, b);
+    return a == b;
+}
+
 /// The codec over `T` for both the plain and the nullable column: `T` is the
-/// integer whose LEB128 form is a value payload, and `Nullable` says whether
-/// a null run is part of the format. For the plain form `Element == T`; for
-/// the nullable form `Element == ?T`.
-fn RleGeneric(comptime T: type, comptime Nullable: bool) type {
+/// payload whose bytes one value occupies, `Nullable` says whether a null run
+/// is part of the format, and `Utf8` says whether a byte payload has to be
+/// valid UTF-8. For the plain form `Element == T`; for the nullable form
+/// `Element == ?T`.
+fn RleGeneric(comptime T: type, comptime Nullable: bool, comptime Utf8: bool) type {
     return struct {
         /// One decoded column entry: `T` for the plain form, `?T` for the
         /// nullable one.
@@ -135,6 +229,19 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool) type {
             return out;
         }
 
+        /// The number of values a slab holds, counted run by run without
+        /// materialising one.
+        ///
+        /// This is the length [`decodeAll`] allocates from, and it is the
+        /// right answer for a caller that only needs the row count: a repeat
+        /// or null run is charged its declared length instead of being
+        /// stepped through, so a slab claiming `maxSlabLen` values costs one
+        /// pass over its runs rather than `maxSlabLen` calls. A slab that is
+        /// not a slab at all raises whatever the walk hits first.
+        pub fn countEntries(bytes: []const u8) ParseError!usize {
+            return countValues(bytes);
+        }
+
         /// Checks that `bytes` is a well-formed *and* canonical slab for this
         /// column type. Structural non-canonicality is `error.InvalidValue`, a
         /// null run in a non-nullable column is `error.UnexpectedNull`, and a
@@ -154,13 +261,15 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool) type {
                     if (hdr.count < 2) return error.InvalidValue; // rule 1
                     const cv = try readValue(bytes, hdr.payload_at);
                     const v: Element = cv.value;
-                    // Rules 6 and 8.
+                    // Rules 6 and 8, by value and not by slice identity:
+                    // two payloads borrowed from the slab at different
+                    // offsets are still the same value.
                     if (prev) |p| switch (p) {
                         .run => |q| {
-                            if (q == v) return error.InvalidValue;
+                            if (elementEql(q, v)) return error.InvalidValue;
                         },
                         .lit => |q| {
-                            if (q == v) return error.InvalidValue;
+                            if (elementEql(q, v)) return error.InvalidValue;
                         },
                         .null_run => {},
                     };
@@ -188,14 +297,14 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool) type {
                         const cv = try readValue(bytes, p);
                         const v: Element = cv.value;
                         if (prev_lit) |pl| {
-                            if (pl == v) return error.InvalidValue; // rule 7
+                            if (elementEql(pl, v)) return error.InvalidValue; // rule 7
                         } else if (prev) |q| switch (q) {
                             // Rule 8, at the boundary of the literal run.
                             .run => |x| {
-                                if (x == v) return error.InvalidValue;
+                                if (elementEql(x, v)) return error.InvalidValue;
                             },
                             .lit => |x| {
-                                if (x == v) return error.InvalidValue;
+                                if (elementEql(x, v)) return error.InvalidValue;
                             },
                             .null_run => {},
                         };
@@ -336,6 +445,27 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool) type {
             return false;
         }
 
+        /// Whether two elements are **the same column value**.
+        ///
+        /// Zig's `==` on a slice compares the pointer and the length, so a
+        /// byte payload borrowed twice from the same slab at different
+        /// offsets would compare unequal and every run boundary would be
+        /// missed. Every equality-sensitive path in this file — the
+        /// segmenter's run detection and rules 6, 7 and 8 of `canonical` —
+        /// goes through here, and so does anything that has to answer
+        /// "are these two values the same" about decoded rows.
+        pub fn elementEql(a: Element, b: Element) bool {
+            if (comptime Nullable) {
+                // An absent value is its own value: it equals another absent
+                // one and nothing else, so it can never be content-equal to
+                // a present empty payload.
+                const av = a orelse return b == null;
+                const bv = b orelse return false;
+                return payloadEql(T, av, bv);
+            }
+            return payloadEql(T, a, b);
+        }
+
         /// The `T` behind a value payload. The segmenter sends every absent
         /// value to a null run, so an absent value never reaches a repeat or
         /// literal payload; the panic is a bug in this file, not in the input.
@@ -350,10 +480,14 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool) type {
         //
         // `u64` packs as unsigned LEB128 and `i64` as signed LEB128, matching
         // the upstream `RleValue for u64` / `for i64` impls
-        // (`rust/hexane/src/lib.rs:566-595`).
+        // (`rust/hexane/src/lib.rs:566-595`). `String` and `Vec<u8>` pack as
+        // an unsigned LEB128 length followed by that many raw bytes
+        // (`lib.rs:725-729`, `:765-769`), which is the one payload whose
+        // length is not the LEB128 width of the value itself.
 
         /// The number of bytes one value of type `T` occupies.
         fn valueSize(value: T) usize {
+            if (comptime T == []const u8) return leb128.unsignedSize(value.len) + value.len;
             if (@typeInfo(T).int.signedness == .signed) {
                 return leb128.signedSize(value);
             }
@@ -362,6 +496,11 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool) type {
 
         /// Writes one value payload, returning the bytes written.
         fn writeValue(out: []u8, value: T) usize {
+            if (comptime T == []const u8) {
+                const n = leb128.writeUnsigned(out, value.len);
+                @memcpy(out[n..][0..value.len], value);
+                return n + value.len;
+            }
             if (@typeInfo(T).int.signedness == .signed) {
                 return leb128.writeSigned(out, value);
             }
@@ -371,7 +510,23 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool) type {
         /// Reads one value payload. A payload byte can only ever spell a
         /// present value: an absent entry is carried by the run header, never
         /// by a payload.
+        ///
+        /// A byte payload is borrowed from `bytes`, and is validated as UTF-8
+        /// here when the codec asks for it — upstream's `RleValue for String`
+        /// validates in `try_unpack` (`lib.rs:700-709`) and skips the check in
+        /// `unpack` only because the column was validated when it loaded
+        /// (`lib.rs:710-723`). This port has no unchecked `unpack`: every
+        /// reader is a `try_` reader, so `RleUtf8`'s check runs on every read,
+        /// and `Rle([]const u8)` keeps `Vec<u8>`'s rule of accepting any byte
+        /// (`lib.rs:756-764`).
         fn readValue(bytes: []const u8, pos: usize) ParseError!struct { value: T, len: usize } {
+            if (comptime T == []const u8) {
+                const pv = try payloadRead(T, bytes, pos);
+                if (comptime Utf8) {
+                    if (!std.unicode.utf8ValidateSlice(pv.value)) return error.InvalidUtf8;
+                }
+                return .{ .value = pv.value, .len = pv.len };
+            }
             if (@typeInfo(T).int.signedness == .signed) {
                 const v = try leb128.readSigned(bytes[pos..]);
                 const narrow = std.math.cast(T, v.value) orelse return error.Overflow;
@@ -548,7 +703,7 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool) type {
                     if (self.pos >= self.values.len) return self.flushLiteral();
                     const v = self.values[self.pos];
                     var j = self.pos + 1;
-                    while (j < self.values.len and self.values[j] == v) j += 1;
+                    while (j < self.values.len and elementEql(self.values[j], v)) j += 1;
                     const run = j - self.pos;
                     if (isNull(v)) {
                         // The literal run in progress belongs before the null
@@ -616,27 +771,48 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool) type {
     };
 }
 
-/// The run-length codec for a non-nullable column. `T` is an integer, `u64` or
-/// `i64` in this port: unsigned types pack their values as unsigned LEB128,
-/// signed types as signed LEB128. A null run on the wire is
-/// `error.UnexpectedNull` rather than a value.
+/// The run-length codec for a non-nullable column. `T` is an integer — `u64`
+/// or `i64` in this port, unsigned types packing as unsigned LEB128 and
+/// signed ones as signed LEB128 — or `[]const u8`, the length-prefixed byte
+/// payload of upstream's `Vec<u8>` (`lib.rs:732-770`). A null run on the
+/// wire is `error.UnexpectedNull` rather than a value.
+///
+/// `Rle([]const u8)` accepts any byte, because `Vec<u8>` does. The codec
+/// that refuses a byte string that is not UTF-8 is [`RleUtf8`].
 pub fn Rle(comptime T: type) type {
-    switch (@typeInfo(T)) {
-        .int => {},
-        else => @compileError("Rle values must be an integer type"),
-    }
-    return RleGeneric(T, false);
+    checkPayload(T);
+    return RleGeneric(T, false, false);
 }
 
 /// The run-length codec for a nullable column over `T`. An absent value is
 /// carried by a null run in the header, so a literal or repeat payload always
 /// holds a present value and `Element` is `?T`.
+///
+/// **An absent value is not an empty one.** `?[]const u8`'s `null` encodes as
+/// the null run and its `""` as a zero-length payload, and the two decode
+/// back to the two distinct values they came from.
 pub fn RleOption(comptime T: type) type {
-    switch (@typeInfo(T)) {
-        .int => {},
-        else => @compileError("RleOption values must be an integer type"),
-    }
-    return RleGeneric(T, true);
+    checkPayload(T);
+    return RleGeneric(T, true, false);
+}
+
+/// The run-length codec over `String`, in both the plain and the nullable
+/// form: upstream's `RleValue for String` (`lib.rs:696-730`), which is
+/// `Vec<u8>`'s payload plus a UTF-8 check.
+///
+/// The value type is the byte slice, not an owning string — one `[]const u8`
+/// per row, borrowed from whatever storage the slab lives in — and
+/// `Nullable` picks the same two forms [`Rle`] and [`RleOption`] have.
+///
+/// **Where the check runs.** Upstream splits it: `try_unpack` validates and
+/// `unpack` does not, the second relying on the column having been validated
+/// at load (`lib.rs:700-723`). This port has one reader and no unchecked
+/// path, so the check is in the reader itself — a byte string that is not
+/// UTF-8 is `error.InvalidUtf8` from `decodeAll`, from `Decoder.next` and
+/// from `canonical`, and a slab carrying one is never counted, never sized
+/// and never handed out a row for.
+pub fn RleUtf8(comptime Nullable: bool) type {
+    return RleGeneric([]const u8, Nullable, true);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -699,17 +875,31 @@ fn checkRoundTrip(comptime Codec: type, comptime T: type, values: []const T) !vo
 
     const back = try Codec.decodeAll(buf, gpa);
     defer gpa.free(back);
-    try testing.expectEqualSlices(T, values, back);
+    try expectEqualElements(Codec, values, back);
 
     var dec = try Codec.Decoder.init(buf);
     for (values) |want| {
-        try testing.expectEqual(want, (try dec.next()).?);
+        const got = (try dec.next()).?;
+        try testing.expect(Codec.elementEql(want, got));
     }
     try testing.expect((try dec.next()) == null);
 
     const appended = try expectWritten(Codec, T, values);
     defer gpa.free(appended);
     try testing.expectEqualSlices(u8, buf, appended);
+}
+
+/// Two value sequences hold the same values.
+///
+/// **`expectEqualSlices` cannot answer this for a byte payload.** Its
+/// element comparison is `==`, and `==` on a slice is the pointer and the
+/// length — so two spellings of `"a"` borrowed from two places in one slab
+/// would be reported unequal. The codec's own `elementEql` is the same
+/// answer the run boundaries are decided by, which is what makes a
+/// round trip test and a canonicality test agree about "the same value".
+fn expectEqualElements(comptime Codec: type, want: []const Codec.Element, got: []const Codec.Element) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |a, b| try testing.expect(Codec.elementEql(a, b));
 }
 
 test "u64 values round trip through write, decodeAll and Decoder" {
@@ -1138,6 +1328,13 @@ test "arbitrary bytes are refused, never a trap" {
     const gpa = testing.allocator;
     const U = Rle(u64);
     const O = RleOption(u64);
+    // The byte payload's reader is the one that trusts a number from the
+    // wire, so the sweep below runs all four of its codecs over the same
+    // bytes: two spellings of "any byte" and two of "UTF-8 only".
+    const B = Rle([]const u8);
+    const BO = RleOption([]const u8);
+    const S = RleUtf8(false);
+    const SO = RleUtf8(true);
     var prng = std.Random.DefaultPrng.init(0xc0ffee);
     const random = prng.random();
 
@@ -1151,6 +1348,10 @@ test "arbitrary bytes are refused, never a trap" {
         for (bytes[0..len]) |*b| b.* = random.int(u8);
         U.canonical(bytes[0..len]) catch {};
         O.canonical(bytes[0..len]) catch {};
+        B.canonical(bytes[0..len]) catch {};
+        BO.canonical(bytes[0..len]) catch {};
+        S.canonical(bytes[0..len]) catch {};
+        SO.canonical(bytes[0..len]) catch {};
         if (U.Decoder.init(bytes[0..len])) |made| {
             var d = made;
             // Three values is enough to cross a header boundary; counting them
@@ -1167,11 +1368,46 @@ test "arbitrary bytes are refused, never a trap" {
                 _ = d.next() catch break;
             }
         } else |_| {}
+        inline for (.{ B, BO, S, SO }) |codec| {
+            if (codec.Decoder.init(bytes[0..len])) |made| {
+                var d = made;
+                var steps: usize = 0;
+                while (steps < 3) : (steps += 1) {
+                    _ = d.next() catch break;
+                }
+            } else |_| {}
+        }
     }
 
-    // A second sweep over slabs built from the run grammar, each one then
-    // flipped at a random bit. These keep the counts small enough to decode
-    // in full, so the two readers can be held against each other.
+    // A second sweep over slabs built from the run grammar with *byte*
+    // payloads — a length, then that many bytes — so the payload reader is
+    // exercised against lengths that are right, short by a byte or two, and
+    // absurd.
+    round = 0;
+    while (round < 2000) : (round += 1) {
+        const len = byteGrammarSlab(random, &bytes);
+        const flip = random.uintLessThan(usize, len);
+        bytes[flip] ^= @as(u8, 1) << @intCast(random.uintLessThan(u8, 8));
+        _ = B.canonical(bytes[0..len]) catch {};
+        _ = BO.canonical(bytes[0..len]) catch {};
+        _ = S.canonical(bytes[0..len]) catch {};
+        _ = SO.canonical(bytes[0..len]) catch {};
+        const back = B.decodeAll(bytes[0..len], gpa) catch continue;
+        defer gpa.free(back);
+        // What decoded must hold exactly what the cursor yields, value for
+        // value, compared by content — the two readers cannot drift apart.
+        var dec = try B.Decoder.init(bytes[0..len]);
+        var i: usize = 0;
+        while (i < back.len) : (i += 1) {
+            try testing.expect(B.elementEql(back[i], (try dec.next()).?));
+        }
+        try testing.expect((try dec.next()) == null);
+    }
+
+    // A third sweep over slabs built from the run grammar with integer
+    // payloads, each one then flipped at a random bit. These keep the counts
+    // small enough to decode in full, so the two readers can be held against
+    // each other.
     round = 0;
     while (round < 2000) : (round += 1) {
         const len = grammarSlab(random, &bytes);
@@ -1219,6 +1455,44 @@ fn grammarSlab(random: std.Random, out: []u8) usize {
     return n;
 }
 
+/// Writes a slab built from the run grammar with *byte* payloads — a length,
+/// then that many bytes — into `out`, returning its length. The counts and the
+/// payload lengths are capped so the slab always fits `out`; the payloads are
+/// rarely all well-formed, because the claim the reader has to catch is a
+/// length the bytes behind it do not back.
+fn byteGrammarSlab(random: std.Random, out: []u8) usize {
+    var n: usize = 0;
+    const runs = random.uintLessThan(usize, 3) + 1;
+    for (0..runs) |_| {
+        switch (random.uintLessThan(u8, 3)) {
+            0 => {
+                n += leb128.writeSigned(out[n..], random.intRangeAtMost(i64, 1, 40));
+                n += writeBytePayload(random, out[n..]);
+            },
+            1 => {
+                const count = random.uintLessThan(usize, 2) + 1;
+                n += leb128.writeSigned(out[n..], -@as(i64, @intCast(count)));
+                for (0..count) |_| n += writeBytePayload(random, out[n..]);
+            },
+            else => {
+                n += leb128.writeSigned(out[n..], 0);
+                n += leb128.writeUnsigned(out[n..], random.intRangeAtMost(u64, 0, 40));
+            },
+        }
+    }
+    return n;
+}
+
+/// One length-prefixed byte payload, half the time claiming more bytes than
+/// are written behind it.
+fn writeBytePayload(random: std.Random, out: []u8) usize {
+    const claimed = random.intRangeAtMost(u8, 0, 4);
+    const written = if (random.boolean()) claimed else random.intRangeAtMost(u8, 0, 4);
+    const n = leb128.writeUnsigned(out, claimed);
+    for (out[n..][0..written]) |*b| b.* = random.int(u8);
+    return n + written;
+}
+
 test "a slab claiming more values than a slab may hold is refused" {
     const gpa = testing.allocator;
     const U = Rle(u64);
@@ -1246,3 +1520,618 @@ test "a slab claiming more values than a slab may hold is refused" {
     try testing.expectEqual(@as(?u64, 7), try dec.next());
     try testing.expectEqual(@as(?u64, 7), try dec.next());
 }
+
+// ── Upstream `hexane/src/tests.rs`, the frozen byte fixtures ──────────────────
+
+test "golden_format_rle_u64" {
+    // **`tests.rs:4793-4799`.** `Column::<u64>::from_values(..).save()` against
+    // the frozen bytes, then `Column::load` back to the values
+    // ([`golden_rle`, `tests.rs:4773-4791`](
+    // ../github-automerge-automerge/rust/hexane/src/tests.rs)).
+    //
+    // **A single-slab column's `save()` *is* its codec's bytes.** The column
+    // wire format has no column-level header: the fixture
+    // `[3, 1, 125, 2, 3, 4, 4, 5]` reads as `repeat(3)×1`, `signed(125) ==
+    // -3` literal count then `2, 3, 4`, then `repeat(4)×5` — the whole of
+    // upstream's RLE wire, which is what the module doc above quotes from
+    // `rle/mod.rs:25-33`. So the case pins the **codec**, and it pins it at
+    // the same bytes; a `Column` in the way would add nothing.
+    //
+    // The fixture is frozen, and upstream says so at `tests.rs:4762-4771`:
+    // "If one of these assertions fails, the wire format changed. That is a
+    // compatibility break with every existing automerge document: stop and
+    // think, don't update the fixture." It is written out here, not read
+    // from the corpus, for that reason.
+    const fixture = [_]u8{ 3, 1, 125, 2, 3, 4, 4, 5 };
+    const values = [_]u64{ 1, 1, 1, 2, 3, 4, 5, 5, 5, 5 };
+    try expectBytes(Rle(u64), u64, &values, &fixture);
+
+    // The reload half of `golden_rle`: the fixture decodes back to the values
+    // it was frozen from, element by element and not by a length.
+    const back = try Rle(u64).decodeAll(&fixture, testing.allocator);
+    defer testing.allocator.free(back);
+    try testing.expectEqualSlices(u64, &values, back);
+}
+
+test "golden_format_rle_opt_u64" {
+    // **`tests.rs:4802-4807`.** `Column::<Option<u64>>`, same fixture shape.
+    //
+    // Read as runs: `signed(0)` is the null marker and its payload is an
+    // *unsigned* count, so `[0, 2]` is two absent values; then `2, 1` is
+    // `repeat(2)×1`; `0, 1` is one absent; then `126, 2` is `signed(126) ==
+    // -2` literal count with `2, 172` behind it — `172` as unsigned LEB128
+    // is `172 - 128 = 44`, but the fixture says `300`, so the two literal
+    // values are `172 & 0x7F = 44` continuing `2`'s high bit — that is,
+    // `unsigned(2) = 0b10` low seven bits then `172`'s payload
+    // `0b0101100`, which joins to `300`. The codec's own split is what
+    // decides this, and `expectBytes` asserts the encoder agrees with it.
+    const fixture = [_]u8{ 0, 2, 2, 1, 0, 1, 126, 2, 172, 2 };
+    const values = [_]?u64{ null, null, 1, 1, null, 2, 300 };
+    try expectBytes(RleOption(u64), ?u64, &values, &fixture);
+
+    const back = try RleOption(u64).decodeAll(&fixture, testing.allocator);
+    defer testing.allocator.free(back);
+    try testing.expectEqualSlices(?u64, &values, back);
+}
+
+test "golden_format_rle_str" {
+    // **`tests.rs:4810-4815`.** `Column::<String>`, the same frozen-fixture
+    // shape as the two integer cases above.
+    //
+    // Read as runs: `2` is `repeat(2)` and its payload is `1, 97` — an
+    // unsigned LEB128 length of one followed by the byte `'a'`, which is
+    // `RleValue for String`'s `pack` (`lib.rs:725-729`). `126` is
+    // `signed(126) == -2`, a literal run of two values `"bb"` and `"ccc"`,
+    // each written the same way. So the fixture is exactly what `write`
+    // produces and `decodeAll` reads back.
+    const fixture = [_]u8{ 2, 1, 97, 126, 2, 98, 98, 3, 99, 99, 99 };
+    // The two `"a"`s are two windows of one buffer, so the repeat run this
+    // fixture pins cannot come from comparing slice identity.
+    var raw = [_]u8{ 'a', 'x', 'a', 'y', 'b', 'b', 'c', 'c', 'c' };
+    const values = [_][]const u8{ raw[0..1], raw[2..3], raw[4..6], raw[6..9] };
+    try expectBytes(RleUtf8(false), []const u8, &values, &fixture);
+
+    const back = try RleUtf8(false).decodeAll(&fixture, testing.allocator);
+    defer testing.allocator.free(back);
+    try expectEqualElements(RleUtf8(false), &values, back);
+}
+
+test "golden_format_rle_opt_str" {
+    // **`tests.rs:4818-4823`.** `Column::<Option<String>>`.
+    //
+    // `127` is `signed(-1)`, a literal run of one value `"x"`; `0, 2` is the
+    // null marker with an *unsigned* count of two, so two absent values; then
+    // `127` again for the literal `"yz"`. **The two adjacent absent values are
+    // one null run and not two literal zero-length payloads**: an absent
+    // value is carried by the header and never by a payload
+    // (`lib.rs:406-437`), so `null` and `""` are different wire forms.
+    const fixture = [_]u8{ 127, 1, 120, 0, 2, 127, 2, 121, 122 };
+    const present_x: ?[]const u8 = "x";
+    const absent: ?[]const u8 = null;
+    const present_yz: ?[]const u8 = "yz";
+    const values = [_]?[]const u8{ present_x, absent, absent, present_yz };
+    try expectBytes(RleUtf8(true), ?[]const u8, &values, &fixture);
+
+    const back = try RleUtf8(true).decodeAll(&fixture, testing.allocator);
+    defer testing.allocator.free(back);
+    try expectEqualElements(RleUtf8(true), &values, back);
+}
+
+test "golden_format_rle_bytes" {
+    // **`tests.rs:4826-4831`.** `Column::<Vec<u8>>`, the payload that takes
+    // any byte rather than only UTF-8 (`lib.rs:747-770`).
+    //
+    // `2` is `repeat(2)` over the payload `2, 1, 2` — length two, bytes
+    // `1, 2` — and `127` is a literal run of one value, `1, 3`. The wire form
+    // is `Vec<u8>`'s, and the value type is `[]const u8`: a borrowed window on
+    // the slab, not an owning buffer.
+    const fixture = [_]u8{ 2, 2, 1, 2, 127, 1, 3 };
+    // Two windows of one buffer, so the repeat run the fixture pins is found
+    // by content and not by slice identity.
+    var raw = [_]u8{ 1, 2, 1, 2, 3 };
+    const values = [_][]const u8{ raw[0..2], raw[2..4], raw[4..5] };
+    try expectBytes(Rle([]const u8), []const u8, &values, &fixture);
+
+    const back = try Rle([]const u8).decodeAll(&fixture, testing.allocator);
+    defer testing.allocator.free(back);
+    try expectEqualElements(Rle([]const u8), &values, back);
+}
+
+test "a byte payload is a length and the bytes, at every width" {
+    // **`lib.rs:696-770`.** The one payload whose width is not a function of
+    // the type: a length prefix plus that many bytes, with the length itself
+    // LEB128, so a value's size crosses from one header byte to two at 128
+    // bytes of content. Every value below round trips through all four entry
+    // points, and `encodedSize` has to agree with `write` at each of them.
+    const Codec = Rle([]const u8);
+    const gpa = testing.allocator;
+
+    // 127 bytes is the widest one-byte length; 128 is the first that needs a
+    // second header byte. The contents cycle, so a payload is never a
+    // constant string a comparison could short-circuit.
+    var at127: [127]u8 = undefined;
+    for (&at127, 0..) |*b, i| b.* = @intCast('a' + i % 26);
+    var at128: [128]u8 = undefined;
+    for (&at128, 0..) |*b, i| b.* = @intCast('a' + i % 26);
+
+    const empty: [0]u8 = .{};
+    const bad: []const u8 = &[_]u8{ 0xff, 0xfe };
+    const bad2: []const u8 = &[_]u8{ 0x00, 0x80 };
+    const mixed: []const u8 = &[_]u8{ 0x00, 0x01, 0x7f, 0x80, 0xf4, 0x8f, 0xbf, 0xbf };
+
+    const cases = [_][]const []const u8{
+        &.{},
+        &.{""},
+        &.{ "", "" },
+        &.{ "", "x", "" },
+        &.{ "a", "a" },
+        &.{ "a", "b", "a" },
+        &.{ "hello", "hello", "hello", "world" },
+        &.{ "", "hello", "", "world", "" },
+        &.{&empty},
+        // Bytes that are not UTF-8 at all: `Vec<u8>` takes them, and this is
+        // the codec a `Vec<u8>` column is spelled with upstream
+        // (`lib.rs:747-770`).
+        &.{bad},
+        &.{ bad, bad, bad2 },
+        &.{mixed},
+        &.{at127[0..]},
+        &.{at128[0..]},
+        &.{ at127[0..], at128[0..], at127[0..] },
+    };
+    for (cases) |c| try checkRoundTrip(Codec, []const u8, c);
+
+    // The width claim itself, read off the wire. A single value is a
+    // one-element literal: one header byte, then the length, then the bytes.
+    // 127 fits one length byte and 128 needs two, so the two slabs differ by
+    // exactly the extra length byte and nothing else.
+    const one = [_][]const u8{at127[0..]};
+    const one_bytes = try expectWritten(Codec, []const u8, &one);
+    defer gpa.free(one_bytes);
+    try testing.expectEqual(@as(usize, 1 + 1 + 127), one_bytes.len);
+    const two = [_][]const u8{at128[0..]};
+    const two_bytes = try expectWritten(Codec, []const u8, &two);
+    defer gpa.free(two_bytes);
+    try testing.expectEqual(@as(usize, 1 + 2 + 128), two_bytes.len);
+}
+
+test "an empty string is a present value and a null is not one" {
+    // Upstream's nullable string column has three states a run boundary can
+    // tell apart — a present non-empty value, a present *empty* value, and an
+    // absent one (`lib.rs:406-437`, `:696-730`). Only the last is a null run.
+    //
+    // This is the arm a byte payload adds and an integer cannot: with `""`
+    // present and `null` absent, `null` is not the identity of the codec's
+    // element equality, and `""` twice in a row is a repeat run while `""`
+    // then `null` is two runs of different kinds.
+    const Codec = RleOption([]const u8);
+    const gpa = testing.allocator;
+    const empty_v: ?[]const u8 = "";
+    const absent: ?[]const u8 = null;
+    const one: ?[]const u8 = "x";
+
+    // Two empty values are `repeat(2)` over a zero-length payload — one
+    // length byte and no content at all.
+    try expectBytes(Codec, ?[]const u8, &.{ empty_v, empty_v }, &.{ 0x02, 0x00 });
+    // An empty value beside a null: the literal is `127` (one value) with a
+    // zero-length payload, then the null marker with its unsigned count.
+    try expectBytes(Codec, ?[]const u8, &.{ empty_v, absent }, &.{ 0x7f, 0x00, 0x00, 0x01 });
+
+    const values = [_]?[]const u8{ empty_v, absent, empty_v, empty_v, absent, one, empty_v };
+    const bytes = try expectWritten(Codec, ?[]const u8, &values);
+    defer gpa.free(bytes);
+    const back = try Codec.decodeAll(bytes, gpa);
+    defer gpa.free(back);
+    try expectEqualElements(Codec, &values, back);
+
+    // And the three states really are three states: an absent value is never
+    // content-equal to an empty one.
+    try testing.expect(!Codec.elementEql(absent, empty_v));
+    try testing.expect(!Codec.elementEql(empty_v, absent));
+    try testing.expect(Codec.elementEql(absent, absent));
+    try testing.expect(Codec.elementEql(empty_v, empty_v));
+
+    // A slab that spells two empty values as two adjacent literals is
+    // non-canonical, because they should have been one repeat run.
+    try testing.expectError(error.InvalidValue, Codec.canonical(&.{ 0x7f, 0x00, 0x7f, 0x00 }));
+}
+
+test "run boundaries are decided by content, not by slice identity" {
+    // The byte payload's trap: two spellings of the same string borrowed from
+    // two offsets of one slab are different slices, so Zig's `==` says they
+    // differ. Every rule that turns on "these are the same value" — the
+    // segmenter's run detection and rules 6, 7 and 8 of `canonical` — has to
+    // answer it by content instead.
+    const Codec = Rle([]const u8);
+
+    // Three windows of one buffer: different pointers, same bytes.
+    var raw = [_]u8{ 'a', 'a', 'a' };
+    const b = raw[0..1];
+    const c = raw[1..2];
+    const d = raw[2..3];
+    try testing.expect(!std.meta.eql(b, c));
+    try testing.expect(Codec.elementEql(b, c));
+
+    // The encoder's side: three equal values are one repeat run, because the
+    // segmenter compared their contents.
+    try expectBytes(Codec, []const u8, &.{ b, c, d }, &.{ 0x03, 0x01, 97 });
+
+    // The validator's side, on hand-written slabs whose payloads sit at
+    // different byte offsets and are therefore *different* slices:
+    // `repeat(2)×"a"` then a literal `"a"` breaks rule 8.
+    try testing.expectError(
+        error.InvalidValue,
+        Codec.canonical(&.{ 0x02, 0x01, 97, 0x7f, 0x01, 97 }),
+    );
+    // Two equal values inside one literal run: rule 7, same reason — the two
+    // payloads sit at different offsets of the same slab, so `==` cannot see
+    // them. And the encoder never produces either shape.
+    try testing.expectError(
+        error.InvalidValue,
+        Codec.canonical(&.{ 0x7f, 0x02, 0x01, 97, 0x01, 97 }),
+    );
+    const three = [_][]const u8{ b, c, d };
+    try expectCanonical(Codec, []const u8, &three);
+}
+
+test "load_invalid_utf8_in_string_is_error" {
+    // **`tests.rs:1797-1814`.** A bytes column's output must not load as a
+    // string column.
+    //
+    // Upstream builds the slab with `Column::<Vec<u8>>::from_values` and reads
+    // it back with `Column::<String>::load`, and expects
+    // `PackError::InvalidUtf8`. **The slab is the same bytes either way** —
+    // `String` and `Vec<u8>` share one payload (`lib.rs:696-730`,
+    // `:747-770`) — so what differs is only which codec reads it, which is
+    // exactly what this does: the bytes codec writes, the UTF-8 codec reads.
+    const gpa = testing.allocator;
+    const bad: []const u8 = &[_]u8{ 0xff, 0xfe };
+    const values = [_][]const u8{bad};
+    const bytes = try expectWritten(Rle([]const u8), []const u8, &values);
+    defer gpa.free(bytes);
+
+    // The bytes codec is happy with them: they are its own output.
+    const own = try Rle([]const u8).decodeAll(bytes, gpa);
+    defer gpa.free(own);
+    try expectEqualElements(Rle([]const u8), &values, own);
+    try Rle([]const u8).canonical(bytes);
+
+    // Every reading of the same slab as a string is `error.InvalidUtf8`.
+    try testing.expectError(error.InvalidUtf8, RleUtf8(false).decodeAll(bytes, gpa));
+    try testing.expectError(error.InvalidUtf8, RleUtf8(false).canonical(bytes));
+    try testing.expectError(error.InvalidUtf8, RleUtf8(false).countEntries(bytes));
+    // **`Decoder.init` reads the opening run *header* only**, and the header
+    // of a literal run says nothing about its payload, so the refusal is
+    // raised by the first `next` — where the payload is read. The same is
+    // true of the nullable form's null refusal, and the same reasoning is
+    // recorded at the foot of this file.
+    {
+        var dec = try RleUtf8(false).Decoder.init(bytes);
+        try testing.expectError(error.InvalidUtf8, dec.next());
+    }
+}
+
+test "load_invalid_utf8_in_nullable_string_is_error" {
+    // **`tests.rs:1817-1833`.** The same refusal for `Column<Option<String>>`.
+    //
+    // **The null run is not what makes this nullable.** Upstream's slab holds
+    // one value and no null at all, and the refusal is the UTF-8 check on
+    // that value's payload; the nullable form only adds that a *payload* byte
+    // can never spell an absent one, so the check has to run in the same
+    // place for both forms.
+    const gpa = testing.allocator;
+    const present: ?[]const u8 = &[_]u8{ 0xff, 0xfe };
+    const values = [_]?[]const u8{present};
+    const bytes = try expectWritten(RleOption([]const u8), ?[]const u8, &values);
+    defer gpa.free(bytes);
+
+    const own = try RleOption([]const u8).decodeAll(bytes, gpa);
+    defer gpa.free(own);
+    try expectEqualElements(RleOption([]const u8), &values, own);
+
+    try testing.expectError(error.InvalidUtf8, RleUtf8(true).decodeAll(bytes, gpa));
+    try testing.expectError(error.InvalidUtf8, RleUtf8(true).canonical(bytes));
+    try testing.expectError(error.InvalidUtf8, RleUtf8(true).countEntries(bytes));
+    {
+        var dec = try RleUtf8(true).Decoder.init(bytes);
+        try testing.expectError(error.InvalidUtf8, dec.next());
+    }
+}
+
+test "a string codec refuses a payload the bytes cannot back" {
+    // **Truncation is where a variable-width payload stops being total.** An
+    // integer payload is bounded by its own LEB128 width; a byte payload is
+    // bounded by a number the wire spells and the bytes do not have to
+    // agree with, so the reader has to check and refuse.
+    const gpa = testing.allocator;
+    const B = Rle([]const u8);
+    const S = RleUtf8(false);
+
+    // A literal run of one value whose length is 5 with two bytes behind it.
+    const short = [_]u8{ 0x7f, 0x05, 'a', 'b' };
+    try testing.expectError(error.LengthExceedsInput, S.decodeAll(&short, gpa));
+    try testing.expectError(error.LengthExceedsInput, S.canonical(&short));
+    try testing.expectError(error.LengthExceedsInput, B.decodeAll(&short, gpa));
+
+    // The same claim in a repeat run, which is the other way a payload is
+    // read: once at the run, then served from memory for each of its values.
+    const repeat = [_]u8{ 0x02, 0x05, 'a' };
+    try testing.expectError(error.LengthExceedsInput, S.decodeAll(&repeat, gpa));
+    try testing.expectError(error.LengthExceedsInput, B.canonical(&repeat));
+
+    // A length that does not fit `usize` at all: ten continuation bytes and a
+    // payload, which `readUnsigned` refuses before anything is sized from it.
+    const huge = [_]u8{
+        0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01,
+    };
+    try testing.expectError(error.Overflow, S.decodeAll(&huge, gpa));
+
+    // Every prefix of a real slab is either refused or decoded, and the two
+    // that cut a payload in half are the dedicated error. A run-length format
+    // makes no promise about a prefix that lands on a run boundary — that is a
+    // complete slab — so what is pinned is that no cut traps and that the two
+    // readers never disagree about a cut both of them accept.
+    const whole = [_]u8{ 0x02, 0x02, 'h', 'i', 0x7e, 0x01, 'a', 0x02, 'b', 'b' };
+    for (0..whole.len) |cut| {
+        const got = B.decodeAll(whole[0..cut], gpa) catch continue;
+        defer gpa.free(got);
+        var dec = try B.Decoder.init(whole[0..cut]);
+        var i: usize = 0;
+        while (i < got.len) : (i += 1) {
+            try testing.expect(B.elementEql(got[i], (try dec.next()).?));
+        }
+        try testing.expect((try dec.next()) == null);
+    }
+    for ([_]usize{ 3, 9 }) |cut| {
+        try testing.expectError(error.LengthExceedsInput, B.decodeAll(whole[0..cut], gpa));
+    }
+
+    // The payload read out of a slab is a window on the slab itself, so a
+    // value's bytes are the encoded bytes and not a copy of them.
+    const decoded = try B.decodeAll(&whole, gpa);
+    defer gpa.free(decoded);
+    try testing.expectEqualSlices(u8, "hi", decoded[0]);
+    try testing.expectEqualSlices(u8, "bb", decoded[3]);
+}
+
+test "load_null_in_non_nullable_bytes_is_error" {
+    // **`tests.rs:1869-1878`.** Bytes a *nullable* column saved must not load
+    // into a non-nullable one — upstream's `Column<Option<Vec<u8>>>` into
+    // `Column<Vec<u8>>`.
+    //
+    // **Rule 9 is carried by the run header, never by a payload byte** — that
+    // is the module doc's own statement of the null run's form
+    // (`rle/mod.rs:25-33`, quoted at `rle.zig:1-20`), and it is why the
+    // refusal is the same whatever the values are. What is exercised here is
+    // the half a hand-written fixture does not: the bytes are *produced* by
+    // the nullable encoder and then refused by the non-nullable reader, so an
+    // encoder that stopped emitting the null run would fail here.
+    const gpa = testing.allocator;
+    const present: ?[]const u8 = "a";
+    const nullable = [_]?[]const u8{ present, null };
+    const bytes = try expectWritten(RleOption([]const u8), ?[]const u8, &nullable);
+    defer gpa.free(bytes);
+
+    // The nullable codec is happy with them: they are its own output.
+    const own = try RleOption([]const u8).decodeAll(bytes, gpa);
+    defer gpa.free(own);
+    try expectEqualElements(RleOption([]const u8), &nullable, own);
+
+    // And every non-nullable entry point that sees the null run refuses them.
+    // **Not `Decoder.init`, which legitimately succeeds here**: the slab is
+    // `[0x7f, 0x01, 0x61, 0x00, 0x01]` — one literal value then one absent —
+    // and `init` reads only the *first* run header, which is a legal literal
+    // (`rle.zig:344-352`). The refusal is raised when the cursor reaches the
+    // null run, which is what `decodeAll` and the walk below both show.
+    try testing.expectError(error.UnexpectedNull, Rle([]const u8).decodeAll(bytes, gpa));
+    try testing.expectError(error.UnexpectedNull, Rle([]const u8).canonical(bytes));
+    {
+        var dec = try Rle([]const u8).Decoder.init(bytes);
+        try testing.expectEqualStrings("a", (try dec.next()).?);
+        try testing.expectError(error.UnexpectedNull, dec.next());
+    }
+}
+
+test "load_null_in_non_nullable_string_is_error" {
+    // **`tests.rs:1858-1867`.** The same refusal, for `Column<String>` — and
+    // **the UTF-8 codec rather than the bytes codec**, so the two cases differ
+    // in more than their names: this one has to get past the string check
+    // before it reaches the null run at all.
+    //
+    // Two cases that reduce to one assertion at the codec are kept as two
+    // tests because upstream has two tests, and a coverage count against
+    // `rust/hexane/src/tests.rs` is only legible if every upstream name is
+    // spelled; **the body is deliberately the same, so a reader who wants one
+    // of them can delete the other.**
+    const gpa = testing.allocator;
+    const present: ?[]const u8 = "a";
+    const nullable = [_]?[]const u8{ present, null };
+    const bytes = try expectWritten(RleUtf8(true), ?[]const u8, &nullable);
+    defer gpa.free(bytes);
+
+    const own = try RleUtf8(true).decodeAll(bytes, gpa);
+    defer gpa.free(own);
+    try expectEqualElements(RleUtf8(true), &nullable, own);
+
+    // The same two whole-slab entry points, and for the same reason `init` is
+    // not among them: the null run is the second one, not the first.
+    try testing.expectError(error.UnexpectedNull, RleUtf8(false).decodeAll(bytes, gpa));
+    try testing.expectError(error.UnexpectedNull, RleUtf8(false).canonical(bytes));
+    {
+        var dec = try RleUtf8(false).Decoder.init(bytes);
+        try testing.expectEqualStrings("a", (try dec.next()).?);
+        try testing.expectError(error.UnexpectedNull, dec.next());
+    }
+}
+
+// ── The differential corpus ──────────────────────────────────────────────────
+
+const corpus = @import("codec_golden.zig");
+
+/// The boundary cases the RLE corpus has to carry.
+///
+/// Named case by case because a corpus that quietly lost one of these would
+/// still pass every comparison below while testing less: the run counts are
+/// where a LEB128 width changes, `pair_*` is where a header width and a
+/// payload width disagree, and the `null_*` counts are the same widths on the
+/// nullable form's own count field.
+const rle_boundary_cases = [_][]const u8{
+    "empty",
+    "one",
+    "two_equal",
+    "two_differ",
+    "three_aba",
+    "three_all_differ",
+    "repeat_2",
+    "repeat_3",
+    "repeat_63",
+    "repeat_64",
+    "repeat_65",
+    "repeat_127",
+    "repeat_128",
+    "repeat_129",
+    "repeat_16383",
+    "repeat_16384",
+    "repeat_16385",
+    "null_2",
+    "null_127",
+    "null_128",
+    "null_16384",
+    "null_16385",
+    "pair_0",
+    "boundary_literal",
+    "all_equal_300",
+    "ascending",
+    "descending",
+    "alternating",
+    "null_alone",
+    "null_then_value",
+    "value_then_null",
+    "null_sandwiched",
+    "nulls_and_boundaries",
+    "random_0",
+    "random_12",
+    "random_23",
+};
+
+/// The eight column types the RLE corpus carries.
+///
+/// A table of `(name, tag)` pairs rather than a `switch` on the name: Zig
+/// will not switch on a `[]const u8`, and the codec type has to be known at
+/// compile time for `checkOne` to instantiate it. `corpus.dispatch` walks
+/// this with an `inline for` and hands each arm a comptime tag.
+const RleKind = enum { u64, i64, u32, i32, opt_u64, opt_i64, opt_u32, opt_i32 };
+
+const rle_kinds = [_]struct { name: []const u8, tag: RleKind }{
+    .{ .name = "rle-u64", .tag = .u64 },
+    .{ .name = "rle-i64", .tag = .i64 },
+    .{ .name = "rle-u32", .tag = .u32 },
+    .{ .name = "rle-i32", .tag = .i32 },
+    .{ .name = "rle-opt-u64", .tag = .opt_u64 },
+    .{ .name = "rle-opt-i64", .tag = .opt_i64 },
+    .{ .name = "rle-opt-u32", .tag = .opt_u32 },
+    .{ .name = "rle-opt-i32", .tag = .opt_i32 },
+};
+
+/// One golden case, through the codec the record names.
+fn rleCaseFor(kind: RleKind, rec: corpus.Record, gpa: std.mem.Allocator) !void {
+    switch (kind) {
+        .u64 => try corpus.checkOne(Rle(u64), u64, gpa, rec),
+        .i64 => try corpus.checkOne(Rle(i64), i64, gpa, rec),
+        .u32 => try corpus.checkOne(Rle(u32), u32, gpa, rec),
+        .i32 => try corpus.checkOne(Rle(i32), i32, gpa, rec),
+        .opt_u64 => try corpus.checkOne(RleOption(u64), ?u64, gpa, rec),
+        .opt_i64 => try corpus.checkOne(RleOption(i64), ?i64, gpa, rec),
+        .opt_u32 => try corpus.checkOne(RleOption(u32), ?u32, gpa, rec),
+        .opt_i32 => try corpus.checkOne(RleOption(i32), ?i32, gpa, rec),
+    }
+}
+
+fn rleCase(rec: corpus.Record, gpa: std.mem.Allocator) !void {
+    try corpus.dispatch(rle_kinds, rleCaseFor, gpa, rec);
+}
+
+test "the RLE codec encodes the reference's bytes for every golden case" {
+    const gpa = testing.allocator;
+    var names = corpus.Names.init(gpa);
+    defer names.deinit();
+
+    // The count is the corpus: eight types over one case list each. A change
+    // to it means the corpus changed and the coverage below has to be re-read.
+    const cases = try corpus.eachCase(gpa, "rle", &names, rleCase);
+    try testing.expectEqual(@as(usize, 890), cases);
+    try names.expectRequired(&rle_boundary_cases);
+}
+
+test "the corpus came out of the generator this port can reproduce" {
+    try testing.expectEqual(@as(usize, 1), try corpus.checkGenerator(testing.allocator));
+}
+
+// Zig 0.16.0 / upstream / Rust / port
+//
+// * **The frozen fixtures are pinned at the codec, and a single-slab column's
+//   `save()` is its codec's bytes.** There is no column-level header above a
+//   run sequence, so `Column::<u64>::from_values(..).save()` over
+//   `[1,1,1,2,3,4,5,5,5,5]` is exactly `Rle(u64).write` over the same values:
+//   `[3, 1, 125, 2, 3, 4, 4, 5]`, read as `repeat(3)×1`, `signed(125) == -3`
+//   literal count over `2,3,4`, then `repeat(4)×5`. **`golden_format_rle_u64`
+//   and `golden_format_rle_opt_u64` therefore pin `Rle`/`RleOption` directly**
+//   and name no `Column`; the fixtures are written out rather than read from
+//   the corpus because upstream freezes them at `tests.rs:4762-4771` and says a
+//   failure is a compatibility break with every existing automerge document.
+//
+// * **The three variable-width fixtures are pinned here too, and `RawColumn`
+//   still could not carry them.** `golden_format_rle_str`,
+//   `golden_format_rle_opt_str` and `golden_format_rle_bytes` encode a
+//   length-prefixed byte payload, which is `Rle([]const u8)`,
+//   `RleOption([]const u8)` and `RleUtf8` — one payload with two rules about
+//   what it may contain (`lib.rs:696-730`, `:747-770`). They are pinned at the
+//   same three fixtures for the same reason as the integer two: a single-slab
+//   column's `save()` *is* its codec's bytes, so a `Column` in the way would
+//   add nothing. `RawColumn` cannot stand in for any of them — its wire form
+//   is a plain concatenation of slab bytes with no run headers and no value
+//   boundary (`raw.zig:461-466`), so it cannot produce `[2, 1, 97, 126, 2, 98,
+//   98, …]` — and `columnar/encoding.zig`'s `RleSlice` is outside this
+//   crate's hexane surface.
+//
+// * **`load_null_in_non_nullable_bytes_is_error` and
+//   `load_null_in_non_nullable_string_is_error` are spelled over the byte
+//   codecs now, and that is a widening rather than a re-spelling.** Both were
+//   written over `u64` because there was no byte payload to name; there is one
+//   now, so each is spelled over the codec upstream names — `Rle([]const u8)`
+//   and `RleUtf8` — with the *values* upstream uses (`Some("a")` then
+//   `None`, `tests.rs:1858-1878`). What each case asserts is upstream's rule 9
+//   either way: **a null run is carried by the run header and never by a
+//   payload byte** (`rle/mod.rs:25-33`, quoted at `rle.zig:1-20`). What the
+//   byte form adds is that the run before the null is a real payload, so an
+//   encoder that stopped emitting the null run, or a reader that mistook a
+//   zero-length payload for an absent value, fails here and would not have
+//   failed over `u64`.
+//
+// * **`Decoder.init` is deliberately not among the refused entry points, for
+//   either refusal.** `[Some("a"), null]` encodes as
+//   `[0x7f, 0x01, 0x61, 0x00, 0x01]` — one literal value, then one absent —
+//   and `init` reads only the *first* run header, which is a legal literal and
+//   says nothing about its payload. The refusal surfaces when the cursor
+//   reaches the null run, which `decodeAll` and the explicit walk both show;
+//   the UTF-8 refusal surfaces on the first `next` for the same reason.
+//   Asserting on `init` would be asserting that the slab's first run is the
+//   null one, which it is not.
+//
+// * **A byte payload is borrowed, never copied, and that is upstream's rule.**
+//   `payloadRead`, `decodeAll` and `Decoder.next` all return windows on the
+//   bytes they were given, which is `try_unpack`'s `&'a [u8]`
+//   (`lib.rs:700-709`, `:756-764`). `decodeAll` allocates the *headers* and
+//   nothing else. **A caller that keeps a value past its slab's lifetime has
+//   to copy it**, and a caller that appends to a `List` it handed to `append`
+//   invalidates every value read out of it — which is why
+//   `payloadRead`/`payloadAppend`/`payloadEql` are the three names a column
+//   needs, and why `elementEql` rather than `==` is what it must compare with.
+//
+// * **A literal run of byte payloads is bounded by its byte count, not by its
+//   value count.** `readRunHeader` rejects a literal count larger than the
+//   bytes behind it, and that check is still right here because every payload
+//   costs at least one byte — an empty `[]const u8` is the single-byte length
+//   `0x00`, never zero bytes. So a run cannot claim more values than the slab
+//   holds whatever its payloads are, and every walk over one stays bounded
+//   before it starts.

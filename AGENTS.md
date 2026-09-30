@@ -62,12 +62,32 @@ upstream behaviour *executed*, extend the oracle crate.
   citation, in the code comment or in the commit description.
 - Do not add a dependency without a reason recorded in the commit. The port
   currently needs none.
+- Prose about a test goes **inside** the braces as `//`, never above the
+  declaration as `///`. Zig 0.16 analyses test declarations in a non-test
+  build, so a `///` on a `test` is a compile error for the whole module — and
+  the module failing to build takes down every test in the tree, not just its
+  own. "Inside the braces" is the rule rather than "do not use `///`",
+  because the habit is to write the prose above.
+- A `Change` here is a header view over borrowed bytes with **no decoded op
+  set**, so `parseChange` cannot know the op count and writes `max_op = 0`
+  (`change.zig`). Anywhere a change is encoded and then re-parsed, something
+  must call `Change.withOpCount`, or the field is silently zero. Upstream
+  cannot be wrong this way: `Change::new_from_unverified` counts the ops as
+  it decodes them (`change.rs:30-46`).
+- `OpSet.actors` is the authoritative actor table; an `ActorIdx` *means* an
+  index into it (`automerge.rs:565`, `:1309-1314`). `authors`, the graph's
+  `seq_index` and `Actor::Cached` are mirrors, and upstream fans one
+  insertion or removal out to all of them from a single site
+  (`automerge.rs:428`, `:1301-1306`). A route that grows a mirror alone
+  drifts silently, and a cached index left pointing at a renumbered slot
+  names a *different actor*.
 
 ## Commands
 
 - `zig build` makes the module available to consumers.
 - `zig build test` runs the unit tests.
-- `zig build conformance` regenerates `test/golden/` from the oracle.
+- `zig build conformance` checks every vector in `test/golden/` against the
+  reference oracle, and `-Dconformance-record` rewrites them from it.
 - `zig fmt --check .` checks formatting. `gate` runs the house gate.
 - `jj st` shows working-copy status. Use `jj`, not raw Git, for mutations.
 

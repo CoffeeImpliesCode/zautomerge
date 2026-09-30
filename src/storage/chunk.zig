@@ -61,16 +61,27 @@ pub const ChunkType = enum(u8) {
     bundle = 3,
 };
 
-/// One framed chunk. `data` borrows the input the chunk was parsed from; it is
-/// the bytes as stored, so for `ChunkType.compressed` it is still deflated.
+/// One framed chunk. `data` and `frame` both borrow the input the chunk was
+/// parsed from; `data` is the bytes as stored, so for `ChunkType.compressed`
+/// it is still deflated.
 ///
 /// `checksum` is the value read from the header, not one recomputed here. It
 /// equals `checksumOf(typ, data)` for every type except `compressed`, whose
 /// checksum covers the inflated body.
+///
+/// **`frame` is the chunk and `data` is its tail.** The header cannot be
+/// derived from `data`, because the LEB128 carrying the length is exactly as
+/// wide as the length needs, so a reader that needs the whole chunk — the one
+/// a receiver dispatches on — takes `frame` instead of rebuilding a header
+/// from the three fields below. [`storage/bundle.zig`](bundle.zig)'s
+/// `parseFramedChunk` is that reader: a bundle is a chunk, so a bundle read
+/// out of a multi-chunk stream hands back the bytes the stream carried, byte
+/// for byte, with nothing re-framed and nothing copied.
 pub const Chunk = struct {
     typ: ChunkType,
     checksum: [checksum_size]u8,
     data: []const u8,
+    frame: []const u8,
 };
 
 /// The change hash of a chunk body: `SHA-256(typ || uleb128(len) || data)`
@@ -163,6 +174,30 @@ pub fn decompressChunk(gpa: std.mem.Allocator, chunk: Chunk) ParseError![]u8 {
     return body;
 }
 
+/// The room `compressRaw` leaves in its output buffer for everything the input
+/// length does not account for: the DEFLATE block headers, and the few bytes a
+/// body that does not shrink needs to grow into. It is also the whole capacity
+/// when the length term cannot be added to it.
+const deflate_headroom: usize = 64;
+
+/// The capacity `compressRaw` starts its output buffer at: the input length plus
+/// [`deflate_headroom`], or the headroom alone when that sum does not fit in a
+/// `usize`.
+///
+/// A plain `data.len + deflate_headroom` wraps once `data.len` is within the
+/// headroom of `maxInt(usize)`, and the wrapped value is what `Compress.init`
+/// is then handed: at `maxInt(usize)` it is 0, which trips the
+/// `output.buffer.len > 8` assert (`std/compress/flate/Compress.zig:309`) and
+/// turns a large body into a trap. The length term is a hint and not a bound —
+/// `Allocating` grows with checked arithmetic
+/// (`std/Io/Writer.zig:2615-2644`) — so dropping it costs reallocations and
+/// nothing else, and it is what upstream pays for every body anyway: the
+/// deflate output goes into a `Vec::new()` that `read_to_end` grows
+/// (`storage/change/compressed.rs:27-28`).
+fn outputCapacity(data_len: usize) usize {
+    return std.math.add(usize, data_len, deflate_headroom) catch deflate_headroom;
+}
+
 /// Deflates `data` into a raw DEFLATE stream: no zlib or gzip wrapper, which
 /// is what a compressed chunk's body is (`change/compressed.rs:23-30`).
 ///
@@ -176,7 +211,9 @@ pub fn compressRaw(gpa: std.mem.Allocator, data: []const u8) std.mem.Allocator.E
 
     // `Compress` asserts the output buffer is longer than 8 bytes, and this
     // capacity also covers the usual case of a body that actually shrinks.
-    var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, data.len + 64);
+    // `outputCapacity` is what keeps that sum from wrapping into a capacity
+    // too small for either of those claims.
+    var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, outputCapacity(data.len));
     defer aw.deinit();
 
     var compressor: flate.Compress = undefined;
@@ -240,10 +277,69 @@ pub fn parseChunks(bytes: []const u8, gpa: std.mem.Allocator) ParseError![]Chunk
     return out.toOwnedSlice(gpa);
 }
 
+/// A chunk stream that stopped before the input ran out.
+///
+/// Upstream's `LoadedChanges`
+/// ([`storage/load.rs`:51-64](../github-automerge-automerge/rust/automerge/src/storage/load.rs))
+/// is the same shape: `Complete(Vec<Change>)` when the whole stream parsed,
+/// and `Partial { loaded, remaining, error }` when a prefix did.
+pub const PartialChunks = struct {
+    /// The chunks that parsed, in order. The caller owns the slice; the
+    /// chunks inside it borrow the input they were read from.
+    chunks: []Chunk,
+    /// What stopped the walk, or null when the input ran out cleanly.
+    err: ?ParseError,
+
+    /// Frees the slice and nothing else.
+    pub fn deinit(self: PartialChunks, gpa: std.mem.Allocator) void {
+        gpa.free(self.chunks);
+    }
+};
+
+/// [`parseChunks`], keeping whatever parsed before the first refusal
+/// ([`load_changes`](../../github-automerge-automerge/rust/automerge/src/storage/load.rs):75-97).
+///
+/// **This is the same loop with the error captured instead of propagated.**
+/// `load_changes` builds `changes` chunk by chunk and, on the first `Err`,
+/// returns `LoadedChanges::Partial { loaded: changes, remaining: data, error }`
+/// — the chunks before the bad one are kept, not discarded. A stream that is a
+/// valid save with four bytes of rubbish appended parses every chunk and then
+/// fails on the rubbish, and upstream keeps the document.
+///
+/// `parseChunks` stays the all-or-nothing spelling, because `Document.load`
+/// *is* all-or-nothing: upstream's default is `OnPartialLoad::Error`
+/// ([`automerge.rs`:107-110, :177](../github-automerge-automerge/rust/automerge/src/automerge.rs)).
+pub fn parseChunksPartial(
+    bytes: []const u8,
+    gpa: std.mem.Allocator,
+) std.mem.Allocator.Error!PartialChunks {
+    var out: std.ArrayList(Chunk) = .empty;
+    errdefer out.deinit(gpa);
+    var in: Input = .init(bytes);
+    while (!in.isEmpty()) {
+        const chunk = readChunk(&in) catch |e| {
+            return .{
+                .chunks = try out.toOwnedSlice(gpa),
+                .err = e,
+            };
+        };
+        try out.append(gpa, chunk);
+    }
+    return .{ .chunks = try out.toOwnedSlice(gpa), .err = null };
+}
+
 /// Consumes one chunk from `in`, leaving the cursor on the first byte after
 /// it. The body is bounded by the declared length, so a chunk can never read
 /// into its successor.
+///
+/// **The frame is the window the chunk was read from**, taken from where the
+/// cursor stood before the magic to where it stands after the body. That is
+/// the whole of what preserving it costs: a slice of the caller's own buffer,
+/// with no allocation, no copy, and no arithmetic about how wide the header
+/// turned out to be — the one thing this layer knows exactly and a reader
+/// downstream of it cannot work out.
 fn readChunk(in: *Input) ParseError!Chunk {
+    const start = in.pos;
     if (!std.mem.eql(u8, &try in.takeArray(u32), &magic)) return error.InvalidMagic;
     const checksum = try in.takeArray(u32);
     const typ: ChunkType = switch (try in.takeByte()) {
@@ -267,7 +363,12 @@ fn readChunk(in: *Input) ParseError!Chunk {
     if (typ != .compressed and !std.mem.eql(u8, &checksum, &checksumOf(typ, data))) {
         return error.InvalidChecksum;
     }
-    return .{ .typ = typ, .checksum = checksum, .data = data };
+    return .{
+        .typ = typ,
+        .checksum = checksum,
+        .data = data,
+        .frame = in.bytes[start..in.pos],
+    };
 }
 
 const testing = std.testing;
@@ -389,6 +490,16 @@ test "a chunk written is a chunk parsed, byte for byte" {
     try testing.expectEqual(ChunkType.change, chunk.typ);
     try testing.expectEqualStrings(body, chunk.data);
     try testing.expectEqualSlices(u8, &checksumOf(.change, body), &chunk.checksum);
+    // **The frame is the input byte for byte, and the body is its tail** —
+    // not a window recomputed from a header length worked out here. The
+    // LEB128 carrying the length is exactly the part a reader downstream
+    // cannot derive from the body, which is why the whole chunk is what
+    // travels here rather than the two ends of it.
+    try testing.expectEqualSlices(u8, out.items, chunk.frame);
+    try testing.expectEqual(
+        chunk.frame.ptr + chunk.frame.len,
+        chunk.data.ptr + chunk.data.len,
+    );
 
     // Re-writing the parsed chunk reproduces the input exactly.
     var again: std.ArrayList(u8) = .empty;
@@ -429,6 +540,16 @@ test "a stream of three chunks parses into three chunks" {
         try testing.expectEqual(typ, chunk.typ);
         try testing.expectEqualStrings(body, chunk.data);
     }
+    // **The frames tile the stream exactly.** Nothing is dropped between two
+    // chunks and nothing is counted twice, so a chunk taken out of a stream
+    // hands back the bytes the stream carried — which is what a receiver
+    // re-sending one chunk of a document needs.
+    var at: usize = 0;
+    for (chunks) |chunk| {
+        try testing.expectEqualSlices(u8, out.items[at..][0..chunk.frame.len], chunk.frame);
+        at += chunk.frame.len;
+    }
+    try testing.expectEqual(out.items.len, at);
 
     // Each chunk stops at its own length: the stream is the concatenation, and
     // re-serialising it is a no-op.
@@ -544,6 +665,43 @@ test "a length past the end of the input is refused without allocating" {
     try testing.expectError(error.Overflow, parseChunk(&malformed));
 }
 
+test "a declared length that would wrap the deflate capacity hint is refused" {
+    const gpa = testing.allocator;
+    const max = std.math.maxInt(usize);
+    // `compressRaw` reserves `data.len + deflate_headroom` for its output, so
+    // the only body length that could make that sum wrap is one within the
+    // headroom of `maxInt(usize)`. A chunk declaring one is refused by the
+    // framing instead: `readChunk` bounds the declared length against what is
+    // left of the input before the body is touched, so the value never reaches
+    // an allocation.
+    const declared = [_]usize{
+        max - deflate_headroom,
+        max - deflate_headroom + 1,
+        max,
+    };
+    for (declared) |len| {
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(gpa);
+        try bytes.appendSlice(gpa, &magic);
+        // The checksum is never reached: the length is bounded first, so four
+        // zero bytes here are as good as the value the reference would write.
+        try bytes.appendSlice(gpa, &[_]u8{ 0, 0, 0, 0 });
+        try bytes.append(gpa, @intFromEnum(ChunkType.change));
+        try leb128.appendUnsigned(&bytes, gpa, len);
+        try bytes.appendSlice(gpa, "body");
+        try testing.expectError(error.LengthExceedsInput, parseChunk(bytes.items));
+
+        // And the streaming entry point refuses it with an allocator that fails
+        // every allocation, so the error is the length and not the allocator.
+        var failing: testing.FailingAllocator = .init(gpa, .{ .fail_index = 0 });
+        try testing.expectError(
+            error.LengthExceedsInput,
+            parseChunks(bytes.items, failing.allocator()),
+        );
+        try testing.expectEqual(@as(usize, 0), failing.allocations);
+    }
+}
+
 test "a raw DEFLATE stream round trips, and a truncated one does not" {
     const gpa = testing.allocator;
     const body = "abcabcabcabc" ** 64;
@@ -568,6 +726,29 @@ test "a raw DEFLATE stream round trips, and a truncated one does not" {
     const back = try decompressRaw(gpa, empty);
     defer gpa.free(back);
     try testing.expectEqual(@as(usize, 0), back.len);
+}
+
+test "the deflate capacity hint is the old sum where it fits, and never wraps" {
+    const max = std.math.maxInt(usize);
+    // Small bodies: the hint is exactly what the old `data.len + 64` computed,
+    // so a body any real document can carry starts from the same capacity it
+    // always did and deflates to the same bytes.
+    for (0..deflate_headroom + 1) |len| {
+        try testing.expectEqual(@as(usize, len) + deflate_headroom, outputCapacity(len));
+    }
+    // The largest body whose sum still fits, and the two past it. The headroom
+    // is 64 bytes, so `maxInt - 64` is the last length the old sum could carry
+    // and `maxInt - 63` is the first it would have wrapped: 0 there, and 63 at
+    // `maxInt` itself, both of which are buffers `Compress.init` refuses.
+    try testing.expectEqual(max, outputCapacity(max - deflate_headroom));
+    try testing.expectEqual(deflate_headroom, outputCapacity(max - deflate_headroom + 1));
+    try testing.expectEqual(deflate_headroom, outputCapacity(max));
+
+    // Whatever the body, the hint stays above the eight bytes `Compress.init`
+    // asserts on (`std/compress/flate/Compress.zig:309`), so no length reaches
+    // the compressor through a buffer too small to enter it.
+    const lens = [_]usize{ 0, 1, 8, 9, 4096, max - deflate_headroom, max };
+    for (lens) |len| try testing.expect(outputCapacity(len) > 8);
 }
 
 test "compressChunk writes what decompressChunk reads back" {
@@ -601,7 +782,7 @@ test "compressChunk writes what decompressChunk reads back" {
     try testing.expectError(error.InvalidChecksum, decompressChunk(gpa, tampered));
     try testing.expectError(
         error.InvalidChunkType,
-        decompressChunk(gpa, .{ .typ = .change, .checksum = chunk.checksum, .data = chunk.data }),
+        decompressChunk(gpa, .{ .typ = .change, .checksum = chunk.checksum, .data = chunk.data, .frame = chunk.frame }),
     );
 
     // `writeChunk` cannot produce a compressed chunk: it hashes the deflated
@@ -643,6 +824,13 @@ test "two change chunks written by automerge parse and re-serialise exactly" {
     try testing.expectEqualSlices(u8, &magic, two_change_chunks[67..71]);
     try testing.expectEqual(@as(u8, 0x01), two_change_chunks[75]);
     try testing.expectEqual(@as(u8, 100), two_change_chunks[76]);
+
+    // **Each chunk carries the exact window automerge wrote**, 67 bytes for
+    // the first and the rest of the file for the second, so a reader that
+    // needs a whole chunk re-emits automerge's own bytes rather than a header
+    // this port rebuilt.
+    try testing.expectEqualSlices(u8, two_change_chunks[0..67], chunks[0].frame);
+    try testing.expectEqualSlices(u8, two_change_chunks[67..], chunks[1].frame);
 
     // Each chunk on its own parses with `parseChunk`, and re-serialising both
     // gives back the file byte for byte.

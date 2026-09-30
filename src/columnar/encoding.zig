@@ -86,6 +86,26 @@
 //! Upstream does the same with `ValueType::Unknown(code)`
 //! (`column_range/value.rs:254-259`).
 //!
+//! # Overlong LEB128
+//!
+//! A value column is the one place on the load path where a LEB128 sits
+//! *inside* a length-delimited payload, so a value can be encoded in more
+//! bytes than it needs and still fit the length its metadata word declares.
+//! `test/fixtures/counter_value_is_overlong.automerge` is exactly that: a
+//! counter of -48 written as `d0 7f`, two bytes, where the one byte `40`
+//! would do, under a metadata word that says two bytes. The reference refuses
+//! the load (`rust/automerge/tests/test.rs:2230-2231`).
+//!
+//! The refusal is not this module's to make and not its to soften. Upstream
+//! reads a counter, an int and a timestamp with the in-tree reader
+//! (`column_range/value.rs:226`, `:249`, `:252`), and that reader returns
+//! `Leb128Overlong` for an encoding that spends a byte the value did not need
+//! (`storage/parse/leb128.rs:52-73`). This module inherits it through
+//! `leb128.readSigned` / `leb128.readUnsigned`, so the `r.len != bytes.len`
+//! check below is the *second* line of defence, not the first: it catches a
+//! payload that is too short, and the reader catches one that is too long for
+//! the value it holds.
+//!
 //! # A cursor, not a slice
 //!
 //! `Decoder` yields one value per call. A document walk reads one row across
@@ -735,6 +755,11 @@ pub const ValueDecoder = struct {
     /// the value is `ScalarValue.unknown` carrying the type code and the
     /// declared bytes verbatim, so a document from a future version round
     /// trips through this one (`column_range/value.rs:254-259`).
+    ///
+    /// A payload whose LEB128 is overlong is refused by the reader, not
+    /// clamped and not warned about: a document that differs on the wire is
+    /// not a document. See the module's *Overlong LEB128* section, and
+    /// `storage/parse/leb128.rs:52-73` for the reference rule.
     pub fn next(self: *ValueDecoder) ParseError!?ScalarValue {
         const word = (try self.meta.next()) orelse return null;
         const m = ValueMeta.fromRaw(word);
@@ -785,8 +810,13 @@ pub const ValueDecoder = struct {
                 // other length as a hard error
                 // (`column_range/value.rs:233-240`).
                 if (len != 8) return error.InvalidValue;
-                const bits: [8]u8 = bytes[0..8].*;
-                break :blk ScalarValue{ .float = @bitCast(bits) };
+                // Little-endian, because that is the wire order: upstream
+                // writes `f64::to_le_bytes` (`value.rs:795`) and reads
+                // `f64::from_le_bytes` (`column_range/value.rs:233-240`),
+                // and `columns.zig`/`opset/types.zig` already say `.little`
+                // on both sides. A `@bitCast` of the bytes is a host-order
+                // read, so on powerpc64 it named a different number.
+                break :blk ScalarValue{ .float = @bitCast(std.mem.readInt(u64, bytes[0..8], .little)) };
             },
             .string => blk: {
                 if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
@@ -1202,6 +1232,24 @@ pub fn encodeMaybeBoolean(
 /// The two halves report their own tags, so neither reports the `value` that
 /// was asked for. That difference is the format's: a value column is two
 /// columns of one id (`change_op_columns.rs:327-336`).
+///
+/// **`values` is borrowed and the result is not.** Every payload a value
+/// carries — the bytes of a `.str`, a `.bytes`, an `.actor_id`'s id or an
+/// `.unknown`'s — must be readable for the duration of the call and no
+/// longer: the pair copies each one into its own `raw` column before it
+/// returns, so the caller may reuse or free the source the instant this
+/// returns. The reverse is not true, and cannot be: the copy *is* the read, so
+/// a payload that was freed by its producer faults here, inside the encoder,
+/// long after the producer let it go.
+///
+/// **Upstream cannot reach that state.** `TxOp` holds an `OpBuilder<'static>`
+/// ([`op.rs:164-170`](../../github-automerge-automerge/rust/automerge/src/op_set2/op.rs)),
+/// so a `ScalarValue<'static>` in a `pending` vector can only be `Cow::Owned`
+/// ([`types.rs:566-570`](../../github-automerge-automerge/rust/automerge/src/op_set2/types.rs))
+/// and the borrow checker refuses a `pending` that borrows a local. Zig has no
+/// lifetime parameter to copy, so the port's `ScalarValue` and `OpBuilder`
+/// borrow whatever they are handed and the *producer* owes the copy. This
+/// function is where that debt is read, not where it is paid.
 pub fn encodeValuePair(
     gpa: Allocator,
     col_id: u32,
@@ -1220,16 +1268,20 @@ pub fn encodeValuePair(
     errdefer raw.deinit(gpa);
     for (values) |v| try appendPayload(gpa, &raw, v);
 
+    const meta_bytes = try meta.toOwnedSlice(gpa);
+    errdefer gpa.free(meta_bytes);
+    const raw_bytes = try raw.toOwnedSlice(gpa);
+
     return .{
         .meta = .{
             .spec = ColumnSpec.make(col_id, .value_metadata, false),
-            .bytes = try meta.toOwnedSlice(gpa),
+            .bytes = meta_bytes,
             .encoding = .value_metadata,
             .len = values.len,
         },
         .raw = .{
             .spec = ColumnSpec.make(col_id, .value, false),
-            .bytes = try raw.toOwnedSlice(gpa),
+            .bytes = raw_bytes,
             .encoding = .value,
             .len = values.len,
         },
@@ -1354,6 +1406,12 @@ fn appendValueMetadata(gpa: Allocator, out: *std.ArrayList(u8), values: []const 
 /// Appends the payload of one value to the value column, which carries no
 /// length prefix of its own: the length is in the metadata word
 /// (`column_range/value.rs:356-370`).
+///
+/// **`v`'s payload is borrowed, and only for this call.** This is the read a
+/// freed payload faults in, so the caller's obligation is the whole of
+/// [`encodeValuePair`]'s: the bytes must be there now. Nothing here can tell a
+/// live slice from a dead one, and copying defensively would read the dead one
+/// to find out.
 fn appendPayload(gpa: Allocator, out: *std.ArrayList(u8), v: ScalarValue) ParseError!void {
     switch (v) {
         // These three carry their whole value in the metadata word, so the
@@ -1363,9 +1421,18 @@ fn appendPayload(gpa: Allocator, out: *std.ArrayList(u8), v: ScalarValue) ParseE
         .int => |i| try leb128.appendSigned(out, gpa, i),
         .counter => |c| try leb128.appendSigned(out, gpa, c.current),
         .timestamp => |t| try leb128.appendSigned(out, gpa, t),
-        .float => |f| {
-            const bits: [8]u8 = @bitCast(f);
-            try out.appendSlice(gpa, &bits);
+        .float => |f| blk: {
+            // Little-endian, matching `ValueDecoder.next`'s float arm above
+            // and upstream's `self.to_le_bytes()`
+            // (`columnar/encoding/encodable_impls.rs:74-78`). A `@bitCast`
+            // into `[8]u8` is host order, so a big-endian build wrote this
+            // document's float payloads reversed for every reader — including
+            // this port's own reader, which is why the round-trip test stayed
+            // green while the bytes disagreed with the reference.
+            var buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &buf, @bitCast(f), .little);
+            try out.appendSlice(gpa, &buf);
+            break :blk;
         },
         .str => |s| try out.appendSlice(gpa, s),
         .bytes => |b| try out.appendSlice(gpa, b),
@@ -1701,6 +1768,92 @@ test "a value column pair round trips every scalar" {
     try testing.expectEqualSlices(u8, pair.raw.bytes, again.raw.bytes);
 }
 
+test "a float value column's payload is the reference's eight little-endian bytes" {
+    // **A round trip is the wrong instrument here, and the round-trip test
+    // above is why this defect survived.** Its writer and its reader were both
+    // host-order, so they agreed with each other on every host and with the
+    // reference on none of them: `0.5` re-encoded to the same wrong bytes on
+    // powerpc64 exactly as it did here. **Two halves that are wrong in the
+    // same direction cannot be caught by comparing them to each other.** What
+    // pins the wire is the bytes themselves, spelled out here, and a read of
+    // bytes this process did not write.
+    //
+    // The expected bytes are upstream's: `to_le_bytes`
+    // (`columnar/encoding/encodable_impls.rs:74-78`), so `1.5` is
+    // `0x3FF8000000000000` least significant byte first — `f8` at index 6 and
+    // `3f` at index 7. `-0.0` is in the pair because it is the value that
+    // would pass any equality check written as `==`: its sign bit is the only
+    // thing that separates it from `0.0`, and it is byte 7.
+    const gpa = testing.allocator;
+    const pair = try encodeValuePair(gpa, 5, &.{
+        .{ .float = 1.5 },
+        .{ .float = -0.0 },
+    });
+    defer pair.deinit(gpa);
+
+    const one_point_five = [_]u8{ 0, 0, 0, 0, 0, 0, 0xf8, 0x3f };
+    const negative_zero = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0x80 };
+    try testing.expectEqualSlices(u8, &one_point_five, pair.raw.bytes[0..8]);
+    try testing.expectEqualSlices(u8, &negative_zero, pair.raw.bytes[8..16]);
+
+    // The other direction, and it is the half that was independently wrong: a
+    // cursor handed the reference's bytes must name the numbers those bytes
+    // spell. Feeding the array in rather than this build's own output is what
+    // makes it a check on the reader instead of an agreement between two arms
+    // of the same mistake.
+    var dec = try ValueDecoder.init(pair.meta.bytes, &[_]u8{
+        0, 0, 0, 0, 0, 0, 0xf8, 0x3f, 0, 0, 0, 0, 0, 0, 0, 0x80,
+    });
+    const first = (try dec.next()) orelse return error.TestUnexpectedResult;
+    switch (first) {
+        .float => |f| try testing.expectEqual(@as(f64, 1.5), f),
+        else => return error.TestUnexpectedResult,
+    }
+    // `==` accepts a `0.0` here, so the sign bit is compared as bits.
+    const second = (try dec.next()) orelse return error.TestUnexpectedResult;
+    switch (second) {
+        .float => |f| try testing.expectEqual(@as(u64, 0x8000000000000000), @as(u64, @bitCast(f))),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect((try dec.next()) == null);
+}
+
+test "the encoded pair copies the payloads it is given and never aliases them" {
+    const gpa = testing.allocator;
+    // **The contract this pins is the one the change encoder stands on.** A
+    // `ScalarValue` borrows its payload, and the value column pair is where
+    // those borrows are read a second time — at commit, after whatever buffer
+    // the producer named them in has been given back. The pair's bytes are
+    // the encoder's own, so the copy has to have happened here: a value whose
+    // buffer is reused the moment `encodeValuePair` returns must still read
+    // back as the characters that were in it at the call.
+    //
+    // Upstream never reaches the question. Its `TxOp` holds an
+    // `OpBuilder<'static>` (`op.rs:164-170`), so a `pending` operation
+    // cannot hold a borrow of a local at all, and the copy is made where the
+    // value is built (`inner.rs:1481-1501`) rather than where it is written
+    // out.
+    const buf = try gpa.dupe(u8, "hello");
+    defer gpa.free(buf);
+    const pair = try encodeValuePair(gpa, 5, &.{
+        .{ .str = buf[0..1] },
+        .{ .str = buf[1..5] },
+    });
+    defer pair.deinit(gpa);
+
+    // The caller takes the buffer back and overwrites it, which is exactly
+    // what `TxHook.insert`'s `concat` and `BlockDiffHook.insert`'s `run` do
+    // when their hook returns (`textdiff.zig`).
+    @memset(buf, 'Z');
+
+    var dec = try ValueDecoder.init(pair.meta.bytes, pair.raw.bytes);
+    const first = (try dec.next()) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("h", first.str);
+    const second = (try dec.next()) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("ello", second.str);
+    try testing.expect((try dec.next()) == null);
+}
+
 test "the pair's two halves are the metadata word and the payload" {
     const gpa = testing.allocator;
     const values = [_]ScalarValue{
@@ -2024,3 +2177,138 @@ test "a malformed column is refused as a ParseError" {
     var dec6 = try ValueDecoder.init(&[_]u8{ 0x7f, 0x3c }, "");
     try testing.expectError(error.LengthExceedsInput, dec6.next());
 }
+
+// The three counter fixtures, at the level this module decodes them. The
+// `value_metadata` column of all three is the two bytes `7f 28`: one literal
+// run of one, whose word is `(2 << 4) | 8` — two payload bytes, type code 8,
+// a counter (`column_range/value.rs:412-435`). The `value` column is what
+// differs, and it is the only column the three fixtures disagree about.
+const counter_meta = [_]u8{ 0x7f, 0x28 };
+
+test "an overlong LEB in a counter payload is refused, and the short form is not" {
+    // `counter_value_is_ok.automerge`: 2000 as `d0 0f`, the two bytes it
+    // needs. Upstream loads it (`rust/automerge/tests/test.rs:2232-2233`).
+    var ok = try ValueDecoder.init(&counter_meta, &[_]u8{ 0xd0, 0x0f });
+    const good = (try ok.next()) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 2000), good.counter.current);
+
+    // `counter_value_is_overlong.automerge`: -48 as `d0 7f`, where the one
+    // byte `40` would do. Upstream refuses the load
+    // (`rust/automerge/tests/test.rs:2230-2231`).
+    var over = try ValueDecoder.init(&counter_meta, &[_]u8{ 0xd0, 0x7f });
+    try testing.expectError(error.InvalidLeb128, over.next());
+
+    // `counter_value_has_incorrect_meta.automerge`: the same word, but the
+    // payload is `10 7f`, whose LEB is one byte and whose second byte the
+    // word does not account for. That is a *different* refusal and it must
+    // still be the one that fires: the two fixtures must not end up
+    // indistinguishable (`rust/automerge/tests/test.rs:2228-2229`).
+    var short = try ValueDecoder.init(&counter_meta, &[_]u8{ 0x10, 0x7f });
+    try testing.expectError(error.InvalidValue, short.next());
+}
+
+test "an overlong LEB is refused for every value type that carries one" {
+    // The three *signed* types — 4, 8 and 9 — each under a word declaring two
+    // payload bytes (`column_range/value.rs:226`, `:249` and `:252`; the code
+    // table is `meta.rs:23-43`, as recorded in
+    // docs/survey/02-transaction-opset.md:1151). The `0x7f` in front is one
+    // literal metadata row, as in the counter fixtures.
+    const signed_words = [_]u8{ 0x24, 0x28, 0x29 };
+
+    // A `0x7f` terminator after a penultimate byte whose sign bit is set
+    // (`storage/parse/leb128.rs:63-65`) — the signed rule, and the shape the
+    // overlong counter fixture carries.
+    for (signed_words) |word| {
+        var dec = try ValueDecoder.init(&[_]u8{ 0x7f, word }, &[_]u8{ 0xd0, 0x7f });
+        try testing.expectError(error.InvalidLeb128, dec.next());
+    }
+    // The same two bytes with a terminator that does *not* continue `0xd0`'s
+    // sign are canonical, and all three types must still read: this is the
+    // half that keeps the refusal from being "refuse everything".
+    for (signed_words) |word| {
+        var dec = try ValueDecoder.init(&[_]u8{ 0x7f, word }, &[_]u8{ 0xd0, 0x0f });
+        const got = (try dec.next()) orelse return error.TestUnexpectedResult;
+        const as_int = switch (got) {
+            .int => |v| v,
+            .counter => |c| c.current,
+            .timestamp => |t| t,
+            else => return error.TestUnexpectedResult,
+        };
+        try testing.expectEqual(@as(i64, 2000), as_int);
+    }
+
+    // The unsigned rule, on the one type that reads an unsigned LEB — code 3,
+    // `column_range/value.rs:225`: a `0x00` terminator after a byte that
+    // already reached the value (`storage/parse/leb128.rs:32-33`). `d0 00` is
+    // 0 in two bytes.
+    var uleb = try ValueDecoder.init(&[_]u8{ 0x7f, 0x23 }, &[_]u8{ 0xd0, 0x00 });
+    try testing.expectError(error.InvalidLeb128, uleb.next());
+    // ...and the canonical two-byte uleb, 16383, is still read.
+    var ok_uleb = try ValueDecoder.init(&[_]u8{ 0x7f, 0x23 }, &[_]u8{ 0xff, 0x7f });
+    const big = (try ok_uleb.next()) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, 16383), big.uint);
+}
+
+test "an overlong LEB is refused in a run header, a null count and a string length" {
+    // The run header is a signed LEB (`rle.zig:59-69` for the run grammar):
+    // `-1` in two bytes where the one byte `7f` would do.
+    try testing.expectError(error.InvalidLeb128, RleSlice.Decoder.init(&[_]u8{ 0xff, 0x7f }));
+    // The count after a null run is an unsigned LEB: zero in two bytes.
+    try testing.expectError(error.InvalidLeb128, RleSlice.Decoder.init(&[_]u8{ 0x00, 0x80, 0x00 }));
+    // A string payload's length prefix is an unsigned LEB: zero in two bytes.
+    // A literal run's payload is not read by `init`, so the refusal lands on
+    // the first `next`.
+    var lit = try RleSlice.Decoder.init(&[_]u8{ 0x7f, 0x80, 0x00 });
+    try testing.expectError(error.InvalidLeb128, lit.next());
+
+    // The same three shapes, canonical: a repeat run of two empty strings, a
+    // null run of one, and a literal run of one empty string.
+    var repeat = try RleSlice.Decoder.init(&[_]u8{ 0x02, 0x00 });
+    const first = (try repeat.next()) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("", first.?);
+    const second = (try repeat.next()) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("", second.?);
+    try testing.expectEqual(@as(??[]const u8, null), try repeat.next());
+
+    // A null run of one: the first `next` is an absent row — the *inner* null —
+    // and the second is the end of the column, the outer one. The two are the
+    // pair `rle.zig` keeps distinct.
+    var nulls = try RleSlice.Decoder.init(&[_]u8{ 0x00, 0x01 });
+    try testing.expectEqual(@as(?[]const u8, null), (try nulls.next()).?);
+    try testing.expectEqual(@as(??[]const u8, null), try nulls.next());
+
+    var empty = try RleSlice.Decoder.init(&[_]u8{ 0x7f, 0x00 });
+    const blank = (try empty.next()) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("", blank.?);
+}
+
+// Zig 0.16.0 / upstream / Rust / port
+//
+// * **`encodeValuePair` is where a freed payload faults, and it cannot be the
+//   place that prevents it.** The pair copies every payload it is given into
+//   its own `raw` column, so it owes the caller nothing afterwards — but the
+//   copy *is* the read, and a payload its producer already freed faults inside
+//   [`appendPayload`] on a `memcpy` of an unmapped address. Nothing at this
+//   layer can tell a live slice from a dead one, and copying defensively
+//   would read the dead one to find out.
+//
+//   Upstream does not reach the state, and the reason is a type rather than a
+//   care: `TxOp` holds an `OpBuilder<'static>`
+//   (`op.rs:164-170`), so a `ScalarValue<'static>` in its `pending` vector can
+//   only be `Cow::Owned` (`types.rs:566-570`) and the borrow checker refuses a
+//   pending operation that borrows a local. `BatchInsertion::splice_text`
+//   relies on that — it collects an **owned** `Vec<ScalarValue>` before its
+//   loop (`inner.rs:1481-1501`) — so every value the change encoder reads is
+//   owned by the time it reads it. Zig has no lifetime parameter to copy, so the
+//   port's [`ScalarValue`] and `OpBuilder` borrow whatever they are handed and
+//   the copy is the producer's to make; it is made in
+//   `Transaction.ownText` (transact.zig), which is what stopped the suite
+//   dying here on a `diff_marks` commit.
+//
+// * **The test above is a pin, not a regression.** It fails if this encoder
+//   ever starts aliasing the caller's buffer instead of copying it, which is
+//   the other way this contract could rot: a "fix" that made the pair borrow
+//   would leave the rows and the change disagreeing, silently, in the same
+//   place. The regression test for the defect itself is at the producer, in
+//   `transact.zig`: "a spliced character does not follow the caller's buffer
+//   into the change".

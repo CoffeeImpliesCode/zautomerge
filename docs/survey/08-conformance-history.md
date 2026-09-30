@@ -22,7 +22,7 @@ Paths covered, with line counts where counted:
 | `rust/automerge/tests/fuzz-crashers/` | 8 files, 893 B total | `cargo fuzz` artifact directory |
 | `rust/automerge/fuzz/` | `Cargo.toml` 417 B, `fuzz_targets/load.rs` 960 B, `.gitignore` 23 B | cargo-fuzz crate, outside the workspace |
 | `rust/automerge/src/` | 163 files, ~65k lines | 34 files declare `#[cfg(test)] mod tests` |
-| `rust/CHANGELOG.md` | 424 lines | workspace-level changelog; the compatibility contract |
+| `rust/CHANGELOG.md` | 423 lines | workspace-level changelog; the compatibility contract |
 | `rust/hexane/CHANGELOG.md` | 2.7 KB | 3 entries only |
 | `rust/Cargo.toml` | workspace root, 8 members | |
 | `rust/rust-toolchain.toml` | 29 B | `channel = "1.90"` |
@@ -39,7 +39,7 @@ Paths covered, with line counts where counted:
 | `.github/workflows/ci.yaml` | 11 jobs | |
 | `.github/workflows/release.yaml`, `advisory-cron.yaml`, `dependabot.yaml` | | |
 | `scripts/ci/*` | 12 scripts | the actual CI body |
-| `flake.nix` | 499 lines | `ci-*` app targets |
+| `flake.nix` | 501 lines | `ci-*` app targets |
 | `LICENSE` (root, `javascript/`, `automerge-wasm/`) | 1.0 KB each, byte-identical MIT | |
 | `rust/automerge/src/text_diff/LICENSE` | Apache-2.0 | vendored `myers.rs` |
 
@@ -87,8 +87,8 @@ op_set2/op_set.rs:1612                   mod tests
 op_set2/parents.rs:95                   mod tests
 op_set2/skip_list.rs:534                mod tests
 op_set2/change/batch.rs:1161            mod tests
-op_set/mark_index.rs:341                pub(crate) mod tests
-op_set/op_iter.rs:1106                  mod tests
+op_set2/op_set/mark_index.rs:341         pub(crate) mod tests
+op_set2/op_set/op_iter.rs:1106           mod tests
 storage/bundle.rs:174                  mod test
 storage/change/change_op_columns.rs:580 mod tests
 storage/columns/column_specification.rs:216 mod tests
@@ -120,7 +120,7 @@ Groups, in file order:
 
 *PatchLog-mismatch regression (0.10.0), `test.rs:37-78`* — `applying_changes_with_patch_log_from_another_document_returns_error_not_panic`, `transaction_with_patch_log_from_another_document_does_not_panic`, `transaction_at_with_patch_log_from_another_document_does_not_panic`, `owned_transaction_with_patch_log_from_another_document_does_not_panic`. All assert `AutomergeError::PatchLogMismatch` / `automerge::PatchLogMismatch` instead of panicking.
 
-*Fuzz-trace minimisations (0.11.0/0.12.0 era), `test.rs:94-826`* — 28 tests. Names encode the invariant: `merge_patches_clear_conflict_after_losing_list_value_is_deleted_from_fuzz_trace`, `bundle_with_mark_columns_decodes_from_fuzz_trace`, `fork_at_rejects_edit_to_object_outside_isolation_from_fuzz_trace`, `historical_owned_transaction_omits_patches_for_unreachable_object_from_fuzz_trace`, `diff_incremental_respects_isolated_heads_from_fuzz_trace`, `fork_at_with_increment_over_conflicted_counter_survives_save_load_from_fuzz_trace`, `transaction_patches_replace_multi_character_string_in_text_from_fuzz_trace`, `merge_patches_replace_multi_character_string_in_text_from_fuzz_trace`, `merge_patches_include_text_element_update_from_fuzz_trace`, `diff_preserves_conflict_after_winning_value_is_deleted_from_fuzz_trace`, `incremental_put_seq_in_text_applies_to_hydrated_value_from_fuzz_trace`, `current_state_diff_with_block_applies_to_hydrated_value_from_fuzz_trace` (**cfg-gated**, see §3), `reverse_diff_of_replaced_lists_applies_to_hydrated_value_from_fuzz_trace`, `unmark_at_end_of_remotely_inserted_conflicted_scalar_in_text_from_fuzz_trace`, `insert_into_replaced_text_run_with_trailing_zero_width_unmark_from_fuzz_trace`, `update_text_after_marking_text_with_hidden_scalar`, `rollback_after_save_load_of_deep_hydrated_root_map_from_fuzz_trace`, `fork_at_preserves_text_encoding`, `load_incremental_into_empty_doc_preserves_utf8_text_encoding`, `spans_match_text_after_merge_of_conflicting_text_overwrites_from_fuzz_trace`, `doc_iter_spans_skip_losing_conflicting_text_overwrites_after_object_shift`, `diff_spans_preserve_marks_on_inserted_text`, `diff_spans_skip_losing_conflicting_text_overwrites`.
+*Fuzz-trace minimisations (0.11.0/0.12.0 era), `test.rs:94-826`* — **23** tests. Names encode the invariant: `merge_patches_clear_conflict_after_losing_list_value_is_deleted_from_fuzz_trace`, `bundle_with_mark_columns_decodes_from_fuzz_trace`, `fork_at_rejects_edit_to_object_outside_isolation_from_fuzz_trace`, `historical_owned_transaction_omits_patches_for_unreachable_object_from_fuzz_trace`, `diff_incremental_respects_isolated_heads_from_fuzz_trace`, `fork_at_with_increment_over_conflicted_counter_survives_save_load_from_fuzz_trace`, `transaction_patches_replace_multi_character_string_in_text_from_fuzz_trace`, `merge_patches_replace_multi_character_string_in_text_from_fuzz_trace`, `merge_patches_include_text_element_update_from_fuzz_trace`, `diff_preserves_conflict_after_winning_value_is_deleted_from_fuzz_trace`, `incremental_put_seq_in_text_applies_to_hydrated_value_from_fuzz_trace`, `current_state_diff_with_block_applies_to_hydrated_value_from_fuzz_trace` (**cfg-gated**, see §3), `reverse_diff_of_replaced_lists_applies_to_hydrated_value_from_fuzz_trace`, `unmark_at_end_of_remotely_inserted_conflicted_scalar_in_text_from_fuzz_trace`, `insert_into_replaced_text_run_with_trailing_zero_width_unmark_from_fuzz_trace`, `update_text_after_marking_text_with_hidden_scalar`, `rollback_after_save_load_of_deep_hydrated_root_map_from_fuzz_trace`, `fork_at_preserves_text_encoding`, `load_incremental_into_empty_doc_preserves_utf8_text_encoding`, `spans_match_text_after_merge_of_conflicting_text_overwrites_from_fuzz_trace`, `doc_iter_spans_skip_losing_conflicting_text_overwrites_after_object_shift`, `diff_spans_preserve_marks_on_inserted_text`, `diff_spans_skip_losing_conflicting_text_overwrites`.
 
 The dominant assertion shape is: build doc → `hydrate` → mutate → produce patches → `hydrate.apply_patches(TextEncoding::…, patches)` → `assert_eq!(actual, expected)`. `TextEncoding::UnicodeCodePoint` is the default in most; three tests force `GraphemeCluster` (`:399`) or `Utf8CodeUnit` (`:4289`, `:4318`, `:4339`).
 

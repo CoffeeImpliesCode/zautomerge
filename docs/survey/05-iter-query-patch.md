@@ -19,7 +19,7 @@ Paths covered under `rust/automerge/src/`, with total line counts.
 | `read.rs` | 330 | `ReadDoc` trait, `Stats` |
 | `query/list_state.rs` | 230 | **dead — not compiled**, see Risk |
 | `query/seek_mark.rs` | 142 | **dead — not compiled**, see Risk |
-| `patches.rs` | 6 | module root |
+| `patches.rs` | 7 | module root |
 | `patches/patch.rs` | 95 | `Patch`, `PatchAction` |
 | `patches/patch_builder.rs` | 381 | `PatchBuilder` (crate-private) |
 | `patches/patch_log.rs` | 779 | `PatchLog`, internal `Event`, `ExposeQueue` |
@@ -27,7 +27,7 @@ Paths covered under `rust/automerge/src/`, with total line counts.
 | `text_diff/myers.rs` | 332 | Myers O((N+M)D) + `DiffHook` trait |
 | `text_diff/replace.rs` | 139 | `Replace<D>` hook decorator |
 | `text_diff/utils.rs` | 119 | prefix/suffix helpers |
-| `text_diff/LICENSE` | 202 | Apache-2.0, copied from `similar` |
+| `text_diff/LICENSE` | 201 | Apache-2.0, copied from `similar` |
 | `marks.rs` | 541 | `Mark`, `MarkSet`, `ExpandMark`, `UpdateSpansConfig` |
 | `cursor.rs` | 296 | `Cursor`, `OpCursor`, `MoveCursor`, wire format |
 | `hydrate.rs` | 372 | `hydrate::Value`, macros, wasm bridge |

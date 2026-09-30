@@ -46,22 +46,107 @@ pub fn countGraphemes(s: []const u8) !usize {
     return n;
 }
 
+/// Whether an extended grapheme cluster opens immediately before the code
+/// point `cp`: for the first code point of a string always, because there is
+/// nothing in front of it to break from, and for every later one exactly when
+/// the UAX #29 break rules fire.
+///
+/// **The scanner is fed before `started` is read, and that order is the whole
+/// point.** [`Scanner.step`] is what sets `started`, so the expression
+/// `!st.started or st.step(cp)` short-circuits on the first code point:
+/// `step` never runs, `started` is still false when the second code point
+/// arrives, and every position in the string then looks like a cluster start.
+/// That is why [`countGraphemes`] — which calls `step` for every code point
+/// and never reads `started` — was the only correct primitive in this file,
+/// and why `textdiff.graphemes` had to ask it about every prefix in turn to
+/// place one boundary (`textdiff.zig`, before its single-pass rewrite).
+/// Nothing here reads `started` after calling `step`.
+fn opensCluster(st: *Scanner, cp: u21) bool {
+    const was_started = st.started;
+    const brk = st.step(cp);
+    return !was_started or brk;
+}
+
+/// The byte offsets at which the extended grapheme clusters of `s` **after
+/// the first** begin, ascending. A null ends the walk.
+///
+/// **The first cluster is not repeated**, because its start is 0 and every
+/// caller already knows it: a walk starts at 0, takes `text[at..start]` for
+/// each answer, and closes the last cluster at `s.len`.
+///
+/// **The scanner is carried across calls**, so the string is decoded exactly
+/// once however many clusters it has. That is the whole difference from
+/// asking [`countGraphemes`] about every prefix, which is `O(n^2)` and is
+/// what this type replaced: for a 210 000-character ASCII string the count
+/// walks 2.2e10 code points, this walks 210 000.
+///
+/// **The walk terminates on any input.** Every step advances `cursor` by at
+/// least one byte — `utf8ByteSequenceLength` answers one to four or an error —
+/// and a truncated sequence or a bad start byte ends the walk with
+/// `error.InvalidUtf8` rather than being skipped, so untrusted bytes are an
+/// error and never a spin.
+pub const GraphemeBoundaryIter = struct {
+    s: []const u8,
+    st: Scanner = .{},
+    /// The offset the next code point to feed the scanner starts at.
+    cursor: usize = 0,
+    /// Whether the first code point has been fed.
+    seeded: bool = false,
+
+    pub fn next(self: *GraphemeBoundaryIter) !?usize {
+        if (!self.seeded) {
+            // The first code point opens the first cluster and closes none. It
+            // is fed here rather than in the loop because it is what makes
+            // `opensCluster` mean "a rule fired" rather than "nothing is
+            // behind this yet" from the second code point on, and because a
+            // loop that fed it would report a break before the first code
+            // point and hand back an empty first cluster.
+            self.seeded = true;
+            if (self.s.len == 0) return null;
+            const len = std.unicode.utf8ByteSequenceLength(self.s[0]) catch
+                return error.InvalidUtf8;
+            if (len > self.s.len) return error.InvalidUtf8;
+            const cp = std.unicode.utf8Decode(self.s[0..len]) catch
+                return error.InvalidUtf8;
+            _ = self.st.step(cp);
+            self.cursor = len;
+        }
+        var i = self.cursor;
+        while (i < self.s.len) {
+            const len = std.unicode.utf8ByteSequenceLength(self.s[i]) catch
+                return error.InvalidUtf8;
+            if (i + len > self.s.len) return error.InvalidUtf8;
+            const cp = std.unicode.utf8Decode(self.s[i .. i + len]) catch
+                return error.InvalidUtf8;
+            // **Every code point is fed exactly once.** `opensCluster` both
+            // reports the break and advances the scanner, so the cursor moves
+            // past the code point that reported it; a cursor left at the break
+            // would feed that code point again and close the next cluster at
+            // its own first byte.
+            if (opensCluster(&self.st, cp)) {
+                self.cursor = i + len;
+                return i;
+            }
+            i += len;
+        }
+        self.cursor = self.s.len;
+        return null;
+    }
+};
+
+/// The boundary walk over `s`.
+pub fn graphemeBoundaries(s: []const u8) GraphemeBoundaryIter {
+    return .{ .s = s };
+}
+
 /// The byte offset of the grapheme cluster boundary at or after `byte_index`,
 /// or `s.len` at the end. `byte_index` must be a codepoint boundary.
 pub fn nextGraphemeBoundary(s: []const u8, byte_index: usize) !usize {
     if (byte_index >= s.len) return s.len;
     if (byte_index == 0) return 0;
-    var st = Scanner{};
-    var i: usize = 0;
-    while (i < s.len) {
-        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch return error.InvalidUtf8;
-        if (i + len > s.len) return error.InvalidUtf8;
-        const cp = std.unicode.utf8Decode(s[i .. i + len]) catch return error.InvalidUtf8;
-        // A boundary falls before `i` when the break rule fires, or at `i`
-        // when `i` opens a cluster after the first one.
-        const opens_cluster = !st.started or st.step(cp);
-        if (opens_cluster and i >= byte_index) return i;
-        i += len;
+    var walk = graphemeBoundaries(s);
+    while (try walk.next()) |start| {
+        if (start >= byte_index) return start;
     }
     return s.len;
 }
@@ -76,8 +161,7 @@ pub fn prevGraphemeBoundary(s: []const u8, byte_index: usize) !usize {
     while (i < byte_index and i < s.len) {
         const len = std.unicode.utf8ByteSequenceLength(s[i]) catch return error.InvalidUtf8;
         const cp = std.unicode.utf8Decode(s[i .. i + len]) catch return error.InvalidUtf8;
-        const opens_cluster = !st.started or st.step(cp);
-        if (opens_cluster and i < byte_index) best = i;
+        if (opensCluster(&st, cp) and i < byte_index) best = i;
         i += len;
     }
     return best;
@@ -86,14 +170,12 @@ pub fn prevGraphemeBoundary(s: []const u8, byte_index: usize) !usize {
 /// The byte offset of grapheme cluster `index`, counting from the start. An
 /// index past the end gives `s.len`.
 pub fn graphemeOffset(s: []const u8, index: usize) !usize {
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < s.len) {
-        if (n == index) return i;
-        const next = try nextGraphemeBoundary(s, i + 1);
-        if (next <= i) return s.len;
-        i = next;
-        n += 1;
+    if (index == 0) return 0;
+    var walk = graphemeBoundaries(s);
+    var seen: usize = 1;
+    while (try walk.next()) |start| {
+        if (seen == index) return start;
+        seen += 1;
     }
     return s.len;
 }
@@ -422,6 +504,102 @@ test "grapheme boundaries" {
     // the ñ that precedes it: the last boundary strictly before 3 is 1.
     try std.testing.expectEqual(@as(usize, 1), try prevGraphemeBoundary(s, 3));
     try std.testing.expectEqual(@as(usize, 3), try nextGraphemeBoundary(s, 3));
+}
+
+/// The byte ranges [`graphemeBoundaries`] hands out, as `[start, end)` pairs.
+/// The test below is its only caller, and it is where the two ends of a walk
+/// are pinned.
+fn clusters(s: []const u8) !std.ArrayList([2]usize) {
+    var out: std.ArrayList([2]usize) = .empty;
+    errdefer out.deinit(std.testing.allocator);
+    var walk = graphemeBoundaries(s);
+    var at: usize = 0;
+    while (try walk.next()) |start| {
+        try out.append(std.testing.allocator, .{ at, start });
+        at = start;
+    }
+    // The last cluster is closed by the end of the string, not by a break.
+    if (at < s.len) try out.append(std.testing.allocator, .{ at, s.len });
+    return out;
+}
+
+test "the cluster walk and the cluster count answer one question" {
+    // **Every case the UAX #29 rules name**, and both ends with them: the
+    // empty string, one ASCII cluster, a CRLF pair, a base plus a combining
+    // mark, a ZWJ sequence, a flag, three regional indicators, a skin-tone
+    // modifier, Hangul syllables, and — the two a rule cannot catch — a lone
+    // combining mark with nothing in front of it and a lone ZWJ with nothing
+    // behind it.
+    const corpus = [_][]const u8{
+        "",                      "a",        "abcd",
+        "añb",
+        "\r\n",                  "\r\na",
+        "👨‍👩‍👦",
+        "a\u{0301}",
+        "🇩🇪",
+        "🇩🇪🇫🇷",
+        "🇩🇪🇫",
+        "👍🏽",
+        "한글",
+        "the quick brown fox. ", "\u{0301}", "\u{200d}x",
+        "\u{0d}x",
+    };
+    for (corpus) |s| {
+        var got = try clusters(s);
+        defer got.deinit(std.testing.allocator);
+
+        // **One cluster per [`countGraphemes`].** The walk and the count are
+        // two ways of answering one question, and this is the only place they
+        // are held to each other.
+        try std.testing.expectEqual(try countGraphemes(s), got.items.len);
+
+        if (got.items.len == 0) {
+            // Nothing to close, and an empty string is the only input for
+            // which zero clusters is the right answer.
+            try std.testing.expectEqual(@as(usize, 0), s.len);
+            continue;
+        }
+        // **The first cluster starts at 0 and the last one ends at `s.len`,
+        // asserted rather than derived.** Every other cluster is closed by a
+        // break one of the rules fired on, and these two are not — they are
+        // closed by the ends of the string. A walk that reports a break
+        // before the first code point hands back an empty first cluster, and
+        // a walk that never closes the last one drops it; both tile the middle
+        // of the string correctly and fail only here.
+        try std.testing.expectEqual(@as(usize, 0), got.items[0][0]);
+        try std.testing.expectEqual(s.len, got.items[got.items.len - 1][1]);
+
+        // **They tile the string, in order, none of them empty**, and their
+        // bytes joined are the input's own.
+        var tiled: usize = 0;
+        var joined: std.ArrayList(u8) = .empty;
+        defer joined.deinit(std.testing.allocator);
+        for (got.items) |c| {
+            try std.testing.expect(c[1] > c[0]);
+            try std.testing.expectEqual(tiled, c[0]);
+            try joined.appendSlice(std.testing.allocator, s[c[0]..c[1]]);
+            tiled = c[1];
+        }
+        try std.testing.expectEqual(s.len, tiled);
+        try std.testing.expectEqualStrings(s, joined.items);
+    }
+}
+
+test "a long text is segmented in one pass" {
+    // **210 000 clusters, the text `tests/text.rs`:1125 splices.** Under the
+    // per-prefix count this is 2.2e10 code-point visits and the test does not
+    // finish; under the walk it is one decode per code point. **There is no
+    // clock here on purpose**: a timing assertion is flaky, and this is not —
+    // the old implementation hangs on this input and this one answers it, so
+    // the input itself is the regression guard.
+    const gpa = std.testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    for (0..10_000) |_| try body.appendSlice(gpa, "the quick brown fox. ");
+    var got = try clusters(body.items);
+    defer got.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 210_000), got.items.len);
+    try std.testing.expectEqual(@as(usize, 210_000), try countGraphemes(body.items));
 }
 
 test "hangul syllables cluster" {

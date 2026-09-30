@@ -833,3 +833,187 @@ test "debugString names the change" {
         text,
     );
 }
+
+// ── The hole that made a class of assertion vacuous ────────────────────────
+
+// Every change a document hands out names the counter of its own last op row.
+//
+// **Why this test exists.** `max_op` is not in the change header — it is the
+// row count of the op columns — so `parseChange` writes `.max_op = 0` and
+// someone has to call [`Change.withOpCount`] once the columns are decoded
+// (`change.zig:45-55`, `:380-382`). **A path that forgets is silent**: the
+// change still parses, still hashes to the same thirty-two bytes, and still
+// hands its peer every operation; only the range is wrong. Nothing about the
+// shape of the old code made the omission fail, so in this tree two assertions
+// that compared a re-parsed `max_op` against another re-parsed `max_op` were
+// comparing zero with zero and could not fail. This test is the one that would
+// have caught that class: it derives the answer from the change's own bytes,
+// so the value under test cannot be the value that is wrong.
+//
+// Upstream cannot have the hole: `Change::new_from_unverified` counts the ops
+// as it decodes them — `stored.verify_ops(|_| len += 1)`
+// ([`change.rs:30-46`](../../github-automerge-automerge/rust/automerge/src/change.rs))
+// — so `Change::max_op()` is `start_op + len - 1` for every `Change` that
+// exists at all ([`change.rs:74-76`](../../github-automerge-automerge/rust/automerge/src/change.rs)).
+//
+// The document is built by this test's own transactions, so the ranges below
+// are the operation counts the test wrote and nothing else. Three routes out
+// of the document are walked — [`doc.Document.getChanges`],
+// [`doc.Document.getChangeByHash`] and [`doc.Document.getLastLocalChange`] —
+// plus one change that arrived from a peer, because a change that was only
+// ever applied never passed through the local commit path.
+test "every change a document hands out names the counter its own last op row carries" {
+    const docmod = @import("doc.zig");
+    const transact = @import("transact.zig");
+    const changechunk = @import("storage/change_chunk.zig");
+
+    const gpa = testing.allocator;
+    var doc = try docmod.Document.init(gpa, .manual);
+    defer doc.deinit();
+    doc.setActorId(.{ .bytes = &([_]u8{0xa1} ** 16) });
+
+    // The rows the test writes: three operations in one change, then a merge
+    // commit with none, then one more. **The empty change is the interesting
+    // shape**: `start_op` is `graph.max_op() + 1` and its own `max_op` is one
+    // below that, so the next change reuses the counter — which is the one
+    // arrangement where a range read from the wrong end still looks plausible.
+    var t1 = try transact.Transaction.open(gpa, &doc);
+    _ = try t1.put(.root, .{ .key = "a" }, .{ .int = 1 });
+    const inner = try t1.putObject(.root, .{ .key = "m" }, .map);
+    _ = try t1.put(inner, .{ .key = "deep" }, .{ .str = "v" });
+    _ = (try t1.commit(null, 1)).?;
+    t1.deinit();
+
+    _ = try doc.emptyCommit(gpa, null, 2);
+
+    var t2 = try transact.Transaction.open(gpa, &doc);
+    _ = try t2.put(.root, .{ .key = "z" }, .{ .uint = 9 });
+    _ = (try t2.commit(null, 3)).?;
+    t2.deinit();
+
+    try testing.expectEqual(@as(u64, 4), doc.graph.maxOp());
+    const actor = doc.getActorIndex().?;
+
+    var changes = try doc.getChanges(gpa, &.{});
+    defer changes.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), changes.len());
+
+    // `start_op` and the row count, both written by the test above.
+    const want = [_]struct { start: u64, rows: usize }{
+        .{ .start = 1, .rows = 3 },
+        .{ .start = 4, .rows = 0 },
+        .{ .start = 4, .rows = 1 },
+    };
+    var rows_total: u64 = 0;
+    for (changes.slice(), want) |built, w| {
+        try testing.expectEqual(w.start, built.change.start_op);
+
+        // **What the change's own columns say.** `opCount` walks the
+        // run-length-encoded action column of the body the document just
+        // handed out ([`storage/change_chunk.zig:399-410`](storage/change_chunk.zig)),
+        // which is a count of rows and not a header field. It is the same
+        // number `src/c/doc.zig`'s `AMchange.size` falls back to when a change
+        // carries no `max_op`, and the same number upstream's `verify_ops`
+        // counts.
+        const rows = blk: {
+            var block = try changechunk.parseChangeChunk(built.body, gpa);
+            defer block.deinit(gpa);
+            break :blk try block.opCount();
+        };
+        try testing.expectEqual(w.rows, rows);
+        rows_total += rows;
+
+        // **The assertion this test is for.** On the old code `max_op` came
+        // back `0` from the re-parse and this compares `start_op + rows - 1`
+        // against `0`, so it fails the moment the fill-in is dropped — which
+        // is what `withOpCount` does and what a bare `parseChange` does not.
+        try testing.expectEqual(
+            (try built.change.withOpCount(rows)).max_op,
+            built.change.max_op,
+        );
+
+        // **And the graph's interval query agrees.** `opidToHash` is the
+        // function a wrong range breaks: it answers the change whose
+        // `[start_op, max_op]` contains a counter
+        // ([`change_graph.rs:300-320`](../../github-automerge-automerge/rust/automerge/src/change_graph.rs)).
+        // A `max_op` of zero makes every counter the change owns belong to no
+        // change at all, which is what a peer's `start_op` then collides with.
+        if (rows == 0) {
+            // An empty change owns no counter: `max_op` is one below
+            // `start_op`, and the counter at `max_op` still belongs to the
+            // change before it.
+            try testing.expectEqual(built.change.start_op - 1, built.change.max_op);
+            const below = doc.graph.opidToHash(.init(@intCast(built.change.max_op), actor));
+            try testing.expect(below != null and !below.?.eql(built.change.hash));
+        } else {
+            const owned = doc.graph.opidToHash(.init(@intCast(built.change.max_op), actor));
+            try testing.expect(owned != null and owned.?.eql(built.change.hash));
+        }
+    }
+    // The ranges the changes claim partition the document's counters, with the
+    // empty change's gap counted as the gap it is.
+    try testing.expectEqual(doc.graph.maxOp(), rows_total);
+
+    // **A peer is the consumer of the number.** [`change_queue.zig`](change_queue.zig)
+    // counts a change's ops as `max_op - start_op + 1`, so a change whose
+    // `max_op` was never filled in lands *no rows and no error*: the peer keeps
+    // the header and none of the operations. The row counts above are what each
+    // application has to land, so this is the same number observed at the far
+    // end of the wire.
+    var peer = try docmod.Document.init(gpa, .auto);
+    defer peer.deinit();
+    for (changes.slice(), want) |built, w| {
+        const framed = try built.change.encode(gpa);
+        defer gpa.free(framed);
+        try testing.expectEqual(w.rows, try peer.loadIncremental(gpa, framed));
+    }
+    try testing.expectEqual(@as(u64, 4), peer.graph.maxOp());
+
+    // **The other direction: a change this document never wrote.** A change
+    // that arrived over sync is decoded on the way in (`Document.applyChanges`
+    // fills its range from the decoded rows), and has to come back out of
+    // `getChangeByHash` carrying the same one.
+    var other = try docmod.Document.init(gpa, .manual);
+    defer other.deinit();
+    other.setActorId(.{ .bytes = &([_]u8{0xb2} ** 16) });
+    var t3 = try transact.Transaction.open(gpa, &other);
+    _ = try t3.put(.root, .{ .key = "p" }, .{ .int = 4 });
+    _ = try t3.put(.root, .{ .key = "q" }, .{ .int = 5 });
+    _ = (try t3.commit(null, 4)).?;
+    t3.deinit();
+
+    var theirs = try other.getChanges(gpa, &.{});
+    defer theirs.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), theirs.len());
+    const theirs_hash = theirs.slice()[0].change.hash;
+    const theirs_framed = try theirs.slice()[0].change.encode(gpa);
+    defer gpa.free(theirs_framed);
+    try testing.expectEqual(@as(usize, 2), try doc.loadIncremental(gpa, theirs_framed));
+
+    var back = (try doc.getChangeByHash(gpa, theirs_hash)).?;
+    defer back.deinit(gpa);
+    const back_rows = blk: {
+        var block = try changechunk.parseChangeChunk(back.body, gpa);
+        defer block.deinit(gpa);
+        break :blk try block.opCount();
+    };
+    try testing.expectEqual(@as(usize, 2), back_rows);
+    try testing.expectEqual(
+        (try back.change.withOpCount(back_rows)).max_op,
+        back.change.max_op,
+    );
+    try testing.expectEqual(@as(u64, 1), back.change.start_op);
+    try testing.expectEqual(@as(u64, 2), back.change.max_op);
+
+    // **The third route out**, which is the one the C ABI's
+    // `AMgetLastLocalChange` takes. It is the local actor's last change, so it
+    // is the one-op change written above and not the peer's.
+    var last = (try doc.getLastLocalChange(gpa)).?;
+    defer last.deinit(gpa);
+    try testing.expectEqual(@as(u64, 4), last.change.start_op);
+    try testing.expectEqual(@as(u64, 4), last.change.max_op);
+    try testing.expectEqual(
+        (try last.change.withOpCount(1)).max_op,
+        last.change.max_op,
+    );
+}

@@ -8,7 +8,7 @@ Paths covered, with line counts.
 
 | File | Lines | Role |
 |---|---|---|
-| `src/lib.rs` | 13 | `mod` list only: `actor_id, byte_span, change, cursor, doc, index, item, items, obj, result, sync` (`src/lib.rs:1-13`) |
+| `src/lib.rs` | 11 | `mod` list only: `actor_id, byte_span, change, cursor, doc, index, item, items, obj, result, sync` (`src/lib.rs:1-13`) |
 | `src/byte_span.rs` | 227 | `AMbyteSpan` + 3 fns |
 | `src/result.rs` | 653 | `AMresult`, `AMstatus`, 7 fns, ~35 `From` impls |
 | `src/actor_id.rs` | 193 | `AMactorId` + 6 fns |
@@ -19,18 +19,18 @@ Paths covered, with line counts.
 | `src/doc/list.rs` | 636 | 15 `AMlist*` fns |
 | `src/doc/map.rs` | 556 | 15 `AMmap*` fns |
 | `src/doc/mark.rs` | 296 | `AMmark`, `AMmarkExpand`, 6 fns |
-| `src/index.rs` | 79 | `AMindex` (private), `AMidxType` |
+| `src/index.rs` | 84 | `AMindex` (private), `AMidxType` |
 | `src/item.rs` | 2177 | `AMitem`, `AMunknownValue`, `AMvalType`, internal `Value`/`Item`, 36 fns |
 | `src/items.rs` | 401 | `AMitems` iterator, 7 fns |
 | `src/obj.rs` | 216 | `AMobjId`, `AMobjType`, 4 fns |
-| `src/sync.rs` | 6 | `pub mod have; pub mod message; pub mod state;` |
-| `src/sync/have.rs` | 45 | `AMsyncHave` + 1 fn |
+| `src/sync.rs` | 7 | `pub mod have; pub mod message; pub mod state;` |
+| `src/sync/have.rs` | 42 | `AMsyncHave` + 1 fn |
 | `src/sync/message.rs` | 146 | `AMsyncMessage` + 5 fns |
 | `src/sync/state.rs` | 262 | `AMsyncState` + 8 fns |
-| `src/utils/{result,stack,stack_callback_data,string}.c` | 19/122/13/50 | hand-written C utility layer |
+| `src/utils/{result,stack,stack_callback_data,string}.c` | 33/105/9/46 | hand-written C utility layer |
 | `include/automerge-c/utils/{result,stack,stack_callback_data,string}.h` | — | the only checked-in headers |
 | `cbindgen.toml`, `build.rs`, `CMakeLists.txt` (439 lines), `cmake/` (6 files) | — | header generation + build |
-| `examples/quickstart.c` | 118 | canonical usage |
+| `examples/quickstart.c` | 131 | canonical usage |
 | `test/` (21 files, cmocka) | — | incl. `test/ported_wasm/{basic,sync,cursor}_tests.c` ported from the wasm suite |
 
 `automerge.h` itself is **not** checked in; it is generated at build time.
@@ -43,7 +43,7 @@ Paths covered, with line counts.
 | `src/interop.rs` | 2407 | JS↔Rust conversion (`JS`, `AR` newtypes, ~40 `TryFrom`/`From`) |
 | `src/sequence_tree.rs` | 617 | private sequence tree for span ops; exports `pub struct Iter<'a,T>` (`:472`) only |
 | `src/export_cache.rs` | 367 | `ExportCache` for materialize/hydrate; no public items |
-| `src/sync.rs` | 86 | `SyncState` class (`:13`) + `DecodeSyncStateErr` |
+| `src/sync.rs` | 83 | `SyncState` class (`:13`) + `DecodeSyncStateErr` |
 | `src/value.rs` | 186 | `pub(crate) enum Datatype`, `InvalidDatatype` |
 | `src/export-web-wasm.js`, `scripts/compile.mjs`, `fixup-node-cjs.mjs`, `package.json`, `deno-tests/deno.ts`, `test/` (10 files), `examples/` (3) | — | build/test harness |
 

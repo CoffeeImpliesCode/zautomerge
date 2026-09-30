@@ -580,8 +580,13 @@ pub fn SequenceTree(comptime T: type) type {
         pub fn checkInvariants(self: *const Self) err.InternalError!void {
             // A tree with no root holds nothing, which is consistent.
             const root = if (self.root) |*r| r else return;
+            // `checkShape` re-derives every node's `length` from its children
+            // (`:423`), so the root's is checked with the rest. It used to be
+            // checked a second time here, against `len()` — which is
+            // `root.length` (`seq-448`), so the branch could not fire and a
+            // reader could believe it was the length check the property tests
+            // lean on.
             try root.checkShape();
-            if (root.length != self.len()) return error.Invariant;
         }
     };
 }
@@ -889,7 +894,17 @@ test "insert_book_vec" {
     for (0..100) |i| {
         try tree.insert(i % 3, {});
         try model.insert(gpa, i % 3, {});
-        try testing.expectEqual(model.items.len, tree.len());
+        // **Upstream compares the model against `t.iter().copied().collect()`
+        // after every step** (`sequence_tree.rs:590`), and that walk is what
+        // the assertion is for. A length is not the same assertion: an
+        // iterator that stops early, or visits one element twice and misses
+        // another, still has the right length. The elements are `void` here
+        // and upstream's are `()`, so the count is the only thing the
+        // comparison can say — but it must be said by walking.
+        var walked: usize = 0;
+        var it = tree.iter();
+        while (it.next()) |_| walked += 1;
+        try testing.expectEqual(model.items.len, walked);
         try tree.checkInvariants();
     }
     try testing.expectEqual(@as(usize, 100), model.items.len);
@@ -1000,3 +1015,12 @@ test "property: interleaved inserts and removes keep the tree in step" {
         }
     }
 }
+
+// ── Diff against the reference, for the test assertions and the invariant walk
+// ────────────────────────────────────────────────────────────────────────────
+//
+// | Zig 0.16.0 | upstream | Rust | port | does not / is / this |
+// | --- | --- | --- | --- | --- |
+// | `test "insert_book_vec"` walks the iterator every step | `sequence_tree.rs:582-592` | `assert_eq!(v, t.iter().copied().collect::<Vec<_>>())` inside `for i in 0..100` | `var walked: usize = 0; var it = tree.iter(); while (it.next()) \|_\| walked += 1; try testing.expectEqual(model.items.len, walked);` | **is** upstream's assertion rather than a length check standing in for it: an iterator that stops early, or visits one element twice and misses another, **still** has the right `len()`, which **is** `root.length` |
+// | `checkInvariants()` ends at `try root.checkShape()` | `fn check`, `sequence_tree.rs:363-368` | re-derives every node's `length` by summing its children's lengths | the same recursive re-derivation, plus the occupancy and arity rules every split and merge in this file relies on | **does not** repeat the root's length against `len()` — that branch **was** here and could never fire, because `len()` **is** `root.length` |
+// | `SequenceTree.eql(a, b)` | `impl PartialEq`, `sequence_tree.rs:471-478` | `self.len() == other.len() && self.iter().zip(other.iter()).all(\|(a, b)\| a == b)` | the same length-then-lockstep comparison over `iter()`, with `std.meta.eql` for the element | **is** upstream's, and **does not** compare the shape: a delete leaves different shapes behind for the same sequence, and upstream's `hydrate::List` derives `PartialEq` from it |

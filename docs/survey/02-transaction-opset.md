@@ -43,7 +43,7 @@ Reference checkout: `~/projects/github-automerge-automerge`, commit `ddbff535407
 | `op_set2/op_set/marks.rs` | 88 | grep map |
 | `indexed_cache.rs` | 113 | full |
 | `exid.rs` | 238 | full |
-| `clock.rs` | ~180 | full |
+| `clock.rs` | 251 | full |
 | `error.rs` | ~190 | full |
 | `types.rs` | 774 | 22-33, 388-623, plus grep map |
 | `Cargo.toml` | — | feature list |
@@ -893,7 +893,7 @@ impl ObjId { with_new_actor :523, without_actor :531, load :539, map :548, root 
 pub(crate) struct ObjMeta { pub(crate) id: ObjId, pub(crate) typ: ObjType };    // :596-600
 impl ObjMeta { pub(crate) fn root() -> Self }                                    // :611-618
 pub(crate) struct ElemId(pub(crate) OpId);                                      // :653
-pub enum TextEncoding { UnicodeCodePoint, Utf8, Utf16, GraphemeCluster }          // :621-…
+pub enum TextEncoding { UnicodeCodePoint, Utf8CodeUnit, Utf16CodeUnit, GraphemeCluster }   // :622-631
 pub struct ChangeHash(pub [u8; 32]);                                             // :690
 ```
 

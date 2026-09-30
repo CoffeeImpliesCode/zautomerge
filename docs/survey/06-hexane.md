@@ -36,7 +36,7 @@ Reference checkout: `~/projects/github-automerge-automerge`, commit
 | `src/delta/mod.rs` | 3576 |
 | `src/delta/decoder.rs` | 150 |
 | `src/delta/indexed.rs` | 490 |
-| **library total** | **24 908** |
+| **library total** | **22 153** |
 
 Test-only (not compiled into the lib): `src/tests.rs` (5770), `src/splice_fuzz.rs` (583),
 `src/edit_fuzz.rs` (1177), `tests/pending.rs` (145).
@@ -84,7 +84,8 @@ How it is used, by call site:
   action: Column<Action>, value_meta: PrefixColumn<ValueMeta>, value:
   RawColumn, mark_name: Column<Option<String>>, expand: Column<bool> }` and
   `Indexes { text: PrefixColumn<Option<u32>>, top: PrefixColumn<bool>,
-  visible: Column<bool>, … }` (`src/op_set2/index.rs:150-155`).
+  visible: Column<bool>, … }` (`src/op_set2/op_set/index.rs:150-156`). There is
+  no `src/op_set2/index.rs`; the earlier path here was wrong.
 - **Value types implemented against hexane's traits** (this is the *only* way
   automerge extends hexane — there is no plugin API):
   `hexane::ColumnValue` + `hexane::RleValue` for `ActorIdx` and `Action`
@@ -107,7 +108,7 @@ How it is used, by call site:
   `src/op_set2/top_op.rs:272-274`.
 - **Errors** are absorbed at the boundary:
   `#[from] hexane::PackError` (`src/storage/error.rs:28`),
-  `use hexane::PackError` (`src/op_set.rs:22`, `src/op_set2/columns.rs:10`,
+  `use hexane::PackError` (`src/op_set2/op_set.rs:22`, `src/op_set2/columns.rs:10`,
   `src/op_set2/mark_index.rs:3`, `src/storage/document.rs:1`).
 - **Sizes**: `hexane::{lebsize, ulebsize}` (`src/op_set2/meta.rs:2`).
 

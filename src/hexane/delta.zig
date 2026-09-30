@@ -1245,3 +1245,243 @@ test "an editor grows a slab a row at a time" {
     defer gpa.free(back);
     try testing.expectEqualSlices(i64, values, back);
 }
+
+// ── Upstream `hexane/src/tests.rs`, the frozen byte fixtures ──────────────────
+
+test "golden_format_delta_i64" {
+    // **`tests.rs:4841-4853`.** `DeltaColumn::<i64>::from_values(..).save()`
+    // against the frozen bytes, then `DeltaColumn::load` back to the values.
+    //
+    // **A single-slab column's `save()` *is* its codec's bytes** — there is no
+    // column-level header above the run sequence, so the fixture is the
+    // codec's output and pinning it needs no `Column`. Upstream froze it at
+    // `tests.rs:4762-4771` and calls a failure here a compatibility break with
+    // every existing automerge document; the bytes are written out for that
+    // reason rather than read from the corpus.
+    //
+    // Read against `delta/mod.rs`'s format: `3` is the signed literal count,
+    // `10` is the first row's value, and the rest are signed differences from
+    // the running sum — `125` as signed LEB128 is `-3` (20 − 10), `123` is
+    // `-5` (25 − 30), `0` is `0` (25 − 25) and `98` is `-30` (−5 − 25). The
+    // count `3` covers the first value, which is why six values spend five
+    // headers; that is upstream's rule and not this port's
+    // (`rust/hexane/src/delta/state.rs`, quoted at `delta.zig:1-70`).
+    const fixture = [_]u8{ 3, 10, 125, 123, 0, 98 };
+    const values = [_]i64{ 10, 20, 30, 25, 25, -5 };
+
+    // Both sizing entry points must agree with the frozen length, or the
+    // bytes below would not be the whole of it.
+    try testing.expectEqual(@as(usize, fixture.len), Delta(i64).encodedSize(&values));
+    var buf: [fixture.len]u8 = undefined;
+    Delta(i64).write(&buf, &values);
+    try testing.expectEqualSlices(u8, &fixture, &buf);
+
+    // The reload half. `decodeAll` splits the bytes itself, so this is a real
+    // pin and not `toDeltas` handing the encoder its own input back.
+    const back = try Delta(i64).decodeAll(&fixture, testing.allocator);
+    defer testing.allocator.free(back);
+    try testing.expectEqualSlices(i64, &values, back);
+}
+
+test "golden_format_delta_opt_i64" {
+    // **`tests.rs:4855-4867`.** The nullable delta column
+    // `[None, 0, 2, 3, None, 10]`, same frozen bytes.
+    //
+    // `Delta(?i64)` instantiates because `domainOf` unwraps the optional
+    // (`delta.zig:76-89`); an absent row is carried by the null run header
+    // rather than by a delta, so the running sum survives it — which is what
+    // makes `98` at the end still a difference and not an absolute.
+    const fixture = [_]u8{ 0, 1, 125, 0, 2, 1, 0, 1, 127, 7 };
+    const values = [_]?i64{ null, 0, 2, 3, null, 10 };
+
+    try testing.expectEqual(@as(usize, fixture.len), Delta(?i64).encodedSize(&values));
+    var buf: [fixture.len]u8 = undefined;
+    Delta(?i64).write(&buf, &values);
+    try testing.expectEqualSlices(u8, &fixture, &buf);
+
+    const back = try Delta(?i64).decodeAll(&fixture, testing.allocator);
+    defer testing.allocator.free(back);
+    try testing.expectEqualSlices(?i64, &values, back);
+}
+
+test "delta_column_load_with_roundtrip" {
+    // **`tests.rs:2635-2643`.** A nullable delta column of
+    // `[Some(10), None, Some(30)]` saves, reloads, and reads back three rows.
+    //
+    // **At the codec, and the codec is where the round trip lives.** The
+    // column wrapper around it adds a slab list and nothing else: `save` is
+    // the codec's `write` over the column's rows and `load` is `decodeAll`
+    // over the same bytes (the same identity the golden fixtures above rest
+    // on). **What is not covered here** is the wrapper's own incremental
+    // re-anchoring — that a delta stays correct when rows are inserted in
+    // front of it — which is `Column`'s and is `column.zig`'s to hold.
+    //
+    // The default load options are `LoadOpts::new()` upstream
+    // (`load_opts.rs:20-40`), which set neither a length nor a fill, so the
+    // bytes alone decide the row count. `decodeAll` is the port's spelling
+    // of exactly that: the count comes out of the slab and nothing supplies
+    // it.
+    const gpa = testing.allocator;
+    const E = Delta(?u64);
+    const values = [_]?u64{ 10, null, 30 };
+
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try E.append(&list, gpa, &values);
+
+    // The bytes really are self-describing: the count is in them.
+    try testing.expectEqual(@as(usize, values.len), try countRows(list.items));
+
+    const loaded = try E.decodeAll(list.items, gpa);
+    defer gpa.free(loaded);
+    try testing.expectEqual(@as(usize, 3), loaded.len);
+    try testing.expectEqualSlices(?u64, &values, loaded);
+
+    // And the absent row survived as an absence rather than as a zero, which
+    // is the one thing a delta column can get wrong that an RLE one cannot:
+    // the running sum has to cross the hole untouched.
+    //
+    // `prefixAt(deltas, index)` is the anchor **standing before** row `index`
+    // (`delta/mod.rs:1185-1197`, `delta.zig:235-239`) — exclusive, not a total
+    // through the row. So the three anchors of `[10, null, 30]` are 0, 10 and
+    // 10, and the last is the one the case is about: **the absent row moved
+    // nothing**, so row 2's delta of 20 is still measured from 10.
+    //
+    // The check goes through `toDeltas` and not the loaded rows, because the
+    // anchors are a property of the *stored* form and reading them off the
+    // realized values would only re-derive the sum the decoder just did.
+    try testing.expectEqual(@as(?u64, null), loaded[1]);
+    const deltas = try E.toDeltas(gpa, &values);
+    defer gpa.free(deltas);
+    try testing.expectEqual(@as(?i64, null), deltas[1]);
+    try testing.expectEqual(@as(i64, 0), try E.prefixAt(deltas, 0));
+    try testing.expectEqual(@as(i64, 10), try E.prefixAt(deltas, 1));
+    try testing.expectEqual(@as(i64, 10), try E.prefixAt(deltas, 2));
+    try testing.expectEqual(@as(i64, 30), try E.prefixAt(deltas, 3));
+}
+
+// ── The differential corpus ──────────────────────────────────────────────────
+
+const corpus = @import("codec_golden.zig");
+
+/// The boundary cases the delta corpus has to carry.
+///
+/// `zero_deltas` and `all_zero_100` are the cases where a delta column's
+/// deltas are all zero, `descending` is where they go negative,
+/// `width_jump` is where one delta's width changes in the middle of a
+/// stream — the case a width-selection bug hides in — and
+/// `null_between_equal` is where a null has to leave the running value
+/// alone.
+const delta_boundary_cases = [_][]const u8{
+    "empty",
+    "one",
+    "zero_deltas",
+    "all_zero_100",
+    "all_equal_300",
+    "descending",
+    "ascending",
+    "pair_0",
+    "boundary_walk",
+    "width_jump",
+    "width_jump_down",
+    "null_alone",
+    "null_then_value",
+    "value_then_null",
+    "null_between_equal",
+    "nulls_between_differing",
+    "null_sandwiched",
+    "random_0",
+    "random_12",
+    "random_23",
+};
+
+/// The eight column types the delta corpus carries.
+///
+/// A table of `(name, tag)` pairs rather than a `switch` on the name: Zig
+/// will not switch on a `[]const u8`, and the codec type has to be known at
+/// compile time for `checkOne` to instantiate it. `corpus.dispatch` walks
+/// this with an `inline for` and hands each arm a comptime tag.
+const DeltaKind = enum { u64, i64, u32, i32, opt_u64, opt_i64, opt_u32, opt_i32 };
+
+const delta_kinds = [_]struct { name: []const u8, tag: DeltaKind }{
+    .{ .name = "delta-u64", .tag = .u64 },
+    .{ .name = "delta-i64", .tag = .i64 },
+    .{ .name = "delta-u32", .tag = .u32 },
+    .{ .name = "delta-i32", .tag = .i32 },
+    .{ .name = "delta-opt-u64", .tag = .opt_u64 },
+    .{ .name = "delta-opt-i64", .tag = .opt_i64 },
+    .{ .name = "delta-opt-u32", .tag = .opt_u32 },
+    .{ .name = "delta-opt-i32", .tag = .opt_i32 },
+};
+
+fn deltaCaseFor(kind: DeltaKind, rec: corpus.Record, gpa: std.mem.Allocator) !void {
+    switch (kind) {
+        .u64 => try corpus.checkOne(Delta(u64), u64, gpa, rec),
+        .i64 => try corpus.checkOne(Delta(i64), i64, gpa, rec),
+        .u32 => try corpus.checkOne(Delta(u32), u32, gpa, rec),
+        .i32 => try corpus.checkOne(Delta(i32), i32, gpa, rec),
+        .opt_u64 => try corpus.checkOne(Delta(?u64), ?u64, gpa, rec),
+        .opt_i64 => try corpus.checkOne(Delta(?i64), ?i64, gpa, rec),
+        .opt_u32 => try corpus.checkOne(Delta(?u32), ?u32, gpa, rec),
+        .opt_i32 => try corpus.checkOne(Delta(?i32), ?i32, gpa, rec),
+    }
+}
+
+fn deltaCase(rec: corpus.Record, gpa: std.mem.Allocator) !void {
+    try corpus.dispatch(delta_kinds, deltaCaseFor, gpa, rec);
+}
+
+test "the delta codec encodes the reference's bytes for every golden case" {
+    const gpa = testing.allocator;
+    var names = corpus.Names.init(gpa);
+    defer names.deinit();
+
+    const cases = try corpus.eachCase(gpa, "delta", &names, deltaCase);
+    try testing.expectEqual(@as(usize, 540), cases);
+    try names.expectRequired(&delta_boundary_cases);
+}
+
+// Zig 0.16.0 / upstream / Rust / port
+//
+// * **Both frozen delta fixtures are pinned at the codec.** A single-slab
+//   column's `save()` is its codec's bytes — no column-level header sits above
+//   a run sequence — so `DeltaColumn::<i64>::from_values(..).save()` over
+//   `[10,20,30,25,25,-5]` *is* `Delta(i64).write` over the same values:
+//     `[3, 10, 125, 123, 0, 98]`, read as literal count 3, the first row's
+//   value `10`, then signed differences `−3`, `−5`, `0`, `−30`. The count
+//   covers the first value, which is why six values spend five headers —
+//     upstream's rule, at `delta/state.rs`, quoted in this file's own module
+//   comment. Upstream freezes the fixture at `tests.rs:4762-4771` and calls a
+//   failure a compatibility break with every existing automerge document, so
+//   the bytes are written out rather than read from the corpus.
+//
+// * **`golden_format_delta_opt_i64` is `Delta(?i64)`, not `DeltaOption`.**
+//   `DeltaOption` is this file's alias for `Delta(?u32)` (`delta.zig:758`), and
+//   upstream's case is over `Option<i64>`. `Delta(?i64)` instantiates because
+//   `domainOf` unwraps the optional (`delta.zig:76-89`), which is what makes
+//   the nullable fixture reachable at all; the alias would have pinned a
+//   different fixture's bytes and passed for the wrong reason.
+//
+// * **`delta_column_load_with_roundtrip` is the codec's round trip and not the
+//   column's.** `save` is the codec's `write` over the column's rows and `load`
+//   is `decodeAll` over the same bytes, so those are what the case asserts.
+// The wrapper's default `LoadOpts::new()` (`load_opts.rs:20-40`) sets neither a
+//   length nor a fill, which is why the count can come out of the bytes alone.
+//   **What is not covered** is the wrapper's incremental re-anchoring — that a
+//   delta stays correct when rows are inserted in front of it — which is
+//   `Column`'s and belongs to `column.zig`.
+//
+// * **`prefixAt` is exclusive, and the anchors are the whole of the nullable
+//   case.** It answers the realized value standing *before* row `index`
+//   (`delta/mod.rs:1185-1197`, `delta.zig:235-239`), not a total through it.
+//   For `[10, null, 30]` the anchors are 0, 10, 10 and 30, and the third is
+//   the one worth pinning: **the absent row moved nothing**, so row 2's delta
+//   of 20 is still measured from 10. Reading those anchors off the realized
+//   values would only re-derive the sum `decodeAll` had already done, so the
+//   assertions go through `toDeltas` — the stored form — instead.
+//
+// * **`delta_column_load_with_nullable_empty_fill` is blocked, not folded in.**
+//   It asks for five absent rows out of *empty* bytes, which needs
+//   `LoadOpts::with_length` and `with_fill`; those are `Column.LoadOpts`
+//   (`column.zig:2814-2846`) and `delta.zig` is a codec with no load options,
+//   so there is nowhere outside `column.zig` to ask for a length or a fill.

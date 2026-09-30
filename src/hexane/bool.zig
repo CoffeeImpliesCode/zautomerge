@@ -419,3 +419,122 @@ test "run counts that overflow the total are rejected" {
     try std.testing.expectError(error.Overflow, Bool.decodeAll(&slab, gpa));
     try std.testing.expectError(error.Overflow, countValues(&slab));
 }
+
+// ── Upstream `hexane/src/tests.rs`, the frozen byte fixtures ──────────────────
+
+test "golden_format_bool" {
+    // **`tests.rs:4834-4839`.** Both arms of upstream's `golden_rle::<bool>`,
+    // against the frozen bytes.
+    //
+    // **A single-slab column's `save()` *is* its codec's bytes** — the column
+    // wire format carries no column-level header above the run sequence, so
+    // the fixture is the codec's output and pinning it needs no `Column`.
+    // Upstream froze these at `tests.rs:4762-4771` and says outright that a
+    // failure here is a compatibility break with every existing automerge
+    // document; the bytes are written out for that reason rather than read
+    // from the corpus.
+    {
+        // `[2, 3, 1]`: two false, three true, one false. A boolean slab is a
+        // bare sequence of run counts with no value bytes at all
+        // (`bool.rs:33-49`), so three bytes are three counts.
+        const values = [_]bool{ false, false, true, true, true, false };
+        const bytes = try encode(std.testing.allocator, &values);
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqualSlices(u8, &.{ 2, 3, 1 }, bytes);
+
+        const back = try Bool.decodeAll(bytes, std.testing.allocator);
+        defer std.testing.allocator.free(back);
+        try std.testing.expectEqualSlices(bool, &values, back);
+    }
+    {
+        // `[0, 2, 1]`: a column starting **true** carries the zero-count false
+        // pad, because the first count describes the false run and this
+        // sequence begins with a value that is not false.
+        const values = [_]bool{ true, true, false };
+        const bytes = try encode(std.testing.allocator, &values);
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqualSlices(u8, &.{ 0, 2, 1 }, bytes);
+
+        const back = try Bool.decodeAll(bytes, std.testing.allocator);
+        defer std.testing.allocator.free(back);
+        try std.testing.expectEqualSlices(bool, &values, back);
+    }
+}
+
+// ── The differential corpus ──────────────────────────────────────────────────
+
+const corpus = @import("codec_golden.zig");
+
+/// The boundary cases the boolean corpus has to carry.
+///
+/// The run counts are where a count's own LEB128 width changes, the
+/// `run_*_true` cases are the ones that open on a zero-count pad, and
+/// `sandwich_*` are three runs with a single opposite value in the middle —
+/// the shape where a leading pad and a real run are easy to confuse.
+const bool_boundary_cases = [_][]const u8{
+    "empty",
+    "one_false",
+    "one_true",
+    "run_2_false",
+    "run_2_true",
+    "run_63_false",
+    "run_64_true",
+    "run_127_false",
+    "run_128_true",
+    "run_16383_false",
+    "run_16384_true",
+    "run_16385_false",
+    "alternating_odd",
+    "alternating_even",
+    "sandwich_false_1",
+    "sandwich_true_1",
+    "sandwich_false_128",
+    "sandwich_true_16384",
+    "random_0",
+    "random_12",
+    "random_23",
+};
+
+/// One golden case, through the boolean codec.
+fn boolCase(rec: corpus.Record, gpa: std.mem.Allocator) !void {
+    if (!std.mem.eql(u8, rec.codec, "bool")) return error.CorpusCodecUnknown;
+    try corpus.checkOne(Bool, bool, gpa, rec);
+}
+
+test "the boolean codec encodes the reference's bytes for every golden case" {
+    const gpa = std.testing.allocator;
+    var names = corpus.Names.init(gpa);
+    defer names.deinit();
+
+    const cases = try corpus.eachCase(gpa, "bool", &names, boolCase);
+    try std.testing.expectEqual(@as(usize, 71), cases);
+    try names.expectRequired(&bool_boundary_cases);
+}
+
+// Zig 0.16.0 / upstream / Rust / port
+//
+// * **`golden_format_bool` is pinned at the codec, for the same reason the RLE
+//   fixtures are.** A boolean slab is a bare sequence of run counts with no
+//   value bytes (`bool.rs:33-49`), and there is no column-level header above
+//   one, so `Column::<bool>::from_values(..).save()` over
+//   `[false,false,true,true,true,false]` *is* `Bool.write` over the same
+//   values: `[2, 3, 1]`. Both upstream arms are here, including the one that
+//   exists because a column starting true carries the zero-count false pad.
+//
+// * **Two upstream boolean cases are blocked and neither is a transcription
+//   problem.** `fuzz_bool_splice_exhaustive` splices a `Column<bool>` across a
+//   slab boundary and compares against a `Vec`;
+//   `bool_encoder_into_column_direct_matches_load` builds one under a
+//   four-segment budget and demands `save()` be byte-identical to a one-shot
+//   encode. Both need the column's slab list and its seam pass, which is
+//   `column.zig` — **`Bool` encodes and decodes one slab, and `Slab.splice`
+//   rewrites only inside a single one, so the multi-slab seam these cases
+//   exist to catch cannot be built here.**
+//
+// * **The zero-count pad is a property of the *first run*, not of the first
+//   value.** That is why `[true, true, false]` is `[0, 2, 1]` and not
+//   `[2, 1]`: the first count describes the false run, and this sequence
+//   begins with a value that is not false. `Bool.encodedSize` and `Bool.write`
+//   both have to agree that it costs a byte, and the bytes are obtained
+//   through `encodedSize`, so a disagreement between them would fail the byte
+//   compare rather than hide inside it.

@@ -14,7 +14,7 @@
 //!
 //! A composite has no rows of its own, so its row count *is* the row count
 //! of its underlying columns, and every write has to leave them all in
-//! step. Two rules keep that true:
+//! step. Three rules keep that true:
 //!
 //! * a view is built by `init`, which refuses columns that disagree, and
 //!   `checkLengths` re-checks it — the columns come from bytes a peer sent,
@@ -26,6 +26,15 @@
 //!   group, whose payload columns are rewritten one after another, is the
 //!   one exception, and a group out of step is still a value a
 //!   `checkLengths` reports rather than a value a cursor reads.
+//!
+//! * a splice's replacement rows are **borrowed for the call**: a composite
+//!   takes what it needs out of them — a string into the string table, an
+//!   integer into its column — before it rewrites anything, so the caller may
+//!   reuse or free the slice the instant `splice` returns. The mirror of that
+//!   is [`Value.iterator`], whose values are a *view* of the composite's own
+//!   raw buffer and live until that buffer is spliced. One is a borrow the
+//!   caller lends the callee for one call, the other a borrow the callee
+//!   lends the caller until the next write; neither outlives its own rule.
 //!
 //! # What each composite is a view over
 //!
@@ -902,6 +911,14 @@ fn objIdCells(id: ExId) struct { actor: ?u32, counter: ?u64 } {
     return switch (id) {
         .root => .{ .actor = null, .counter = null },
         .id => |o| .{ .actor = o.actor, .counter = o.counter },
+        // Upstream's `ExId::Id` is three fields (`exid.rs:15-18`); `.named`
+        // is the port's spelling of the same value, carrying the actor's
+        // bytes so an id survives an actor-table renumber. **It writes the
+        // same two cells as `.id`** — the name is a convenience for the
+        // in-memory case and is not part of the document format, so it must
+        // not reach the columns. The doc comment above says "an operation id
+        // spells out both", and that is the whole rule.
+        .named => |n| .{ .actor = @intCast(n.op.actor), .counter = n.op.counter },
     };
 }
 
@@ -1041,7 +1058,8 @@ pub const OpIdList = struct {
         var counters: std.ArrayList(?u32) = .empty;
         defer counters.deinit(gpa);
         for (rows) |row| {
-            try counts.append(gpa, @as(?u64, @intCast(row.len)));
+            try counts.append(gpa, std.math.cast(u64, row.len) orelse
+                return error.Overflow);
             for (row) |id| {
                 try actors.append(gpa, id.actor);
                 try counters.append(gpa, id.counter);

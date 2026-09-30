@@ -718,3 +718,10 @@ test "the cursor never leaves its buffer" {
         }
     }
 }
+
+// The totality regression suite over every parser below, driven by the eight
+// upstream fuzz crashers. It lives beside the parsers it drives rather than
+// under `test/` because it imports them as private modules.
+test {
+    _ = @import("totality_test.zig");
+}
