@@ -72,7 +72,7 @@ reachable only under `-Dconformance-record`, which is the same function's record
 branch. Structure is not proof, so it was **proved by breaking it**: one byte of
 `test/golden/change.jsonl` was flipped and `zig build conformance -- change`
 failed, naming both files in the `cmp` —
-`cmp /home/tmp/…/o/4c715b…/change.jsonl /vol/…/test/golden/change.jsonl`,
+`cmp <cache>/change.jsonl test/golden/change.jsonl`,
 `Build Summary: 2/4 steps succeeded (1 failed)`. The file was then restored and
 confirmed **byte-exact by sha256** (`0689ff5d…` identical before and after), and
 the gate returned to 4/4. Full sweep: **18/18 steps, 8 vectors**, each
@@ -930,9 +930,12 @@ file's header explains). The other 17 are this port's `abi_coverage.c`.
 "21 cmocka files" is not a measurable count. Upstream's
 `rust/automerge-c/test/` holds **19** `.c` files, 5 headers, one data file and
 `CMakeLists.txt` — 26 files in all. Two upstream fixtures are worth recording:
-the suite needs `-Dcmocka-prefix=<dir>` pointing at a cmocka built against this
-host's glibc, and it needs `LD_LIBRARY_PATH` to include that prefix's `lib64`,
-because the build step sets no rpath.
+the suite needs `-Dcmocka-prefix=<dir>` pointing at a cmocka built against the
+running glibc. It also used to need `LD_LIBRARY_PATH` to include that prefix's
+`lib64`, because the build step set no rpath; that requirement is obsolete
+since `build.zig:539` absolutises the prefix and `build.zig:612` sets
+`ctest_bin.each_lib_rpath`, so `libcmocka.so.0` resolves from the binary's own
+`RUNPATH` whatever the working directory is.
 
 ## 7. Verification strategy
 

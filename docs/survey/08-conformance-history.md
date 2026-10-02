@@ -2,7 +2,7 @@
 
 ## Scope
 
-Read-only reference checkout: `~/projects/github-automerge-automerge` at commit `ddbff535407e4d28cd2a82eaf6c6add08caa3bdd`.
+Read-only reference checkout: `../github-automerge-automerge` at commit `ddbff535407e4d28cd2a82eaf6c6add08caa3bdd`.
 
 Paths covered, with line counts where counted:
 

@@ -2,7 +2,7 @@
 
 ## Scope
 
-Reference checkout: `~/projects/github-automerge-automerge`, commit
+Reference checkout: `../github-automerge-automerge`, commit
 `ddbff535407e4d28cd2a82eaf6c6add08caa3bdd`, crate root `rust/hexane/`
 (`hexane` v1.0.0-alpha.5, edition 2021, MSRV `rust-version = "1.90.0"` in
 `Cargo.toml:7`; the README claims MSRV 1.80 — `Cargo.toml:7` is authoritative).

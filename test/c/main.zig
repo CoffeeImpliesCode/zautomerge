@@ -5,7 +5,7 @@
 //! root of an executable: it passes it as `-Mroot=main.c`, the CLI reads that
 //! as a Zig compilation unit, and `std/start.zig` then fails on the missing
 //! `root.main` ([std/Build/Step/Compile.zig:1319-1331](
-//! ~/.cache/zig/lib/std/Build/Step/Compile.zig)
+//! ../../lib/std/Build/Step/Compile.zig)
 //! is where that `-M` is emitted). So the root is this file, it owns `main`,
 //! and it hands control to the suite's C driver, `test/c/main.c`, which is
 //! upstream's `rust/automerge-c/test/main.c` with the function renamed.

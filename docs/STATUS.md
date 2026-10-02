@@ -224,9 +224,10 @@ the checkout).
 **`AUTOMERGE_REF` in this environment is unset** (measured, 2026-10-01), so
 anything that reads the variable rather than the relative path falls back
 correctly through `tools/link-oracle.sh` to the sibling checkout. Where it is
-*set* it has pointed at `~/projects/github-automerge-automerge`,
-which does not exist; the script refuses it by name and says so, so a stale
-export is a warning rather than a wrong source.
+*set* it has pointed at an absolute path from elsewhere rather than the sibling
+`../github-automerge-automerge`, and that path does not exist here; the script
+refuses it by name and says so, so a stale export is a warning rather than a
+wrong source.
 
 `test/fixtures/` holds **18** corpus files (measured: regular files at depth 1,
 excluding `manifest.zig`). `test/fixtures/manifest.zig` records **5** entries
@@ -699,6 +700,14 @@ answer looks right — but these are open, not closed.
    the module in is a single example file. **A file excluded from the main
    suite has exactly one other place it can fail, and it should not be the
    crate-root example.** It passes now — `test/example_test.zig` is 3/3.
+4. **The 20-target portability matrix has no verdict yet — its one run was
+   interrupted, not failed.** Run `20261002-115542-31452-24919` (Zig 0.16.0,
+   `test/cross-test.profile.sh`, `zig build test`) covered 12 of the 20
+   runnable targets before the harness was stopped (exit 143): 0 pass /
+   20 fail with `bookkeeping_failure=false` is the shape of an aborted run,
+   not of twenty broken targets. The per-target logs stay outside the repo;
+   re-run per the profile and record the outcome here before claiming any
+   platform verdict.
 
 ## Traps found and fixed
 
@@ -966,7 +975,8 @@ and is not done.**
 **Cost.** The `src/hexane/btree.zig` suite goes 2.46 s / 29 passed / 1 skipped
 to 4.72 s / 30 passed / 0 skipped — that is the deep sweep the option buys. The
 whole library suite goes 4m58s to 8m17s, the rest being the cross-check on
-every `seekOpsByIndex` call site. Both Debug, both on this machine, 2026-10-01.
+every `seekOpsByIndex` call site. Both Debug, both on the machine measured,
+2026-10-01.
 
 **`zig build ctest -Dslow-path` is green: 17/17, exit 0.** That combination is
 new rather than a repeat — `cabi_lib` in `build.zig` imports `zautomerge`,
@@ -1005,32 +1015,36 @@ obvious one is the missing rpath — `each_lib_rpath = true` on the
 sufficient on its own**. Measured on a two-line executable linked against the
 prefix's `libcmocka.so.0`:
 
-- `-L <absolute>/lib64 -feach-lib-rpath` → `RUNPATH: [/vol/.../cmocka-prefix/lib64]`, runs from any working directory with no `LD_LIBRARY_PATH`, exit 0.
+- `-L <absolute>/lib64 -feach-lib-rpath` → `RUNPATH: [<prefix>/lib64]`, runs from any working directory with no `LD_LIBRARY_PATH`, exit 0.
 - `-L ../cmocka-prefix/lib64 -feach-lib-rpath` → `RUNPATH: [../cmocka-prefix/lib64]`, and from `test/c/suite` it fails with **the same `libcmocka.so.0` message and the same exit 127**.
 
 So the rpath supplies the *entry* and the prefix supplies its *value*, and a
 relative prefix produces a relative entry that is just as cwd-dependent as the
 environment variable was. The pair is: **absolutise `cmocka_prefix` once**
 (`b.pathFromRoot(prefix)`, public but documented as low-level) before it reaches
-`addIncludePath`/`addLibraryPath`, **and** set `each_lib_rpath`. Six lines in
-`build.zig`, no test changes, and it deletes a requirement from the invoker.
-**Not done** — it is in a file six agents are appending to and belongs to
-whoever owns that region.
+`addIncludePath`/`addLibraryPath`, **and** set `each_lib_rpath`. **Done, both
+halves**: `build.zig:539` takes `b.pathFromRoot(prefix)` unless
+`std.fs.path.isAbsolute(prefix)` is true, and `build.zig:612` sets
+`ctest_bin.each_lib_rpath = true`. Six lines in `build.zig`, no test changes,
+and it deletes a requirement from the invoker: the `LD_LIBRARY_PATH` export
+described above is obsolete, the prefix is all the step takes, and a relative
+`-Dcmocka-prefix=../cmocka-prefix` now works.
 
 ### 5. Gates measured, and one environment note
 
 `zig build test`, `zig build conformance` and `zig build ctest` were all
 **not measured** in the previous revision of this file; all three are measured
 now, at the top of this file. `zig build ctest` needs `-Dcmocka-prefix=<dir>`
-naming the directory holding `lib64/libcmocka.so` (here
-`~/cmocka-prefix`); **without it the step does not
+naming the directory holding `lib64/libcmocka.so` (here `../cmocka-prefix`, a
+sibling of this repository, which is the default `test/c/build-cmocka.sh`
+derives from the repository's own location); **without it the step does not
 fail at the launch, it fails at the link**, with `unable to find dynamic system
 library 'cmocka' using strategy 'paths_first'` and a search list that does not
 include the prefix — which reads like a missing dependency rather than a
 missing flag. That is the whole of the long-standing "`zig build ctest`
 FAILS, reason never captured": there is no defect in the C ABI or the suite,
 only an argument the gate does not pass. With the prefix the suite links,
-runs and passes. `zig-gate` was not run.
+runs and passes. The house gate was not run.
 
 ## How to work on this
 
@@ -1051,10 +1065,10 @@ runs and passes. `zig-gate` was not run.
   They surfaced only when a consumer wrapped a sub-iterator and forwarded the
   kernel, because that is what finally forced the analysis. Where a
   conformance mark exists for a type, something has to call through it.
-- The repository is on an NFS export and the build cache is not: put
-  `ZIG_GLOBAL_CACHE_DIR` and `--cache-dir` on local disk, and never let two
-  builds share one. `/tmp` on this machine is small; a dozen agents each with a
-  private cache will fill it.
+- The repository is on a network export and the build cache should not be: put
+  `ZIG_GLOBAL_CACHE_DIR` and `--cache-dir` on a large local scratch volume, and
+  never let two builds share one. A system volume's `/tmp` is small; a dozen
+  agents each with a private cache will fill it.
 - `zig build conformance -- fixtures` runs the Rust reference against the
   corpus and prints the same 18 results the manifest records. `doc`, `change`,
   `codec`, `diff`, `converge` and `sync` emit the golden vectors to compare a

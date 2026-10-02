@@ -2085,16 +2085,16 @@ fn spliceScalars(
 // express only by ordering `--dep` before the `-M` it belongs to:
 //
 // ```text
-// printf 'pub const check_slow_paths = false;\n' > /tmp/bo.zig
+// printf 'pub const check_slow_paths = false;\n' > $SCRATCH/bo.zig
 // zig test -ODebug --dep zautomerge -Mroot=test/upstream_batch_insert.zig \
 //   --dep build_options -Mzautomerge=src/root.zig \
-//   --dep build_options -Mbuild_options=/tmp/bo.zig
+//   --dep build_options -Mbuild_options=$SCRATCH/bo.zig
 // ```
 //
-// **`/home/tmp`, not `/tmp`.** `/tmp` and `/var/tmp` are small local
-// filesystems on these machines and are not for large data; the Rechenbetriebsgruppe
-// keeps them bounded and asks that scratch land in `/vol/tmp`, `/vol/tmp2`,
-// `/home/tmp` or `/home/tmp2` instead. Check which a machine actually provides
+// **A large local volume, not a small system volume.** `/tmp` and `/var/tmp` are
+// small local filesystems on these machines and are not for large data: they are
+// kept bounded, so a build cache must not land on them. Put scratch on a large
+// local volume of your own instead, and check what a machine actually provides
 // with `df -hT`, and how much is left, before pointing a build cache at one.
 //
 // (Putting `--dep build_options` before `-Mroot=`, which is the obvious thing to

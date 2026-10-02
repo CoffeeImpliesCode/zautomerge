@@ -1018,7 +1018,7 @@ fn emptyClock(gpa: Allocator) !Clock {
 /// Whether two values are the same value, **by content**.
 ///
 /// **`expectEqual` on a [`ValueRef`] compares the pointers of the slices
-/// inside it** ([std/testing.zig:130-139](../../tmp/zig-global-cache/lib/std/testing.zig)),
+/// inside it** ([std/testing.zig:130-139](../../lib/std/testing.zig)),
 /// so a test that used it would pass on any two string values and fail on
 /// none. [`ScalarValue.eql`] is the content comparison, and it is what
 /// upstream's `PartialEq` on `ValueRef` means.

@@ -109,9 +109,10 @@ zig build ctest
 ### cmocka is not in the compiler's default search path here, and the packaged one will not run
 
 The Nix-provided `cmocka-2.0.2` needs `GLIBC_ABI_GNU2_TLS` (glibc ≥ 2.42) and
-this host has glibc 2.40, so a suite linked against the packaged library fails
-to launch. The gate therefore needs `-Dcmocka-prefix=<dir>` pointing at a
-cmocka built against the **host** glibc.
+glibc 2.40 on the build host is older than that, so a suite linked against the
+packaged library fails to launch. The gate therefore needs
+`-Dcmocka-prefix=<dir>` pointing at a cmocka built against the glibc the build
+host runs.
 
 **`test/c/build-cmocka.sh` builds it, and the prefix it installs to is a
 sibling of this repository** — `../cmocka-prefix`, on the same volume the
@@ -138,8 +139,8 @@ it deliberately does not do — nixpkgs's `uintptr_t.patch`, which is a no-op on
 a host that has `<stdint.h>`, and cmocka's own test suite.
 
 `build.zig:153` declares the option and `build.zig:194-203` adds `include` plus
-both `lib` and `lib64` under it, so one prefix covers either layout (this host
-installs into `lib64`). Nothing is vendored and no path is hardcoded in
+both `lib` and `lib64` under it, so one prefix covers either layout (cmocka
+installs into `lib64` here). Nothing is vendored and no path is hardcoded in
 `build.zig`. **A build step that only works because of something done by hand,
 with no record, is a build step that breaks for the next person** — hence this
 section and the script.

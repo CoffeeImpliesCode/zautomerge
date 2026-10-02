@@ -1,6 +1,6 @@
 # Iteration, Queries, Patches, Text Diff, Marks, Cursors, Hydrate
 
-Reference checkout: `~/projects/github-automerge-automerge` @ `ddbff535407e4d28cd2a82eaf6c6add08caa3bdd`, crate `rust/automerge` (v0.12.0, `rust/automerge/Cargo.toml:1-3`).
+Reference checkout: `../github-automerge-automerge` @ `ddbff535407e4d28cd2a82eaf6c6add08caa3bdd`, crate `rust/automerge` (v0.12.0, `rust/automerge/Cargo.toml:1-3`).
 
 ## Scope
 

@@ -5522,7 +5522,7 @@ const want_succ_count = [_]u32{
 /// That two columns hold the same values in the same order, row for row.
 ///
 /// `expectEqual` on two slices compares their **pointers**
-/// ([std/testing.zig:130-139](../../tmp/zig-global-cache/lib/std/testing.zig)),
+/// ([std/testing.zig:130-139](../../lib/std/testing.zig)),
 /// so a test that used it here would pass on any two slices and fail on none.
 fn expectSameCol(comptime Col: type, a: *const Col, b: *const Col, gpa: Allocator) !void {
     const av = try a.toSlice(gpa);

@@ -2,7 +2,7 @@
 
 ## Scope
 
-Reference checkout: `~/projects/github-automerge-automerge` at commit
+Reference checkout: `../github-automerge-automerge` at commit
 `ddbff535407e4d28cd2a82eaf6c6add08caa3bdd`, crate `automerge` v0.12.0
 (`rust/automerge/Cargo.toml:3`), edition 2021, MSRV 1.90.0. Nothing was built or run; every
 claim below is read out of the source.

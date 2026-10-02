@@ -2,7 +2,7 @@
 
 ## Scope
 
-Reference checkout: `~/projects/github-automerge-automerge`, commit `ddbff535407e4d28cd2a82eaf6c6add08caa3bdd`. All paths below are relative to `rust/automerge/src/`.
+Reference checkout: `../github-automerge-automerge`, commit `ddbff535407e4d28cd2a82eaf6c6add08caa3bdd`. All paths below are relative to `rust/automerge/src/`.
 
 | Path | Lines | What was read |
 |---|---|---|

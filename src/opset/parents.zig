@@ -783,7 +783,7 @@ fn collect(
 /// Compares two paths element-wise.
 ///
 /// `expectEqual` on two slices compares their **pointers**
-/// ([`std/testing.zig:130-139`](../../tmp/zig-global-cache/lib/std/testing.zig)),
+/// ([`std/testing.zig:130-139`](../../lib/std/testing.zig)),
 /// and a [`Prop`] holds a slice besides, so neither `expectEqual` nor `==`
 /// says anything here.
 fn expectPath(got: []const PathElem, want: []const PathElem) !void {

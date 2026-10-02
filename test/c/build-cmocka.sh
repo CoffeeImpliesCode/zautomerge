@@ -1,13 +1,13 @@
 #!/bin/sh
 # Build the cmocka that `zig build ctest` links against, from the upstream
-# release tarball and against this host's glibc.
+# release tarball and against the local glibc.
 #
-# Why this exists: the packaged cmocka on this host is a Nix build whose glibc
-# is newer than the running one (it needs GLIBC_ABI_GNU2_TLS, glibc >= 2.42;
-# this host is 2.40), so a suite linked against it cannot even start. The gate
-# therefore needs a cmocka compiled here. `test/c/README.md` records the trap;
-# this script is the part that makes the fix repeatable rather than a thing
-# somebody did by hand once.
+# Why this exists: the packaged cmocka available here is a Nix build whose
+# glibc is newer than the running one (it needs GLIBC_ABI_GNU2_TLS, glibc
+# >= 2.42, while the local glibc is 2.40), so a suite linked against it
+# cannot even start. The gate therefore needs a cmocka compiled here.
+# `test/c/README.md` records the trap; this script is the part that makes
+# the fix repeatable rather than a thing somebody did by hand once.
 #
 # Usage:
 #   test/c/build-cmocka.sh [<prefix> [<work-dir>]]
@@ -31,13 +31,13 @@
 #     only adds `#include <stdint.h>` and `#define HAVE_UINTPTR_T 1` to
 #     `include/cmocka.h` because the 1.1.x sources are inconsistent about it.
 #     cmocka 2.0 includes `<stdint.h>` itself and probes `uintptr_t` in
-#     `ConfigureChecks.cmake`, so on this host the patch is a no-op and the
-#     bytes built are the tarball's.
+#     `ConfigureChecks.cmake`, so on a host that has `<stdint.h>` the patch is a
+#     no-op and the bytes built are the tarball's.
 #   * It does not run cmocka's own test suite (`-DUNIT_TESTING=ON`, which
 #     nixpkgs turns on for `doCheck`). The gate that matters here is `zig build
 #     ctest`, and building cmocka's tests buys nothing: they would be compiled
-#     by this host's compiler either way, so a failure would have been visible
-#     in the suite that uses the library.
+#     by the same compiler either way, so a failure would have been visible in
+#     the suite that uses the library.
 
 set -eu
 
@@ -90,7 +90,7 @@ echo
 echo "installed:"
 ls -1 "$PREFIX/lib" "$PREFIX/lib64" 2>/dev/null || true
 echo
-echo "glibc symbols the installed library needs (must top out below this host's 2.40):"
+echo "glibc symbols the installed library needs (must top out below the local 2.40):"
 for lib in "$PREFIX"/lib/libcmocka.so* "$PREFIX"/lib64/libcmocka.so*; do
     [ -f "$lib" ] || continue
     echo "  $lib"

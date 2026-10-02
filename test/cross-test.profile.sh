@@ -18,17 +18,17 @@
 # WHAT THIS FILE DECIDES, AND WHAT IT LEAVES ALONE
 # The matrix it names, the concurrency, and the deadlines. Everything about
 # WHERE the run happens stays with the caller, and that is deliberate: a
-# committed path like /home/tmp2/<user>/cross-out works on exactly one machine,
+# committed path like <scratch>/cross-out works on exactly one machine,
 # and the oracle of that path outlives the checkout it was written for. So this
 # file sets no ZIG (the caller's compiler wins, and cross-test probes it
 # afterwards anyway), no CROSS_PREFIX (zig-gate passes --output), and no cache or
 # TMPDIR (cross-test keeps its own fresh cache under ZIG_GLOBAL_CACHE_DIR when
 # the host policy exported one, else under TMPDIR, and refuses an output prefix
-# that resolves to /tmp, /var/tmp or /dev/shm on the buildhost hosts). Every one
-# of those comes from the shared host policy the gate already sources, so no
-# scratch, cache or artifact lands on a small system volume. Command-line flags
-# still win over this file: `--timeout 60` really does override the budget
-# below, which is the one trap worth naming here.
+# that resolves to /tmp, /var/tmp or /dev/shm on hosts without small-volume
+# restrictions). Every one of those comes from the shared host policy the gate
+# already sources, so no scratch, cache or artifact lands on a small system
+# volume. Command-line flags still win over this file: `--timeout 60` really
+# does override the budget below, which is the one trap worth naming here.
 
 # The step, not a narrower one. `zig build test` (build.zig:95) is the whole
 # per-target subject: the library suite, the fixture corpus read from
@@ -45,8 +45,8 @@ CROSS_BUILD_STEP=test
 # table is inherited, not replaced: CROSS_MATRIX is left untouched, so
 # `cross-test --targets '<any platform in the table>'` still reaches every
 # other row, and `cross-test --no-profile --list` prints them all with the
-# runner this host has for each. These four are the rows this host can actually
-# say something about, measured with `cross-test --list` on this checkout:
+# runner the host has for each. These four are the rows runnable on a host with
+# qemu-user for them, measured with `cross-test --list` on this checkout:
 #
 #   x86_64-linux     native (`native`). The host itself, no emulator in the
 #                    loop, and the only row whose wall clock means what it
@@ -103,7 +103,7 @@ CROSS_BUILD_JOBS=1
 # passes it to the build as `--test-timeout 900s`, so it is the number a
 # "timed out after 8m58s" in a per-target log is measured against, and it is
 # also the wall clock of the run phase in an artifact profile. 900 rather than
-# the tool's 300: the library suite takes minutes on this host before any
+# the tool's 300: the library suite takes minutes natively before any
 # emulation is involved, and qemu_user is slower again, so 300 is a budget
 # that measures the harness rather than the port.
 #
@@ -118,12 +118,13 @@ CROSS_TIMEOUT=900
 CROSS_BUILD_TIMEOUT=3600
 
 # A target with no runner is compile coverage, not a pass, and not a failure
-# either. x86_64-windows has no wine64 on this host, so cross-test records it
-# build_only/runtime_unavailable and says so in its summary; CROSS_REQUIRE_RUNNERS
-# is what would turn that truthful partial into an error, and the house gate
-# does not pass --require-runners. Stating 0 here keeps the policy in the
-# project rather than in an unwritten default, so the row cannot be promoted to
-# a pass by accident and cannot fail the gate by accident either.
+# either. x86_64-windows has no wine64 in this environment, so cross-test
+# records it build_only/runtime_unavailable and says so in its summary;
+# CROSS_REQUIRE_RUNNERS is what would turn that truthful partial into an
+# error, and the house gate does not pass --require-runners. Stating 0 here
+# keeps the policy in the project rather than in an unwritten default, so the
+# row cannot be promoted to a pass by accident and cannot fail the gate by
+# accident either.
 #
 # Expected when all runnable rows pass: `status=partial pass=1 fail=0
 # build_only=1 partial=2 summary=<path>`. Windows is compile-only, not a pass.
@@ -136,7 +137,7 @@ CROSS_BUILD_TIMEOUT=3600
 # src/c_abi_test.zig at build.zig:221), and a dynamically-linked foreign binary
 # needs a target-side loader. cross-test supplies one only when
 # CROSS_LIBC_RUNTIMES names a directory of them, and the Zig 0.16.0 lib
-# directory on this host ships no `libc/runtimes` to name. Its run policy then
+# directory used ships no `libc/runtimes` to name. Its run policy then
 # skips exactly those run steps on the qemu_user rows: the binaries are still
 # compiled and linked for those targets, only not executed, and cross-test
 # records the row `partial` rather than `pass`. CROSS_LIBC_RUNTIMES is
