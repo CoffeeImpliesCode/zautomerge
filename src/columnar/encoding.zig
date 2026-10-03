@@ -86,6 +86,13 @@
 //! Upstream does the same with `ValueType::Unknown(code)`
 //! (`column_range/value.rs:254-259`).
 //!
+//! **The word's type field is four bits wide**, so the codes that can exist
+//! at all are `0x00` to `0x0f`: a word that came off the wire decodes to a
+//! code inside that range whatever its low byte was, because the decode
+//! reads the low nibble (`value.zig:45-59`). Going the other way,
+//! [`metaWordOf`] admits exactly the codes it can carry and refuses a wider
+//! one, rather than writing the excess bits into the length half.
+//!
 //! # Overlong LEB128
 //!
 //! A value column is the one place on the load path where a LEB128 sits
@@ -289,7 +296,11 @@ pub const RleSlice = struct {
         std.debug.assert(pos == n);
     }
 
-    /// Appends the encoding of `values` to `list`.
+    /// Appends the encoding of `values` to `list`. `values` is borrowed for
+    /// the call and encoded into the list, so the caller may free it the
+    /// instant this returns. **`error.OutOfMemory` leaves `list` exactly as
+    /// it was** — the room is reserved before a byte is written and the
+    /// whole encoding goes in as one piece.
     pub fn append(list: *std.ArrayList(u8), gpa: Allocator, values: []const Element) ParseError!void {
         const n = encodedSize(values);
         try list.ensureUnusedCapacity(gpa, n);
@@ -409,12 +420,13 @@ pub const RleSlice = struct {
         pos: usize,
         /// Values still owed by the run in `run`.
         remaining: u64,
+        /// The run being served, which is how the next value is answered
+        /// without re-reading a repeat or a null run.
         run: Run,
 
         const Run = union(enum) {
             /// Between runs, or the slab is exhausted.
             idle,
-            /// Serve `elem` `remaining` times.
             repeat: []const u8,
             /// Read a value from `pos` for each of the next `remaining`.
             literal,
@@ -775,10 +787,11 @@ pub const ValueDecoder = struct {
         }
         // Every remaining type takes exactly the declared number of bytes, and
         // the declared number is the one thing in this column that came off
-        // the wire. It is checked against what is left before anything is
-        // taken, and `scalarLength` is used rather than `ValueMeta.length`,
-        // whose cast is unchecked.
-        const len = scalarLength(m) catch |e| return e;
+        // the wire. `ValueMeta.length` casts the shift it read through a
+        // checked cast, so a word whose length does not fit a `usize` here is
+        // `error.Overflow` on a 32-bit target and never a trap, and the
+        // length is checked against what is left before anything is taken.
+        const len = try m.length();
         if (len > self.raw.len - self.pos) return error.LengthExceedsInput;
         const bytes = self.raw[self.pos..][0..len];
         self.pos += len;
@@ -830,13 +843,6 @@ pub const ValueDecoder = struct {
     }
 };
 
-/// The byte length a metadata word declares, or `error.Overflow` when it does
-/// not fit a `usize`. `ValueMeta.length` casts the shift without checking it,
-/// which is fine for a word this port wrote and not for one it did not.
-fn scalarLength(m: ValueMeta) ParseError!usize {
-    return std.math.cast(usize, m.raw >> 4) orelse error.Overflow;
-}
-
 /// The metadata word for a scalar: `(byte_length << 4) | type_code`
 /// (`column_range/value.rs:412-435`).
 ///
@@ -851,6 +857,15 @@ fn scalarLength(m: ValueMeta) ParseError!usize {
 /// the caller's code as it stands and this encoder does the same, because
 /// refusing it would refuse a value the format admits
 /// (`column_range/value.rs:429-432`).
+///
+/// **A code above `0x0f` is `error.InvalidValueType`, and that is the whole
+/// of the admitted range.** The word's type field is four bits wide, so the
+/// excess bits of a wider code do not disappear — they land on the length
+/// half. `.{ .unknown = .{ .type_code = 0x11, .bytes = "a" } }` would be
+/// written as the word `0x21`, which reads back as type code 1 — a boolean,
+/// which takes no payload at all — with length 2: every value after it in
+/// that column read one byte late, and nothing on the way out says so. The
+/// four-bit field is the format's, so the refusal has to be this encoder's.
 pub fn metaWordOf(v: ScalarValue) ParseError!u64 {
     return switch (v) {
         .null_value => 0,
@@ -866,7 +881,7 @@ pub fn metaWordOf(v: ScalarValue) ParseError!u64 {
         .actor_id => |a| shiftLen(a.bytes.len, 7),
         .counter => |c| shiftLen(leb128.signedSize(c.current), 8),
         .timestamp => |t| shiftLen(leb128.signedSize(t), 9),
-        .unknown => |u| shiftLen(u.bytes.len, u.type_code),
+        .unknown => |u| unknownWord(u),
     };
 }
 
@@ -877,19 +892,36 @@ fn shiftLen(len: anytype, code: u8) ParseError!u64 {
     return (@as(u64, @intCast(len)) << 4) | @as(u64, code);
 }
 
+/// The metadata word for a `ScalarValue.unknown`: `(byte_length << 4) |
+/// code`, with the code the caller gave. A code the four-bit field cannot
+/// carry is `error.InvalidValueType`; every code it can carry is written as
+/// it stands, which is what [`metaWordOf`] documents.
+fn unknownWord(u: ScalarValue.UnknownValue) ParseError!u64 {
+    if (u.type_code > 0x0f) return error.InvalidValueType;
+    return shiftLen(u.bytes.len, u.type_code);
+}
+
 // ── The decoder ─────────────────────────────────────────────────────────────
 
 /// A cursor over one column, yielding its values one at a time.
 ///
 /// The cursor is the whole read path. It holds no allocation, so a walk that
 /// reads one row across sixteen columns materialises none of them; the only
-/// thing it borrows is the column's own bytes.
+/// thing it borrows is the column's own bytes, which must stay alive and
+/// unmodified for as long as the cursor walks them.
+///
+/// **A cursor is mutable state with no synchronisation of its own.** Two
+/// threads sharing one cursor race; two *copies* of one are two independent
+/// cursors over the same bytes, which is what a copy is good for.
 pub const Decoder = struct {
     /// The specification whose bytes this cursor walks. For a value column
     /// pair this is the *metadata* half's specification, because that is the
     /// specification the logical column carries
     /// (`column_builder.rs:78-84`).
     spec: ColumnSpec,
+    /// The cursor for the tag this column carries. The arm in it borrows the
+    /// column's own bytes, and `next` switches through it by pointer so each
+    /// arm advances in place.
     body: Body,
 
     /// The per-encoding cursor. One arm per tag, and the tag is chosen once
@@ -1134,7 +1166,11 @@ pub const Encoded = struct {
     /// of bytes and not the number of runs.
     len: usize,
 
-    /// Releases the bytes.
+    /// Releases the bytes. **The allocator is not released** — a `gpa` here
+    /// may be an arena that outlives the column — and `Encoded` is taken by
+    /// value, so a copy the caller kept is still in hand and reading its
+    /// `bytes` afterwards reads freed memory. Release once, per encoded
+    /// column.
     pub fn deinit(self: Encoded, gpa: Allocator) void {
         gpa.free(self.bytes);
     }
@@ -1156,7 +1192,10 @@ pub const ValuePair = struct {
     /// The value column: the payloads, concatenated.
     raw: Encoded,
 
-    /// Releases both sets of bytes.
+    /// Releases both sets of bytes, on the allocator given. **The allocator is
+    /// not released**, and the two halves go together: a pair whose metadata
+    /// column outlives its payload column describes payloads that are gone.
+    /// Call once, per pair.
     pub fn deinit(self: ValuePair, gpa: Allocator) void {
         self.meta.deinit(gpa);
         self.raw.deinit(gpa);
@@ -1905,6 +1944,49 @@ test "a metadata word naming an unknown type is preserved, not rejected" {
     const got = (try dec.next()) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u8, 10), got.unknown.type_code);
     try testing.expectEqualStrings("zz", got.unknown.bytes);
+}
+
+test "an unknown type code the four-bit field cannot carry is refused" {
+    const gpa = testing.allocator;
+    // **The type field of a metadata word is four bits wide.** A code wider
+    // than that does not lose its high bits on the way in — they land on the
+    // length half, so code `0x11` over one payload byte is written as the
+    // word `0x21`: type code 1, a boolean, which takes no payload, with
+    // length 2. Every value after it in the column would then be read one
+    // byte late, and nothing on the way out would say so. The word is built
+    // before the payload column is touched, so the refusal costs nothing and
+    // the column it would have written is not left half-built.
+    try testing.expectError(
+        error.InvalidValueType,
+        encodeValuePair(gpa, 5, &.{
+            .{ .unknown = .{ .type_code = 0x11, .bytes = "a" } },
+            .{ .str = "z" },
+        }),
+    );
+    // The first code past the field, and the largest `u8`, are the two ends
+    // of the refused range; both answer at the word, wherever the value sits.
+    try testing.expectError(
+        error.InvalidValueType,
+        metaWordOf(.{ .unknown = .{ .type_code = 0x10, .bytes = "" } }),
+    );
+    try testing.expectError(
+        error.InvalidValueType,
+        metaWordOf(.{ .unknown = .{ .type_code = 0xff, .bytes = "x" } }),
+    );
+    // **Every code the field can carry is still written as it stands**, the
+    // largest included, and reads back as itself with its bytes.
+    const admitted = [_]ScalarValue{
+        .{ .unknown = .{ .type_code = 0x0f, .bytes = "ok" } },
+        .{ .unknown = .{ .type_code = 0x0a, .bytes = "" } },
+    };
+    try testing.expectEqual(@as(u64, (2 << 4) | 0x0f), try metaWordOf(admitted[0]));
+    try testing.expectEqual(@as(u64, 0x0a), try metaWordOf(admitted[1]));
+    const pair = try encodeValuePair(gpa, 5, &admitted);
+    defer pair.deinit(gpa);
+    const bulk = try decodeValuePair(gpa, pair.meta.bytes, pair.raw.bytes);
+    defer gpa.free(bulk);
+    try testing.expectEqual(admitted.len, bulk.len);
+    for (admitted, bulk) |want, got| try testing.expect(got.eql(want));
 }
 
 test "a value length that runs past the end is refused without allocating" {

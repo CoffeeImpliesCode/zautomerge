@@ -250,6 +250,13 @@ pub const RichTextQueryState = struct {
         return .{ .gpa = gpa };
     }
 
+    /// Frees the map of open marks and poisons the receiver, so a second call
+    /// is a use-after-free rather than a double free.
+    ///
+    /// The [`MarkData`] the map holds has a name **borrowed from the document's
+    /// string table** ([`mark_index.zig:673-679`](mark_index.zig)), so this
+    /// frees the buckets and nothing else: the names belong to whoever owns the
+    /// table and must outlive this.
     pub fn deinit(self: *RichTextQueryState) void {
         self.map.deinit(self.gpa);
         self.* = undefined;
@@ -409,6 +416,18 @@ pub fn InsertQuery(comptime O: type) type {
         /// The index being resolved (`insert.rs:21`).
         target: usize,
 
+        /// That this type is a positional cursor the [`Shiftable`] kernel can
+        /// walk, checked at compile time.
+        ///
+        /// Instantiating it is the check: [`Shiftable`](hexane/column.zig:6169-6181)
+        /// refuses a type that is missing `pos`, `maxPos`, `setMax`,
+        /// `advanceTo`, `advanceBy`, `shift`, `shiftNext` or `seekTo`. **A
+        /// caller writing its own row type needs all eight** — the same set
+        /// [`OpIter`](op_iter.zig)'s cursors carry — and `isShiftable` is then
+        /// always true, because the instantiation is the answer. This is the
+        /// mark upstream's `Shift` trait carries (`shift.rs:19-31`), and the
+        /// splice path needs it: a window that moves has to move with the
+        /// walk.
         pub const shiftable = column.Shiftable(Self);
 
         /// A resolver for `target` over `iter` (`InsertQuery::new`,

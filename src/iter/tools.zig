@@ -1089,7 +1089,24 @@ pub fn DiffKernel(comptime Item: type, comptime Q: type, comptime S: type) type 
 
         /// Repositions the walk onto `rows` and reads the first changed row in
         /// it ([`iter/tools.rs:578-589`](../../github-automerge-automerge/rust/automerge/src/iter/tools.rs)).
+        ///
+        /// **The two comptime checks its three sibling `shiftNext`s carry, and
+        /// the second is why the first is here too.** A caller asks
+        /// [`isShiftable`](Self.isShiftable) whether this instantiation is
+        /// repositionable at all, and it is answered from `Q` and `S` alone;
+        /// without these two lines an instantiation that is not shiftable fails
+        /// **inside** this body, on a field access, naming neither the parameter
+        /// that has to change nor the declaration that has to grow. `S` is the
+        /// check [`DiffSkipper.shiftNext`] and [`SkipIter.shiftNext`] already
+        /// make, verbatim; `Q` is [`hasKernel`] — the eight forwarders above,
+        /// of which this body calls one.
         pub fn shiftNext(self: *Self, rows: RowRange) !?Entry {
+            if (comptime !hasKernel(Q)) @compileError(
+                "a DiffKernel can only be repositioned over a walk that carries the whole kernel",
+            );
+            if (comptime !@hasDecl(S, "shiftNext")) @compileError(
+                "a DiffKernel can only be repositioned over skippers that carry shiftNext",
+            );
             const step = (try self.skipper.shiftNext(rows)) orelse return null;
             const start = rows.start + step.at;
             const item = (try self.iter.shiftNext(.{ .start = start, .end = rows.end })) orelse return null;

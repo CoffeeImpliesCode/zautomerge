@@ -44,24 +44,53 @@
 //! same slab split, the same index, the same bytes.
 //!
 //! What the rebuild does *not* do is re-encode the region it did not touch.
-//! It hands [`slabmod.splice`](slab.zig) one call — replace `[at, read)` of
-//! the slab with the rebuilt values — and the splice copies the runs before
-//! the cut and after the tail's first run verbatim (`rle/edit.rs:193-217`
-//! reads only the tail's first run and carries the rest as bytes). So one
-//! write-back is one partition, one byte splice, one `settle` and one
-//! `rebuildAggs`, however many edits the slab took.
+//! The write-back is one column-level splice — replace `[at, read)` of the
+//! slab with the rebuilt values — and the splice copies the runs before the
+//! cut and after the tail's first run verbatim (`rle/edit.rs:193-217` reads
+//! only the tail's first run and carries the rest as bytes). So one
+//! write-back is one partition, one byte splice, one cut to the run budget,
+//! one coalescing of the neighbours and one index rebuild, however many
+//! edits the slab took — and all five happen inside the one staged splice
+//! the write-back publishes.
 //!
 //! # The open rebuild is a staging buffer
 //!
-//! Nothing the cursor absorbs reaches the column until a write-back, which
-//! happens at `finish`, at a carry-budget close, or when the cursor walks
-//! into the next slab. So abandoning a cursor is not a partially applied
-//! edit: it is a discarded one, and the column is exactly as it was. That is
-//! the one place this port is deliberately stricter than upstream, whose
-//! `Drop` closes an open rebuild and so commits the batch
-//! (`edit.rs:611-626`); Zig has no destructors, `deinit` has no error
-//! channel, and a cursor that could only be released by committing would
-//! make "I meant to throw that away" impossible to say.
+//! Nothing an open rebuild has absorbed reaches the column until a
+//! write-back, which happens at `finish`, at a carry-budget close, or when
+//! the cursor walks into the next slab. So abandoning a cursor never
+//! half-applies a rebuild: it throws it away whole, and the column still
+//! holds every row it held before the rebuild opened. That is the one place
+//! this port is deliberately stricter than upstream, whose `Drop` closes an
+//! open rebuild and so commits the batch (`edit.rs:611-626`); Zig has no
+//! destructors, `deinit` has no error channel, and a cursor that could only
+//! be released by committing would make "I meant to throw that away"
+//! impossible to say.
+//!
+//! **The cursor is not a transaction; the stage is.** A delete that covers
+//! whole slabs publishes them the moment that stage is done, whether or not
+//! a rebuild was open behind them, so a cursor's work is a sequence of
+//! published stages plus at most one rebuild held for `finish`. A caller
+//! that wants a cursor's whole run or none of it has to say which before it
+//! starts, because `deinit` rolls back the held rebuild and cannot roll back
+//! what a stage already published.
+//!
+//! **A write-back that is refused is the same as one that was not
+//! attempted.** The batch is staged beside the column and published into it,
+//! never written into it, so the whole write-back — the partition, the byte
+//! splice, the length, the cut to the run budget, the coalescing, the index
+//! — happens against a provisional column whose slab list starts as copies
+//! of this one's. Every allocation the hand-over needs is taken before the
+//! stage returns and the hand-over itself cannot fail, so a write-back
+//! refused at any of its steps — out of `finish`, out of a carry-budget
+//! close, out of the walk into the next slab — leaves that batch staged,
+//! the cursor open, and the column byte-for-byte as it was *before that
+//! stage*. The caller may retry it, or discard it with `deinit`; it is
+//! never left believing a batch was committed when it was not, nor holding
+//! a column whose length and index still measure the rows from before the
+//! batch. That is the same discipline the staging buffer gives on the way
+//! out, applied to the way in. It is a guarantee about the stage, though,
+//! and a call that makes several of them — `delete` over several slabs —
+//! keeps the ones that already published.
 //!
 //! # The codecs
 //!
@@ -124,10 +153,19 @@ fn Reader(comptime E: type) type {
 /// is how far the rebuild has consumed the original, and `wires` is what it
 /// has emitted; the two differ by the net edit, and `close` replaces
 /// `[at, read)` of the slab with `wires`.
+///
+/// It owns both buffers it holds — the encode buffer and the segment list —
+/// and releases them with `gpa`, which is the allocator the cursor was
+/// opened with rather than the column's. `data` is the opposite: a read-only
+/// view of the slab, borrowed from the column and dropped by `release`
+/// without being freed. A copied rebuild is a second owner of both buffers.
 fn Rebuild(comptime E: type) type {
     return struct {
         const Self = @This();
 
+        /// The allocator both owned buffers are allocated and released
+        /// with. It is the allocator `Edit.init` was given, and it is not
+        /// released itself.
         gpa: std.mem.Allocator,
         /// The rebuilt region's values, in the codec's wire domain.
         wires: std.ArrayList(E.Wire),
@@ -227,19 +265,15 @@ fn Rebuild(comptime E: type) type {
             self.read += n;
         }
 
-        /// Writes the rebuild back into `slab` (`EditSlab::close`,
-        /// `edit.rs:60-63`): one partition of the slab at the rebuild's
-        /// edges, one byte splice of the rebuilt middle, and the rest of the
-        /// slab copied verbatim. Upstream returns the slabs the rebuild
-        /// spilled into; here the spill is the column's `settle`, which cuts
-        /// an over-budget slab at run boundaries (`column.zig:1865`).
-        fn close(self: *Self, slab: *Slab) ParseError!void {
-            try slabmod.splice(self.gpa, E, slab, self.at, self.read - self.at, self.wires.items, null);
-            self.release();
-        }
-
-        /// Drops everything the rebuild was holding. The slab's bytes are
-        /// about to move, so no reference into them may outlive this.
+        /// Drops everything the rebuild was holding.
+        ///
+        /// Run after the write-back has been published. The staged slab list
+        /// shares the original column's buffers and the publish frees the
+        /// slabs it detached — the one the rebuild was reading among them —
+        /// so nothing may reach back into them after this. Neither does
+        /// anything that was not released above: `segs` is the rebuild's own
+        /// copy and `wires` is its own buffer, and `data` is only ever
+        /// cleared, never read.
         fn release(self: *Self) void {
             self.wires.clearRetainingCapacity();
             if (self.segs.len != 0) self.gpa.free(self.segs);
@@ -258,6 +292,21 @@ fn Rebuild(comptime E: type) type {
 /// from. Every entry point that allocates takes the allocator, and it has to
 /// be the column's own: a slab the cursor leaves behind is freed by the
 /// column's `deinit`.
+///
+/// # What the cursor owns
+///
+/// * **The column is borrowed, not owned.** `col` is a mutable borrow that
+///   must outlive the cursor, and the cursor writes to it. A column freed
+///   while a cursor is open leaves the cursor pointing at nothing.
+/// * **The rebuild buffer is owned.** It is allocated with the allocator
+///   `init` was given and released by [`deinit`](Edit.deinit) with that same
+///   allocator — not with the column's, which is a different value whenever
+///   the cursor was opened over a column built in an arena.
+/// * **A copy is a second owner of one buffer.** Zig has no move semantics,
+///   so `var b = a;` gives two cursors that both free the same encode buffer
+///   on `deinit`. Hand a cursor around as a pointer, or rebuild it.
+/// * **Not thread-safe.** The cursor, its buffer and the column it writes to
+///   are one mutable state with no synchronisation.
 pub fn Edit(comptime T: type, comptime E: type) type {
     // The wire value is what a slab's bytes decode to, and the cursor reads
     // and writes the rebuilt region in the wire domain. Every codec this
@@ -355,11 +404,28 @@ pub fn Edit(comptime T: type, comptime E: type) type {
             };
         }
 
-        /// Releases the cursor. An open rebuild is **discarded**, not
-        /// written back: the column is exactly as it was when the cursor
-        /// opened. Upstream's `Drop` closes the rebuild instead
+        /// Releases the cursor, and with it the rebuild's encode buffer —
+        /// freed with the allocator [`init`](Edit.init) was given, which is
+        /// not necessarily the column's. The allocator itself is not
+        /// released.
+        ///
+        /// An open rebuild is **discarded**, not written back: of what the
+        /// cursor was carrying, nothing that was still in it reaches the
+        /// column. Upstream's `Drop` closes the rebuild instead
         /// (`edit.rs:611-626`); see the module doc for why this port does
         /// not, and use `finish` to commit a batch.
+        ///
+        /// **This is not a rollback of the cursor's whole run.** It undoes
+        /// the rebuild held here and nothing else. Whole slabs a
+        /// [`delete`](Edit.delete) covered were published the moment their
+        /// stage completed, and a [`finish`](Edit.finish) that already
+        /// landed is in the column; both stay, because a caller cannot unwrite
+        /// a column it has already handed back. Say which run you want before
+        /// you start one.
+        ///
+        /// Calling this on a *copy* of a live cursor frees the buffer both
+        /// own, and the second free is a double free: a cursor is moved by
+        /// pointer, not by value.
         pub fn deinit(self: *Self) void {
             self.edit.deinit();
             self.* = undefined;
@@ -382,9 +448,15 @@ pub fn Edit(comptime T: type, comptime E: type) type {
             return self.ahead;
         }
 
-        /// The column under the cursor. Only meaningful while no rebuild is
-        /// open — the slab metadata is stale until one closes
-        /// (`edit.rs:213-217`).
+        /// The column under the cursor, borrowed for the cursor's life.
+        ///
+        /// **It answers the pre-batch column while a rebuild is open.** An
+        /// open rebuild has not been written back, so `len` and the slab
+        /// metadata still describe the column as it was before the batch and
+        /// do not match what the cursor has already absorbed
+        /// (`edit.rs:213-217`). This is neither an error nor a trap — the
+        /// pointer is always right, and reading through it simply sees the
+        /// pre-batch column until a write-back lands.
         pub fn column(self: *const Self) *const Col {
             return self.col;
         }
@@ -516,12 +588,55 @@ pub fn Edit(comptime T: type, comptime E: type) type {
         }
 
         /// Deletes `n` items at the cursor (`edit.rs:366-372`).
+        ///
+        /// **A refusal leaves the column and the cursor coherent, not
+        /// untouched.** Every stage this call makes — a whole-slab drop, a
+        /// write-back — takes what it needs before it touches the column and
+        /// publishes in one step that cannot fail, so a refusal costs no
+        /// half-applied edit: what is in the column is whole, and what is not
+        /// is staged in the open rebuild, where [`finish`](Edit.finish) will
+        /// commit it and [`deinit`](Edit.deinit) will throw it away. A delete
+        /// over several slabs makes several stages, so a refusal can arrive
+        /// after an earlier one published and the rows that one took stay
+        /// taken; this call is not a transaction.
+        ///
+        /// **The cursor does not owe the batch twice, and does not owe all
+        /// of it once.** By the time a refusal arrives, `pos`, `outPos` and
+        /// `remaining` have already moved past the rows it consumed, and past
+        /// nothing else: a refusal in the last write-back leaves `pos` at the
+        /// end of the delete with the tail of it still staged. How far `pos`
+        /// came depends on which stage refused. A stage refuses with its rows
+        /// already consumed and staged whenever it got as far as taking them
+        /// — and `close` runs after `took`, so a write-back that cannot be
+        /// staged says so even when it is the *first* stage of the call. Only
+        /// a refusal before the rows were taken leaves `pos` where the call
+        /// found it: opening a rebuild, and staging a drop, which has moved
+        /// nothing at all. So re-issuing `delete(n)` would delete a second
+        /// span rather than continue this one, and `finish` on its own commits
+        /// only the staged rebuild — it does not reach the rows this call
+        /// never got to.
+        ///
+        /// **The recovery, in full.** A caller that wants the delete it asked
+        /// for records `start = pos()` and `wanted = @min(n, remaining())`
+        /// before the call. On a refusal it calls `finish` — which may itself
+        /// refuse, and is retried the same way — and then deletes only what
+        /// is left owing: `owed = wanted - (pos() - start)`, which is at most
+        /// `remaining()` and is zero once the delete is complete. That is a
+        /// fresh call on the same cursor, with the same recovery if it is
+        /// refused, so the loop makes progress until `owed` is zero or the
+        /// allocator lets a stage through. Nothing about the refusal is
+        /// special-cased: every path into it leaves the cursor owned by the
+        /// caller and valid to keep using.
+        ///
+        /// A caller that cannot afford to keep the part that published calls
+        /// [`deinit`](Edit.deinit) instead, which discards the staged rebuild
+        /// and leaves what is already in the column — that part is spent, and
+        /// the caller's `owed` stops mattering because the cursor is gone.
         pub fn delete(self: *Self, n: usize) ParseError!*Self {
             // A delete off the end of the column takes what is there;
             // counting the rest would move the cursor past items that never
             // existed, and a later `seek` would look like it went backwards.
             var left = @min(n, self.ahead);
-            var dropped = false;
             while (left > 0) {
                 const avail = self.origLen() - self.in_slab;
                 // A locate never leaves the cursor at a slab's end except at
@@ -534,21 +649,18 @@ pub fn Edit(comptime T: type, comptime E: type) type {
                     self.took(left);
                     return self;
                 }
-                // A whole slab, and no rebuild reading it: drop it outright,
-                // without decoding a byte of it. The column always keeps one
-                // slab, so the last one is emptied through the rebuild
-                // instead (`edit.rs:388-401`).
-                if (self.in_slab == 0 and !self.dirty and self.col.slabs.items.len > 1) {
-                    self.col.slabs.items[self.slab].deinit(self.col.gpa);
-                    _ = self.col.slabs.orderedRemove(self.slab);
-                    try self.treeRemove(self.slab);
-                    self.index_writes += 1;
-                    self.col.total_len -= avail;
-                    self.orig += avail;
-                    self.ahead -= avail;
-                    left -= avail;
-                    dropped = true;
-                    self.locateOut();
+                // Whole slabs at the cursor, and no rebuild reading them:
+                // drop them outright rather than through a rebuild. The
+                // column always keeps one slab, so the last one is emptied
+                // through the rebuild instead (`edit.rs:388-401`) — and
+                // that is the condition to ask for, not merely "the column
+                // holds more than one slab". At the last slab the two
+                // disagree, and a drop taken there takes nothing: its own
+                // loop stops short of the last slab, so it would answer
+                // zero and `left` would never come down.
+                const one_more = self.slab + 1 < self.col.slabs.items.len;
+                if (self.in_slab == 0 and !self.dirty and one_more) {
+                    left -= try self.dropSlabs(left);
                     continue;
                 }
                 // The delete reaches this slab's end: finish it here and go
@@ -560,21 +672,84 @@ pub fn Edit(comptime T: type, comptime E: type) type {
                 left -= avail;
                 try self.close();
             }
-            if (dropped) {
-                // Dropping slabs can leave undersized neighbours meeting,
-                // so the range around the cursor is coalesced and the index
-                // and the weight prefixes are brought back into step
-                // (`edit.rs:415-420`).
-                self.index_writes += 1;
-                try self.col.settle(self.slab, 1);
-                try self.col.rebuildAggs();
-                self.locateOut();
-            }
             return self;
+        }
+
+        /// Drops the run of whole slabs at the cursor that `left` can cover,
+        /// and answers how many items went (`edit.rs:388-401`).
+        ///
+        /// **The drop is staged and published, like a write-back, and it
+        /// publishes the moment it is done.** The run reached no further than
+        /// its own start, so the cursor does not move in edited coordinates —
+        /// `orig` and `ahead` advance, and only once the column has taken the
+        /// slabs. A refusal inside the stage therefore leaves the cursor
+        /// where the caller left it, with the slabs still named and the index
+        /// still measuring them, and `delete` can be called again. A stage
+        /// that publishes is not undone by a later refusal in the same
+        /// `delete`; see [`delete`](Edit.delete).
+        ///
+        /// **No value in a dropped slab is read.** The cut's head is empty by
+        /// construction — the run starts on a slab boundary — so no piece is
+        /// built from the range's front, and the slabs themselves are freed
+        /// rather than rebuilt. What *is* decoded is the first slab behind
+        /// the run: the cut ends on a boundary, and the column resolves that
+        /// boundary to the slab that starts there rather than the one that
+        /// ends there (`findByPrefix`'s strict `<`), so it rebuilds that
+        /// whole slab as the range's one piece. That is the price of going
+        /// through the column's splice, and it is one slab per drop however
+        /// many slabs the run took — which is what `Rebuild.reset` would have
+        /// cost had the run gone through a rebuild, and no more than the
+        /// bytes one cut of the column already reads.
+        ///
+        /// **One stage covers the whole run**, so the price is one copy of
+        /// the slab list and the index however many slabs go, rather than
+        /// one per slab. Dropping them one at a time is what let a refusal
+        /// leave a column holding an index that measured the rows from
+        /// before the batch while the cursor's own counters had already
+        /// moved. The seam the run leaves is coalesced by the stage's own
+        /// reconciliation, over the one piece that replaced the range,
+        /// exactly as a [`Column.splice`](column.zig) of the same range
+        /// coalesces it.
+        fn dropSlabs(self: *Self, left: usize) ParseError!usize {
+            const col = self.col;
+            var items: usize = 0;
+            var s = self.slab;
+            // The column always keeps one slab, so the run stops short of
+            // the last one. It is never empty: the caller has established
+            // that the current slab fits in `left` and that there is another
+            // slab behind it.
+            while (items < left and s + 1 < col.slabs.items.len) {
+                const n = col.slabs.items[s].len;
+                if (items + n > left) break;
+                items += n;
+                s += 1;
+            }
+            var stage = try col.stageSplice(col.tree.itemsBeforeSlab(self.slab), items, &.{});
+            defer stage.deinit();
+            stage.publish(col);
+            self.index_writes += 1;
+            // The run started at the cursor, so the rows it took were the
+            // rows *at* it rather than rows behind it, and `out` — the
+            // position in the column as edited — does not move.
+            self.orig += items;
+            self.ahead -= items;
+            self.locateOut();
+            return items;
         }
 
         /// Closes the open rebuild, if any, and reconciles the column. Ends
         /// a chain (`edit.rs:458-461`).
+        ///
+        /// **A refusal leaves the batch open and owed.** The write-back is
+        /// staged beside the column and published into it, and the hand-over
+        /// cannot fail, so an `error.OutOfMemory` out of here means the
+        /// edits are still staged, `isOpen` is still true, and this call can
+        /// simply be made again; `deinit` discards them instead and leaves
+        /// the column as it was. A caller that cannot retry has to choose,
+        /// and this is what it chooses on: neither outcome is silent.
+        ///
+        /// Idempotent in the sense that matters: a second call with nothing
+        /// open returns at once without touching the column.
         pub fn finish(self: *Self) ParseError!void {
             try self.close();
         }
@@ -747,36 +922,62 @@ pub fn Edit(comptime T: type, comptime E: type) type {
         /// Finishes the open rebuild: write it back, cut it to the run
         /// budget, coalesce the neighbours and update the index — each once,
         /// however many edits the slab took (`close`, `edit.rs:565-600`).
+        ///
+        /// **The batch is staged beside the column and published into it,
+        /// never written into it.** [`Column.stageSplice`](column.zig) runs
+        /// the whole write-back — the partition, the byte splice, the
+        /// length, the cut to the run budget, the coalescing and the index
+        /// — against a provisional column whose slab list starts as copies
+        /// of this one's, and takes every allocation the hand-over needs
+        /// before it returns. `publish` then hands the column the staged
+        /// slabs, index, bases and length, and cannot fail.
+        ///
+        /// So `dirty` and `write_backs` are set only after a publish that
+        /// cannot fail, and a refusal anywhere before it — the splice, the
+        /// split, the merge, the re-index — leaves the rebuild staged in
+        /// `edit`, the cursor open, and the column byte-for-byte as it was.
+        /// `finish` can be called again, and `deinit` still discards the
+        /// batch rather than half-applying it.
+        ///
+        /// Settling the live column beside the splice instead would leave
+        /// two ways to be wrong on one refusal. Marking the cursor clean
+        /// first would drop the staged edits on the floor; writing the bytes
+        /// first and settling after would leave a column whose length and
+        /// index still measure the rows from before the batch, so a later
+        /// read resolves the wrong slab out of a tree that no longer
+        /// describes the slab list. `isOpen` would answer false either way,
+        /// and the caller would have no way to tell the column never
+        /// received them.
+        ///
+        /// The batch is a column-level splice of `[at, read)` in slab `si`,
+        /// which is the same splice the rebuild would have made in that
+        /// slab's own bytes — the tail the rebuild did not reach is copied
+        /// verbatim, and a rebuild that outgrew the run budget spills where
+        /// the stage cuts it. Two costs this stops paying: the rebuild's
+        /// `wires` are copied once by the stage's own value encoding, and the
+        /// slab the splice writes comes out of the column's allocator rather
+        /// than the cursor's, which is where a column-owned buffer belongs.
         fn close(self: *Self) ParseError!void {
             if (!self.dirty) return;
+            const si = self.slab;
+            var stage = try self.col.stageSplice(
+                self.col.tree.itemsBeforeSlab(si) + self.edit.at,
+                self.edit.read - self.edit.at,
+                self.edit.wires.items,
+            );
+            defer stage.deinit();
+            stage.publish(self.col);
+            // The batch is in the column and its buffer is spent: a second
+            // close must not splice it again.
+            self.edit.release();
             self.dirty = false;
             self.write_backs += 1;
-            const si = self.slab;
-            const removed = self.col.slabs.items[si].len;
-            // One partition of the slab and one byte splice of the rebuilt
-            // middle. The tail the rebuild did not reach is copied, and a
-            // rebuild that outgrew the budget spills at `settle`.
-            const slab: *Slab = &self.col.slabs.items[si];
-            try self.edit.close(slab);
-            self.col.total_len = self.col.total_len - removed + self.col.slabs.items[si].len;
             self.index_writes += 1;
-            try self.col.settle(si, 1);
-            try self.col.rebuildAggs();
-            // The write-back can merge, split or drop slabs, so `slab` and
+            // The write-back can merge, split or drop slabs, so `si` and
             // `in_slab` mean nothing until they are looked up again. Doing
             // it here rather than at each call site is what lets everything
             // downstream trust them.
             self.locateOut();
-        }
-
-        /// Takes slab `at` out of the slab index, so a dropped slab stops
-        /// being a position the index can resolve (`ColumnIndex::splice`,
-        /// `edit.rs:398`).
-        fn treeRemove(self: *Self, at: usize) ParseError!void {
-            self.col.tree.splice(at, at + 1, &.{}) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.InvalidIndex => return error.InvalidValue,
-            };
         }
     };
 }
@@ -1391,6 +1592,66 @@ test "a delete that covers whole slabs drops them without decoding" {
     try testing.expect(col.slabCount() < slabs_before);
 }
 
+test "a delete that empties the last slab is emptied through a rebuild" {
+    const gpa = testing.allocator;
+    const T = u64;
+    const E = column.Prefix(u64);
+    // A prefix codec, so the retained rows are held to an index that the
+    // delete had to rebuild per slab and not only to bytes it could re-read.
+    // 400 runs of 3 is 1200 values, far more runs than one slab holds.
+    var built = try buildRuns(T, E, 400);
+    var col = built.col;
+    defer built.orig.deinit(gpa);
+    defer col.deinit();
+    var m = try Model(T).init(gpa, built.orig.items);
+    defer m.deinit(gpa);
+    const slabs = col.slabCount();
+    const total = col.len();
+    try testing.expect(slabs > 2);
+
+    // The first item of the last slab: a boundary resolves to the slab that
+    // starts there, so this is the final slab at its own start.
+    const cut = blk: {
+        var n: usize = 0;
+        for (0..slabs - 1) |i| n += col.slabAt(i).?.len;
+        break :blk n;
+    };
+    try testing.expect(cut > 0 and cut < total);
+
+    {
+        var e = try Edit(T, E).init(col.allocator(), &col, cut);
+        defer e.deinit();
+        // **The bug was the guard asking only whether the column held more
+        // than one slab.** The drop stops short of the last one, so here it
+        // took nothing, answered zero, and `left` never came down — the
+        // delete spun, with the cursor going nowhere.
+        try testing.expectEqual(slabs - 1, e.slab);
+        try testing.expectEqual(0, e.in_slab);
+
+        _ = try e.delete(total - cut);
+        try e.finish();
+
+        try testing.expect(!e.isOpen());
+        // Every original row past the boundary is taken, and the cursor
+        // answers in both coordinate systems rather than only the first.
+        try testing.expectEqual(total, e.pos());
+        try testing.expectEqual(cut, e.outPos());
+        try testing.expectEqual(0, e.remaining());
+    }
+    m.seek(cut);
+    m.delete(total - cut);
+
+    // What the column kept is the prefix before the boundary, row for row.
+    try testing.expectEqual(cut, col.len());
+    try expectSound(T, E, &col);
+    try expectModel(T, E, &col, &m);
+    // And it answers a prefix sum over that prefix from inside a slab, not
+    // only its grand total: the bases were rebuilt for the slabs that
+    // survived rather than carried over from the ones that went.
+    const mid = cut / 2;
+    try testing.expectEqual(try sumOf(T, m.built.items[0..mid]), try col.runningAt(mid));
+}
+
 test "the cursor is forward-only and refuses a position past the end" {
     const gpa = testing.allocator;
     const T = u64;
@@ -1470,4 +1731,153 @@ test "every codec the cursor serves edits through it" {
     try exerciseOneSlabBatch(u32, column.Prefix(u32));
     try exerciseOneSlabBatch(?u32, column.Prefix(?u32));
     try exerciseOneSlabBatch(bool, column.Bool);
+}
+
+/// Exact values through both the sequential reader and the positional index,
+/// plus every prefix boundary for a codec that keeps prefix weights.
+fn expectWritebackValues(comptime E: type, col: *const column.Column(u64, E), want: []const u64) !void {
+    try expectSound(u64, E, col);
+    const got = try col.toSlice(testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(want.len, col.len());
+    try testing.expectEqualSlices(u64, want, got);
+    var running: i64 = 0;
+    for (want, 0..) |value, i| {
+        try testing.expectEqual(@as(?u64, value), try col.get(i));
+        if (comptime E.tracks_prefix) {
+            try testing.expectEqual(running, try col.runningAt(i));
+            running += @intCast(value);
+        }
+    }
+    try testing.expectEqual(@as(?u64, null), try col.get(want.len));
+    if (comptime E.tracks_prefix) try testing.expectEqual(running, try col.runningAt(want.len));
+}
+
+/// Refuses successive allocation points of the same held write-back, then
+/// lets it land. Setup and the invariant checks run with refusals disarmed.
+fn sweepFinish(comptime E: type, orig: []const u64, at: usize, ins: []const u64) !usize {
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var col = try column.Column(u64, E).initWithBudget(gpa, 4);
+    defer col.deinit();
+    try col.extend(gpa, orig);
+    try expectWritebackValues(E, &col, orig);
+    const before = try col.encode(testing.allocator);
+    defer testing.allocator.free(before);
+
+    var want: std.ArrayList(u64) = .empty;
+    defer want.deinit(testing.allocator);
+    try want.appendSlice(testing.allocator, orig[0..at]);
+    try want.appendSlice(testing.allocator, ins);
+    try want.appendSlice(testing.allocator, orig[at..]);
+
+    var e = try Edit(u64, E).init(gpa, &col, at);
+    defer e.deinit();
+    for (ins) |value| _ = try e.insert(value);
+    const next: ?u64 = if (at < orig.len) orig[at] else null;
+    try testing.expect(e.isOpen());
+    try testing.expect(e.column() == &col);
+    try testing.expectEqual(0, e.rebuilds());
+    try testing.expectEqual(0, e.indexWrites());
+    try testing.expectEqual(at, e.pos());
+    try testing.expectEqual(at + ins.len, e.outPos());
+    try testing.expectEqual(orig.len - at, e.remaining());
+    try testing.expectEqual(next, try e.peek());
+    try expectWritebackValues(E, &col, orig);
+
+    var held: usize = 0;
+    while (true) {
+        failing.fail_index = failing.alloc_index + held;
+        const outcome = e.finish();
+        // FailingAllocator does not advance alloc_index on a refusal, so it
+        // keeps refusing until disarmed. An invariant check allocates through
+        // the column's allocator too; leaving it armed would turn that check
+        // or the retry into another OOM, not evidence about the write-back.
+        failing.fail_index = std.math.maxInt(usize);
+        if (outcome) |_| {
+            break;
+        } else |failure| {
+            try testing.expectEqual(error.OutOfMemory, failure);
+            // The caller still owns the cursor and its batch. Neither the
+            // dual positions nor either write counter may claim a commit.
+            try testing.expect(e.isOpen());
+            try testing.expect(e.column() == &col);
+            try testing.expectEqual(0, e.rebuilds());
+            try testing.expectEqual(0, e.indexWrites());
+            try testing.expectEqual(at, e.pos());
+            try testing.expectEqual(at + ins.len, e.outPos());
+            try testing.expectEqual(orig.len - at, e.remaining());
+            try testing.expectEqual(next, try e.peek());
+            try expectWritebackValues(E, &col, orig);
+            const refused = try col.encode(testing.allocator);
+            defer testing.allocator.free(refused);
+            try testing.expectEqualSlices(u8, before, refused);
+            held += 1;
+            // Bound a broken retry loop rather than hanging the test.
+            if (held > 256) return error.Fail;
+        }
+    }
+
+    // The same cursor commits the entire batch once the allocator permits it.
+    try testing.expect(!e.isOpen());
+    try testing.expect(e.column() == &col);
+    try testing.expectEqual(1, e.rebuilds());
+    try testing.expectEqual(1, e.indexWrites());
+    try testing.expectEqual(at, e.pos());
+    try testing.expectEqual(at + ins.len, e.outPos());
+    try testing.expectEqual(orig.len - at, e.remaining());
+    try testing.expectEqual(next, try e.peek());
+    try expectWritebackValues(E, &col, want.items);
+    // A further finish must not insert the batch a second time.
+    try e.finish();
+    try testing.expectEqual(1, e.rebuilds());
+    try testing.expectEqual(1, e.indexWrites());
+    try expectWritebackValues(E, &col, want.items);
+    return held;
+}
+
+test "a refused write-back leaves the batch open, owed, and retryable" {
+    // A cursor marked clean before staging loses its batch on the first
+    // refusal: the retry returns without publishing what it still owes.
+    // Refuse only finish, and disarm before checking or retrying. Otherwise
+    // an OOM in the check itself can hide the refusal this test must observe.
+    // The cut is inside a run and at a run boundary. Following slabs also
+    // have to retain their positional index and, for Prefix, their bases.
+    const orig = [_]u64{
+        1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4,
+        5, 5, 5, 6, 6, 6, 7, 7, 7, 8, 8, 8,
+    };
+    const ins = [_]u64{ 9, 9, 9, 9, 9, 9, 9 };
+    for ([_]usize{ 2, 9 }) |at| {
+        try testing.expect(try sweepFinish(column.Rle(u64), &orig, at, &ins) != 0);
+        try testing.expect(try sweepFinish(column.Prefix(u64), &orig, at, &ins) != 0);
+    }
+}
+
+test "finishing an unchanged cursor succeeds while allocations are refused" {
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    const E = column.Prefix(u64);
+    const orig = [_]u64{ 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4 };
+    var col = try column.Column(u64, E).initWithBudget(gpa, 4);
+    defer col.deinit();
+    try col.extend(gpa, &orig);
+    var e = try Edit(u64, E).init(gpa, &col, 0);
+    defer e.deinit();
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    for (orig) |_| _ = try e.replace(same(u64));
+    try e.finish();
+    try testing.expect(!e.isOpen());
+    try testing.expect(e.column() == &col);
+    try testing.expectEqual(0, e.rebuilds());
+    try testing.expectEqual(0, e.indexWrites());
+    try testing.expectEqual(orig.len, e.pos());
+    try testing.expectEqual(orig.len, e.outPos());
+    try testing.expectEqual(0, e.remaining());
+
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try expectWritebackValues(E, &col, &orig);
 }

@@ -221,6 +221,18 @@ pub const DocError = doc.DocError;
 /// ([`Keys`](keys.zig), `iter.rs:11`, `iter/keys.rs:8-11`).
 pub const Keys = keys.Keys;
 
+/// What reading an object's keys can fail with
+/// ([`KeysError`](keys.zig), `keys.zig:119`).
+///
+/// **Not upstream**, for the reason [`DocError`] gives: upstream's `Keys`
+/// returns upstream's `OpQueryError` and `iter.rs:11` exports no name for it.
+/// It is a **subset of [`ReadError`]** — the same union without the
+/// [`ParseError`](../../src/error.zig) arm, which the three range readers add
+/// because a counter's value is read through
+/// [`OpSet.getIncrementDiffAtPos`](../opset/op_set.zig) — so a caller holding
+/// both names can widen with the one it already has.
+pub const KeysError = keys.KeysError;
+
 // ── `iter.rs:12,18` — list_range ─────────────────────────────────────────────
 
 /// One entry per visible element of a sequence
@@ -330,11 +342,11 @@ pub const Values = values.Values;
 /// **Not upstream**: upstream's item is the bare tuple `(types::Value<'a>,
 /// ExId)` (`values.rs:26`) and a Zig tuple cannot be named in a signature, so
 /// the pair needs a name for [`Values.next`] to return one
-/// ([values.zig:152-160](values.zig)).
+/// ([values.zig:139-168](values.zig)).
 pub const ValuesItem = values.ValuesItem;
 
 /// What reading values can fail with ([`ValuesError`](values.zig),
-/// `values.zig:137`).
+/// `values.zig:145`).
 ///
 /// **Not upstream**, for the reason [`DocError`] gives.
 pub const ValuesError = values.ValuesError;
@@ -345,7 +357,7 @@ pub const ValuesError = values.ValuesError;
 /// **Not upstream as a type**: upstream's inner is a `Box<dyn OpQueryTerm>`
 /// and the two impls are the trait impls on `OpIter` and `TopOps`. Zig has no
 /// trait objects, so each impl becomes the type that carries its methods
-/// ([values.zig:164-230](values.zig)).
+/// ([values.zig:190-204](values.zig)).
 pub const RowQuery = values.RowQuery;
 
 /// A winner walk as a query term, the other of the two inners
@@ -365,15 +377,15 @@ pub const TopQuery = values.TopQuery;
 /// `doc` one, the gap this file's table records.
 pub const Diff = tools.Diff;
 
-/// The diff kernel the three range readers are built on
-/// ([`DiffKernel`](tools.zig), `iter/tools.rs:528-608`).
-///
-/// **No `pub const` here, and deliberately**: upstream's `iter.rs` re-exports
-/// one item of `tools` and this is not it, so a root export would put a name
-/// in every reader's namespace that the rule above this section keeps out. It
-/// is reached as `tools.DiffKernel`, where upstream reaches it as
-/// `iter::tools::DiffIter` — renamed because upstream has two types by that
-/// name and `iter.rs:17` exports the other one.
+// The diff kernel the three range readers are built on
+// ([`DiffKernel`](tools.zig), `iter/tools.rs:528-608`) has **no `pub const`
+// here, and deliberately**: upstream's `iter.rs` re-exports one item of `tools`
+// and this is not it, so a root export would put a name in every reader's
+// namespace that the rule above this section keeps out. It is reached as
+// `tools.DiffKernel`, where upstream reaches it as `iter::tools::DiffIter` —
+// renamed because upstream has two types by that name and `iter.rs:17` exports
+// the other one. **This note is a file comment and not a doc comment on the
+// declaration below**, because it is about a name this file does not export.
 /// The repositioning kernel every cursor in this directory carries
 /// ([`Shiftable`](tools.zig), `iter/tools.rs:62`).
 ///
@@ -388,14 +400,16 @@ pub const Shiftable = tools.Shiftable;
 //
 // Comptime, and not in a test: a rename in a sibling is then a *compile error
 // in this file*, which names the sibling and the line, rather than a failure
-// three files away in a caller. The test below then pins that each of these is
-// the sibling's own declaration and not a copy of it.
+// three files away in a caller. Every name below is a re-export and not a copy,
+// so naming it here is the whole of the check — there is no second declaration
+// in this file for a rename to miss.
 
 comptime {
     _ = Doc;
     _ = ObjIdIter;
     _ = DocError;
     _ = Keys;
+    _ = KeysError;
     _ = ListRange;
     _ = ListRangeItem;
     _ = ListDiff;
@@ -607,7 +621,7 @@ fn threeKeyDoc(gpa: Allocator) !*Fixture {
 }
 
 /// `ValueRef` equality as upstream's `PartialEq` means it
-/// ([map_range.zig:1023-1035](map_range.zig)), spelled here rather than
+/// ([map_range.zig:1198-1205](map_range.zig)), spelled here rather than
 /// imported because the two walks below are compared against each other and
 /// not against a literal.
 fn sameValue(got: ValueRef, want: ValueRef) !void {
@@ -619,42 +633,6 @@ fn sameValue(got: ValueRef, want: ValueRef) !void {
 }
 
 // ── The tests ───────────────────────────────────────────────────────────────
-
-test "every name this root re-exports is the sibling's own declaration" {
-    // A **rename** in a sibling is a compile error in the `comptime` block
-    // above, which names the sibling. What a copy rather than a re-export
-    // looks like is a *second* declaration that agrees today and drifts
-    // tomorrow, and that is what these assertions are for: each one holds only
-    // if this file's name and the sibling's are the same type. A flat
-    // `pub const Keys = struct {...}` would fail every line below.
-    try testing.expect(@TypeOf(Doc) == @TypeOf(doc.Doc));
-    try testing.expect(@TypeOf(ObjIdIter) == @TypeOf(doc.ObjIdIter));
-    try testing.expect(@TypeOf(DocError) == @TypeOf(doc.DocError));
-    try testing.expect(@TypeOf(Keys) == @TypeOf(keys.Keys));
-    try testing.expect(@TypeOf(ListRange) == @TypeOf(list_range.ListRange));
-    try testing.expect(@TypeOf(ListRangeItem) == @TypeOf(list_range.ListRangeItem));
-    try testing.expect(@TypeOf(ListDiff) == @TypeOf(list_range.ListDiff));
-    try testing.expect(@TypeOf(ListDiffItem) == @TypeOf(list_range.ListDiffItem));
-    try testing.expect(@TypeOf(MapRange) == @TypeOf(map_range.MapRange));
-    try testing.expect(@TypeOf(MapRangeItem) == @TypeOf(map_range.MapRangeItem));
-    try testing.expect(@TypeOf(MapDiff) == @TypeOf(map_range.MapDiff));
-    try testing.expect(@TypeOf(MapDiffItem) == @TypeOf(map_range.MapDiffItem));
-    try testing.expect(@TypeOf(ReadError) == @TypeOf(map_range.ReadError));
-    try testing.expect(@TypeOf(Span) == @TypeOf(spans.Span));
-    try testing.expect(@TypeOf(Spans) == @TypeOf(spans.Spans));
-    try testing.expect(@TypeOf(SpanDiff) == @TypeOf(spans.SpanDiff));
-    try testing.expect(@TypeOf(SpanInternal) == @TypeOf(spans.SpanInternal));
-    try testing.expect(@TypeOf(SpansDiff) == @TypeOf(spans.SpansDiff));
-    try testing.expect(@TypeOf(SpansInternal) == @TypeOf(spans.SpansInternal));
-    try testing.expect(@TypeOf(RichTextDiff) == @TypeOf(batch.RichTextDiff));
-    try testing.expect(@TypeOf(Values) == @TypeOf(values.Values));
-    try testing.expect(@TypeOf(ValuesItem) == @TypeOf(values.ValuesItem));
-    try testing.expect(@TypeOf(ValuesError) == @TypeOf(values.ValuesError));
-    try testing.expect(@TypeOf(RowQuery) == @TypeOf(values.RowQuery));
-    try testing.expect(@TypeOf(TopQuery) == @TypeOf(values.TopQuery));
-    try testing.expect(@TypeOf(Diff) == @TypeOf(tools.Diff));
-    try testing.expect(@TypeOf(Shiftable) == @TypeOf(tools.Shiftable));
-}
 
 test "a handle over an op set answers, and the op set is what keeps it alive" {
     // `FailingAllocator` with no `fail_index` never fails and counts every
@@ -785,7 +763,7 @@ test "a map walked through this root is the same walk as one reached directly" {
     );
     // **No `deinit`**, because a `MapRange` owns nothing: four column cursors,
     // a skipper and a lookahead, all of them values over storage the op set
-    // already holds ([map_range.zig:835-837](map_range.zig)). Dropping the
+    // already holds ([map_range.zig:976-987](map_range.zig)). Dropping the
     // `defer` here is a statement that the reader cannot leak.
     var direct_range = try map_range.MapRange(opmod.Op).init(
         &fx.set,

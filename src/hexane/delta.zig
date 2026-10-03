@@ -56,6 +56,33 @@
 //! segment splitter at the bottom of the file therefore walks the values
 //! directly, following the run-header convention above. The interop
 //! test holds it to `rle`: same deltas in, same bytes out, both ways.
+//!
+//! # Import route and the shortest sequence that works
+//!
+//! `@import("hexane/delta.zig")`, or `zautomerge.hexane.delta` through the root
+//! module. Zig 0.16.0. What a column imports from here is [`Delta`] and its
+//! nullable alias [`DeltaOption`]; [`Stored`] is the type of one stored delta
+//! and an `Editor` — `Delta(T).Editor` — is the cursor that edits one slab.
+//!
+//! ```zig
+//! const Codec = delta.Delta(u64);
+//! var ed = try Codec.Editor.fromValues(gpa, &.{ 1, 4, 9 });
+//! defer ed.deinit();                  // releases the buffer ed.gpa holds
+//! try ed.replace(1, 10);              // leaves a fix-up owed
+//! try ed.settle();
+//! const rows = try ed.values(gpa);    // a copy the caller frees
+//! defer gpa.free(rows);
+//! ```
+//!
+//! # What it deliberately does not do
+//!
+//! It does not widen its domain the way upstream does. Every edit and every
+//! decode is checked against the column's own 2^63 window instead, so the
+//! rows a column can hold are exactly the rows it can produce and nothing
+//! wraps. An unsettled `Delta(T).Editor` is a caller mistake rather than a
+//! reported error: the reads that would hand back a row one step out abort
+//! the process, because a document with plausible wrong rows is the one
+//! failure this port will not produce.
 
 const std = @import("std");
 const rle = @import("rle.zig");
@@ -152,6 +179,8 @@ pub fn Delta(comptime T: type) type {
         /// The realized-value domain, as `i64`. A loader validates every
         /// slab's realized values against these (`delta/mod.rs:99-100`).
         pub const min_i64: i64 = domainOf(payloadOf(T)).min;
+        /// The other end of the same window, and the value a realized row may
+        /// not exceed.
         pub const max_i64: i64 = domainOf(payloadOf(T)).max;
 
         const Payload = payloadOf(T);
@@ -298,6 +327,9 @@ pub fn Delta(comptime T: type) type {
 
         /// A cursor over a slab that yields values one at a time.
         pub const Decoder = struct {
+            /// The value cursor underneath, over the same borrowed slab. It
+            /// carries this decoder's borrow: the `bytes` given to [`init`]
+            /// must outlive the cursor.
             inner: WireDecoder,
             /// The realized value standing before the next row.
             running: i64,
@@ -337,10 +369,30 @@ pub fn Delta(comptime T: type) type {
         /// `pendingAdjust` reports it and `settle` — or a `seek`, which
         /// pays it on the way — closes it. Until then the rows after the
         /// cursor decode one step out, so every read of realized values
-        /// refuses rather than handing those back.
+        /// **traps rather than handing those back**: an unsettled editor is a
+        /// caller mistake, and the failure is a panic that ends the process,
+        /// not an `error` a `catch` can name.
+        ///
+        /// **The editor owns its delta buffer and nothing else.** The buffer
+        /// is allocated from [`gpa`] and released with it by [`deinit`], so
+        /// the allocator this editor was built with is the one every later
+        /// mutation uses — [`append`] has no allocator of its own for exactly
+        /// that reason. The allocator itself is not owned and is not released.
+        ///
+        /// **It has one owner.** Zig has no move, so a copy of an editor is a
+        /// second owner of one buffer: `deinit` on both copies is a double
+        /// free, and the copy's cursor is independent while its buffer is
+        /// not. Pass an editor by pointer where a copy would be wrong.
+        ///
+        /// [`values`] is the one method that allocates a result of its own,
+        /// and that result is the caller's to free with the allocator it was
+        /// given — it is not the editor's buffer and outliving the editor is
+        /// fine.
         pub const Editor = struct {
             const Self = @This();
 
+            /// The allocator the delta buffer was built with, and the one
+            /// [`deinit`] releases it with and the mutations grow it with.
             gpa: std.mem.Allocator,
             /// The slab's deltas, one per row.
             deltas: std.ArrayList(Stored),
@@ -375,7 +427,10 @@ pub fn Delta(comptime T: type) type {
                 return fromValues(gpa, rows);
             }
 
-            /// Frees the slab.
+            /// Frees the slab's delta buffer with [`gpa`]. The allocator
+            /// itself is not released. Exactly one `deinit` per editor: a copy
+            /// of an editor is a second owner of one buffer, so releasing both
+            /// is a double free.
             pub fn deinit(self: *Self) void {
                 self.deltas.deinit(self.gpa);
             }
@@ -403,8 +458,12 @@ pub fn Delta(comptime T: type) type {
             }
 
             /// The realized value of row `index`, or `error.Overflow`
-            /// when the running sum leaves the column's domain. Requires
-            /// a settled editor; see `settle`.
+            /// when the running sum leaves the column's domain.
+            ///
+            /// **Traps on an unsettled editor.** `pendingAdjust` is nonzero
+            /// unless `settle` has run, and this aborts the process rather
+            /// than returning an error: no error on this path names the
+            /// unsettled state, so a caller cannot `catch` its way out of it.
             pub fn valueAt(self: *const Self, index: usize) ParseError!T {
                 self.requireSettled();
                 if (index >= self.deltas.items.len) return error.ColumnOutOfBounds;
@@ -529,15 +588,19 @@ pub fn Delta(comptime T: type) type {
                 }
             }
 
-            /// The realized value of every row. The caller owns the
-            /// result. Requires a settled editor; see `settle`.
+            /// The realized value of every row, in a fresh slice the caller
+            /// owns and frees with `gpa`. It is a copy, not a window, so it
+            /// outlives the editor.
+            ///
+            /// **Traps on an unsettled editor**, the same way `valueAt` does.
             pub fn values(self: *const Self, gpa: std.mem.Allocator) ParseError![]T {
                 self.requireSettled();
                 return fromDeltas(gpa, self.deltas.items);
             }
 
-            /// The number of bytes the slab's encoding takes. Requires a
-            /// settled editor; see `settle`.
+            /// The number of bytes the slab's encoding takes.
+            ///
+            /// **Traps on an unsettled editor**, the same way `valueAt` does.
             pub fn encodedSize(self: *const Self) ParseError!usize {
                 self.requireSettled();
                 return slabSize(Source.fromDeltas(self.deltas.items));
@@ -545,7 +608,8 @@ pub fn Delta(comptime T: type) type {
 
             /// Writes the slab's bytes into `out`, which must hold
             /// `encodedSize` bytes, and returns how many it wrote.
-            /// Requires a settled editor; see `settle`.
+            ///
+            /// **Traps on an unsettled editor**, the same way `valueAt` does.
             pub fn write(self: *const Self, out: []u8) ParseError!usize {
                 self.requireSettled();
                 return writeSlab(out, Source.fromDeltas(self.deltas.items));

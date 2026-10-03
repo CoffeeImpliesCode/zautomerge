@@ -85,6 +85,14 @@ comptime {
 /// allocation: the `other_actors` array `parseChange` makes. `deinit` frees
 /// that and nothing else.
 ///
+/// **"Owns one allocation" is a property of the value, not a promise that a
+/// function returning a `Change` handed the caller a new one.** Where a
+/// method returns a `Change` it says on the declaration whether the result is
+/// a fresh owner or an alias of the receiver's
+/// ([`withOpCount`](Change.withOpCount) is the one that aliases), because the
+/// two shapes read identically at the call site and only one of them may be
+/// deinited.
+///
 /// Use `parseChange` to get one. Building one by hand is fine and is what the
 /// future change encoder does, but then `other_actors` is whatever slice the
 /// caller put there and `deinit` must not be called on it.
@@ -159,6 +167,15 @@ pub const Change = struct {
     /// (`ReadChangeOpError::CounterTooLarge`, `storage/change.rs:182-184`).
     /// Here the check waits for the op count, because the columns that would
     /// supply it are not decoded in this module.
+    ///
+    /// **The result aliases the receiver's `other_actors`; it is not a
+    /// transfer.** The body copies the struct and fills in one field, so both
+    /// values name one actor array and `deinit` frees it. Exactly one of the
+    /// two may be deinited: deinit both and the array is freed twice, deinit
+    /// neither and it leaks. A caller that reads the result owes nothing and
+    /// must not free it — which is the shape the in-tree callers use, since
+    /// they go straight to [`ChangeMetadata.fromChange`](ChangeMetadata.fromChange),
+    /// which borrows rather than copies.
     pub fn withOpCount(self: Change, num_ops: u64) ParseError!Change {
         if (self.start_op > std.math.maxInt(u32)) return error.Overflow;
         var next = self;
@@ -170,7 +187,20 @@ pub const Change = struct {
     }
 
     /// Writes the change header, in the order and widths the format fixes, to
-    /// the end of `out`.
+    /// the end of `out`. **`out` is the caller's buffer and is appended to,
+    /// not replaced**: whatever it already holds is kept, and the nine appends
+    /// below land after it, so a caller writes its framing first. It is not
+    /// truncated, cleared or reserved.
+    ///
+    /// **A refused append leaves `out` holding the prefix that did fit.** The
+    /// header is written field by field and each field can need a grow, so
+    /// `error.OutOfMemory` can arrive with a dependency count and half a
+    /// dependency list already appended. That is not a usable buffer and not
+    /// a silent truncation: `out`'s length is exactly what was written, and
+    /// the caller — which owns `out` and knows what else was in it — has to
+    /// drop it. There is no rollback here because there is nothing to roll
+    /// back to: a partial header is not shorter than the prefix, it is a
+    /// different string.
     ///
     /// This is the inverse of the header half of `parseChange`: a change
     /// parsed from a body and written back with it produces the original
@@ -193,6 +223,12 @@ pub const Change = struct {
     /// The whole change chunk, framed and ready to concatenate into a
     /// document. The body is `bytes` as it stands: it is already the exact
     /// body the hash was taken over, so nothing is re-serialised here.
+    ///
+    /// **The returned slice is a fresh allocation the caller owns and must
+    /// free with `gpa`.** It borrows nothing: the chunk framing is copied out
+    /// and the body is copied in, so the result outlives `bytes` and survives
+    /// a [`deinit`](Change.deinit) of the change it came from. An
+    /// `error.OutOfMemory` returns no slice and nothing is leaked.
     pub fn encode(self: Change, gpa: Allocator) Allocator.Error![]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);
@@ -202,6 +238,12 @@ pub const Change = struct {
 
     /// A short form for an error message: the hash prefix, the author, the
     /// sequence number, the op range, and the message.
+    ///
+    /// **The returned slice is a fresh allocation the caller owns and must
+    /// free with `gpa`,** the same rule as [`encode`](Change.encode): the text
+    /// is formatted into a new buffer and borrows nothing from the change.
+    /// The intermediate actor hex the format needs is freed here, so the one
+    /// allocation that reaches the caller is the string itself.
     pub fn debugString(self: Change, gpa: Allocator) Allocator.Error![]u8 {
         // Eight hex digits is enough to find the change in a hash set and
         // short enough to keep an error readable.
@@ -253,8 +295,14 @@ pub const ChangeMetadata = struct {
     /// The actors this change references but does not own.
     other_actors: []const ActorId,
 
-    /// The metadata for a change, borrowing everything from it. The result is
-    /// only valid while `change.bytes` is.
+    /// The metadata for a change, borrowing everything from it: the actor
+    /// bytes, the dependency hashes, the message and the referenced actor
+    /// bytes are the change's own, and the result shares their lifetime. It
+    /// is valid while `change.bytes` is and no longer, and it owns nothing —
+    /// **so [`deinit`](ChangeMetadata.deinit) must not be called on it.** A
+    /// function that takes `ChangeMetadata` by value therefore does not take
+    /// ownership of it unless it says so, and the ones that do not say so
+    /// copy it instead.
     pub fn fromChange(change: Change) ChangeMetadata {
         return .{
             .actor = change.actor,
@@ -272,6 +320,14 @@ pub const ChangeMetadata = struct {
     /// A deep copy that owns its bytes, for a graph node that outlives the
     /// change it was read from. Upstream's `into_owned`
     /// (`op_set2/types.rs:762-777`) is the same move, for the same reason.
+    ///
+    /// **The result is owned by the caller** and must be released with
+    /// [`deinit`](ChangeMetadata.deinit): four allocations — the actor bytes,
+    /// the dependency hashes, the message, and the referenced actor bytes with
+    /// their array. Handing it *to* a function does not pass that ownership
+    /// on unless the callee says it took it, which is why every in-tree caller
+    /// of `addChange` keeps its own `defer meta.deinit(gpa)` and the callee
+    /// copies.
     pub fn intoOwned(self: ChangeMetadata, gpa: Allocator) Allocator.Error!ChangeMetadata {
         const actor = try gpa.dupe(u8, self.actor.bytes);
         errdefer gpa.free(actor);
@@ -868,7 +924,7 @@ test "every change a document hands out names the counter its own last op row ca
     const changechunk = @import("storage/change_chunk.zig");
 
     const gpa = testing.allocator;
-    var doc = try docmod.Document.init(gpa, .manual);
+    var doc = try docmod.Document.init(gpa, std.testing.io, .manual);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = &([_]u8{0xa1} ** 16) });
 
@@ -960,7 +1016,7 @@ test "every change a document hands out names the counter its own last op row ca
     // the header and none of the operations. The row counts above are what each
     // application has to land, so this is the same number observed at the far
     // end of the wire.
-    var peer = try docmod.Document.init(gpa, .auto);
+    var peer = try docmod.Document.init(gpa, std.testing.io, .auto);
     defer peer.deinit();
     for (changes.slice(), want) |built, w| {
         const framed = try built.change.encode(gpa);
@@ -973,7 +1029,7 @@ test "every change a document hands out names the counter its own last op row ca
     // that arrived over sync is decoded on the way in (`Document.applyChanges`
     // fills its range from the decoded rows), and has to come back out of
     // `getChangeByHash` carrying the same one.
-    var other = try docmod.Document.init(gpa, .manual);
+    var other = try docmod.Document.init(gpa, std.testing.io, .manual);
     defer other.deinit();
     other.setActorId(.{ .bytes = &([_]u8{0xb2} ** 16) });
     var t3 = try transact.Transaction.open(gpa, &other);

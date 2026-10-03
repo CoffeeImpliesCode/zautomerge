@@ -567,15 +567,26 @@ Per construct, in the order they appear above.
 
 **`smallvec`/`Cow<'a, str>` (`MapRangeItem::key` is `Cow<'a, str>` per 0.7.0)** → `[]const u8` for borrowed, `[]u8` for owned, with a `union(enum) { borrowed: []const u8, owned: []u8 }` when the API must offer both. The changelog shows this exact shape of change is API-visible, so the port should pick one and document it.
 
-**`Option<T>` → `?T`, `Result<T, E>` → `T || E`.** Direct. Note `Result<_, PatchLogMismatch>` (0.10.0) is a new error variant that must exist in the Zig error set, and that a Rust `Err` is a *value* while a Zig error is control flow — `tests/test.rs:51-78` shows the distinction is observable to callers.
+**Options and errors use different Zig types.** `Option<T>` maps to `?T`.
+`Result<T, E>` maps to `E!T` when `E` is an error set.
+A failure that carries an ordinary value needs a tagged union.
+The port's transaction outcomes retain the primary error and recovery ownership explicitly.
 
-**Enums → tagged unions.** `ScalarValue`, `Prop`, `ObjType`, `PatchAction`, `Span`, `ExpandMark`, `TextEncoding`, `MessageFlag`, `Message`, `OnPartialLoad`, `VerificationMode` are all tagged unions in Zig. `ExpandMark::{Before, After, Both, None}` is literally a 2-bit field in Rust; in Zig it will be a union and the *set* is a struct-of-bools or a `packed struct(u2)`.
+**Enum representation depends on payloads.** Payload-free choices use `enum`. Payload-bearing choices use `union(enum)`.
+The port's `ExpandMark` uses `enum(u2)`. The wire and C discriminants remain part of the compatibility contract.
 
-**`ActorId` / `Author` / `Hash` (32-byte) newtypes** → `struct { bytes: [N]u8 }` with hand-written `eql`, `cmp`, `toHex`, `parseHex`. `ActorId::random()` and `Author::from(vec![…])` come from the test code directly (`tests/test.rs:1970`, `:3462`), so the byte-level constructors must be public.
+**Identity types keep different storage contracts.** `ChangeHash` contains 32 bytes.
+`ActorId` holds a slice and permits variable-length identities.
+`ActorId.random(gpa, io)` returns an owned 16-byte secure identity.
+The caller keeps the I/O provider live and frees the bytes with the supplied allocator.
+Byte-level constructors remain public for fixtures and explicit identities.
 
 **Borrowing → slices/pointers.** `automerge`'s `ReadDoc` is a read-only view over a shared op set with interior mutability for caches (e.g. `src/op_set.rs:68-81` exposes a `&self` method that mutates debug state). The Rust code uses `Rc`/`Arc` (`marks::MarkSet` is `Arc<MarkSet>` in `tests/block_tests.rs:12`, `tests/diff_marks.rs:6`) and `Send` types. In Zig this becomes raw pointers plus explicit lifetimes-by-convention, and the "no aliasing mutable + immutable views" rule that the borrow checker enforces for free in Rust becomes a manual invariant. **This is where a Zig port will get it wrong.** The suite's panic-free shape means a borrow violation shows up as memory corruption, not a test failure.
 
-**Procs / build.** `cbindgen` (`rust/automerge-c/build-dependencies`) generates the C header; the header is *generated at build time* and "subject to change based on the platform and the release version" (`rust/automerge-c/README.md:22-25`). A Zig port emitting a C API needs its own `translate-c` step or a hand-written header.
+**The C build has two roots.** The reference generates its header with cbindgen.
+The port ships `include/automerge.h` with the static library from `src/c/root.zig`.
+`test/c/cabi.zig` translates that header for compile-time parity checks.
+The production package does not depend on the test root.
 
 **MSRV 1.90 → irrelevant.** Zig 0.16 has no MSRV concept. The 1.89/1.90 constraints in `benchmark-battery/Cargo.toml:5` and everywhere else carry no port meaning; the 0.11.0 changelog's "MSRV 1.90" is a policy statement only.
 

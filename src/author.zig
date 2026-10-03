@@ -72,6 +72,11 @@ pub const Authors = struct {
     }
 
     /// Releases the actor bytes, the table, and the last remap in one call.
+    ///
+    /// The allocator passed to [`init`](Authors.init) is not released here.
+    /// The table and every [`ActorId`](types.zig) it handed out are unusable
+    /// afterwards; the value is poisoned, so a second call — including one
+    /// through a copy — is a double free with no diagnostic in any mode.
     pub fn deinit(self: *Authors) void {
         self.items.deinit(self.gpa);
         self.remap_buf.deinit(self.gpa);
@@ -144,6 +149,23 @@ pub const Authors = struct {
         _ = try self.insert(gpa, i, actor);
     }
 
+    /// Reserves room in the remap buffer for one entry per actor in the table
+    /// as it stands, so a following [`removeAt`](Authors.removeAt) at any
+    /// valid index allocates nothing.
+    ///
+    /// **Call this before mutating anything that must be rolled back.** A
+    /// caller that removes an actor from the change graph and the op set and
+    /// only then removes it from this table has to unwind both when the third
+    /// step fails, and an unwind that cannot itself allocate is the only one
+    /// that is safe to write. This is the staging half of that sequence, and
+    /// it pairs with [`removeAt`](Authors.removeAt) the way
+    /// [`SeqClock.reserveNewActor`](clock.zig) pairs with
+    /// [`SeqClock.rewriteWithNewActor`](clock.zig). It is the only fallible
+    /// step, and it leaves the table unchanged.
+    pub fn reserveRemap(self: *Authors, gpa: Allocator) !void {
+        try self.remap_buf.ensureTotalCapacity(gpa, self.items.items.len);
+    }
+
     /// Removes the actor at `idx`, shifting indices above it down, and records
     /// the mapping old index -> new index. The caller must not have any stored
     /// reference to `idx`: upstream asserts the same thing when it drops an
@@ -151,6 +173,14 @@ pub const Authors = struct {
     /// that still named the actor would silently retarget another actor.
     ///
     /// Returns `error.InvalidIndex` when `idx` is not an index of the table.
+    ///
+    /// **After [`reserveRemap`](Authors.reserveRemap) this call allocates
+    /// nothing and its only remaining refusal is `error.InvalidIndex`**, so a
+    /// caller that validated the index may treat that tag as unreachable. A
+    /// removal that has already renamed indices elsewhere in the document
+    /// should reserve first; see [`reserveRemap`](Authors.reserveRemap).
+    ///
+    /// The table is unchanged on either refusal.
     pub fn removeAt(self: *Authors, gpa: Allocator, idx: ActorIdx) Error!void {
         const i: usize = idx;
         const n = self.items.items.len;
@@ -595,4 +625,30 @@ test "list returns an owned copy the caller frees" {
     // table's actor bytes outlive any list taken from it.
     try std.testing.expectEqual(@as(usize, 2), table.count());
     try expectActorAt(table, 0, "a");
+}
+
+test "a removal after reserveRemap allocates nothing" {
+    const gpa = std.testing.allocator;
+    var table = Authors.init(gpa);
+    defer table.deinit();
+
+    _ = try table.intern(gpa, .{ .bytes = "a" });
+    _ = try table.intern(gpa, .{ .bytes = "b" });
+    _ = try table.intern(gpa, .{ .bytes = "c" });
+
+    // The caller removes an actor from the change graph and the op set before
+    // it removes it here, and the unwind of those two must not be able to
+    // fail. `failing_allocator` refuses every allocation, so the removal
+    // below can only succeed if `reserveRemap` left the room it needed.
+    try table.reserveRemap(gpa);
+    try table.removeAt(std.testing.failing_allocator, 1);
+
+    try expectActorAt(table, 0, "a");
+    try expectActorAt(table, 1, "c");
+    try expectSortedTable(table);
+    const remap = table.remap();
+    try std.testing.expectEqual(@as(usize, 3), remap.len);
+    try std.testing.expectEqual(@as(ActorIdx, 0), remap[0]);
+    try std.testing.expectEqual(Authors.no_index, remap[1]);
+    try std.testing.expectEqual(@as(ActorIdx, 1), remap[2]);
 }

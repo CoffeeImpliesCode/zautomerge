@@ -2,12 +2,86 @@
 
 The plan of record is [plan.md](plan.md); this is the state of it.
 
-**Every number below was measured on 2026-09-30/2026-10-01 CEST, and the
-command that measured it is given next to it.** A number that could not be
-measured is written *not measured* rather than estimated. This file has carried
-a wrong test count more than once, and each time the error cost a round, so the
-rule is now structural: if a claim cannot be produced by running something, it
-does not go in.
+## Current API-design repair evidence
+
+**Source baseline:** working-copy revision `4450924c`, based on committed parent
+`f8aace30c150ac99f97efbe36a1c731430996ec2`. The repairs are uncommitted edits against that baseline.
+The package hash below identifies the frozen native/C source snapshot used by the consumers.
+The read-only reference is Automerge 0.12.0 at
+`ddbff535407e4d28cd2a82eaf6c6add08caa3bdd`.
+The compiler is Zig 0.16.0 on x86-64 Linux.
+No result here certifies another compiler or target.
+
+The repair closes 194 individually tracked findings across 17 audit slices.
+The source review covers all 15 topics in `zig-api-design`.
+[API.md](../API.md#api-design-decisions) records the contracts and eight contested decisions.
+Those judgments have grade **analyst-inferred**, authored by the coding assistant.
+Caller obligations have grade **documented-contract**.
+The checks below provide version-scoped compilation or runtime evidence for named paths, not universal enforcement.
+
+| Check, measured 2026-10-04 | Proof label | Observed result and scope |
+| --- | --- | --- |
+| Focused native text and encoding run | Runtime observation, Debug | 80/80 passed. Includes all eleven new range regressions, patch coalescing, hydrated deletion, and document reads in four encodings. |
+| Shipped-header and generic diagnostic probes | Exercised compilation | 9/9 verified. The real header compiled. Eight malformed contracts failed compilation with the intended diagnostic. |
+| Fetched native and C consumers, Debug | Exercised compilation and runtime observation | 8/8 build steps succeeded. Both executables ran against the URL-and-hash dependency. |
+| Fetched native and C consumers, ReleaseFast | Exercised compilation and runtime observation | 8/8 build steps succeeded. Both executables used explicit runtime checks, not debug-only assertions. |
+| `zig build` with a local scratch install prefix | Exercised compilation and install observation | 4/4 steps succeeded. The production C library and header installed. |
+| `zig fmt --check .` | Formatter runtime observation | Exit 0 after all source writers finished. |
+| Integrated `test slow-path conformance ctest` run | Exercised compilation and runtime observation, Debug | 58/58 steps succeeded. 3682/3683 Zig tests passed, with one default-run skip and no failures. |
+| Native `test` roots | Runtime observation, Debug | 1965 passed, one skipped. The library root had 1716 passed and one skipped. All 118 upstream document cases passed. |
+| `slow-path` library root | Runtime observation, Debug | 1717/1717 passed, including the case skipped in the default run. |
+| Rust conformance comparisons | Runtime observation | All eight golden files matched: doc, change, sync, diff, converge, converge-parallel, codec, and clock. |
+| C runtime suite | Runtime observation, Debug | 160/160 cases passed across 13 groups, against the production library. The shipped-header guard compiled in the same gate. |
+
+The complete integrated command was:
+
+```sh
+zig build test slow-path conformance ctest -Dcmocka-prefix=../cmocka-prefix -j1 --summary all
+```
+
+The direct C report used the same built executable with its declared working directory, `test/c/suite`.
+An initial direct launch from the repository root failed to open the relative load fixture.
+The corrected fixture context passed all 160 cases. No source change was needed.
+The integrated gate already supplies that working directory.
+
+The diagnostic refusals cover function-width mismatch, an uncovered header function,
+an uncovered enum tag, and malformed hydrate, Values, Shiftable, batch, and diff sink types.
+The header guard checks 187 physical function signatures, 37 enum names across five enums, and five struct layouts.
+Only `AMbyteSpan` and `AMitems` cross by value.
+It does not check semantic pointer constness, nullability, sentinels, nominal enum identity, or reordered same-typed parameters.
+
+**Text red/green evidence:** before the range repair, the new tests observed suffix loss,
+split-surrogate acceptance, partial deletion after allocation refusal, and index overflow.
+The focused run passes after the repair.
+`ConcreteTextValue` remains UTF-8-backed. It refuses split scalar boundaries and recomputes current grapheme segmentation.
+Rust's native-unit trees and lossy rendering have a different contract.
+See [survey/05](survey/05-iter-query-patch.md#traits-and-generics) for the cited representation gap.
+
+**Package snapshot:** the final source archive has package hash
+`zautomerge-0.0.0-FlN8sAVekAAUKQiHaBhEAd2noutJSvO2t5tLnDbwjqsJ`.
+The consumer manifest uses an HTTP URL and that hash, not a relative path.
+The archive contains the package's declared source, header, build files, and MIT notice.
+One uninstrumented fresh fetch reported an illegal `unknown` file type for `src/hydrate.zig`.
+The traced retry fetched the archive successfully. The ordinary cached fetch also succeeded.
+This is an observed transport limit, not evidence of a source-file type change or a resolved compiler defect.
+
+The native executable exercised entropy refusal, independent default actors, merge,
+save/load, a local incremental patch, and truncated UTF-8 refusal.
+Its allocation-refusal scenario freed the caller's payload, refused recovery once,
+retried rollback, wrote one unique operation ID, and verified save/load.
+Its UTF-16 scenario refused a split surrogate without mutation, deleted the complete supplementary scalar,
+preserved the suffix, and retained the borrowed buffer on an out-of-range no-op.
+The conflict scenario merged two branches, deleted one conflicting value, and replayed the resulting patches.
+All eight combinations of actor order and text encoding retained the exact survivor.
+The replayed mirror matched fresh hydration, and save/load preserved the merged document.
+The C executable exercised null-input refusal, secure default creation, write/read,
+a retained result concatenation borrow, the variadic join, and cleanup.
+
+## Historical measurements
+
+The sections below preserve measurements from 2026-09-30 and 2026-10-01.
+Their commands and dates define their scope. They do not certify the repaired working tree.
+The current evidence above supersedes those test totals.
 
 ## The shape of the thing
 
@@ -80,17 +154,31 @@ Build Summary: 5/5 steps succeeded          153 cmocka cases, 0 failed
 | crate-root example suite | **3 / 3 pass** | as above, `-lc` and `--dep zautomerge` |
 | ported upstream `tests/test.rs` | **117 / 117 pass** | `zig test … -Mroot=test/upstream_doc_test.zig` |
 | conformance vectors | **8 vectors, all checked against the reference** | `zig build conformance` |
-| C ABI cmocka cases | **153 run, 153 pass** | `zig build ctest -Dcmocka-prefix=<dir>` |
+| C ABI cmocka cases | **153 run, 153 pass** (last measured; `abi_coverage.c` has grown since) | `zig build ctest -Dcmocka-prefix=<dir>` |
 
 The example suite needs `-lc` because its third test reads one document through
 `AMmapRange` and through `read.mapRange` in the same process
-(the example step's own comment says why); `zig build test` passes it. `zig build ctest` needs both `-Dcmocka-prefix` and
-`LD_LIBRARY_PATH`, because the step sets no rpath.
+(the example step's own comment says why); `zig build test` passes it.
+`zig build ctest` needs `-Dcmocka-prefix`, and **nothing else**: the prefix is
+absolutised inside the build and the executable sets `each_lib_rpath`, so
+`libcmocka.so.0` resolves from the binary's own RUNPATH whatever the working
+directory is. **`LD_LIBRARY_PATH` is not required and this file previously said
+it was** — that was true while the step set no rpath and absolutised nothing,
+and it is stale now.
 
-**The failure mode is exit 127, not a compile error — and that is the part worth
-knowing.** `run_ctest` sets the step's working directory to `test/c/suite`, so
-**a relative `-Dcmocka-prefix` and a relative `LD_LIBRARY_PATH` both resolve
-against that directory**, not against the repository root. The binary still
+**What `zig build ctest` builds, in order**: the production static library
+`libzautomerge.a` from `src/c/root.zig`; the **separate** ABI-check library
+from `test/c/cabi.zig`, which compiles the real header and compares names,
+by-value layouts and enum discriminants at comptime; then the suite executable,
+linked against **the artifact and not the check**. A header/library mismatch in
+the check is a build failure; a header/suite mismatch at link time is a link
+error; a by-value struct whose layout diverged is neither, and only the check
+catches it.
+
+**The failure mode when the prefix is wrong is exit 127, not a compile error.**
+`run_ctest` sets the step's working directory to `test/c/suite`, so a `-L`
+directory that reached the binary as a **relative** RUNPATH entry resolves
+against that directory rather than the repository root. The binary still
 compiles; it then fails to launch:
 
 ```
@@ -98,9 +186,11 @@ error while loading shared libraries: libcmocka.so.0: cannot open shared object 
 error: process exited with code 127 (expected exited with code 0)
 ```
 
-**So a relative `LD_LIBRARY_PATH` is a build failure that is not one**, and the
-`...FAIL`-count rule does not apply — this is neither a failing test nor a blocked
-run but a process that never started. Use an **absolute** path.
+**That is a build failure that is not one**, and the `...FAIL`-count rule does
+not apply: this is neither a failing test nor a blocked run but a process that
+never started. The build now absolutises the prefix before it reaches the
+module, so `-Dcmocka-prefix=../cmocka-prefix` works and the historical advice to
+pass an absolute path is belt-and-braces rather than a requirement.
 
 
 **The instrument, stated first because a ranking whose instrument is unstated is
@@ -271,20 +361,25 @@ the file exists.
 | P3 columnar and format | done | `parse.zig`, `chunk.zig`, `column_spec.zig`, `columnar/encoding.zig`, `columnar/columns.zig`, `storage/change_chunk.zig`, `storage/document_chunk.zig`. The document chunk reproduces the oracle's 446-byte `save()` output byte for byte. |
 | P4 change graph and encoding | done | `change.zig`, `author.zig`, `change_graph.zig`, `change_queue.zig`, `storage/change_chunk.zig`. |
 | P5 op set and merge | **done; one gate clause open** | `opset/ids.zig`, `types.zig`, `op.zig` (the row and `Op.step`, the row-order invariant as four machine-checkable rules, each with a rejection test), `columns.zig`, `mark_index.zig`, `op_iter.zig`, `index.zig`, `visible.zig`, `top_op.zig`, `op_query.zig`, `marks.zig`, `found_op.zig`, `insert.zig`, `parents.zig`, `op_set.zig` and `batch.zig`. Both invariant checkers are demonstrated failing. The merge is checked against itself one change at a time by `debugCmp`, over a map, a list and text. **Both named upstream files are ported**: `tests/test.rs` 140/140 and `tests/batch_insert.rs` 46/46 (`test/upstream_batch_insert.zig`, wired at `the `upstream_batch_insert_tests` step`, 47/47 passing, 45 replay sites). What remains is the gate's second clause — a shared document's `save()` bytes matching modulo the DEFLATE stream is **not separately asserted anywhere**; `save()` equivalence is checked by loading, per `plan.md` §1. |
-| P6 document API | **done** | `doc.zig` (the document, actor table, change graph, op set, `load`/`save`/`commit`/`merge`/`applyChanges`/`fork`/`forkAt`/`clone`/`isolate`, the diff surface), `read.zig` (twenty methods, the `ReadDoc` surface), `transact.zig` (the `Transactable` bodies and the manual `Transaction`), `transaction.zig` (`CommitOptions`, `Outcome`, `enclose`, the accessors). The crate-root address-book example **compiles and passes** (3/3, 2026-10-01) — the "`src/c/sync.zig` does not compile" claim this row used to carry is false. |
+| P6 document API | **done; signatures changed this revision** | `doc.zig` (the document, actor table, change graph, op set, `load`/`save`/`commit`/`merge`/`applyChanges`/`fork`/`forkAt`/`clone`/`isolate`, the diff surface, the bundle and fragment surface), `read.zig` (the whole `ReadDoc` surface — the unsuffixed readers, the eleven `_at` readers, `iter`/`iterAt`, the three cursor readers and `getCursorPositionFor`), `transact.zig` (the `Transactable` bodies and the manual `Transaction`), `transaction.zig` (`CommitOptions`, `Success`/`Failure`/`Outcome`, `enclose`/`encloseWith`, the accessors). **This row said "`read.zig` (twenty methods)"; that count was a snapshot and is not maintained** — the list of names is in `API.md` §Read, which is the thing to read. The crate-root address-book example **compiled and passed** (3/3, measured 2026-10-01) — the "`src/c/sync.zig` does not compile" claim this row used to carry is false. **Every constructor on this surface now takes a borrowed `std.Io`**, which is a signature change across the whole row and the reason every count in *Test state* is dated rather than current. |
 | P7 iteration | **done; gate clause re-measured 2026-10-01 and met bar two named cases** | `sequence_tree.zig` and all six of upstream's iterators: `iter/tools.zig` (`Unshift`, `PeekShift`, `SkipIter`, `Diff`, `DiffKernel`, `Shiftable`), `iter/map_range.zig`, `iter/list_range.zig`, `iter/spans.zig`, `iter/keys.zig`, `iter/values.zig`, `iter/doc.zig` (`ObjIdIter`, `DiffIter`) and `iter/slice.zig`. The claim that "one of the ported text tests fails" is **false**: the library suite is **1469 passed, 1 skipped, 0 failed**. **This row said the gate's other clause was not met, on a name-presence count of 8 for `tests/text.rs` and 10 for `tests/text_encoding.rs`, and that count was wrong** — it is the same instrument this file has already retracted once, and the port renames every ported case into English. Verified case by case against both upstream files: **all 21 `text.rs` cases and all 15 `text_encoding.rs` cases are in the tree**, and the instrument that settles it is that case-by-case comparison rather than any name match. **34 of the 36 run under all four `TextEncoding`s**, so the gate's "the 15 tests each run under 4 encodings" holds for 34, and the two exceptions are named: `empty_marks_before_block_marker_dont_repeat_text` (`text.rs:321-348`) and the `marks_are_okay` proptest driver (`text.rs:658-710`). **Both build their model in ASCII-plus-`'\n'`, and a block marker is three units wide under `utf8_code_unit`** — upstream measures every non-`Set(Str)` action as `text_encoding.width("\u{fffc}")` (`op_set2/op_set.rs:443-447`) — so a `'\n'`-wide model does not describe that document. `src/read.zig:7971-7981` is the port's own record of the same two. |
 | P8 sync | **done, measured 2026-10-01** | `sync/bloom.zig`, `sync/message.zig`, `sync/state.zig`, `sync/protocol.zig` and `sync/v1.zig`: the message codec, the peer state, the document-side state machine and the frozen v1 path. The gate's third clause names "the five round-trip tests from `sync/v1_compat_test/`"; upstream has **three** (`src/sync/v1_compat_test/mod.rs:473`, `:496`, `:519` — `bloom.rs` and `state.rs` declare none), and the directory is **907** lines as the plan says. The port's `src/sync/v1.zig` carries 9 tests, covering both directions and a v1-only peer. |
 | P9 patches, marks, cursors, text diff, hydrate | **done; gate met** | `marks.zig`, `textdiff.rs` (the vendored Myers diff, byte-identical to upstream's), `patches.zig` (all nine `PatchAction` variants, the expose queue's ordering asserted as a property), `cursor.zig` (the v1 codec pinned as literal bytes in both directions, plus the legacy v0 parser), `hydrate.zig` (the round trip), and both `anonymize.zig` and `autoserde.zig`. **Both named files are ported: `tests/diff_marks.rs` 36 of 36** (`src/marks.zig`, one `test "diff_marks: …"` block per upstream case, all green) **and `tests/test_mark_patches.rs` 1 of 1** (`test/mark_patches_test.zig`, wired). The hydrate clause holds. **This row said "partly met, the weakest gate in the plan" until 2026-10-01, on a name-presence count of 12/36 that was measuring the wrong thing — the port renames every case into English.** **The hydrate dispatch arms are now measured, and the measurement is what closed the defect `plan.md` §1.1a records.** That section had one mutation: three tests all hydrating `.root`, a root is a map, so the `text` and `list` arms were never reached, and rewriting the `.text` arm to build an empty string left all three green. **It is now a sweep — 25 mutations applied at once, one per candidate arm, over the whole suite reachable from `src/hydrate.zig` — and 23 of the 25 arms were invisible to the entire tree while 2 were detected.** What closed it is the **nine tests now covering the uncovered arms**. `plan.md` §1.1a still carries the single-mutation account and has not been amended. |
-| P10 C ABI | **done, measured 2026-10-01** | `include/automerge.h`, `src/c/result.zig`, `src/c/doc.zig`, `src/c/sync.zig`. `zig build ctest` is **5/5 steps, 153 cmocka cases, 0 failed**: 136 of the cases are upstream's own (`test/c/suite/` is a verbatim copy of `rust/automerge-c/test/`, re-verified file-by-file on 2026-10-01) and 17 are this port's `abi_coverage.c`. The gate's "21 cmocka files" is not a measurable count — upstream's directory holds **19** `.c` files, 5 headers, one data file and `CMakeLists.txt`. |
-| bundle engine | **done, and the two halves are not the same claim** | **The bundle chunk codec works and is proved against the reference.** `storage/bundle.zig` carries **9** test blocks, among them `a bundle the reference wrote reads field by field, at literal offsets` (`src/storage/bundle.zig:2553`) and `a written bundle is byte for byte the bundle the reference wrote` (`:2869`), and the file is in the library suite through `src/root.zig:172`. **The fragment API that produces bundle chunks for an incremental load does not exist.** There is no `Fragment`, `fragments()`, `get_fragment()`, `cache_fragment()`, `loose_commit()` or `bfs_until_clock()` anywhere in `src/`, where upstream declares `get_fragment` (`change_graph.rs:585`), `fragments` (`:614`) and `pub struct Fragment` (`:1768`), so **10 of upstream's 12 `change_graph.rs` `#[test]`s (`change_graph.rs:1229-1642`) are missing code rather than missing tests** — the two that are not fragment cases are `clock_by_heads` (`:1072`) and `remove_ancestors` (`:1094`). **`Automerge::bundle(hashes)` (`automerge.rs:1141`) is absent**, so `loadIncremental` refuses a bundle chunk: `src/doc.zig:3972` is `.bundle => return error.Unsupported`. `API.md` §Known gaps item 6 records the absence, and `src/change_graph.zig:1997` is the row that records the missing fragment surface. |
+| P10 C ABI | **current API-design evidence above** | `include/automerge.h`, production root `src/c/root.zig`, separate ABI check `test/c/cabi.zig`, and the C result/document/sync modules. The historical run passed 153 cmocka cases. The current guard reflects 187 physical function signatures, 37 enum names across five enums, and five exposed struct layouts. `AMbyteSpan` and `AMitems` cross by value. `zig build` installs `libzautomerge.a` and `automerge.h`. The suite links that artifact, not the check library. |
+| bundle engine | **done, and the two halves are now both present** | **The bundle chunk codec works and is proved against the reference.** `storage/bundle.zig` carries **9** test blocks, among them `a bundle the reference wrote reads field by field, at literal offsets` and `a written bundle is byte for byte the bundle the reference wrote`, and the file is in the library suite through `src/root.zig`'s test block. **This row said the fragment API did not exist; it does.** `Fragment` is `src/change_graph.zig`'s, and the document surface `Document.bundle(gpa, hashes)`, `Document.fragments(gpa, levels)`, `Document.getFragment(gpa, head)` and `Document.bundleFragments(gpa, wanted)` are all declared, alongside the graph's own `cacheFragment` and `looseCommit`. `Automerge::get_fragment` / `Automerge::fragments` / `Automerge::bundle_fragments` are ported. |
 
 ## The API contract
 
 `API.md` is the target public surface. It was audited against the tree on
-2026-09-30 and **re-measured against both trees on 2026-10-01**. Its
+2026-09-30, re-measured against both trees on 2026-10-01, and **re-audited for
+this revision**. Its
 [audit table](../API.md#audit-every-declaration-in-this-file-against-the-port)
 records, for every declaration, whether it is present, renamed, absent or
-deliberately different, with the file and line it lives on. The short version of
+deliberately different. **The Location column is now symbol-based, not a line
+number** — four separate re-measurements found the numeric locators stale
+because the port grew under them, and a locator that must be re-derived every
+release is not a locator. Rust citations keep their `path:line` form, because
+the reference checkout is pinned and read-only. The short version of
 what the audit found:
 
 - `Automerge::diff` and its five siblings were missing from `API.md` entirely,
@@ -315,22 +410,30 @@ what the audit found:
   well as against the port.
 - `split` matched nothing at all, upstream or here; `rollback` is a
   transaction's method upstream and here, not a document's; `bundle` upstream
-  takes a hash list and there is no document-level one.
+  takes a hash list and **there is now a document-level one** —
+  `Document.bundle(gpa, hashes)`. **That sentence was correct when written and
+  is wrong now**: the method was added to the tree and this file kept the old
+  verdict.
 
 - **Re-measured 2026-10-01, three more declarations wrong against the Rust, not
   only against the port.** `parents` was declared as
   `pub fn parents(doc, obj) Parents` — upstream `read.rs:35` returns a
-  `Result<Parents<'_>, AutomergeError>` and the port's own `src/read.zig:1102`
+  `Result<Parents<'_>, AutomergeError>` and the port's own `read.parents`
   returns `ReadError!Parents`, so the contract dropped an error union that
   *both* implementations have. §Write's "twenty … one for one" counts
   **twenty-one** declarations against upstream's **twenty** methods, and
   `mark` / `unmark` do not match `transactable.rs:103-117` in arity or order.
   All three are fixed in `API.md` with the upstream `path:line` beside them.
-- **149 of the 184 `// path:line` citations in `API.md` and 72 of its audit
-  table's Location cells had drifted** — the port grew after the audit
-  (`doc.zig` by up to +1061 lines). Every one has been re-derived by matching
-  the declared name *and* the parameter and return types, and `184/184` now
-  land on the declaration they name.
+- **The numeric locators are gone rather than refreshed.** `API.md` cited
+  `path:line` into this repository in 184 places, and 149 of them were wrong at
+  the 2026-10-01 re-measurement. This revision replaces every one with the
+  declaration's symbol, so there is no count of correct line citations left to
+  keep in step.
+- **Three known gaps were closed in the tree while the gap list still carried
+  them** — `read.iter` / `read.iterAt`, `Document.getAuthors`, and
+  `Document.bundle` with the fragment API beside it. **A gap the tree has
+  already answered is a defect in the contract**, because the alternative is a
+  caller declining to use a declaration that is sitting right there.
 
 ## The slab merge budget, and why the previous account of it was wrong
 
@@ -695,7 +798,7 @@ answer looks right — but these are open, not closed.
    The `gpa` shadowing at `src/c/sync.zig:197` is gone; the file compiles.
    The reason it is kept here rather than deleted is the way it hid, which is
    the transferable part: the library test block keeps most of `src/c/**` out
-   (`src/root.zig:222-226`) because those files are `extern "C"` over libc, so
+   (`src/root.zig`'s test block) because those files are `extern "C"` over libc, so
    the library suite could not have seen it, and the one test that *does* pull
    the module in is a single example file. **A file excluded from the main
    suite has exactly one other place it can fail, and it should not be the
@@ -881,7 +984,7 @@ a cursor naming a row of another object where it used to answer
 `.ok_or_else(|| InvalidCursor(cursor.clone()))` on the seek's empty answer
 (`automerge.rs:1778-1781`) and is what the same cursor already answered with a
 clock. The one thing that did need building is
-`Document.clockAtScope` (`src/doc.zig:5477`), upstream's `Automerge::clock_at`
+`Document.clockAtScope` (`src/doc.zig`), upstream's `Automerge::clock_at`
 (`automerge.rs:1236-1247`): the unsuffixed readers resolve their clock through
 `readScope`, which reads the **isolation's** heads, and six of the new readers
 hand a walk back — and a walk copies the `Clock` by value and borrows only its
@@ -1023,12 +1126,16 @@ relative prefix produces a relative entry that is just as cwd-dependent as the
 environment variable was. The pair is: **absolutise `cmocka_prefix` once**
 (`b.pathFromRoot(prefix)`, public but documented as low-level) before it reaches
 `addIncludePath`/`addLibraryPath`, **and** set `each_lib_rpath`. **Done, both
-halves**: `build.zig:539` takes `b.pathFromRoot(prefix)` unless
-`std.fs.path.isAbsolute(prefix)` is true, and `build.zig:612` sets
-`ctest_bin.each_lib_rpath = true`. Six lines in `build.zig`, no test changes,
-and it deletes a requirement from the invoker: the `LD_LIBRARY_PATH` export
-described above is obsolete, the prefix is all the step takes, and a relative
-`-Dcmocka-prefix=../cmocka-prefix` now works.
+halves**: `build.zig` takes `b.pathFromRoot(prefix)` unless
+`std.fs.path.isAbsolute(prefix)` is true, and sets
+`ctest_bin.each_lib_rpath = true`. No test changes, and it deletes a requirement
+from the invoker: the `LD_LIBRARY_PATH` export described above is obsolete, the
+prefix is all the step takes, and a relative `-Dcmocka-prefix=../cmocka-prefix`
+now works. **The `each_lib_rpath` line is a stated requirement rather than a
+measured fix**: `readelf -d` reports the same RUNPATH with it set and unset on
+this toolchain, because the linker already copies every `-L` directory into the
+RUNPATH by itself. It is there so that if a future toolchain changes that
+default, this is the line that says not to.
 
 ### 5. Gates measured, and one environment note
 

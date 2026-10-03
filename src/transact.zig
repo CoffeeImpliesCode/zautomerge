@@ -67,6 +67,15 @@
 //! refusal rather than a trap because Rust's answer was a compile error and the
 //! closest honest runtime answer is an error, not a silent success.
 //!
+//! Native automatic refusal retains published or queued work in
+//! `Document.auto_recovery` without allocating. A validation refusal with no
+//! pending producer or rollback work disposes only the empty transaction;
+//! valid unused actor metadata remains owned by the document. The primary error
+//! is returned unchanged. Retained rollback is explicit through
+//! `Document.recoverAuto` or retried before the next native automatic write.
+//! Until recovery succeeds, held/manual entry is refused and retained operations
+//! cannot be committed.
+//!
 //! [`Mode.auto`]: doc.zig
 //! [`Mode.manual`]: doc.zig
 //!
@@ -326,11 +335,14 @@ pub const Inserted = struct {
 /// ([`inner.rs:25-26`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs));
 /// [`commit`] takes an override for each, which is upstream's
 /// `commit_impl`'s `if message.is_some()` / `if let Some(t)` (`:152-158`).
+/// A producer refusal after publication or batch queuing makes the transaction
+/// rollback-only. Commit allocation refusal alone remains open for commit retry.
 pub const Transaction = struct {
     /// The allocator every owned buffer in this transaction belongs to, which
     /// is the document's.
     gpa: Allocator,
-    /// The document being written. Every write goes through it.
+    /// Borrowed document. Keep it at this address until transaction disposal;
+    /// do not mutate it through another transaction or write entry point.
     doc: *Document,
     /// The actor this transaction creates operations for
     /// ([`inner.rs:23`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)).
@@ -340,23 +352,23 @@ pub const Transaction = struct {
     /// The counter of the change's first operation. **Global, not per actor**
     /// ([`automerge.rs:566-567`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
     start_op: u64,
-    /// The change's dependencies, owned here and sorted
-    /// ([`inner.rs:30`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs),
-    /// `deps.sort_unstable()` at `:198`).
+    /// Owned, sorted dependency hashes, independent of the document's heads.
+    /// Moved from `TransactionArgs`; freed by `deinit` (`inner.rs:30,198`).
     deps: []ChangeHash,
     /// The heads this transaction reads at, **borrowed**. Null is an unscoped
     /// read of the present document, which is what takes the indexed fast
     /// paths ([`op_set.rs:569-576`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)).
+    /// Native automatic recovery rebinds this borrow to its own owned `deps`
+    /// before the wrapper returns, so releasing isolation does not invalidate it.
     scope_heads: ?[]const ChangeHash,
     /// The clock over `scope_heads`, built on first use and null until then.
     scope: ?Clock,
     /// Whether `scope` has been decided, which is not the same as being null.
     scope_built: bool,
-    /// The operations this transaction has made, in order. Their ids are the
-    /// contiguous run `start_op .. start_op + pending.len()`
-    /// ([`inner.rs:295-297`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)).
+    /// Owned operation undo records in insertion order. Commit drains them;
+    /// rollback removes and disposes each successfully undone record.
     pending: std.ArrayList(Pending),
-    /// The commit message, or null. Overridden by [`commit`]'s argument.
+    /// Borrowed commit message; keep bytes live until commit returns.
     message: ?[]const u8 = null,
     /// The commit time. Upstream's default is zero, not "now"
     /// ([`inner.rs:68-91`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)).
@@ -366,10 +378,13 @@ pub const Transaction = struct {
     /// ([`manual_transaction.rs:135-145`](../../github-automerge-automerge/rust/automerge/src/transaction/manual_transaction.rs)),
     /// and a second application of either is a bug here rather than a no-op.
     closed: bool = false,
-    /// The bytes [`textFor`] handed out, freed by [`deinit`]. The diff hook
-    /// takes a `textFor` that stays valid for the call
-    /// ([textdiff.zig:733-734](textdiff.zig)) and has no way to be told when the
-    /// call is over, so the transaction keeps it.
+    /// Rollback-only after partial production or a rollback attempt. No further
+    /// writes or commit are permitted.
+    rolling_back: bool = false,
+    /// Number of operations already undone, retained across rollback retries.
+    cancelled: usize = 0,
+    /// Owned `textFor` cache. A successful next `textFor` call replaces it;
+    /// a failed call preserves it. `deinit` frees the last buffer.
     text_cache: ?[]u8 = null,
     /// The bytes a queued operation's value borrows, freed by [`deinit`].
     ///
@@ -461,6 +476,7 @@ pub const Transaction = struct {
     /// `error.InvalidOp` for a document in autocommit mode: upstream's
     /// `Transaction::new` takes an `Automerge`, so the two flavours cannot be
     /// confused, and here they can.
+    /// Pending native automatic recovery also refuses entry with `error.InvalidOp`.
     pub fn open(gpa: Allocator, doc: *Document) WriteError!Transaction {
         if (doc.documentMode() != .manual) return error.InvalidOp;
         const args = try doc.transactionArgs(gpa, null);
@@ -472,6 +488,7 @@ pub const Transaction = struct {
     ///
     /// **`heads` is borrowed** and must outlive the transaction: the scope
     /// clock is built from it on first use, which may be after this returns.
+    /// Pending native automatic recovery refuses entry with `error.InvalidOp`.
     pub fn openAt(gpa: Allocator, doc: *Document, heads: ?[]const ChangeHash) WriteError!Transaction {
         if (doc.documentMode() != .manual) return error.InvalidOp;
         const args = try doc.transactionArgs(gpa, heads);
@@ -517,9 +534,9 @@ pub const Transaction = struct {
     /// difference between a read here and a read through the document.
     pub fn scopeClock(self: *Transaction) WriteError!?Clock {
         if (!self.scope_built) {
-            self.scope_built = true;
             if (self.scope_heads) |heads| {
                 var clock = try self.doc.graph.clockAt(self.gpa, heads);
+                errdefer clock.deinit();
                 // **`clock.isolate(actor_index)`**
                 // ([`automerge.rs:1266`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
                 // and it is load-bearing rather than tidying. Upstream builds
@@ -539,6 +556,7 @@ pub const Transaction = struct {
                 try clock.isolate(self.actor);
                 self.scope = clock;
             }
+            self.scope_built = true;
         }
         return self.scope;
     }
@@ -560,6 +578,7 @@ pub const Transaction = struct {
     /// them in the wrong object, so the resolution is not only a lookup: it is
     /// what the write is anchored to.
     fn exidToObj(self: *Transaction, id: ExId) WriteError!ObjMeta {
+        try self.requireOpen();
         const live = self.doc.resolve(id) orelse return error.NotAnObject;
         const obj = ObjMeta{ .id = live, .typ = try self.doc.objectType(live) };
         const oid = live.opId() orelse return obj; // the root is always in scope
@@ -597,7 +616,8 @@ pub const Transaction = struct {
     /// on an op id the document already holds — the same collision that a
     /// `max_op` of zero produces.
     fn requireOpen(self: *const Transaction) WriteError!void {
-        if (self.closed) return error.InvalidOp;
+        if (self.closed or self.rolling_back or self.doc.auto_recovery != null)
+            return error.InvalidOp;
     }
 
     // ── Producing an operation ───────────────────────────────────────────
@@ -617,26 +637,28 @@ pub const Transaction = struct {
     ) WriteError!void {
         try self.requireOpen();
         var op = tx;
-        errdefer op.deinit(self.gpa);
+        var transferred = false;
+        errdefer if (!transferred) op.deinit(self.gpa);
         if (self.start_op + self.pending.items.len > std.math.maxInt(u32)) return error.Overflow;
 
         var change = try changeOpOf(self.gpa, &op);
-        errdefer change.deinit(self.gpa);
-
+        errdefer if (!transferred) change.deinit(self.gpa);
+        try self.pending.ensureUnusedCapacity(self.gpa, 1);
         const added = try self.doc.ops.splice(op.pos, &.{change});
-        op.undo = std.ArrayList(SuccUndo).fromOwnedSlice(
-            try self.doc.ops.addSuccWithUndo(succ),
-        );
-        // `inner.rs:321-324` — only a scoped transaction, and only because its
-        // operations land outside the clock its own reads see through.
+        // Publication transfers undo ownership before any successor or index
+        // mutation can refuse. A partially produced operation is rollback-only.
+        self.pending.appendAssumeCapacity(.{ .tx = op, .op = change });
+        transferred = true;
+        errdefer self.rolling_back = true;
+        const retained = &self.pending.items[self.pending.items.len - 1].tx;
+        try self.doc.ops.addSuccWithUndo(succ, &retained.undo);
         if (self.scope_heads != null) {
+            retained.reset_range = .{ .start = range.start, .end = range.end };
             try self.doc.ops.resetTop(.{
                 .start = range.start,
                 .end = range.end + added,
             });
-            op.reset_range = .{ .start = range.start, .end = range.end };
         }
-        try self.pending.append(self.gpa, .{ .tx = op, .op = change });
     }
 
     /// An operation on a map key ([`local_map_op`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):446-493).
@@ -678,10 +700,10 @@ pub const Transaction = struct {
             query.range,
             query.end_pos,
         );
-        const tx = try TxOp.map(self.gpa, id, obj, pos, resolved, key, pred);
-        const inc = tx.getIncrementValue();
         const succ = try self.gpa.alloc(SuccInsert, query.ops.items.len);
         defer self.gpa.free(succ);
+        const tx = try TxOp.map(self.gpa, id, obj, pos, resolved, key, pred);
+        const inc = tx.getIncrementValue();
         for (query.ops.items, succ) |row, *slot| slot.* = row.addSucc(id, inc);
 
         try self.insertLocalOp(tx, succ, query.range);
@@ -802,6 +824,8 @@ pub const Transaction = struct {
         defer self.gpa.free(pred);
         for (query.ops.items, pred) |row, *slot| slot.* = row.id();
 
+        const succ = try self.gpa.alloc(SuccInsert, query.ops.items.len);
+        defer self.gpa.free(succ);
         const tx = try TxOp.list(
             self.gpa,
             id,
@@ -813,8 +837,6 @@ pub const Transaction = struct {
             pred,
         );
         const inc = tx.getIncrementValue();
-        const succ = try self.gpa.alloc(SuccInsert, query.ops.items.len);
-        defer self.gpa.free(succ);
         for (query.ops.items, succ) |row, *slot| slot.* = row.addSucc(id, inc);
 
         try self.insertLocalOp(tx, succ, query.range);
@@ -1087,14 +1109,18 @@ pub const Transaction = struct {
             elem,
             &.{found.op.id()},
         );
-        errdefer op.deinit(self.gpa);
+        var transferred = false;
+        errdefer if (!transferred) op.deinit(self.gpa);
         const succ = [_]SuccInsert{found.op.addSucc(id, null)};
-        op.undo = std.ArrayList(SuccUndo).fromOwnedSlice(
-            try self.doc.ops.addSuccWithUndo(&succ),
-        );
         var change = try changeOpOf(self.gpa, &op);
-        errdefer change.deinit(self.gpa);
+        errdefer if (!transferred) change.deinit(self.gpa);
         try self.pending.append(self.gpa, .{ .tx = op, .op = change });
+        transferred = true;
+        errdefer self.rolling_back = true;
+        try self.doc.ops.addSuccWithUndo(
+            &succ,
+            &self.pending.items[self.pending.items.len - 1].tx.undo,
+        );
     }
 
     /// Replaces the block at `index` with a fresh empty one
@@ -1165,9 +1191,9 @@ pub const Transaction = struct {
     /// Removes a mark over `[from, to)`
     /// ([`unmark`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):879-891).
     ///
-    /// **An unmark is a mark whose value is null**, and that is the whole
-    /// difference. Upstream's signature has no value parameter; `API.md`'s
-    /// does, and null is upstream's `Mark::new(name, ScalarValue::Null, ..)`.
+    /// Null removes the named mark (`inner.rs:879-891`). A non-null value is
+    /// forwarded to `mark` and applies that value instead; this port retains
+    /// the value parameter required by `API.md`.
     pub fn unmark(
         self: *Transaction,
         obj: ExId,
@@ -1275,18 +1301,21 @@ pub const Transaction = struct {
         defer self.gpa.free(pred);
         for (rows, pred) |row, *slot| slot.* = row.id();
 
-        var op = try TxOp.listDel(self.gpa, id, obj, index, elem, pred);
-        errdefer op.deinit(self.gpa);
         const succ = try self.gpa.alloc(SuccInsert, rows.len);
         defer self.gpa.free(succ);
+        var op = try TxOp.listDel(self.gpa, id, obj, index, elem, pred);
+        var transferred = false;
+        errdefer if (!transferred) op.deinit(self.gpa);
         for (rows, succ) |row, *slot| slot.* = row.addSucc(id, null);
-
-        op.undo = std.ArrayList(SuccUndo).fromOwnedSlice(
-            try self.doc.ops.addSuccWithUndo(succ),
-        );
         var change = try changeOpOf(self.gpa, &op);
-        errdefer change.deinit(self.gpa);
+        errdefer if (!transferred) change.deinit(self.gpa);
         try self.pending.append(self.gpa, .{ .tx = op, .op = change });
+        transferred = true;
+        errdefer self.rolling_back = true;
+        try self.doc.ops.addSuccWithUndo(
+            succ,
+            &self.pending.items[self.pending.items.len - 1].tx.undo,
+        );
     }
 
     /// Inserts a list of hydrated values at `pos`
@@ -1303,6 +1332,10 @@ pub const Transaction = struct {
         after: ElemId,
         values: []const hydmod.Value,
     ) WriteError!usize {
+        const pending_start = self.pending.items.len;
+        errdefer if (self.pending.items.len > pending_start) {
+            self.rolling_back = true;
+        };
         var queue: Queue = .init(self.gpa);
         defer queue.deinit();
 
@@ -1335,7 +1368,7 @@ pub const Transaction = struct {
                     elem,
                 ));
                 elem = ElemId.fromOpId(id);
-                if (made) |t| queue.push(ObjMeta{ .id = self.doc.idToExid(id), .typ = t }, value);
+                if (made) |t| try queue.push(ObjMeta{ .id = self.doc.idToExid(id), .typ = t }, value);
             }
             try batch.finish();
         }
@@ -1372,20 +1405,23 @@ pub const Transaction = struct {
     /// `message` and `time` override this transaction's own when they are not
     /// null, which is upstream's `if message.is_some()` /
     /// `if let Some(t)` at `:152-158`.
+    /// Allocation refusal from a writable transaction leaves it open for commit
+    /// retry or rollback. A partial producer refusal is instead rollback-only.
+    /// Metadata overrides apply only on success. Do not dispose an open
+    /// transaction without undoing its rows.
     pub fn commit(
         self: *Transaction,
         message: ?[]const u8,
         time: ?i64,
     ) WriteError!?ChangeHash {
         try self.requireOpen();
-        self.closed = true;
         if (self.pending.items.len == 0) {
-            if (self.seq == 1) try self.doc.removeActor(self.gpa, self.actor);
             try self.doc.removeUnusedActors(self.gpa);
+            self.closed = true;
             return null;
         }
-        self.message = message orelse self.message;
-        self.time = time orelse self.time;
+        const commit_message = message orelse self.message;
+        const commit_time = time orelse self.time;
         const ops = try self.changeOps(self.gpa);
         defer self.gpa.free(ops);
         // **The change's metadata is this transaction's, and it is handed over
@@ -1423,9 +1459,12 @@ pub const Transaction = struct {
             .deps = self.deps,
             .scope = self.scope_heads,
             .author = null,
-        }, ops, self.message, self.time);
+        }, ops, commit_message, commit_time);
         for (self.pending.items) |*item| item.deinit(self.gpa);
         self.pending.clearRetainingCapacity();
+        self.message = commit_message;
+        self.time = commit_time;
+        self.closed = true;
         return hash;
     }
 
@@ -1433,20 +1472,22 @@ pub const Transaction = struct {
     /// operations it cancelled
     /// ([`TransactionInner::rollback`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):211-227).
     ///
-    /// **In reverse order**, because a row's position only means what it means
-    /// while the rows after it are still there.
+    /// Undo runs in reverse order (`inner.rs:211-227`). On refusal, successful
+    /// undo records are already disposed and `cancelled` records progress.
+    /// Retry `rollback` to continue; writes and commit are then refused.
     pub fn rollback(self: *Transaction) WriteError!usize {
         if (self.closed) return error.InvalidOp;
-        self.closed = true;
-        const num = self.pending.items.len;
-        var i = num;
-        while (i > 0) {
-            i -= 1;
-            try self.doc.ops.undoOp(&self.pending.items[i].tx);
+        self.rolling_back = true;
+        while (self.pending.items.len != 0) {
+            const last = self.pending.items.len - 1;
+            try self.doc.ops.undoOp(&self.pending.items[last].tx);
+            var item = self.pending.pop().?;
+            item.deinit(self.gpa);
+            self.cancelled += 1;
         }
-        if (self.seq == 1) try self.doc.removeActor(self.gpa, self.actor);
         try self.doc.removeUnusedActors(self.gpa);
-        return num;
+        self.closed = true;
+        return self.cancelled;
     }
 
     // ── The read side ──────────────────────────────────────────────────
@@ -1549,8 +1590,8 @@ pub const Transaction = struct {
 
     /// [`textdiff.Sink`]'s `textFor` ([`doc.text_for`](../../github-automerge-automerge/rust/automerge/src/text_diff.rs):22).
     ///
-    /// **The bytes belong to the transaction** and are freed by [`deinit`],
-    /// because the hook is given no way to say when the call is over.
+    /// Borrowed bytes remain valid until the next successful `textFor` or
+    /// `deinit`. Failure preserves the previous buffer. Do not free the slice.
     ///
     /// **The scope clock is the transaction's** — `doc.text_for(text_obj,
     /// tx.get_scope().clone())` (`:22`) — so an isolated transaction diffs
@@ -1560,9 +1601,9 @@ pub const Transaction = struct {
     /// id it is handed, so a stale index would read no rows at all and the diff
     /// would see an empty old text and re-insert everything.
     pub fn textFor(self: *Transaction, obj: ExId) WriteError![]const u8 {
-        if (self.text_cache) |bytes| self.gpa.free(bytes);
         const live = self.doc.resolve(obj) orelse return error.NotAnObject;
         const bytes = try self.doc.ops.text(self.gpa, live, try self.scopeClock());
+        if (self.text_cache) |previous| self.gpa.free(previous);
         self.text_cache = bytes;
         return bytes;
     }
@@ -1933,10 +1974,11 @@ pub const Transaction = struct {
             .key => (try self.localOp(meta, prop, .{ .make = root_type })) orelse
                 return error.Invariant,
         };
+        errdefer self.rolling_back = true;
 
         var queue: Queue = .init(self.gpa);
         defer queue.deinit();
-        queue.push(ObjMeta{ .id = self.doc.idToExid(id), .typ = root_type }, &value);
+        try queue.push(ObjMeta{ .id = self.doc.idToExid(id), .typ = root_type }, &value);
         var batch = Batch.init(self, self.doc.ops.len());
         try batch.bfs(&queue);
         try batch.finish();
@@ -1950,6 +1992,11 @@ pub const Transaction = struct {
     /// is what makes the operation ids — and so the change hash — the same on
     /// every run over the same value.
     pub fn initRootFromHydrate(self: *Transaction, value: *const hydmod.Map) WriteError!void {
+        try self.requireOpen();
+        const pending_start = self.pending.items.len;
+        errdefer if (self.pending.items.len > pending_start) {
+            self.rolling_back = true;
+        };
         const root = ObjMeta.root();
         var batch = Batch.init(self, self.doc.ops.len());
         var queue: Queue = .init(self.gpa);
@@ -1970,7 +2017,7 @@ pub const Transaction = struct {
                 .{ .put = child.toScalar() orelse return error.NotAnObject };
             const id = try batch.appendRoot(root, key, action);
             if (made) |t| {
-                queue.push(ObjMeta{ .id = self.doc.idToExid(id), .typ = t }, child);
+                try queue.push(ObjMeta{ .id = self.doc.idToExid(id), .typ = t }, child);
             }
         }
         try batch.bfs(&queue);
@@ -2414,10 +2461,9 @@ const Queue = struct {
         return self.items.items.len;
     }
 
-    fn push(self: *Queue, container: ObjMeta, value: *const hydmod.Value) void {
-        // The caller's value outlives the queue, so a pointer to it is the
-        // whole of the entry; upstream's is a borrow too.
-        self.items.append(self.gpa, .{ .container = container, .value = value }) catch return;
+    fn push(self: *Queue, container: ObjMeta, value: *const hydmod.Value) Allocator.Error!void {
+        // The caller's value outlives the queue.
+        try self.items.append(self.gpa, .{ .container = container, .value = value });
     }
 
     fn next(self: *Queue) ?Entry {
@@ -2460,8 +2506,12 @@ const Batch = struct {
     /// Queues `op` without writing it
     /// ([`BatchInsertion::append`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):1464-1471).
     fn append(self: *Batch, op: TxOp) WriteError!OpId {
+        errdefer if (self.tx.pending.items.len > self.start) {
+            self.tx.rolling_back = true;
+        };
         var tx_op = op;
         errdefer tx_op.deinit(self.tx.gpa);
+        try self.tx.requireOpen();
         const id = tx_op.id();
         var change = try changeOpOf(self.tx.gpa, &tx_op);
         errdefer change.deinit(self.tx.gpa);
@@ -2509,6 +2559,9 @@ const Batch = struct {
     /// transaction commits, and the value column reads these units again at
     /// that point.
     fn spliceText(self: *Batch, container: ObjMeta, after: ElemId, text: []const u8) WriteError!usize {
+        errdefer if (self.tx.pending.items.len > self.start) {
+            self.tx.rolling_back = true;
+        };
         const units = try textUnits(self.tx.gpa, text, self.tx.doc.textEncoding());
         defer self.tx.gpa.free(units);
         var inserted_width: usize = 0;
@@ -2533,6 +2586,9 @@ const Batch = struct {
     /// The breadth-first walk over nested values
     /// ([`batch_bfs`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):1539-1603).
     fn bfs(self: *Batch, queue: *Queue) WriteError!void {
+        errdefer if (self.tx.pending.items.len > self.start) {
+            self.tx.rolling_back = true;
+        };
         while (queue.next()) |entry| {
             const container = entry.container;
             switch (entry.value.*) {
@@ -2551,7 +2607,7 @@ const Batch = struct {
                             else
                                 .{ .put = child.toScalar() orelse return error.NotAnObject };
                             const id = try self.appendRoot(container, key, action);
-                            if (made) |t| queue.push(
+                            if (made) |t| try queue.push(
                                 ObjMeta{ .id = self.tx.doc.idToExid(id), .typ = t },
                                 child,
                             );
@@ -2578,7 +2634,7 @@ const Batch = struct {
                                 elem,
                             ));
                             elem = ElemId.fromOpId(id);
-                            if (made) |t| queue.push(
+                            if (made) |t| try queue.push(
                                 ObjMeta{ .id = self.tx.doc.idToExid(id), .typ = t },
                                 item,
                             );
@@ -2599,6 +2655,9 @@ const Batch = struct {
     /// [`OpSet.splice`](opset/op_set.zig), which is
     /// [`BatchInsertion::finish`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):1514-1519.
     fn finish(self: Batch) WriteError!void {
+        errdefer if (self.tx.pending.items.len > self.start) {
+            self.tx.rolling_back = true;
+        };
         const queued = self.tx.pending.items[self.start..];
         if (queued.len == 0) return;
         const ops = try self.tx.gpa.alloc(ChangeOp, queued.len);
@@ -2618,8 +2677,24 @@ const Batch = struct {
 /// checked where the caller walks through it. `error.InvalidOp` is
 /// [`Error`]'s word for "this operation does not belong here", and it is the
 /// closest honest runtime answer to a compile error.
-fn requireAuto(doc: *const Document) Error!void {
+fn requireAuto(doc: *Document) Error!void {
     if (doc.documentMode() != .auto) return error.InvalidOp;
+    _ = doc.recoverAuto() catch |e| return asError(e);
+}
+
+// An automatic wrapper has no caller-held transaction to return on refusal.
+// Retain unresolved producer work without fallible rollback at this boundary.
+// Valid unused actor metadata belongs to the document, not the empty journal.
+fn finishAuto(tx: *Transaction) void {
+    if (tx.closed or (tx.pending.items.len == 0 and !tx.rolling_back)) {
+        tx.deinit();
+        return;
+    }
+    std.debug.assert(tx.doc.auto_recovery == null);
+    tx.rolling_back = true;
+    if (tx.scope_heads != null) tx.scope_heads = tx.deps;
+    tx.doc.auto_recovery = tx.*;
+    tx.* = undefined;
 }
 
 /// Opens the transaction an autocommit call works in
@@ -2647,6 +2722,8 @@ fn openAuto(gpa: Allocator, doc: *Document) WriteError!Transaction {
 /// and closing it only on `commit_with` (`:728-739`), `rollback` (`:742-751`)
 /// or a read that needs it (`:459-468`). A caller of this function owns the
 /// returned transaction and makes that choice itself.
+/// Pending native automatic recovery is refused with `error.InvalidOp`; call
+/// `Document.recoverAuto` before taking held ownership.
 pub fn openAutoHeld(gpa: Allocator, doc: *Document) WriteError!Transaction {
     return openAuto(gpa, doc);
 }
@@ -2667,7 +2744,7 @@ pub fn put(doc: *Document, obj: ExId, prop: Prop, value: ScalarValue) Error!OpId
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     const made = tx.put(obj, prop, value) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
     return made orelse OpId.root;
@@ -2679,7 +2756,7 @@ pub fn putObject(doc: *Document, obj: ExId, prop: Prop, t: ObjType) Error!ExId {
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     const id = tx.putObject(obj, prop, t) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
     return id;
@@ -2691,7 +2768,7 @@ pub fn insert(doc: *Document, obj: ExId, index: usize, value: ScalarValue) Error
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     const id = tx.insert(obj, index, value) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
     return id;
@@ -2703,7 +2780,7 @@ pub fn insertObject(doc: *Document, obj: ExId, index: usize, t: ObjType) Error!E
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     const id = tx.insertObject(obj, index, t) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
     return id;
@@ -2720,7 +2797,7 @@ pub fn increment(doc: *Document, obj: ExId, prop: Prop, by: i64) Error!void {
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     tx.increment(obj, prop, by) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
 }
@@ -2734,7 +2811,7 @@ pub fn delete(doc: *Document, obj: ExId, prop: Prop) Error!usize {
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     const n = tx.delete(obj, prop) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
     return n;
@@ -2755,7 +2832,7 @@ pub fn splice(
 ) Error!void {
     try requireAuto(doc);
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     try spliceHeld(&tx, obj, pos, del, gpa, values);
     _ = tx.commit(null, null) catch |e| return asError(e);
 }
@@ -2821,7 +2898,7 @@ pub fn spliceText(doc: *Document, obj: ExId, pos: usize, del: isize, text: []con
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     tx.spliceText(obj, pos, del, text) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
 }
@@ -2844,13 +2921,14 @@ pub fn mark(
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     tx.mark(obj, from, to, name, expand, value) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
 }
 
 /// Removes a mark over `[from, to)`, and commits
 /// ([`Transactable::unmark`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):91-101).
+/// Null removes the mark; a non-null value applies it, as `Transaction.unmark`.
 pub fn unmark(
     doc: *Document,
     obj: ExId,
@@ -2863,7 +2941,7 @@ pub fn unmark(
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     tx.unmark(obj, from, to, expand, name, value) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
 }
@@ -2874,7 +2952,7 @@ pub fn splitBlock(doc: *Document, obj: ExId, index: usize) Error!ExId {
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     const id = tx.splitBlock(obj, index) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
     return id;
@@ -2886,7 +2964,7 @@ pub fn joinBlock(doc: *Document, text: ExId, index: usize) Error!void {
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     tx.joinBlock(text, index) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
 }
@@ -2897,7 +2975,7 @@ pub fn replaceBlock(doc: *Document, text: ExId, index: usize) Error!ExId {
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     const id = tx.replaceBlock(text, index) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
     return id;
@@ -2913,7 +2991,7 @@ pub fn updateText(doc: *Document, obj: ExId, new_text: []const u8) Error!void {
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     tx.updateText(obj, new_text) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
 }
@@ -2927,7 +3005,7 @@ pub fn updateObject(doc: *Document, obj: ExId, value: hydmod.Map) Error!void {
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     tx.updateMapValue(obj, &value) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
 }
@@ -2947,7 +3025,7 @@ pub fn updateSpans(doc: *Document, obj: ExId, spans: []const Span) Error!void {
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     tx.updateSpans(obj, spans) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
 }
@@ -2973,7 +3051,7 @@ pub fn updateSpansWithConfig(
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     tx.updateSpansWithConfig(obj, config, spans) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
 }
@@ -2988,7 +3066,7 @@ pub fn batchCreateObject(doc: *Document, obj: ExId, prop: Prop, t: ObjType) Erro
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     const id = tx.batchCreateObject(obj, prop, t) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
     return id;
@@ -3011,7 +3089,7 @@ pub fn batchCreateValue(
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     const id = tx.batchCreateValue(obj, prop, value, as_insert) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
     return id;
@@ -3026,7 +3104,7 @@ pub fn initRootFromHydrate(doc: *Document, value: hydmod.Map) Error!void {
     try requireAuto(doc);
     const gpa = doc.allocator();
     var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer tx.deinit();
+    defer finishAuto(&tx);
     tx.initRootFromHydrate(&value) catch |e| return asError(e);
     _ = tx.commit(null, null) catch |e| return asError(e);
 }
@@ -3056,13 +3134,14 @@ pub fn initRootFromHydrate(doc: *Document, value: hydmod.Map) Error!void {
 /// source of truth for it — an edge's id is an operation's id, read from the
 /// same columns the row walk reads.
 ///
-/// The read is a walk of the two columns, and it is the only way the document
-/// can be asked: `Document` has no slot for an open transaction, and one is not
-/// added here.
+/// With refused native automatic work, this returns the retained journal's
+/// count without reading partially undone columns. Otherwise it walks rows
+/// and successor edges as described above.
 ///
 /// For the *transaction's own* count, which is O(1), see
 /// [`Transaction.count`].
 pub fn pendingOps(doc: *const Document) usize {
+    if (doc.auto_recovery) |*tx| return tx.count();
     const highest = doc.graph.maxOp();
     const rows: usize = doc.ops.len();
     var n: usize = 0;
@@ -3114,7 +3193,7 @@ fn freshDoc(gpa: Allocator) !Document {
 /// here:** every module function refuses a `.manual` document and
 /// [`Transaction.open`] refuses a `.auto` one, so a fixture has to name it.
 fn freshDocIn(gpa: Allocator, mode: docmod.Mode) !Document {
-    var doc = try Document.init(gpa, mode);
+    var doc = try Document.init(gpa, std.testing.io, mode);
     doc.setActorId(.{ .bytes = "0123456789abcdef" });
     return doc;
 }
@@ -4070,7 +4149,7 @@ test "an empty document and a non-object target are refusals, not traps" {
 
 test "the wrong door is an error: the module functions want autocommit and a transaction wants manual" {
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, std.testing.io, .manual);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = "0123456789abcdef" });
 
@@ -4557,7 +4636,7 @@ test "updateSpans brings a text object's spans and marks in line" {
 /// same state by different doors have to be different actors, or the second
 /// one would answer "already have it".
 fn docWithActor(gpa: Allocator, actor: []const u8) !Document {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = actor });
     return doc;
@@ -4891,3 +4970,357 @@ test "a list insert lands where the sequence order says, not where the write hap
 //   the same changes applied through the apply path, **and reads the five
 //   values back in the order they were asked for** — the row order alone would
 //   not say where the two insertions went.
+
+test "commit allocation refusals preserve rollback and recorded history" {
+    var reached_success = false;
+    for (0..256) |offset| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var doc = try Document.init(gpa, testing.io, .manual);
+        defer doc.deinit();
+        doc.setActorId(types.ActorId.init("rollback-regression"));
+        {
+            var first = try Transaction.open(gpa, &doc);
+            defer first.deinit();
+            _ = try first.put(.root, .{ .key = "baseline" }, .{ .int = 7 });
+            _ = try first.commit(null, null);
+        }
+        try doc.updateDiffCursor();
+        var tx = try Transaction.open(gpa, &doc);
+        defer tx.deinit();
+        _ = try tx.put(.root, .{ .key = "uncommitted" }, .{ .int = 42 });
+        failing.fail_index = failing.alloc_index + offset;
+        const hash = tx.commit("refused", 9) catch |commit_error| {
+            failing.fail_index = std.math.maxInt(usize);
+            try testing.expectEqual(error.OutOfMemory, commit_error);
+            try testing.expect(!tx.closed);
+            try testing.expectEqual(@as(usize, 1), doc.graph.len());
+            try testing.expectEqual(@as(usize, 1), try tx.rollback());
+            try testing.expect((try readmod.get(&doc, .root, .{ .key = "uncommitted" })) == null);
+            try testing.expectEqual(@as(i64, 7), (try readmod.get(&doc, .root, .{ .key = "baseline" })).?.value.scalar.int);
+            var patches = try doc.diffIncremental(gpa);
+            defer patches.deinit();
+            try testing.expectEqual(@as(usize, 0), patches.len());
+            continue;
+        };
+        failing.fail_index = std.math.maxInt(usize);
+        try testing.expect(hash != null);
+        try testing.expectEqual(@as(usize, 2), doc.graph.len());
+        reached_success = true;
+        break;
+    }
+    try testing.expect(reached_success);
+}
+
+test "textFor refusal preserves the previous borrowed buffer" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var doc = try Document.init(gpa, testing.io, .manual);
+    defer doc.deinit();
+    var tx = try Transaction.open(gpa, &doc);
+    defer tx.deinit();
+    const obj = try tx.putObject(.root, .{ .key = "text" }, .text);
+    try tx.spliceText(obj, 0, 0, "hello");
+    const before = try tx.textFor(obj);
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, tx.textFor(obj));
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqualStrings("hello", before);
+    _ = try tx.rollback();
+}
+
+test "native validation refusal without recovery work leaves reads and writes available" {
+    // Reject a scalar write into committed text before producer publication.
+    // The refusal must not turn an unchanged document into recovery-only state.
+    const gpa = testing.allocator;
+    var doc = try freshDoc(gpa);
+    defer doc.deinit();
+    const text = try putObject(&doc, .root, .{ .key = "text" }, .text);
+    try spliceText(&doc, text, 0, 0, "original");
+    const rows = doc.ops.len();
+    const changes = doc.graph.len();
+    const max_op = doc.graph.maxOp();
+
+    try testing.expectError(error.InvalidOp, put(&doc, text, .{ .key = "scalar" }, .{ .int = 7 }));
+    const unchanged = try readmod.text(&doc, text, gpa);
+    defer gpa.free(unchanged);
+    try testing.expectEqualStrings("original", unchanged);
+    try testing.expect(doc.auto_recovery == null);
+    try testing.expectEqual(@as(usize, 0), pendingOps(&doc));
+    try testing.expectEqual(rows, doc.ops.len());
+    try testing.expectEqual(changes, doc.graph.len());
+    try testing.expectEqual(max_op, doc.graph.maxOp());
+    try testing.expectEqual(@as(usize, 0), try doc.recoverAuto());
+
+    try spliceText(&doc, text, 8, 0, "!");
+    const following = try readmod.text(&doc, text, gpa);
+    defer gpa.free(following);
+    try testing.expectEqualStrings("original!", following);
+    try testing.expect(doc.auto_recovery == null);
+}
+
+test "native fresh-document validation refusal leaves unused actor metadata readable" {
+    // Opening the refused write interns an actor, but publishes no operation.
+    // Document-owned metadata must not keep an empty transaction in recovery.
+    const gpa = testing.allocator;
+    var doc = try freshDoc(gpa);
+    defer doc.deinit();
+    try testing.expectError(error.InvalidOp, put(&doc, .root, .{ .index = 0 }, .{ .int = 7 }));
+    try testing.expect((try readmod.get(&doc, .root, .{ .key = "text" })) == null);
+    try testing.expect(doc.auto_recovery == null);
+    try testing.expectEqual(@as(usize, 0), pendingOps(&doc));
+    try testing.expectEqual(@as(usize, 0), doc.ops.len());
+    try testing.expectEqual(@as(usize, 0), doc.graph.len());
+    try testing.expectEqual(@as(u64, 0), doc.graph.maxOp());
+    try testing.expectEqual(doc.ops.actors.items.len, doc.graph.numActors());
+    try testing.expectEqual(doc.ops.actors.items.len, doc.authors.count());
+    try testing.expectEqualStrings("0123456789abcdef", doc.getActorId().bytes);
+    try testing.expectEqual(@as(usize, 0), try doc.recoverAuto());
+
+    const text = try putObject(&doc, .root, .{ .key = "text" }, .text);
+    try spliceText(&doc, text, 0, 0, "fresh");
+    const following = try readmod.text(&doc, text, gpa);
+    defer gpa.free(following);
+    try testing.expectEqualStrings("fresh", following);
+    try testing.expect(doc.auto_recovery == null);
+}
+
+test "isolated native auto refusal recovers before another write without id collisions" {
+    // Each offset starts with a fresh fixture: a late refusal must exercise
+    // published rows, not capacities warmed by an earlier failed attempt.
+    var reached_success = false;
+    var reached_published_refusal = false;
+    var reached_second_refusal = false;
+    for (0..512) |offset| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var doc = try freshDoc(gpa);
+        defer doc.deinit();
+        try doc.isolate(gpa, &.{});
+        failing.fail_index = failing.alloc_index + offset;
+        const refused = put(&doc, .root, .{ .key = "a" }, .{ .int = 41 });
+        if (refused) |_| {
+            failing.fail_index = std.math.maxInt(usize);
+            reached_success = true;
+            break;
+        } else |primary| {
+            try testing.expectEqual(error.OutOfMemory, primary);
+            const published = doc.ops.len() != 0;
+            if (published) {
+                reached_published_refusal = true;
+                // Refuse the recovery attempt as well, then restore allocation.
+                // The second call must not allocate another operation id.
+                failing.fail_index = failing.alloc_index;
+                try testing.expectError(error.OutOfMemory, put(&doc, .root, .{ .key = "blocked" }, .{ .int = 99 }));
+                try testing.expect(doc.auto_recovery != null);
+                try testing.expectEqual(@as(u64, 0), doc.graph.maxOp());
+                reached_second_refusal = true;
+            }
+            failing.fail_index = std.math.maxInt(usize);
+            const following = try put(&doc, .root, .{ .key = "b" }, .{ .int = 42 });
+            try testing.expect((try readmod.get(&doc, .root, .{ .key = "a" })) == null);
+            try testing.expect((try readmod.get(&doc, .root, .{ .key = "blocked" })) == null);
+            try testing.expectEqual(@as(i64, 42), (try readmod.get(&doc, .root, .{ .key = "b" })).?.value.scalar.int);
+            try testing.expectEqual(@as(usize, 1), doc.ops.len());
+            try testing.expectEqual(@as(u32, 1), following.counter);
+            try testing.expectEqual(@as(u64, 1), doc.graph.maxOp());
+            try testing.expect(try doc.ops.validateOpOrder());
+            try testing.expect((try doc.ops.validateTopIndex()) == null);
+            const bytes = try doc.save(gpa);
+            defer gpa.free(bytes);
+            var loaded = try Document.load(gpa, testing.io, bytes, doc.textEncoding(), .auto);
+            defer loaded.deinit();
+            try testing.expectEqual(@as(usize, 1), loaded.ops.len());
+            try testing.expect((try readmod.get(&loaded, .root, .{ .key = "a" })) == null);
+            try testing.expectEqual(@as(i64, 42), (try readmod.get(&loaded, .root, .{ .key = "b" })).?.value.scalar.int);
+        }
+    }
+    try testing.expect(reached_success);
+    try testing.expect(reached_published_refusal);
+    try testing.expect(reached_second_refusal);
+}
+
+test "native hydrated auto refusal retains published and queued producer undo" {
+    // A child is queued before the parent batch is published, then written in
+    // a second batch. Sweep both sides of that ownership handover.
+    var reached_success = false;
+    var reached_published_refusal = false;
+    for (0..1024) |offset| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var doc = try freshDoc(gpa);
+        defer doc.deinit();
+        const list = try putObject(&doc, .root, .{ .key = "list" }, .list);
+        var nested = hydmod.List.init(gpa, .root);
+        defer nested.deinit();
+        try nested.push(.{ .int = 7 }, false);
+        const values = [_]hydmod.Value{
+            .{ .int = 1 },
+            .{ .object = .{ .list = nested } },
+            .{ .int = 3 },
+        };
+        failing.fail_index = failing.alloc_index + offset;
+        if (splice(&doc, list, 0, 0, gpa, &values)) |_| {
+            failing.fail_index = std.math.maxInt(usize);
+            reached_success = true;
+            try testing.expectEqual(@as(usize, 3), doc.ops.seqLength(list, doc.textEncoding(), null));
+            break;
+        } else |primary| {
+            try testing.expectEqual(error.OutOfMemory, primary);
+            reached_published_refusal = reached_published_refusal or doc.ops.len() > 1;
+            failing.fail_index = std.math.maxInt(usize);
+            _ = try insert(&doc, list, 0, .{ .int = 42 });
+            try testing.expectEqual(@as(usize, 1), doc.ops.seqLength(list, doc.textEncoding(), null));
+            try testing.expectEqual(@as(i64, 42), (try readmod.get(&doc, list, .{ .index = 0 })).?.value.scalar.int);
+            try testing.expectEqual(@as(usize, 2), doc.ops.len());
+            try testing.expectEqual(@as(usize, 2), doc.graph.len());
+            try testing.expect(try doc.ops.validateOpOrder());
+            try testing.expect((try doc.ops.validateTopIndex()) == null);
+        }
+    }
+    try testing.expect(reached_success);
+    try testing.expect(reached_published_refusal);
+}
+
+test "retained native recovery refuses overlapping mutation and survives scope release" {
+    // Find a fresh-fixture refusal after a row was published, then exercise
+    // the explicit recovery door with another allocation refusal.
+    var reached = false;
+    for (0..512) |offset| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var doc = try freshDoc(gpa);
+        defer doc.deinit();
+        try doc.isolate(gpa, &.{});
+        const transient = try gpa.dupe(u8, "refused");
+        failing.fail_index = failing.alloc_index + offset;
+        const attempted = put(&doc, .root, .{ .key = "a" }, .{ .str = transient });
+        // A retained undo may keep a slice descriptor, but must not read bytes
+        // the caller was promised it could release when the wrapper returned.
+        gpa.free(transient);
+        if (attempted) |_| {
+            failing.fail_index = std.math.maxInt(usize);
+            break;
+        } else |primary| {
+            try testing.expectEqual(error.OutOfMemory, primary);
+        }
+        failing.fail_index = std.math.maxInt(usize);
+        if (doc.ops.len() == 0) continue;
+        reached = true;
+        try testing.expect(doc.auto_recovery != null);
+        try testing.expectEqual(@as(usize, 1), pendingOps(&doc));
+        try testing.expectError(error.InvalidOp, openAutoHeld(gpa, &doc));
+        try testing.expectError(error.InvalidOp, doc.isolate(gpa, &.{}));
+        try testing.expectError(error.InvalidOp, doc.integrate());
+        try testing.expectError(error.InvalidOp, doc.putActorRef(gpa, types.ActorId.init("overlap")));
+        try testing.expectError(error.InvalidOp, doc.applyChanges(gpa, &.{}));
+        try testing.expectError(error.InvalidOp, doc.save(gpa));
+        doc.setMode(.manual);
+        try testing.expectError(error.InvalidOp, Transaction.open(gpa, &doc));
+        try testing.expectError(error.InvalidOp, Transaction.openAt(gpa, &doc, &.{}));
+        // These configuration changes do not mutate rows or renumber IDs.
+        // Releasing the document's heads must not release recovery's scope.
+        doc.dropIsolation();
+        doc.setActorId(types.ActorId.init("following"));
+        doc.resetDiffCursor();
+        failing.fail_index = failing.alloc_index;
+        try testing.expectError(error.OutOfMemory, doc.recoverAuto());
+        try testing.expect(doc.auto_recovery != null);
+        failing.fail_index = std.math.maxInt(usize);
+        try testing.expectEqual(@as(usize, 1), try doc.recoverAuto());
+        try testing.expectEqual(@as(usize, 0), try doc.recoverAuto());
+        try testing.expect(doc.auto_recovery == null);
+        doc.setMode(.auto);
+        _ = try put(&doc, .root, .{ .key = "b" }, .{ .int = 42 });
+        try testing.expect((try readmod.get(&doc, .root, .{ .key = "a" })) == null);
+        try testing.expectEqual(@as(i64, 42), (try readmod.get(&doc, .root, .{ .key = "b" })).?.value.scalar.int);
+        break;
+    }
+    try testing.expect(reached);
+}
+
+test "manual published producer refusal retains resumable undo and baseline" {
+    // Overwriting a committed register exercises successor and scoped-reset
+    // publication as well as the inserted row's ownership.
+    const allocation_count = blk: {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var doc = try freshDocIn(gpa, .manual);
+        defer doc.deinit();
+        {
+            var baseline = try Transaction.open(gpa, &doc);
+            defer baseline.deinit();
+            _ = try baseline.put(.root, .{ .key = "k" }, .{ .int = 7 });
+            _ = try baseline.commit(null, null);
+        }
+        var tx = try Transaction.openAt(gpa, &doc, doc.graph.getHeads());
+        defer tx.deinit();
+        const before = failing.alloc_index;
+        _ = try tx.put(.root, .{ .key = "k" }, .{ .int = 42 });
+        const count = failing.alloc_index - before;
+        _ = try tx.rollback();
+        break :blk count;
+    };
+    var reached_success = false;
+    var reached_partial = false;
+    for (0..allocation_count + 1) |offset| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var doc = try freshDocIn(gpa, .manual);
+        defer doc.deinit();
+        {
+            var baseline = try Transaction.open(gpa, &doc);
+            defer baseline.deinit();
+            _ = try baseline.put(.root, .{ .key = "k" }, .{ .int = 7 });
+            _ = try baseline.commit(null, null);
+        }
+        var tx = try Transaction.openAt(gpa, &doc, doc.graph.getHeads());
+        defer tx.deinit();
+        failing.fail_index = failing.alloc_index + offset;
+        if (tx.put(.root, .{ .key = "k" }, .{ .int = 42 })) |_| {
+            failing.fail_index = std.math.maxInt(usize);
+            _ = try tx.rollback();
+            reached_success = true;
+            break;
+        } else |primary| {
+            try testing.expectEqual(error.OutOfMemory, primary);
+        }
+        failing.fail_index = std.math.maxInt(usize);
+        const queued = tx.count();
+        if (queued != 0) {
+            reached_partial = true;
+            try testing.expect(tx.rolling_back);
+            try testing.expectError(error.InvalidOp, tx.commit(null, null));
+            failing.fail_index = failing.alloc_index;
+            try testing.expectError(error.OutOfMemory, tx.rollback());
+            failing.fail_index = std.math.maxInt(usize);
+        } else {
+            try testing.expect(!tx.rolling_back);
+        }
+        try testing.expectEqual(queued, try tx.rollback());
+        try testing.expectEqual(@as(usize, 1), doc.ops.len());
+        try testing.expectEqual(@as(usize, 1), doc.graph.len());
+        try testing.expectEqual(@as(i64, 7), (try readmod.get(&doc, .root, .{ .key = "k" })).?.value.scalar.int);
+        try testing.expect((try doc.ops.validateTopIndex()) == null);
+    }
+    try testing.expect(reached_success);
+    try testing.expect(reached_partial);
+}
+
+test "manual validation refusal before batch publication remains writable" {
+    // Invalid text must not poison an otherwise valid manual transaction:
+    // no operation from the refused splice was queued or published.
+    const gpa = testing.allocator;
+    var doc = try freshDocIn(gpa, .manual);
+    defer doc.deinit();
+    var tx = try Transaction.open(gpa, &doc);
+    defer tx.deinit();
+    const text = try tx.putObject(.root, .{ .key = "text" }, .text);
+    try testing.expectError(error.InvalidUtf8, tx.spliceText(text, 0, 0, "\xff"));
+    try testing.expect(!tx.rolling_back);
+    try tx.spliceText(text, 0, 0, "okay");
+    _ = try tx.commit(null, null);
+    const got = try doc.text(gpa, text);
+    defer gpa.free(got);
+    try testing.expectEqualStrings("okay", got);
+}

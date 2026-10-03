@@ -41,16 +41,26 @@
 //! `opset/batch.zig` hands a sink a **borrowed** mark set and frees it as soon
 //! as the call returns (`ValueState.mapFlush` and `ValueState.listFlush` own the
 //! set they export, `batch.zig`:803-804`, `:849-852`). Everything a
-//! [`PatchLog`] keeps is therefore **a copy**: mark names, mark-set entries,
-//! map keys, spliced text, and the bytes a scalar payload names. Nothing in a
-//! [`PatchLog`] borrows from the op set.
+//! [`PatchLog`] keeps from an **event** is therefore **a copy**: mark names,
+//! mark-set entries, map keys, spliced text, and the bytes a scalar payload
+//! names. No event borrows from the op set.
+//!
+//! **The path cache is the one thing that borrows, and it says so.** A
+//! [`PathMap`] owns its array and none of its keys
+//! ([`PathMap`](PathMap)): [`PatchBuilder.updatePathMap`] copies each key it
+//! finds into the batch arena, and a map handed in through
+//! [`PatchLog.pathHint`] keeps the keys its builder gave it. Either way the
+//! keys are read only while a diff runs, and every path entry is copied into
+//! the arena before it reaches a patch.
 //!
 //! The same rule holds on the way out, for a different reason. Upstream's patch
 //! carries `Value<'static>` (`patch.rs`:39`, `:50`, `:61`) and gets there by
 //! cloning (`patch_builder.rs`:304`). The port's op-set types borrow their
 //! payload, and a patch has to survive the next mutation of the document it
 //! came from, so [`Patches`] owns an arena and **every slice a patch names is
-//! allocated in it**. `Patches.deinit` is the one free.
+//! allocated in it**. `Patches.deinit` is the one free a consumer owes; a
+//! [`StagedLocal`] is freed with that arena and its own `deinit` releases only
+//! its array.
 //!
 //! # The document is a parameter, not an import
 //!
@@ -330,18 +340,30 @@ fn scalarAsI64(v: ScalarValue) i64 {
 /// The text a [`PatchAction.splice_text`] carries, in the units of the
 /// document's encoding ([`ConcreteTextValue`](text_value.rs):192-270`).
 ///
-/// **A deviation from upstream's storage, and not from its behaviour.**
-/// Upstream keeps a `SequenceTree` of the encoding's own unit type —
-/// `SequenceTree<u8>`, `<u16>`, `<char>`, `<String>` (`text_value.rs`:36-197`)
-/// — so the value can be cloned cheaply and spliced a unit at a time. A patch's
-/// text is built once, spliced into a neighbouring patch, and read as a string;
-/// nothing shares it. This keeps the **bytes** and derives each unit boundary
-/// from the encoding, which gives the same `len`, the same `splice`, the same
-/// `remove` and the same string for the four operations [`PatchBuilder`] makes
-/// (`patch_builder.rs`:189`, `:217-220`, `:242-247`).
+/// **UTF-8-backed, with stricter mutation boundaries than upstream.**
+/// Upstream stores native units in `SequenceTree<u8>`, `<u16>`, `<char>`, or
+/// `<String>` (`text_value.rs`:36`, `:75`, `:113`, `:152`). Its UTF-8 and
+/// UTF-16 trees can retain partial scalars and render them lossily
+/// (`text_value.rs`:60-62`, `:137-139`). This type retains valid UTF-8 instead:
+/// mutations must land on scalar boundaries, or on current grapheme boundaries
+/// in grapheme mode. A split UTF-8 scalar or UTF-16 surrogate pair is refused.
+/// Grapheme boundaries are derived from the current bytes, not retained as
+/// independent tree elements after concatenation (`text_value.rs`:157-168`).
+/// Consumers deleting several encoded units use `removeRange`, so a complete
+/// scalar is removed without creating an unrepresentable intermediate value
+/// (`patch_builder.rs`:242-249`).
 ///
-/// `gpa` owns `bytes`. Inside a patch it is the [`Patches`] arena and the value
-/// is never freed on its own.
+/// **Arena-oriented, and the obligation is on the type.** `gpa` owns `bytes`,
+/// and the one owner of a patch's copy is the [`Patches`] arena the value was
+/// built in, which frees it at [`Patches.deinit`]. [`ConcreteTextValue.deinit`]
+/// is for a value built with an ordinary allocator by
+/// [`ConcreteTextValue.init`] or [`ConcreteTextValue.dup`], and calling it on
+/// a patch's copy is a double free.
+///
+/// The methods that replace the text allocate a **new** buffer without freeing
+/// the old one. An arena reclaims both; an ordinary owning caller must free
+/// the old buffer only when a replacement was published. A no-op retains it.
+/// See `ConcreteTextValue.splice` and `ConcreteTextValue.removeRange`.
 pub const ConcreteTextValue = struct {
     /// The allocator that owns `bytes`.
     gpa: Allocator,
@@ -351,14 +373,23 @@ pub const ConcreteTextValue = struct {
     /// The text, as UTF-8, owned.
     bytes: []const u8,
 
-    /// `s` measured in `enc` (`text_value.rs`:200-207`).
+    /// A value holding a copy of `s`, with `s` measured in `enc`
+    /// (`text_value.rs`:200-207`).
+    ///
+    /// `s` must be valid UTF-8; this copies it without whole-string validation.
+    /// **The copy is owned through `gpa`.** An arena makes `deinit`
+    /// unnecessary; an ordinary allocator makes it mandatory, exactly once.
     pub fn init(gpa: Allocator, s: []const u8, enc: TextEncoding) Error!ConcreteTextValue {
         return .{ .gpa = gpa, .enc = enc, .bytes = try gpa.dupe(u8, s) };
     }
 
-    /// Frees `bytes` and nothing else. **A patch's copy is arena-owned and is
-    /// freed by [`Patches.deinit`] instead**; calling this on one would be a
-    /// double free.
+    /// Frees `bytes` and nothing else, and leaves the value `undefined`.
+    ///
+    /// **A patch's copy is arena-owned and is freed by [`Patches.deinit`]
+    /// instead**; calling this on one would be a double free. It belongs to a
+    /// value built by [`ConcreteTextValue.init`] or
+    /// [`ConcreteTextValue.dup`] on an ordinary allocator, and it is called
+    /// exactly once.
     pub fn deinit(self: *ConcreteTextValue) void {
         self.gpa.free(self.bytes);
         self.* = undefined;
@@ -370,15 +401,35 @@ pub const ConcreteTextValue = struct {
         return self.enc.width(self.bytes);
     }
 
-    /// The text as a string ([`TextValue::make_string`](text_value.rs):60-62`).
-    /// The bytes came from a `&str` upstream, so they are valid UTF-8 and
-    /// upstream's `from_utf8_lossy` never rewrites them.
+    /// Borrows the current UTF-8 buffer until it is replaced or freed.
+    /// Unlike upstream's native-unit trees and lossy rendering
+    /// (`text_value.rs`:60-62`, `:137-139`), mutations preserve scalar boundaries.
     pub fn asStr(self: ConcreteTextValue) []const u8 {
         return self.bytes;
     }
 
     /// Inserts `value` at unit `index`
     /// ([`TextValue::splice`](text_value.rs):48-51`, `:87-90`, `:125-128`, `:163-166`).
+    ///
+    /// `value` must be valid UTF-8. An index past the end appends; an index
+    /// splitting a UTF-8 scalar or UTF-16 surrogate pair returns
+    /// `error.InvalidCharacter`. Grapheme indices use the current segmentation.
+    ///
+    /// **The buffer it replaces is not freed.** The new text is allocated
+    /// whole and `bytes` is pointed at it, so the old buffer is released only
+    /// where its allocator releases it — the [`Patches`] arena, at
+    /// [`Patches.deinit`]. An owning caller on an ordinary allocator must free
+    /// the old `bytes` itself after this returns:
+    ///
+    /// ```zig
+    /// const old = v.bytes;
+    /// try v.splice(index, value);
+    /// gpa.free(old);
+    /// ```
+    ///
+    /// Doing that inside an arena is harmless and doing nothing outside one
+    /// leaks the old buffer on every call. On error nothing is written and
+    /// `bytes` still names the old buffer.
     pub fn splice(self: *ConcreteTextValue, index: usize, value: []const u8) Error!void {
         const at = try byteOffset(self.enc, self.bytes, index);
         const out = try self.gpa.alloc(u8, self.bytes.len + value.len);
@@ -388,18 +439,52 @@ pub const ConcreteTextValue = struct {
         self.bytes = out;
     }
 
-    /// Removes the one unit at `index`
-    /// ([`TextValue::remove`](text_value.rs):69-71`, `:107-109`, `:147-149`, `:185-187`).
+    /// Removes one unit of `enc` at `index`, using `removeRange(index, 1)`.
+    /// Upstream's native-unit `remove` (`text_value.rs`:69-71`, `:146-148`)
+    /// can split scalars; this UTF-8-backed value returns
+    /// `error.InvalidCharacter` instead, without mutation.
+    ///
+    /// An index at or past the end is a no-op. The old-buffer release and
+    /// error contracts are those of `ConcreteTextValue.removeRange`.
     pub fn remove(self: *ConcreteTextValue, index: usize) Error!void {
+        try self.removeRange(index, 1);
+    }
+
+    /// Removes `length` units of `enc` starting at `index`, clamping the end
+    /// to the text's length even when `index + length` would overflow.
+    ///
+    /// Both ends must be scalar boundaries for UTF-8, UTF-16 and code-point
+    /// indexing, or current grapheme boundaries for grapheme indexing.
+    /// A split scalar returns `error.InvalidCharacter`; `error.OutOfMemory`
+    /// can occur while allocating the one replacement buffer. Both errors
+    /// leave `bytes` and its contents unchanged.
+    ///
+    /// Zero length or an index at/past the end allocates nothing and retains
+    /// the original buffer. A nonempty removal publishes a new buffer but
+    /// does not free the old one, which the patch arena reclaims. An owning
+    /// caller using an ordinary allocator must release the old buffer only
+    /// if the pointer changed after success:
+    ///
+    /// ```zig
+    /// const old = v.bytes;
+    /// try v.removeRange(index, length);
+    /// if (v.bytes.ptr != old.ptr) gpa.free(old);
+    /// ```
+    pub fn removeRange(self: *ConcreteTextValue, index: usize, length: usize) Error!void {
+        if (length == 0) return;
         const at = try byteOffset(self.enc, self.bytes, index);
-        const end = try byteOffset(self.enc, self.bytes, index + 1);
+        if (at == self.bytes.len) return;
+        const end_index = index +| length;
+        // Start from a known boundary rather than decoding the prefix twice.
+        const end = at + try byteOffset(self.enc, self.bytes[at..], end_index - index);
         const out = try self.gpa.alloc(u8, self.bytes.len - (end - at));
         @memcpy(out[0..at], self.bytes[0..at]);
         @memcpy(out[at..], self.bytes[end..]);
         self.bytes = out;
     }
 
-    /// A second, independent copy.
+    /// A second, independent copy, with its own `bytes` allocated through
+    /// `gpa`. The receiver is untouched.
     pub fn dup(self: ConcreteTextValue, gpa: Allocator) Error!ConcreteTextValue {
         return .{ .gpa = gpa, .enc = self.enc, .bytes = try gpa.dupe(u8, self.bytes) };
     }
@@ -410,22 +495,26 @@ pub const ConcreteTextValue = struct {
     }
 };
 
-/// The byte offset of unit `index` in `bytes` under `enc`.
-///
-/// The four boundaries: a UTF-8 code unit is a byte, a code point is
-/// `utf8ByteSequenceLength`, a UTF-16 code unit is one unit per code point below
-/// U+10000 and two above, and a grapheme cluster is
-/// [`unicode.graphemeOffset`].
+/// Maps an encoded index to a byte boundary, clamping past the end.
+/// UTF-8 and UTF-16 unit indices inside a scalar return `InvalidCharacter`;
+/// code-point and grapheme indices already count complete boundaries.
+/// Only the prefix needed to find the boundary is scanned.
 fn byteOffset(enc: TextEncoding, bytes: []const u8, index: usize) Error!usize {
     switch (enc) {
-        .utf8_code_unit => return @min(index, bytes.len),
+        .utf8_code_unit => {
+            const at = @min(index, bytes.len);
+            if (at < bytes.len and (bytes[at] & 0xC0) == 0x80) return error.InvalidCharacter;
+            return at;
+        },
         .unicode_code_point => {
             var n: usize = 0;
             var i: usize = 0;
             while (i < bytes.len) {
                 if (n == index) return i;
-                i += std.unicode.utf8ByteSequenceLength(bytes[i]) catch
+                const width = std.unicode.utf8ByteSequenceLength(bytes[i]) catch
                     return error.InvalidCharacter;
+                if (width > bytes.len - i) return error.InvalidCharacter;
+                i += width;
                 n += 1;
             }
             return bytes.len;
@@ -435,11 +524,14 @@ fn byteOffset(enc: TextEncoding, bytes: []const u8, index: usize) Error!usize {
             var i: usize = 0;
             while (i < bytes.len) {
                 if (n == index) return i;
-                const cp = std.unicode.utf8Decode(bytes[i..]) catch
+                const width = std.unicode.utf8ByteSequenceLength(bytes[i]) catch
                     return error.InvalidCharacter;
-                i += std.unicode.utf8CodepointSequenceLength(cp) catch
+                if (width > bytes.len - i) return error.InvalidCharacter;
+                const cp = std.unicode.utf8Decode(bytes[i..][0..width]) catch
                     return error.InvalidCharacter;
+                i += width;
                 n += if (cp > 0xFFFF) @as(usize, 2) else 1;
+                if (n > index) return error.InvalidCharacter;
             }
             return bytes.len;
         },
@@ -479,16 +571,23 @@ pub const MarkRun = struct {
 /// lands in [`PatchAction.mark`], and upstream's is a `BTreeMap`'s
 /// (`marks.rs`:68-74`).
 pub const MarkRuns = struct {
+    /// The allocator every name and every value payload is copied with. It is
+    /// retained for the accumulator's whole life and is what
+    /// [`MarkRuns.deinit`] frees through, so it must outlive it.
     gpa: Allocator,
     /// The runs, sorted by name, and in insertion order within a name.
     runs: std.ArrayList(MarkRun) = .empty,
 
+    /// An empty accumulator that stores `gpa` for its own runs. Allocates
+    /// nothing.
     pub fn init(gpa: Allocator) MarkRuns {
         return .{ .gpa = gpa };
     }
 
     /// Frees every run: its name **and** its value's bytes, because
-    /// [`MarkRuns.add`] copies both.
+    /// [`MarkRuns.add`] copies both, then the runs array itself. The allocator
+    /// is not released. The accumulator is `undefined` afterward and a second
+    /// call is a double free.
     pub fn deinit(self: *MarkRuns) void {
         for (self.runs.items) |*run| {
             self.gpa.free(run.name);
@@ -505,6 +604,13 @@ pub const MarkRuns = struct {
     /// values are equal and the previous run ends exactly where this one
     /// starts, and that is the whole reason a mark read back from the document
     /// comes out as one span rather than one span per position.
+    ///
+    /// **Both halves of a run are copied**, so the mark set and the names it
+    /// points at may be released as soon as this returns — the log outlives the
+    /// op set the names live in, which is why this type exists beside
+    /// [`MarkAccumulator`](marks.zig). The copies are released together by
+    /// [`MarkRuns.deinit`]; on `error.OutOfMemory` neither half of the run
+    /// being built is kept, and the runs already inserted stay.
     pub fn add(self: *MarkRuns, index: usize, len: usize, other: *const MarkSet) Error!void {
         for (other.entries.items) |entry| {
             const at = self.lowerBound(entry.name);
@@ -518,11 +624,18 @@ pub const MarkRuns = struct {
                     continue;
                 }
             }
+            // **Both copies are made before the insert, and each is released
+            // if the next one or the insert fails.** Built inside the struct
+            // literal, the first one has no owner until the insert lands.
+            const owned_name = try self.gpa.dupe(u8, entry.name);
+            errdefer self.gpa.free(owned_name);
+            const owned_value = try ownScalar(self.gpa, entry.value);
+            errdefer freeScalar(self.gpa, owned_value);
             try self.runs.insert(self.gpa, at, .{
-                .name = try self.gpa.dupe(u8, entry.name),
+                .name = owned_name,
                 .index = index,
                 .len = len,
-                .value = try ownScalar(self.gpa, entry.value),
+                .value = owned_value,
             });
         }
     }
@@ -564,6 +677,12 @@ pub const MarkRunsIter = struct {
     runs: []const MarkRun,
     index: usize = 0,
 
+    /// The next run as a `Mark`, or `null` at the end.
+    ///
+    /// **The `Mark` borrows twice**: its `name` is the run's own copy, and a
+    /// `str`, `bytes`, `actor_id` or `unknown` value carries a payload that
+    /// belongs to the run as well. Both die with [`MarkRuns.deinit`], so a
+    /// caller that keeps the `Mark` past that call reads freed bytes.
     pub fn next(self: *MarkRunsIter) ?Mark {
         if (self.index >= self.runs.len) return null;
         const at = self.index;
@@ -613,6 +732,9 @@ pub const Patch = struct {
 /// One value inside an [`PatchAction.insert`]: upstream's
 /// `(Value<'static>, ObjId, bool)` triple ([`patch.rs`](patch.rs):61`).
 pub const InsertValue = struct {
+    /// The value put in. A `str`, `bytes`, `actor_id` or `unknown` payload is
+    /// **borrowed from the [`Patches`] arena** the patch lives in, like every
+    /// other byte a patch names; see the module doc.
     value: Value,
     /// **Meaningful only for a `Value::Object`** (`patch.rs`:60`).
     obj: ExId,
@@ -922,6 +1044,9 @@ pub fn markSetEql(a: ?*const MarkSet, b: ?*const MarkSet) bool {
 pub const Patches = struct {
     /// Every byte a patch names.
     arena: std.heap.ArenaAllocator,
+    /// The patches themselves, in stream order. **The list's buffer is arena
+    /// memory**, so it is released by [`Patches.clear`] and
+    /// [`Patches.deinit`] and is never freed on its own.
     items: std.ArrayList(Patch) = .empty,
 
     /// An empty batch. **Constructing one allocates nothing** — the arena takes
@@ -936,27 +1061,46 @@ pub const Patches = struct {
     }
 
     /// Frees every patch and every byte they name.
+    ///
+    /// The backing allocator given to [`Patches.init`] is not released, only
+    /// the memory taken from it. The batch is `undefined` afterward and a
+    /// second call is a double free.
     pub fn deinit(self: *Patches) void {
         self.arena.deinit();
         self.* = undefined;
     }
 
+    /// How many patches this batch holds.
     pub fn len(self: *const Patches) usize {
         return self.items.items.len;
     }
 
+    /// The patches, in the order a consumer applies them.
+    ///
+    /// **The slice borrows this batch's own array and dies with it.** It is
+    /// invalidated by [`Patches.clear`] and by [`Patches.deinit`], and so is
+    /// every patch, path and payload a caller reached through it.
     pub fn slice(self: *const Patches) []const Patch {
         return self.items.items;
     }
 
-    /// Copies every patch of `other` into this batch, deep.
+    /// Copies every patch of `other` into this batch, deep, and appends them
+    /// in order.
     ///
     /// Upstream's `make_patches` **clones** `completed_patches` before
     /// extending it with the current ones (`patch_log.rs`:506-507`), and that
     /// clone is what this is: a [`PatchLog`] keeps its completed patches after
     /// [`PatchLog.makePatches`] returns, so a second call has to build a second
     /// batch.
+    ///
+    /// **All or nothing.** Every `copyPatch` can be refused, and a batch copied
+    /// up to the refusal is a batch a retry would copy again on top of, so the
+    /// list is put back where it started when any one of them fails. The
+    /// capacity that reservation leaves behind is arena memory, which
+    /// [`Patches.clear`] and [`Patches.deinit`] release with the rest.
     pub fn appendFrom(self: *Patches, other: *const Patches) Error!void {
+        const mark = self.items.items.len;
+        errdefer self.items.shrinkRetainingCapacity(mark);
         for (other.items.items) |p| {
             try self.items.append(self.allocator(), try copyPatch(self.allocator(), p));
         }
@@ -976,6 +1120,37 @@ pub const Patches = struct {
     pub fn clear(self: *Patches) void {
         self.items = .empty;
         _ = self.arena.reset(.free_all);
+    }
+};
+
+/// One local change's patches, deep-copied into a [`PatchLog`]'s own storage
+/// and waiting to be attached to it.
+///
+/// **Staging is what makes a local commit failure-atomic.** A commit that has
+/// already inserted the change into the graph cannot report a failure, so the
+/// deep copy — the only part that can be refused — has to happen before that
+/// point, on data the log has not published yet. [`PatchLog.prepareLocal`] is
+/// that copy and [`PatchLog.commitLocal`] is the infallible attachment.
+///
+/// **Every byte is in [`PatchLog.local`]'s arena**, so abandoning a staged batch
+/// releases its array and nothing else, and the arena reclaims the payloads
+/// with the rest. A staged batch is therefore not a value a caller may hold
+/// past its log's [`PatchLog.deinit`], and the two halves are used in pairs:
+/// [`StagedLocal.deinit`] on the abort path, [`PatchLog.commitLocal`] on the
+/// success path, never both.
+pub const StagedLocal = struct {
+    /// The arena allocator every patch here was copied with.
+    gpa: Allocator,
+    /// The staged patches, in stream order. Not yet reachable through
+    /// [`PatchLog.makePatches`] or [`PatchLog.finishCurrentView`].
+    items: std.ArrayList(Patch) = .empty,
+
+    /// Abandons the staged batch without attaching it. Releases `items` and
+    /// nothing else — see the type comment. The staged value is `undefined`
+    /// afterward.
+    pub fn deinit(self: *StagedLocal) void {
+        self.items.deinit(self.gpa);
+        self.* = undefined;
     }
 };
 
@@ -1102,12 +1277,18 @@ fn ownProp(gpa: Allocator, prop: Prop) Error!Prop {
 }
 
 /// A copy of `m` whose names `gpa` owns. The mark set's own `gpa` is `gpa`, so
-/// its entries buffer is allocated with it too.
+/// its entries buffer is allocated with it too. The counterpart is
+/// [`freeMarkSet`], and the pair must be used together.
 fn copyMarkSet(gpa: Allocator, m: *const MarkSet) Error!MarkSet {
     var out: MarkSet = .init(gpa);
     errdefer freeMarkSet(gpa, &out);
     for (m.entries.items) |e| {
-        try out.put(try gpa.dupe(u8, e.name), e.value);
+        // **The name is registered with the set before the insert is
+        // attempted.** Passed to `put` inline, it has no owner when the
+        // insert refuses it, and `freeMarkSet` only walks entries that landed.
+        const owned = try gpa.dupe(u8, e.name);
+        errdefer gpa.free(owned);
+        try out.put(owned, e.value);
     }
     return out;
 }
@@ -1287,17 +1468,30 @@ pub const PathMapEntry = struct {
 
 /// The map itself: a flat array sorted by `obj`.
 ///
-/// Upstream's is a `BTreeMap` and so is the order this keeps. **A map's prop
-/// keys are borrowed** and [`PathMap.deinit`] frees the array and not the keys:
-/// the keys point into the document, whose storage the caller owns.
+/// Upstream's is a `BTreeMap` and so is the order this keeps. **The map owns
+/// its array and none of its keys.** [`PathMap.deinit`] frees the array alone,
+/// so whoever put a `.key` entry in owns those bytes and keeps them alive for
+/// as long as the map is read — see [`PatchBuilder.updatePathMap`] for the one
+/// producer inside this module and [`PatchLog.pathHint`] for the one a caller
+/// supplies.
 pub const PathMap = struct {
+    /// The entries, sorted by `obj`. **Not freed by anything but
+    /// [`PathMap.deinit`]**, and its keys are not freed at all.
     items: std.ArrayList(PathMapEntry) = .empty,
 
+    /// Releases the entries array. The keys stay where they are; see the type
+    /// comment. `gpa` is the allocator the array was allocated with and is not
+    /// released. The map is `undefined` afterward.
     pub fn deinit(self: *PathMap, gpa: Allocator) void {
         self.items.deinit(gpa);
         self.* = undefined;
     }
 
+    /// The entry for `obj`, or null. Allocates nothing.
+    ///
+    /// **The pointer is into this map's own array** and is invalidated by the
+    /// next [`PathMap.put`] or [`PathMap.deinit`], both of which can reallocate
+    /// or shift the entries.
     pub fn get(self: *const PathMap, obj: ExId) ?*const PathMapEntry {
         var lo: usize = 0;
         var hi: usize = self.items.items.len;
@@ -1313,6 +1507,10 @@ pub const PathMap = struct {
     }
 
     /// Inserts, or replaces the entry of an object that already has one.
+    ///
+    /// **`e.prop`'s key is taken as given and is not copied or freed.** The
+    /// caller owns it; see the type comment. On `error.OutOfMemory` nothing is
+    /// stored and the map is unchanged.
     pub fn put(self: *PathMap, gpa: Allocator, e: PathMapEntry) Error!void {
         var lo: usize = 0;
         var hi: usize = self.items.items.len;
@@ -1349,7 +1547,14 @@ pub fn PatchBuilder(comptime D: type) type {
         out: *Patches,
         /// `out`'s allocator. **Every byte a patch names comes from here.**
         gpa: Allocator,
+        /// The document every path and value is read from. **Borrowed**: it
+        /// must outlive the builder, and nothing is copied out of it except
+        /// into the arena.
         doc: *const D,
+        /// The patches built so far, in stream order. **This is the builder's
+        /// output**: [`PatchLog.buildCurrent`] appends it to the batch in
+        /// `out` once the walk is done. Its buffer is `gpa` memory, so it is
+        /// never freed on its own.
         patches: std.ArrayList(Patch) = .empty,
         /// The mark set of the last splice, kept for the coalescing test
         /// (`patch_builder.rs`:18`); see [`markSetEql`] for what the comparison
@@ -1357,21 +1562,56 @@ pub fn PatchBuilder(comptime D: type) type {
         /// memory, so it stays valid for as long as the patches do, and this
         /// field is never freed.
         last_mark_set: ?MarkSet = null,
-        /// The cache `init` was handed (`patch_builder.rs`:19`).
+        /// The cache `init` was handed, **taken over rather than copied**
+        /// (`patch_builder.rs`:19`).
+        ///
+        /// **Its array belongs to `path_map_gpa` and nothing else.** Every
+        /// growth here goes through that allocator and `deinit` frees it
+        /// through the same one, because a growing `std.ArrayList` releases
+        /// the buffer it replaces through whichever allocator was passed
+        /// alongside it — a map that mixed two would free one of them wrongly.
+        /// The **keys are the exception and deliberately are not routed with
+        /// it**: a [`PathMap`] frees no keys, so a key copied into `gpa`'s
+        /// arena is reclaimed by [`Patches.deinit`] with no free of its own.
         path_map: PathMap,
+        /// The allocator `path_map`'s array was allocated with, retained for
+        /// this builder's whole life so it must outlive it. **Not `gpa`.** It
+        /// is whatever the caller that handed the map over built it with —
+        /// for a [`PatchLog`], its own.
+        path_map_gpa: Allocator,
         /// The objects whose parent has already been walked, and the cycle
         /// guard (`patch_builder.rs`:20`, `:152-155`).
         seen: std.HashMapUnmanaged(ExId, void, ExIdContext, 64) = .empty,
+        /// The encoding every text length in a patch is counted in, read once
+        /// from the document (`patch_builder.rs`:26). Copied, so it does not
+        /// borrow from `doc`.
         text_encoding: TextEncoding,
         /// `null` for the current heads, and a clock for an earlier view
         /// (`patch_builder.rs`:22`).
         clock: ?Clock,
 
         /// A builder over `out` ([`PatchBuilder::new`](patch_builder.rs):27-45`).
+        ///
+        /// **`owned_seed` is taken over, not copied, and `seed_gpa` must be the
+        /// allocator its array was built with.** The builder adopts the map
+        /// and every growth of it goes through `seed_gpa`, because a growing
+        /// `std.ArrayList` releases the buffer it replaces through whichever
+        /// allocator was passed alongside it: a map behind two allocators
+        /// frees one of them wrongly, and Zig 0.16's `ArenaAllocator.free`
+        /// silently returns for a block it never handed out. Nothing is
+        /// copied, so `init` cannot fail and this is not an error union.
+        ///
+        /// **The map's keys are the other half of the ledger.** A
+        /// [`PathMap`] frees no keys at all, so the keys this builder copies
+        /// in [`updatePathMap`] go into `gpa`'s arena and are reclaimed by
+        /// [`Patches.deinit`] with no free of their own — while keys that came
+        /// in with the seed stay the seed's owner's business for as long as
+        /// they are read.
         pub fn init(
             out: *Patches,
             doc: *const D,
-            path_map: PathMap,
+            owned_seed: PathMap,
+            seed_gpa: Allocator,
             clock: ?Clock,
             text_encoding: TextEncoding,
         ) Self {
@@ -1379,16 +1619,22 @@ pub fn PatchBuilder(comptime D: type) type {
                 .out = out,
                 .gpa = out.allocator(),
                 .doc = doc,
-                .path_map = path_map,
+                .path_map = owned_seed,
+                .path_map_gpa = seed_gpa,
                 .clock = clock,
                 .text_encoding = text_encoding,
             };
         }
 
-        /// Frees the path map and the cycle guard. The patches themselves
-        /// belong to `out` and are not touched.
+        /// Frees the path map with **`path_map_gpa`**, the allocator its array
+        /// came from, and the cycle guard with `gpa`, the arena that holds it.
+        /// The patches belong to `out` and are not touched.
+        ///
+        /// The map was **transferred in**, not borrowed, so the caller must not
+        /// release it and has no route to after this. The builder is
+        /// `undefined` afterward and a second call is a double free.
         pub fn deinit(self: *Self) void {
-            self.path_map.deinit(self.gpa);
+            self.path_map.deinit(self.path_map_gpa);
             self.seen.deinit(self.gpa);
             self.* = undefined;
         }
@@ -1457,12 +1703,12 @@ pub fn PatchBuilder(comptime D: type) type {
                     parent = found.parent;
                 }
                 cur = parent;
-                // **The prop is borrowed and a path entry is not.** A map key
-                // comes from the document's register table (`updatePathMap`
-                // below) or from a caller-supplied [`PathMap`], both of which
-                // the batch outlives, so the key is copied into the arena
-                // here. An index is a number, and `ownProp` is the identity
-                // for it.
+                // **A path entry is arena-owned whatever the cache holds.**
+                // [`updatePathMap`] already copied the keys it found into the
+                // arena, but a caller-supplied [`PathMap`] through
+                // [`PatchLog.pathHint`] may hold borrowed ones, and this is the
+                // one place every patch's key passes through. An index is a
+                // number, and `ownProp` is the identity for it.
                 try path.append(self.gpa, .{
                     .obj = exportObj(D, self.doc, cur),
                     .prop = try ownProp(self.gpa, prop),
@@ -1568,16 +1814,30 @@ pub fn PatchBuilder(comptime D: type) type {
         /// this file has just built**: a delete landing inside the tail insert
         /// or the tail splice removes them, and a patch that empties is dropped
         /// rather than pushed.
+        ///
+        /// Text is removed as one boundary-valid range: upstream can remove
+        /// individual native units (`patch_builder.rs`:244-246`), whereas
+        /// this UTF-8-backed value cannot retain a partial surrogate pair.
+        ///
+        /// **`length == 0` does nothing, before any arithmetic.** Upstream's
+        /// coalescing arms test `index + length - 1` (`patch_builder.rs`:243`,
+        /// `:259`), which underflows at zero. A text element whose value is
+        /// empty has width zero, and `PatchLog.replaceSeq` logs that width.
+        /// Here the guard is explicit, and no patch is emitted.
         pub fn deleteSeq(self: *Self, obj: ExId, index: usize, length: usize) Error!void {
+            if (length == 0) return;
             if (self.maybeAppend(obj)) |action| {
                 switch (action.*) {
                     .splice_text => |*a| {
                         const tail = a.index;
                         const len = a.value.len();
-                        if (index >= tail and index + length - 1 < tail + len) {
-                            for (0..length) |_| try a.value.remove(index - tail);
-                            if (a.value.len() == 0) _ = self.patches.pop();
-                            return;
+                        if (index >= tail) {
+                            const offset = index - tail;
+                            if (offset < len and length <= len - offset) {
+                                try a.value.removeRange(offset, length);
+                                if (a.value.bytes.len == 0) _ = self.patches.pop();
+                                return;
+                            }
                         }
                     },
                     .insert => |*a| {
@@ -1710,8 +1970,9 @@ pub fn PatchBuilder(comptime D: type) type {
 
         /// Copies every run of `runs` into `out`, **name and value**: a name
         /// is a `[]const u8` and a value can carry bytes of its own
-        /// ([`ownScalar`]'s four cases), and both belong to the
-        /// [`PatchLog`] holding the event, not to the arena `out` grows in.
+        /// ([`ownScalar`]'s four cases). The event's copies belong to the
+        /// [`PatchLog`] holding it and die at [`PatchLog.deinit`], while the
+        /// patch has to outlive that, so both are copied in with the arena.
         fn collectMarks(
             self: *Self,
             out: *std.ArrayList(Mark),
@@ -1719,9 +1980,16 @@ pub fn PatchBuilder(comptime D: type) type {
         ) Error!void {
             var it = runs.intoIter();
             while (it.next()) |m| {
+                // **Each copy is released if the next one or the append
+                // refuses.** Built inline in the call, the name has no owner
+                // between the `dupe` and the `append`.
+                const owned_name = try self.gpa.dupe(u8, m.name);
+                errdefer self.gpa.free(owned_name);
+                const owned_value = try ownScalar(self.gpa, m.value);
+                errdefer freeScalar(self.gpa, owned_value);
                 try out.append(self.gpa, Mark.init(
-                    try self.gpa.dupe(u8, m.name),
-                    try ownScalar(self.gpa, m.value),
+                    owned_name,
+                    owned_value,
                     m.start,
                     m.end,
                 ));
@@ -1751,13 +2019,24 @@ pub fn PatchBuilder(comptime D: type) type {
         /// **One walk per parent, not one lookup per object**, and that is what
         /// `seen` is for (`patch_builder.rs`:34-35`, `:152-155`). Only object
         /// values are recorded: a scalar has no path.
+        ///
+        /// **A map key is copied into the batch arena, not borrowed.** The
+        /// module rule is that everything this file keeps is a copy, and a key
+        /// a document walk hands out is only good until the next mutation of
+        /// it. The index arms have nothing to copy: an index is a number.
+        ///
+        /// **The array grows with `path_map_gpa` and the keys land in `gpa`,
+        /// and that asymmetry is the point.** The array is a `PathMap`'s one
+        /// owned resource and must be freed by whoever allocated it; a key is
+        /// owned by nobody, so the arena is a free place to leave it. The
+        /// index arms write no key at all.
         fn updatePathMap(self: *Self, parent_id: ExId, parent_type: ObjType) Error!void {
             switch (parent_type) {
                 .list => {
                     var it = self.doc.listRangeFor(parent_id, self.clock);
                     while (try it.next()) |item| {
                         if (!item.value.isObject()) continue;
-                        try self.path_map.put(self.gpa, .{
+                        try self.path_map.put(self.path_map_gpa, .{
                             .obj = internalObj(item.id),
                             .prop = .{ .index = item.index },
                             .parent = parent_id,
@@ -1768,7 +2047,7 @@ pub fn PatchBuilder(comptime D: type) type {
                     var it = self.doc.spans(parent_id, self.clock);
                     while (try it.next()) |span| {
                         switch (span) {
-                            .obj => |o| try self.path_map.put(self.gpa, .{
+                            .obj => |o| try self.path_map.put(self.path_map_gpa, .{
                                 .obj = internalObj(o.id),
                                 .prop = .{ .index = o.index },
                                 .parent = parent_id,
@@ -1781,9 +2060,12 @@ pub fn PatchBuilder(comptime D: type) type {
                     var it = self.doc.mapRangeFor(parent_id, self.clock);
                     while (try it.next()) |item| {
                         if (!item.value.isObject()) continue;
-                        try self.path_map.put(self.gpa, .{
+                        try self.path_map.put(self.path_map_gpa, .{
                             .obj = internalObj(item.id),
-                            .prop = .{ .key = item.key },
+                            // **Copied, so the entry this keeps does not name
+                            // the walk's storage.** The arena releases it with
+                            // the batch.
+                            .prop = try ownProp(self.gpa, .{ .key = item.key }),
                             .parent = parent_id,
                         });
                     }
@@ -1810,8 +2092,20 @@ pub fn PatchBuilder(comptime D: type) type {
 /// (`patch_log.rs`:680): the only operations are `first`, `insert`, `remove`
 /// and the ordered comparison in [`ExposeQueue.pumpQueue`], all of which the
 /// array answers.
+///
+/// **No consumer of this module can build one.** `init` and `deinit` are
+/// private and the two public methods take a `*PatchBuilder(D)`, which itself
+/// needs a [`Patches`] and a [`PathMap`]; the queue is reached only through
+/// [`PatchLog`], which builds one per diff in [`PatchLog.buildCurrent`]. The
+/// type is published because a `pub` method on it is reachable from there, not
+/// because it is meant to be constructed.
 pub const ExposeQueue = struct {
+    /// The allocator the array is allocated with, held for the queue's whole
+    /// life.
     gpa: Allocator,
+    /// The queued objects, sorted by `ExId` and free of duplicates. The array
+    /// is released by the private `deinit` that only [`PatchLog.buildCurrent`]
+    /// reaches.
     items: std.ArrayList(ExId) = .empty,
 
     fn init(gpa: Allocator) ExposeQueue {
@@ -2088,12 +2382,16 @@ pub const PatchLog = struct {
         };
     }
 
-    /// A log that records ([`PatchLog::active`](patch_log.rs):256-258`).
+    /// A log whose `isActive` flag is true. Event methods still record when
+    /// called directly; callers use the flag to decide whether to call them
+    /// ([`PatchLog::active`](patch_log.rs):256-258`).
     pub fn active(gpa: Allocator) PatchLog {
         return init(gpa, true);
     }
 
-    /// A log that records nothing ([`PatchLog::inactive`](patch_log.rs):245-247`).
+    /// A log whose `isActive` flag is false. This does not suppress direct
+    /// event calls: callers must check the flag when they want no recording
+    /// ([`PatchLog::inactive`](patch_log.rs):245-247`).
     pub fn inactive(gpa: Allocator) PatchLog {
         return init(gpa, false);
     }
@@ -2107,6 +2405,15 @@ pub const PatchLog = struct {
         return init(gpa, false);
     }
 
+    /// Releases everything the log owns: every event and its payload, the event
+    /// list, the expose set, the completed and local patch batches with
+    /// everything in their arenas, the path map, the heads copy, every actor's
+    /// bytes and the speculative actor.
+    ///
+    /// **The allocator given to [`PatchLog.init`] is not released.** Any
+    /// [`Patches`] this log handed out stays the caller's to free, and a
+    /// [`StagedLocal`] still in hand is released with the arena it came from.
+    /// The log is `undefined` afterward and a second call is a double free.
     pub fn deinit(self: *PatchLog) void {
         for (self.events.items) |*e| e.event.deinit(self.gpa);
         self.events.deinit(self.gpa);
@@ -2394,7 +2701,14 @@ pub const PatchLog = struct {
 
     /// Notifies the log that a transaction has finished
     /// ([`PatchLog::finish_transaction`](patch_log.rs):616-626`).
-    pub fn finishTransaction(self: *PatchLog, doc_actors: []const ActorId) Error!void {
+    ///
+    /// Settles the speculative actor [`PatchLog.beginTransaction`] took: the
+    /// document kept it, so it stays, and otherwise it is dropped from the
+    /// log's actor list along with every id that named it. **Infallible** —
+    /// nothing here allocates and nothing here can fail, which is why a
+    /// `defer` at a commit's tail needs no `catch`. `doc_actors` is borrowed
+    /// for the call only.
+    pub fn finishTransaction(self: *PatchLog, doc_actors: []const ActorId) void {
         const speculative = self.speculative_actor orelse return;
         self.speculative_actor = null;
         // **Freed on every path out.** The port's `ActorId` borrows its bytes
@@ -2629,14 +2943,60 @@ pub const PatchLog = struct {
     ///
     /// **Appending, not replacing**, because the log holds every change since
     /// the cursor was last moved and `truncate` is what empties it.
-    pub fn recordLocal(self: *PatchLog, patches: *const Patches) MakeError!void {
+    ///
+    /// **Two halves, and the split is the point.** The deep copy is the only
+    /// part that can be refused, and a commit that has already put the change
+    /// into the graph has nothing left to report it on, so this is the half a
+    /// caller runs first and [`PatchLog.commitLocal`] is the half it runs
+    /// afterwards. **Nothing observable changes here**: a refusal leaves the
+    /// log exactly as it was.
+    pub fn prepareLocal(self: *PatchLog, patches: *const Patches) MakeError!StagedLocal {
         if (self.oom) return error.OutOfMemory;
-        try self.local.appendFrom(patches);
+        const gpa = self.local.allocator();
+        var staged: StagedLocal = .{ .gpa = gpa };
+        errdefer staged.deinit();
+        // **The room is reserved here, while the caller can still give up.**
+        // `commitLocal` appends with `appendSliceAssumeCapacity`, so it has to
+        // be able to; a reservation that fails belongs to this error set, not
+        // to the infallible one. What a refusal leaves behind is arena
+        // capacity, which changes nothing a caller can observe.
+        try self.local.items.ensureUnusedCapacity(gpa, patches.len());
+        try staged.items.ensureTotalCapacity(gpa, patches.len());
+        for (patches.slice()) |p| {
+            staged.items.appendAssumeCapacity(try copyPatch(gpa, p));
+        }
+        return staged;
+    }
+
+    /// Attaches a staged batch to [`PatchLog.local`], at the end.
+    ///
+    /// **Infallible, and this is why it exists.** Every byte the batch names is
+    /// already in the log's own arena and the room for it was reserved by
+    /// [`PatchLog.prepareLocal`], so the append cannot be refused. The staged
+    /// value is consumed: its array is arena memory like everything else here
+    /// and must not be freed, which is also why it must not be handed back to
+    /// [`StagedLocal.deinit`] afterwards.
+    pub fn commitLocal(self: *PatchLog, staged: StagedLocal) void {
+        self.local.items.appendSliceAssumeCapacity(staged.items.items);
     }
 
     /// Seeds the path cache and records the event count it is good for
     /// ([`PatchLog::path_hint`](patch_log.rs):667-670`).
-    pub fn pathHint(self: *PatchLog, hint: PathMap) Error!void {
+    ///
+    /// **Infallible, and the log takes ownership of `hint`.** The previous
+    /// cache is released and `hint` becomes this log's; nothing here allocates.
+    ///
+    /// **The map must have been built with this log's own allocator.** Its
+    /// array is freed with `self.gpa` — at [`PatchLog.truncate`], at
+    /// [`PatchLog.finishCurrentView`], at [`PatchLog.deinit`], or by the
+    /// [`PatchBuilder`] the diff walk hands it to, which takes the map **and
+    /// this allocator** over and grows it with neither the arena nor anything
+    /// else. A map from any other allocator is a mismatched free.
+    ///
+    /// **The keys stay the caller's.** A [`PathMap`] owns no keys, and this
+    /// log copies each one into the patch arena when it builds a path; see
+    /// [`PathMap`].
+    pub fn pathHint(self: *PatchLog, hint: PathMap) void {
         self.path_map.deinit(self.gpa);
         self.path_map = hint;
         self.path_hint = self.events.items.len;
@@ -2652,7 +3012,15 @@ pub const PatchLog = struct {
     ) MakeError!void {
         assertDoc(D);
         const clock: ?Clock = if (self.heads) |h| doc.clockAt(h) else null;
-        const path_map = self.getPathMap();
+        // **The seed is released here, on every path out, until the builder
+        // takes it.** `expose.insert` below can be refused and `getPathMap`
+        // moved the array out of the log, so in that window nothing else owns
+        // it. `self.gpa` is the right allocator because `getPathMap` hands back
+        // either the log's cached map or one handed in through
+        // [`PatchLog.pathHint`], which requires that allocator. The line after
+        // the builder exists empties this, so from there the builder owns it.
+        var path_map = self.getPathMap();
+        defer path_map.deinit(self.gpa);
         var expose: ExposeQueue = .init(self.gpa);
         defer expose.deinit();
         // **The queue is built from the log's `expose` set**, which is where
@@ -2662,7 +3030,11 @@ pub const PatchLog = struct {
         // ordered, which is what the pump below compares against.
         var pending = self.expose.iterator();
         while (pending.next()) |entry| try expose.insert(doc.idToExid(entry.key_ptr.*));
-        var builder: PatchBuilder(D) = .init(out, doc, path_map, clock, doc.textEncoding());
+        // **The builder takes the seed over, allocator and all**, so it is the
+        // one that frees it from here on. This local is emptied below the call
+        // so the `defer` above cannot free the same array a second time.
+        var builder: PatchBuilder(D) = .init(out, doc, path_map, self.gpa, clock, doc.textEncoding());
+        path_map = .{};
         defer builder.deinit();
         // **A stable sort, and the output order rests on it**: the events of
         // one object keep the order they were logged in (`patch_log.rs`:515-516`,
@@ -3904,6 +4276,142 @@ test "a delete that lands inside the insert before it takes the elements back ou
     try testing.expectEqual(@as(usize, 0), none.len());
 }
 
+test "PatchBuilder coalesced text deletion preserves supplementary scalar suffix in every encoding" {
+    // Delete the complete scalar span, not its individual encoded units.
+    // Upstream removes those units from its native-unit tree (`patch_builder.rs`:242-247).
+    const doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
+    for ([_]TextEncoding{
+        .utf8_code_unit, .utf16_code_unit, .unicode_code_point, .grapheme_cluster,
+    }) |enc| {
+        var out: Patches = .init(testing.allocator);
+        defer out.deinit();
+        var builder = PatchBuilder(TestDoc).init(
+            &out,
+            &doc,
+            .{},
+            testing.allocator,
+            null,
+            enc,
+        );
+        defer builder.deinit();
+        try builder.spliceText(.root, 7, "prefix😀suffix", null);
+        try builder.deleteSeq(.root, 7 + enc.width("prefix"), enc.width("😀"));
+        try testing.expectEqual(@as(usize, 1), builder.patches.items.len);
+        const action = builder.patches.items[0].action;
+        try testing.expect(action == .splice_text);
+        try testing.expectEqual(@as(usize, 7), action.splice_text.index);
+        try testing.expectEqualStrings("prefixsuffix", action.splice_text.value.asStr());
+    }
+}
+
+test "ConcreteTextValue single UTF16 unit deletion refuses a split surrogate atomically" {
+    // UTF-8 storage cannot represent one remaining half of a surrogate pair.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var value = try ConcreteTextValue.init(arena.allocator(), "prefix😀suffix", .utf16_code_unit);
+    const original = value.bytes;
+    try testing.expectError(error.InvalidCharacter, value.remove(6));
+    try testing.expect(value.bytes.ptr == original.ptr);
+    try testing.expectEqualStrings("prefix😀suffix", value.asStr());
+    try testing.expectError(error.InvalidCharacter, value.remove(7));
+    try testing.expect(value.bytes.ptr == original.ptr);
+    try testing.expectEqualStrings("prefix😀suffix", value.asStr());
+}
+
+test "ConcreteTextValue removeRange deletes complete scalar and grapheme spans in every encoding" {
+    // The encoded span includes both a supplementary scalar and a combining cluster.
+    for ([_]TextEncoding{
+        .utf8_code_unit, .utf16_code_unit, .unicode_code_point, .grapheme_cluster,
+    }) |enc| {
+        var value = try ConcreteTextValue.init(testing.allocator, "a😀e\u{301}z", enc);
+        defer value.deinit();
+        const old = value.bytes;
+        try value.removeRange(1, enc.width("😀e\u{301}"));
+        testing.allocator.free(old);
+        try testing.expectEqualStrings("az", value.asStr());
+    }
+}
+
+test "ConcreteTextValue removeRange refuses split encoded boundaries without mutation" {
+    // Refuse a split at either endpoint before publishing a replacement.
+    for ([_]TextEncoding{ .utf8_code_unit, .utf16_code_unit }) |enc| {
+        var value = try ConcreteTextValue.init(testing.allocator, "prefix😀suffix", enc);
+        defer value.deinit();
+        const original = value.bytes;
+        try testing.expectError(error.InvalidCharacter, value.removeRange(6, 1));
+        try testing.expect(value.bytes.ptr == original.ptr);
+        try testing.expectEqualStrings("prefix😀suffix", value.asStr());
+        try testing.expectError(error.InvalidCharacter, value.removeRange(7, enc.width("😀")));
+        try testing.expect(value.bytes.ptr == original.ptr);
+        try testing.expectEqualStrings("prefix😀suffix", value.asStr());
+    }
+}
+
+test "ConcreteTextValue removeRange allocation failure retains original bytes" {
+    // Fail exactly the replacement allocation, then prove one allocation suffices.
+    for ([_]TextEncoding{
+        .utf8_code_unit, .utf16_code_unit, .unicode_code_point, .grapheme_cluster,
+    }) |enc| {
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var value = try ConcreteTextValue.init(gpa, "prefix😀suffix", enc);
+        defer value.deinit();
+        const original = value.bytes;
+        failing.fail_index = failing.alloc_index;
+        try testing.expectError(
+            error.OutOfMemory,
+            value.removeRange(6, enc.width("😀")),
+        );
+        try testing.expect(value.bytes.ptr == original.ptr);
+        try testing.expectEqualStrings("prefix😀suffix", value.asStr());
+        failing.fail_index = std.math.maxInt(usize);
+        const allocation_index = failing.alloc_index;
+        try value.removeRange(6, enc.width("😀"));
+        gpa.free(original);
+        try testing.expectEqual(allocation_index + 1, failing.alloc_index);
+        try testing.expectEqualStrings("prefixsuffix", value.asStr());
+    }
+}
+
+test "ConcreteTextValue removeRange no-ops retain ownership and overshooting ends clamp" {
+    // A no-op must not allocate or hand the owning caller a buffer to free.
+    for ([_]TextEncoding{
+        .utf8_code_unit, .utf16_code_unit, .unicode_code_point, .grapheme_cluster,
+    }) |enc| {
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var value = try ConcreteTextValue.init(gpa, "prefix😀suffix", enc);
+        defer value.deinit();
+        const original = value.bytes;
+        failing.fail_index = failing.alloc_index;
+        try value.removeRange(7, 0);
+        try value.removeRange(value.len(), 1);
+        try value.removeRange(std.math.maxInt(usize), std.math.maxInt(usize));
+        try value.remove(std.math.maxInt(usize));
+        try testing.expect(value.bytes.ptr == original.ptr);
+        try testing.expectEqualStrings("prefix😀suffix", value.asStr());
+        failing.fail_index = std.math.maxInt(usize);
+        try value.removeRange(6, std.math.maxInt(usize));
+        gpa.free(original);
+        try testing.expectEqualStrings("prefix", value.asStr());
+        const last = value.bytes;
+        try value.removeRange(0, std.math.maxInt(usize));
+        gpa.free(last);
+        try testing.expectEqualStrings("", value.asStr());
+        const empty = value.bytes;
+        failing.fail_index = failing.alloc_index;
+        try value.removeRange(0, 1);
+        try testing.expect(value.bytes.ptr == empty.ptr);
+    }
+}
+
+test "ConcreteTextValue boundary decoder refuses truncated scalars without overreading" {
+    // Traversal must bound the exact decode slice, including code-point indexing.
+    for ([_]TextEncoding{ .unicode_code_point, .utf16_code_unit, .grapheme_cluster }) |enc| {
+        try testing.expectError(error.InvalidCharacter, byteOffset(enc, "\xF0\x9F", 1));
+    }
+}
+
 // ── 7. Determinism, and 8. nothing to say ───────────────────────────────────
 
 /// Fills `log` with the whole nine-variant script of test 3, so two of them
@@ -4410,7 +4918,7 @@ test "a transaction that made no ops takes its speculative actor back out" {
 
     // Committed with no ops: the document's actor table never grew, and the
     // log has to give the actor — and the event — back.
-    try log.finishTransaction(&.{fixture_actors[0]});
+    log.finishTransaction(&.{fixture_actors[0]});
     try testing.expect(log.speculative_actor == null);
     try testing.expectEqual(@as(usize, 1), log.actors.items.len);
     var after = try log.makePatches(TestDoc, &doc);
@@ -4421,7 +4929,7 @@ test "a transaction that made no ops takes its speculative actor back out" {
     // event (`patch_log.rs`:620-624`).
     try log.beginTransaction(&two_actors, 2, 1);
     log.putMap(.root, "b", .{ .scalar = sval("w") }, opId(3, 1), false, false);
-    try log.finishTransaction(&two_actors);
+    log.finishTransaction(&two_actors);
     var kept = try log.makePatches(TestDoc, &doc);
     defer kept.deinit();
     try expectPatches(gpa, &kept, &.{
@@ -4491,7 +4999,7 @@ test "makePatches reads completed, then the current view's events, then the loca
             .conflict = false,
         } },
     });
-    try log.recordLocal(&local);
+    log.commitLocal(try log.prepareLocal(&local));
 
     var patches = try log.makePatches(TestDoc, &doc);
     defer patches.deinit();
@@ -4500,6 +5008,185 @@ test "makePatches reads completed, then the current view's events, then the loca
         "root path=[] PutMap { key: \"b\", value: Str(\"second\"), obj: 2@0, conflict: false }",
         "root path=[] PutMap { key: \"c\", value: Str(\"third\"), obj: 3@0, conflict: false }",
     });
+}
+
+test "a delete of no elements changes nothing and traps on nothing" {
+    const gpa = testing.allocator;
+    const doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
+
+    var log: PatchLog = .active(gpa);
+    defer log.deinit();
+    log.splice(.root, 0, "abc", null);
+    // **A delete of nothing is a no-op.** This is not a hand-made shape: a
+    // text element whose value is the empty string has width zero under every
+    // encoding, and [`PatchLog.replaceSeq`] logs exactly that width
+    // (`opset/batch.zig:849` logs the same one).
+    log.deleteSeq(.root, 0, 0);
+
+    var patches = try log.makePatches(TestDoc, &doc);
+    defer patches.deinit();
+    // **One patch: the splice alone.** The delete reaches the builder's
+    // coalescing arm, where both arms test `index + length - 1`; at zero that
+    // underflows, so Debug and ReleaseSafe trap and the wrapping modes fall
+    // through and push a `DeleteSeq` carrying `length = 0`.
+    try testing.expectEqual(@as(usize, 1), patches.len());
+    try testing.expect(patches.slice()[0].action == .splice_text);
+}
+
+/// Records one mark and frees the log. The value has bytes of its own, so the
+/// run [`MarkRuns.add`] builds has two owned halves rather than one.
+fn recordOneMarkThenFree(gpa: Allocator) !void {
+    // **Borrowed, so the set outlives the call and is released here.** The
+    // names and the value are literals, which is what
+    // `MarkSet`'s borrow contract asks a test to pass.
+    var set: MarkSet = try MarkSet.fromPairs(gpa, &.{
+        .{ .name = "bold", .value = .{ .str = "yes" } },
+    });
+    defer set.deinit();
+    var log: PatchLog = .active(gpa);
+    defer log.deinit();
+    log.mark(.root, 0, 1, &set);
+    if (log.oom) return error.OutOfMemory;
+}
+
+test "a refused mark run frees the half it had already copied" {
+    // **A leak-failing allocator is the whole assertion.** The name is
+    // duplicated first and the value second; when the second is refused the
+    // first has no owner unless the insert released it, and a plain caller
+    // cannot see that difference any other way.
+    try testing.checkAllAllocationFailures(testing.allocator, recordOneMarkThenFree, .{});
+}
+
+/// A document whose root holds nothing, so the only way a nested object's
+/// path can be resolved is through the cache the caller seeded. The key is a
+/// literal, which is what [`PathMap`]'s borrow contract asks of a test.
+const unbacked_doc: TestDoc = .{
+    .objs = &.{
+        .{ .id = .root, .typ = .map },
+        .{ .id = .{ .id = OpId.init(2, 0) }, .typ = .map, .parent = .root },
+    },
+};
+
+/// Seeds `log`'s path cache with a map built by `gpa`, diffs through it, and
+/// frees everything.
+///
+/// **This is the route `DiffIter.log` hands over, and the seed arrives *after*
+/// the events it describes.** Every caller orders it that way — upstream runs
+/// the walk and only then calls `path_hint`
+/// ([`automerge.rs:1078-1079`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
+/// and the port's own two callers hand over what
+/// `src/iter/doc.zig`'s `DiffIter.log` returned the same way
+/// (`doc.zig`:6160`, `:6444`) — because it is load-bearing, not incidental:
+/// [`PatchLog.pathHint`] records the event count it was called at
+/// (`patch_log.rs`:667-670`) and [`PatchLog.getPathMap`] drops a map taken at
+/// any other one (`patch_log.rs`:497-503`). A seed offered before the event it
+/// is meant to resolve is a seed the walk never sees.
+///
+/// **The seed is built with an ordinary allocator, so `testing.allocator` is
+/// the whole assertion**: a builder that adopted it and released it through
+/// the patch arena would leave the array behind, and one that released it
+/// twice would be reported by the same allocator. The root document
+/// deliberately holds nothing, so the builder cannot fall back to walking the
+/// map and produce the same path — **without the seed there is no patch at
+/// all.**
+fn seededDiffThenFree(gpa: Allocator) !void {
+    var log: PatchLog = .active(gpa);
+    defer log.deinit();
+
+    log.putMap(internalObj(OpId.init(2, 0)), "k", .{ .scalar = sval("w") }, OpId.init(3, 0), false, false);
+
+    var hint: PathMap = .{};
+    try hint.put(gpa, .{
+        .obj = internalObj(OpId.init(2, 0)),
+        .prop = .{ .key = "child" },
+        .parent = .root,
+    });
+    log.pathHint(hint);
+
+    var patches = try log.makePatches(TestDoc, &unbacked_doc);
+    defer patches.deinit();
+    try testing.expectEqual(@as(usize, 1), patches.len());
+    // **And the key the caller handed over is the one in the patch**, which is
+    // the other half: a copy taken before the arena ever saw it.
+    try testing.expectEqualStrings("child", patches.slice()[0].path[0].prop.key);
+}
+
+test "seeded paths survive patch construction and allocation refusals" {
+    // Sweep each allocation after transferring the seed out of the log.
+    // The emitted path must retain its key, with no leaked or duplicate owner.
+    try testing.checkAllAllocationFailures(testing.allocator, seededDiffThenFree, .{});
+}
+
+/// Offers the log the same seed one event too early, and diffs through it.
+///
+/// **The other half of [`PatchLog.pathHint`]'s rule, and the one that owns the
+/// seed once it fires.** A map taken at an older event count describes a view
+/// this one is not, so [`PatchLog.getPathMap`] releases it before the walk
+/// (`patch_log.rs`:497-503`) rather than resolving a path against it. The
+/// root document holds nothing, so the walk finds no path either way and the
+/// stream is empty — **and the dropped array is still freed, through the
+/// allocator it was built with**, which is what `testing.allocator` says
+/// under every refusal.
+fn staleSeedThenFree(gpa: Allocator) !void {
+    var log: PatchLog = .active(gpa);
+    defer log.deinit();
+
+    var hint: PathMap = .{};
+    try hint.put(gpa, .{
+        .obj = internalObj(OpId.init(2, 0)),
+        .prop = .{ .key = "child" },
+        .parent = .root,
+    });
+    log.pathHint(hint);
+
+    log.putMap(internalObj(OpId.init(2, 0)), "k", .{ .scalar = sval("w") }, OpId.init(3, 0), false, false);
+
+    var patches = try log.makePatches(TestDoc, &unbacked_doc);
+    defer patches.deinit();
+    try testing.expectEqual(@as(usize, 0), patches.len());
+}
+
+test "a seed taken at an older event count is dropped, and released" {
+    // The stale branch of `getPathMap`, which no other test here reaches: every
+    // other seed arrives with the event count it was offered at.
+    try testing.checkAllAllocationFailures(testing.allocator, staleSeedThenFree, .{});
+}
+
+/// Records a local batch on a log that already holds one, and frees it. The
+/// staged half has to survive a refusal without publishing anything, and the
+/// infallible half has to attach what the fallible half copied.
+fn stageTwoLocalBatchesThenFree(gpa: Allocator) !void {
+    const doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
+
+    var first: Patches = .init(gpa);
+    defer first.deinit();
+    try first.items.append(first.allocator(), .{
+        .obj = .root,
+        .path = &.{},
+        .action = .{ .put_map = .{
+            .key = "a",
+            .value = .{ .scalar = sval("first") },
+            .obj = ExId.fromParts(1, 0).?,
+            .conflict = false,
+        } },
+    });
+
+    var log: PatchLog = .active(gpa);
+    defer log.deinit();
+    log.commitLocal(try log.prepareLocal(&first));
+
+    // A second batch, staged and abandoned: **nothing observable changes**, and
+    // the first batch is still the only one the stream carries.
+    var abandoned = try log.prepareLocal(&first);
+    abandoned.deinit();
+
+    var patches = try log.makePatches(TestDoc, &doc);
+    defer patches.deinit();
+    try testing.expectEqual(@as(usize, 1), patches.len());
+}
+
+test "a staged local batch that is abandoned publishes nothing" {
+    try testing.checkAllAllocationFailures(testing.allocator, stageTwoLocalBatchesThenFree, .{});
 }
 
 // ── test_mark_patches.rs ──────────────────────────────────────────────────────
@@ -4520,7 +5207,7 @@ const transmod = @import("transact.zig");
 test "mark_patches: a mark over the last character of a text object arrives as one mark patch" {
     const gpa = testing.allocator;
 
-    var doc1 = try docmod.Document.init(gpa, .auto);
+    var doc1 = try docmod.Document.init(gpa, std.testing.io, .auto);
     defer doc1.deinit();
     doc1.setActorId(.{ .bytes = "0123456789abcdef" });
     const text = try transmod.putObject(&doc1, .root, .{ .key = "text" }, .text);
@@ -4530,7 +5217,7 @@ test "mark_patches: a mark over the last character of a text object arrives as o
 
     const saved = try doc1.save(gpa);
     defer gpa.free(saved);
-    var doc2 = try docmod.Document.load(gpa, saved, doc1.textEncoding(), .auto);
+    var doc2 = try docmod.Document.load(gpa, std.testing.io, saved, doc1.textEncoding(), .auto);
     defer doc2.deinit();
 
     // `ExpandMark::After` upstream (`test_mark_patches.rs`:19`).
@@ -4593,7 +5280,7 @@ test "mark_patches: a mark over the last character of a text object arrives as o
 //   [`Document.diffIncremental`](doc.zig) reaches through `batch.zig`'s
 //   `applyChangesBatchToSink`.
 //
-// * **`PatchLog.recordLocal` is a port-only method, and the one place the port
+// * **`PatchLog.prepareLocal` is a port-only method, and the one place the port
 //   and upstream disagree about *where a local change's patches come from*.**
 //   Upstream's log holds *events*, written by `TransactionInner` at the moment
 //   it inserts each op
@@ -4609,7 +5296,7 @@ test "mark_patches: a mark over the last character of a text object arrives as o
 // * **That is what makes `makePatches` three lists where upstream's body is
 //   two** ([`patch_log.rs`:505-509](../../github-automerge-automerge/rust/automerge/src/patches/patch_log.rs)):
 //   `completed_patches`, then `make_current_patches`, and here
-//   `completed`, `events`, `local`. **It was `recordLocal` that replaced an
+//   `completed`, `events`, `local`. **It was `prepareLocal` that replaced an
 //   earlier `appendCompleted`, and the earlier one appended straight to
 //   `completed`** — which put a change committed under an isolation *ahead* of
 //   the transition that preceded it. `finishCurrentView` is not that door
@@ -4625,7 +5312,7 @@ test "mark_patches: a mark over the last character of a text object arrives as o
 //   one `Insert` of 31 values at `Id(3)`, `Id(5)`, … `Id(63)`. The **local**
 //   shape is a different stream — measured, 62 patches for the same change,
 //   one per op — and the port does not produce it. See
-//   [`PatchLog.recordLocal`].
+//   [`PatchLog.prepareLocal`].
 //
 // * **`PatchBuilder.seen` is keyed by `ExId` and `std.hash.autoHash` can no
 //   longer key it**, because the port's `ExId` has a variant that borrows an

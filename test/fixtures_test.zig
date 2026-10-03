@@ -10,6 +10,13 @@ const std = @import("std");
 const manifest = @import("fixtures/manifest.zig");
 
 const gpa = std.testing.allocator;
+
+/// The capability every read of the corpus below goes through.
+///
+/// **Explicit, because `std.Io.Dir` is handed one.** Nothing here reaches an
+/// ambient global, so a step that sets no working directory cannot read the
+/// corpus by accident. This file loads no document, so the capability a
+/// constructor would take is the same value rather than a second name for it.
 const io = std.testing.io;
 
 /// The corpus, relative to the process working directory. Tests run from the

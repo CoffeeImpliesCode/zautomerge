@@ -639,6 +639,10 @@ pub fn anonymize(document: &Automerge) -> Result<Automerge, AnonymizeError>
 - `List::apply` for `Insert` walks `values.into_iter().enumerate()` and uses `value.2` (the bool) as the conflict flag (`hydrate/list.rs:51-58`), matching `SequenceTree<(Value<'static>, ObjId, bool)>`.
 - `Text::apply` for `PutSeq` does `remove(index)` then `splice(index, new)` (`hydrate/text.rs:43-49`) — length changes if the replacement has a different encoded width.
 - Storage invariants: `hydrate::Map` is a `HashMap<String, MapValue>` (**unordered** — key order is not preserved through `apply_patches`); `hydrate::List` is a `SequenceTree<ListValue>` (ordered); `hydrate::Text` is a `ConcreteTextValue` plus a `HashMap<String, ScalarValue> marks` field that is **never written** — `Text::apply` `todo!()`s on `Mark`, so `marks` is always empty (`hydrate/text.rs:11-14`).
+- **Port contract:** `hydrate.Text.apply` applies `delete_seq` through one `ConcreteTextValue.removeRange`, then releases a replaced ordinary-owned buffer.
+  Encoding or allocation refusal leaves the whole deletion action unchanged.
+  Zero-length and out-of-range deletion retain the buffer.
+  `put_seq` remains a separate single-unit removal followed by insertion.
 - Object ids are discarded on the way in: `MapValue::new(value, _id, conflict)` (`hydrate/map.rs:78-82`), `List::push(value, _id, conflict)` (`hydrate/list.rs:105-107`), `ListValue::new(value, conflict)` (`hydrate/list.rs:127-133`).
 - `OpSet::hydrate_op` **panics** on any op that is not `Make` or `Put` (`hydrate.rs:288-303`, `_ => panic!("invalid op to hydrate")`).
 - `OpSet::hydrate_text` builds text via `self.text(obj, clock)` and therefore **loses all marks and all block objects** (`hydrate.rs:278-286`).
@@ -707,16 +711,24 @@ pub fn anonymize(document: &Automerge) -> Result<Automerge, AnonymizeError>
 
 ### Ownership and lifetimes
 
-- `'a` in `MapRangeItem<'a>`, `ListRangeItem<'a>`, `DocItem<'a>`, `MapRange<'a>`, `ListRange<'a>`, `Spans<'a>`, `Keys<'a>`, `Values<'a>` all mean "borrowed from the `&OpSet` / `&Automerge` the iterator was built from". In Zig this is a `*const OpSet` (or `*const Automerge`) plus any derived slices (`[]const u8`, `[]const T`) carried in the iterator struct. `Keys<'a>`/`Values<'a>` need no lifetime at all once the backing data is owned; the borrow is purely for soundness.
-- `into_owned()` on both range items (`iter/list_range.rs:30`, `iter/map_range.rs:31`) is the escape hatch: a Zig port should provide `intoOwned(self) ListRangeItem` that resolves `ExIdPromise` to a concrete `ExId` and `Cow<'a, str>` to an owned `[]const u8`.
+- Zig readers borrow the op set and any stored clock buffers. Keep both live until the walk ends.
+  A returned text span owns its buffer and can outlive the walk.
+  Its mark names and block-object promises still borrow the document.
+- `intoOwned` copies a range row's key, scalar payload, and successor data.
+  Its resolved object ids still borrow actor bytes. Keep the document live.
+- `DiffIter.log` transfers its path-map array. Free it with the walk's allocator or transfer it to `PatchLog.pathHint`.
+  The log requires the same allocator and retains the map's borrowed keys.
+- `PatchBuilder.init` consumes the map and retains its allocator for map growth and disposal.
+  The patch output arena is a separate resource. It owns the emitted patch payloads.
 - `ExIdPromise<'a>` (`iter/tools.rs:188-246`) is a hand-rolled deferred resolution: it holds either `&'a OpSet` + `OpId` or an already-resolved `ExId`, resolved on `exid()`. In Zig, either store `union(enum){ op_set: *const OpSet, exid: ExId }` and branch at resolve time, or resolve eagerly at construction. Eager is correct and cheaper; the deferred form only exists in Rust to avoid work on the common `op_id()` path.
 - `Arc<ExId>` in `DocObjItem.obj` (`iter/doc.rs:338`) is a refcounted, cheaply-clonable object id that the iterator re-creates only when the object changes (`iter/doc.rs:294-296`). In Zig: either an interned pointer (`*const ExId` owned by a document-level interner) or a small refcount. The pointer-equality check there is an optimization, not a semantic.
 - `Box<dyn OpQueryTerm<'a>>` inside `Values` (`iter/values.rs:10`) is a **trait object**. Zig has no trait objects; use a vtable struct `{ ptr: *anyopaque, nextFn: *const fn(*anyopaque) ?Op, getMarksFn: ..., rangeFn: ... }`, or — better — since there is exactly one concrete term (`TopOps`) constructed by `Automerge::values_for`, make `Values` hold a concrete `TopOps` and drop the `dyn` indirection entirely. That removes one heap allocation per `values()` call.
 
 ### Enums and unions
 
-- `Span`, `DocItem`, `PatchAction`, `Cursor`, `MoveCursor`, `CursorPosition`, `ExpandMark`, `Diff`, `MarkDiff`, `hydrate::Value` → Zig tagged unions (`union(enum) { ... }`). `PatchAction` is the largest (it embeds `SequenceTree<(Value, ObjId, bool)>` and `Vec<Mark>`); boxing the large payloads in a pointer variant keeps the union small. Note that `#[derive(PartialEq)]` on `PatchAction` (`patches/patch.rs:32`) is part of the public contract, so `std.meta.eql` must be deep — expect this to be a hot path in patch application.
-- `Diff` (`iter/tools.rs:611-616`) is a 3-variant fieldless enum → `enum { same, add, del }`. `MarkDiff` (`iter/spans.rs:291-297`) is `enum { nothing, after: *MarkSet, before: *MarkSet, diff: struct{ before: *MarkSet, after: *MarkSet } }` with `Arc` → refcounted pointers. The custom `PartialEq` with `Arc::ptr_eq` fast paths (`iter/spans.rs:299-313`) maps to comparing the refcount pointers before falling back to `std.meta.eql`.
+- Payload-bearing choices use `union(enum)`. Payload-free choices, including `ExpandMark` and `Diff`, use `enum`.
+  The port implements deep `PatchAction.eql` and the mark comparisons explicitly.
+  `std.meta.eql` does not replace a content comparison for slice payloads.
 - `ClockRange` (`clock.rs:75-78`, adjacent slice) is `Current(?Clock) | Diff(Clock, Clock)` → the same tagged union, referenced by `?*const Clock`.
 
 ### Iterators
@@ -738,13 +750,20 @@ pub fn anonymize(document: &Automerge) -> Result<Automerge, AnonymizeError>
 - `SpansActionValue` (`iter/spans.rs:56-59`) is a hand-rolled `Either` with an explicit `#[expect(clippy::large_enum_variant)]` at `:55`, and the source comment notes boxing "loses a few milliseconds on some iteration benchmarks" (`:54`). In Zig: `union(enum){ current: Unshift, diff: Unshift }`, both inline, for the same reason.
 - `DiffHook` (`text_diff/myers.rs:29-52`) is a trait with an **associated type** `type Error`. Zig equivalent: a vtable `{ equal, delete, insert, replace, finish, ptr }` where every hook returns `AutomergeError!void` directly — the associated type exists only so `TxHook` and `BlockDiffHook` can both use `AutomergeError`; collapsing it is strictly better.
 - `OpQueryTerm<'a>` (`op_set2/op_set/op_query.rs:14`) is a **private bound on a public type** (`Values`). This is a Rust-specific hazard: it makes `Values` unusable as a generic parameter outside the crate. Monomorphizing to `TopOps` removes the problem entirely.
-- `TextValue` (`text_value.rs:38,76,114,154`) is a trait with an associated type `Elem` (`u8`/`char`/`u16`/`String`) implemented four times over `SequenceTree<T>`. Zig: four concrete `TextValue` structs plus a `switch` on `TextEncoding` at each use site, or a comptime-generic `TextValue(comptime E: type)`.
+- `TextValue` (`text_value.rs:38,76,114,154`) has associated element types `u8`, `char`, `u16`, and `String` over separate `SequenceTree<T>` instances.
+  **Port decision:** `ConcreteTextValue` retains UTF-8 bytes and a runtime `TextEncoding`.
+  `removeRange` requires scalar or current grapheme boundaries and refuses split UTF-8/UTF-16 units without mutation.
+  Rust's trees retain native units (`text_value.rs:36,113,152`) and render incomplete units lossily (`:60-62`, `:137-139`).
+  The port does not preserve those incomplete units or stored grapheme segmentation.
+  Patch coalescing uses one span instead of Rust's repeated unit removals (`patches/patch_builder.rs:242-249`).
 - `Deref`/`DerefMut` on `hydrate::Map` (`hydrate/map.rs:92-102`) exposing the inner `HashMap<String, MapValue>` — there is no Zig operator overloading. Either expose the field publicly (matching the Rust behavior callers already rely on) or provide a full pass-through method set.
 
 ### Data structures
 
 - `HashMap` → `std.StringHashMap` (for `hydrate::Map`, `UpdateSpansConfig::per_mark_expands`) or `std.AutoHashMap` (for hot maps). `SmallHashMap<A,B> = HashMap<A,B,FxBuildHasher>` (`types.rs:19-20`) → `std.AutoHashMap` / `std.HashMapUnmanaged` with a fixed-seed hasher.
-- `BTreeMap<SmolStr, ScalarValue>` (`marks.rs:107`, `:64`) → `std.StringHashMap` would change **iteration order**. `MarkSet` iterates in sorted-key order and `MarkDiff::iter()` (`iter/spans.rs:342-386`) merges two iterators by key comparison assuming sorted order. Keeping `BTreeMap` semantics requires either `std.Treap`/`std.StringHashMap` + explicit sort on iteration, or a sorted `ArrayList` (marks sets are tiny — at most one entry per mark name — so a sorted array is faster in practice).
+- The port keeps mark entries sorted by name in an array.
+  This preserves the ordered merge used by mark diffs.
+  No measurement here compares this representation against a tree.
 - `BTreeSet<ExId>` (`ExposeQueue`, `patches/patch_log.rs:680`) and `BTreeMap<ObjId, IterType>` (`iter/doc.rs:55`) are used for **ordered** iteration semantics. `ExposeQueue` relies on `.first()` (smallest) and `>= obj` comparison (`patches/patch_log.rs:683-706`) — that is a min-heap/ordered-set operation, not a set operation. `iter/doc.rs` relies on `pop_first()` (min) for child traversal order. A `std.PriorityQueue(ExId, void, compare)` or a `std.Treap` is required; a hash map would silently change document iteration order.
 - `SequenceTree<T>` (B-tree, `sequence_tree.rs`) is the ordered-sequence primitive behind `hydrate::List` and `PatchAction::Insert`. A direct port is mechanical. Two hooks: `impl PartialEq` is O(n) (`sequence_tree.rs:471-478`) and `Debug` prints everything (`:529-537`) — in Zig use an `ArrayList` unwrapping for debug and keep `PartialEq` explicit.
 - `SmolStr` (`marks.rs`) → `[]const u8` with an inline small-string optimization, or just a plain slice plus a borrowed/owned union. Zig's `[]const u8` is the borrowed half; add an owned variant if the port must round-trip `Mark.name`.
@@ -776,7 +795,9 @@ pub fn anonymize(document: &Automerge) -> Result<Automerge, AnonymizeError>
 - **`std::iter::from_fn` with a closure state machine** (`iter/spans.rs:345-386`): a `Pop` enum + `move ||` closure capturing two `Peekable`s. In Zig: an explicit struct with the two cursors and the `Pop` tag as an enum field.
 - **`zip` + `take_while` + `rev`** in `common_prefix_len` / `common_suffix_len` (`text_diff/utils.rs:19-64`) — direct `while` loops, no allocation.
 - **GATs / `dyn` + associated types**: not present in this slice. `Send`/`Sync` bounds: not present in this slice. `no_std`: not present — the crate uses `std::sync::Arc`, `std::collections`, `std::io`, `std::fmt`.
-- **Allocator-generic (`impl Allocator`) plumbing**: the automerge crate takes no allocator parameter; every `Vec`/`String`/`HashMap` uses the global allocator. A Zig port must either thread an `Allocator` through every struct in this slice (a large mechanical change, since `SequenceTree`, `Map`, `List`, `Text`, `PatchLog`, `PatchBuilder`, `Anonymization` all own collections) or commit to the page allocator + an explicit arena. Recommend threading `std.mem.Allocator` — these types are long-lived and the `hydrate` tree in particular is per-document.
+- Native containers retain or receive an explicit `std.mem.Allocator`.
+  No native entry point uses a global or page allocator.
+  The C bridge is the fixed-ABI exception. Its allocation and release rules are in the shipped header.
 - **`#[derive(PartialEq)]` on `PatchAction` (`patches/patch.rs:32`)** and the hand-written `PartialEq` for `MarkDiff` (`iter/spans.rs:301-313`) and `NonDeletedMarks` (`marks.rs:441-450`) are semantic, not derived — each needs a deliberate Zig implementation.
 - **`prop_map` / `prop_filter_map` / `flat_map` / `peekable` / `collect` / `by_ref`** chains throughout the slice — all become explicit loops; there is no chaining sugar in Zig.
 - **`std::mem::take` / `mem::replace` / `mem::swap`** (`iter/tools.rs:49,55`; `patch_log.rs:505,506,555,562,578`; `sequence_tree.rs:57,262,329,352`) — `swap` and `replace` are one-liners; `take` needs a temporary or a `std.mem.Allocator`-aware `defer`.

@@ -78,9 +78,12 @@
 //!
 //! [`MarkIter`] owns a [`MarkStateMachine`](../../src/marks.zig), which holds
 //! an empty `ArrayList` and an empty `MarkSet` until a mark row arrives
-//! (`src/marks.zig:484-517`); [`NoMarkIter`] owns only the walk it was handed.
-//! Both are freed by the caller, and a long document's buffer is theirs rather
-//! than the caller's.
+//! (`src/marks.zig:484-517`), and [`MarkIter.deinit`] frees it. A long
+//! document's mark buffer is the fold's rather than the caller's.
+//! [`NoMarkIter`] owns only the walk it was handed and nothing else, so **it
+//! declares no `deinit` at all** and the teardown a caller writes for it is
+//! the inner walk's own. The pair is not interchangeable there: the uniform
+//! `defer x.deinit()` it invites compiles for one of the two only.
 
 const std = @import("std");
 const err = @import("../error.zig");
@@ -153,6 +156,10 @@ pub fn MarkIter(comptime I: type) type {
         /// Frees the fold's buffers and nothing else: the walk is the
         /// caller's, and its own storage is freed by the caller's own
         /// `deinit`.
+        ///
+        /// Once only. The free poisons the receiver, so a second call reads
+        /// undefined storage, and two copies of a walk that has folded rows
+        /// share one fold.
         pub fn deinit(self: *Self) void {
             self.marks.deinit();
             self.gpa = undefined;
@@ -253,8 +260,13 @@ pub fn MarkIter(comptime I: type) type {
 /// (`NoMarkIter`, `op_set2/op_set/marks.rs:55-88`).
 ///
 /// The same rows as [`MarkIter`], and `getMarks` is null for every one of them
-/// (`marks.rs:81-83`). It holds no fold, so it needs no allocator and `deinit`
-/// frees nothing.
+/// (`marks.rs:81-83`).
+///
+/// **It owns nothing, so it declares no `deinit`.** It holds the walk it was
+/// handed and nothing else, and there is no fold here to free. [`MarkIter`] is
+/// the adapter in this pair that has a `deinit` of its own, because the fold
+/// is what it owns, and a caller composing the two writes one teardown for the
+/// pair and it is the inner walk's.
 pub fn NoMarkIter(comptime I: type) type {
     return struct {
         const Self = @This();

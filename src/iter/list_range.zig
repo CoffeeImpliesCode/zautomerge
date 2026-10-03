@@ -13,8 +13,8 @@
 //! not**. That is the whole rule, and it is decided by the register the rows
 //! share: two rows belong to the same element when the `insert` column's
 //! running count is the same at both ([`insert_acc_range`], `op_set.rs:906-908`),
-//! and that count is what [`List.inserts`] carries. A row is a *put* when it
-//! hangs by another element ([`elemid_or_key`], `op.rs:1040-1046`), so an
+//! and that count is what [`ListEntry.inserts`] carries. A row is a *put* when
+//! it hangs by another element ([`elemid_or_key`], `op.rs:1040-1046`), so an
 //! overwritten element contributes one element, not two.
 //!
 //! Two concurrent inserts at the same position are **two elements, adjacent**,
@@ -133,14 +133,50 @@ const predates = maprange.predates;
 /// ([survey §`normalize_range`](../../docs/survey/05-iter-query-patch.md)), and
 /// a half-open pair of bounds cannot. `start` is inclusive; a null `end` is
 /// the end of the object.
+///
+/// # An inverted range is empty, and that is deliberate
+///
+/// **A range with `start > end` contains nothing**, so a caller that gets one
+/// — a `end` computed from a filtered count that came out below its `start` —
+/// reads **no elements at all**, indistinguishable from an empty object. There
+/// is **no error and no diagnostic**, and the cost is a **full walk of the
+/// object**: [`ListRange.next`] filters after diffing, as upstream does, so
+/// every row is read and every element's index computed before the range is
+/// asked about.
+///
+/// **Why silence rather than a refusal.** The range is a pair of plain
+/// integers with no invariant between them, upstream's `RangeBounds` has no
+/// ordered form to check, and a half-open window that names nothing is a
+/// coherent answer — the same answer an empty object gives. **A caller that
+/// wants the other answer has to ask for it**, and the route that validates
+/// does: the C bridge's `toRange` returns `error.InvalidRange` for
+/// `begin > end`, citing upstream's `format!("Invalid range [{}-{})"`
+/// ([`src/c/doc.zig`](../../src/c/doc.zig)), so a C consumer gets a diagnostic
+/// where a Zig consumer gets an empty read. **A range whose `start` is past the
+/// end of the object is the same case and is likewise silent** — an index no
+/// element ever reaches. The test "an empty sequence reads as nothing, and a
+/// range past its end reads as nothing" is the behavioural pin: it reads
+/// `.{ .start = 2, .end = 1 }` off a three-element list and answers `null`.
 pub const IndexRange = struct {
     /// The first index the reader answers, inclusive. Defaults to the head.
+    ///
+    /// **Not checked against `end`**, so a `start` above `end` is the empty
+    /// range described at the type's first section rather than an error.
     start: usize = 0,
     /// One past the last index the reader answers, or null for the end of the
     /// object.
+    ///
+    /// **Clamped by nothing and checked against nothing**: a value past the
+    /// object's length is the same as the end of the object, and a value below
+    /// `start` makes the range empty.
     end: ?usize = null,
 
-    /// The range `1..`, which is the whole object.
+    /// The whole object: the range `0..`, which is every element.
+    ///
+    /// **Index zero is not excluded.** `.{ .start = 0 }` is the whole object,
+    /// and a caller that wants to skip the first element passes
+    /// `.{ .start = 1 }` — upstream's `normalize_range` answers
+    /// `list_range(obj, 1..)` the same way (`list_range.rs:359-372`).
     pub fn all() IndexRange {
         return .{};
     }
@@ -148,6 +184,10 @@ pub const IndexRange = struct {
     /// Whether `index` is in the range. This is upstream's
     /// `Range::contains` at `list_range.rs:351`, which is what decides whether
     /// a diffed element is handed to the caller.
+    ///
+    /// **False for every index when `start > end`**, which is the half-open
+    /// window naming nothing — see the type's first section. A null `end` is
+    /// the end of the object and never fails this test.
     pub fn contains(self: IndexRange, index: usize) bool {
         if (index < self.start) return false;
         const end = self.end orelse return true;
@@ -160,27 +200,55 @@ pub const IndexRange = struct {
 /// One visible element of a sequence ([`ListRangeItem`],
 /// [`list_range.rs:14-20`](../../github-automerge-automerge/rust/automerge/src/iter/list_range.rs)).
 ///
-/// **The value is borrowed from the document** and is valid until the next
-/// mutation of it; [`ListRangeItem.intoOwned`] is the copy for a caller that
-/// has to hold one across a mutation.
+/// # The borrows, and their windows
+///
+/// **The value is the op set's, and is valid until the next mutation**: its
+/// payload is read out of the value column, which a splice rewrites.
+/// [`intoOwned`](ListRangeItem.intoOwned) is the copy for a caller that has to
+/// hold one across a mutation.
+///
+/// **The id is a second borrow**: resolving it reads the op set's actor table
+/// ([`ExIdPromise`]), and the [`ExId`] it produces holds **the actor's bytes**,
+/// which in a document are that document's arena ([`ExId.Named.actor`],
+/// `types.zig:280-288`). Neither [`intoOwned`](ListRangeItem.intoOwned) nor any
+/// other copy of this row releases it — the borrow survives the copy, so an
+/// owned element still has to be read while the document is alive.
+///
+/// **A sequence key is not a payload here.** The map reader's row carries the
+/// key out of the string table ([`MapRangeItem`]); this one carries no key,
+/// because an element is named by its index.
 pub fn ListRangeItem(comptime O: type) type {
     return struct {
         const Self = @This();
 
         /// Which visible element this is, counting from zero over the visible
         /// elements of the object (`list_range.rs:16`).
+        ///
+        /// **Counted over the elements the reader sees, not over rows**, and it
+        /// is what [`IndexRange`] filters on — which is why the filter is
+        /// applied after the diff.
         index: usize,
         /// The element's width in the document's text encoding
         /// (`list_range.rs:16` has no such field; see the module doc).
+        ///
+        /// Read from `index.text` on the register's **last** row, and zero for a
+        /// row with no width there (a mark, or a row that is not the winner).
         width: usize,
         /// The value a reader sees: a scalar, or a reference to an object
         /// (`list_range.rs:17`).
+        ///
+        /// **Borrowed out of the op set's value column**, so valid until the
+        /// next mutation of it; [`intoOwned`](ListRangeItem.intoOwned) is the
+        /// copy that outlives one.
         value: ValueRef,
         /// Whether the element's register holds more than one visible value
         /// (`list_range.rs:18`).
         conflict: bool,
         /// The row's id, and the op set that will turn it into an [`ExId`]
         /// (`list_range.rs:19`).
+        ///
+        /// **Both are borrowed**: the op set has to outlive this promise, and
+        /// the resolved [`ExId`] borrows the actor's bytes from it.
         maybe_exid: ExIdPromise(O),
 
         /// The row's op id, without resolving it
@@ -190,12 +258,37 @@ pub fn ListRangeItem(comptime O: type) type {
         }
 
         /// The row's [`ExId`] ([`ListRangeItem::id`](../../github-automerge-automerge/rust/automerge/src/iter/list_range.rs), `list_range.rs:27-29`).
+        ///
+        /// **The returned id borrows the op set's actor bytes**, and in a
+        /// document those are the document's arena
+        /// ([`ExId.Named.actor`](../../src/types.zig), `types.zig:280-288`), so
+        /// the op set — and so the document — has to outlive anything the
+        /// caller does with the id.
         pub fn id(self: *const Self) ExId {
             return self.maybe_exid.exid();
         }
 
         /// A copy that owns its value
         /// ([`ListRangeItem::into_owned`](../../github-automerge-automerge/rust/automerge/src/iter/list_range.rs), `list_range.rs:30-37`).
+        ///
+        /// # What survives a failure
+        ///
+        /// **Nothing.** The only reachable error is `error.OutOfMemory`, from
+        /// the one allocating step ([`ValueRef.intoOwned`](../../opset/types.zig)),
+        /// and it is the **last** fallible step before the item is built, so on
+        /// the error path the caller owns nothing and the row it passed in is
+        /// untouched. There is no partial copy to release and no key copy to
+        /// release, because this row has no key.
+        ///
+        /// # What the copy does *not* detach
+        ///
+        /// **`id` is still a borrow.** The copy resolves the promise and drops
+        /// the op set pointer, which is upstream's `into_owned`, but an [`ExId`]
+        /// is a counter plus **the actor's bytes** — in a document, that
+        /// document's arena ([`ExId.Named.actor`](../../src/types.zig),
+        /// `types.zig:280-288`). Nothing here copies or releases those bytes,
+        /// so an owned element still cannot outlive the document it was read
+        /// from; see [`OwnedListRangeItem`]'s field comment.
         pub fn intoOwned(self: Self, gpa: Allocator) !OwnedListRangeItem {
             return .{
                 .index = self.index,
@@ -210,20 +303,51 @@ pub fn ListRangeItem(comptime O: type) type {
 
 /// A [`ListRangeItem`] that owns its value
 /// ([`ListRangeItem<'static>`](../../github-automerge-automerge/rust/automerge/src/iter/list_range.rs), `list_range.rs:30`).
+///
+/// # "Owns its value" is the whole of what it owns
+///
+/// **`id` is not owned.** Upstream's `ExId::Id` holds an `ActorId` by value and
+/// its `ActorId` owns a `Vec<u8>` of actor bytes
+/// ([`exid.rs:17`](../../github-automerge-automerge/rust/automerge/src/exid.rs)),
+/// so `into_owned` has nothing to drop. The port's [`ExId`] **borrows** those
+/// bytes from whoever interned the actor ([`ExId.Named.actor`](../../src/types.zig),
+/// `types.zig:280-288`), and [`ListRangeItem.intoOwned`] resolves the promise
+/// without copying them — so an `OwnedListRangeItem` **still has to be read
+/// while the document is alive**, and neither
+/// [`deinit`](OwnedListRangeItem.deinit) nor any other call on this type
+/// releases or extends that borrow.
 pub const OwnedListRangeItem = struct {
     /// Which visible element this is.
     index: usize,
-    /// The element's width in the document's text encoding.
+    /// The element's width in the document's text encoding. A plain number, so
+    /// it outlives the document on its own.
     width: usize,
-    /// The value, owned.
+    /// The value, owned: a copy the caller frees with
+    /// [`deinit`](OwnedListRangeItem.deinit) and the same allocator
+    /// [`ListRangeItem.intoOwned`] was given.
     value: OwnedValueRef,
     /// Whether the element's register holds more than one visible value.
     conflict: bool,
     /// The row's id, already resolved.
+    ///
+    /// **Still borrowing the actor's bytes** from the document that interned
+    /// the actor — the type's first section. This is the one field
+    /// [`ListRangeItem.intoOwned`] does not detach and
+    /// [`deinit`](OwnedListRangeItem.deinit) does not release.
     id: ExId,
 
     /// Gives back every byte [`ListRangeItem.intoOwned`] allocated, and nothing
     /// this item borrowed.
+    ///
+    /// **Once, on the one owner, with the allocator the copy was taken with.**
+    /// The receiver is a pointer and the body ends in `self.* = undefined`, so a
+    /// second call reads undefined storage rather than freeing the value twice;
+    /// a **copy** carries those bytes but not the teardown, so deiniting both a
+    /// copy and the original is a double free. A *move* is fine.
+    ///
+    /// **The `id`'s actor bytes are not among the bytes this frees** — they
+    /// belong to the document, and a caller that outlives the document has to
+    /// keep its own copy of the actor (see the type's first section).
     pub fn deinit(self: *OwnedListRangeItem, gpa: Allocator) void {
         self.value.deinit(gpa);
         self.* = undefined;
@@ -232,29 +356,57 @@ pub const OwnedListRangeItem = struct {
 
 // ── The rows ────────────────────────────────────────────────────────────────
 
-/// One row of a sequence object's range ([`List`],
+/// One row of a sequence object's range ([`ListEntry`],
 /// [`list_range.rs:280-287`](../../github-automerge-automerge/rust/automerge/src/iter/list_range.rs)).
-const List = struct {
+///
+/// **`pub` and named, because a consumer cannot name the alternative.**
+/// [`ListIter.shiftNext`] and [`ListIter.seekTo`] return this row, and
+/// `pub const Rows` hands a caller a `ListIter`, so a caller that wants to hold
+/// one in a struct field or write it in a signature has to spell the type. The
+/// map reader's row is published for exactly this reason, as [`MapEntry`]
+/// ([`map_range.zig`](map_range.zig)); this is that type, under the name that
+/// matches.
+///
+/// **Not generic over the op set's row type**, and it needs no generic
+/// parameter: the four cursors it is read out of are all `OpSet`-independent.
+/// The one type here that does need the row type is [`ExIdPromise`], because it
+/// holds the op set.
+///
+/// **`value` is borrowed** out of the op set's value column, valid until the
+/// next mutation, and is the one payload here that can outlive the walk only
+/// through [`ListRangeItem.intoOwned`].
+pub const ListEntry = struct {
+    const Self = @This();
+
     /// How many inserts the `insert` column has counted through this row, and
     /// so **which element the row belongs to** (`list_range.rs:282`).
     inserts: i64,
     /// What the row does.
     action: Action,
-    /// The value it puts.
+    /// The value it puts, borrowed out of the op set's value column and valid
+    /// until the next mutation.
     value: ScalarValue,
-    /// The row's own id.
+    /// The row's own id — a counter and an actor *index*, so nothing here
+    /// borrows the actor table.
     id: OpId,
-    /// The row's position, absolute in the op set.
+    /// The row's position, absolute in the op set. The width read is keyed on
+    /// it, which is why the reader carries it.
     pos: usize,
 
     /// One row (`List::new`, `list_range.rs:289-299`).
-    fn init(
+    ///
+    /// **`pub`, because the walk's own constructors return this type** and a
+    /// caller that builds a row by hand has to name it. A row built here has
+    /// the same obligations as one read out of the walk: `value` borrows the
+    /// caller's own storage and `pos` must be a position in the same op set
+    /// the rest of the reader is reading.
+    pub fn init(
         inserts: i64,
         action: Action,
         value: ScalarValue,
         id: OpId,
         pos: usize,
-    ) List {
+    ) ListEntry {
         return .{ .inserts = inserts, .action = action, .value = value, .id = id, .pos = pos };
     }
 };
@@ -353,18 +505,18 @@ pub const ListIter = struct {
     /// **All four cursors move before any of them is read**, and the position
     /// is read after the null checks — see
     /// [`MapIter.shiftNext`](map_range.zig) for why the second half matters.
-    pub fn shiftNext(self: *ListIter, rows: RowRange) ReadError!?List {
+    pub fn shiftNext(self: *ListIter, rows: RowRange) ReadError!?ListEntry {
         const id = try self.id.shiftNext(rows);
         const inserts = try self.inserts.shiftNext(rows);
         const action = try self.action.shiftNext(rows);
         const value = try self.value.shiftNext(rows);
         if (id == null or inserts == null or action == null or value == null) return null;
-        return List.init(inserts.?.total(), action.?, value.?, id.?, self.id.pos() - 1);
+        return ListEntry.init(inserts.?.total(), action.?, value.?, id.?, self.id.pos() - 1);
     }
 
     /// Consumes through `at` and reads the row there, or null past the end of
     /// the window ([`seek_to`](../../github-automerge-automerge/rust/hexane/src/shift.rs), `shift.rs:65-74`).
-    pub fn seekTo(self: *ListIter, at: usize) ReadError!?List {
+    pub fn seekTo(self: *ListIter, at: usize) ReadError!?ListEntry {
         if (at < self.pos()) return null;
         return self.shiftNext(.{ .start = at, .end = self.maxPos() });
     }
@@ -403,8 +555,21 @@ pub fn ListDiffItem(comptime O: type) type {
         /// (`list_range.rs:195`).
         diff: Diff,
         /// The value as the *after* state sees it (`list_range.rs:196`).
+        ///
+        /// **A counter's total is folded with wrapping arithmetic**, the same
+        /// rule [`Op.fixCounter`](../opset/op.zig) materialises it with: a
+        /// counter is an `i64` and its increments are summed modulo 2^64, so a
+        /// counter that overflows the width wraps rather than trapping. `inc`
+        /// below is folded the same way.
         value: ValueRef,
         /// The net counter change over the range, or zero (`list_range.rs:197`).
+        ///
+        /// **`after - before`, folded with the same wrapping subtraction**
+        /// ([`Op.fixCounter`](../opset/op.zig)): each side is a sum of the
+        /// increments its clock covers, and their difference wraps on the width
+        /// too. Increments that are all positive make this a plain difference;
+        /// a decrement, or a clock pair that is not nested, is where the wrap
+        /// shows. Zero on every non-counter row.
         inc: i64,
         /// Which visible element this is (`list_range.rs:198`).
         index: usize,
@@ -532,16 +697,34 @@ pub fn ListDiff(comptime O: type) type {
         /// without reading it (`list_range.rs:43`).
         iter: tools.Unshift(Walk),
         /// Which visible element the next `next` is (`list_range.rs:44`).
+        ///
+        /// **Counted over visible elements, not rows**: a mark's element has
+        /// width zero and still advances it (`list_range.rs:166-169`). Reset to
+        /// zero by [`shiftNext`](ListDiff.shiftNext), because the next range is
+        /// a different object whose first element is element zero.
         index: usize = 0,
-        /// Which two states, or which one, the diff is between (`list_range.rs:45`).
+        /// Which two states, or which one, the diff is between
+        /// (`list_range.rs:45`).
+        ///
+        /// **A borrowed copy of the caller's clocks.** [`ClockRange`] holds up
+        /// to two [`Clock`](../../src/clock.zig) values, each a `[]u32` plus the
+        /// allocator that allocated it, and this walk reads through them on
+        /// every row. **This type never frees them**, so the caller's clocks
+        /// have to outlive the reader; a `Clock.deinit` while a diff built from
+        /// it is still being read leaves the reader walking released counters.
         clock: ClockRange,
         /// The object's rows, which is what bounds the width lookup
         /// ([`OpSet.elemidAt`](../../opset/op_set.zig)).
+        ///
+        /// **Clamped once here and re-clamped at every shift** — its `end` half
+        /// is what keeps the width read inside the object, which is why
+        /// [`shiftNext`](ListDiff.shiftNext) re-clamps where the map reader's
+        /// [`MapRange.shiftNext`](map_range.zig) does not.
         rows: RowRange,
 
         /// The walk this instantiation is
         /// ([`ListDiff::new`](../../github-automerge-automerge/rust/automerge/src/iter/list_range.rs), `list_range.rs:48-65`).
-        pub const Walk = tools.DiffKernel(List, ListIter, opset.OpSet(O).Visible);
+        pub const Walk = tools.DiffKernel(ListEntry, ListIter, opset.OpSet(O).Visible);
         /// The rows the walk reads, one per visible row.
         pub const Rows = ListIter;
 
@@ -550,6 +733,14 @@ pub fn ListDiff(comptime O: type) type {
         ///
         /// **The window is clamped once, here**; see
         /// [`MapDiff.init`](map_range.zig) for why.
+        ///
+        /// **`set` and `over` are both borrowed.** The op set has to outlive
+        /// the reader, and so do the clocks inside `over`: this stores the
+        /// `ClockRange` by value and never frees it, so **a `Clock.deinit`
+        /// while this reader is still being walked leaves it reading released
+        /// counters** (see the `clock` field). A read of the present is
+        /// `.{ .current = null }`, which holds no clock and so nothing to keep
+        /// alive.
         pub fn init(set: *opset.OpSet(O), rows: RowRange, over: ClockRange) ReadError!Self {
             const window = column.clampRange(rows, set.len());
             const walk = Walk.init(
@@ -611,15 +802,22 @@ pub fn ListDiff(comptime O: type) type {
                 }
 
                 // `list_range.rs:135-141`, the same counter arithmetic the map
-                // reader does at `map_range.rs:255-265`.
+                // reader does at `map_range.rs:255-265` — including the
+                // wrapping: `-%` and `+%`, modulo 2^64 on the `i64`, which is
+                // how [`Op.fixCounter`](../opset/op.zig) materialises a counter
+                // and how the map reader folds the same two sums. Upstream adds
+                // and subtracts with checked operators, which trap on an
+                // overflow in a checked build; a counter whose increments
+                // overflow the width is a corrupt document, and a read is not
+                // where that should be reported.
                 var value: ValueRef = undefined;
                 switch (list.value) {
                     .counter => |c| {
                         const d = try set.getIncrementDiffAtPos(list.pos, self.clock);
-                        state.inc = d.after - d.before;
+                        state.inc = d.after -% d.before;
                         value = ValueRef.fromActionValue(
                             list.action,
-                            .{ .counter = ScalarValue.Counter.init(c.current + d.after) },
+                            .{ .counter = ScalarValue.Counter.init(c.current +% d.after) },
                         );
                     },
                     else => {
@@ -703,9 +901,14 @@ fn elementWidth(
 }
 
 /// The diff kernel a list range is built on: one row per visible row, tagged
-/// with what happened to it.
+/// with what happened to it ([`tools.DiffKernel`], `iter/tools.rs:528-608`).
+///
+/// **The kernel's row type is [`ListEntry`], published for the reason the map
+/// reader's [`MapEntry`](map_range.zig) is.** It is the same declaration as
+/// [`ListDiff.Walk`], at the same two type parameters; this is the name a
+/// caller reaches for when it wants the kernel without a diff around it.
 pub fn ListWalk(comptime O: type) type {
-    return tools.DiffKernel(List, ListIter, opset.OpSet(O).Visible);
+    return tools.DiffKernel(ListEntry, ListIter, opset.OpSet(O).Visible);
 }
 
 /// A sequence object's visible elements, one at a time ([`ListRange`],
@@ -713,18 +916,42 @@ pub fn ListWalk(comptime O: type) type {
 ///
 /// Constructing one allocates nothing: four column cursors, a skipper and a
 /// lookahead, all of them values over storage the op set already holds.
+///
+/// **It owns nothing and has no `deinit`.** Everything it holds is borrowed —
+/// the op set and the clock behind [`ListDiff`] — and the walks read the op set's
+/// shared successor buffer, so a second reader over one op set needs its own
+/// buffer sized with
+/// [`opiter.maxSuccCount`](../opset/op_iter.zig) (the same rule
+/// [iter/doc.zig](doc.zig) states for the readers built here).
 pub fn ListRange(comptime O: type) type {
     return struct {
         const Self = @This();
 
-        /// The diff this reader is a view of.
+        /// The diff this reader is a view of, and so where its borrowed clocks
+        /// are kept.
         iter: ListDiff(O),
         /// Which indices the caller asked for (`list_range.rs:258`).
+        ///
+        /// **Kept as given and never re-validated.** An inverted range is the
+        /// empty read [`IndexRange`] documents, not an error — see its first
+        /// section.
         range: IndexRange,
 
         /// The reader over the object's `rows`, as the states `clock` names see
         /// them, restricted to `range`
         /// ([`ListRange::new`](../../github-automerge-automerge/rust/automerge/src/iter/list_range.rs), `list_range.rs:324-335`).
+        ///
+        /// **`clock` is borrowed, and `null` is the present.** It is a
+        /// [`Clock`] by value — a `[]u32` plus the allocator that allocated it
+        /// ([`Clock.init`](../../src/clock.zig)) — and the reader reads through
+        /// it on every row, so **the caller's clock has to outlive the reader**:
+        /// a `Clock.deinit` while this reader is still being walked leaves it
+        /// reading released counters. `null` sees every operation the op set
+        /// holds; a non-null clock bounds the read to the operations it covers.
+        ///
+        /// **`range` is not checked here either** — it is stored and applied by
+        /// [`next`](ListRange.next) after the diff, which is the only place an
+        /// element's index is known.
         pub fn init(
             set: *opset.OpSet(O),
             obj_rows: RowRange,
@@ -744,6 +971,16 @@ pub fn ListRange(comptime O: type) type {
         /// index is only known once the elements before it have been counted,
         /// so a range that starts past the end of the object still walks every
         /// row ([survey §`ListRange`](../../docs/survey/05-iter-query-patch.md)).
+        ///
+        /// **Three things follow from that, and they are the ones a caller
+        /// gets wrong.** An element outside `range` is *skipped*, not a reason to
+        /// stop; an **inverted** range therefore walks the whole object and
+        /// answers `null` ([`IndexRange`]'s first section); and the element this
+        /// returns is **borrowed** — see [`ListRangeItem`]'s first section for
+        /// the two borrows it carries and which of them survives a mutation.
+        ///
+        /// **Null is the end of the object's elements**, and an element every
+        /// row of which has been deleted is not an element and yields nothing.
         pub fn next(self: *Self) ReadError!?ListRangeItem(O) {
             while (true) {
                 const item = (try self.iter.next()) orelse return null;
@@ -755,6 +992,16 @@ pub fn ListRange(comptime O: type) type {
         /// Repositions the reader onto `rows` and reads the first element in
         /// the requested range
         /// ([`ListRange::shift_next`](../../github-automerge-automerge/rust/automerge/src/iter/list_range.rs), `list_range.rs:337-342`).
+        ///
+        /// **The index goes back to zero and the window is re-clamped**, because
+        /// the next range is a different object whose first element is element
+        /// zero, and because `rows.end` is what bounds the width read. This is
+        /// the same pair of steps [`ListDiff.shiftNext`] takes, and the map
+        /// reader's [`MapRange.shiftNext`](map_range.zig) needs only the first
+        /// because it has no width to bound.
+        ///
+        /// A range that starts behind the cursor is `error.InvalidValue`; a
+        /// range past the end answers `null`.
         pub fn shiftNext(self: *Self, rows: RowRange) ReadError!?ListRangeItem(O) {
             try self.iter.iter.shift(rows);
             self.iter.index = 0;
@@ -1457,6 +1704,102 @@ test "a five-element list with one register written twice reads five elements, t
     // **The winner is the later operation of the register**, which is the row
     // the reader reported and not the one that came first in it.
     try testing.expectEqual(opId(8, 1), got.items[3].opId());
+}
+
+test "an element's counter wraps rather than trapping when its total overflows i64" {
+    const gpa = testing.allocator;
+    const list = made(1, 0);
+    // **The stored value is `i64`'s maximum and the covered increment is one**,
+    // so `current + after` is one past the width — the same overflow the map
+    // reader folds, and the same answer. Upstream adds with a checked operator
+    // (`list_range.rs:135-141`) and traps there in a checked build; this folds
+    // the total the way [`Op.fixCounter`](../opset/op.zig) materialises one,
+    // modulo 2^64, so a corrupt counter cannot stop the process.
+    const bumped = [_]opmod.SuccEntry{.{ .id = opId(3, 0), .inc = 1 }};
+    const doc = try Fixture.build(gpa, &.{actor_a}, &.{
+        row(opId(1, 0), .root, .{ .map = "l" }, false, .make_list, .null_value, &.{}),
+        row(
+            opId(2, 0),
+            list,
+            head(),
+            true,
+            .set,
+            .{ .counter = ScalarValue.Counter.init(std.math.maxInt(i64)) },
+            &bumped,
+        ),
+        // **The increment is a row of its own**, the same shape the map
+        // reader's fixture has and for the same reason: the index only takes
+        // one off the counter's successor count when the increment's own
+        // operation is processed (`index.rs:196-203`), and that count is what
+        // `IndexBuilder.flush` scans for the register's winner. An edge with
+        // no row behind it would leave the element a row no register wins.
+        row(opId(3, 0), list, anchored(opId(2, 0)), false, .increment, .{ .int = 1 }, &.{}),
+    });
+    defer doc.destroy();
+
+    var got = try readAll(&doc.set, list, gpa, null);
+    defer got.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), got.items.len);
+    try expectValue(got.items[0].value, .{
+        .scalar = .{ .counter = ScalarValue.Counter.init(std.math.minInt(i64)) },
+    });
+}
+
+test "an element's net counter change wraps when the diff's two clocks are concurrent" {
+    const gpa = testing.allocator;
+    const list = made(1, 0);
+    // **Two concurrent increments on one element's counter** — one at `i64`'s
+    // maximum and one at -2 — and a diff whose two states do not nest: the
+    // before state has seen the first, the after state the second. That is what
+    // a diff of two concurrent heads is, and `-2 - (2^63 - 1)` is one past the
+    // bottom of the width. Each side is summed one edge at a time without
+    // overflowing, so the wrap is this subtraction's and not the sums'.
+    const concurrent = [_]opmod.SuccEntry{
+        .{ .id = opId(3, 0), .inc = std.math.maxInt(i64) },
+        .{ .id = opId(4, 1), .inc = -2 },
+    };
+    const doc = try Fixture.build(gpa, &.{ actor_a, actor_b }, &.{
+        row(opId(1, 0), .root, .{ .map = "l" }, false, .make_list, .null_value, &.{}),
+        row(
+            opId(2, 0),
+            list,
+            head(),
+            true,
+            .set,
+            .{ .counter = ScalarValue.Counter.init(0) },
+            &concurrent,
+        ),
+        // **The two increments, one row per edge.** A row aiming at `seq(2, 0)`
+        // without inserting is the *same register* as the insert that made
+        // that element — a register is named by the element it hangs by, not
+        // by the id of the row ([`Op.elemidOrKey`](../opset/op.zig),
+        // `op.rs:1040-1046`) — which is what makes these this element's
+        // increments rather than elements of their own.
+        row(opId(3, 0), list, anchored(opId(2, 0)), false, .increment, .{ .int = std.math.maxInt(i64) }, &.{}),
+        row(opId(4, 1), list, anchored(opId(2, 0)), false, .increment, .{ .int = -2 }, &.{}),
+    });
+    defer doc.destroy();
+
+    var before = try Clock.init(gpa, 2);
+    defer before.deinit();
+    _ = before.include(0, 3);
+    var after = try Clock.init(gpa, 2);
+    defer after.deinit();
+    _ = after.include(1, 4);
+
+    var diff = try ListDiff(opmod.Op).init(&doc.set, try doc.set.scopeToObj(list), .{
+        .diff = .{ .before = before, .after = after },
+    });
+    const item = (try diff.next()) orelse return error.TestExpectedItem;
+
+    // **The after clock has not seen actor 0 at all**, so the element is gone
+    // from the after state and the row is tagged as its removal; a diff still
+    // reports the counter it carried.
+    try testing.expectEqual(Diff.del, item.diff);
+    // `-(2^63) - 1` has the same bits as `2^63 - 1`.
+    try testing.expectEqual(@as(i64, std.math.maxInt(i64)), item.inc);
+    try expectValue(item.value, .{ .scalar = .{ .counter = ScalarValue.Counter.init(-2) } });
+    try testing.expect((try diff.next()) == null);
 }
 
 // Zig 0.16.0 / upstream / Rust / port

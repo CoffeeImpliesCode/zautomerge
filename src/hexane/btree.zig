@@ -83,7 +83,9 @@ pub const SlabAgg = struct {
     /// The weight operations the tree needs. The generic core calls only
     /// these; it never inspects a field of `SlabAgg`.
     pub const Aggregate = struct {
+        /// The weight of no slabs at all: the identity of `merge`.
         pub const identity: SlabAgg = .zero;
+        /// The weight of two adjacent spans, left before right.
         pub fn merge(l: SlabAgg, r: SlabAgg) SlabAgg {
             if (l.len == 0) return r;
             if (r.len == 0) return l;
@@ -96,9 +98,11 @@ pub const SlabAgg = struct {
                 .max_offset = @max(l.max_offset, l.total + r.max_offset),
             };
         }
+        /// How many column rows the weight covers.
         pub fn itemCount(a: SlabAgg) usize {
             return a.len;
         }
+        /// Whether two weights describe the same span.
         pub fn eql(a: SlabAgg, b: SlabAgg) bool {
             return a.len == b.len and a.total == b.total and
                 a.min_offset == b.min_offset and a.max_offset == b.max_offset;
@@ -179,8 +183,11 @@ pub fn Tree(comptime A: type) type {
         /// top-down walk reads it instead of descending first
         /// (`btree.rs:226-230`).
         const ChildSlot = struct {
+            /// Child node id in this tree's arena.
             id: NodeId,
+            /// Cached aggregate of the child's subtree.
             agg: A,
+            /// Number of slabs in the child's subtree.
             slab_count: usize,
         };
 
@@ -192,7 +199,9 @@ pub fn Tree(comptime A: type) type {
         };
 
         const Node = union(enum) {
+            /// Owned slab weights in logical order.
             leaf: std.ArrayList(A),
+            /// Owned child summaries in logical order.
             internal: std.ArrayList(ChildSlot),
         };
 
@@ -213,16 +222,23 @@ pub fn Tree(comptime A: type) type {
         /// The slab a positional search landed in, and the item count
         /// strictly before it (`btree.rs:1192-1227`).
         pub const PositionalHit = struct {
+            /// Zero-based index of the containing slab.
             slab: usize,
+            /// Number of items strictly before that slab.
             items_before: usize,
         };
 
+        /// Retained allocation provider; must remain live and must not be
+        /// replaced independently of the arena.
         gpa: std.mem.Allocator,
         /// The arena. A `null` slot is a freed node, which is also on
         /// `free`.
         nodes: std.ArrayList(?Node),
+        /// Reusable ids whose corresponding arena slots are null.
         free: std.ArrayList(NodeId),
+        /// Live root node id. Arena ids are not stable across mutation.
         root: NodeId,
+        /// Number of logical slabs, equal to the sum of the leaf lengths.
         total_slabs: usize,
 
         /// A tree with one empty leaf root and no slabs. The root leaf is
@@ -234,7 +250,37 @@ pub fn Tree(comptime A: type) type {
             return .{ .gpa = gpa, .nodes = nodes, .free = .empty, .root = 0, .total_slabs = 0 };
         }
 
-        /// Frees every node still held and the arena itself.
+        /// Copies the arena and every node buffer into `gpa`, preserving node
+        /// ids, free slots and cached weights without recomputing aggregates.
+        /// The caller owns the result and must call `deinit` exactly once.
+        /// Weights are copied by value, as in `fromSlice`; any references
+        /// inside `A` remain borrowed. Failure leaves `self` unchanged.
+        /// Time and storage are proportional to the arena and its entries.
+        pub fn clone(self: *const Self, gpa: std.mem.Allocator) std.mem.Allocator.Error!Self {
+            var result: Self = .{
+                .gpa = gpa,
+                .nodes = .empty,
+                .free = .empty,
+                .root = self.root,
+                .total_slabs = self.total_slabs,
+            };
+            errdefer result.deinit();
+            try result.nodes.ensureTotalCapacity(gpa, self.nodes.items.len);
+            try result.free.appendSlice(gpa, self.free.items);
+            for (self.nodes.items) |slot| {
+                const copied: ?Node = if (slot) |entry| switch (entry) {
+                    .leaf => |items| .{ .leaf = try copyOf(gpa, A, items.items) },
+                    .internal => |items| .{ .internal = try copyOf(gpa, ChildSlot, items.items) },
+                } else null;
+                result.nodes.appendAssumeCapacity(copied);
+            }
+            return result;
+        }
+
+        /// Frees every node buffer, the arena and the free-slot list with
+        /// the retained allocator, then poisons `self`. Exactly once; a
+        /// shallow copy is not a second owner. Does not release `gpa` or
+        /// references stored inside the copied weights.
         pub fn deinit(self: *Self) void {
             for (self.nodes.items) |*slot| {
                 if (slot.* == null) continue;

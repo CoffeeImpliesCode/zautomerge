@@ -229,26 +229,60 @@ pub fn predates(over: ClockRange, id: OpId) bool {
 /// One key of a map, as a reader sees it ([`MapRangeItem`],
 /// [`map_range.rs:13-20`](../../github-automerge-automerge/rust/automerge/src/iter/map_range.rs)).
 ///
-/// **The key is borrowed from the document's string table** and is valid until
-/// the next mutation of it. [`MapRangeItem.intoOwned`] is the copy for a
-/// caller that has to hold one across a mutation.
+/// # The borrows, and their windows
+///
+/// **The key is the document's own interned bytes**, resolved out of the
+/// string table the op set borrows ([`MapIter.key_str`](map_range.zig);
+/// upstream's `Option<String>` column is an interned id here, which is what
+/// makes [`MapIter`] carry a table). Interning **copies into an arena that only
+/// grows** ([`Strings.intern`](../../doc.zig), `doc.zig:287-296`), so **a key is
+/// valid for as long as the string table, and so for a document for as long as
+/// the document** — a later mutation does not move it. The test in
+/// [src/read.zig](../../read.zig), "a map key is the document's own bytes, and
+/// a mutation does not move them", is what pins that.
+///
+/// **The value is the op set's, and is valid until the next mutation**: its
+/// payload is read out of the value column, which a splice rewrites.
+/// [`intoOwned`](MapRangeItem.intoOwned) is the copy for a caller that has to
+/// hold either across a mutation — and it copies the key too, because a key
+/// held past the string table's own life would be the other half of the same
+/// problem.
+///
+/// **The id is a third borrow**: resolving it reads the op set's actor table
+/// ([`ExIdPromise`]), and the [`ExId`] it produces holds **the actor's bytes**,
+/// which in a document are that document's arena ([`ExId.Named.actor`],
+/// `types.zig:280-288`). Neither [`intoOwned`](MapRangeItem.intoOwned) nor any
+/// other copy of this row releases it — the borrow survives the copy, so an
+/// owned row still has to be read while the document is alive.
 pub fn MapRangeItem(comptime O: type) type {
     return struct {
         const Self = @This();
 
-        /// The key the register hangs by (`map_range.rs:15`).
+        /// The key the register hangs by (`map_range.rs:15`), **borrowed from
+        /// the string table** and valid for as long as that table — see the
+        /// type's first section.
         key: []const u8,
         /// The value a reader sees: a scalar, or a reference to an object
         /// (`map_range.rs:16`).
+        ///
+        /// **A payload borrowed out of the op set's value column**, so valid
+        /// until the next mutation of it; [`intoOwned`](MapRangeItem.intoOwned)
+        /// is the copy that outlives one.
         value: ValueRef,
         /// Whether the register holds more than one visible value
         /// (`map_range.rs:17`).
         conflict: bool,
         /// The row the winner was read from, absolute in the op set
         /// (`map_range.rs:18`).
+        ///
+        /// The row's own position, not an index into this walk, and it is what
+        /// the increment read is keyed on.
         pos: usize,
         /// The row's id, and the op set that will turn it into an [`ExId`]
         /// (`map_range.rs:19`).
+        ///
+        /// **Both are borrowed**: the op set has to outlive this promise, and
+        /// the resolved [`ExId`] borrows the actor's bytes from it.
         maybe_exid: ExIdPromise(O),
 
         /// The row's op id, without resolving it
@@ -258,12 +292,40 @@ pub fn MapRangeItem(comptime O: type) type {
         }
 
         /// The row's [`ExId`] ([`MapRangeItem::id`](../../github-automerge-automerge/rust/automerge/src/iter/map_range.rs), `map_range.rs:26-28`).
+        ///
+        /// **The returned id borrows the op set's actor bytes**, and in a
+        /// document those are the document's arena
+        /// ([`ExId.Named.actor`](../../src/types.zig), `types.zig:280-288`), so
+        /// the op set — and so the document — has to outlive anything the
+        /// caller does with the id. Resolving costs a walk of the actor table,
+        /// which is why [`opId`](MapRangeItem.opId) exists for a caller that
+        /// only needs to compare rows.
         pub fn id(self: *const Self) ExId {
             return self.maybe_exid.exid();
         }
 
         /// A copy that owns its key and its value
         /// ([`MapRangeItem::into_owned`](../../github-automerge-automerge/rust/automerge/src/iter/map_range.rs), `map_range.rs:30-39`).
+        ///
+        /// # What survives a failure
+        ///
+        /// **Nothing.** The only reachable error is
+        /// `error.OutOfMemory`, and the copy is **failure-atomic**: the key is
+        /// duped first and `errdefer` releases it immediately, before the one
+        /// other fallible step ([`ValueRef.intoOwned`](../../opset/types.zig)),
+        /// so on the error path the caller owns nothing at all and the row it
+        /// passed in is untouched.
+        ///
+        /// # What the copy does *not* detach
+        ///
+        /// **`id` is still a borrow.** The copy resolves the promise and drops
+        /// the op set pointer, which is upstream's
+        /// `into_owned`, but an [`ExId`] is a counter plus **the actor's bytes**
+        /// — in a document, that document's arena
+        /// ([`ExId.Named.actor`](../../src/types.zig), `types.zig:280-288`).
+        /// Nothing here copies or releases those bytes, so an owned row still
+        /// cannot outlive the document it was read from; see
+        /// [`OwnedMapRangeItem`]'s field comment.
         pub fn intoOwned(self: Self, gpa: Allocator) !OwnedMapRangeItem {
             const key = try gpa.dupe(u8, self.key);
             errdefer gpa.free(key);
@@ -285,20 +347,52 @@ pub fn MapRangeItem(comptime O: type) type {
 /// `'static` item is dropped; a borrowed slice cannot be dropped, so the copy
 /// and the free travel together here, as they do for
 /// [`ChangeMetadata.intoOwned`](../../src/change.zig).
+///
+/// # "Owns its key and its value" is the whole of what it owns
+///
+/// **`id` is not owned.** Upstream's `ExId::Id` holds an `ActorId` by value and
+/// its `ActorId` owns a `Vec<u8>` of actor bytes
+/// ([`exid.rs:17`](../../github-automerge-automerge/rust/automerge/src/exid.rs)),
+/// so `into_owned` has nothing to drop. The port's [`ExId`] **borrows** those
+/// bytes from whoever interned the actor ([`ExId.Named.actor`](../../src/types.zig),
+/// `types.zig:280-288`), and [`MapRangeItem.intoOwned`] resolves the promise
+/// without copying them — so an `OwnedMapRangeItem` **still has to be read while
+/// the document is alive.** Reading `item.id`'s actor bytes after
+/// `Document.deinit` reads released memory, and neither
+/// [`deinit`](OwnedMapRangeItem.deinit) nor any other call on this type
+/// releases or extends that borrow.
 pub const OwnedMapRangeItem = struct {
-    /// The key, owned.
+    /// The key, owned: a copy the caller frees with
+    /// [`deinit`](OwnedMapRangeItem.deinit) and the same allocator
+    /// [`MapRangeItem.intoOwned`] was given.
     key: []u8,
-    /// The value, owned.
+    /// The value, owned, and freed the same way.
     value: OwnedValueRef,
     /// Whether the register holds more than one visible value.
     conflict: bool,
     /// The row the winner was read from.
     pos: usize,
     /// The row's id, already resolved.
+    ///
+    /// **Still borrowing the actor's bytes** from the document that interned
+    /// the actor — the type's first section. This is the one field
+    /// [`MapRangeItem.intoOwned`] does not detach and
+    /// [`deinit`](OwnedMapRangeItem.deinit) does not release.
     id: ExId,
 
     /// Gives back every byte [`MapRangeItem.intoOwned`] allocated, and nothing
     /// this item borrowed.
+    ///
+    /// **Once, on the one owner, with the allocator the copy was taken with.**
+    /// The receiver is a pointer and the body ends in `self.* = undefined`, so a
+    /// second call reads undefined storage rather than freeing `key` and the
+    /// value twice; a **copy** carries those bytes but not the teardown, so
+    /// deiniting both a copy and the original is a double free. A *move* is
+    /// fine.
+    ///
+    /// **The `id`'s actor bytes are not among the bytes this frees** — they
+    /// belong to the document, and a caller that outlives the document has to
+    /// keep its own copy of the actor (see the type's first section).
     pub fn deinit(self: *OwnedMapRangeItem, gpa: Allocator) void {
         gpa.free(self.key);
         self.value.deinit(gpa);
@@ -316,6 +410,12 @@ pub const OwnedMapRangeItem = struct {
 /// cursors it is read out of are all `OpSet`-independent. The one type here
 /// that does need the row type is [`ExIdPromise`], because it holds the op
 /// set.
+///
+/// **Both payloads are borrowed out of the op set this was read from**: `key`
+/// is the string table's own bytes (valid for as long as the table — see
+/// [`MapRangeItem`]'s first section) and `value` is a slice of the value column
+/// (valid until the next mutation). A row that has to outlive either goes
+/// through [`MapRangeItem.intoOwned`] after [`MapDiffItem.exportItem`].
 pub const MapEntry = struct {
     const Self = @This();
 
@@ -557,13 +657,28 @@ pub fn MapDiffItem(comptime O: type) type {
 
         /// What happened to the row between the two states (`map_range.rs:44`).
         diff: Diff,
-        /// The key the row hangs by, borrowed (`map_range.rs:45`).
+        /// The key the row hangs by, borrowed from the string table
+        /// (`map_range.rs:45`); see [`MapRangeItem`]'s first section for the
+        /// window.
         key: []const u8,
         /// The value as the *after* state sees it: a counter already carries
         /// every increment the range adds (`map_range.rs:46`).
+        ///
+        /// **A counter's total is folded with wrapping arithmetic**, the same
+        /// rule [`Op.fixCounter`](../opset/op.zig) materialises it with: a
+        /// counter is an `i64` and its increments are summed modulo 2^64, so a
+        /// counter that overflows the width wraps rather than trapping.
+        /// `inc` below is folded the same way.
         value: ValueRef,
         /// The net counter change over the range, or zero for a non-counter
         /// (`map_range.rs:47`).
+        ///
+        /// **`after - before`, folded with the same wrapping subtraction**
+        /// ([`Op.fixCounter`](../opset/op.zig)): each side is a sum of the
+        /// increments its clock covers, and their difference wraps on the width
+        /// too. Increments that are all positive make this a plain difference;
+        /// a decrement, or a clock pair that is not nested, is where the wrap
+        /// shows.
         inc: i64,
         /// Whether the register is conflicted *after* this row
         /// (`map_range.rs:48`).
@@ -636,7 +751,15 @@ pub fn MapDiff(comptime O: type) type {
         /// The lookahead over the diff, so the next row can be asked about
         /// without reading it (`map_range.rs:218`).
         iter: tools.Unshift(DiffWalk(O)),
-        /// Which two states, or which one, the diff is between (`map_range.rs:219`).
+        /// Which two states, or which one, the diff is between
+        /// (`map_range.rs:219`).
+        ///
+        /// **A borrowed copy of the caller's clocks.** [`ClockRange`] holds up
+        /// to two [`Clock`](../../src/clock.zig) values, each a `[]u32` plus the
+        /// allocator that allocated it, and this walk reads through them on
+        /// every row. **This type never frees them**, so the caller's clocks
+        /// have to outlive the reader; a `Clock.deinit` while a diff built from
+        /// it is still being read leaves the reader walking released counters.
         clock: ClockRange,
 
         /// The walk this instantiation is
@@ -653,6 +776,14 @@ pub fn MapDiff(comptime O: type) type {
         /// ([`visible.zig:408-419`](../../opset/visible.zig)); clamping here
         /// means every one of them sees the same window, and a caller that has
         /// clamped already pays for it once.
+        ///
+        /// **`set` and `over` are both borrowed.** The op set has to outlive
+        /// the reader, and so do the clocks inside `over`: this stores the
+        /// `ClockRange` by value and never frees it, so **a `Clock.deinit`
+        /// while this reader is still being walked leaves it reading released
+        /// counters** (see the `clock` field). A read of the present is
+        /// `.{ .current = null }`, which is a `ClockRange` holding no clock and
+        /// so nothing to keep alive.
         pub fn init(set: *opset.OpSet(O), rows: RowRange, over: ClockRange) ReadError!Self {
             const window = column.clampRange(rows, set.len());
             const walk = DiffWalk(O).init(
@@ -718,15 +849,26 @@ pub fn MapDiff(comptime O: type) type {
                 // the *after* state puts on it, and the net change over the
                 // range is reported beside it; every other value is the
                 // row's own.
+                //
+                // **Wrapping arithmetic, both halves, and that is the point.**
+                // `getIncrementDiffAtPos` answers two sums of increments; this
+                // subtracts them and adds one to the row's stored value.
+                // Upstream uses checked operators there (`map_range.rs:255-265`),
+                // which trap on an overflow in a checked build; the port folds
+                // every counter the way [`Op.fixCounter`](../opset/op.zig)
+                // materialises one — `+%` and `-%`, i.e. modulo 2^64 on the
+                // `i64` — because a counter whose increments overflow the width
+                // is a corrupt document and there is no value to report. A read
+                // must not be the thing that traps on it.
                 var value: ValueRef = undefined;
                 var inc: i64 = 0;
                 switch (map.value) {
                     .counter => |c| {
                         const d = try set.getIncrementDiffAtPos(map.pos, self.clock);
-                        inc = d.after - d.before;
+                        inc = d.after -% d.before;
                         value = ValueRef.fromActionValue(
                             map.action,
-                            .{ .counter = ScalarValue.Counter.init(c.current + d.after) },
+                            .{ .counter = ScalarValue.Counter.init(c.current +% d.after) },
                         );
                     },
                     else => value = ValueRef.fromActionValue(map.action, map.value),
@@ -836,21 +978,50 @@ pub fn VisibleDiffSkipper(comptime O: type) type {
 ///
 /// Constructing one allocates nothing: four column cursors, a skipper and a
 /// lookahead, all of them values over storage the op set already holds.
+///
+/// **It owns nothing and has no `deinit`.** Everything it holds is borrowed —
+/// the op set and the clock behind [`MapDiff`] — and the walks read the op set's
+/// shared successor buffer, which is why [iter/doc.zig](doc.zig) says of the
+/// readers built here that one may be live at a time (a reader that needs two
+/// sizes its own buffer with
+/// [`opiter.maxSuccCount`](../opset/op_iter.zig)).
 pub fn MapRange(comptime O: type) type {
     return struct {
         const Self = @This();
 
-        /// The diff this reader is a view of.
+        /// The diff this reader is a view of, and so where its borrowed clocks
+        /// are kept.
         iter: MapDiff(O),
 
         /// The reader over `rows`, as the states `clock` names see them
         /// ([`MapRange::new`](../../github-automerge-automerge/rust/automerge/src/iter/map_range.rs), `map_range.rs:204-208`).
+        ///
+        /// **`clock` is borrowed, and `null` is not "no clock".** It is a
+        /// [`Clock`] by value — a `[]u32` plus the allocator that allocated it
+        /// ([`Clock.init`](../../src/clock.zig)) — and the reader reads through
+        /// it on every row, so **the caller's clock has to outlive the reader**:
+        /// a `Clock.deinit` while this reader is still being walked leaves it
+        /// reading released counters. **`null` is the present**, which is
+        /// upstream's `Option::None` here too: a read of the current state sees
+        /// every operation the op set holds, while a non-null clock bounds the
+        /// read to the operations it covers.
         pub fn init(set: *opset.OpSet(O), rows: RowRange, clock: ?Clock) ReadError!Self {
             return .{ .iter = try MapDiff(O).init(set, rows, .{ .current = clock }) };
         }
 
         /// The next key, as a reader sees it
         /// ([`Iterator::next` for `MapRange`](../../github-automerge-automerge/rust/automerge/src/iter/map_range.rs), `map_range.rs:99-103`).
+        ///
+        /// **The row it returns is borrowed**, in all three of its payloads —
+        /// the key out of the string table, the value out of the value column
+        /// and the actor bytes behind the id. See [`MapRangeItem`]'s first
+        /// section for which window each has, and
+        /// [`MapRangeItem.intoOwned`] for the copy that detaches two of the
+        /// three.
+        ///
+        /// **Null is the end of the object's rows**, and a register whose rows
+        /// are all deleted yields no row at all rather than an empty one — that
+        /// is the same rule [keys.zig](keys.zig) states for a key walk.
         pub fn next(self: *Self) ReadError!?MapRangeItem(O) {
             const item = (try self.iter.next()) orelse return null;
             return item.exportItem(self.iter.op_set);
@@ -858,6 +1029,15 @@ pub fn MapRange(comptime O: type) type {
 
         /// Repositions the reader onto `rows` and reads the first key in it
         /// ([`MapRange::shift_next`](../../github-automerge-automerge/rust/automerge/src/iter/map_range.rs), `map_range.rs:210-212`).
+        ///
+        /// **The window is not re-clamped here, and
+        /// [`ListRange.shiftNext`](list_range.zig) does clamp.** The clamp the
+        /// list reader has to redo is the one that bounds its width read, and
+        /// this reader has no width; a map shift only repositions four column
+        /// cursors, each of which clamps itself to the op set.
+        ///
+        /// A range that starts behind the cursor is
+        /// `error.InvalidValue`; a range past the end answers `null`.
         pub fn shiftNext(self: *Self, rows: RowRange) ReadError!?MapRangeItem(O) {
             try self.iter.iter.shift(rows);
             return self.next();
@@ -1592,6 +1772,109 @@ test "a row with no key string ends a map walk rather than yielding a row" {
     try testing.expect((try scoped.next()) == null);
 }
 
+test "a counter whose after-state total overflows i64 wraps rather than trapping" {
+    const gpa = testing.allocator;
+    // **The stored value is `i64`'s maximum and the covered increment is one**,
+    // so `current + after` is one past the width. Upstream adds with a checked
+    // operator (`map_range.rs:255-265`) and traps there in a checked build; the
+    // port folds a counter's total the way `Op.fixCounter` materialises one
+    // ([`op.zig:2065`](../opset/op.zig)), modulo 2^64, so the read answers the
+    // wrapped value. **A corrupt counter must not be the thing that stops the
+    // process**, and a reader that traps cannot report anything at all.
+    const bumped = [_]opmod.SuccEntry{.{ .id = opId(2, 0), .inc = 1 }};
+    const doc = try Fixture.build(gpa, &.{actor_a}, &.{
+        row(
+            opId(1, 0),
+            .root,
+            .{ .map = "n" },
+            .set,
+            .{ .counter = ScalarValue.Counter.init(std.math.maxInt(i64)) },
+            &bumped,
+        ),
+        // **The increment is a row of its own, and the edge is only half of
+        // it.** `bumped` names the operation that increments this counter;
+        // this is that operation. An increment is a document operation like
+        // any other ([`Op.isInc`](../opset/op.zig), `op.rs:1122-1124`), and
+        // the edge's amount only becomes real when the increment arrives:
+        // [`indexmod.IndexBuilder.processOp`](../opset/index.zig) looks the
+        // edge up by the increment's own id and, finding it, writes
+        // `index.inc` **and takes one off the predecessor's successor count**
+        // (`index.rs:196-203`). That count is what
+        // [`indexmod.IndexBuilder.flush`] scans for a zero to decide the
+        // register's winner, so a fixture that declared the edge and stopped
+        // there would leave the counter a row no register ever wins, and the
+        // read would answer nothing at all.
+        row(opId(2, 0), .root, .{ .map = "n" }, .increment, .{ .int = 1 }, &.{}),
+    });
+    defer doc.destroy();
+
+    // Read at the present, so every increment is covered and `after` is the
+    // whole of them (`visibleAfter` on a null clock is "yes to everything",
+    // `op_set.zig:4598-4601`).
+    var got = try readAll(&doc.set, gpa, null);
+    defer got.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), got.items.len);
+    try expectValue(got.items[0].value, .{
+        .scalar = .{ .counter = ScalarValue.Counter.init(std.math.minInt(i64)) },
+    });
+}
+
+test "a counter's net change wraps when the after clock's increments underflow it" {
+    const gpa = testing.allocator;
+    // **Two concurrent increments on one counter** — one at `i64`'s maximum,
+    // one at -2 — and a diff between two states that **do not nest**: the
+    // before state has seen the first, the after state the second. That is
+    // what a diff of two concurrent heads is (`before` and `after` are
+    // independent clocks, `op_set.zig:4586-4602`), and `-2 - (2^63 - 1)` is
+    // one past the bottom of the width. Each side is summed without
+    // overflowing — that is `getIncrementDiffAtPos`, which sums one edge at a
+    // time — so the wrap is this subtraction's and not the sums'.
+    const concurrent = [_]opmod.SuccEntry{
+        .{ .id = opId(2, 0), .inc = std.math.maxInt(i64) },
+        .{ .id = opId(3, 1), .inc = -2 },
+    };
+    const doc = try Fixture.build(gpa, &.{ actor_a, actor_b }, &.{
+        row(
+            opId(1, 0),
+            .root,
+            .{ .map = "n" },
+            .set,
+            .{ .counter = ScalarValue.Counter.init(0) },
+            &concurrent,
+        ),
+        // **The two increments, one row per edge**, in the order the edges are
+        // written. They have to be rows for the amounts on the edges to mean
+        // anything (`index.rs:196-203`), and their own ids stay ascending
+        // because two actors' rows in one register interleave by operation id
+        // — rule **R3**, `op.rs:1056-1057`, the rule every other register's
+        // rows obey.
+        row(opId(2, 0), .root, .{ .map = "n" }, .increment, .{ .int = std.math.maxInt(i64) }, &.{}),
+        row(opId(3, 1), .root, .{ .map = "n" }, .increment, .{ .int = -2 }, &.{}),
+    });
+    defer doc.destroy();
+
+    var before = try Clock.init(gpa, 2);
+    defer before.deinit();
+    _ = before.include(0, 2);
+    var after = try Clock.init(gpa, 2);
+    defer after.deinit();
+    _ = after.include(1, 3);
+
+    var diff = try MapDiff(opmod.Op).init(&doc.set, try doc.root(), .{
+        .diff = .{ .before = before, .after = after },
+    });
+    const item = (try diff.next()) orelse return error.TestExpectedItem;
+
+    // **The after clock has not seen actor 0 at all**, so the register is gone
+    // from the after state and the row is tagged as its removal — a diff still
+    // reports the counter the row carried.
+    try testing.expectEqual(Diff.del, item.diff);
+    // `-(2^63) - 1` has the same bits as `2^63 - 1`.
+    try testing.expectEqual(@as(i64, std.math.maxInt(i64)), item.inc);
+    try expectValue(item.value, .{ .scalar = .{ .counter = ScalarValue.Counter.init(-2) } });
+    try testing.expect((try diff.next()) == null);
+}
+
 // Zig 0.16.0 / upstream / Rust / port
 //
 // * **The forward shift works, and it is the one line `map_range.rs:210-212`
@@ -1601,13 +1884,14 @@ test "a row with no key string ends a map walk rather than yielding a row" {
 //   row order" walks a root and a child map, reads the root's first key,
 //   shifts onto the child's own rows and reads the child's key.
 //   **Every assertion in it is an index into one expected sequence, because
-//   this reader does not sort** — the note at `iter/map_range.zig:1486-1490`
-//   is a warning that a contents-only equality passes on a reader that
+//   this reader does not sort** — the note in the test "a map read at one state
+//   and at another differs" (`map_range.zig:1353-1356`) is a warning that a
+//   contents-only equality passes on a reader that
 //   answers the same three keys in some other order. Perturbations: dropping
 //   the reposition fails it *and* "a map range walks its object's keys, and a
 //   shift behind the cursor is refused"; landing one row past the range the
 //   caller named fails it alone, with `error.TestExpectedItem` at
-//   `map_range.zig:1399`.
+//   `map_range.zig:1579`.
 //
 // * **A reader over a window spanning several objects cannot reposition
 //   inside that window, and that is upstream's limitation, faithfully

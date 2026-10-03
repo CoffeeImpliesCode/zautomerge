@@ -140,7 +140,9 @@ pub const deflate_min_size: usize = 256;
 /// `none` is what `save_nocompress` selects (`automerge.rs:1179-1185`) and
 /// copies the body verbatim; `threshold` deflates every column whose length
 /// is at least the value, and is the only variant that reaches
-/// `document/compression.rs`.
+///
+/// Copying this is copying a number, so a copy is independent and either may
+/// be read from another thread.
 pub const CompressConfig = union(enum) {
     /// Every column is written as it stands, with the DEFLATE bit clear.
     none,
@@ -162,6 +164,12 @@ pub const CompressConfig = union(enum) {
 /// unchanged. Nothing here is owned by the value: the actor slices and the
 /// head hashes borrow the body, and the two `RawColumns` own only their
 /// column lists.
+///
+/// Copying this is copying a view: the copy shares the two column lists and
+/// everything they borrow, so it must not outlive the body those index, and
+/// freeing the two lists twice is a double free. Nothing here is mutated by
+/// the writer, so a copy may be read from another thread while the original
+/// lives.
 pub const DocumentBlock = struct {
     /// The actor table, in the order the actor indices name it. A document's
     /// actors are sorted (`document.rs:204-205`), because the indices in the
@@ -220,6 +228,11 @@ pub const DocumentBlock = struct {
 /// hold point into the *caller's* body, so the body must outlive the
 /// `Document`; the rebuilt body, when there is one, is owned here and the
 /// column data points into it.
+///
+/// **Copying this copies an owner.** A copy holds the same rebuilt body, the
+/// same actor, head and head-index arrays and the same two column lists, so
+/// exactly one copy may be torn down. Nothing here is mutated after the parse
+/// returns, so the value may be read from another thread while it lives.
 pub const Document = struct {
     /// The document's contents, as they are after the DEFLATE pass: no
     /// column carries the DEFLATE bit, whatever the body said.
@@ -284,10 +297,21 @@ pub const Document = struct {
         return self.block.ops.bytesFor(spec);
     }
 
-    /// The body the columns index into: the rebuilt one when a column was
+    /// The bytes the columns index into: the rebuilt body when a column was
     /// deflated, and the caller's own bytes otherwise. These are the bytes a
-    /// writer reproduces, and what `chunk.checksumOf(.document, .)` is taken
-    /// over.
+    /// writer reproduces, and for a document with no deflated column they are
+    /// the ones `chunk.checksumOf(.document, .)` is taken over.
+    ///
+    /// **For a document that had a deflated column they are not those.** The
+    /// checksum a chunk header carries is taken over the body *as written*,
+    /// which for a `CompressConfig.threshold` write is the deflated body
+    /// (`writeChunk` frames `rewritten.bytes`, not `body.items`), and
+    /// `chunk.parseChunk` verifies the stored checksum against exactly those
+    /// deflated bytes. This method hands back the inflated body, so
+    /// `checksumOf(.document, doc.body())` matches the header only when
+    /// `inflated` is null — that is, only when no column reached the threshold.
+    /// A caller that recomputes a document chunk's checksum has to deflate the
+    /// body itself, or use the bytes the chunk was read from.
     pub fn body(self: Document) []const u8 {
         return self.inflated orelse self.borrowed;
     }
@@ -319,8 +343,13 @@ pub const Document = struct {
         return true;
     }
 
-    /// Frees the rebuilt body, the two column lists and the three arrays.
-    /// The caller's own bytes are left alone.
+    /// Frees the rebuilt body, the two column lists and the three arrays. The
+    /// caller's own bytes are left alone.
+    ///
+    /// After this the struct is poisoned, not emptied: `self.*` is set to
+    /// undefined, so reading any field afterwards is a use of undefined memory.
+    /// One call per value, and — because a copy is a second owner — one call per
+    /// copy.
     pub fn deinit(self: *Document, gpa: Allocator) void {
         if (self.inflated) |rebuilt| gpa.free(rebuilt);
         gpa.free(self.block.actors);
@@ -778,25 +807,44 @@ pub fn parseFramedChunk(c: chunk.Chunk, gpa: Allocator) ParseError!Document {
 ///
 /// The inverse of `parseDocumentChunk` for a block that was written this way:
 /// the same actors, the same heads, the same columns in the same order with
-/// the same bytes, and the same head indexes. No column is deflated, which
-/// this module asserts rather than writes: a column with the DEFLATE bit set
-/// is a column the reader has already inflated, and writing it back verbatim
-/// would make the body's length depend on a flag the writer does not own.
+/// the same bytes, and the same head indexes.
 ///
 /// `RawColumns.init` has already dropped the columns with no bytes, so
 /// `len()` is the count of columns the block will name and a descriptor is
 /// written for each of them.
+///
+/// **Refused, all `ParseError`, and in every optimize mode.** These are real
+/// returns rather than `std.debug.assert`s, so a caller that assembles a
+/// `DocumentBlock` by hand is told rather than left to write a body no reader
+/// accepts:
+///
+/// * a column carrying the DEFLATE bit, and a specification that is less than
+///   the one before it — both `error.InvalidColumnSpec`;
+/// * a specification equal to the one before it — `error.DuplicateColumn`;
+/// * a head-index list that is neither empty nor one index per head —
+///   `error.UnexpectedEnd` when it is short, `error.TrailingBytes` when it is
+///   long, which are the two answers [`parseDocumentChunk`] gives for the body
+///   each of those would have produced.
+///
+/// **No head indexes at all is allowed**, whatever the head count. The suffix
+/// is optional in the format (`document.rs:131-135`), so an empty list is the
+/// older writer's rendering and the reader accepts it back with zero indexes.
 pub fn writeBody(
     out: *std.ArrayList(u8),
     gpa: Allocator,
     block: DocumentBlock,
-) Allocator.Error!void {
+) ParseError!void {
     _ = try writeBodyLayout(out, gpa, block);
 }
 
 /// The body a document chunk carries, without the framing. Owned by the
 /// caller. See `writeBody`.
-pub fn encodeBody(gpa: Allocator, block: DocumentBlock) Allocator.Error![]u8 {
+///
+/// The refusals are the same and arrive in the same order. A body assembled
+/// here is discarded when one of them fires, so a failed call returns the error
+/// and nothing else; the partial body `writeBody` appends as it goes is the
+/// only thing a caller reusing one buffer can be left holding.
+pub fn encodeBody(gpa: Allocator, block: DocumentBlock) ParseError![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     try writeBody(&out, gpa, block);
@@ -851,7 +899,7 @@ fn writeBodyLayout(
     out: *std.ArrayList(u8),
     gpa: Allocator,
     block: DocumentBlock,
-) Allocator.Error!Layout {
+) ParseError!Layout {
     // The prefix: a count, then per actor a uleb128 length and that many
     // bytes; then a count, then 32 raw bytes per head (`document.rs:208-220`).
     try leb128.appendUnsigned(out, gpa, block.actors.len);
@@ -879,6 +927,19 @@ fn writeBodyLayout(
     // The suffix: one uleb128 per head index (`document.rs:233-235`). A
     // document with no indexes writes none, which is what a body written by
     // an older implementation held (`document.rs:131-135`).
+    //
+    // **Zero indexes and one index per head are the only two bodies the
+    // suffix can spell, and the writer refuses the rest.** The reader reads
+    // exactly `heads.len()` values whenever anything is left after the op
+    // data, and none at all when nothing is (`document.rs:131-136`), so a
+    // partial list is a body this module's own reader refuses — one that stops
+    // inside the suffix, and one that leaves bytes past it. The two errors are
+    // the ones that reader would have reported for the body this would have
+    // emitted, so a caller sees the answer before the bytes exist.
+    if (block.head_indexes.len != 0 and block.head_indexes.len != block.heads.len) {
+        if (block.head_indexes.len < block.heads.len) return error.UnexpectedEnd;
+        return error.TrailingBytes;
+    }
     for (block.head_indexes) |index| try leb128.appendUnsigned(out, gpa, index);
 
     return .{
@@ -892,37 +953,50 @@ fn writeBodyLayout(
 /// Appends one column metadata block: the column count, then per column its
 /// specification and the length of its bytes (`raw_column.rs:258-268`).
 ///
-/// The columns go out in the order `RawColumns` holds them, which
-/// `RawColumns.init` and every `FromIterator` require to be ascending by
-/// normalized specification (`raw_column.rs:248-253`). That is a property of
-/// the set the caller built, so it is asserted rather than sorted: a
-/// descending body is one no reader of this format accepts, and a silent
-/// wrong document is worse than a failed build.
+/// The columns go out in the order `RawColumns` holds them, and that order is
+/// checked rather than sorted. It is a property of the caller's set, which is
+/// not this function's to rearrange: a descending body is one no reader of
+/// this format accepts (`raw_column.rs:248-253`), and a silent wrong document
+/// is worse than a failed write.
+///
+/// **The refusals are real errors, not assertions.** The three names are the
+/// ones [`parseDocumentChunk`] reports for the same three blocks, so the writer
+/// refuses exactly what this module's reader refuses and says the same thing:
+///
+/// * `error.InvalidColumnSpec` — a column carrying the DEFLATE bit, which the
+///   reader has already inflated (`raw_column.rs:89-102`), so a block that
+///   still carries one is not a block this writer can emit;
+/// * `error.InvalidColumnSpec` — a specification that is less than the one
+///   before it, upstream's `NotInNormalOrder` (`raw_column.rs:289-297`);
+/// * `error.DuplicateColumn` — a specification equal to the one before it,
+///   upstream's `DuplicateColumnSpecs` (`storage/columns.rs:193-199`), which
+///   the reader reports after the DEFLATE pass.
+///
+/// A non-strict order check would let two columns of one specification through,
+/// which is what this writer used to do: `parseDocumentChunk` refuses the body
+/// with `error.DuplicateColumn` and no optimize mode turns that assertion into
+/// a diagnostic.
 fn writeColumnMeta(
     out: *std.ArrayList(u8),
     gpa: Allocator,
     cols: RawColumns,
-) Allocator.Error!void {
+) ParseError!void {
     var count: std.ArrayList(u8) = .empty;
     defer count.deinit(gpa);
     try leb128.appendUnsigned(&count, gpa, cols.len());
-    for (cols.columns, 0..) |col, i| {
-        // A deflated column is a column the reader has already inflated
-        // (`raw_column.rs:89-102`), so a block that still carries one is not
-        // a block this writer can emit.
-        std.debug.assert(!col.spec.isCompressed());
-        if (i != 0) {
-            // Ascending by normalized specification, which is what a reader
-            // demands: the current column may not be less than the one
-            // before it.
-            std.debug.assert(!col.spec.lessThan(ColumnSpec.make(
-                cols.columns[i - 1].spec.id(),
-                cols.columns[i - 1].spec.encoding(),
-                false,
-            )));
+    var previous: ?ColumnSpec = null;
+    for (cols.columns) |col| {
+        if (col.spec.isCompressed()) return error.InvalidColumnSpec;
+        if (previous) |prev| {
+            switch (col.spec.compare(prev)) {
+                .lt => return error.InvalidColumnSpec,
+                .eq => return error.DuplicateColumn,
+                .gt => {},
+            }
         }
         try leb128.appendUnsigned(&count, gpa, col.spec.raw);
         try leb128.appendUnsigned(&count, gpa, col.len());
+        previous = col.spec;
     }
     try out.appendSlice(gpa, count.items);
 }
@@ -1863,7 +1937,7 @@ const Shape = struct {
 /// never the bytes.
 ///
 /// `specs` must be in ascending normalized order and free of repeats, because
-/// `writeColumnMeta` asserts the order a reader demands
+/// `writeColumnMeta` refuses the order a reader demands
 /// (`raw_column.rs:248-253`). A test that wants a repeat hands the reader a
 /// body as bytes instead.
 fn shapeOf(gpa: Allocator, specs: []const ColumnSpec) !Shape {
@@ -2269,6 +2343,123 @@ test "a body cut short is refused at the boundary it stops in" {
     try over.appendSlice(gpa, &hand_built_body);
     try over.append(gpa, 0x00);
     try testing.expectError(error.TrailingBytes, parseDocumentChunk(over.items, gpa));
+}
+
+test "the document writer refuses the blocks its own reader refuses" {
+    const gpa = testing.allocator;
+    const no_changes: RawColumns = .{ .columns = &.{}, .data = &.{} };
+    const actors = [_][]const u8{&[_]u8{0xaa}};
+    const one_head = [_]ChangeHash{.{ .bytes = @splat(0x11) }};
+    const two_heads = [_]ChangeHash{
+        .{ .bytes = @splat(0x11) },
+        .{ .bytes = @splat(0x22) },
+    };
+
+    // **A repeated specification.** The order check here used to be
+    // non-strict, so two columns of one specification went out and the body
+    // this module wrote was the body its reader refuses with
+    // `error.DuplicateColumn` (`storage/columns.rs:193-199`) — with no
+    // diagnostic in any optimize mode.
+    {
+        const data = [_]u8{ 0x7f, 0x00 };
+        const descs = [_]ColumnDesc{
+            ColumnDesc.init(ColumnSpec.make(2, .actor, false), 1),
+            ColumnDesc.init(ColumnSpec.make(2, .actor, false), 1),
+        };
+        const cols = try RawColumns.init(gpa, &descs, &data);
+        defer cols.deinit(gpa);
+        try testing.expectError(
+            error.DuplicateColumn,
+            encodeBody(gpa, DocumentBlock.init(&actors, &one_head, no_changes, cols, &[_]u64{0})),
+        );
+    }
+
+    // **A descending specification**, and **a column the reader has already
+    // inflated**. Both are `error.InvalidColumnSpec`, which is what
+    // `parseDocumentChunk` reports for the same two blocks
+    // (`raw_column.rs:248-253`, `:289-297`; `:89-102`).
+    {
+        const data = [_]u8{ 0x7f, 0x00 };
+        const descs = [_]ColumnDesc{
+            ColumnDesc.init(ColumnSpec.make(4, .rle_uint, false), 1),
+            ColumnDesc.init(ColumnSpec.make(2, .actor, false), 1),
+        };
+        const cols = try RawColumns.init(gpa, &descs, &data);
+        defer cols.deinit(gpa);
+        try testing.expectError(
+            error.InvalidColumnSpec,
+            encodeBody(gpa, DocumentBlock.init(&actors, &one_head, no_changes, cols, &[_]u64{0})),
+        );
+    }
+    {
+        const data = [_]u8{0x7f};
+        const descs = [_]ColumnDesc{ColumnDesc.init(ColumnSpec.make(3, .boolean, true), 1)};
+        const cols = try RawColumns.init(gpa, &descs, &data);
+        defer cols.deinit(gpa);
+        try testing.expectError(
+            error.InvalidColumnSpec,
+            encodeBody(gpa, DocumentBlock.init(&actors, &one_head, no_changes, cols, &[_]u64{0})),
+        );
+    }
+
+    // **The head-index suffix.** The reader takes exactly `heads.len()` values
+    // when anything is left after the op data and none at all when nothing is
+    // (`document.rs:131-136`), so a partial list is a body it refuses — one
+    // that stops inside the suffix, and one that leaves bytes past it. The
+    // writer refuses the same two with the reader's own names.
+    const data = [_]u8{0x01};
+    const descs = [_]ColumnDesc{ColumnDesc.init(ColumnSpec.make(3, .boolean, false), 1)};
+    const cols = try RawColumns.init(gpa, &descs, &data);
+    defer cols.deinit(gpa);
+    try testing.expectError(
+        error.UnexpectedEnd,
+        encodeBody(gpa, DocumentBlock.init(&actors, &two_heads, no_changes, cols, &[_]u64{0})),
+    );
+    try testing.expectError(
+        error.TrailingBytes,
+        encodeBody(gpa, DocumentBlock.init(&actors, &one_head, no_changes, cols, &[_]u64{ 0, 1 })),
+    );
+
+    // **Zero indexes stays allowed, whatever the head count.** The suffix is
+    // optional in the format (`document.rs:131-135`), so an empty list is the
+    // older writer's rendering and not a mismatch: the body it writes reads
+    // back with no suffix at all.
+    const absent = try encodeBody(gpa, DocumentBlock.init(&actors, &two_heads, no_changes, cols, &.{}));
+    defer gpa.free(absent);
+    var doc = try parseDocumentChunk(absent, gpa);
+    defer doc.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), doc.heads().len);
+    try testing.expectEqual(@as(usize, 0), doc.headIndexes().len);
+
+    // And one index per head is the third shape: emitted, and taken back.
+    const matched = try encodeBody(gpa, DocumentBlock.init(
+        &actors,
+        &two_heads,
+        no_changes,
+        cols,
+        &[_]u64{ 0, 1 },
+    ));
+    defer gpa.free(matched);
+    var doc2 = try parseDocumentChunk(matched, gpa);
+    defer doc2.deinit(gpa);
+    try testing.expectEqualSlices(u64, &[_]u64{ 0, 1 }, doc2.headIndexes());
+
+    // The half that keeps the refusals from being a blanket: a well-formed
+    // block still writes, and re-encoding what the reader handed back
+    // reproduces the body.
+    const body = try encodeBody(gpa, DocumentBlock.init(
+        &actors,
+        &one_head,
+        no_changes,
+        cols,
+        &[_]u64{0},
+    ));
+    defer gpa.free(body);
+    var doc3 = try parseDocumentChunk(body, gpa);
+    defer doc3.deinit(gpa);
+    const again = try encodeBody(gpa, doc3.block);
+    defer gpa.free(again);
+    try testing.expectEqualSlices(u8, body, again);
 }
 
 /// One column a test expects a set to hold: the wire word of its

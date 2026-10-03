@@ -8,17 +8,25 @@
 //! `OpSet::to_string` call and nothing else — which is the whole reason it is
 //! this small and the reason it must not grow any logic of its own.
 //!
-//! # It is `OpSet.topOps`, and the scratch is that walk's
+//! # It is `OpSet.topOps`, and the buffers are that walk's own
 //!
 //! [`OpSet.keys`] is `Keys::new(self, self.top_ops(obj, clock))`
 //! ([`op_set.rs:377-379`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)),
 //! so [`Keys.init`] takes a [`TopWalk`] **by value** and never builds a second
-//! one. That matters because the port's [`TopOps`] is three walks alive at
-//! once and each needs its own successor buffer
-//! ([`op_set.zig:309-318`](../opset/op_set.zig)): a second `TopScratch` built
-//! here would be a fourth thing to free and, worse, a caller holding two walks
-//! would find one clobbering the other. [`Keys.deinit`] frees the scratch it
-//! was handed and nothing else.
+//! one. The port's [`TopOps`] is three walks alive at once and each needs its
+//! own successor buffer ([`TopWalk`](../opset/op_set.zig), `op_set.zig:354-385`),
+//! so [`OpSet.topOps`] allocates a **fresh** [`top_op.TopScratch`] on every call
+//! — three allocations, one per walk
+//! ([`topScratch`](../opset/top_op.zig), `top_op.zig:730-744`).
+//!
+//! **So two [`Keys`] over one op set are independent, and both may be live at
+//! once.** The port's sharing rule ([`op_set.zig:40-49`](../opset/op_set.zig))
+//! is about the walks that borrow the op set's *shared* buffer
+//! ([`OpSet.succ_scratch`](../opset/op_set.zig)), and a top walk borrows no such
+//! buffer: it brings its own. The test "a key walk takes the winner walk's
+//! scratch, so two may be live at once" reads two of them interleaved and
+//! deinits both, which is what a caller who needs two at once is doing.
+//! [`Keys.deinit`] frees the three buffers it was handed and nothing else.
 //!
 //! # A register is absent, not null
 //!
@@ -31,19 +39,39 @@
 //! ([`keys.rs:13`](../../github-automerge-automerge/rust/automerge/src/iter/keys.rs)),
 //! which is this fact stated as a type.
 //!
-//! # The key is borrowed, not owned
+//! # The key is borrowed, not owned, and there are two owners
 //!
 //! Upstream's item is an owned `String` because `OpSet::to_string` is
 //! `format!` ([`op_set.rs:1093-1098`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)).
 //! The port's is a borrowed slice, which is the house rule for a slice out of a
-//! document's own storage ([`AGENTS.md`](../../AGENTS.md) *Invariants*):
+//! document's own storage ([`AGENTS.md`](../../AGENTS.md) *Invariants*). **One
+//! return type carries both windows, so which one a key is under is decided by
+//! what kind of key it is, and that is stated here because nothing else on the
+//! surface says it:**
 //!
-//! * a **map key** comes out of the op set's string table
-//!   ([`opiter.KeyIter.load`](../opset/op_iter.zig), `op_iter.rs:258-263`) and
-//!   is valid until the next mutation of the table;
-//! * a **sequence anchor** is rendered into a buffer this walk already owns,
-//!   which the next `next` overwrites. A caller that has to hold one across
-//!   another call copies it.
+//! * a **map key** is the **string table's own bytes**, resolved from the
+//!   interned id `key_str` holds
+//!   ([`opiter.KeyIter.load`](../opset/op_iter.zig), `op_iter.rs:258-263`;
+//!   [`Op.elemidOrKey`](../opset/op.zig)). The owner is the
+//!   [`columns.StringTable`](../opset/columns.zig) the op set borrows — in a
+//!   document that is its own `Strings`
+//!   ([`Document.strings`](../../doc.zig)), and **interning copies into an
+//!   arena that only grows** ([`Strings.intern`](../../doc.zig),
+//!   `doc.zig:287-296`: the bytes are duped into an `ArenaAllocator` and the id
+//!   list may reallocate without moving them), so **a map key is valid for as
+//!   long as the table, and so for a document for as long as the document** — a
+//!   later mutation does not move it. The test in
+//!   [src/read.zig](../../read.zig), "a map key is the document's own bytes, and
+//!   a mutation does not move them", is the one that pins it.
+//! * a **sequence anchor** is **rendered into a buffer this walk already owns**
+//!   ([`Keys.buf`]), which the next [`next`] overwrites, so it is valid only
+//!   until this walk's next `next`. A caller that has to hold one across
+//!   another call copies it — or hands the walk's answer to
+//!   [`OpSet.opIdText`](../opset/op_set.zig), which allocates and takes any
+//!   length.
+//!
+//! **A sequence anchor is a key here, not a stop**, which is why the two
+//! windows share one return type; see [`Keys.next`].
 //!
 //! # What is not here
 //!
@@ -125,26 +153,55 @@ const key_buf_len = 96;
 /// element ids in *element* order, which is not the order the strings they
 /// render to sort in.
 ///
-/// Constructing one allocates nothing: a pointer, a [`TopWalk`] and a fixed
-/// buffer.
+/// # What this value borrows, and who frees it
+///
+/// **Three borrows and one obligation, and none of them is the caller's
+/// memory.** `op_set` is borrowed and must outlive this walk; `walk` **owns**
+/// three successor buffers, which [`deinit`](Keys.deinit) must release exactly
+/// once, with the **op set's own allocator** — in a document,
+/// [`Document.allocator`](../../doc.zig) — because that is what
+/// [`OpSet.topOps`](../opset/op_set.zig) allocated them with; and `buf` is
+/// inline storage for a rendered sequence anchor, owned here and overwritten by
+/// the next [`next`](Keys.next).
+///
+/// **Constructing one allocates nothing by hand** — a pointer, a [`TopWalk`]
+/// and a fixed buffer — but [`ofObj`](Keys.ofObj) *is* handed a walk from
+/// `topOps`, and that call allocates.
 pub fn Keys(comptime O: type) type {
     return struct {
         const Self = @This();
 
-        /// The op set a key's actor bytes come from, and the one
-        /// [`Keys.ofObj`] asked for the object of (`keys.rs:9`).
+        /// The op set the walk reads and a rendered anchor's actor bytes come
+        /// from, and the one [`ofObj`](Keys.ofObj) asked for the object of
+        /// (`keys.rs:9`).
+        ///
+        /// **Borrowed**, and the op set must not be mutated, moved or freed
+        /// while a walk built over it is alive: the rendered arm of
+        /// [`next`](Keys.next) reads the actor table, and a map key is the
+        /// string table's own bytes (the module's third section).
         op_set: *opset.OpSet(O),
-        /// The winner walk, with the successor buffers it borrowed
-        /// (`keys.rs:9`, upstream's `TopOps`).
+        /// The winner walk, **together with the three successor buffers it
+        /// owns** (`keys.rs:9`, upstream's `TopOps`).
+        ///
+        /// These buffers are this walk's and no other walk's: `topOps` built a
+        /// fresh scratch for this call, so two walks over one op set do not
+        /// share them. [`deinit`](Keys.deinit) releases them.
         walk: opset.TopWalk(O),
-        /// Where a sequence anchor's text is rendered, valid until the next
-        /// [`next`].
+        /// Where a sequence anchor's text is rendered, owned here and valid
+        /// until the next [`next`](Keys.next).
         buf: [key_buf_len]u8 = undefined,
 
         /// A walk over the keys `walk` yields (`Keys::new`, `keys.rs:23-27`).
         ///
         /// Upstream's is one line; the port's is one line too, and it is
-        /// **taken, not rebuilt** — see the module's second section.
+        /// **taken, not rebuilt** — see the module's first section.
+        ///
+        /// **The teardown travels with the walk it is given**: this walk takes
+        /// `walk` by value, so it owns those three buffers and the caller must
+        /// call [`deinit`](Keys.deinit) with the allocator they came from. A
+        /// caller that built the walk with its own
+        /// [`topScratch`](../opset/top_op.zig) frees it with the allocator it
+        /// passed there.
         pub fn init(op_set: *opset.OpSet(O), walk: opset.TopWalk(O)) Self {
             return .{ .op_set = op_set, .walk = walk };
         }
@@ -153,6 +210,31 @@ pub fn Keys(comptime O: type) type {
         /// `op_set.rs:377-379`).
         ///
         /// The one-liner upstream spells, against the port's `topOps`.
+        ///
+        /// # What this walk owns, and what it borrows
+        ///
+        /// **Owns: three successor buffers.** `topOps` builds a fresh
+        /// [`topScratch`](../opset/top_op.zig) for this call and with **the
+        /// op set's own `gpa`**, so **any number of walks over one op set may
+        /// be live at once** — they do not share a buffer, and the port's
+        /// one-live-at-a-time rule ([`op_set.zig:40-49`](../opset/op_set.zig))
+        /// is about the walks that borrow the op set's *shared* one, which a
+        /// top walk does not. The test "a key walk takes the winner walk's
+        /// scratch, so two may be live at once" reads two of them interleaved.
+        /// Whatever built the walk must free it with
+        /// [`deinit`](Keys.deinit) **and the allocator it was built with**:
+        /// the op set's own, which for a document is
+        /// [`Document.allocator`](../../doc.zig). **Exactly once** — see
+        /// [`deinit`](Keys.deinit).
+        ///
+        /// **Borrows: the op set and the clock.** `op_set` must not move or be
+        /// mutated while the walk is alive. `clock` is a [`Clock`] **by value**,
+        /// which is a borrowed `[]u32` plus the allocator it was taken with, and
+        /// the walk reads through it: **null is the present** — every operation
+        /// the op set holds — and a non-null clock bounds the walk to the
+        /// operations it covers, so **the caller's clock has to outlive this
+        /// walk, and calling `Clock.deinit` while a walk built from it is still
+        /// being read leaves that walk reading released counters.**
         pub fn ofObj(
             op_set: *opset.OpSet(O),
             obj: types.ExId,
@@ -167,6 +249,28 @@ pub fn Keys(comptime O: type) type {
         /// Upstream has nothing to free: its `TopOps` borrows three lazy
         /// column cursors and allocates nothing (`top_op.rs:19-23`). The port's
         /// is three walks alive at once, which is what makes this necessary.
+        ///
+        /// # Which allocator, and how many times
+        ///
+        /// **`gpa` must be the allocator the buffers were allocated with** —
+        /// for a walk from [`ofObj`](Keys.ofObj) or from
+        /// [`OpSet.topOps`](../opset/op_set.zig) that is **the op set's own**,
+        /// which for a document is [`Document.allocator`](../../doc.zig). Any
+        /// other allocator is a mismatched free. A walk built by hand over a
+        /// caller's [`topScratch`](../opset/top_op.zig) is freed with the
+        /// allocator that scratch was taken with.
+        ///
+        /// **Once, on the one owner.** The receiver is a pointer and the body
+        /// ends in `self.* = undefined`, so a second call reads undefined
+        /// storage rather than freeing the same three buffers again. **A copy
+        /// carries the buffers but not the teardown**: `var b = a; a.deinit(gpa);
+        /// b.deinit(gpa);` frees them twice, because the copy's own outer state
+        /// was never poisoned. Moving the walk is fine (`var b = a; a` is dead
+        /// from then on); copying it is not.
+        ///
+        /// After this call the value is unusable: `next` and every other method
+        /// read it. Nothing this walk borrowed is freed here — not the op set,
+        /// not the string table, not the caller's clock.
         pub fn deinit(self: *Self, gpa: Allocator) void {
             self.walk.deinit(gpa);
             self.* = undefined;
@@ -174,10 +278,26 @@ pub fn Keys(comptime O: type) type {
 
         /// The next key, or null at the end of the object's rows
         /// ([`Iterator::next` for `Keys`],
-        /// [`keys.rs:15-19`](../../github-automerge-automerge/rust/automerge/src/iter/keys.rs)).
+        /// [`keys.rs:15-19`](../../github-automerge-automerge/rust/automerge/src/iter/keys.rs))).
         ///
         /// `op_set.to_string(op.elemid_or_key())`, both halves of which are in
         /// [`render`].
+        ///
+        /// # Which borrow the answer is
+        ///
+        /// **The return type is one slice for two answers with two owners, so
+        /// this is the place that has to say which one this is:**
+        ///
+        /// * a **map key** is the op set's string table's own bytes — valid for
+        ///   as long as that table, and so for a document for as long as the
+        ///   document. The next `next` does not disturb it.
+        /// * a **sequence anchor** is rendered into this walk's
+        ///   [`buf`](Keys.buf), and **the next `next` on this walk overwrites
+        ///   it.** Copy it if it has to survive the step, or ask
+        ///   [`OpSet.opIdText`](../opset/op_set.zig), which allocates.
+        ///
+        /// **Null is the end of the rows, not an absent register** — see the
+        /// module's second section.
         pub fn next(self: *Self) KeysError!?[]const u8 {
             const op = (try self.walk.next()) orelse return null;
             return try self.render(op.elemidOrKey());

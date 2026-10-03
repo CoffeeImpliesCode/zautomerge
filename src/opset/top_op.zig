@@ -248,6 +248,11 @@ pub fn ScanTopIter(comptime O: type) type {
         /// shift has to redo.
         cols: *const Ops,
         /// The clock the read is scoped to, borrowed from the caller.
+        ///
+        /// **`Clock` is stored by value and its slots are the caller's.** The
+        /// copy shares the one allocation [`Clock.init`](../../src/clock.zig)
+        /// and every row's visibility is judged against it, so the clock must
+        /// outlive this walk. Nothing in this type pays the borrow off.
         clock: Clock,
         /// The object the range's first row named, and every row after it
         /// must name the same one. Null until the first row is read, and
@@ -494,6 +499,10 @@ fn continuesGroup(row: ScanTopRow, group: ?u32) bool {
 /// object, and does not need to: it finds every top row in whatever range it
 /// is given, and a range that spans two objects answers with both objects'
 /// winners, which is a defined answer rather than a wrong one.
+///
+/// **It owns nothing, so it declares no `deinit`.** Its fields are column
+/// cursors, three numbers and the caller's successor buffer, and the range it
+/// covers is the caller's to clamp.
 pub fn TopIter(comptime O: type) type {
     return struct {
         const Self = @This();
@@ -526,6 +535,10 @@ pub fn TopIter(comptime O: type) type {
 
         /// The rows this walk covers, clamped to the op set
         /// (`iter_range`, `hexane/src/column.rs:1384-1421`).
+        ///
+        /// Clamped **at construction**. [`shiftNext`] writes a caller's range
+        /// here verbatim, which is the one place this walk takes a range it
+        /// has not checked — see that method's own comment.
         rows: RowRange,
         /// The row after the last winner found, which every skip is measured
         /// from (`top_op.rs:146`, `:261-263`).
@@ -626,6 +639,24 @@ pub fn TopIter(comptime O: type) type {
         /// (`iter/tools.rs:60-62`), so it carries `shiftNext` and not the
         /// full kernel — the same shape as the boolean skipper it is built
         /// from (`column.zig:4085-4155`).
+        ///
+        /// **`rows` is not clamped here, unlike in [`init`].** It is stored in
+        /// `self.rows` verbatim, and the last answer [`next`] gives is
+        /// `self.rows.end -| self.cursor`, so a `rows` reaching past the op set
+        /// makes that arithmetic count rows that are not there. Clamp with
+        /// [`column.clampRange`] first, which is what the crate's own callers
+        /// do.
+        ///
+        /// **Repositioning only moves forward**, as [`column.Shiftable`]
+        /// requires (`column.zig:6124-6128`): a `rows` that starts behind the
+        /// cursor is `error.InvalidValue`, which the scan flavour refuses
+        /// before anything in it moves and which the boolean skipper's own
+        /// column cursor refuses the same way. The scan flavour also re-checks
+        /// the single-object precondition [`ScanTopIter.init`] checks, because
+        /// the precondition is per range rather than per walk. This method
+        /// writes `self.cursor`, `self.rows` and `self.spent` *before* either
+        /// check, so a refused shift leaves all three describing the range
+        /// that was refused.
         pub fn shiftNext(self: *Self, rows: RowRange) TopError!?usize {
             self.cursor = rows.start;
             self.rows = rows;
@@ -666,11 +697,19 @@ pub const TopScratch = struct {
     /// For the top walk's. Unread unscoped, when that walk is `Current`.
     top: []SuccEntry,
 
-    /// Frees the three buffers.
-    pub fn deinit(self: TopScratch, gpa: Allocator) void {
+    /// Frees the three buffers, and nothing else: the walks that borrowed them
+    /// own no memory.
+    ///
+    /// **Once only, on the one owner.** The receiver is a pointer so that the
+    /// free can poison it: a second call through a copy of this value reads
+    /// undefined storage rather than freeing the same three buffers again.
+    /// [`TopOps.init`] takes a scratch by value and does not take it over — the
+    /// walk borrows the buffers and the caller keeps the teardown.
+    pub fn deinit(self: *TopScratch, gpa: Allocator) void {
         gpa.free(self.rows);
         gpa.free(self.visible);
         gpa.free(self.top);
+        self.* = undefined;
     }
 };
 
@@ -680,6 +719,10 @@ pub const TopScratch = struct {
 /// One pass over `succ_count` and three allocations. The walk constructors
 /// take none, which is what `test "a top walk allocates nothing to
 /// construct"` measures.
+///
+/// The result is the caller's and nothing frees it for them.
+/// [`TopScratch.deinit`] takes its receiver by pointer, so it is a variable
+/// rather than a temporary that reaches the teardown.
 ///
 /// The op type comes first because the column set is what determines it,
 /// which is the order [`op_iter.maxSuccCount`] takes too
@@ -726,6 +769,13 @@ pub fn TopOps(comptime O: type) type {
         /// The row the next visible skip is measured from (`top_op.rs:31`).
         visible_pos: usize,
         /// The clock the read is scoped to, borrowed from the caller.
+        ///
+        /// **`Clock` is stored by value and its slots are the caller's.** The
+        /// copy shares the one allocation [`Clock.init`](../../src/clock.zig)
+        /// and [`next`] reads it on every winner through [`Op.fixCounter`], so
+        /// the clock must outlive this walk. Each inner walk holds its own copy
+        /// of it when that walk is scan-flavoured, so one lifetime covers all
+        /// three.
         clock: ?Clock,
 
         /// A walk over the winners of `rows`
@@ -735,6 +785,10 @@ pub fn TopOps(comptime O: type) type {
         /// is what all three walks are built over, so they cannot disagree
         /// about where the range ends. `scratch` is the caller's three
         /// successor buffers; see [`TopScratch`].
+        ///
+        /// `clock` is borrowed for the life of the walk and not copied, so
+        /// see the `clock` field for what that obliges the caller to keep
+        /// alive.
         pub fn init(
             cols: *const Ops,
             strings: StringTable,

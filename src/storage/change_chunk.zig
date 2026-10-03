@@ -99,6 +99,9 @@ const RawColumns = column_spec.RawColumns;
 /// constants and `ColumnType` values at `change_op_columns.rs:29-36` and
 /// `:496-547`. They are the two halves of the wire specification, so both are
 /// fixed for the life of the format.
+///
+/// Copying this is copying a value with no allocation and no borrow in it, so
+/// a copy is independent and either may be read from another thread.
 pub const OpColumn = enum(u8) {
     /// The actor index of the object the op acts on. `OBJ_COL_ID` is 0
     /// (`change_op_columns.rs:29`), and the decoder pairs it with
@@ -272,6 +275,11 @@ pub const op_columns: [op_column_table.len]OpColumn = blk: {
 ///
 /// This is everything in a change chunk body after the header `Change` writes,
 /// and it is what a reader hands back as the second half of a parsed chunk.
+///
+/// Copying this is copying a view: the copy shares the column list and the data
+/// block, so neither may outlive the body the list indexes. Neither field is
+/// mutable, so the copy may be read from another thread while the original
+/// lives.
 pub const OpsBlock = struct {
     /// The operation columns and the data block their ranges index into. The
     /// ranges are relative to the data block, not to the chunk
@@ -312,6 +320,11 @@ pub const OpsBlock = struct {
 /// outlive the chunk. The one allocation `parseChange` made — the
 /// `other_actors` array — is freed by `deinit`, and `RawColumns`'s column list
 /// with it.
+///
+/// **Copying this copies an owner.** A copy holds the same `other_actors` array
+/// and the same column list, and `deinit` on both frees each a second time, so
+/// exactly one copy may be torn down. Nothing here is mutated after the parse
+/// returns, so the value may be read from another thread while it lives.
 pub const ChangeChunk = struct {
     /// The change header, as `parseChange` read it. Its `bytes` field is this
     /// body, and its `opsBytes` runs from the end of the header to the end of
@@ -327,6 +340,11 @@ pub const ChangeChunk = struct {
 
     /// Frees the `other_actors` array and the column list. The body, the op
     /// data, and the footer all belong to the caller and are left alone.
+    ///
+    /// After this the struct is poisoned, not emptied: `self.*` is set to
+    /// undefined, so reading any field afterwards is a use of undefined memory.
+    /// One call per value, and — because a copy is a second owner — one call per
+    /// copy.
     pub fn deinit(self: *ChangeChunk, gpa: Allocator) void {
         self.ops.deinit(gpa);
         self.change.deinit(gpa);
@@ -408,6 +426,10 @@ pub const ChangeChunk = struct {
 /// parsed. `chunk.decompressChunk` returns a buffer the caller owns, and every
 /// slice a `ChangeChunk` holds points into it, so the two have the same
 /// lifetime.
+///
+/// **Copying this copies an owner** — the inflated body and, through `parsed`,
+/// the `other_actors` array and the column list — so exactly one copy may be
+/// torn down. Nothing here is mutated after the parse returns.
 pub const OwnedChangeChunk = struct {
     /// The inflated body, when the chunk arrived deflated. Null when the body
     /// was borrowed from the caller's own bytes, in which case nothing here
@@ -419,6 +441,9 @@ pub const OwnedChangeChunk = struct {
 
     /// Frees the inflated body, if this chunk has one, and the parsed chunk's
     /// own two allocations. A borrowed body is never freed.
+    ///
+    /// After this the struct is poisoned, not emptied, for the reason
+    /// [`ChangeChunk.deinit`] gives. One call per value, and one call per copy.
     pub fn deinit(self: *OwnedChangeChunk, gpa: Allocator) void {
         if (self.inflated) |body| gpa.free(body);
         self.parsed.deinit(gpa);
@@ -427,6 +452,9 @@ pub const OwnedChangeChunk = struct {
 };
 
 /// A change chunk body as written, with the identity the framing stores.
+///
+/// **Copying this copies an owner**: the copy holds the same body and one
+/// `deinit` per copy is one free, so exactly one copy may be torn down.
 pub const Encoded = struct {
     /// The whole body: header, op metadata, op data, footer. Owned by the
     /// caller.
@@ -440,7 +468,11 @@ pub const Encoded = struct {
     /// its checksum field (`chunk.rs:180-185`).
     checksum: [checksum_size]u8,
 
-    /// Frees the body. The hash and the checksum are values, not views.
+    /// Frees the body and leaves `body` an empty slice, which is why a second
+    /// call frees nothing: `hash` and `checksum` are values rather than views
+    /// and stay readable afterwards. The rest of the value is untouched, so this
+    /// is a release rather than a poison — the difference from the two teardowns
+    /// beside it, which set their structs to undefined.
     pub fn deinit(self: *Encoded, gpa: Allocator) void {
         gpa.free(self.body);
         self.body = &.{};
@@ -478,7 +510,11 @@ const min_desc_size: usize = 2;
 /// * a block whose specifications are not in ascending normalized order, or
 ///   which repeats one — upstream's `NotInNormalOrder`
 ///   (`raw_column.rs:248-253`) and the duplicate check
-///   (`columns.rs:193-198`).
+///   (`columns.rs:193-198`). **The order is judged over the descriptors as
+///   they were read**, zero-length ones included, which is the set upstream
+///   compares; the duplicate is judged over the columns that survived
+///   construction, so a block that repeats an *empty* specification is not a
+///   duplicate and is accepted, as upstream accepts it.
 pub fn parseChangeChunk(body: []const u8, gpa: Allocator) ParseError!ChangeChunk {
     // The header reader owns the fields; this module needs only where it
     // ended. `header_len` is where the op metadata block starts, and the whole
@@ -502,6 +538,19 @@ pub fn parseChangeChunk(body: []const u8, gpa: Allocator) ParseError!ChangeChunk
         if (desc.spec.isCompressed()) return error.InvalidColumnSpec;
     }
 
+    // Order over the descriptors as they were read, *before* `RawColumns.init`
+    // drops the zero-length ones (`column_spec.zig:432-437`). Upstream's set
+    // keeps every descriptor the block listed, empty ones included, and
+    // `are_normal_sorted` runs over that whole set (`raw_column.rs:232-253`,
+    // `:289-297`), so a block whose first column is empty still has to be
+    // ascending from there. Checking the set that comes back instead would let
+    // `{0x42 len 0, 0x15 len 3}` through: 0x42 is gone by then and 0x15 is the
+    // only column left to be in order. This is where upstream puts the check
+    // too — inside the metadata block's own parse, before the data block is
+    // located — so it runs before the length bound below and the error a
+    // malformed change chunk carries is the one the reference reports.
+    try descsInNormalOrder(descs);
+
     // The data block is exactly the sum of the declared lengths, so a sum past
     // what is left means a column's length runs past the data block. Checked
     // against `remaining()` before `take`, which is what turns a hostile
@@ -520,6 +569,24 @@ pub fn parseChangeChunk(body: []const u8, gpa: Allocator) ParseError!ChangeChunk
     // chunk with `parse::take_rest` (`storage/change.rs:120-125`), and the
     // footer has no length prefix of its own.
     return .{ .change = change, .ops = ops, .footer = in.rest() };
+}
+
+/// The block's descriptors, in ascending normalized order, or
+/// `error.InvalidColumnSpec`.
+///
+/// The whole set takes part, zero-length descriptors included, because upstream
+/// compares the columns the metadata block listed rather than the columns that
+/// survived construction (`raw_column.rs:232-253`, `:289-297`). A repeat is not
+/// a decrease and so passes here; `RawColumns.validate` is what reports one, as
+/// `error.DuplicateColumn`, after the empty columns are gone.
+fn descsInNormalOrder(descs: []const ColumnDesc) ParseError!void {
+    var previous: ?ColumnSpec = null;
+    for (descs) |desc| {
+        if (previous) |prev| {
+            if (desc.spec.compare(prev) == .lt) return error.InvalidColumnSpec;
+        }
+        previous = desc.spec;
+    }
 }
 
 /// Reads a change chunk out of a framed chunk, inflating first if the chunk is
@@ -583,9 +650,22 @@ pub fn writeBody(
 /// with no bytes is not a column, upstream drops it at construction
 /// (`raw_column.rs:40-50`, `:183`) and a count that included it would name a
 /// column no reader could find. A caller whose columns are out of order, or
-/// which names a deflated column, has a bug the format cannot express: the
-/// writer asserts, because a silently wrong body would be a change with the
-/// wrong hash, and no reader would notice.
+/// which names a deflated column, has a bug the format cannot express, and the
+/// writer checks it with `std.debug.assert` because a silently wrong body would
+/// be a change with the wrong hash and no reader would notice.
+///
+/// **Those two checks are programmer preconditions on a caller's own set, not
+/// checks on untrusted input, and `std.debug.assert` is compiled out in
+/// `ReleaseFast` and `ReleaseSmall`.** In those modes a descending or repeated
+/// specification and a deflated column are written out unchecked, and the body
+/// this function produces is one [`parseChangeChunk`] then refuses as
+/// `error.InvalidColumnSpec` or `error.DuplicateColumn`. The document chunk
+/// writer checks the same two things with real errors that survive every
+/// optimize mode (`document_chunk.writeColumnMeta`); this one does not, and a
+/// caller that builds change op sets by hand is the only one that can tell.
+///
+/// The order check is strict (`prev < col`), so it catches a repeat as well as
+/// a descent.
 pub fn writeOpsBlock(
     out: *std.ArrayList(u8),
     gpa: Allocator,
@@ -1474,6 +1554,72 @@ test "opCount is the row count of the action column and not the column count" {
     try testing.expectEqual(@as(usize, 1), parsed2.ops.len());
     try testing.expectEqual(@as(usize, 1000), try parsed2.opCount());
     try testing.expectEqual(@as(u64, 1002), (try parsed2.change.withOpCount(try parsed2.opCount())).max_op);
+}
+
+test "a metadata block that decreases across an empty column is refused" {
+    const gpa = testing.allocator;
+    // `RawColumns.init` drops every zero-length descriptor
+    // (`column_spec.zig:432-437`), so an order check run over the set it returns
+    // never sees this block's first column at all. Upstream's set keeps it —
+    // `RawColumns::parse` builds one `RawColumn` per descriptor, empty ones
+    // included (`raw_column.rs:232-247`) — and `are_normal_sorted` walks that
+    // whole list (`raw_column.rs:289-297`), so the same block is
+    // `NotInNormalOrder` there and in this port's own document reader
+    // (`document_chunk.readColumnMeta`).
+    const head = [_]u8{
+        0x00, // no dependencies
+        0x01, 0xaa, // actor
+        0x01, // seq 1
+        0x01, // start_op 1
+        0x00, // time 0
+        0x00, // no message
+        0x00, // no other actors
+    };
+    const data = [_]u8{ 0x7f, 0x00, 0x5a };
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.appendSlice(gpa, &head);
+    try body.appendSlice(gpa, &[_]u8{
+        0x02, // two op columns
+        0x42, 0x00, // id 4 rle_uint, no bytes
+        0x15, 0x03, // id 1 string, three bytes — less than the column above
+    });
+    try body.appendSlice(gpa, &data);
+    try testing.expectError(error.InvalidColumnSpec, parseChangeChunk(body.items, gpa));
+
+    // The same two columns the other way round is in order and reads: an empty
+    // column simply is not a column (`raw_column.rs:183`), so the set has one
+    // member and the three bytes are all of the op data.
+    var ascending: std.ArrayList(u8) = .empty;
+    defer ascending.deinit(gpa);
+    try ascending.appendSlice(gpa, &head);
+    try ascending.appendSlice(gpa, &[_]u8{
+        0x02, // two op columns
+        0x15, 0x03, // id 1 string, three bytes
+        0x42, 0x00, // id 4 rle_uint, no bytes
+    });
+    try ascending.appendSlice(gpa, &data);
+    var parsed = try parseChangeChunk(ascending.items, gpa);
+    defer parsed.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), parsed.ops.len());
+    try testing.expectEqualSlices(u8, &data, parsed.opData());
+
+    // And a decrease between two columns that both have bytes was always
+    // refused; this is the same check, one column further out. The order is by
+    // normalized specification (`raw_column.rs:289-297`), so "less than the
+    // column above" means a smaller id, not fewer bytes: `0x21` is id 2 and
+    // `0x15` is id 1, and the three bytes after each are that column's length.
+    var full: std.ArrayList(u8) = .empty;
+    defer full.deinit(gpa);
+    try full.appendSlice(gpa, &head);
+    try full.appendSlice(gpa, &[_]u8{
+        0x02, // two op columns
+        0x21, 0x03, // id 2 actor, three bytes
+        0x15, 0x03, // id 1 string, three bytes — less than the column above
+    });
+    try full.appendSlice(gpa, &(data ++ data));
+    try testing.expectError(error.InvalidColumnSpec, parseChangeChunk(full.items, gpa));
 }
 
 // ── Differences from upstream, in one place ─────────────────────────────────

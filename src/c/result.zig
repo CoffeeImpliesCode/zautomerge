@@ -72,6 +72,52 @@
 //! the item layer instantiates it once with its own `Item`. Nothing here names
 //! a concrete item, and nothing here is a placeholder for one.
 //!
+//! # Thread confinement
+//!
+//! **Nothing in this ABI synchronises anything, so nothing in it may be
+//! reached from two threads at once.** Three source-visible facts add up to
+//! that sentence, and each of them is a documented decision rather than an
+//! oversight:
+//!
+//! * Several accessors take a `*const` handle and `@constCast` it to memoise
+//!   a result — [`AMactorId.toStr`](../c/doc.zig), [`AMcursor.toBytes`](../c/doc.zig),
+//!   [`AMchange.extraBytes`](../c/doc.zig) and [`AMchange.size`](../c/doc.zig)
+//!   all write a cache field through the cast. Two threads reaching one
+//!   handle through the same `AMresult` race on that write.
+//! * [`AMitem.retain`](../c/doc.zig) and [`AMitem.deinit`](../c/doc.zig) count
+//!   a shared item in a plain, non-atomic `usize`, exactly as `Rc::strong_count`
+//!   is in upstream (`src/item.rs:1672`). Upstream gets away with it because
+//!   `AMitem` is `!Sync`; this ABI has no way to say so.
+//! * Nothing here takes a lock, and there is no interior mutability to take
+//!   one over.
+//!
+//! ### The rule for a C caller, which is stronger
+//!
+//! **Calls from different threads must use one caller-owned global
+//! serialization boundary, even across distinct handles; they must not
+//! overlap.** That is stronger than "do not share one result": the document
+//! layer binds one process-wide single-threaded `std.Io` provider at the ABI
+//! seam ([`c_io`](../c/doc.zig)) for constructors and actor-id entropy.
+//! Two documents in two threads still share that provider.
+//!
+//! Hold the caller's lock through each outer call and its callbacks. An
+//! `AMstackCallback` invoked by `AMstackResult`, `AMstackItem` or `AMstackItems`
+//! may synchronously inspect the stack and result, including advancing a local
+//! borrowed `AMitems` cursor or copying diagnostics with `AMstrdup`, on the
+//! invoking thread under that already-held lock; nested inspection must not
+//! reacquire or release it. Diagnostic copies are independently owned and need
+//! `free`. Keep the stack and result live without popping, freeing, replacing
+//! or relinking them.
+//! This does not permit general mutation, other reentrancy or cross-thread
+//! entry. The header's `\section threads` and `AMstackCallback` contract state
+//! the full rule and callback lifetimes. The shipped validator uses this
+//! bounded inspection (`test/c/suite/cmocka_utils.c:67-89`).
+//!
+//! `malloc` and `free` — [`CAbi.c_allocator`] — *are* thread-safe by the C
+//! standard (C11 §7.24.3), and that is not enough: a thread-safe allocator is
+//! not a thread-safe library. It is the first of the three reasons that the
+//! heap's safety does not cover.
+//!
 //! # What is deliberately not here
 //!
 //! `AMresultFrom` is variadic, and Zig cannot define a C variadic function:
@@ -100,7 +146,11 @@ const Allocator = std.mem.Allocator;
 /// Upstream declares `Ok`, `Error`, `InvalidResult` with no explicit values in
 /// that order, so they are `0`, `1`, `2`. The order is unalphabetized on
 /// purpose so that `0` is success; upstream says so at `:478`.
-pub const AMstatus = enum(c_int) {
+///
+/// The C enums use `c_uint`, matching the shipped header's default lowering.
+/// The complete header guard checks this compiler and target configuration;
+/// clients must not use `-fshort-enums`.
+pub const AMstatus = enum(c_uint) {
     /// Success. Rust: `src/result.rs:479`.
     ok = 0,
     /// Failure due to an error. Rust: `src/result.rs:481`.
@@ -114,7 +164,7 @@ pub const AMstatus = enum(c_int) {
 /// `Default = 0` (`:172`), `List = 1` (`:174`); `Map` (`:176`) and `Text`
 /// (`:178`) carry no explicit value and continue from the previous variant, so
 /// they are `2` and `3`.
-pub const AMobjType = enum(c_int) {
+pub const AMobjType = enum(c_uint) {
     /// Rust: `src/obj.rs:172`.
     AM_OBJ_TYPE_DEFAULT = 0,
     /// Rust: `src/obj.rs:174`.
@@ -128,7 +178,7 @@ pub const AMobjType = enum(c_int) {
 /// The type of an item's index. Rust: `src/index.rs:60-67`.
 ///
 /// `Default = 0` (`:62`), `Key` (`:64`), `Pos` (`:66`), giving `0`, `1`, `2`.
-pub const AMidxType = enum(c_int) {
+pub const AMidxType = enum(c_uint) {
     /// Rust: `src/index.rs:62`.
     AM_IDX_TYPE_DEFAULT = 0,
     /// Rust: `src/index.rs:64`.
@@ -145,7 +195,7 @@ pub const AMidxType = enum(c_int) {
 /// `Default = 0` (`:48`), `None = 1` (`:50`). `AM_MARK_EXPAND_DEFAULT` is not
 /// a valid argument to `AMmarkCreate` or `AMmarkClear`: the conversion
 /// rejects it with an error result (`src/doc/mark.rs:59-77`).
-pub const AMmarkExpand = enum(c_int) {
+pub const AMmarkExpand = enum(c_uint) {
     /// Rust: `src/doc/mark.rs:42`.
     AM_MARK_EXPAND_AFTER = 3,
     /// Rust: `src/doc/mark.rs:44`.
@@ -296,6 +346,9 @@ pub fn Result(comptime T: type) type {
         /// The allocator that built this result. `deinit` frees with it, which
         /// is why a caller cannot release a result without naming it.
         allocator: Allocator,
+        /// Which of the two variants this result holds. Rust:
+        /// `src/result.rs:11-14`; a C caller asks through `AMresultStatus`
+        /// rather than reading it.
         variant: Variant,
 
         /// The empty items variant. Rust: `impl Default for AMresult`
@@ -745,6 +798,28 @@ pub fn Stack(comptime T: type) type {
         /// a callback written in C can inspect the top result directly
         /// (`src/utils/stack.c:67-74`).
         ///
+        /// `AMstackResult`, `AMstackItem` and `AMstackItems` invoke it
+        /// synchronously on the invoking thread. It borrows the stack and
+        /// result; `data` is passed unchanged and is neither retained nor freed
+        /// by the library. Keep the callback code and any accessed context valid
+        /// through their last use; the callback may then release context it owns.
+        ///
+        /// Synchronous stack/result inspection, including advancing a local
+        /// borrowed `AMitems` cursor or copying diagnostics with `AMstrdup`, uses
+        /// the outer C call's already-held global lock and must not reacquire or
+        /// release it. Diagnostic copies are independently owned and need `free`.
+        /// Do not pop, free, replace or relink the stack or result before the outer call
+        /// returns. No general mutation, other reentrancy or cross-thread entry
+        /// is permitted.
+        ///
+        /// Returning false leaves ownership with the stack. Do not retain the
+        /// callback's stack-parameter address: the null-stack path borrows a
+        /// temporary node and frees the result after the callback, invalidating
+        /// every borrowed view (`CAbi.AMstackResult`). Otherwise, retained views
+        /// still require their owning result to stay live. The shipped validator
+        /// inspects a local cursor and frees its own context after its last use
+        /// (`test/c/suite/cmocka_utils.c:67-89`).
+        ///
         /// Two things about this declaration are load-bearing, and both were
         /// found by linking a real C caller against the built library:
         ///
@@ -974,7 +1049,9 @@ fn tagToString(tags: anytype, raw: u32) [*:0]const u8 {
 
 /// The generated `FromString` body. `false` leaves `dest` untouched, which
 /// the reference suite asserts by pre-setting the out-parameter to `-1` and
-/// checking it is still `-1` (`test/enum_string_tests.c:38-40`).
+/// checking it is still `-1` (`test/enum_string_tests.c:38-40`). `dest` is
+/// non-nullable here on purpose: the `*FromString` exports refuse a `NULL`
+/// `dest` themselves, so this body never sees one and never traps on it.
 fn tagFromString(tags: anytype, dest: anytype, src: []const u8) bool {
     for (tags) |tag| {
         if (std.mem.eql(u8, src, std.mem.span(tag.n))) {
@@ -988,51 +1065,149 @@ fn tagFromString(tags: anytype, dest: anytype, src: []const u8) bool {
 /// `AMobjTypeToString`. Rust: generated, see
 /// `cmake/enum-string-functions-gen.cmake:53-66`.
 ///
-/// The tag is a raw `u32` rather than the Zig enum on purpose. The C prototype
-/// in `include/automerge.h` declares it as `AMobjType const tag`, and every C
-/// compiler lowers that enum to `unsigned int`, so the ABI is identical; but a
-/// Zig `enum` parameter validates its argument and would trap on the out-of-range
-/// tags the reference's own suite passes
-/// (`test/enum_string_tests.c:30, :52, :72, :109`). Taking the integer keeps
-/// the function total, and the `default:` arm becomes the "???" string.
+/// The name of `tag`, or the literal `"???"` for anything that is not one of
+/// the four `AMobjType` tags. The result is a static string constant: it owns
+/// nothing, must never be freed, and outlives every handle in the ABI.
+///
+/// **The tag is a raw `u32` rather than the Zig enum on purpose.** The C
+/// prototype in `include/automerge.h` declares it as `AMobjType const tag`,
+/// and the **default** C enum lowering — the one every toolchain applies
+/// unless `-fshort-enums` is given — makes that a four-byte `unsigned int`,
+/// so the two spellings agree on the ABI. A Zig `enum` parameter, by
+/// contrast, validates its argument and would trap on exactly the
+/// out-of-range tags the reference's own suite passes
+/// (`test/enum_string_tests.c:30, :52, :72, :109`); taking the integer keeps
+/// the function total, and the generator's `default:` arm becomes the `"???"`
+/// string.
+///
+/// **The requirement is the default lowering and it is published, not left
+/// to this comment.** `-fshort-enums` gives `AMobjType`, `AMmarkExpand`,
+/// `AMidxType` and `AMstatus` a one-byte type, and a one-byte enum argument
+/// leaves the rest of its register unspecified, so the comparison in
+/// [`tagToString`] would read a garbage `u32` and answer `"???"` for a tag
+/// that has a name. `AMvalType` needs 21 bits and is unaffected, and neither
+/// is `AMunknownValue` nor `AMstackCallbackData`, whose one enum field is
+/// `AMvalType`. The header's `\warning` on the enumerations
+/// (`include/automerge.h`) states the requirement for the C caller, and
+/// `test/c/cabi.zig` pins the four-byte lowering against `zig translate-c`'s
+/// own `c_uint`.
 pub export fn AMobjTypeToString(tag: u32) [*:0]const u8 {
     return tagToString(obj_type_tags, tag);
 }
 
-pub export fn AMobjTypeFromString(dest: *AMobjType, src: ?[*:0]const u8) bool {
-    return tagFromString(obj_type_tags, dest, std.mem.span(src orelse return false));
+/// `AMobjTypeFromString`. Rust: generated, see
+/// `cmake/enum-string-functions-gen.cmake:68-79`.
+///
+/// Writes the tag named by `src` through `dest` and returns `true`. Returns
+/// `false` **without writing anything** when `src` is `NULL`, when it names no
+/// tag, or when `dest` is `NULL`: a pre-set `*dest` survives all three, which
+/// is what the reference suite asserts by pre-setting the out-parameter to
+/// `-1` and checking it is still `-1` (`test/enum_string_tests.c:38-40`). The
+/// `NULL` `dest` arm is this port's own, and it is a superset of the
+/// generated body rather than a change of contract: upstream dereferences
+/// `*dest` without checking, so a caller that honours the precondition takes
+/// the same path, and a caller that does not gets a report instead of a trap.
+///
+/// `src` is matched against each tag name in full, so it must be the whole
+/// NUL-terminated string, spelling and case included.
+pub export fn AMobjTypeFromString(dest: ?*AMobjType, src: ?[*:0]const u8) bool {
+    const d = dest orelse return false;
+    return tagFromString(obj_type_tags, d, std.mem.span(src orelse return false));
 }
 
+/// `AMmarkExpandToString`. Rust: generated, see
+/// `cmake/enum-string-functions-gen.cmake:53-66`.
+///
+/// The name of `tag`, or the literal `"???"` for anything that is not one of
+/// the five `AMmarkExpand` tags. The result is a static string constant: it
+/// owns nothing, must never be freed, and outlives every handle in the ABI.
+/// The raw-`u32` parameter and the default-lowering requirement behind it are
+/// [`AMobjTypeToString`]'s.
 pub export fn AMmarkExpandToString(tag: u32) [*:0]const u8 {
     return tagToString(mark_expand_tags, tag);
 }
 
-pub export fn AMmarkExpandFromString(dest: *AMmarkExpand, src: ?[*:0]const u8) bool {
-    return tagFromString(mark_expand_tags, dest, std.mem.span(src orelse return false));
+/// `AMmarkExpandFromString`. Rust: generated, see
+/// `cmake/enum-string-functions-gen.cmake:68-79`.
+///
+/// The same contract as [`AMobjTypeFromString`] over the five
+/// `AMmarkExpand` tags: `true` writes the tag through `dest`, and `false`
+/// writes nothing for a `NULL` `src`, an unknown name or a `NULL` `dest`.
+pub export fn AMmarkExpandFromString(dest: ?*AMmarkExpand, src: ?[*:0]const u8) bool {
+    const d = dest orelse return false;
+    return tagFromString(mark_expand_tags, d, std.mem.span(src orelse return false));
 }
 
+/// `AMidxTypeToString`. Rust: generated, see
+/// `cmake/enum-string-functions-gen.cmake:53-66`.
+///
+/// The name of `tag`, or the literal `"???"` for anything that is not one of
+/// the three `AMidxType` tags. The result is a static string constant: it
+/// owns nothing, must never be freed, and outlives every handle in the ABI.
+/// The raw-`u32` parameter and the default-lowering requirement behind it are
+/// [`AMobjTypeToString`]'s.
 pub export fn AMidxTypeToString(tag: u32) [*:0]const u8 {
     return tagToString(idx_type_tags, tag);
 }
 
-pub export fn AMidxTypeFromString(dest: *AMidxType, src: ?[*:0]const u8) bool {
-    return tagFromString(idx_type_tags, dest, std.mem.span(src orelse return false));
+/// `AMidxTypeFromString`. Rust: generated, see
+/// `cmake/enum-string-functions-gen.cmake:68-79`.
+///
+/// The same contract as [`AMobjTypeFromString`] over the three `AMidxType`
+/// tags: `true` writes the tag through `dest`, and `false` writes nothing for
+/// a `NULL` `src`, an unknown name or a `NULL` `dest`.
+pub export fn AMidxTypeFromString(dest: ?*AMidxType, src: ?[*:0]const u8) bool {
+    const d = dest orelse return false;
+    return tagFromString(idx_type_tags, d, std.mem.span(src orelse return false));
 }
 
+/// `AMvalTypeToString`. Rust: generated, see
+/// `cmake/enum-string-functions-gen.cmake:53-66`.
+///
+/// The name of `tag`, or the literal `"???"` for anything that is not one of
+/// the twenty-one `AMvalType` tags. The result is a static string constant:
+/// it owns nothing, must never be freed, and outlives every handle in the
+/// ABI. The raw-`u32` parameter is [`AMobjTypeToString`]'s; `AMvalType` is
+/// the one header enum that `-fshort-enums` cannot shrink, because its
+/// largest tag is `1 << 20`.
 pub export fn AMvalTypeToString(tag: u32) [*:0]const u8 {
     return tagToString(val_type_tags, tag);
 }
 
-pub export fn AMvalTypeFromString(dest: *AMvalType, src: ?[*:0]const u8) bool {
-    return tagFromString(val_type_tags, dest, std.mem.span(src orelse return false));
+/// `AMvalTypeFromString`. Rust: generated, see
+/// `cmake/enum-string-functions-gen.cmake:68-79`.
+///
+/// The same contract as [`AMobjTypeFromString`] over the twenty-one
+/// `AMvalType` tags: `true` writes the tag through `dest`, and `false` writes
+/// nothing for a `NULL` `src`, an unknown name or a `NULL` `dest`.
+pub export fn AMvalTypeFromString(dest: ?*AMvalType, src: ?[*:0]const u8) bool {
+    const d = dest orelse return false;
+    return tagFromString(val_type_tags, d, std.mem.span(src orelse return false));
 }
 
+/// `AMstatusToString`. Rust: generated, see
+/// `cmake/enum-string-functions-gen.cmake:53-66`.
+///
+/// The name of `tag`, or the literal `"???"` for anything that is not one of
+/// the three `AMstatus` tags. The result is a static string constant: it owns
+/// nothing, must never be freed, and outlives every handle in the ABI. The
+/// raw-`u32` parameter and the default-lowering requirement behind it are
+/// [`AMobjTypeToString`]'s.
 pub export fn AMstatusToString(tag: u32) [*:0]const u8 {
     return tagToString(status_tags, tag);
 }
 
-pub export fn AMstatusFromString(dest: *AMstatus, src: ?[*:0]const u8) bool {
-    return tagFromString(status_tags, dest, std.mem.span(src orelse return false));
+/// `AMstatusFromString`. Rust: generated, see
+/// `cmake/enum-string-functions-gen.cmake:68-79`.
+///
+/// The same contract as [`AMobjTypeFromString`] over the three `AMstatus`
+/// tags: `true` writes the tag through `dest`, and `false` writes nothing for
+/// a `NULL` `src`, an unknown name or a `NULL` `dest`. Those three tags are
+/// the whole of what [`AMresultStatus`] can return, so the round trip through
+/// [`AMstatusToString`] is total over a result's status.
+pub export fn AMstatusFromString(dest: ?*AMstatus, src: ?[*:0]const u8) bool {
+    const d = dest orelse return false;
+    return tagFromString(status_tags, d, std.mem.span(src orelse return false));
 }
 
 // ---------------------------------------------------------------------------
@@ -1972,6 +2147,32 @@ test "an unrecognised tag is ??? and a failed parse leaves the out-parameter alo
     var obj_dest: AMobjType = .AM_OBJ_TYPE_LIST;
     try t.expect(!AMobjTypeFromString(&obj_dest, "???"));
     try t.expectEqual(AMobjType.AM_OBJ_TYPE_LIST, obj_dest);
+}
+
+test "a null destination is refused, not dereferenced" {
+    // Every `*FromString` export takes an optional `dest` and answers `false`
+    // for a null one, on every tag table and with a name that does match:
+    // the generated body writes `*dest` as its first act inside the matching
+    // branch (`cmake/enum-string-functions-gen.cmake:71-74`), so a non-optional
+    // parameter would trap on a successful parse rather than report it. A C
+    // caller forwarding an optional out-parameter is the case this is for.
+    try t.expect(!AMobjTypeFromString(null, "AM_OBJ_TYPE_MAP"));
+    try t.expect(!AMmarkExpandFromString(null, "AM_MARK_EXPAND_BOTH"));
+    try t.expect(!AMidxTypeFromString(null, "AM_IDX_TYPE_POS"));
+    try t.expect(!AMvalTypeFromString(null, "AM_VAL_TYPE_CURSOR"));
+    try t.expect(!AMstatusFromString(null, "AM_STATUS_ERROR"));
+
+    // The three other refusals, so the arm is pinned as a set rather than one
+    // spelling of it.
+    var dest: AMobjType = .AM_OBJ_TYPE_DEFAULT;
+    try t.expect(!AMobjTypeFromString(&dest, null));
+    try t.expectEqual(AMobjType.AM_OBJ_TYPE_DEFAULT, dest);
+    try t.expect(AMobjTypeFromString(&dest, "AM_OBJ_TYPE_MAP"));
+    try t.expectEqual(AMobjType.AM_OBJ_TYPE_MAP, dest);
+
+    // A successful parse still writes, and the success arm is reached only
+    // through a real destination.
+    try t.expectEqualStrings("AM_OBJ_TYPE_MAP", std.mem.span(AMobjTypeToString(@intCast(@intFromEnum(dest)))));
 }
 
 // Zig 0.16.0 / upstream / Rust / port

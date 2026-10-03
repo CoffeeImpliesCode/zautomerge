@@ -53,9 +53,9 @@
 //!
 //! # What is not here
 //!
-//! `hydrate::Value` (`op.rs:1084-1116`), `ExId` promotion (`op.rs:1027-1038`)
-//! and `OpSet::id_to_exid` are P9 and the op-set slices respectively; they
-//! name types this file's importers do not have yet.
+//! `hydrate::Value` (`op.rs:1084-1116`) lives in `hydrate.zig`. `ExId`
+//! promotion (`op.rs:1027-1038`) and `OpSet::id_to_exid` belong to the
+//! document/op-set layer rather than this borrowed-row module.
 
 const std = @import("std");
 const err = @import("../error.zig");
@@ -63,6 +63,11 @@ const types = @import("../types.zig");
 const clock = @import("../clock.zig");
 const column = @import("../hexane/column.zig");
 const opset_types = @import("types.zig");
+// The mark index, for the one definition of the `MarkIdx` word this file's
+// rows are marked with. It is an edge in the module graph that did not exist
+// before: `mark_index.zig` imports nothing from this file, so the dependency
+// runs row → index and not back.
+const markidx = @import("mark_index.zig");
 const value = @import("../value.zig");
 
 // The types an op set row is assembled from. `types.zig` is the slice's own
@@ -216,16 +221,23 @@ pub const ResolvedAction = union(enum) {
 };
 
 /// What a `MarkIndexBuilder` marks the column with: the `MarkIdx` word
-/// (`MarkIdx::as_i64`, `op_set2/op_set/mark_index.rs:25-34`).
+/// (`MarkIdx::as_i64`, `op_set2/op_set/mark_index.rs:25-34`), and its
+/// negation for a mark's end.
 ///
-/// `((actor as i64) << 32) + ((counter as i64) & 0xffffffff)`, and its
-/// negation for a mark's end, so the column is ascending by mark id and a
-/// begin sorts before the end that closes it. `columns.zig` owns the column
-/// and its `MarkIdx` (`columns.zig:298-311`); this is only the arithmetic.
+/// The word itself is [`markidx.markIdxWord`]'s, and this is a forwarder
+/// rather than a second expression: the column a mark's word is stored in is
+/// the one `mark_index.zig` owns (`columns.zig:298-311`), so the op row and
+/// the column have to agree on the encoding bit for bit, and the cheapest
+/// way to say they do is to have one definition. The previous copy was
+/// written in `i64` and rested on a rule about signed shifts discarding bits
+/// that the pinned language reference does not state; that copy is gone.
+///
+/// A row's word is `markIdxWord` of the mark's **begin** id: a begin row
+/// names its own id, and an end row is the operation immediately after its
+/// begin and names it at `id.prev()` (`op_set2/op.rs:951`, `:199`), which is
+/// why [`prevSaturating`] is where the end arm goes through.
 fn markIdxWord(id: OpId) i64 {
-    const actor: i64 = @intCast(id.actor);
-    const counter: i64 = @intCast(id.counter);
-    return (actor << 32) + (counter & 0xffffffff);
+    return markidx.markIdxWord(id);
 }
 
 /// `id.prev()` that does not trap at counter zero (`OpId::prev`,
@@ -292,6 +304,26 @@ pub const SuccEntry = struct {
 ///
 /// `entries` is borrowed storage the caller keeps alive, exactly as `Op`'s
 /// key, value and mark name are (`op_set2/op.rs:838-842`).
+///
+/// **Build one with [`fromSpan`] or [`none`], not with a struct literal.**
+/// Every field is reachable and there is no private one to hang the obligation
+/// on, so the one obligation `has_delete` carries is written here instead:
+///
+/// > `has_delete` must equal "some entry of `entries` has `inc == null`",
+/// > and `read` must be a count of how many of them have been read.
+///
+/// [`Op.visible`] reads `has_delete` as the answer for a counter row's
+/// visibility (`op_set2/op.rs:1151-1153`), and that arm is the reason the flag
+/// exists rather than a scan: a counter can have many successors and every
+/// visibility read would otherwise walk them all. `fromSpan` computes the
+/// flag once, at the point the entries are known, and a cursor that satisfies
+/// the invariant cannot answer wrongly there. A literal that sets it to
+/// `false` over entries that delete makes a counter row with a deleting
+/// successor report itself visible; `read` past `entries.len` is worse still,
+/// because `remaining` and `next` both subtract from it.
+///
+/// The three in-package constructors — [`fromSpan`], [`none`] and
+/// [`loadSuccWindow`], which goes through the first — are the supported ones.
 pub const SuccCursors = struct {
     /// The row's successors, in ascending id order — the order
     /// `OpSet::add_succ` keeps them in (`op_set2/op_set.rs:262-276`).
@@ -304,14 +336,25 @@ pub const SuccCursors = struct {
     /// flattened position of the next one, which is what upstream's three
     /// column iterators advance (`op_set2/op.rs:882-886`).
     read: usize,
-    /// Whether any successor deletes rather than increments — the one thing
-    /// [`Op.visible`] needs from the increment column for a counter row
-    /// (`op_set2/op.rs:1151-1153`), computed once here so the accessor stays
-    /// infallible.
+    /// Whether any successor **of this span** deletes rather than increments —
+    /// the one thing [`Op.visible`] needs from the increment column for a
+    /// counter row (`op_set2/op.rs:1151-1153`), computed once at construction
+    /// so that accessor stays infallible and O(1).
+    ///
+    /// It is derived state, not an input: it must equal "some entry of
+    /// `entries` has `inc == null`", and the type doc states that as an
+    /// obligation because Zig has no way to enforce it. It is deliberately
+    /// *not* derived where it is read — the counter arm of `Op.visible` is on
+    /// the query path, where a counter with many successors would pay a walk
+    /// per row.
     has_delete: bool,
 
     /// A cursor over `entries`, whose first entry sits at flattened position
-    /// `at`.
+    /// `at`, with `has_delete` derived from `entries`.
+    ///
+    /// This is the constructor the type doc asks for. It walks `entries` once,
+    /// which is the whole of the work `has_delete` ever costs, and it is why a
+    /// counter row's visibility is O(1) afterwards.
     pub fn fromSpan(entries: []const SuccEntry, at: usize) SuccCursors {
         var has_delete = false;
         for (entries) |e| {
@@ -339,14 +382,33 @@ pub const SuccCursors = struct {
         return self.at + self.read;
     }
 
-    /// How many successors the cursor has left
-    /// (`SuccCursors::len`, `op_set2/op.rs:890-894`).
+    /// How many successors the row has **in total** — a property of `entries`
+    /// alone, not of where this cursor stands (`SuccCursors::len`,
+    /// `op_set2/op.rs:890-894`).
+    ///
+    /// `next` advances `read` and leaves this unchanged, so this is **not** a
+    /// drain-loop bound: `while (c.len() > 0) { _ = c.next(); }` never ends.
+    /// It is the total because that is what the indexed readers need —
+    /// `Op.succAt(i)` indexes `entries` by absolute position, and
+    /// `Op.succCount` is the count it is the bound for.
+    ///
+    /// The number still unread is `entries.len - read`, which is what
+    /// [`SuccIncCursors.len`] answers. Upstream's `ExactSizeIterator::len`
+    /// is the remaining count (`op_set2/op.rs:890-894`), so a caller ported
+    /// from upstream must ask a `SuccIncCursors` — reached through
+    /// [`withInc`] — for the remaining count, not this one.
     pub fn len(self: SuccCursors) usize {
         return self.entries.len;
     }
 
-    /// The next successor, in ascending id order
-    /// (`Iterator for SuccCursors`, `op_set2/op.rs:875-888`).
+    /// The next successor's id, in ascending id order, or null at the end of
+    /// the walk (`Iterator for SuccCursors`, `op_set2/op.rs:875-888`).
+    ///
+    /// This is the cursor half: it advances only `read`, which is the one
+    /// field it owns, and it does not copy or reorder `entries`. `null` is
+    /// the end of the walk and only the end — an entry's `inc == null` is a
+    /// delete, not an end. The successor ids it hands out are borrowed from
+    /// `entries` and are values, so they outlive the cursor.
     pub fn next(self: *SuccCursors) ?OpId {
         if (self.read >= self.entries.len) return null;
         defer self.read += 1;
@@ -358,13 +420,20 @@ pub const SuccCursors = struct {
         return self.read;
     }
 
-    /// How many successors have not been read.
+    /// How many successors have not been read: the remaining count upstream's
+    /// `len` gives (`op_set2/op.rs:890-894`). Safe because `read` is bounded
+    /// by `entries.len` — `next` never passes it.
     fn remaining(self: SuccCursors) usize {
         return self.entries.len - self.read;
     }
 
-    /// A cursor yielding each successor with its increment
-    /// (`SuccIncCursors`, `op_set2/op.rs:871`, `:896-911`).
+    /// A second cursor over the same span that also yields each successor's
+    /// increment (`SuccIncCursors`, `op_set2/op.rs:871`, `:896-911`).
+    ///
+    /// It is a *copy* of this cursor, so the two advance independently: this
+    /// one at `read` and the returned one at its own `read`, both into the
+    /// same borrowed `entries`. Nothing is allocated and nothing is copied out
+    /// of the span.
     pub fn withInc(self: SuccCursors) SuccIncCursors {
         return .{ .inner = self };
     }
@@ -372,19 +441,37 @@ pub const SuccCursors = struct {
 
 /// A cursor over a row's successors carrying their increments
 /// (`SuccIncCursors`, `op_set2/op.rs:871`, `:896-911`).
+///
+/// Nothing is owned: `inner` is a [`SuccCursors`] by value, whose `entries`
+/// the caller still owns, so this borrows exactly as long as the span does
+/// and there is no `deinit`. It is a cursor rather than a collection — its
+/// `len` counts what is left to read, which is the count a drain loop wants,
+/// while the underlying [`SuccCursors.len`] counts the row's total.
+///
+/// Reach one with [`SuccCursors.withInc`], which is also where the
+/// `has_delete` obligation the inner cursor carries is stated.
 pub const SuccIncCursors = struct {
-    /// The cursor this one was made from, advanced in place.
+    /// The cursor this one was made from, advanced in place. Its `read` is
+    /// *this* value's progress, not the `SuccCursors` it was copied from's:
+    /// `withInc` takes the inner by value.
     inner: SuccCursors,
 
-    /// The next successor and its increment
-    /// (`Iterator for SuccIncCursors`, `op_set2/op.rs:896-911`).
+    /// The next successor and its increment, in ascending id order, or null at
+    /// the end of the walk (`Iterator for SuccIncCursors`,
+    /// `op_set2/op.rs:896-911`).
+    ///
+    /// This advances the *inner* cursor's `read` through the copy this value
+    /// owns, so a `SuccIncCursors` is advanced independently of the
+    /// `SuccCursors` it was made from — `withInc` copies. The entries are
+    /// borrowed from the original span and are not copied.
     pub fn next(self: *SuccIncCursors) ?SuccEntry {
         if (self.inner.remaining() == 0) return null;
         defer self.inner.read += 1;
         return self.inner.entries[self.inner.nextIndex()];
     }
 
-    /// How many successors are left (`op_set2/op.rs:927-931`).
+    /// How many successors are **left to read** (`op_set2/op.rs:927-931`) —
+    /// the remaining count, not the total that [`SuccCursors.len`] answers.
     pub fn len(self: SuccIncCursors) usize {
         return self.inner.remaining();
     }
@@ -437,7 +524,8 @@ pub const SuccInsert = struct {
     /// The increment the successor carries, or null for a delete. Nulled
     /// when the row is not a counter (`op_set2/op.rs:959-961`).
     inc: ?i64,
-    /// How many successors the row has now (`op_set2/op.rs:962`).
+    /// The row's count before an insertion pass (`op_set2/op.rs:962`).
+    /// In `SuccUndo.succ`, the count immediately before that individual edge.
     len: u64,
     /// Where in the row's successor list the new one goes, in the flattened
     /// successor columns' coordinates (`op_set2/op.rs:963-969`).
@@ -457,11 +545,13 @@ pub const SuccInsert = struct {
 /// `op_set2/op_set.rs:1587-1593`).
 ///
 /// Carried on [`TxOp.undo`] and replayed by `OpSet::undo_succ`
-/// (`op_set2/op_set.rs:327-351`). The two `?` payloads are upstream's nested
-/// `Option`s: null means "this index column was not touched", and a null
-/// inside `text` means "it was set to null".
+/// (`op_set2/op_set.rs:327-351`). The three optional payloads identify index
+/// columns this edge changed; a null inside `text` means "it was set to null".
 pub const SuccUndo = struct {
-    /// The edge to remove.
+    /// The edge to remove. `len` is its predecessor row's count immediately
+    /// before this edge was published, including earlier edges in the same
+    /// insertion pass. Keep the row and flattened coordinates valid until the
+    /// complete journal is undone; resumable replay checks row ownership first.
     succ: SuccInsert,
     /// The row's `visible` flag before the edge was added, if it was
     /// cleared.
@@ -644,6 +734,16 @@ pub const OpBuilder = struct {
     /// Frees the predecessor list and nothing else: every borrowed payload
     /// belongs to the caller (`AGENTS.md` §Invariants, "slices returned into
     /// a document's own storage").
+    ///
+    /// `gpa` must be the allocator [`init`] built the list with, for the
+    /// reason every resetting teardown in this file gives.
+    ///
+    /// Afterwards the builder is `undefined`: no accessor may be called on
+    /// it, and a second call frees `undefined`, which no optimize mode
+    /// diagnoses — the reset makes the mistake louder in a debug build and
+    /// promises nothing in a fast one. Call it exactly once per builder. A
+    /// copy taken beforehand names the same `_pred` allocation and is **not**
+    /// a second owner: freeing both frees it twice.
     pub fn deinit(self: *OpBuilder, gpa: Allocator) void {
         self._pred.deinit(gpa);
         self.* = undefined;
@@ -973,6 +1073,19 @@ pub const OpBuilder = struct {
 /// The builder is the operation; the rest is what only the transaction needs
 /// — where in the sequence it landed, whether it changes what a reader sees,
 /// and how to undo it.
+///
+/// **The accessors below this point forward.** They exist because a generic
+/// reader (`columns.zig:503`) is written against one interface over all four
+/// op types, and this is the second of the two types that hold a builder
+/// rather than columns. Each forwards one-for-one to the [`OpBuilder`]
+/// accessor of the same name, so the answer, the borrowing rules and the
+/// upstream line are the builder's; each carries its own first line saying
+/// what it answers, and the two whose answers differ between the op types —
+/// [`TxOp.succAt`], [`TxOp.succIncAt`] — say so in full. Nothing is cached and
+/// nothing is copied: every borrowed slice is the builder's, and the op is
+/// `undefined` after [`TxOp.deinit`].
+///
+/// Not thread-safe, and not shared: one `TxOp` belongs to one transaction.
 pub const TxOp = struct {
     /// The type of the parent object (`op_set2/op.rs:165`).
     obj_type: ObjType,
@@ -1230,6 +1343,13 @@ pub const TxOp = struct {
 
     /// Frees the builder's predecessor list and the undo list, and nothing
     /// else: the borrowed payloads belong to the caller.
+    ///
+    /// `gpa` must be the allocator [`OpBuilder.init`] built both with, for the
+    /// reason [`OpBuilder.deinit`] gives. Afterwards the op is `undefined`:
+    /// no accessor may be called on it, and a second call frees `undefined`
+    /// without any optimize mode diagnosing it, so call it exactly once. A
+    /// copy taken beforehand names the same two allocations and is not a
+    /// second owner.
     pub fn deinit(self: *TxOp, gpa: Allocator) void {
         self.undo.deinit(gpa);
         self.bld.deinit(gpa);
@@ -1272,111 +1392,201 @@ pub const TxOp = struct {
         return self.bld.getIncrementValue();
     }
 
+    /// The parent object as the object columns spell it: null for the root
+    /// (`OpBuilder.obj`, `op_set2/op.rs:1276-1281`).
     pub fn obj(self: *const TxOp) ?OpId {
         return self.bld.obj();
     }
+    /// The parent object as `OpBuilder.objId` holds it (`op_set2/op.rs:837`),
+    /// the root included.
     pub fn objId(self: *const TxOp) ObjId {
         return self.bld.objId();
     }
+    /// The parent object's actor, or null for the root
+    /// (`OpBuilder.objActor`, `op_set2/op.rs:1332-1334`).
     pub fn objActor(self: *const TxOp) ?ActorIdx {
         return self.bld.objActor();
     }
+    /// The parent object's counter, or null for the root
+    /// (`OpBuilder.objCtr`, `op_set2/op.rs:1335-1337`).
     pub fn objCtr(self: *const TxOp) ?u32 {
         return self.bld.objCtr();
     }
+    /// The object this operation makes and of what type, or null for one that
+    /// makes nothing (`OpBuilder.objInfo`, `op_set2/op.rs:1360`).
     pub fn objInfo(self: *const TxOp) ?ObjInfo {
         return self.bld.objInfo();
     }
+    /// What the operation does (`OpBuilder.action`, `op_set2/op.rs:1338`).
     pub fn action(self: *const TxOp) Action {
         return self.bld.action();
     }
+    /// What the operation hangs by: the map key it writes or the element it
+    /// lands at (`OpBuilder.key`, `op_set2/op.rs:1346`).
     pub fn key(self: *const TxOp) KeyRef {
         return self.bld.key();
     }
+    /// The map key, or null for a sequence anchor (`OpBuilder.keyStr`,
+    /// `op_set2/op.rs:1339`). Borrowed from the builder, as everywhere here.
     pub fn keyStr(self: *const TxOp) ?[]const u8 {
         return self.bld.keyStr();
     }
+    /// The anchor's actor, or null for a map key (`OpBuilder.keyActor`,
+    /// `op_set2/op.rs:1340-1342`).
     pub fn keyActor(self: *const TxOp) ?ActorIdx {
         return self.bld.keyActor();
     }
+    /// The anchor's counter, or null for a map key (`OpBuilder.keyCtr`,
+    /// `op_set2/op.rs:1343-1345`).
     pub fn keyCtr(self: *const TxOp) ?i64 {
         return self.bld.keyCtr();
     }
+    /// Whether the operation inserts rather than overwrites
+    /// (`OpBuilder.insert`, `op_set2/op.rs:1349`).
     pub fn insert(self: *const TxOp) bool {
         return self.bld.insert();
     }
+    /// The scalar the operation carries (`OpBuilder.value`,
+    /// `op_set2/op.rs:127-129`). Every slice-bearing form is borrowed.
     pub fn value(self: *const TxOp) ScalarValue {
         return self.bld.value();
     }
+    /// The metadata word this value occupies in the value column
+    /// (`OpBuilder.metaValue`, `op_set2/meta.rs:73-93`). It is recomputed per
+    /// call rather than stored, so it is the value's own word and not a
+    /// remembered one.
     pub fn metaValue(self: *const TxOp) ValueMeta {
         return self.bld.metaValue();
     }
+    /// The value's bytes as the value column would store them, or null for a
+    /// value with no bytes (`OpBuilder.rawValue`, `op_set2/op.rs:806-808`).
     pub fn rawValue(self: *const TxOp) ?[]const u8 {
         return self.bld.rawValue();
     }
+    /// Whether a mark's expansion passes its end (`OpBuilder.expand`,
+    /// `op_set2/op.rs:1350`).
     pub fn expand(self: *const TxOp) bool {
         return self.bld.expand();
     }
+    /// The mark's name, or null for a row that is not a mark
+    /// (`OpBuilder.markName`, `op_set2/op.rs:1353`). Borrowed.
     pub fn markName(self: *const TxOp) ?[]const u8 {
         return self.bld.markName();
     }
+    /// The mark's name with the value it puts on the span, or null for a row
+    /// with no name (`OpBuilder.markData`, `op_set2/op.rs:75-79`).
     pub fn markData(self: *const TxOp) ?MarkData {
         return self.bld.markData();
     }
+    /// The mark-index word for a mark operation, or null for one that is not a
+    /// mark (`OpBuilder.markIndex`, `op_set2/op.rs:943-954`). An end names
+    /// its begin at `id.prev()` and is the negation of its word.
     pub fn markIndex(self: *const TxOp) ?i64 {
         return self.bld.markIndex();
     }
+    /// How wide the operation is in `seq_type` (`OpBuilder.width`,
+    /// `op_set2/op.rs:1007-1013`).
     pub fn width(self: *const TxOp, seq_type: SequenceType, text_encoding: TextEncoding) i64 {
         return self.bld.width(seq_type, text_encoding);
     }
+    /// Whether the operation is visible in the document
+    /// (`OpBuilder.visible`, `op_set2/op.rs:573-575`). An operation a
+    /// transaction has built has no successors yet, so only the increment arm
+    /// can answer false here.
     pub fn visible(self: *const TxOp) bool {
         return self.bld.visible();
     }
+    /// Whether the operation is the winner of its register (`OpBuilder.top`,
+    /// `op_set2/op.rs:1357-1359`).
     pub fn top(self: *const TxOp) bool {
         return self.bld.top();
     }
+    /// The element the operation made, if it inserts, and its raw key
+    /// otherwise (`OpBuilder.elemidOrKey`, `op_set2/op.rs:1040-1046`).
     pub fn elemidOrKey(self: *const TxOp) KeyRef {
         return self.bld.elemidOrKey();
     }
+    /// Whether the operation is an increment (`OpBuilder.isInc`,
+    /// `op_set2/op.rs:212-214`).
     pub fn isInc(self: *const TxOp) bool {
         return self.bld.isInc();
     }
+    /// Whether the operation's value is a counter (`OpBuilder.isCounter`,
+    /// `op_set2/op.rs:1126-1128`).
     pub fn isCounter(self: *const TxOp) bool {
         return self.bld.isCounter();
     }
+    /// The element the operation addresses (`OpBuilder.cursor`,
+    /// `op_set2/op.rs:1073-1082`), or `error.InvalidCursorOp` for a map key.
     pub fn cursor(self: *const TxOp) Error!ElemId {
         return self.bld.cursor();
     }
+    /// How many successors the operation has, which is always zero: a
+    /// transaction's operation gains its successors only once it is written
+    /// (`OpBuilder.succCount`, `op_set2/op.rs:516-518`).
     pub fn succCount(self: *const TxOp) usize {
         return self.bld.succCount();
     }
+    /// The `i`-th successor's id — always an error in practice, because the
+    /// count is always zero (`OpBuilder.succAt`, `op_set2/op.rs:516-518`).
+    ///
+    /// `i` must be below [`TxOp.succCount`], which means `i` must be below
+    /// zero for no integer, so a correct caller never gets here. The
+    /// `std.debug.assert` inside is checked in Debug and ReleaseSafe and
+    /// compiled out in ReleaseFast and ReleaseSmall, where this answers
+    /// `OpId.root` — a real id, the root's, which is why a caller must not
+    /// reach this method at all rather than treat the answer as a row's
+    /// successor.
     pub fn succAt(self: *const TxOp, i: usize) OpId {
         return self.bld.succAt(i);
     }
+    /// How many successors carry an increment, which is always zero
+    /// (`OpBuilder.succIncCount`, `op_set2/op.rs:511-514`).
     pub fn succIncCount(self: *const TxOp) usize {
         return self.bld.succIncCount();
     }
+    /// The `i`-th successor's increment — always null in practice, because the
+    /// count is always zero (`OpBuilder.succIncAt`, `op_set2/op.rs:511-514`).
+    ///
+    /// The same precondition as [`TxOp.succAt`]: `i` must be below
+    /// [`TxOp.succIncCount`], and in an optimize mode with the assert
+    /// compiled out this answers null, which a caller could not tell from a
+    /// successor that deletes.
     pub fn succIncAt(self: *const TxOp, i: usize) ?i64 {
         return self.bld.succIncAt(i);
     }
+    /// An empty successor cursor (`OpBuilder.succ`, `op_set2/op.rs:516-518`),
+    /// so [`SuccCursors.len`] is 0 for a transaction's operation.
     pub fn succ(self: *const TxOp) SuccCursors {
         return self.bld.succ();
     }
+    /// An empty successor cursor carrying increments (`OpBuilder.succInc`,
+    /// `op_set2/op.rs:511-514`).
     pub fn succInc(self: *const TxOp) SuccIncCursors {
         return self.bld.succInc();
     }
+    /// The actor half of the operation's id (`OpBuilder.idActor`,
+    /// `op_set2/op.rs:1328`; `:504-506`).
     pub fn idActor(self: *const TxOp) ActorIdx {
         return self.bld.idActor();
     }
+    /// The counter half of the operation's id, widened (`OpBuilder.idCtr`).
     pub fn idCtr(self: *const TxOp) i64 {
         return self.bld.idCtr();
     }
+    /// The operation's own counter (`OpBuilder.opIdCtr`,
+    /// `op_set2/op.rs:1316-1318`).
     pub fn opIdCtr(self: *const TxOp) u32 {
         return self.bld.opIdCtr();
     }
+    /// How many predecessors the operation has (`OpBuilder.predCount`,
+    /// `op_set2/op.rs:1307-1309`).
     pub fn predCount(self: *const TxOp) u32 {
         return self.bld.predCount();
     }
+    /// The predecessor ids, borrowed from the builder's own list
+    /// (`OpBuilder.pred`, `op_set2/op.rs:1319-1321`). They are valid until
+    /// [`TxOp.deinit`], which frees that list.
     pub fn pred(self: *const TxOp) []const OpId {
         return self.bld.pred();
     }
@@ -1389,6 +1599,17 @@ pub const TxOp = struct {
 ///
 /// Unlike [`Op`], a change op is not a row yet: it has no row position until
 /// the merge walks assign one, and its successors are known rather than read.
+///
+/// **The accessors after [`ChangeOp.succIncAt`] forward.** The reason is the
+/// one [`TxOp`] gives: a generic reader (`columns.zig:503`) is written against
+/// one interface over all four op types. Each forwards one-for-one to the
+/// [`OpBuilder`] accessor of the same name, except the successor ones, which
+/// read this op's own `succs` because a decoded op's successors are a list
+/// rather than columns. Everything borrowed is borrowed from the builder or
+/// from `succs`, and the op is `undefined` after [`ChangeOp.deinit`].
+///
+/// Not thread-safe, and not shared: one `ChangeOp` belongs to one change
+/// decode.
 pub const ChangeOp = struct {
     /// The successors its predecessors gained, in ascending id order.
     succs: std.ArrayList(SuccEntry),
@@ -1439,7 +1660,16 @@ pub const ChangeOp = struct {
     }
 
     /// Frees the successor list and the builder's predecessor list, and
-    /// nothing else.
+    /// nothing else: every borrowed payload — the map key, the `str`/`bytes`
+    /// payload, the mark name — belongs to the change or the document it was
+    /// decoded out of.
+    ///
+    /// `gpa` must be the allocator [`init`] was given, for the reason
+    /// [`OpBuilder.deinit`] gives. Afterwards the op is `undefined`: no
+    /// accessor may be called on it, and a second call frees `undefined`
+    /// without any optimize mode diagnosing it, so call it exactly once. A
+    /// copy taken beforehand names the same two allocations and is not a
+    /// second owner.
     pub fn deinit(self: *ChangeOp, gpa: Allocator) void {
         self.succs.deinit(gpa);
         self.bld.deinit(gpa);
@@ -1500,123 +1730,227 @@ pub const ChangeOp = struct {
 
     /// The `i`-th successor's id (`OpLike for ChangeOp::succ`,
     /// `op_set2/op.rs:681-683`).
+    ///
+    /// `i` must be below [`ChangeOp.succCount`], which is `succs.items.len`.
+    /// The `std.debug.assert` is a programmer precondition, checked in Debug
+    /// and ReleaseSafe and compiled out in ReleaseFast and ReleaseSmall; this
+    /// is not a parser and is not reached from untrusted bytes. Unlike
+    /// [`Op.succAt`] the bound really is the caller's to hold here, because
+    /// `ChangeOp.succs` is a reachable field: a consumer may append to or
+    /// truncate it between reading the count and reading the entry. The
+    /// successor ids are values and outlive any borrow of the list.
     pub fn succAt(self: *const ChangeOp, i: usize) OpId {
         std.debug.assert(i < self.succs.items.len);
         return self.succs.items[i].id;
     }
 
-    /// The `i`-th successor's increment, or null
+    /// The `i`-th successor's increment, or null for one that deletes it
     /// (`OpLike for ChangeOp::succ_inc`, `op_set2/op.rs:677-679`).
+    ///
+    /// The same precondition as [`ChangeOp.succAt`]: `i` must be below
+    /// [`ChangeOp.succIncCount`], checked only in the safety-checked optimize
+    /// modes, and the caller's to hold. The increment column has one entry
+    /// per successor (`op_set2/columns.rs:468-470`), which is why both counts
+    /// are the same number.
     pub fn succIncAt(self: *const ChangeOp, i: usize) ?i64 {
         std.debug.assert(i < self.succs.items.len);
         return self.succs.items[i].inc;
     }
 
+    /// The operation's own id, as assigned by the change it was decoded from
+    /// (`OpBuilder.id`, `op_set2/op.rs:1328`).
     pub fn id(self: *const ChangeOp) OpId {
         return self.bld.id();
     }
+    /// The parent object as the object columns spell it: null for the root
+    /// (`OpBuilder.obj`, `op_set2/op.rs:1276-1281`).
     pub fn obj(self: *const ChangeOp) ?OpId {
         return self.bld.obj();
     }
+    /// The parent object as `OpBuilder.objId` holds it (`op_set2/op.rs:837`),
+    /// the root included.
     pub fn objId(self: *const ChangeOp) ObjId {
         return self.bld.objId();
     }
+    /// The parent object's actor, or null for the root
+    /// (`OpBuilder.objActor`, `op_set2/op.rs:1332-1334`).
     pub fn objActor(self: *const ChangeOp) ?ActorIdx {
         return self.bld.objActor();
     }
+    /// The parent object's counter, or null for the root
+    /// (`OpBuilder.objCtr`, `op_set2/op.rs:1335-1337`).
     pub fn objCtr(self: *const ChangeOp) ?u32 {
         return self.bld.objCtr();
     }
+    /// The object this operation makes and of what type, or null for one that
+    /// makes nothing (`OpBuilder.objInfo`, `op_set2/op.rs:1360`).
     pub fn objInfo(self: *const ChangeOp) ?ObjInfo {
         return self.bld.objInfo();
     }
+    /// What the operation does (`OpBuilder.action`, `op_set2/op.rs:1338`).
     pub fn action(self: *const ChangeOp) Action {
         return self.bld.action();
     }
+    /// What the operation hangs by: the map key it writes or the element it
+    /// lands at (`OpBuilder.key`, `op_set2/op.rs:1346`).
     pub fn key(self: *const ChangeOp) KeyRef {
         return self.bld.key();
     }
+    /// The map key, or null for a sequence anchor (`OpBuilder.keyStr`,
+    /// `op_set2/op.rs:1339`). Borrowed from the decoded change.
     pub fn keyStr(self: *const ChangeOp) ?[]const u8 {
         return self.bld.keyStr();
     }
+    /// The anchor's actor, or null for a map key (`OpBuilder.keyActor`,
+    /// `op_set2/op.rs:1340-1342`).
     pub fn keyActor(self: *const ChangeOp) ?ActorIdx {
         return self.bld.keyActor();
     }
+    /// The anchor's counter, or null for a map key (`OpBuilder.keyCtr`,
+    /// `op_set2/op.rs:1343-1345`).
     pub fn keyCtr(self: *const ChangeOp) ?i64 {
         return self.bld.keyCtr();
     }
+    /// Whether the operation inserts rather than overwrites
+    /// (`OpBuilder.insert`, `op_set2/op.rs:1349`).
     pub fn insert(self: *const ChangeOp) bool {
         return self.bld.insert();
     }
+    /// The scalar the operation carries (`OpBuilder.value`,
+    /// `op_set2/op.rs:127-129`). Every slice-bearing form is borrowed.
     pub fn value(self: *const ChangeOp) ScalarValue {
         return self.bld.value();
     }
+    /// The metadata word this value occupies in the value column
+    /// (`OpBuilder.metaValue`, `op_set2/meta.rs:73-93`), recomputed per call.
     pub fn metaValue(self: *const ChangeOp) ValueMeta {
         return self.bld.metaValue();
     }
+    /// The value's bytes as the value column would store them, or null for a
+    /// value with no bytes (`OpBuilder.rawValue`, `op_set2/op.rs:806-808`).
     pub fn rawValue(self: *const ChangeOp) ?[]const u8 {
         return self.bld.rawValue();
     }
+    /// Whether a mark's expansion passes its end (`OpBuilder.expand`,
+    /// `op_set2/op.rs:1350`).
     pub fn expand(self: *const ChangeOp) bool {
         return self.bld.expand();
     }
+    /// The mark's name, or null for a row that is not a mark
+    /// (`OpBuilder.markName`, `op_set2/op.rs:1353`). Borrowed.
     pub fn markName(self: *const ChangeOp) ?[]const u8 {
         return self.bld.markName();
     }
+    /// The mark's name with the value it puts on the span, or null for a row
+    /// with no name (`OpBuilder.markData`, `op_set2/op.rs:75-79`).
     pub fn markData(self: *const ChangeOp) ?MarkData {
         return self.bld.markData();
     }
+    /// The mark-index word for a mark operation, or null for one that is not a
+    /// mark (`OpBuilder.markIndex`, `op_set2/op.rs:943-954`). An end names
+    /// its begin at `id.prev()` and is the negation of its word.
     pub fn markIndex(self: *const ChangeOp) ?i64 {
         return self.bld.markIndex();
     }
+    /// The element the operation made, if it inserts, and its raw key
+    /// otherwise (`OpBuilder.elemidOrKey`, `op_set2/op.rs:1040-1046`).
     pub fn elemidOrKey(self: *const ChangeOp) KeyRef {
         return self.bld.elemidOrKey();
     }
+    /// The string the operation contributes to a text sequence, or the object
+    /// replacement character (`OpBuilder.asStr`, `op_set2/op.rs:997-1005`).
     pub fn asStr(self: *const ChangeOp) []const u8 {
         return self.bld.asStr();
     }
+    /// Whether the operation is an increment (`OpBuilder.isInc`,
+    /// `op_set2/op.rs:212-214`).
     pub fn isInc(self: *const ChangeOp) bool {
         return self.bld.isInc();
     }
+    /// Whether the operation's value is a counter (`OpBuilder.isCounter`,
+    /// `op_set2/op.rs:1126-1128`).
     pub fn isCounter(self: *const ChangeOp) bool {
         return self.bld.isCounter();
     }
+    /// Whether the operation is a mark (`OpBuilder.isMark`,
+    /// `op_set2/op.rs:475-477`).
     pub fn isMark(self: *const ChangeOp) bool {
         return self.bld.isMark();
     }
+    /// Whether the operation deletes (`OpBuilder.isDelete`,
+    /// `op_set2/op.rs:467-469`). A delete is a successor edge rather than a
+    /// row, so a change op can be one before the merge writes it.
     pub fn isDelete(self: *const ChangeOp) bool {
         return self.bld.isDelete();
     }
+    /// The amount an increment carries, or null for anything else
+    /// (`OpBuilder.getIncrementValue`, `op_set2/op.rs:463-465`).
     pub fn getIncrementValue(self: *const ChangeOp) ?i64 {
         return self.bld.getIncrementValue();
     }
+    /// The element the operation addresses (`OpBuilder.cursor`,
+    /// `op_set2/op.rs:1073-1082`), or `error.InvalidCursorOp` for a map key.
     pub fn cursor(self: *const ChangeOp) Error!ElemId {
         return self.bld.cursor();
     }
+    /// How many successors the change recorded for this operation
+    /// (`op_set2/op.rs:681-683`).
+    ///
+    /// Unlike a stored row's, this is not read out of columns: a change op
+    /// carries its successors as the op set hands them over
+    /// (`op_set2/op.rs:681-683`), and [`ChangeOp.succAt`] indexes the same
+    /// list. It is `succs.items.len`, so a consumer that appends to the
+    /// reachable `succs` field changes this count.
     pub fn succCount(self: *const ChangeOp) usize {
         return self.succs.items.len;
     }
+    /// How many successors carry an increment, which is the same number as
+    /// [`ChangeOp.succCount`]: the increment index has one entry per
+    /// successor (`op_set2/columns.rs:468-470`).
     pub fn succIncCount(self: *const ChangeOp) usize {
         return self.succs.items.len;
     }
+    /// A cursor over the recorded successors, borrowing `succs.items`
+    /// (`op_set2/op.rs:681-683`).
+    ///
+    /// `at` is 0 because a change op's successors have no position in a
+    /// document's flattened successor columns yet — the merge walks assign
+    /// `pos`, and until then this list is the only copy. `has_delete` is
+    /// derived by [`SuccCursors.fromSpan`], as the type doc requires. The
+    /// cursor borrows the list rather than the `ChangeOp`, so it is valid
+    /// until the list is freed or [`ChangeOp.deinit`] runs, and appending to
+    /// `succs` afterwards may reallocate it out from under the cursor — a
+    /// programmer obligation rather than a guarantee.
     pub fn succ(self: *const ChangeOp) SuccCursors {
         return SuccCursors.fromSpan(self.succs.items, 0);
     }
+    /// A cursor over the recorded successors carrying their increments, on the
+    /// terms [`ChangeOp.succ`] gives.
     pub fn succInc(self: *const ChangeOp) SuccIncCursors {
         return SuccCursors.fromSpan(self.succs.items, 0).withInc();
     }
+    /// The actor half of the operation's id (`OpBuilder.idActor`,
+    /// `op_set2/op.rs:1328`; `:504-506`).
     pub fn idActor(self: *const ChangeOp) ActorIdx {
         return self.bld.idActor();
     }
+    /// The counter half of the operation's id, widened (`OpBuilder.idCtr`).
     pub fn idCtr(self: *const ChangeOp) i64 {
         return self.bld.idCtr();
     }
+    /// The operation's own counter (`OpBuilder.opIdCtr`,
+    /// `op_set2/op.rs:1316-1318`).
     pub fn opIdCtr(self: *const ChangeOp) u32 {
         return self.bld.opIdCtr();
     }
+    /// How many predecessors the decoded operation declared
+    /// (`OpBuilder.predCount`, `op_set2/op.rs:1307-1309`).
     pub fn predCount(self: *const ChangeOp) u32 {
         return self.bld.predCount();
     }
+    /// The predecessor ids, borrowed from the builder's own list
+    /// (`OpBuilder.pred`, `op_set2/op.rs:1319-1321`). They are valid until
+    /// [`ChangeOp.deinit`], which frees that list.
     pub fn pred(self: *const ChangeOp) []const OpId {
         return self.bld.pred();
     }
@@ -1854,6 +2188,17 @@ pub const Op = struct {
     /// never visible on its own, a counter is visible while every successor
     /// increments it, and anything else is visible only while it has no
     /// successors at all.
+    ///
+    /// **The counter arm reads a cached value, not the successors.** It is
+    /// [`SuccCursors.has_delete`] — derived once by
+    /// [`SuccCursors.fromSpan`] — and it is correct exactly to the extent
+    /// that field agrees with the row's `entries`, which is the obligation the
+    /// [`SuccCursors`] type doc states. That is the price of the arm being
+    /// O(1) on a counter with many successors, and it is why the flag is
+    /// derived where the entries are known rather than here.
+    ///
+    /// The last arm reads [`SuccCursors.len`], which is the row's total
+    /// successor count and does not move as a successor cursor is walked.
     pub fn visible(self: *const Op) bool {
         if (self.isInc()) return false;
         if (self.isCounter()) return !self._succ.has_delete;
@@ -2007,8 +2352,16 @@ pub const Op = struct {
         return 0;
     }
 
-    /// Adds a successor edge to the row and says where it goes
-    /// (`Op::add_succ`, `op_set2/op.rs:956-977`).
+    /// Plans where a successor edge on this row would go, and returns it;
+    /// **nothing is written here** (`Op::add_succ`, `op_set2/op.rs:956-977`).
+    ///
+    /// The receiver is `*const Op` and the body mutates nothing — not the
+    /// row, not its successors, not `pos`. What comes back is a
+    /// [`SuccInsert`] describing the insertion; `OpSet::add_succ`
+    /// (`op_set2/op_set.rs:259-283`) is what applies it, and a transaction's
+    /// own delete uses `add_succ_with_undo` (`:285-325`). A caller that skips
+    /// the apply step gets a [`SuccInsert`] and an unchanged row, so
+    /// [`Op.visible`] still answers for the successors the row has.
     ///
     /// Successors are kept in ascending id order, so `sub_pos` is the first
     /// position past every successor at or below `id`. `inc` is dropped to
@@ -2017,9 +2370,9 @@ pub const Op = struct {
     /// (`op_set2/op.rs:959-961`, and the same normalisation on incoming ops
     /// at `op_set2/change/batch.rs:274-278`).
     ///
-    /// Nothing is written here. `OpSet::add_succ`
-    /// (`op_set2/op_set.rs:259-283`) applies the `SuccInsert`, and a
-    /// transaction's own delete uses `add_succ_with_undo` (`:285-325`).
+    /// The scan runs over a *copy* of the row's successor cursor
+    /// (`var cursors = self._succ`), so walking to find the insertion point
+    /// does not consume the row's own cursor.
     pub fn addSucc(self: *const Op, successor: OpId, inc_in: ?i64) SuccInsert {
         var inc = inc_in;
         if (inc != null and !self.isCounter()) inc = null;
@@ -3765,4 +4118,109 @@ test "every op type answers the whole accessor set" {
         assertOpLike(ChangeOp);
     }
     try testing.expectEqual(@as(u32, 1), idOf(1).counter);
+}
+
+test "a successor cursor's total is not the count of successors left" {
+    const entries = [_]SuccEntry{
+        .{ .id = idOf(2), .inc = 5 },
+        .{ .id = idOf(3), .inc = null },
+        .{ .id = OpId.init(9, 1), .inc = 7 },
+    };
+
+    // `SuccCursors.len` is the row's total successor count and
+    // `SuccIncCursors.len` is what is left to read; they are different
+    // numbers for the same span.
+    var c = SuccCursors.fromSpan(&entries, 10);
+    var with_inc = c.withInc();
+    try testing.expectEqual(@as(usize, 3), c.len());
+    try testing.expectEqual(@as(usize, 3), with_inc.len());
+    try testing.expectEqual(@as(usize, 10), c.pos());
+
+    // The two cursors are copies, so each advances on its own — and the
+    // total does not move, which is what makes `while (c.len() > 0)` a loop
+    // that never ends and a drain loop the wrong shape.
+    _ = c.next();
+    _ = with_inc.next();
+    try testing.expectEqual(@as(usize, 3), c.len());
+    try testing.expectEqual(@as(usize, 2), with_inc.len());
+    try testing.expectEqual(@as(usize, 11), c.pos());
+
+    // And the total is the bound `Op.succAt` indexes against: it is
+    // `Op.succCount`.
+    const row = counterRow(SuccCursors.fromSpan(&entries, 10));
+    try testing.expectEqual(@as(usize, 3), row.succCount());
+    try testing.expectEqual(idOf(2), row.succAt(0));
+    try testing.expectEqual(OpId.init(9, 1), row.succAt(2));
+    try testing.expectEqual(@as(?i64, 7), row.succIncAt(2));
+}
+
+test "a counter row's visibility follows the flag fromSpan derived, not the cursor's position" {
+    const deleting = [_]SuccEntry{
+        .{ .id = idOf(2), .inc = 5 },
+        .{ .id = idOf(3), .inc = null },
+    };
+    const incrementing = [_]SuccEntry{
+        .{ .id = idOf(2), .inc = 5 },
+        .{ .id = idOf(3), .inc = 7 },
+    };
+
+    // `fromSpan` walks the entries once and the flag is exactly "some entry
+    // deletes", which is the obligation the type doc puts on the field.
+    const gone = SuccCursors.fromSpan(&deleting, 0);
+    const counted = SuccCursors.fromSpan(&incrementing, 0);
+    try testing.expect(gone.has_delete);
+    try testing.expect(!counted.has_delete);
+
+    // The flag is a property of the whole span, so `Op.visible` on a counter
+    // answers the same before and after the cursor has been walked — which
+    // is what makes that arm O(1).
+    var walked = gone;
+    _ = walked.next();
+    try testing.expect(walked.has_delete);
+    try testing.expect(!counterRow(walked).visible());
+    try testing.expect(counterRow(counted).visible());
+
+    // A struct literal that satisfies the documented obligation is
+    // indistinguishable from the one `fromSpan` built, for every reader.
+    const literal = SuccCursors{
+        .entries = &deleting,
+        .at = 0,
+        .read = 0,
+        .has_delete = true,
+    };
+    try testing.expectEqual(counterRow(gone).visible(), counterRow(literal).visible());
+    try testing.expectEqual(counterRow(gone).succCount(), counterRow(literal).succCount());
+}
+
+test "a row's width is one per list element, and in text it is the string's own width with a mark at zero" {
+    // `.list` counts a row whatever its value (`op_set2/op.rs:1007-1013`).
+    const str_row = strRow(SuccCursors.none());
+    try testing.expectEqual(@as(i64, 1), str_row.width(.list, .unicode_code_point));
+    try testing.expectEqual(@as(i64, 1), counterRow(SuccCursors.none()).width(.list, .unicode_code_point));
+
+    // `.text` measures the string the row contributes, and a mark row
+    // contributes nothing at all — the boundary that matters is the empty
+    // one, and a mark's empty string is where that comes from.
+    const empty = Op.init(0, false, idOf(1), .set, root, KeyRef.fromStr("a"), true, .{ .str = "" }, false, null, SuccCursors.none());
+    try testing.expectEqual(@as(i64, 0), empty.width(.text, .unicode_code_point));
+
+    // **One code point is not one byte.** U+20AC is a single unit under
+    // `unicode_code_point` and three UTF-8 bytes under `utf8_code_unit`
+    // (`types.zig:697`), so the same row is one wide in one encoding and three
+    // in the other. A one-byte string cannot tell the two apart.
+    const one = Op.init(0, false, idOf(1), .set, root, KeyRef.fromStr("a"), true, .{ .str = "\u{20AC}" }, false, null, SuccCursors.none());
+    try testing.expectEqual(@as(i64, 1), one.width(.text, .unicode_code_point));
+    try testing.expectEqual(@as(i64, 3), one.width(.text, .utf8_code_unit));
+
+    // A combining mark is its own unit under code points, so a row that
+    // *looks* empty is one wide. The width index is a function of the
+    // encoding, not of what a reader sees.
+    const combining = Op.init(0, false, idOf(1), .set, root, KeyRef.fromStr("a"), true, .{ .str = "\u{301}" }, false, null, SuccCursors.none());
+    try testing.expectEqual(@as(i64, 1), combining.width(.text, .unicode_code_point));
+    try testing.expectEqual(@as(i64, 2), combining.width(.text, .utf8_code_unit));
+
+    const mark = Op.init(0, false, idOf(1), .mark, root, KeyRef.fromStr("a"), true, .{ .bool_value = true }, false, "bold", SuccCursors.none());
+    try testing.expectEqual(@as(i64, 0), mark.width(.text, .unicode_code_point));
+    try testing.expectEqual(@as(i64, 0), mark.width(.text, .utf8_code_unit));
+    try testing.expectEqual(@as(i64, 1), mark.width(.list, .unicode_code_point));
 }

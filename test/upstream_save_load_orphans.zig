@@ -5,8 +5,7 @@
 //! It is a **consumer test**: it imports `zautomerge` by name, sets no working
 //! directory and reads no fixture, and `build.zig` builds it as its own module
 //! with its own `addTest`. That is the shape
-//! [`upstream_batch_test.zig`](upstream_batch_test.zig) and
-//! [`upstream_batch_insert.zig`](upstream_batch_insert.zig) have, and it is a
+//! [`upstream_batch_insert.zig`](upstream_batch_insert.zig) has, and it is a
 //! file of its own because it is a *subject*: three cases is not enough to
 //! share a file with anything.
 //!
@@ -85,6 +84,14 @@ const testing = std.testing;
 
 /// **The leak arbiter for the whole file.** One allocator, named once.
 const gpa = testing.allocator;
+
+/// The borrowed capability every document constructor below is handed.
+///
+/// **Explicit, because `Document` keeps it.** The op set draws actors through
+/// this value for as long as the document lives, so a constructor cannot
+/// reach for an ambient global and no document can outlive its provider. Here
+/// that value is `std.testing.io`; an executable passes its own `init.io`.
+const io = std.testing.io;
 const Allocator = std.mem.Allocator;
 
 const Document = am.doc.Document;
@@ -109,7 +116,7 @@ const root: ExId = am.root;
 ///
 /// The bytes start at one, so no document ever has an **empty** actor, which is
 /// a different value from every other one. This is the rule
-/// [`test/upstream_batch_test.zig`](upstream_batch_test.zig) sets and the
+/// [`test/upstream_batch_insert.zig`](upstream_batch_insert.zig) sets and the
 /// reason it gives.
 ///
 /// **The static storage is what makes the returned [`ActorId`] a borrow**: a
@@ -135,7 +142,7 @@ fn mintActor() ActorId {
 
 /// A document in the flavour upstream's `AutoCommit` is.
 fn newDoc() !Document {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, io, .auto);
     errdefer doc.deinit();
     doc.setActorId(mintActor());
     return doc;
@@ -144,10 +151,11 @@ fn newDoc() !Document {
 /// `doc.fork()` ([`test_save_load_orphans.rs`:14](../github-automerge-automerge/rust/automerge/tests/test_save_load_orphans.rs)),
 /// through [`Document.forkAt`](../src/doc.zig) at the source's own heads.
 ///
-/// **Not [`Document.fork`]**, and the reason is recorded where the shape file
-/// records it: `fork` stores `ActorId.random`'s bytes in `actor.unused` and
-/// `Document.deinit` frees no actor bytes, so it leaks under the arbiter. The
+/// **Not [`Document.fork`]**, because that mints its actor through the
+/// source's retained `io` and the fork's actor would differ on every run. The
 /// fork's actor is minted here instead, which is what `fork` draws anyway.
+/// **Determinism, not a leak**: `fork` allocates that actor from the **fork's
+/// own** arena, which [`Document.deinit`](../src/doc.zig) frees.
 fn forkDoc(src: *Document) !Document {
     const heads = try src.getHeads(gpa);
     defer gpa.free(heads);
@@ -208,7 +216,7 @@ fn expectSameThroughApplyChanges(doc: *Document) !void {
     defer gpa.free(views);
     for (0..all.len()) |i| views[i] = all.at(i);
 
-    var replayed = try Document.init(gpa, .auto);
+    var replayed = try Document.init(gpa, io, .auto);
     defer replayed.deinit();
     _ = try replayed.applyChanges(gpa, views);
 
@@ -352,7 +360,7 @@ test "save keeps an orphaned change, and the dependency later drains it" {
     defer gpa.free(saved);
 
     // `let mut loaded = AutoCommit::load(&saved).unwrap();` (`:37`).
-    var loaded = try Document.load(gpa, saved, .unicode_code_point, .auto);
+    var loaded = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
     defer loaded.deinit();
 
     // **An addition, not a gap.** Upstream asserts only the value at `:42-45`,
@@ -421,7 +429,7 @@ test "save discards the orphan when retain_orphans is false" {
     const saved = try orphans.doc.saveWithOptions(gpa, .{ .deflate = true, .retain_orphans = false });
     defer gpa.free(saved);
 
-    var loaded = try Document.load(gpa, saved, .unicode_code_point, .auto);
+    var loaded = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
     defer loaded.deinit();
 
     // **An addition, not a gap.** The oracle reports this case's save as 139
@@ -516,7 +524,7 @@ test "loading an orphan change stream without a document chunk first is refused"
     // the refusal assertion on purpose**, so it is still exercised while the
     // refusal below is failing — a case whose last statement is the failing one
     // reports nothing about the assertions before it.
-    var known = try Document.load(gpa, first, .unicode_code_point, .auto);
+    var known = try Document.load(gpa, io, first, .unicode_code_point, .auto);
     defer known.deinit();
     try testing.expectEqual(@as(usize, 1), try known.applyChanges(gpa, &.{second.at(0)}));
     try testing.expectEqualStrings("value2", (try scalarAt(&known, root, .{ .key = "key" })).str);
@@ -547,7 +555,7 @@ test "loading an orphan change stream without a document chunk first is refused"
     // rather than relaxed — relaxing it would have deleted the only record that
     // the rule was missing — and it now passes against the fix recorded in the
     // diff block at the foot of this file.
-    if (Document.load(gpa, orphan, .unicode_code_point, .auto)) |accepted| {
+    if (Document.load(gpa, io, orphan, .unicode_code_point, .auto)) |accepted| {
         var wrongly = accepted;
         wrongly.deinit();
         std.debug.print(
@@ -728,11 +736,13 @@ test "loading an orphan change stream without a document chunk first is refused"
 //    with `defer` rather than `errdefer` because the view does not point into
 //    it ([`Document.getChanges`](../src/doc.zig)).
 // 4. **`Document.fork` is not used; `Document.forkAt` is**, because `fork`
-//    stores `ActorId.random`'s bytes in `actor.unused` and `Document.deinit`
-//    frees no actor bytes. Upstream's `AutoCommit::fork`
+//    mints its actor through the source's retained `io`, so the actor differs
+//    on every run. Upstream's `AutoCommit::fork`
 //    ([`autocommit.rs`:356-367](../github-automerge-automerge/rust/automerge/src/autocommit.rs))
 //    is a clone plus a fresh actor, which is what `forkAt` at the source's own
-//    heads plus a minted actor is.
+//    heads plus a minted actor is. **Determinism, not a leak**: `fork`
+//    allocates that actor from the **fork's own** arena, which
+//    [`Document.deinit`](../src/doc.zig) frees.
 //
 // ## The one strengthening, named
 //

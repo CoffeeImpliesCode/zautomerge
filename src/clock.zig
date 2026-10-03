@@ -48,6 +48,14 @@
 //! unknown actor they are, so `covers` cannot disagree with `contains` about the
 //! same actor. For the equal-length case — the only one upstream admits — the
 //! answer is identical either way.
+//!
+//! ## Nothing here is synchronized
+//!
+//! A [`Clock`] and a [`SeqClock`] are plain values with no lock and no atomic
+//! field, and every mutating method replaces or rewrites `slots`. Two threads
+//! reaching one clock need whatever synchronization the caller already has,
+//! and the `std.mem.Allocator` a clock was built with is no more thread-safe
+//! than the allocator the caller chose.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -56,32 +64,60 @@ const ActorIdx = types.ActorIdx;
 const OpId = types.OpId;
 
 /// A vector clock: the highest op counter seen from each actor.
+///
+/// **A `Clock` owns one allocation and is not synchronized.** `gpa` is kept
+/// for the clock's whole life and every mutation replaces `slots`, so
+/// sharing one clock across threads is the caller's own synchronization and
+/// nothing in this type provides it.
 pub const Clock = struct {
     /// The whole allocation. The live entries are `[0..len]`.
     slots: []u32,
+    /// The number of live entries.
     len: usize,
+    /// The allocator `slots` came from and the only one that may release it.
+    /// It is retained for the clock's whole life and is never released by
+    /// [`deinit`](Clock.deinit); a clock is bound to it.
     gpa: std.mem.Allocator,
 
+    /// A clock with `size` entries, all zero. `gpa` must be the allocator
+    /// every later call on this clock passes, because [`deinit`](Clock.deinit)
+    /// frees with it.
     pub fn init(gpa: std.mem.Allocator, size: usize) !Clock {
         const slots = try gpa.alloc(u32, size);
         @memset(slots, 0);
         return .{ .slots = slots, .len = size, .gpa = gpa };
     }
 
+    /// A clock with no entries. `slots` is the empty slice, so there is
+    /// nothing to release and [`deinit`](Clock.deinit) needs no special case;
+    /// `gpa` is still remembered, because the first
+    /// [`ensureSize`](Clock.ensureSize) allocates through it.
     pub fn initEmpty(gpa: std.mem.Allocator) Clock {
         return .{ .slots = &.{}, .len = 0, .gpa = gpa };
     }
 
+    /// Releases `slots` with the allocator this clock stores, and poisons the
+    /// clock.
+    ///
+    /// **One clock, one `deinit`.** The allocator is not released here, and
+    /// the value is unusable afterwards: `self.*` becomes `undefined`, so a
+    /// second call — including one made through a copy, which names the same
+    /// allocation — is a double free with no diagnostic in any optimize mode.
     pub fn deinit(self: *Clock) void {
         self.gpa.free(self.slots);
         self.* = undefined;
     }
 
+    /// A second, independent clock over a copy of these entries, from the same
+    /// allocator. The two are separate owners and each releases its own
+    /// allocation with its own [`deinit`](Clock.deinit).
     pub fn clone(self: Clock) !Clock {
         const slots = try self.gpa.dupe(u32, self.slots);
         return .{ .slots = slots, .len = self.len, .gpa = self.gpa };
     }
 
+    /// The live entries, borrowed. Invalidated by every call that grows the
+    /// clock, because growing moves `slots`.
     pub fn values(self: Clock) []const u32 {
         return self.slots[0..self.len];
     }
@@ -182,6 +218,7 @@ pub const Clock = struct {
         return true;
     }
 
+    /// Whether the two clocks are the same length and hold the same entries.
     pub fn eql(a: Clock, b: Clock) bool {
         return a.len == b.len and std.mem.eql(u32, a.slots, b.slots);
     }
@@ -195,32 +232,67 @@ pub const Clock = struct {
 
 /// A sparse vector clock: null means "this actor has not been seen", which
 /// lets a clock be built before the actor table is complete.
+///
+/// **A `SeqClock` owns one allocation, exactly as [`Clock`] does**, and is
+/// released the same way: one [`deinit`](SeqClock.deinit) per clock, through
+/// the allocator stored in [`gpa`](SeqClock.gpa). `slots[0..len]` is live and
+/// `slots[len..]` is spare capacity that
+/// [`reserve`](SeqClock.reserve) prepared; no method reads past `len`.
+///
+/// It is also the type that splits growth in two — [`reserve`](SeqClock.reserve)
+/// then [`resizeNoFail`](SeqClock.resizeNoFail) — because a caller rewriting
+/// several clocks at once has to be able to make the one allocation that can
+/// fail happen before any of them has moved.
 pub const SeqClock = struct {
     /// The whole allocation. The live entries are `[0..len]`.
     slots: []?u32,
+    /// The number of live entries. The rest of `slots` is spare capacity that
+    /// [`reserve`](SeqClock.reserve) prepared and no method reads.
     len: usize,
+    /// The allocator `slots` came from and the only one that may release it.
+    /// It is retained for the clock's whole life and is never released by
+    /// [`deinit`](SeqClock.deinit); a clock is bound to it.
     gpa: std.mem.Allocator,
 
+    /// A clock with `size` entries, all null. `gpa` must be the allocator
+    /// every later call on this clock passes, because [`deinit`](SeqClock.deinit)
+    /// frees with it.
     pub fn init(gpa: std.mem.Allocator, size: usize) !SeqClock {
         const slots = try gpa.alloc(?u32, size);
         @memset(slots, null);
         return .{ .slots = slots, .len = size, .gpa = gpa };
     }
 
+    /// A clock with no entries. `slots` is the empty slice, so there is
+    /// nothing to release and [`deinit`](SeqClock.deinit) needs no special
+    /// case; `gpa` is still remembered, because the first
+    /// [`ensureSize`](SeqClock.ensureSize) allocates through it.
     pub fn initEmpty(gpa: std.mem.Allocator) SeqClock {
         return .{ .slots = &.{}, .len = 0, .gpa = gpa };
     }
 
+    /// Releases `slots` with the allocator this clock stores, and poisons the
+    /// clock.
+    ///
+    /// **One clock, one `deinit`.** The allocator is not released here, and
+    /// the value is unusable afterwards: `self.*` becomes `undefined`, so a
+    /// second call — including one made through a copy, which names the same
+    /// allocation — is a double free with no diagnostic in any optimize mode.
     pub fn deinit(self: *SeqClock) void {
         self.gpa.free(self.slots);
         self.* = undefined;
     }
 
+    /// A second, independent clock over a copy of these entries, from the same
+    /// allocator. The two are separate owners and each releases its own
+    /// allocation with its own [`deinit`](SeqClock.deinit).
     pub fn clone(self: SeqClock) !SeqClock {
         const slots = try self.gpa.dupe(?u32, self.slots);
         return .{ .slots = slots, .len = self.len, .gpa = self.gpa };
     }
 
+    /// The live entries, borrowed. Invalidated by every call that grows the
+    /// clock, because growing moves `slots`.
     pub fn values(self: SeqClock) []const ?u32 {
         return self.slots[0..self.len];
     }
@@ -262,12 +334,25 @@ pub const SeqClock = struct {
         self.len = size;
     }
 
+    /// The counter recorded for `actor`, or null when the actor is unknown.
+    /// "Unknown" is one answer for two cases — an index past the end and an
+    /// entry that is in range but has never been seen — because upstream's
+    /// `get_for_actor` flattens both into one (`clock.rs:30-32`).
     pub fn get(self: SeqClock, actor: ActorIdx) ?u32 {
         if (actor >= self.len) return null;
         return self.slots[actor];
     }
 
     /// Records `counter` for `actor` when it advances the clock.
+    ///
+    /// Counter zero never advances a clock, and an actor outside the clock
+    /// cannot be advanced at all, for the same reasons
+    /// [`Clock.include`](clock.zig) gives: zero is the head sentinel, and the
+    /// clock's length is the actor table saying which actors exist. The clock
+    /// is unchanged on either refusal. Upstream's `include` stores nothing
+    /// for a zero counter but still reports it as an advance
+    /// ([`clock.rs:38-53`](../../github-automerge-automerge/rust/automerge/src/clock.rs));
+    /// this reports the clock it actually produced.
     pub fn include(self: *SeqClock, actor: ActorIdx, counter: u32) bool {
         if (actor >= self.len) return false;
         if (counter == 0) return false;
@@ -278,7 +363,17 @@ pub const SeqClock = struct {
         return true;
     }
 
-    /// Drops an actor, shifting the indices above it down.
+    /// Drops an actor, shifting the indices above it down. The entry the
+    /// dropped actor held is overwritten with null rather than left in place,
+    /// and the live length shrinks by one.
+    ///
+    /// **An index at or past the end is neither a refusal nor a change**: the
+    /// call returns having done nothing and the clock still names every actor
+    /// it named before. Upstream's `Vec::remove` panics there
+    /// ([`clock.rs:22-24`](../../github-automerge-automerge/rust/automerge/src/clock.rs));
+    /// this answers instead, because a caller that cannot be sure its index is
+    /// live has to be able to find out without a crash. A caller that wants
+    /// the refusal has to ask with [`get`](SeqClock.get) first.
     pub fn removeActor(self: *SeqClock, idx: ActorIdx) void {
         if (idx >= self.len) return;
         std.mem.copyForwards(?u32, self.slots[idx .. self.len - 1], self.slots[idx + 1 .. self.len]);
@@ -315,6 +410,10 @@ pub const SeqClock = struct {
         self.slots[idx] = null;
     }
 
+    /// `a.merge(b)` makes `a` the elementwise maximum, over the actors both
+    /// clocks have. Aliasing is allowed. As on [`Clock.merge`](clock.zig), a
+    /// receiver keeps its own length and its own tail, so an actor past the end
+    /// of the operand contributes nothing.
     pub fn merge(a: *SeqClock, b: SeqClock) void {
         const n = @min(a.len, b.len);
         for (a.slots[0..n], b.slots[0..n]) |*x, y| {
@@ -352,17 +451,36 @@ pub const SeqClock = struct {
 };
 
 /// Which view of history a read sees.
+///
+/// **A `ClockRange` is a borrowed view and owns nothing.** It stores each
+/// [`Clock`] by value, which copies the handle rather than the entries: a
+/// range and the clocks it was built from name one allocation, and
+/// [`Clock.deinit`] on those clocks is the only release there is. There is
+/// deliberately no `deinit` here — a range that could be torn down would be
+/// one more way to free storage a holder still reads. Copying a range, storing
+/// one in a struct or returning one from a function copies a view and nothing
+/// else.
+///
+/// The clocks also carry their own allocator, so a range may outlive the
+/// function that built it and stay readable — but only while those clocks are
+/// alive.
 pub const ClockRange = union(enum) {
-    /// No heads: the document's current state.
+    /// One state to read at. `null` is the present, which contains every
+    /// operation the document has and is the case with no clock to check a
+    /// row against.
     current: ?Clock,
     /// A past state: `before` is the state, `after` is the clock it was
-    /// computed against.
+    /// computed against. Both are borrowed as described above.
     diff: struct { before: Clock, after: Clock },
 
+    /// The present, with no clock to check rows against. Owns nothing, so it
+    /// outlives whatever it was built beside.
     pub fn now() ClockRange {
         return .{ .current = null };
     }
 
+    /// One past state, borrowed from `clock`. The clock is not released and
+    /// stays the caller's to pass to [`deinit`](Clock.deinit).
     pub fn at(clock: Clock) ClockRange {
         return .{ .current = clock };
     }
@@ -455,6 +573,56 @@ test "SeqClock actor insert and removal" {
     try std.testing.expectEqual(@as(usize, 2), c.len);
     try std.testing.expectEqual(@as(?u32, 1), c.get(0));
     try std.testing.expectEqual(@as(?u32, 2), c.get(1));
+}
+
+test "SeqClock.removeActor past the end changes nothing, and keeps naming every actor" {
+    const gpa = std.testing.allocator;
+    var c = try SeqClock.init(gpa, 3);
+    defer c.deinit();
+    _ = c.include(0, 1);
+    _ = c.include(2, 3);
+
+    // The call returns void, so the only thing a caller can be shown is that
+    // the clock is exactly as it was. Upstream's `Vec::remove` panics here
+    // (`clock.rs:22-24`); this answers instead, and the answer is that
+    // nothing happened.
+    c.removeActor(3);
+    c.removeActor(std.math.maxInt(ActorIdx));
+    try std.testing.expectEqual(@as(usize, 3), c.len);
+    try std.testing.expectEqual(@as(?u32, 1), c.get(0));
+    try std.testing.expectEqual(@as(?u32, null), c.get(1));
+    try std.testing.expectEqual(@as(?u32, 3), c.get(2));
+
+    // A live index still drops, so the no-op above is not the call doing
+    // nothing at all.
+    c.removeActor(1);
+    try std.testing.expectEqual(@as(usize, 2), c.len);
+    try std.testing.expectEqual(@as(?u32, 1), c.get(0));
+    try std.testing.expectEqual(@as(?u32, 3), c.get(1));
+}
+
+test "a ClockRange is a view: it releases nothing of its own" {
+    const gpa = std.testing.allocator;
+    var at = try Clock.init(gpa, 3);
+    defer at.deinit();
+    _ = at.include(1, 7);
+
+    // Both constructors name the caller's clock, and a range copied out of
+    // one still reads through to the same entries. A range has no teardown
+    // because a teardown would free storage the caller still holds.
+    const single = ClockRange.at(at);
+    const copied = single;
+    try std.testing.expect(copied.current.?.get(1) == 7);
+    try std.testing.expect(ClockRange.now().current == null);
+
+    var before = try Clock.init(gpa, 2);
+    defer before.deinit();
+    var after = try Clock.init(gpa, 2);
+    defer after.deinit();
+    _ = after.include(0, 4);
+    const pair = ClockRange{ .diff = .{ .before = before, .after = after } };
+    try std.testing.expect(pair.diff.before.get(0) == 0);
+    try std.testing.expect(pair.diff.after.get(0) == 4);
 }
 
 test "SeqClock insert at the end and clone" {

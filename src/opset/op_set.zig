@@ -223,9 +223,18 @@ pub const SuccInsert = opmod.SuccInsert;
 /// The index rebuild's two halves, re-exported because `OpSet.indexBuilder`
 /// and `OpSet.setIndexes` hand them across.
 pub const IndexBuilder = indexmod.IndexBuilder;
+
+/// What an object is and which operation made it, re-exported because
+/// [`OpSet.obj_info`] is an [`ObjIndex`] of them (`index.zig:96`).
 pub const ObjInfo = indexmod.ObjInfo;
+/// The op set's object table, re-exported so a caller can name the type
+/// [`OpSet.spliceObjects`] writes to (`index.zig:125`).
 pub const ObjIndex = indexmod.ObjIndex;
+/// The class a document whose marks are out of order is refused with, which
+/// [`OpSet.load`] can raise (`index.zig:234`).
 pub const MarkOrderError = indexmod.MarkOrderError;
+/// What [`OpSet.rebuildIndex`] produces, re-exported with the builder that
+/// makes it (`index.zig:753`).
 pub const Rebuilt = indexmod.Rebuilt;
 
 /// The column set the op set holds (`columns.Columns(O)`), re-exported so a
@@ -669,9 +678,49 @@ pub const DebugCmpFault = union(enum) {
 /// is checked, and it is how two builds of the same document are compared
 /// without going near a compressed chunk.
 ///
-/// The caller owns the bytes and frees them with
-/// [`Checkpoint.deinit`](checkpoint.Deinit).
-pub const Checkpoint = std.StringArrayHashMapUnmanaged([]u8);
+/// **This is a struct rather than the map it used to be an alias for, and the
+/// reason is the teardown.** Every value here is a separately allocated
+/// column encoding, and `std.StringArrayHashMapUnmanaged.deinit` frees the
+/// table's own backing storage and none of those values — so the contract
+/// this type used to publish, "frees them with `Checkpoint.deinit`", named a
+/// teardown that leaked twenty allocations per checkpoint, and the routine
+/// that did free them was file-private. [`Checkpoint.deinit`] frees the values
+/// and the table together, and it is the whole of what a caller has to call.
+pub const Checkpoint = struct {
+    /// The columns by name, in the order [`OpSet.saveCheckpoint`] recorded
+    /// them. Public so a consumer can iterate it, paired with
+    /// [`checkpoint_column_names`] for upstream's save order.
+    map: std.StringArrayHashMapUnmanaged([]u8) = .empty,
+
+    /// The bytes recorded under `name`, or null for a name the checkpoint does
+    /// not hold. A borrow of the checkpoint's own allocation, good until
+    /// [`Checkpoint.deinit`].
+    pub fn get(self: *const Checkpoint, name: []const u8) ?[]const u8 {
+        return self.map.get(name);
+    }
+
+    /// How many columns the checkpoint holds, which is
+    /// [`checkpoint_column_names`].len for any one [`OpSet.saveCheckpoint`].
+    pub fn count(self: *const Checkpoint) usize {
+        return self.map.count();
+    }
+
+    /// Frees every column's bytes and the table that named them, then poisons
+    /// the receiver, so a second call reads undefined memory rather than
+    /// double-freeing.
+    ///
+    /// **One call frees everything a checkpoint owns.** Freeing the map alone
+    /// frees its own storage and leaks one allocation per column.
+    pub fn deinit(self: *Checkpoint, gpa: Allocator) void {
+        // `iterator()` is a by-value cursor over the entries, so the bytes are
+        // read through `value_ptr` rather than a dedicated value cursor
+        // (`std/array_hash_map.zig:265`).
+        var it = self.map.iterator();
+        while (it.next()) |entry| gpa.free(entry.value_ptr.*);
+        self.map.deinit(gpa);
+        self.* = undefined;
+    }
+};
 
 /// The twenty column names [`OpSet.saveCheckpoint`] fills, in upstream's
 /// order (`columns.rs:189-211`).
@@ -778,9 +827,23 @@ pub fn OpSet(comptime O: type) type {
         /// buffer belongs to.
         gpa: Allocator,
         /// The document's actors, in actor-index order (`op_set.rs:61`).
-        /// Sorted, because [`OpSet.lookupActor`] binary searches them
-        /// (`:1187-1189`) and because a change's actor column is written in
-        /// that order ([types.zig:108-110]).
+        ///
+        /// **Sorted, ascending, and every writer here holds that.** An
+        /// [`ActorIdx`] means a position in this table and nothing else
+        /// (`automerge.rs:565`, `:1309-1314`), so a table out of order makes
+        /// [`OpSet.lookupActor`], which binary searches it
+        /// (`op_set.rs:1187-1189`), miss an actor that is present, and the miss
+        /// is indistinguishable from absence. Three things establish the order:
+        /// a change's actor column is written in it ([types.zig:108-110]), the
+        /// reference's saver writes the table out as it stands and says so
+        /// (`storage/document.rs:204-205`), and [`OpSet.insertActor`]
+        /// asserts the slot it is handed.
+        ///
+        /// The field is public because this is a leaf that hands out its own
+        /// state, so a caller that writes it writes the invariant with it.
+        /// Building one through [`OpSet.fromActors`], [`OpSet.fromParts`],
+        /// [`OpSet.load`] or [`OpSet.fromDocOps`] takes a slice already in
+        /// order; each says so.
         actors: std.ArrayList(ActorId) = .empty,
         /// What every object is and where it hangs (`op_set.rs:62`).
         obj_info: ObjIndex,
@@ -813,6 +876,13 @@ pub fn OpSet(comptime O: type) type {
 
         /// An op set with no rows and the given actors
         /// (`OpSet::from_actors`, `op_set.rs:79-86`).
+        ///
+        /// **`actors` must be sorted ascending**, because the table is copied
+        /// in the order given and [`OpSet.lookupActor`] binary searches it. The
+        /// slice is the caller's own table in that order — a document's
+        /// actors as its saver wrote them (`storage/document.rs:204-205`) — and
+        /// upstream's `from_actors` takes it the same way with nothing
+        /// checking either.
         pub fn fromActors(
             gpa: Allocator,
             actors: []const ActorId,
@@ -855,6 +925,11 @@ pub fn OpSet(comptime O: type) type {
         /// (`storage/document.rs:355`) happens at the same place in the order
         /// as upstream. `error.InvalidMarkOrder` is the class `index.zig:201-207`
         /// declared for it, under the name upstream gives it.
+        ///
+        /// **`actors` must be sorted ascending**, for the reason
+        /// [`OpSet.fromActors`] gives. Upstream's `load` takes the document's
+        /// own actor list (`op_set.rs:1203`) and has nothing to check it with
+        /// either, because the format's writer emits it in actor order.
         pub fn load(
             gpa: Allocator,
             cols: RawColumns,
@@ -874,6 +949,12 @@ pub fn OpSet(comptime O: type) type {
         /// Public because [`OpSet.load`] is `fromParts` plus one step and the
         /// difference is the whole reason this file owns the rebuild; a caller
         /// that wants the two apart has a reason this port cannot see.
+        ///
+        /// **`actors` must be sorted ascending**, for the reason
+        /// [`OpSet.fromActors`] gives. **The set this returns is not usable
+        /// until [`OpSet.rebuildIndex`] has run**: every query over the rows
+        /// reads the index columns, and they are empty here, so a walk answers
+        /// `error.UnexpectedEnd` rather than a wrong row.
         pub fn fromParts(
             gpa: Allocator,
             cols: RawColumns,
@@ -887,9 +968,6 @@ pub fn OpSet(comptime O: type) type {
             // **The load comes before the free, and that order is the whole
             // point.** `Columns.deinit` ends in `self.* = undefined`
             // (`columns.rs:647`), so deiniting first and then calling a
-            // fallible function leaves `set.cols` poisoned: if that call
-            // returns an error the assignment never happens and the
-            // `errdefer` above frees 0xAA bytes. `test/fixtures/missing_actor.automerge`
             // is the input that reached it — `Ops.load` answers
             // `error.InvalidValue` for it — and the process died in
             // `Slab.deinit` on a `General protection exception`.
@@ -924,7 +1002,9 @@ pub fn OpSet(comptime O: type) type {
         ///
         /// Sixteen data columns and four index columns; `top` is not among
         /// them, which is upstream's list (`columns.rs:187-215`) and this
-        /// keeps. The caller owns the result.
+        /// keeps. **The caller owns the result and frees it with
+        /// [`Checkpoint.deinit`]**, which frees the twenty column byte slices
+        /// and the table that names them.
         ///
         /// **Two of these entries are comparable only within one op set.** The
         /// `key_str` and `mark_name` entries are the encoded **ids**
@@ -935,9 +1015,14 @@ pub fn OpSet(comptime O: type) type {
         /// compared only against another taken from the same op set, which is
         /// what makes it sound; **a checkpoint is not a document identity**, and
         /// [`OpSet.debugCmp`] is the thing that is.
+        ///
+        /// **An error leaves nothing behind.** Every column is encoded before
+        /// it is recorded and the recorded ones are freed again by the
+        /// `errdefer`, so a failed call answers with the op set exactly as it
+        /// was.
         pub fn saveCheckpoint(self: *const Self, gpa: Allocator) ParseError!Checkpoint {
-            var out: Checkpoint = .empty;
-            errdefer freeCheckpoint(gpa, &out);
+            var out: Checkpoint = .{};
+            errdefer out.deinit(gpa);
             const cols = &self.cols;
             try putCheckpoint(gpa, "id_actor", try cols.id_actor.encode(gpa), &out);
             try putCheckpoint(gpa, "id_ctr", try cols.id_ctr.encode(gpa), &out);
@@ -1382,20 +1467,47 @@ pub fn OpSet(comptime O: type) type {
         /// Interns `actor` at index `idx` (`OpSet::insert_actor`,
         /// `op_set.rs:1400-1405`).
         ///
+        /// **Two preconditions, both on `idx` and both about the table it
+        /// writes.** `idx` must be in `0..=actors.len`, and it must be the
+        /// position `actor` takes in a sorted table — that is, `actor` must
+        /// sort after every entry below `idx` and before every entry at or
+        /// above it. The first is [`std.ArrayList.insertAssumeCapacity`]'s own
+        /// assertion; the second is this function's, and it is stated as an
+        /// assertion because it is a caller obligation rather than untrusted
+        /// input: the index comes from [`BatchApply.actorSlot`](batch.zig),
+        /// which is a lower bound over the same sorted table, or from a caller
+        /// that has one. Upstream's `Vec::insert` asserts the first and
+        /// nothing checks the second there either — its `insert_actor` has the
+        /// same unchecked write (`op_set.rs:1400-1405`).
+        ///
         /// A new actor is *always* appended by the reference's load path, so
         /// `idx == actors.len` is the normal case and the rewrite is skipped.
         /// Any other index means interning an actor into the middle of the
         /// table, which renumbers every actor index at or above `idx` — so the
         /// rewrite happens first, and the new actor lands at the position the
         /// shifted ones vacated.
+        ///
+        /// **The capacity is reserved before the rewrite, which is what makes
+        /// the call safe to refuse.** Every fallible step here renumbers the
+        /// columns, the mark index and the object table, and the append is the
+        /// one that has to follow it. Reserving first leaves nothing fallible
+        /// after the renumbering, so `error.OutOfMemory` from this call leaves
+        /// an op set that is exactly what it was: no half-renumbered columns
+        /// against a table that never grew. It costs one
+        /// `ensureUnusedCapacity`, which is a no-op once the table has spare
+        /// room.
         pub fn insertActor(self: *Self, idx: usize, actor: ActorId) ParseError!void {
+            std.debug.assert(idx <= self.actors.items.len);
+            assertSortedSlot(self.actors.items, idx, actor);
+            // **Before the rewrite, and that is the whole point.**
+            try self.actors.ensureUnusedCapacity(self.gpa, 1);
             if (self.actors.items.len != idx) {
                 // Upstream's index is a `usize` (`op_set.rs:1400`) and an
                 // actor index is a `u32` here, so the rewrite's argument is
                 // the checked narrowing rather than a silent one.
                 try self.rewriteWithNewActor(std.math.cast(ActorIdx, idx) orelse return error.Overflow);
             }
-            try self.actors.insert(self.gpa, idx, actor);
+            self.actors.insertAssumeCapacity(idx, actor);
         }
 
         /// Renumbers every actor index at or above `idx`, as if a new actor
@@ -1403,21 +1515,60 @@ pub fn OpSet(comptime O: type) type {
         /// `op_set.rs:1407-1417`).
         ///
         /// Three things move, and all three have to: the four data columns
-        /// that hold an actor index (`columns.rs:342-348`), the mark index's
-        /// rows **and its cache** (`mark_index.rs:252-259`, and
-        /// `mark_index.zig:623-627` for the half that re-keys), and the object
-        /// table's own keys and parents. Upstream's `ObjIndex` rebuild maps
-        /// both halves of each entry; so does this, through
-        /// [`indexmod.withNewActor`].
+        /// that hold an actor index (`columns.rs:332-340`, `:342-348`), the
+        /// mark index's rows **and its cache** (`mark_index.rs:252-259`,
+        /// `:271-289`), and the object table's own keys and parents. Upstream's
+        /// `ObjIndex` rebuild maps both halves of each entry; so does this,
+        /// through [`indexmod.withNewActor`]. A half-renumbered op set is the
+        /// state nothing here survives: [`OpSet.objectType`] and
+        /// [`OpSet.objectParent`] read the object table with no check, so a
+        /// table half-way through would answer about the old actors with no
+        /// diagnostic, and a `MarkData` keyed by the old table makes
+        /// [`MarkIndexColumn.markData`](mark_index.zig) answer null for every
+        /// mark in the document.
+        ///
+        /// # What is prepared, and where the fallible steps stop
+        ///
+        /// **Everything fallible happens before anything is published.** The
+        /// object table is staged first, while nothing has moved and while the
+        /// table it is read from still describes the actors everything else
+        /// still names. The mark index is staged second, through
+        /// [`MarkIndexColumn.stageRemap`](mark_index.zig), which builds both of
+        /// its halves beside the index and hands them over in one step rather
+        /// than publishing as it goes — that is what lets the mark index be
+        /// prepared *before* the data columns and published *after* them, so
+        /// there is no window in which the two disagree about the actor table.
+        ///
+        /// Then the four data columns move, and
+        /// [`Columns.remapActors`](columns.zig) makes that all-or-nothing.
+        /// **That call is the last fallible step**, and it is the barrier:
+        /// everything after it is a swap, a pointer store and a drop.
+        ///
+        /// So an `error.OutOfMemory` anywhere in this method leaves the actor
+        /// table, the four data columns, the mark index's rows *and* its cache,
+        /// and the object table exactly as they were — and a refusal has an
+        /// `errdefer` per staged half, so the staged halves go back to the
+        /// allocator they came from rather than leaking. There is no inverse
+        /// rollback to get wrong: nothing was published for a rollback to undo.
         pub fn rewriteWithNewActor(self: *Self, idx: ActorIdx) ParseError!void {
-            try self.cols.rewriteWithNewActor(self.gpa, idx);
-            try self.cols.index.mark.rewriteWithNewActor(self.gpa, idx);
-            var fresh = ObjIndex.init(self.gpa);
+            // Prepared while nothing has moved. The `errdefer` hands the staged
+            // object table back on every error path, and the `defer` hands the
+            // staged mark index back on **every** path — on the success path it
+            // is the no-op [`StagedRemap.deinit`] is for, because the publish
+            // has already spent it.
+            var fresh = try self.stagedObjInfo(idx, .up);
             errdefer fresh.deinit();
-            var it = self.obj_info.map.iterator();
-            while (it.next()) |entry| {
-                try fresh.insert(entry.key_ptr.*.withNewActor(idx), indexmod.withNewActor(entry.value_ptr.*, idx));
-            }
+            var mark = try self.cols.index.mark.stageRemap(idx, .up);
+            defer mark.deinit();
+
+            // The barrier. All-or-nothing, and the last thing here that can
+            // fail.
+            try self.cols.rewriteWithNewActor(self.gpa, idx);
+
+            // Past it. A swap, a pointer store, a drop: the mark index and the
+            // object table take the halves staged above, and the actor table
+            // is left for [`OpSet.insertActor`], which owns the append.
+            mark.publish(&self.cols.index.mark);
             self.obj_info.deinit();
             self.obj_info = fresh;
         }
@@ -1425,45 +1576,152 @@ pub fn OpSet(comptime O: type) type {
         /// Forgets the actor at `idx` and renumbers the ones above it down
         /// (`OpSet::remove_actor`, `op_set.rs:1419-1429`).
         ///
+        /// # The mark index, which upstream does not renumber at all
+        ///
+        /// Upstream's `remove_actor` rewrites `cols` and rebuilds `obj_info`
+        /// and **stops** (`op_set.rs:1419-1429`): `cols.index.mark` is not in
+        /// it, though `rewrite_with_new_actor` right above renumbers the mark
+        /// index (`op_set.rs:1407-1409`). Its one caller makes that survivable —
+        /// `remove_unused_actors` (`automerge.rs:443-452`) removes only actors
+        /// the change graph has no change for — but "the actor being removed
+        /// made nothing" says nothing about the actors *above* it, which this
+        /// renumbering moves down one. A mark row holds an actor index
+        /// (`mark_index.rs:25-34`) and so does a cache key
+        /// (`mark_index.rs:216`), so after an upstream removal those rows and
+        /// keys name an actor index one higher than the actor table holds,
+        /// while `obj_info` and the four data columns name the right one. This
+        /// renumbers the mark index with them, through the same
+        /// [`MarkIndexColumn.stageRemap`](mark_index.zig) the insertion uses.
+        ///
         /// Upstream drops the actor from the table first and then rewrites, and
         /// upstream's rewrite panics if the actor is still referenced
         /// (`columns.rs:355-357`). This one rewrites first, because the port's
-        /// rewrite *refuses* (`columns.zig:853-861`) — and a refusal after the
-        /// table had been edited would leave a document whose actor table and
-        /// columns disagree about how many actors there are. Rewriting first
-        /// has no other observable effect: the rewrite either succeeds or the
-        /// document is left exactly as it was.
+        /// rewrite *refuses* ([`Columns.rewriteWithoutActor`](columns.zig)) —
+        /// and a refusal after the table had been edited would leave a document
+        /// whose actor table and columns disagree about how many actors there
+        /// are. Rewriting first has no other observable effect: the rewrite
+        /// either succeeds or the document is left exactly as it was.
         ///
         /// An object made by the removed actor has no identity left, so its
         /// entry goes with it — upstream's `filter_map` (`:1426`) and
         /// [`indexmod.withoutActor`] returning null.
+        ///
+        /// **`idx` must be in `0..actors.len`**, the assertion
+        /// [`std.ArrayList.orderedRemove`] makes. The index comes from the
+        /// batch layer, so this is a caller precondition and not validation of
+        /// untrusted input; [`OpSet.getActor`] bounds-checks because it is an
+        /// accessor a caller reaches on its own, and this is a mutation.
+        ///
+        /// # What is prepared, and where the fallible steps stop
+        ///
+        /// **The order is [`OpSet.rewriteWithNewActor`]'s**, and both reference
+        /// checks are reads that run before anything has moved:
+        /// [`MarkIndexColumn.referencesActor`](mark_index.zig) over the mark
+        /// rows and the cache, and [`Columns.rewriteWithoutActor`](columns.zig)
+        /// over the four data columns and the mark index again. Both answer
+        /// `error.InvalidValue`.
+        ///
+        /// A mark row **cannot** survive the removal of the actor it names, and
+        /// it cannot be dropped either: the index is aligned with the op set,
+        /// so a row that became "no mark" would move every row above it. The
+        /// refusal is the only honest answer, and it is the one the four data
+        /// columns have always given.
+        ///
+        /// **In a well-formed op set the mark half of that refusal is
+        /// subsumed**, because a mark's begin is a row and a row names its
+        /// actor: an actor a mark names is always one `id_actor` names. It is
+        /// asked anyway because [`MarkIndexColumn.stageRemap`](mark_index.zig)
+        /// is a public seam that cannot renumber such a row downwards and has
+        /// to say so, and because "no store of this set names the actor" is
+        /// worth being true of rather than true of five sixths.
+        ///
+        /// Everything fallible happens before anything is published: the object
+        /// table is staged, the mark index is staged, and the four data columns
+        /// move — all-or-nothing, and that is the barrier. `error.OutOfMemory`
+        /// anywhere in this method leaves the actor table, the four data
+        /// columns, the mark index's rows *and* its cache, and the object table
+        /// exactly as they were. Past the barrier the three steps that cannot
+        /// fail — publishing the mark index, dropping the actor, swapping the
+        /// staged object table in — run together.
         pub fn removeActor(self: *Self, idx: ActorIdx) ParseError!void {
-            try self.cols.rewriteWithoutActor(self.gpa, idx);
-            _ = self.actors.orderedRemove(idx);
-            var fresh = ObjIndex.init(self.gpa);
+            std.debug.assert(idx < self.actors.items.len);
+            var fresh = try self.stagedObjInfo(idx, .down);
             errdefer fresh.deinit();
-            var it = self.obj_info.map.iterator();
-            while (it.next()) |entry| {
-                const key = entry.key_ptr.*.withoutActor(idx) orelse continue;
-                const info = indexmod.withoutActor(entry.value_ptr.*, idx) orelse continue;
-                try fresh.insert(key, info);
-            }
+            var mark = try self.cols.index.mark.stageRemap(idx, .down);
+            defer mark.deinit();
+
+            // The barrier. This is where an actor a mark still names is
+            // refused, and where the four data columns move together.
+            try self.cols.rewriteWithoutActor(self.gpa, idx);
+
+            // Past it. Nothing below allocates, frees through a second
+            // allocator, or can be refused.
+            mark.publish(&self.cols.index.mark);
+            _ = self.actors.orderedRemove(idx);
             self.obj_info.deinit();
             self.obj_info = fresh;
         }
 
-        /// The actor at `idx` (`OpSet::get_actor`, `op_set.rs:1179-1181`).
-        /// Null rather than a trap for an index the table does not have, for
-        /// the reason [`OpSet.getActorSafe`] gives.
+        /// Which way an actor renumbering moves the indices at or above the
+        /// slot, for [`OpSet.stagedObjInfo`].
+        ///
+        /// This is the object table's half of the rule and the mark index has
+        /// its own — [`mark_index.Shift`](mark_index.zig) — because an object
+        /// entry can be dropped when it names a removed actor and a mark row
+        /// cannot: this one answers "the entry goes", that one answers "the
+        /// caller must ask [`MarkIndexColumn.referencesActor`](mark_index.zig)
+        /// first". An actor renumbering needs both, which is why
+        /// [`OpSet.rewriteWithNewActor`] and [`OpSet.removeActor`] pass the
+        /// same arm to each.
+        const ActorShift = enum { up, down };
+
+        /// The object table this op set would hold after every actor index at
+        /// or above `idx` moved [`ActorShift.up`], or after the actor at `idx`
+        /// went away and every index above it came down one.
+        ///
+        /// Built from the table **as it stands**, before the columns or the
+        /// mark index have moved, so a caller can stage it and commit it last.
+        /// Both halves of each entry move together — the key is the op that
+        /// made the object and the value holds its parent — because an entry
+        /// with a moved key and a stale parent answers about an object nothing
+        /// can reach. Under [`ActorShift.down`] an entry whose key or whose
+        /// parent names the removed actor is dropped rather than kept: the
+        /// object has no identity left.
+        ///
+        /// The caller owns the result and installs it over `self.obj_info` with
+        /// the old one freed; nothing here touches the op set.
+        fn stagedObjInfo(self: *const Self, idx: ActorIdx, way: ActorShift) ParseError!ObjIndex {
+            var fresh = ObjIndex.init(self.gpa);
+            errdefer fresh.deinit();
+            var it = self.obj_info.map.iterator();
+            while (it.next()) |entry| {
+                switch (way) {
+                    .up => try fresh.insert(
+                        entry.key_ptr.*.withNewActor(idx),
+                        indexmod.withNewActor(entry.value_ptr.*, idx),
+                    ),
+                    .down => {
+                        const key = entry.key_ptr.*.withoutActor(idx) orelse continue;
+                        const info = indexmod.withoutActor(entry.value_ptr.*, idx) orelse continue;
+                        try fresh.insert(key, info);
+                    },
+                }
+            }
+            return fresh;
+        }
+
+        /// The actor at `idx`, or null past the end (`OpSet::get_actor`,
+        /// `op_set.rs:1179-1181`).
+        ///
+        /// **Upstream's `get_actor` is `&self.actors[idx]`** and panics on an
+        /// index the table does not have, which is the whole reason its
+        /// `get_actor_safe` exists beside it (`op_set.rs:1183-1185`). This one
+        /// bounds-checks and answers null, so **there is one accessor here
+        /// rather than two**, and a caller reaching for a safe spelling gets
+        /// this: the safe answer is the only answer.
         pub fn getActor(self: *const Self, idx: ActorIdx) ?ActorId {
             if (idx >= self.actors.items.len) return null;
             return self.actors.items[idx];
-        }
-
-        /// The actor at `idx`, or null (`OpSet::get_actor_safe`,
-        /// `op_set.rs:1183-1185`).
-        pub fn getActorSafe(self: *const Self, idx: ActorIdx) ?ActorId {
-            return self.getActor(idx);
         }
 
         /// Where `actor` sits in the table (`OpSet::lookup_actor`,
@@ -1635,40 +1893,74 @@ pub fn OpSet(comptime O: type) type {
             const rows = self.cols.len();
             const succs = self.subLen();
 
-            if (self.cols.index.text.len() < rows) {
-                const pad = try self.gpa.alloc(?u32, rows - self.cols.index.text.len());
+            // **All five pads are staged, then published together.** These are
+            // five appends to five columns that have to end up the same length,
+            // and writing them in sequence leaves a refusal in the fourth with
+            // three columns padded and two not — the same half-applied pass
+            // [`Columns.splice`] refuses to leave, on the path every loaded
+            // document walks before its first query.
+            const text_at = self.cols.index.text.len();
+            const top_at = self.cols.index.top.len();
+            const visible_at = self.cols.index.visible.len();
+            const mark_at = self.cols.index.mark.len();
+            const inc_at = self.cols.index.inc.len();
+            var s_text: ?opcols.TextColumn.StagedSplice = null;
+            defer if (s_text) |*st| st.deinit();
+            var s_top: ?opcols.BoolPrefixColumn.StagedSplice = null;
+            defer if (s_top) |*st| st.deinit();
+            var s_visible: ?opcols.BoolColumn.StagedSplice = null;
+            defer if (s_visible) |*st| st.deinit();
+            var s_mark: ?markmod.MarkIndexColumn.StagedMarkIndex = null;
+            defer if (s_mark) |*st| st.deinit();
+            var s_inc: ?opcols.IncColumn.StagedSplice = null;
+            defer if (s_inc) |*st| st.deinit();
+
+            if (text_at < rows) {
+                const pad = try self.gpa.alloc(?u32, rows - text_at);
                 defer self.gpa.free(pad);
                 @memset(pad, null);
-                try self.cols.index.text.splice(self.gpa, self.cols.index.text.len(), 0, pad);
+                s_text = try self.cols.index.text.stageSplice(text_at, 0, pad);
             }
-            if (self.cols.index.top.len() < rows) {
-                const pad = try self.gpa.alloc(bool, rows - self.cols.index.top.len());
+            if (top_at < rows) {
+                const pad = try self.gpa.alloc(bool, rows - top_at);
                 defer self.gpa.free(pad);
                 @memset(pad, false);
-                try self.cols.index.top.splice(self.gpa, self.cols.index.top.len(), 0, pad);
+                s_top = try self.cols.index.top.stageSplice(top_at, 0, pad);
             }
-            if (self.cols.index.visible.len() < rows) {
-                const pad = try self.gpa.alloc(bool, rows - self.cols.index.visible.len());
+            if (visible_at < rows) {
+                const pad = try self.gpa.alloc(bool, rows - visible_at);
                 defer self.gpa.free(pad);
                 @memset(pad, false);
-                try self.cols.index.visible.splice(self.gpa, self.cols.index.visible.len(), 0, pad);
+                s_visible = try self.cols.index.visible.stageSplice(visible_at, 0, pad);
             }
-            if (self.cols.index.mark.len() < rows) {
-                // `extend` takes builders, not words, because a begin also
-                // seeds the cache ([mark_index.zig:683-699](mark_index.zig));
+            if (mark_at < rows) {
+                // `stageExtend` takes builders, not words, because a begin also
+                // seeds the cache ([`MarkIndexColumn.stageExtend`](mark_index.zig));
                 // a run of nulls is a run of rows with no mark, and a null
-                // builder is a null word with no cache entry.
-                const pad = try self.gpa.alloc(?markmod.MarkIndexBuilder, rows - self.cols.index.mark.len());
+                // builder is a null word with no cache entry. **The staged cache
+                // is a copy of the one already here**, so this pad adds rows and
+                // no marks — which is correct and costs a copy of the whole
+                // cache, and that cost belongs in the cache's representation
+                // rather than in this call.
+                const pad = try self.gpa.alloc(?markmod.MarkIndexBuilder, rows - mark_at);
                 defer self.gpa.free(pad);
                 @memset(pad, null);
-                try self.cols.index.mark.extend(self.gpa, self.cols.index.mark.len(), pad);
+                s_mark = try self.cols.index.mark.stageExtend(mark_at, pad);
             }
-            if (self.cols.index.inc.len() < succs) {
-                const pad = try self.gpa.alloc(?i64, succs - self.cols.index.inc.len());
+            if (inc_at < succs) {
+                const pad = try self.gpa.alloc(?i64, succs - inc_at);
                 defer self.gpa.free(pad);
                 @memset(pad, null);
-                try self.cols.index.inc.splice(self.gpa, self.cols.index.inc.len(), 0, pad);
+                s_inc = try self.cols.index.inc.stageSplice(inc_at, 0, pad);
             }
+
+            // The commit. Every publish is infallible and consumes its stage,
+            // and the `defer`s above are no-ops afterwards.
+            if (s_text) |*st| st.publish(&self.cols.index.text);
+            if (s_top) |*st| st.publish(&self.cols.index.top);
+            if (s_visible) |*st| st.publish(&self.cols.index.visible);
+            if (s_mark) |*st| st.publish(&self.cols.index.mark);
+            if (s_inc) |*st| st.publish(&self.cols.index.inc);
         }
 
         // ── Mutation ───────────────────────────────────────────────────
@@ -1700,6 +1992,11 @@ pub fn OpSet(comptime O: type) type {
         /// nothing. Called by [`OpSet.splice`] for every op it writes, which is
         /// why the object table and the rows cannot disagree about which ops
         /// made which objects.
+        ///
+        /// **This cannot fail for a caller that used [`OpSet.splice`]**, which
+        /// reserves room for exactly this many entries before the rows are
+        /// written. Called directly it can, and a refusal leaves the entries it
+        /// had already written in place.
         pub fn spliceObjects(self: *Self, ops: []const O) ParseError!void {
             for (ops) |op| {
                 if (op.objInfo()) |info| try self.obj_info.insert(op.id(), info);
@@ -1714,13 +2011,37 @@ pub fn OpSet(comptime O: type) type {
         /// the count. The object table is brought along in the same call, which
         /// is the whole of what `splice` adds over `cols.splice`.
         ///
-        /// **The successor buffer is refitted afterwards**, because a row that
-        /// arrives with more successors than the buffer holds would make every
-        /// later walk over this op set answer `error.TooLarge`
-        /// (`op_iter.zig:908-910`). A buffer that is already wide enough is
-        /// left alone, so a splice in a document with a wide register costs
-        /// nothing.
+        /// **The successor buffer is reserved before anything is written**,
+        /// because a row that arrives with more successors than the buffer holds
+        /// would make every later walk over this op set answer `error.TooLarge`
+        /// (`op_iter.zig:908-910`). The buffer that is already wide enough is
+        /// left alone, so a splice in a document with a wide register costs one
+        /// pass over `succ_count` and no allocation — and that pass is the one
+        /// [`OpSet.refitScratch`] would have made afterwards anyway.
+        ///
+        /// **Every step that can fail is a step that changes nothing.** The
+        /// successor buffer and the object table's capacity are reserved before
+        /// the first column moves, so the two steps that follow the column
+        /// writes cannot run out of either: the object table and the successor
+        /// buffer never fall out of step with the rows. And
+        /// [`columns.Columns.splice`] stages all twenty-one of its column
+        /// writes and publishes them together, so a refusal inside one leaves
+        /// the whole set as it was.
+        ///
+        /// **Upstream's sequence at `columns.rs:428-492` is not the precedent
+        /// for running them in sequence.** Its `?`s are packing and bounds —
+        /// `Column::splice` answers `Result<_, PackError>` because a value may
+        /// not pack — and a Rust allocation failure aborts the process rather
+        /// than returning an error. **This port's heap is fallible where
+        /// upstream's is not**, so an `error.OutOfMemory` from anywhere in this
+        /// method has no upstream counterpart and the port owes the caller an
+        /// op set that is still a document.
+        ///
+        /// So the rule for a caller is the ordinary one: **an error from here
+        /// changes nothing, and the op set stays usable.**
         pub fn splice(self: *Self, pos: usize, ops: []const O) ParseError!usize {
+            try self.reserveScratchFor(ops);
+            try self.obj_info.reserve(self.gpa, objectMakingCount(O, ops));
             const added = try self.cols.splice(self.gpa, pos, ops, self.text_encoding, self.strings);
             try self.spliceObjects(ops);
             try self.refitScratch();
@@ -1741,6 +2062,9 @@ pub fn OpSet(comptime O: type) type {
         /// the same as the ones a rebuild derives: `splice` trusts the op, and
         /// [`OpSet.rebuildIndex`] recomputes. The test that holds the two to
         /// each other is the reason this method is here.
+        ///
+        /// **`actors` must be sorted ascending**, for the reason
+        /// [`OpSet.fromActors`] gives.
         pub fn fromDocOps(
             gpa: Allocator,
             actors: []const ActorId,
@@ -1765,15 +2089,89 @@ pub fn OpSet(comptime O: type) type {
         /// it made, if it made one (`:251-253`); then `reset_top` over the
         /// range the transaction captured, which is what undoes the conflict
         /// reordering an insert performed (`:254-256`).
+        ///
+        /// **A retry is sound, and each of the four steps is what makes it so.**
+        /// An undo is the one mutation a caller may run twice: a rollback that
+        /// was refused comes back with the same [`opmod.TxOp`]
+        /// ([`Transaction.rollback`](../transact.zig)), and every step here has
+        /// to recognise work it has already done.
+        ///
+        /// * [`OpSet.undoSucc`] skips an edge unless its predecessor's current
+        ///   count and successor window still own the recorded edge.
+        /// * [`OpSet.undoOneRow`] takes the row out only if the row at
+        ///   `op.pos` is still this op's row. Ids are unique, so a row that is
+        ///   not this one is a neighbour that has moved into the slot, and
+        ///   removing it would take an unrelated op with it.
+        /// * The object-table removal is a `remove` of a key that may already
+        ///   be gone, which is a no-op.
+        ///
+        /// **`reset_top` runs on every attempt, and that is a proof rather
+        /// than a policy.** The pass is idempotent: after one run the last row
+        /// in the window that is either visible or top is the only one that is
+        /// top, and every earlier such row is not — which is exactly the fixed
+        /// point its scan derives, so a second run finds nothing to demote and
+        /// nothing to expose. Its `visible` input never changes, because the
+        /// pass writes only `top` and `text`. **So a retry after a refusal
+        /// inside it re-derives the same window and no-ops, and the reset is
+        /// never lost.** Gating it on "did this call remove the row" was wrong
+        /// and left a document with stale `top` and `text` whenever the row
+        /// removal landed and the reset then ran out.
+        ///
+        /// **Three transactions, and each is atomic on its own.**
+        /// [`columns.Columns.removeOps`] stages all twenty-two of its column
+        /// writes before it publishes any; [`OpSet.resetTop`] stages `top` and
+        /// `text` as two whole-window replacements and publishes both; and each
+        /// edge of [`OpSet.undoSucc`] stages its own column writes together.
+        /// **A refusal from any one of them leaves the op set unchanged by that
+        /// one.**
+        ///
+        /// **And a retry is sound, because the guards make each step recognise
+        /// work it has already done.** [`OpSet.undoSucc`] skips an edge whose
+        /// predecessor has already been restored; [`OpSet.undoOneRow`] takes the row out
+        /// only if the row at `op.pos` is still this op's row, and ids are
+        /// unique so anything else is a neighbour that moved into the slot; the
+        /// object-table removal is a `remove` of a key that may already be gone.
+        ///
+        /// **What a retry cannot repair is the progress `undo_succ` made between
+        /// two edges.** A refusal there leaves some edges taken back and some
+        /// not, which is a *valid* set of columns holding a document the caller
+        /// must not read until the retry finishes. That is a property of the
+        /// seam: `Column.publish` takes one stage per column per pass, and the
+        /// list's edges are disjoint single-value removals in the flattened
+        /// pair, so one stage cannot express them all. Closing it is a request
+        /// to `Column`'s owner for a multi-point stage.
         pub fn undoOp(self: *Self, op: *const opmod.TxOp) (ParseError || ReadOpError)!void {
             if (op.undo.items.len != 0) try self.undoSucc(op.undo.items);
-            const builders = [_]opmod.OpBuilder{op.bld};
-            _ = try self.cols.removeOps(self.gpa, op.pos, &builders);
+            _ = try self.undoOneRow(op);
             if (op.objInfo() != null) self.obj_info.remove(op.bld.id());
             // `OpRange` and `RowRange` are the same two fields under two
             // names, and this is the one call that crosses between them.
+            // **Every attempt** — the doc above says why the reset is not lost
+            // by being skipped on a retry.
             if (op.reset_range) |rows| try self.resetTop(.{ .start = rows.start, .end = rows.end });
+            // Cannot allocate: an undo only ever makes rows narrower, so the
+            // widest row left is no wider than the buffer already holds and
+            // `refitScratch` finds nothing to do.
             try self.refitScratch();
+        }
+
+        /// Takes the one row `op` wrote out of the columns, unless it is
+        /// already gone. The guard is what keeps a retry from taking a
+        /// neighbour with it.
+        ///
+        /// **The row at `op.pos` is this op's row or the op is already
+        /// undone.** Ids are unique per `(counter, actor)`, so a row whose id
+        /// is not `op.bld.id()` is a neighbour that has moved down into the
+        /// slot, and removing `del` rows there would take that neighbour with
+        /// it. This is what a retry of a refused undo sees, and it is the same
+        /// answer for an undo whose row was removed by something else.
+        fn undoOneRow(self: *Self, op: *const opmod.TxOp) ParseError!bool {
+            const actor = (try self.cols.id_actor.get(op.pos)) orelse return false;
+            const ctr = (try self.cols.id_ctr.get(op.pos)) orelse return false;
+            if (!OpId.init(ctr, actor).eql(op.bld.id())) return false;
+            const builders = [_]opmod.OpBuilder{op.bld};
+            _ = try self.cols.removeOps(self.gpa, op.pos, &builders);
+            return true;
         }
 
         /// Recomputes the `top` column over `rows` (`OpSet::reset_top`,
@@ -1787,21 +2185,50 @@ pub fn OpSet(comptime O: type) type {
         /// because a row's `top` value is read once and the answer for the
         /// whole range is only known at the end.
         ///
+        /// **The apply is staged, and that is the whole difference from
+        /// upstream.** Upstream's pass calls `conflict` and `expose` per row
+        /// (`op_set.rs:107-138`), which on this port's fallible heap means one
+        /// write per demoted row and a refusal half way through leaving `top`
+        /// and `text` describing two different registers. So the two columns
+        /// this pass writes are **built as whole-window replacements and
+        /// published together**: the target values are computed into two
+        /// buffers, both replacements are staged, and two infallible publishes
+        /// commit them. [`OpSet.conflict`] and [`OpSet.expose`] stay as the
+        /// per-row forms they are upstream, and `resetTop` no longer composes
+        /// them — the two writes each of them makes are the two this pass makes
+        /// at once.
+        ///
+        /// **An `error.OutOfMemory` leaves both columns exactly as they were.**
+        ///
         /// `top ⇒ visible` is asserted upstream at `:116` and cannot be
         /// violated here — the only writer of `top` in this loop is `expose`,
         /// and `expose` is only reached from the `else if v` arm, i.e. a row
         /// the `visible` column already marks.
         pub fn resetTop(self: *Self, rows: RowRange) (ParseError || ReadOpError)!void {
             const window = column.clampRange(rows, self.cols.len());
+            const count = window.end - window.start;
+            var top_target = try self.gpa.alloc(bool, count);
+            defer self.gpa.free(top_target);
+            var text_target = try self.gpa.alloc(?u32, count);
+            defer self.gpa.free(text_target);
             var conflicts: std.ArrayList(usize) = .empty;
             defer conflicts.deinit(self.gpa);
             var expose_at: ?usize = null;
             var last_t: ?usize = null;
             var visible_rows = try self.cols.index.visible.iterRange(window);
             var top = try self.cols.index.top.iterRange(window);
+            var text_rows = try self.cols.index.text.iterRange(window);
             var i: usize = 0;
-            while (try visible_rows.next()) |v| {
+            while (i < count) {
+                const v = (try visible_rows.next()) orelse break;
                 const t = (try top.next()) orelse break;
+                top_target[i] = t;
+                // **`TextColumn`'s value is itself optional**, so `next` answers
+                // `??u32`: the outer null is the end of the window and the
+                // inner one is a row with no width. Both land on null here, and
+                // the fill loop below would have written null for the tail
+                // anyway — so the inner null is preserved rather than dropped.
+                text_target[i] = (try text_rows.next()) orelse null;
                 if (t) {
                     if (last_t) |n| try conflicts.append(self.gpa, n);
                     last_t = i;
@@ -1813,8 +2240,40 @@ pub fn OpSet(comptime O: type) type {
                 }
                 i += 1;
             }
-            for (conflicts.items) |n| try self.conflict(window.start + n);
-            if (expose_at) |n| try self.expose(window.start + n);
+            // **The rest of the window keeps what it has**, read directly rather
+            // than through the cursors: a cursor that stopped short means the
+            // index column is shorter than the window, and this pass must
+            // still produce a replacement of exactly the window's width.
+            while (i < count) : (i += 1) {
+                top_target[i] = (try self.cols.index.top.get(window.start + i)) orelse false;
+                text_target[i] = (try self.cols.index.text.get(window.start + i)) orelse null;
+            }
+            // The two accumulators become two entries in the targets.
+            for (conflicts.items) |n| {
+                top_target[n] = false;
+                text_target[n] = null;
+            }
+            if (expose_at) |n| {
+                top_target[n] = true;
+                // The width is measured over the *current* rows, before the
+                // publish, which is where `OpSet.expose` measured it too
+                // (`op_set.rs:155-157`) — and a row's width does not depend on
+                // its own `top`, so measuring first is the same answer.
+                const width: ?u32 = if (try self.get(window.start + n)) |row| blk: {
+                    const w = row.width(.text, self.text_encoding);
+                    break :blk if (w < 0) null else std.math.cast(u32, w) orelse null;
+                } else null;
+                text_target[n] = width;
+            }
+            if (count == 0) return;
+            var s_top = try self.cols.index.top.stageSplice(window.start, count, top_target);
+            defer s_top.deinit();
+            var s_text = try self.cols.index.text.stageSplice(window.start, count, text_target);
+            defer s_text.deinit();
+            // The commit. Neither publish can fail, so `top` and `text` never
+            // disagree about a row this pass moved.
+            s_top.publish(&self.cols.index.top);
+            s_text.publish(&self.cols.index.text);
         }
 
         /// Demotes the row at `pos` from winner of its register
@@ -1824,9 +2283,14 @@ pub fn OpSet(comptime O: type) type {
         /// contributing width to the text index, or the sequence's measured
         /// length would count a conflicted character twice
         /// (`op_set.rs:143-144`).
+        /// Both index entries publish together; refusal leaves both unchanged.
         pub fn conflict(self: *Self, pos: usize) ParseError!void {
-            try self.cols.index.top.splice(self.gpa, pos, 1, &.{false});
-            try self.cols.index.text.splice(self.gpa, pos, 1, &.{null});
+            var top = try self.cols.index.top.stageSplice(pos, 1, &.{false});
+            defer top.deinit();
+            var s_text = try self.cols.index.text.stageSplice(pos, 1, &.{null});
+            defer s_text.deinit();
+            top.publish(&self.cols.index.top);
+            s_text.publish(&self.cols.index.text);
         }
 
         /// Promotes the row at `pos` to winner of its register
@@ -1838,13 +2302,19 @@ pub fn OpSet(comptime O: type) type {
         /// measured, so requiring the caller to pass the object type would buy
         /// nothing. [`columns.Columns.splice`] makes the same choice on the way
         /// in (`columns.rs:475-485`).
+        /// Width measurement and both stages precede publication. Refusal
+        /// leaves the winner and text-width entries unchanged.
         pub fn expose(self: *Self, pos: usize) (ParseError || ReadOpError)!void {
-            try self.cols.index.top.splice(self.gpa, pos, 1, &.{true});
             const width: ?u32 = if (try self.get(pos)) |row| blk: {
                 const w = row.width(.text, self.text_encoding);
                 break :blk if (w < 0) null else std.math.cast(u32, w) orelse null;
             } else null;
-            try self.cols.index.text.splice(self.gpa, pos, 1, &.{width});
+            var top = try self.cols.index.top.stageSplice(pos, 1, &.{true});
+            defer top.deinit();
+            var s_text = try self.cols.index.text.stageSplice(pos, 1, &.{width});
+            defer s_text.deinit();
+            top.publish(&self.cols.index.top);
+            s_text.publish(&self.cols.index.text);
         }
 
         /// Adds a successor edge to each of `inserts`, with nothing recorded
@@ -1909,11 +2379,21 @@ pub fn OpSet(comptime O: type) type {
         /// * `inc != null` after the expose — another increment on the same
         ///   row, or on any other row. Also a no-op undo.
         ///
-        /// The caller owns the returned list and frees it.
-        pub fn addSuccWithUndo(self: *Self, inserts: []const SuccInsert) ParseError![]SuccUndo {
-            var undo: std.ArrayList(SuccUndo) = .empty;
-            errdefer undo.deinit(self.gpa);
-            try undo.ensureTotalCapacity(self.gpa, inserts.len);
+        /// Appends to the caller-owned journal, allocated with `self.gpa`.
+        /// Reserve happens before mutation. Every published edge has a retained
+        /// undo record before the next fallible step; refusal keeps that prefix.
+        /// Undo the journal before reading or mutating the affected rows again.
+        /// Do not retry adding the same edges after partial publication.
+        ///
+        /// The four successor columns publish together. Visibility, text and
+        /// top publish together after their stages succeed. A refusal between
+        /// those publications leaves work for the retained journal to undo.
+        pub fn addSuccWithUndo(
+            self: *Self,
+            inserts: []const SuccInsert,
+            undo: *std.ArrayList(SuccUndo),
+        ) ParseError!void {
+            try undo.ensureUnusedCapacity(self.gpa, inserts.len);
 
             var succ_inc: usize = 0;
             var last_pos: ?usize = null;
@@ -1929,52 +2409,47 @@ pub fn OpSet(comptime O: type) type {
                     last_pos = item.pos;
                     succ_inc = 1;
                 }
-                // op_set.rs:298-305 — the four column writes, and *only*
-                // those. Upstream reads the three index values at `:308-310`
-                // and `:317` **before** it writes them at `:312-314` and
-                // `:319`, so sharing a helper that also mutated the index
-                // would record the post-write values and make the undo a
-                // no-op. The helper is `writeSuccColumns`; the delete's
-                // index block is below, in upstream's order.
-                try self.writeSuccColumns(item, succ_inc);
+                // Upstream restores the pass's original count on every undo
+                // (op_set.rs:327-340). Record this edge's preceding count so
+                // a refused undo also keeps the remaining flattened pair in step.
+                var entry = SuccUndo{
+                    .succ = item,
+                    .visible = null,
+                    .text = null,
+                    .top = null,
+                };
+                entry.succ.len = std.math.add(usize, item.len, succ_inc - 1) catch return error.Overflow;
+                const needs_expose = item.inc != null and delete and !did_expose;
+                // Read index values before publishing anything (op_set.rs:308-319).
                 if (item.inc == null) {
-                    // op_set.rs:306-314 — a delete.
                     delete = true;
-                    const row_vis = try self.cols.index.visible.get(item.pos);
+                    entry.visible = try self.cols.index.visible.get(item.pos);
                     const row_text = try self.cols.index.text.get(item.pos);
-                    const row_top = try self.cols.index.top.get(item.pos);
-                    try undo.append(self.gpa, .{
-                        .succ = item,
-                        .visible = row_vis,
-                        .text = if (row_text) |t| @as(?u32, t) else null,
-                        .top = row_top,
-                    });
-                    try self.cols.index.visible.splice(self.gpa, item.pos, 1, &.{false});
-                    try self.cols.index.text.splice(self.gpa, item.pos, 1, &.{null});
-                    try self.cols.index.top.splice(self.gpa, item.pos, 1, &.{false});
-                } else if (delete and !did_expose) {
-                    // op_set.rs:315-319 — the re-expose.
+                    entry.text = if (row_text) |t| @as(?u32, t) else null;
+                    entry.top = try self.cols.index.top.get(item.pos);
+                } else if (needs_expose) {
                     did_expose = true;
-                    const row_top = try self.cols.index.top.get(item.pos);
-                    try undo.append(self.gpa, .{
-                        .succ = item,
-                        .visible = null,
-                        .text = null,
-                        .top = row_top,
-                    });
-                    try self.cols.index.top.splice(self.gpa, item.pos, 1, &.{true});
-                } else {
-                    // op_set.rs:320-322 — nothing in the index moved.
-                    try undo.append(self.gpa, .{
-                        .succ = item,
-                        .visible = null,
-                        .text = null,
-                        .top = null,
-                    });
+                    entry.top = try self.cols.index.top.get(item.pos);
+                }
+                try self.writeSuccColumns(item, succ_inc);
+                undo.appendAssumeCapacity(entry);
+                if (item.inc == null) {
+                    var s_vis = try self.cols.index.visible.stageSplice(item.pos, 1, &.{false});
+                    defer s_vis.deinit();
+                    var s_text = try self.cols.index.text.stageSplice(item.pos, 1, &.{null});
+                    defer s_text.deinit();
+                    var s_top = try self.cols.index.top.stageSplice(item.pos, 1, &.{false});
+                    defer s_top.deinit();
+                    s_vis.publish(&self.cols.index.visible);
+                    s_text.publish(&self.cols.index.text);
+                    s_top.publish(&self.cols.index.top);
+                } else if (needs_expose) {
+                    var s_top = try self.cols.index.top.stageSplice(item.pos, 1, &.{true});
+                    defer s_top.deinit();
+                    s_top.publish(&self.cols.index.top);
                 }
             }
             try self.refitScratch();
-            return undo.toOwnedSlice(self.gpa);
         }
 
         /// Removes the successor edges `undos` names, restoring what they
@@ -1984,9 +2459,20 @@ pub fn OpSet(comptime O: type) type {
         /// [`OpSet.addSucc`]: the list came out of
         /// [`OpSet.addSuccWithUndo`] in reverse, so replaying it in reverse
         /// undoes the *last* edge first, which is the one whose `succ_count` and
-        /// `sub_pos` were computed against the state its predecessor left. A
-        /// `succ_count` is read back out of the column each time, so the count
-        /// going down by one per edge is the whole of it.
+        /// `sub_pos` were computed against the state its predecessor left.
+        /// Each `SuccUndo.succ.len` must be the row's count immediately before
+        /// that individual edge was published, not the pass's original count
+        /// for every edge on the same row. [`OpSet.addSuccWithUndo`] records it.
+        ///
+        /// **An edge that is already gone is skipped**, which is what makes a
+        /// retry of a refused [`OpSet.undoOp`] sound. The list is replayed whole,
+        /// including edges taken back on the first attempt. A successor id can
+        /// occur on several predecessor rows, so identity alone cannot decide
+        /// whether an edge remains: the recorded predecessor's current count
+        /// and flattened successor window must own it ([`OpSet.holdsSucc`]).
+        /// On refusal, completed edge undos remain published and the failing
+        /// edge is unchanged. Retain `undos` and retry before any other mutation
+        /// or read of the affected rows; this call borrows the journal.
         ///
         /// The three `?` payloads are upstream's nested `Option`s
         /// ([`SuccUndo`](op.zig)): null means this column was not touched, and a
@@ -1997,23 +2483,77 @@ pub fn OpSet(comptime O: type) type {
                 i -= 1;
                 const entry = undos[i];
                 const item = entry.succ;
-                try self.cols.succ_count.splice(self.gpa, item.pos, 1, &.{
-                    std.math.cast(u32, item.len) orelse return error.Overflow,
-                });
-                try self.cols.succ_actor.splice(self.gpa, item.sub_pos, 1, &.{});
-                try self.cols.succ_ctr.splice(self.gpa, item.sub_pos, 1, &.{});
-                try self.cols.index.inc.splice(self.gpa, item.sub_pos, 1, &.{});
+                if (!try self.holdsSucc(item)) continue;
+                const count = std.math.cast(u32, item.len) orelse return error.Overflow;
+                // **One edge's seven writes are staged and published
+                // together.** Upstream's pass writes them in sequence
+                // (`op_set.rs:327-351`), which on a fallible heap means a
+                // refusal between `succ_count` and the flattened pair leaves
+                // the two disagreeing about the same row. A stage reads its
+                // column and writes nothing and its publish cannot fail, so a
+                // refusal now falls between two edges rather than inside one,
+                // and the `holdsSucc` guard makes the retry resume exactly
+                // where it stopped.
+                var s_count = try self.cols.succ_count.stageSplice(item.pos, 1, &.{count});
+                defer s_count.deinit();
+                var s_actor = try self.cols.succ_actor.stageSplice(item.sub_pos, 1, &.{});
+                defer s_actor.deinit();
+                var s_ctr = try self.cols.succ_ctr.stageSplice(item.sub_pos, 1, &.{});
+                defer s_ctr.deinit();
+                var s_inc = try self.cols.index.inc.stageSplice(item.sub_pos, 1, &.{});
+                defer s_inc.deinit();
+                // The three index columns this edge recorded, and only the ones
+                // it recorded: a null payload means the edge did not move that
+                // column ([`SuccUndo`](op.zig)).
+                var s_vis: ?opcols.BoolColumn.StagedSplice = null;
+                defer if (s_vis) |*st| st.deinit();
+                var s_text: ?opcols.TextColumn.StagedSplice = null;
+                defer if (s_text) |*st| st.deinit();
+                var s_top: ?opcols.BoolPrefixColumn.StagedSplice = null;
+                defer if (s_top) |*st| st.deinit();
                 if (entry.visible) |v| {
-                    try self.cols.index.visible.splice(self.gpa, item.pos, 1, &.{v});
+                    s_vis = try self.cols.index.visible.stageSplice(item.pos, 1, &.{v});
                 }
                 if (entry.text) |t| {
-                    try self.cols.index.text.splice(self.gpa, item.pos, 1, &.{t});
+                    s_text = try self.cols.index.text.stageSplice(item.pos, 1, &.{t});
                 }
                 if (entry.top) |t| {
-                    try self.cols.index.top.splice(self.gpa, item.pos, 1, &.{t});
+                    s_top = try self.cols.index.top.stageSplice(item.pos, 1, &.{t});
                 }
+                // The commit. Every publish is infallible and consumes its
+                // stage, and the `defer`s above are no-ops afterwards.
+                s_count.publish(&self.cols.succ_count);
+                s_actor.publish(&self.cols.succ_actor);
+                s_ctr.publish(&self.cols.succ_ctr);
+                s_inc.publish(&self.cols.index.inc);
+                if (s_vis) |*st| st.publish(&self.cols.index.visible);
+                if (s_text) |*st| st.publish(&self.cols.index.text);
+                if (s_top) |*st| st.publish(&self.cols.index.top);
             }
             try self.refitScratch();
+        }
+
+        /// Whether `item`'s predecessor still owns the recorded successor edge.
+        ///
+        /// Each undo restores the preceding count atomically with its edge
+        /// removal. Matching that count plus one distinguishes pending work
+        /// from completed work, including several edges on one row. The
+        /// flattened slot must also lie inside this row's current prefix window:
+        /// a delete of a conflicted register gives several rows the same id,
+        /// and a neighbouring row's edge can move into a completed entry's slot.
+        /// Index values are not a guard: forward publication may have stopped
+        /// after the edge and journal were published but before the index moved.
+        fn holdsSucc(self: *const Self, item: SuccInsert) ParseError!bool {
+            const count = (try self.cols.succ_count.get(item.pos)) orelse return false;
+            if (count == 0) return false;
+            if (count - 1 != item.len) return false;
+            const start = std.math.cast(usize, try self.cols.succ_count.getPrefix(item.pos)) orelse
+                return error.Overflow;
+            if (item.sub_pos < start) return false;
+            if (item.sub_pos - start >= count) return false;
+            const actor = (try self.cols.succ_actor.get(item.sub_pos)) orelse return false;
+            const ctr = (try self.cols.succ_ctr.get(item.sub_pos)) orelse return false;
+            return actor == item.id.actor and ctr == item.id.counter;
         }
 
         /// The one successor edge's four *column* writes, shared by
@@ -2034,12 +2574,24 @@ pub fn OpSet(comptime O: type) type {
         /// `succ_count` and the flattened pair the same length.
         fn writeSuccColumns(self: *Self, item: SuccInsert, succ_inc: usize) ParseError!void {
             const new_count = std.math.add(u64, item.len, succ_inc) catch return error.Overflow;
-            try self.cols.succ_count.splice(self.gpa, item.pos, 1, &.{
-                std.math.cast(u32, new_count) orelse return error.Overflow,
-            });
-            try self.cols.succ_actor.splice(self.gpa, item.sub_pos, 0, &.{item.id.actor});
-            try self.cols.succ_ctr.splice(self.gpa, item.sub_pos, 0, &.{item.id.counter});
-            try self.cols.index.inc.splice(self.gpa, item.sub_pos, 0, &.{item.inc});
+            const count = std.math.cast(u32, new_count) orelse return error.Overflow;
+            // **Staged, then published together.** These four columns have to
+            // agree — `succ_count` and the flattened pair are the same edges
+            // counted two ways — so a refusal between two of them would leave
+            // them disagreeing about the row. A stage reads its column and
+            // writes nothing; its publish cannot fail.
+            var s_count = try self.cols.succ_count.stageSplice(item.pos, 1, &.{count});
+            defer s_count.deinit();
+            var s_actor = try self.cols.succ_actor.stageSplice(item.sub_pos, 0, &.{item.id.actor});
+            defer s_actor.deinit();
+            var s_ctr = try self.cols.succ_ctr.stageSplice(item.sub_pos, 0, &.{item.id.counter});
+            defer s_ctr.deinit();
+            var s_inc = try self.cols.index.inc.stageSplice(item.sub_pos, 0, &.{item.inc});
+            defer s_inc.deinit();
+            s_count.publish(&self.cols.succ_count);
+            s_actor.publish(&self.cols.succ_actor);
+            s_ctr.publish(&self.cols.succ_ctr);
+            s_inc.publish(&self.cols.index.inc);
         }
 
         /// The same edge, *including* the index: what [`OpSet.addSucc`]
@@ -2051,9 +2603,15 @@ pub fn OpSet(comptime O: type) type {
         fn writeSuccEdge(self: *Self, item: SuccInsert, succ_inc: usize) ParseError!void {
             try self.writeSuccColumns(item, succ_inc);
             if (item.inc == null) {
-                try self.cols.index.visible.splice(self.gpa, item.pos, 1, &.{false});
-                try self.cols.index.text.splice(self.gpa, item.pos, 1, &.{null});
-                try self.cols.index.top.splice(self.gpa, item.pos, 1, &.{false});
+                var s_vis = try self.cols.index.visible.stageSplice(item.pos, 1, &.{false});
+                defer s_vis.deinit();
+                var s_text = try self.cols.index.text.stageSplice(item.pos, 1, &.{null});
+                defer s_text.deinit();
+                var s_top = try self.cols.index.top.stageSplice(item.pos, 1, &.{false});
+                defer s_top.deinit();
+                s_vis.publish(&self.cols.index.visible);
+                s_text.publish(&self.cols.index.text);
+                s_top.publish(&self.cols.index.top);
             }
         }
 
@@ -2064,11 +2622,36 @@ pub fn OpSet(comptime O: type) type {
         /// answer `error.TooLarge` ([`op_iter.SuccIterIter`]). A buffer that is
         /// already wide enough is left alone, so the common case costs one pass
         /// over `succ_count` and no allocation.
+        ///
+        /// **It reads the width out of the columns, so it can only run after
+        /// they are written** — which is why [`OpSet.splice`] calls
+        /// [`OpSet.reserveScratchFor`] first. After that call this cannot
+        /// allocate, so the failure it would otherwise introduce cannot happen.
         fn refitScratch(self: *Self) ParseError!void {
             const want = try opiter.maxSuccCount(O, &self.cols, .{
                 .start = 0,
                 .end = self.cols.len(),
             });
+            if (self.succ_scratch.items.len < want) {
+                try self.succ_scratch.resize(self.gpa, want);
+            }
+        }
+
+        /// The same bound as [`OpSet.refitScratch`], taken from `ops` and
+        /// reserved before their rows are written.
+        ///
+        /// Every value a row arrives with is in `ops` before the columns are
+        /// touched, so the widest incoming row can be found now — it is the
+        /// largest `succCount()` in `ops` — and combined with the widest row
+        /// already there. That is the whole of the buffer's width, so the refit
+        /// that runs after the write finds the buffer wide enough already and
+        /// changes nothing.
+        fn reserveScratchFor(self: *Self, ops: []const O) ParseError!void {
+            var want = try opiter.maxSuccCount(O, &self.cols, .{
+                .start = 0,
+                .end = self.cols.len(),
+            });
+            for (ops) |op| want = @max(want, op.succCount());
             if (self.succ_scratch.items.len < want) {
                 try self.succ_scratch.resize(self.gpa, want);
             }
@@ -2190,6 +2773,19 @@ pub fn OpSet(comptime O: type) type {
 
         /// The row at `pos`, or null past the end (`OpSet::get`,
         /// `op_set.rs:786-788`).
+        ///
+        /// **The row borrows the op set's shared successor buffer.** This is
+        /// [`OpSet.iterRange`] over one row, and that walk materialises each
+        /// row's successors into `succ_scratch`
+        /// (`op_iter.zig:939-940`), so `row.succ()` is a read of the buffer
+        /// until the next walk over **this** op set is advanced. Copy the ids
+        /// out — an [`OpId`] is a value — if a later query is going to run
+        /// before the read. A walk that needs two rows alive at once builds its
+        /// own buffer; the module doc's fourth section is the rule.
+        ///
+        /// Upstream's `OpSet::get` returns the same borrowed row and has the
+        /// same rule (`op_set.rs:786-788`); what it does not have is a second
+        /// spelling for it.
         pub fn get(self: *Self, pos: usize) ReadOpError!?Op {
             var walk = try self.iterRange(.{ .start = pos, .end = pos + 1 });
             return walk.next();
@@ -2500,7 +3096,7 @@ pub fn OpSet(comptime O: type) type {
         /// and re-resolves the index on every use ([`automerge.rs`:744-758](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
         ///
         /// The op set *is* the table ([`OpSet.getActor`](op_set.zig),
-        /// `op_set.rs`:1183-1185`), so the bytes are one bounds-checked read
+        /// `op_set.rs`:1179-1181), so the bytes are one bounds-checked read
         /// away and there is nothing to look up beyond it — which is why
         /// [`Document.idToExid`](../doc.zig) is now this same answer, and why
         /// the port's own "identity is the [`OpId`] alone, in both shapes"
@@ -2514,7 +3110,7 @@ pub fn OpSet(comptime O: type) type {
         /// [`OpSet.splice`] would have rejected.
         pub fn idToExid(self: *const Self, id: OpId) ExId {
             if (id.eql(OpId.root)) return .root;
-            const who = self.getActorSafe(id.actor) orelse return .{ .id = id };
+            const who = self.getActor(id.actor) orelse return .{ .id = id };
             return ExId.withActor(id, who);
         }
 
@@ -4604,21 +5200,46 @@ fn visibleAfter(over: ClockRange, id: OpId) bool {
 
 // ── Checkpoint helpers ─────────────────────────────────────────────────────
 
-/// Records one column's bytes under `name`.
+/// Records one column's bytes under `name`, and frees them again if the table
+/// cannot hold the name.
 fn putCheckpoint(gpa: Allocator, name: []const u8, bytes: []u8, out: *Checkpoint) ParseError!void {
     errdefer gpa.free(bytes);
-    try out.put(gpa, name, bytes);
+    try out.map.put(gpa, name, bytes);
 }
 
-/// Frees every column's bytes in a checkpoint and the table itself.
-fn freeCheckpoint(gpa: Allocator, cp: *Checkpoint) void {
-    // `iterator()` is a by-value cursor over the entries, so the bytes are
-    // read through `value_ptr` rather than a dedicated value cursor
-    // (`std/array_hash_map.zig:265`).
-    var it = cp.iterator();
-    while (it.next()) |entry| gpa.free(entry.value_ptr.*);
-    cp.deinit(gpa);
-    cp.* = .empty;
+/// That `actor` may be written into `table` at `idx` without unsorting it.
+///
+/// The sortedness of the actor table is what [`OpSet.lookupActor`] binary
+/// searches and what every actor index in the columns means
+/// (`types.zig:108-110`), and it is established by where the caller writes
+/// rather than by anything here — so the writer states it. This is a debug
+/// assertion on a **programmer precondition**: the index comes from
+/// [`BatchApply.actorSlot`](batch.zig) or from a caller that holds a lower
+/// bound, never from bytes a document supplied, and it is the same obligation
+/// upstream has with nothing checking it (`op_set.rs:1400-1405`).
+///
+/// **It checks the two neighbours, not the whole table.** An insertion that
+/// sorts between its neighbours sorts everywhere, and the cost is two
+/// comparisons instead of a pass over every actor a document may hold.
+fn assertSortedSlot(table: []const ActorId, idx: usize, actor: ActorId) void {
+    if (idx != 0) std.debug.assert(ActorId.order(table[idx - 1], actor) != .gt);
+    if (idx != table.len) std.debug.assert(ActorId.order(table[idx], actor) != .lt);
+}
+
+/// How many of `ops` make an object, which is how many entries
+/// [`OpSet.spliceObjects`] can add and therefore how much room
+/// [`ObjIndex.reserve`] has to find first.
+///
+/// Only an op that *makes* something has an entry (`op_set.rs:232-238`), so
+/// this is the count of ops whose [`objInfo`] is not null. A `set` op names
+/// nothing and is not counted, so the reservation is never larger than the
+/// writes it covers.
+fn objectMakingCount(comptime O: type, ops: []const O) usize {
+    var n: usize = 0;
+    for (ops) |op| {
+        if (op.objInfo() != null) n += 1;
+    }
+    return n;
 }
 
 /// Two mark values compared the way the fold compares them: the tag, and then
@@ -4968,7 +5589,9 @@ const Table = struct {
             if (std.mem.eql(u8, item, text)) return std.math.cast(u32, i) orelse error.Overflow;
         }
         const id = std.math.cast(u32, self.items.items.len) orelse error.Overflow;
-        try self.items.append(gpa, try gpa.dupe(u8, text));
+        const owned = try gpa.dupe(u8, text);
+        errdefer gpa.free(owned);
+        try self.items.append(gpa, owned);
         return id;
     }
 };
@@ -6508,9 +7131,9 @@ test "a difference in slab layout is not a difference in the document" {
     // reachable — the same rows written two different ways.
     {
         var a = try batched.saveCheckpoint(gpa);
-        defer freeCheckpointOf(gpa, &a);
+        defer a.deinit(gpa);
         var b = try one_at_a_time.saveCheckpoint(gpa);
-        defer freeCheckpointOf(gpa, &b);
+        defer b.deinit(gpa);
         var differing: usize = 0;
         for (checkpoint_column_names) |name| {
             if (!std.mem.eql(u8, a.get(name).?, b.get(name).?)) differing += 1;
@@ -6559,10 +7182,6 @@ fn counterSet(gpa: Allocator, table: *Table) !struct { set: Set, before: Checkpo
     return .{ .set = set, .before = try set.saveCheckpoint(gpa) };
 }
 
-fn freeCheckpointOf(gpa: Allocator, cp: *Checkpoint) void {
-    freeCheckpoint(gpa, cp);
-}
-
 test "addSuccWithUndo handles a delete, an increment, a re-expose and a no-op, and undo restores the columns" {
     const gpa = testing.allocator;
 
@@ -6574,7 +7193,7 @@ test "addSuccWithUndo handles a delete, an increment, a re-expose and a no-op, a
         defer table.deinit();
         var built = try counterSet(gpa, &table);
         defer built.set.deinit();
-        defer freeCheckpointOf(gpa, &built.before);
+        defer built.before.deinit(gpa);
 
         try testing.expectEqual(true, (try built.set.cols.index.visible.get(0)).?);
         try testing.expectEqual(true, (try built.set.cols.index.top.get(0)).?);
@@ -6587,8 +7206,10 @@ test "addSuccWithUndo handles a delete, an increment, a re-expose and a no-op, a
             .len = 0,
             .sub_pos = 0,
         }};
-        const undo = try built.set.addSuccWithUndo(&edges);
-        defer gpa.free(undo);
+        var journal: std.ArrayList(SuccUndo) = .empty;
+        defer journal.deinit(gpa);
+        try built.set.addSuccWithUndo(&edges, &journal);
+        const undo = journal.items;
 
         // The undo records the three values it is about to overwrite, which is
         // the whole of the case: read them *before* the writes, as
@@ -6605,7 +7226,7 @@ test "addSuccWithUndo handles a delete, an increment, a re-expose and a no-op, a
 
         try built.set.undoSucc(undo);
         var after = try built.set.saveCheckpoint(gpa);
-        defer freeCheckpointOf(gpa, &after);
+        defer after.deinit(gpa);
         try sameCheckpoint(built.before, after);
     }
 
@@ -6617,7 +7238,7 @@ test "addSuccWithUndo handles a delete, an increment, a re-expose and a no-op, a
         defer table.deinit();
         var built = try counterSet(gpa, &table);
         defer built.set.deinit();
-        defer freeCheckpointOf(gpa, &built.before);
+        defer built.before.deinit(gpa);
 
         const edges = [_]opmod.SuccInsert{.{
             .id = opId(3, 0),
@@ -6626,8 +7247,10 @@ test "addSuccWithUndo handles a delete, an increment, a re-expose and a no-op, a
             .len = 0,
             .sub_pos = 0,
         }};
-        const undo = try built.set.addSuccWithUndo(&edges);
-        defer gpa.free(undo);
+        var journal: std.ArrayList(SuccUndo) = .empty;
+        defer journal.deinit(gpa);
+        try built.set.addSuccWithUndo(&edges, &journal);
+        const undo = journal.items;
 
         try testing.expectEqual(@as(usize, 1), undo.len);
         try testing.expectEqual(@as(?bool, null), undo[0].visible);
@@ -6640,7 +7263,7 @@ test "addSuccWithUndo handles a delete, an increment, a re-expose and a no-op, a
 
         try built.set.undoSucc(undo);
         var after = try built.set.saveCheckpoint(gpa);
-        defer freeCheckpointOf(gpa, &after);
+        defer after.deinit(gpa);
         try sameCheckpoint(built.before, after);
     }
 
@@ -6654,7 +7277,7 @@ test "addSuccWithUndo handles a delete, an increment, a re-expose and a no-op, a
         defer table.deinit();
         var built = try counterSet(gpa, &table);
         defer built.set.deinit();
-        defer freeCheckpointOf(gpa, &built.before);
+        defer built.before.deinit(gpa);
 
         const edges = [_]opmod.SuccInsert{
             // index 0: the increment, at the front of the flattened pair.
@@ -6662,8 +7285,10 @@ test "addSuccWithUndo handles a delete, an increment, a re-expose and a no-op, a
             // index 1: the delete, which the backwards pass meets first.
             .{ .id = opId(4, 0), .pos = 0, .inc = null, .len = 0, .sub_pos = 0 },
         };
-        const undo = try built.set.addSuccWithUndo(&edges);
-        defer gpa.free(undo);
+        var journal: std.ArrayList(SuccUndo) = .empty;
+        defer journal.deinit(gpa);
+        try built.set.addSuccWithUndo(&edges, &journal);
+        const undo = journal.items;
 
         try testing.expectEqual(@as(usize, 2), undo.len);
         // The undo list comes out in the pass's own order, which is backwards
@@ -6691,7 +7316,7 @@ test "addSuccWithUndo handles a delete, an increment, a re-expose and a no-op, a
 
         try built.set.undoSucc(undo);
         var after = try built.set.saveCheckpoint(gpa);
-        defer freeCheckpointOf(gpa, &after);
+        defer after.deinit(gpa);
         try sameCheckpoint(built.before, after);
     }
 
@@ -6703,14 +7328,16 @@ test "addSuccWithUndo handles a delete, an increment, a re-expose and a no-op, a
         defer table.deinit();
         var built = try counterSet(gpa, &table);
         defer built.set.deinit();
-        defer freeCheckpointOf(gpa, &built.before);
+        defer built.before.deinit(gpa);
 
         const edges = [_]opmod.SuccInsert{
             .{ .id = opId(4, 0), .pos = 0, .inc = 1, .len = 0, .sub_pos = 0 },
             .{ .id = opId(3, 0), .pos = 0, .inc = 2, .len = 0, .sub_pos = 0 },
         };
-        const undo = try built.set.addSuccWithUndo(&edges);
-        defer gpa.free(undo);
+        var journal: std.ArrayList(SuccUndo) = .empty;
+        defer journal.deinit(gpa);
+        try built.set.addSuccWithUndo(&edges, &journal);
+        const undo = journal.items;
 
         try testing.expectEqual(@as(usize, 2), undo.len);
         for (undo) |entry| {
@@ -6730,9 +7357,161 @@ test "addSuccWithUndo handles a delete, an increment, a re-expose and a no-op, a
 
         try built.set.undoSucc(undo);
         var after = try built.set.saveCheckpoint(gpa);
-        defer freeCheckpointOf(gpa, &after);
+        defer after.deinit(gpa);
         try sameCheckpoint(built.before, after);
     }
+}
+
+test "successor journals retain every published edge under allocation refusal" {
+    const edges = [_]opmod.SuccInsert{
+        .{ .id = opId(3, 0), .pos = 0, .inc = 7, .len = 0, .sub_pos = 0 },
+        .{ .id = opId(4, 0), .pos = 0, .inc = null, .len = 0, .sub_pos = 0 },
+    };
+    // Measure this fixture's successful allocation path instead of truncating
+    // the refusal sweep before the staged columns have finished publishing.
+    const allocation_count = blk: {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
+        const gpa = failing.allocator();
+        var table = Table.init(gpa);
+        defer table.deinit();
+        var built = try counterSet(gpa, &table);
+        defer built.set.deinit();
+        defer built.before.deinit(gpa);
+        var journal: std.ArrayList(SuccUndo) = .empty;
+        defer journal.deinit(gpa);
+        const before = failing.alloc_index;
+        try built.set.addSuccWithUndo(&edges, &journal);
+        break :blk failing.alloc_index - before;
+    };
+    var reached_success = false;
+    var retained_prefix = false;
+    for (0..allocation_count + 1) |offset| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
+        const gpa = failing.allocator();
+        var table = Table.init(gpa);
+        defer table.deinit();
+        var built = try counterSet(gpa, &table);
+        defer built.set.deinit();
+        defer built.before.deinit(gpa);
+        var journal: std.ArrayList(SuccUndo) = .empty;
+        defer journal.deinit(gpa);
+
+        failing.fail_index = failing.alloc_index + offset;
+        const result = built.set.addSuccWithUndo(&edges, &journal);
+        failing.fail_index = std.math.maxInt(usize);
+        const succeeded = if (result) |_| true else |failure| blk: {
+            try testing.expectEqual(error.OutOfMemory, failure);
+            retained_prefix = retained_prefix or journal.items.len != 0;
+            break :blk false;
+        };
+        try built.set.undoSucc(journal.items);
+        var restored = try built.set.saveCheckpoint(gpa);
+        defer restored.deinit(gpa);
+        try sameCheckpoint(built.before, restored);
+        if (succeeded) {
+            reached_success = true;
+            break;
+        }
+    }
+    try testing.expect(retained_prefix);
+    try testing.expect(reached_success);
+}
+
+/// A delete of both visible predecessors in a conflicted list register. Each
+/// predecessor starts without successors, so both edges record `sub_pos == 0`
+/// and carry the same successor id, as a local delete does.
+fn successorReplayFixture(gpa: Allocator, table: *Table) !struct {
+    set: Set,
+    before: Checkpoint,
+    journal: std.ArrayList(SuccUndo),
+} {
+    var set = try Set.fromActors(gpa, &two_actors, encoding, table.asTable());
+    errdefer set.deinit();
+    const rows = conflictRows();
+    _ = try set.splice(0, &rows);
+    try testing.expect(try set.validateOpOrder());
+    try testing.expectEqual(@as(?TopIndexFault, null), try set.validateTopIndex());
+    var before = try set.saveCheckpoint(gpa);
+    errdefer before.deinit(gpa);
+    const successor = opId(4, 0);
+    const edges = [_]SuccInsert{
+        try edgeOnto(&set, 1, successor),
+        try edgeOnto(&set, 2, successor),
+    };
+    var journal: std.ArrayList(SuccUndo) = .empty;
+    errdefer journal.deinit(gpa);
+    try set.addSuccWithUndo(&edges, &journal);
+    return .{ .set = set, .before = before, .journal = journal };
+}
+
+test "successor undo retries preserve row ownership when predecessors share one successor id" {
+    // Calibrate the successful undo, then rebuild the real column fixture for
+    // every allocation refusal. At least one refusal must land after the first
+    // predecessor is restored but before the second edge can publish its undo.
+    const allocation_count = blk: {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
+        const gpa = failing.allocator();
+        var table = Table.init(gpa);
+        defer table.deinit();
+        var built = try successorReplayFixture(gpa, &table);
+        defer built.set.deinit();
+        defer built.before.deinit(gpa);
+        defer built.journal.deinit(gpa);
+        const before = failing.alloc_index;
+        try built.set.undoSucc(built.journal.items);
+        break :blk failing.alloc_index - before;
+    };
+    var refused_between_edges = false;
+    var reached_success = false;
+    for (0..allocation_count + 1) |offset| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
+        const gpa = failing.allocator();
+        var table = Table.init(gpa);
+        defer table.deinit();
+        var built = try successorReplayFixture(gpa, &table);
+        defer built.set.deinit();
+        defer built.before.deinit(gpa);
+        defer built.journal.deinit(gpa);
+        try testing.expectEqual(@as(usize, 2), built.journal.items.len);
+        for (built.journal.items) |entry| {
+            try testing.expectEqual(opId(4, 0), entry.succ.id);
+            try testing.expectEqual(@as(u64, 0), entry.succ.len);
+            try testing.expectEqual(@as(usize, 0), entry.succ.sub_pos);
+        }
+
+        failing.fail_index = failing.alloc_index + offset;
+        const result = built.set.undoSucc(built.journal.items);
+        failing.fail_index = std.math.maxInt(usize);
+        try expectColumnsAgree(&built.set);
+        if (result) |_| {
+            reached_success = true;
+        } else |failure| {
+            try testing.expectEqual(error.OutOfMemory, failure);
+            const first_count = (try built.set.cols.succ_count.get(1)).?;
+            const second_count = (try built.set.cols.succ_count.get(2)).?;
+            if (first_count == 0 and second_count == 1) {
+                refused_between_edges = true;
+                try testing.expectEqual(true, (try built.set.cols.index.visible.get(1)).?);
+                try testing.expectEqual(false, (try built.set.cols.index.top.get(1)).?);
+                try testing.expectEqual(@as(?u32, null), (try built.set.cols.index.text.get(1)).?);
+                try testing.expectEqual(false, (try built.set.cols.index.visible.get(2)).?);
+                try testing.expectEqual(false, (try built.set.cols.index.top.get(2)).?);
+                try testing.expectEqual(@as(?u32, null), (try built.set.cols.index.text.get(2)).?);
+            }
+        }
+        // Retry the caller-owned journal whole, including entries whose edge
+        // has already gone. A matching global slot is not proof of row ownership.
+        try built.set.undoSucc(built.journal.items);
+        try expectColumnsAgree(&built.set);
+        var restored = try built.set.saveCheckpoint(gpa);
+        defer restored.deinit(gpa);
+        try sameCheckpoint(built.before, restored);
+        try testing.expect(try built.set.validateOpOrder());
+        try testing.expectEqual(@as(?TopIndexFault, null), try built.set.validateTopIndex());
+        if (reached_success) break;
+    }
+    try testing.expect(refused_between_edges);
+    try testing.expect(reached_success);
 }
 
 test "addSucc places an edge and takes it away with the same round trip" {
@@ -6746,7 +7525,7 @@ test "addSucc places an edge and takes it away with the same round trip" {
     defer table.deinit();
     var built = try counterSet(gpa, &table);
     defer built.set.deinit();
-    defer freeCheckpointOf(gpa, &built.before);
+    defer built.before.deinit(gpa);
 
     const edges = [_]opmod.SuccInsert{
         .{ .id = opId(3, 0), .pos = 0, .inc = 5, .len = 0, .sub_pos = 0 },
@@ -6756,13 +7535,17 @@ test "addSucc places an edge and takes it away with the same round trip" {
     try testing.expectEqual(@as(u32, 2), (try built.set.cols.succ_count.get(0)).?);
     try testing.expectEqual(false, (try built.set.cols.index.visible.get(0)).?);
 
+    // Match addSuccWithUndo's per-edge preceding count, not the pass's original
+    // count: the increment was published after the delete and is undone first.
+    var increment_undo = edges[0];
+    increment_undo.len = 1;
     const undo = [_]opmod.SuccUndo{
         .{ .succ = edges[1], .visible = true, .text = 1, .top = true },
-        .{ .succ = edges[0], .visible = null, .text = null, .top = false },
+        .{ .succ = increment_undo, .visible = null, .text = null, .top = false },
     };
     try built.set.undoSucc(&undo);
     var after = try built.set.saveCheckpoint(gpa);
-    defer freeCheckpointOf(gpa, &after);
+    defer after.deinit(gpa);
     try sameCheckpoint(built.before, after);
 }
 
@@ -7095,8 +7878,10 @@ test "every entry point answers on an op set with no rows" {
     try testing.expectEqual(@as(usize, 0), try set.splice(0, &.{}));
     try set.spliceObjects(&.{});
     try set.addSucc(&.{});
-    const undo = try set.addSuccWithUndo(&.{});
-    defer gpa.free(undo);
+    var journal: std.ArrayList(SuccUndo) = .empty;
+    defer journal.deinit(gpa);
+    try set.addSuccWithUndo(&.{}, &journal);
+    const undo = journal.items;
     try testing.expectEqual(@as(usize, 0), undo.len);
     try set.undoSucc(undo);
     try set.resetTop(.{ .start = 0, .end = 0 });
@@ -7655,7 +8440,7 @@ test "interning an actor renumbers the objects the index already holds" {
     try testing.expectEqual(@as(usize, 1), doc.set.obj_info.count());
     try testing.expectEqual(@as(?ObjType, .list), doc.set.objectType(made(1, 0)));
 
-    // An actor interned **in the middle** of the table
+    // An actor interned **at the start** of the table
     // ([`OpSet.insertActor`], `op_set.rs:1400-1405`) renumbers every actor
     // index at or above it, so the object the rows made moves with them — and
     // the index has to move the entry's key *and* the parent in its value
@@ -7663,7 +8448,7 @@ test "interning an actor renumbers the objects the index already holds" {
     // `ObjIndex(… .map(|(id, make)| (id.with_new_actor(idx), make.with_new_actor(idx)))`).
     // A key moved and a parent left behind would make the walk ask about the
     // object under an id nothing answers.
-    try doc.set.insertActor(0, .{ .bytes = "aaab" });
+    try doc.set.insertActor(0, .{ .bytes = "0000" });
 
     try testing.expectEqual(@as(usize, 2), doc.set.actorCount());
     try testing.expectEqual(@as(usize, 1), doc.set.obj_info.count());
@@ -7713,6 +8498,527 @@ test "removing an actor renumbers the objects that survive it and forgets the id
     try testing.expectEqual(@as(?ObjId, .root), doc.set.objectParent(made(1, 0)));
     try testing.expect((try doc.set.get(1)).?.objId().eql(made(1, 0)));
     try testing.expectEqual(@as(usize, 2), doc.set.len());
+}
+
+// ── Refused mutations ───────────────────────────────────────────────────────
+
+/// Everything a reader can see about an op set's actor table, taken so a
+/// refused interning or removal can be asked whether it changed anything.
+///
+/// **The columns are compared through a checkpoint** — twenty encodings, byte
+/// for byte — because that is the comparison a consumer makes and because the
+/// four actor columns are the ones a renumbering moves. **The actor table is
+/// compared as a list and through [`OpSet.lookupActor`]**, because a table
+/// whose contents are right and whose order is wrong answers a binary search
+/// with a miss (`op_set.rs:1187-1189`), and the list alone would not see it.
+/// The object table's size stands in for its contents: every entry is keyed by
+/// an op id, and a renumbering that moved every key is what the count cannot
+/// see — so the object reads below are what closes that.
+const ActorSnapshot = struct {
+    columns: Checkpoint,
+    actors: []ActorId,
+    objects: usize,
+    marks: MarkSnapshot,
+
+    fn take(gpa: Allocator, set: *const Set) !ActorSnapshot {
+        var columns = try set.saveCheckpoint(gpa);
+        errdefer columns.deinit(gpa);
+        const actors = try gpa.dupe(ActorId, set.actors.items);
+        errdefer gpa.free(actors);
+        const marks = try MarkSnapshot.take(gpa, &set.cols.index.mark, set.actors.items.len);
+        return .{ .columns = columns, .actors = actors, .objects = set.obj_info.count(), .marks = marks };
+    }
+
+    fn deinit(self: ActorSnapshot, gpa: Allocator) void {
+        // **Through a local copy**: a by-value parameter is a `const` binding and
+        // [`Checkpoint.deinit`] takes `*Self` because it poisons its receiver.
+        var cols = self.columns;
+        cols.deinit(gpa);
+        gpa.free(self.actors);
+        self.marks.deinit(gpa);
+    }
+
+    fn expectSame(self: ActorSnapshot, gpa: Allocator, set: *const Set) !void {
+        var now = try set.saveCheckpoint(gpa);
+        defer now.deinit(gpa);
+        try sameCheckpoint(self.columns, now);
+        try testing.expectEqual(self.actors.len, set.actors.items.len);
+        for (self.actors, 0..) |a, i| {
+            try testing.expect(a.eql(set.actors.items[i]));
+            try testing.expectEqual(i, set.lookupActor(a) orelse std.math.maxInt(usize));
+        }
+        try testing.expectEqual(self.objects, set.obj_info.count());
+        // The mark index is **not** part of the checkpoint and not part of the
+        // object table, so it is compared on its own. It is two stores, and both
+        // of them hold an actor index, so both are read.
+        try self.marks.expectSame(gpa, &set.cols.index.mark, set.actors.items.len);
+    }
+};
+
+/// The mark index as a reader sees it: every row decoded, and the `MarkData`
+/// behind every begin those rows open.
+///
+/// **Both stores, because they are two.** The rows hold a `MarkIdx` whose
+/// actor half is an actor index (`mark_index.rs:25-34`) and the cache is keyed
+/// by the begin's `OpId` (`mark_index.rs:216`), and the bad state this exists
+/// to catch is one that moved and the other that did not — which no
+/// comparison of one of them can see, and which makes
+/// [`MarkIndexColumn.markData`](mark_index.zig) answer null for every mark in
+/// the document.
+///
+/// The fingerprint is complete because [`take`](MarkSnapshot.take) and
+/// [`expectSame`](MarkSnapshot.expectSame) both run
+/// [`expectConsistent`] first: every `Start` row has an entry in the cache, the
+/// cache holds nothing else, and **no row and no key names an actor index the
+/// actor table does not have**.
+const MarkSnapshot = struct {
+    /// One entry per row, in row order: the decoded word, and the name the
+    /// cache holds for it when it opens a mark.
+    rows: []Entry,
+
+    const Entry = struct {
+        mark: ?markidx.MarkIdx,
+        name: ?[]const u8,
+    };
+
+    fn take(gpa: Allocator, col: *const markidx.MarkIndexColumn, actors: usize) !MarkSnapshot {
+        try expectConsistent(col, gpa, actors);
+        var out: std.ArrayList(Entry) = .empty;
+        errdefer out.deinit(gpa);
+        var it = try col.iter();
+        for (0..col.data.len()) |_| {
+            const m = try it.next();
+            const name: ?[]const u8 = if (m) |mark| switch (mark) {
+                .start => |begin| (col.markData(begin) orelse return error.InvalidValue).name,
+                .end => null,
+            } else null;
+            try out.append(gpa, .{ .mark = m, .name = name });
+        }
+        return .{ .rows = try out.toOwnedSlice(gpa) };
+    }
+
+    fn deinit(self: MarkSnapshot, gpa: Allocator) void {
+        gpa.free(self.rows);
+    }
+
+    fn expectSame(
+        self: MarkSnapshot,
+        gpa: Allocator,
+        col: *const markidx.MarkIndexColumn,
+        actors: usize,
+    ) !void {
+        const now = try take(gpa, col, actors);
+        defer now.deinit(gpa);
+        try testing.expectEqual(self.rows.len, now.rows.len);
+        for (self.rows, now.rows) |was, is_now| {
+            try testing.expectEqual(was.mark, is_now.mark);
+            try testing.expectEqualStrings(was.name orelse "", is_now.name orelse "");
+        }
+    }
+};
+
+/// That the mark index's two stores agree, and that both name actors the table
+/// has — the facts that make a refusal on either side of an actor renumbering
+/// visible.
+///
+/// **The bounds are the point of a removal sweep.** An actor index the table
+/// does not have is not an interior inconsistency a reader can find its way out
+/// of: [`MarkIndexColumn.markData`](mark_index.zig) answers null for every mark
+/// of that actor and `richTextAt` yields nothing, with no error anywhere to say
+/// so. So it is asked here rather than assumed — the mark index is the one
+/// store an actor renumbering can leave naming an actor nothing else does.
+///
+/// **`End` rows are counted through their begin, not separately.** An `End`
+/// names the *begin's* id (`mark_index.rs:12-16`, `:54-58`), so `markData` on
+/// one answers the begin's entry and is not a second entry in the cache.
+fn expectConsistent(col: *const markidx.MarkIndexColumn, gpa: Allocator, actors: usize) !void {
+    var begins: std.ArrayList(OpId) = .empty;
+    defer begins.deinit(gpa);
+    var it = try col.iter();
+    while (try it.nextRun()) |run| {
+        const m = run.value orelse continue;
+        try testing.expect(m.actorIndex() < actors);
+        switch (m) {
+            .start => |begin| {
+                try testing.expect(begin.actor < actors);
+                var seen = false;
+                for (begins.items) |known| {
+                    if (known.eql(begin)) seen = true;
+                }
+                if (!seen) try begins.append(gpa, begin);
+                try testing.expect(col.markData(begin) != null);
+            },
+            .end => |begin| try testing.expect(begin.actor < actors),
+        }
+    }
+    try testing.expectEqual(begins.items.len, col.cache.count());
+}
+
+/// Runs `mutate` with each of its own allocations refused in turn, checks the
+/// op set after every refusal, and leaves the last attempt — the one that
+/// allocates the whole way through — applied.
+///
+/// **The check runs with nothing refused**, because a check refused by the very
+/// failure it reports on would report nothing. This is the sweep
+/// `change_graph.zig:3717-3753` writes for the graph, with the op set in place
+/// of the graph: an actor mutation is safe to re-run after a refusal precisely
+/// because it changes nothing when it is refused.
+fn sweepActorRefusals(
+    failing: *testing.FailingAllocator,
+    set: *Set,
+    before: ActorSnapshot,
+    mutate: anytype,
+    gpa: Allocator,
+) !void {
+    // Checks also allocate. Arm relative to each attempt, then disarm before
+    // checking residue so the observation cannot consume the injected fault.
+    var skip: usize = 0;
+    while (true) {
+        failing.fail_index = failing.alloc_index + skip;
+        const outcome = @call(.auto, mutate, .{set});
+        failing.fail_index = std.math.maxInt(usize);
+        if (outcome) |_| break else |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            try before.expectSame(gpa, set);
+            skip += 1;
+            // A mutation that is never allowed through is a test that never
+            // ends. The widest actor rewrite here makes a few dozen
+            // allocations, so this bound is far above it.
+            if (skip > 512) return error.Fail;
+        }
+    }
+    // A mutation that allocated nothing could not have been refused, and the
+    // sweep would have proved nothing.
+    try testing.expect(skip > 0);
+}
+
+/// The fixture the two actor sweeps share: two actors and one object, with
+/// every row written by the **second** actor.
+///
+/// **The rows name actor `1` and not actor `0`**, which is what makes
+/// [`OpSet.removeActor`] legal here: the columns refuse to drop an actor they
+/// still name (`columns.rs:355-357`), so a fixture whose rows name both actors
+/// could only be interned into and never have one taken away.
+fn twoActorRows() [2]TestRow {
+    return .{
+        rowAt(opId(1, 1), .root, .{ .map = "list" }, false, .make_list, .null_value, null, &.{}, true, true),
+        rowAt(opId(2, 1), made(1, 1), .{ .seq = head }, true, .set, .{ .str = "a" }, null, &.{}, true, true),
+    };
+}
+
+fn internAnActor(set: *Set) ParseError!void {
+    // "0000" sorts before the fixture's "aaaa", so index zero is the slot a
+    // lower bound gives it — and the rewrite it forces is the one that renumbers
+    // both the columns and the object table.
+    try set.insertActor(0, .{ .bytes = "0000" });
+}
+
+fn removeAnActor(set: *Set) ParseError!void {
+    try set.removeActor(0);
+}
+
+test "a refused actor interning leaves the columns, the actor table and the object table as they were" {
+    // **The claim is about the failure path, and the fixture is built to make
+    // the failure path reachable.** `insertActor` reserves the actor table's
+    // capacity, renumbers the four actor columns, the mark index and the object
+    // table, and only then writes the actor in
+    // ([`OpSet.insertActor`](op_set.zig)); an `error.OutOfMemory` anywhere in
+    // that sequence used to leave the columns renumbered against a table that
+    // never grew, so every actor index in `[idx, len)` named the actor one slot
+    // lower and the last one named past the end.
+    const gpa = testing.allocator;
+    var failing: testing.FailingAllocator = .init(gpa, .{ .resize_fail_index = 0 });
+    const agpa = failing.allocator();
+    var doc = try TwoActors(agpa);
+    defer doc.destroy();
+    _ = try doc.set.splice(0, &twoActorRows());
+    try testing.expectEqual(@as(?ObjType, .list), doc.set.objectType(made(1, 1)));
+
+    const before = try ActorSnapshot.take(agpa, &doc.set);
+    defer before.deinit(agpa);
+    try sweepActorRefusals(&failing, &doc.set, before, internAnActor, agpa);
+
+    // The attempt that was allowed through did the whole renumbering: the
+    // interned actor took slot zero, the fixture's two actors moved up, and the
+    // object the rows made moved with them — key and parent, which is the half
+    // a stale object table gets wrong.
+    try testing.expectEqual(@as(usize, 3), doc.set.actorCount());
+    try testing.expect(doc.set.getActor(0).?.eql(.{ .bytes = "0000" }));
+    try testing.expectEqual(@as(usize, 0), doc.set.lookupActor(.{ .bytes = "0000" }).?);
+    try testing.expectEqual(@as(usize, 1), doc.set.lookupActor(actor0).?);
+    try testing.expectEqual(@as(usize, 2), doc.set.lookupActor(actor1).?);
+    try testing.expectEqual(@as(usize, 1), doc.set.obj_info.count());
+    try testing.expectEqual(@as(?ObjType, .list), doc.set.objectType(made(1, 2)));
+    try testing.expectEqual(@as(?ObjId, .root), doc.set.objectParent(made(1, 2)));
+    // And the row that hangs in it moved with it, so the index and the rows
+    // still agree about which object the element belongs to.
+    try testing.expect((try doc.set.get(1)).?.objId().eql(made(1, 2)));
+}
+
+test "a refused actor removal changes nothing either" {
+    const gpa = testing.allocator;
+    var failing: testing.FailingAllocator = .init(gpa, .{ .resize_fail_index = 0 });
+    const agpa = failing.allocator();
+    var doc = try TwoActors(agpa);
+    defer doc.destroy();
+    _ = try doc.set.splice(0, &twoActorRows());
+
+    const before = try ActorSnapshot.take(agpa, &doc.set);
+    defer before.deinit(agpa);
+    try sweepActorRefusals(&failing, &doc.set, before, removeAnActor, agpa);
+
+    try testing.expectEqual(@as(usize, 1), doc.set.actorCount());
+    try testing.expect(doc.set.getActor(0).?.eql(actor1));
+    try testing.expectEqual(@as(usize, 0), doc.set.lookupActor(actor1).?);
+    try testing.expect(doc.set.lookupActor(actor0) == null);
+    try testing.expectEqual(@as(usize, 1), doc.set.obj_info.count());
+    try testing.expectEqual(@as(?ObjType, .list), doc.set.objectType(made(1, 0)));
+    try testing.expect((try doc.set.get(1)).?.objId().eql(made(1, 0)));
+}
+
+/// Two actors, one text object, and one bold mark over its first element,
+/// with **every row written by the second actor**.
+///
+/// **The mark is the whole point of this fixture.** [`twoActorRows`] has none,
+/// so the mark index is empty under both sweeps above and every mark
+/// invariant is vacuously true there — which is how an op set could publish
+/// its mark index against columns that had not moved and both sweeps still
+/// pass. A mark row's `MarkIdx` and its cache's `OpId` are the two stores a
+/// renumbering has to move together, so the fixture has to have both.
+///
+/// Every row names actor `1` and none names actor `0`, which is what makes
+/// [`OpSet.removeActor`] legal here for the reason [`twoActorRows`]'s doc gives.
+fn markedRows() [4]TestRow {
+    const txt = made(1, 1);
+    return .{
+        rowAt(opId(1, 1), .root, .{ .map = "text" }, false, .make_text, .null_value, null, &.{}, true, true),
+        markBegin(opId(16, 1), txt, head, "bold", .{ .bool_value = true }),
+        rowAt(opId(5, 1), txt, .{ .seq = head }, true, .set, .{ .str = "ab" }, null, &.{}, true, true),
+        markEnd(opId(17, 1), txt, anchor(opId(5, 1))),
+    };
+}
+
+test "a refused actor insertion preserves populated mark rows and their cache" {
+    const gpa = testing.allocator;
+    var failing: testing.FailingAllocator = .init(gpa, .{ .resize_fail_index = 0 });
+    const agpa = failing.allocator();
+    var doc = try TwoActors(agpa);
+    defer doc.destroy();
+    _ = try doc.set.splice(0, &markedRows());
+    try testing.expect(doc.set.cols.index.mark.hasAnyMarks());
+
+    const before = try ActorSnapshot.take(agpa, &doc.set);
+    defer before.deinit(agpa);
+    try sweepActorRefusals(&failing, &doc.set, before, internAnActor, agpa);
+
+    // The other half of the claim: the attempt that was allowed through moved
+    // **both** mark stores with the columns, so a mark is still answerable.
+    try testing.expectEqual(@as(usize, 3), doc.set.actorCount());
+    try expectConsistent(&doc.set.cols.index.mark, agpa, 3);
+    const begin = opId(16, 1);
+    try testing.expect(doc.set.cols.index.mark.markData(begin.withNewActor(0)) != null);
+    try testing.expectEqualStrings(
+        "bold",
+        (doc.set.cols.index.mark.markData(begin.withNewActor(0)) orelse return error.InvalidValue).name,
+    );
+    try testing.expect(doc.set.cols.index.mark.markData(begin) == null);
+    // And the row says so too, which is the half a rows-only remap gets wrong.
+    var it = try doc.set.cols.index.mark.iter();
+    var opens: usize = 0;
+    while (try it.nextRun()) |run| {
+        const m = run.value orelse continue;
+        switch (m) {
+            .start => |id| {
+                opens += 1;
+                try testing.expect(id.eql(begin.withNewActor(0)));
+            },
+            .end => |id| try testing.expect(id.eql(begin.withNewActor(0))),
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), opens);
+}
+
+test "a refused actor removal preserves populated mark rows and their cache" {
+    const gpa = testing.allocator;
+    var failing: testing.FailingAllocator = .init(gpa, .{ .resize_fail_index = 0 });
+    const agpa = failing.allocator();
+    var doc = try TwoActors(agpa);
+    defer doc.destroy();
+    _ = try doc.set.splice(0, &markedRows());
+    try testing.expect(doc.set.cols.index.mark.hasAnyMarks());
+
+    const before = try ActorSnapshot.take(agpa, &doc.set);
+    defer before.deinit(agpa);
+    try sweepActorRefusals(&failing, &doc.set, before, removeAnActor, agpa);
+
+    // And the removal that lands renumbers the mark index too, which upstream's
+    // `remove_actor` (`op_set.rs:1419-1429`) does not: the mark's actor came
+    // down from `1` to `0` with everything else.
+    try testing.expectEqual(@as(usize, 1), doc.set.actorCount());
+    try expectConsistent(&doc.set.cols.index.mark, agpa, 1);
+    const begin = opId(16, 1);
+    try testing.expect(doc.set.cols.index.mark.markData(opId(16, 0)) != null);
+    try testing.expect(doc.set.cols.index.mark.markData(begin) == null);
+    // The object the rows made moved with the actor, and the row that hangs in
+    // it still hangs in it.
+    try testing.expectEqual(@as(?ObjType, .text), doc.set.objectType(made(1, 0)));
+    try testing.expectEqual(@as(?ObjId, .root), doc.set.objectParent(made(1, 0)));
+    try testing.expectEqual(@as(usize, 4), doc.set.len());
+}
+
+test "a removal of an actor a mark names is refused rather than renumbered past" {
+    // **A mark's begin is a row, and a row names its actor**, so the mark
+    // index's own reference check is subsumed by the four data columns' here:
+    // an actor a mark names is always one `id_actor` names. The mark guard
+    // exists at the seam — [`MarkIndexColumn.stageRemap`](mark_index.zig)
+    // cannot renumber a row downwards and has to say so — and is exercised
+    // there. What this asserts is the op-set-level consequence: the refusal
+    // happens before anything moves, and **neither** mark store is touched by
+    // it.
+    const gpa = testing.allocator;
+    var doc = try TwoActors(gpa);
+    defer doc.destroy();
+    const txt = made(1, 1);
+    _ = try doc.set.splice(0, &.{
+        rowAt(opId(1, 1), .root, .{ .map = "text" }, false, .make_text, .null_value, null, &.{}, true, true),
+        markBegin(opId(16, 0), txt, head, "bold", .{ .bool_value = true }),
+        rowAt(opId(5, 1), txt, .{ .seq = head }, true, .set, .{ .str = "ab" }, null, &.{}, true, true),
+    });
+
+    const before = try ActorSnapshot.take(gpa, &doc.set);
+    defer before.deinit(gpa);
+    try testing.expectError(error.InvalidValue, doc.set.removeActor(0));
+    try before.expectSame(gpa, &doc.set);
+}
+
+test "a refused winner change preserves both visibility and text width" {
+    const rows = [_]TestRow{
+        rowAt(opId(1, 0), .root, .{ .map = "text" }, false, .make_text, .null_value, null, &.{}, true, true),
+        rowAt(opId(2, 0), made(1, 0), .{ .seq = head }, true, .set, .{ .str = "a" }, null, &.{}, true, true),
+    };
+    for ([_]bool{ false, true }) |exposing| {
+        var refused: usize = 0;
+        var landed = false;
+        for (0..512) |skip| {
+            var failing: testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
+            const gpa = failing.allocator();
+            var table = Table.init(gpa);
+            defer table.deinit();
+            var set = try Set.fromActors(gpa, &fixture_actors, encoding, table.asTable());
+            defer set.deinit();
+            _ = try set.splice(0, &rows);
+            if (exposing) try set.conflict(1);
+            const before_top = (try set.cols.index.top.get(1)) orelse false;
+            const before_text = (try set.cols.index.text.get(1)) orelse null;
+            failing.fail_index = failing.alloc_index + skip;
+            const outcome = if (exposing) set.expose(1) else set.conflict(1);
+            failing.fail_index = std.math.maxInt(usize);
+            if (outcome) |_| {
+                try testing.expectEqual(exposing, (try set.cols.index.top.get(1)) orelse false);
+                try testing.expectEqual(@as(?u32, if (exposing) 1 else null), (try set.cols.index.text.get(1)) orelse null);
+                try testing.expectEqual(@as(usize, if (exposing) 1 else 0), try set.seqLength(made(1, 0), encoding, null));
+                landed = true;
+                break;
+            } else |e| {
+                try testing.expectEqual(error.OutOfMemory, e);
+                try testing.expectEqual(before_top, (try set.cols.index.top.get(1)) orelse false);
+                try testing.expectEqual(before_text, (try set.cols.index.text.get(1)) orelse null);
+                try testing.expectEqual(@as(usize, if (before_top) 1 else 0), try set.seqLength(made(1, 0), encoding, null));
+                refused += 1;
+            }
+        }
+        try testing.expect(landed);
+        try testing.expect(refused > 0);
+    }
+}
+
+test "a refused splice leaves rows, successor scratch and the object table unchanged" {
+    const gpa = testing.allocator;
+    const rows = [_]TestRow{
+        rowAt(opId(1, 0), .root, .{ .map = "list" }, false, .make_list, .null_value, null, &.{}, true, true),
+        rowAt(opId(2, 0), made(1, 0), .{ .seq = head }, true, .set, .{ .str = "a" }, null, &.{}, true, true),
+    };
+    var failing: testing.FailingAllocator = .init(gpa, .{});
+    const agpa = failing.allocator();
+    var skip: usize = 0;
+    var landed = false;
+    while (skip <= 512) {
+        // Rebuild the fixture so each attempt starts with identical logical
+        // state and the same allocation sequence.
+        failing.fail_index = std.math.maxInt(usize);
+        var table = Table.init(agpa);
+        defer table.deinit();
+        var set = try Set.fromActors(agpa, &fixture_actors, encoding, table.asTable());
+        defer set.deinit();
+        var before = try set.saveCheckpoint(agpa);
+        defer before.deinit(agpa);
+
+        failing.fail_index = failing.alloc_index + skip;
+        const outcome = set.splice(0, &rows);
+        failing.fail_index = std.math.maxInt(usize);
+        if (outcome) |added| {
+            try testing.expectEqual(@as(usize, 2), added);
+            try testing.expectEqual(@as(usize, 2), set.len());
+            // The object table is in step with the rows: one entry, for the one
+            // op that made an object.
+            try testing.expectEqual(@as(usize, 1), set.obj_info.count());
+            try testing.expectEqual(@as(?ObjType, .list), set.objectType(made(1, 0)));
+            try expectScratchCoversRows(&set);
+            landed = true;
+            break;
+        } else |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            // Scratch may retain capacity, but must remain usable after refusal.
+            try expectScratchCoversRows(&set);
+            // A refused staged splice writes no row. Its checkpoint and
+            // object table remain readable and unchanged.
+            try testing.expectEqual(@as(usize, 0), set.len());
+            var after = try set.saveCheckpoint(agpa);
+            defer after.deinit(agpa);
+            try sameCheckpoint(before, after);
+            try testing.expectEqual(@as(usize, 0), set.obj_info.count());
+            skip += 1;
+        }
+    }
+    try testing.expect(landed);
+    // A splice that allocated nothing could not have been refused, so the
+    // sweep would have proved nothing.
+    try testing.expect(skip > 0);
+}
+
+/// Checks that successor scratch can read every row the columns hold.
+fn expectScratchCoversRows(set: *const Set) !void {
+    const want = try opiter.maxSuccCount(TestRow, &set.cols, .{
+        .start = 0,
+        .end = set.cols.len(),
+    });
+    try testing.expect(set.succ_scratch.items.len >= want);
+}
+
+test "a checkpoint owns every column's bytes, and one deinit frees them" {
+    const gpa = testing.allocator;
+    var table = Table.init(gpa);
+    defer table.deinit();
+    var set = try documentSet(gpa, &table);
+    defer set.deinit();
+
+    // **The leak is the assertion.** `Checkpoint` used to be an alias for
+    // `StringArrayHashMapUnmanaged([]u8)`, whose own `deinit` frees the table's
+    // backing storage and none of the twenty separately allocated column
+    // encodings; `std.testing.allocator` reports every one of them at the end of
+    // this test. [`Checkpoint.deinit`](Checkpoint.deinit) frees the values and
+    // the table together.
+    var cp = try set.saveCheckpoint(gpa);
+    try testing.expectEqual(checkpoint_column_names.len, cp.count());
+    for (checkpoint_column_names) |name| {
+        try testing.expect(cp.get(name) != null);
+    }
+    // Two columns of the same document are two separate encodings, and the
+    // fixture's rows give them different lengths — so this is two pointers to
+    // two allocations, not one buffer reached twice.
+    try testing.expect(cp.get("id_actor").?.ptr != cp.get("id_ctr").?.ptr);
+    try testing.expect(!std.mem.eql(u8, cp.get("id_actor").?, cp.get("id_ctr").?));
+    cp.deinit(gpa);
 }
 
 // ── The mark walk ───────────────────────────────────────────────────────────
@@ -8163,7 +9469,7 @@ test "splicing a range and removing it again leaves every column byte-identical"
     };
     try testing.expectEqual(@as(usize, 1), try set.splice(0, &first));
     var before = try set.saveCheckpoint(gpa);
-    defer freeCheckpointOf(gpa, &before);
+    defer before.deinit(gpa);
 
     const added = [_]TestRow{
         rowAt(opId(2, 0), .root, .{ .map = "b" }, false, .set, counter(2), null, &.{}, true, true),
@@ -8200,7 +9506,7 @@ test "splicing a range and removing it again leaves every column byte-identical"
 
     try testing.expectEqual(@as(usize, 1), set.len());
     var after = try set.saveCheckpoint(gpa);
-    defer freeCheckpointOf(gpa, &after);
+    defer after.deinit(gpa);
     // **The mirror claim, asserted from the side that was never asserted.**
     // `Columns::splice` and `Columns::removeOps` are each other's inverse by
     // construction (`columns.rs:419-492` against `:361-417`), and until this
@@ -8270,6 +9576,332 @@ test "undoOp instantiates over OpSet(ChangeOp), the one op set a document holds"
     try testing.expectEqual(true, (try set.cols.index.top.get(0)).?);
 }
 
+/// The document the undo sweep and its reference are both built from: two rows
+/// and a delete onto the first, so the transaction's undo list is not empty
+/// and [`OpSet.undoSucc`] has index values to restore.
+///
+/// **The edge is a delete, not an increment**, because that is the case
+/// `addSuccWithUndo` records `visible`, `text` and `top` for
+/// (`op_set.rs:306-314`) and the case `undoSucc` therefore *replaces* rather
+/// than removes — and a replacement is a splice that can allocate, which is
+/// what makes this a fixture for the refusal sweep and not only for the
+/// round trip.
+fn undoFixture(gpa: Allocator, table: *Table) !struct { set: OpSet(opmod.ChangeOp), tx: opmod.TxOp } {
+    const ChangeSet = OpSet(opmod.ChangeOp);
+    var set = try ChangeSet.fromActors(gpa, &fixture_actors, encoding, table.asTable());
+    errdefer set.deinit();
+    var r0 = try opmod.ChangeOp.init(
+        gpa,
+        opId(1, 0),
+        .root,
+        .set,
+        .{ .map = "a" },
+        counter(1),
+        false,
+        false,
+        null,
+        &.{},
+    );
+    defer r0.deinit(gpa);
+    var r1 = try opmod.ChangeOp.init(
+        gpa,
+        opId(2, 0),
+        .root,
+        .set,
+        .{ .map = "b" },
+        counter(2),
+        false,
+        false,
+        null,
+        &.{},
+    );
+    defer r1.deinit(gpa);
+    const rows = [_]opmod.ChangeOp{ r0, r1 };
+    _ = try set.splice(0, &rows);
+    // **A `[_]` array and not `&.{…}`**: a pointer to a tuple cannot be turned
+    // into a slice in 0.16.0, which is the whole of the third row of the table
+    // [`opElementType`](columns.zig) writes down.
+    const edges = [_]opmod.SuccInsert{.{
+        .id = opId(1, 0),
+        .pos = 0,
+        .inc = null,
+        .len = 0,
+        .sub_pos = 0,
+    }};
+    var undos: std.ArrayList(SuccUndo) = .empty;
+    errdefer undos.deinit(gpa);
+    try set.addSuccWithUndo(&edges, &undos);
+    var tx = try opmod.TxOp.map(
+        gpa,
+        opId(2, 0),
+        ObjMeta.root(),
+        1,
+        .{ .visible_update = .{ .put = counter(2) } },
+        "b",
+        &.{},
+    );
+    errdefer tx.deinit(gpa);
+    tx.undo = undos;
+    return .{ .set = set, .tx = tx };
+}
+
+test "a refused undo, retried, lands where an undo that was never refused lands" {
+    // **The claim is about the retry, and only the retry.** A rollback that was
+    // refused comes back with the same [`opmod.TxOp`]
+    // ([`Transaction.rollback`](../transact.zig)), so every step of
+    // [`OpSet.undoOp`] has to recognise work it has already done: an edge taken
+    // back once must not be taken back twice, and a row already removed must
+    // not take its neighbour with it. The reference is an undo of the same
+    // document that was never refused, and the two op sets must be identical
+    // column for column.
+    const gpa = testing.allocator;
+
+    var want_table = Table.init(gpa);
+    defer want_table.deinit();
+    var want = try undoFixture(gpa, &want_table);
+    defer want.tx.deinit(gpa);
+    defer want.set.deinit();
+    try want.set.undoOp(&want.tx);
+    var want_cols = try want.set.saveCheckpoint(gpa);
+    defer want_cols.deinit(gpa);
+    // The reference really did undo something: the row the transaction wrote is
+    // gone and the edge is out of the flattened pair.
+    try testing.expectEqual(@as(usize, 1), want.set.len());
+    try testing.expectEqual(@as(usize, 0), want.set.subLen());
+
+    var failing: testing.FailingAllocator = .init(gpa, .{});
+    const agpa = failing.allocator();
+    var skip: usize = 0;
+    var refused = false;
+    while (skip <= 512) : (skip += 1) {
+        failing.fail_index = std.math.maxInt(usize);
+        var table = Table.init(agpa);
+        defer table.deinit();
+        var got = try undoFixture(agpa, &table);
+        defer got.tx.deinit(agpa);
+        defer got.set.deinit();
+
+        // **The arm is relative to where this round's fixture ended**, not to
+        // the allocator's running total, so `skip` walks the undo's own
+        // allocations one at a time whatever the fixture before it did. The
+        // sweep ends when the arm is past the last of them, which is the one
+        // attempt that is not refused at all.
+        const base = failing.alloc_index;
+        failing.fail_index = base + skip;
+        const outcome = got.set.undoOp(&got.tx);
+        failing.fail_index = std.math.maxInt(usize);
+        if (outcome) |_| {
+            // Nothing was refused this time, so this is the attempt that lands
+            // with everything allocated — the same one the reference made.
+        } else |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            refused = true;
+            // **The retry, and the whole of the test.** The guards in
+            // `undoOp` are what make this land where the reference did.
+            try got.set.undoOp(&got.tx);
+        }
+        var got_cols = try got.set.saveCheckpoint(agpa);
+        defer got_cols.deinit(agpa);
+        try sameCheckpoint(want_cols, got_cols);
+        try testing.expectEqual(want.set.len(), got.set.len());
+        try testing.expectEqual(want.set.subLen(), got.set.subLen());
+    }
+    // An undo that allocated nothing could not have been refused, so the sweep
+    // would have proved nothing.
+    try testing.expect(refused);
+}
+
+/// `n` rows in one register: every row visible, and the **last two** of them the
+/// winner (`columns.rs:475-489` — a row that is not top has no width, which is
+/// what the fixture gives it through [`rowAt`]).
+///
+/// **Two winners, not one, because that is what makes `reset_top` write.** A
+/// window whose only top row is its last has nothing to demote and nothing to
+/// expose, so the reset would stage a replacement equal to what it read and the
+/// sweep would never reach a write it has to publish. With two, the earlier is
+/// a conflict ([`OpSet.conflict`]) and the staged `top` and `text` differ from
+/// the columns they were read from.
+fn wideRows(comptime n: usize) [n]TestRow {
+    var out: [n]TestRow = undefined;
+    for (&out, 0..) |*r, i| {
+        r.* = rowAt(
+            opId(@intCast(i + 1), 0),
+            .root,
+            .{ .map = "a" },
+            false,
+            .set,
+            counter(@intCast(i + 1)),
+            null,
+            &.{},
+            i + 1 == n or i + 1 == n - 1,
+            true,
+        );
+    }
+    return out;
+}
+
+/// That every column in the set agrees with the set about how many rows and
+/// how many successors it holds.
+///
+/// **This is the consumer-visible invariant a half-applied pass breaks, and it
+/// is asked through `len()` rather than through a checkpoint**: the question is
+/// one of agreement, not of content. The `value` column is deliberately not
+/// here — it counts bytes, not rows (`columns.rs:443-444`), so it has no
+/// length to agree with.
+fn expectColumnsAgree(set: *const Set) !void {
+    const rows = set.cols.len();
+    const succs = set.cols.subLen();
+    try testing.expectEqual(rows, set.cols.id_actor.len());
+    try testing.expectEqual(rows, set.cols.id_ctr.len());
+    try testing.expectEqual(rows, set.cols.obj_actor.len());
+    try testing.expectEqual(rows, set.cols.obj_ctr.len());
+    try testing.expectEqual(rows, set.cols.key_actor.len());
+    try testing.expectEqual(rows, set.cols.key_ctr.len());
+    try testing.expectEqual(rows, set.cols.key_str.len());
+    try testing.expectEqual(rows, set.cols.insert.len());
+    try testing.expectEqual(rows, set.cols.action.len());
+    try testing.expectEqual(rows, set.cols.expand.len());
+    try testing.expectEqual(rows, set.cols.mark_name.len());
+    try testing.expectEqual(rows, set.cols.value_meta.len());
+    try testing.expectEqual(rows, set.cols.succ_count.len());
+    try testing.expectEqual(succs, set.cols.succ_actor.len());
+    try testing.expectEqual(succs, set.cols.succ_ctr.len());
+    try testing.expectEqual(rows, set.cols.index.mark.len());
+    try testing.expectEqual(rows, set.cols.index.text.len());
+    try testing.expectEqual(rows, set.cols.index.top.len());
+    try testing.expectEqual(rows, set.cols.index.visible.len());
+    try testing.expectEqual(succs, set.cols.index.inc.len());
+    // **`succ_count`'s sum against the flattened pair's length** — the one
+    // invariant a half-applied edge breaks, because a row's successor count and
+    // its edges are the same edges counted two ways and a refusal between them
+    // lands in the middle of the count.
+    var counts = try set.cols.succ_count.iterator();
+    var total: usize = 0;
+    while (try counts.next()) |n| total += n;
+    try testing.expectEqual(succs, total);
+}
+
+test "a refused undo across a slab boundary leaves every column agreeing, and its reset in step" {
+    // **Bigger than one slab, because that is the only shape in which the
+    // interesting allocation is reachable at all.**
+    // `Column.max_segments` is the run budget one slab may hold
+    // (`hexane/column.zig:2494-2500`), so a column with more values than that
+    // has more than one slab, and a removal that straddles the boundary has to
+    // merge the two halves into one — which allocates. A sweep over a fixture
+    // that fits in one slab therefore never reaches a column's own allocation
+    // path, and proves nothing about a pass that does not stage.
+    //
+    // **And scoped, so `reset_top` runs.** `TxOp::map` leaves `reset_range` null
+    // and only a scoped transaction fills it in (`transact.zig:631-639`), so the
+    // undo test above never reaches the two-column reset at all. Here it is set,
+    // and the reset covers the whole register — which is what makes it stage a
+    // full-width replacement of `top` and `text`.
+    const gpa = testing.allocator;
+    const n = 2 * opcols.ActorColumn.max_segments + 16;
+    const pos = n / 2;
+
+    // The reference: one undo that was never refused.
+    var want_table = Table.init(gpa);
+    defer want_table.deinit();
+    var want = try buildWide(gpa, &want_table, n, pos);
+    defer want.tx.deinit(gpa);
+    defer want.set.deinit();
+    try want.set.undoOp(&want.tx);
+    var want_cols = try want.set.saveCheckpoint(gpa);
+    defer want_cols.deinit(gpa);
+    try expectColumnsAgree(&want.set);
+    try testing.expectEqual(@as(usize, n - 1), want.set.len());
+
+    var failing: testing.FailingAllocator = .init(gpa, .{});
+    const agpa = failing.allocator();
+    var skip: usize = 0;
+    var refused = false;
+    while (skip <= 512) : (skip += 1) {
+        failing.fail_index = std.math.maxInt(usize);
+        var table = Table.init(agpa);
+        defer table.deinit();
+        var got = try buildWide(agpa, &table, n, pos);
+        defer got.tx.deinit(agpa);
+        defer got.set.deinit();
+        try expectColumnsAgree(&got.set);
+
+        const base = failing.alloc_index;
+        failing.fail_index = base + skip;
+        const outcome = got.set.undoOp(&got.tx);
+        failing.fail_index = std.math.maxInt(usize);
+        // **The consumer's question after any refusal, asked before anything
+        // else: is this still a document?** Every column still agrees with the
+        // row count and the successor count — so a refusal inside the row
+        // removal, inside the successor removals or inside the reset cannot
+        // have moved half of anything.
+        try expectColumnsAgree(&got.set);
+        var after = try got.set.saveCheckpoint(agpa);
+        defer after.deinit(agpa);
+        if (outcome) |_| {
+            // The last attempt is the one that allocates the whole way through,
+            // so it lands where the reference did.
+            try sameCheckpoint(want_cols, after);
+        } else |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            refused = true;
+            // **No byte-identity claim here, and the shape of `undoSucc` is
+            // why.** A refusal can fall *between* two edges, so the set may
+            // already have some of them taken back and some not — that is the
+            // per-edge progress the seam allows and the only progress it
+            // allows. What it may never be is a set whose columns disagree, and
+            // the assertion above is the one that says so.
+            try expectColumnsAgree(&got.set);
+            // **And the retry**, which is what a rollback does with a refusal.
+            try got.set.undoOp(&got.tx);
+            var retried = try got.set.saveCheckpoint(agpa);
+            defer retried.deinit(agpa);
+            try sameCheckpoint(want_cols, retried);
+        }
+        try expectColumnsAgree(&got.set);
+    }
+    // An undo that allocated nothing could not have been refused, so the sweep
+    // would have proved nothing.
+    try testing.expect(refused);
+}
+
+/// The document the wide sweep and its reference are both built from: `n` rows
+/// in one register, a delete onto the row at `pos`, and the [`opmod.TxOp`]
+/// that takes the row, the edge and the register's winners back.
+///
+/// **`reset_range` spans the whole register**, which is what a scoped
+/// transaction records (`transact.zig:631-639`) and what makes `undoOp` run
+/// [`OpSet.resetTop`] over a window far wider than the row it removed.
+fn buildWide(gpa: Allocator, table: *Table, comptime n: usize, pos: usize) !struct { set: Set, tx: opmod.TxOp } {
+    var set = try Set.fromActors(gpa, &fixture_actors, encoding, table.asTable());
+    errdefer set.deinit();
+    const rows = wideRows(n);
+    _ = try set.splice(0, &rows);
+    try testing.expectEqual(@as(usize, n), set.len());
+    const edges = [_]opmod.SuccInsert{.{
+        .id = opId(1, 0),
+        .pos = pos,
+        .inc = null,
+        .len = 0,
+        .sub_pos = 0,
+    }};
+    var undos: std.ArrayList(SuccUndo) = .empty;
+    errdefer undos.deinit(gpa);
+    try set.addSuccWithUndo(&edges, &undos);
+    var tx = try opmod.TxOp.map(
+        gpa,
+        opId(@intCast(pos + 1), 0),
+        ObjMeta.root(),
+        pos,
+        .{ .visible_update = .{ .put = counter(@intCast(pos + 1)) } },
+        "a",
+        &.{},
+    );
+    errdefer tx.deinit(gpa);
+    tx.undo = undos;
+    tx.reset_range = .{ .start = 0, .end = n };
+    return .{ .set = set, .tx = tx };
+}
+
 // ── The overwrite rule ──────────────────────────────────────────────────────
 
 /// One successor edge onto the register row at `pos`
@@ -8333,8 +9965,9 @@ fn localPut(
     const register = try set.propRange(.root, key);
     const row = rowAt(id, .root, .{ .map = key }, false, .set, val, null, &.{}, true, true);
     _ = try set.splice(register.end, &.{row});
-    const undo = try set.addSuccWithUndo(succ);
-    gpa.free(undo);
+    var undo: std.ArrayList(SuccUndo) = .empty;
+    defer undo.deinit(gpa);
+    try set.addSuccWithUndo(succ, &undo);
 }
 
 /// How many of the register's rows are `top`, and how many are `visible`.

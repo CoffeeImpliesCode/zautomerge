@@ -1,9 +1,10 @@
 # `test/c/` — the C conformance suite
 
 This directory is **not** a port of the reference's C tests. It **is** the
-reference's C tests, plus three things this port adds around them. Read this
-before changing anything under `test/c/suite/`: that tree is vendored, and a
-vendored tree that drifts silently is worse than one that is wrong.
+reference's C tests, plus the wiring this port adds around them, **plus the ABI
+compile check that links none of it**. Read this before changing anything under
+`test/c/suite/`: that tree is vendored, and a vendored tree that drifts silently
+is worse than one that is wrong.
 
 ## What is vendored, and from where
 
@@ -19,7 +20,7 @@ rust/automerge: Answer get_marks from the mark index
 (MIT, plus the vendored notices it carries).
 
 **The one upstream file that is not copied is `CMakeLists.txt`**, because the
-build is `build.zig`'s: `build.zig:98-156` names every `.c` file explicitly,
+build is `build.zig`'s: the `ctest_exe` module names every `.c` file explicitly,
 sets the two include paths (`test/c/include`, which forwards onto this port's
 one `include/automerge.h`, and `include` itself), and sets the run step's
 working directory. Nothing in upstream's CMake file survives in any form.
@@ -32,13 +33,94 @@ calls `suite_main`. Every other line of `main.c` is upstream's.
 
 ## What this port adds, and why it lives here rather than in `suite/`
 
-Three files sit beside `suite/` and are **not** upstream's:
+Files that sit beside `suite/` and are **not** upstream's:
 
 | File | What it is |
 | --- | --- |
-| `abi_coverage.c` / `.h` | This port's own group. `rust/automerge-c/test/` calls **147 of the 187** functions `include/automerge.h` declares; the other forty would link and never run. `main.c` calls `run_abi_coverage_tests()` so they are covered. |
+| `abi_coverage.c` / `.h` | This port's own group. `rust/automerge-c/test/` reaches most of the 187 functions `include/automerge.h` declares; the ones no upstream case calls would link and never run. `main.c` calls `run_abi_coverage_tests()` so they are covered. |
 | `main.c`, `main.zig` | The driver, described above. |
 | `include/` | Forwarding headers onto `include/automerge.h`, because the suite does `#include <automerge-c/…>` and the reference's split-header layout is part of what is being tested. |
+| `cabi.zig` | **The ABI compile check, and it is not part of the suite.** See the next section. |
+
+## `cabi.zig` is a second library, not the suite's root
+
+**The suite does not link `cabi.zig`, and `cabi.zig` does not link the
+artifact.** They are two independent gates, and either alone is the weaker
+check:
+
+- **`zig build ctest`** builds the production static library `libzautomerge.a`
+  from the production root `src/c/root.zig`, links the suite against **that**,
+  and runs it. That is a link-level check: it proves every declaration the
+  header reaches resolves to a symbol in the library a consumer actually gets.
+- **`test/c/cabi.zig`** is the root of a **separate** static library
+  (`zautomerge-abi-check`), built with the shipped `include/automerge.h` on its
+  include path, and it **translates that header** through `zig translate-c` and
+  compares what the C side sees against what the library is — at comptime, so a
+  mismatch is a **compile error** rather than a test failure. It checks the
+  187 physical function signatures, five exposed struct layouts, and 37 enum
+  names. Header declarations and native enum fields are reflected for coverage.
+  `ctest` depends on that library's step so the header is analysed even when no
+  C case reaches a given declaration, and **nothing else links it**.
+
+**The counts the check pins are properties of the header**, not of any run:
+187 declared functions, 37 enum names across five enums (including the distinct
+default sentinel tags), and five exposed struct layouts. `AMbyteSpan` and
+`AMitems` cross by value; `AMunknownValue`, `AMstack`, and
+`AMstackCallbackData` are reached by pointer.
+**The cmocka case count is a different
+thing**: it is what the suite executes, it moves when `abi_coverage.c` grows,
+and it is measured by running the suite — see *Known differences* below, where
+the last measured figure is dated.
+
+## C calls from different threads require one global boundary
+
+`include/automerge.h`'s `\section threads` states the obligation, and it is
+**stronger than "do not share one handle between threads"**: calls from
+different threads must share one caller-owned global serialization boundary
+and must not overlap, even across distinct handles. Two independent documents
+do not make overlapping calls from two threads safe. `src/c/result.zig`,
+`src/c/doc.zig` and `src/c/sync.zig` carry the same note in their module docs.
+
+The reason is the seam. A C caller cannot supply a capability, so
+`src/c/doc.zig`
+  binds one at the ABI boundary — `pub const c_io: std.Io =
+  std.Io.Threaded.global_single_threaded.io()` — and every entry point that
+  builds a document or draws an actor id reaches it: `AMcreate`, `AMclone`,
+  `AMfork`, `AMload`, `AMloadIncremental`, `AMchangeLoadDocument` and
+  `AMactorIdInit`. That provider is **process-wide and explicitly
+  single-threaded**, which is what forces global serialization rather than
+  per-handle confinement. Two further reasons are in the header: some
+  accessors memoise a result inside a handle whose prototype is `const`, and an
+  item's reference count is a plain integer, so there is no interior
+  mutability to lock over; and a thread-safe `malloc` is not a thread-safe
+  library.
+
+**There is no mutex in `src/c/`, and none is promised.** Hold one caller-owned
+lock through each outer call, its callbacks and its return. An `AMstackCallback`
+invoked by `AMstackResult`, `AMstackItem` or `AMstackItems` may synchronously
+inspect the stack and result on that same thread, including advancing a local
+borrowed `AMitems` cursor. **Nested inspection uses the already-held lock and
+must not reacquire or release it.** The shipped `cmocka_cb` does exactly this:
+it calls `AMresultStatus`, `AMresultItems`, `AMitemsNext` and `AMitemValType`
+inside the stack call (`suite/cmocka_utils.c:67-89`).
+Result diagnostics (`AMresultError`, `AMvalTypeToString` and `AMstrdup` for a
+diagnostic copy) are also permitted under that held lock. The validator's error
+path uses them (`suite/cmocka_utils.c:59-64,73-85`). The diagnostic helper frees
+its independent string copy, not the borrowed result.
+
+The callback must keep stack nodes and results live and preserve their ownership
+and links until the outer call returns: no popping, freeing, replacement or
+relinking. Rejection leaves ownership with the stack. Do not retain the
+callback's stack-parameter address; the null-stack path borrows a temporary
+node and frees the result after the callback. Other retained views still need
+their owning result to stay live. Callback data is passed unchanged and is
+neither retained nor freed by the library; keep callback code and accessed
+context valid through their last use. `cmocka_cb` releases its own data after
+that last use. The header's `AMstackCallback` contract supplies these rules.
+
+This permits no general mutation, other reentrancy or cross-thread entry.
+A caller who needs genuine concurrency uses separate processes. The reference
+crate's `Send`/`Sync` story does not transfer to this ABI.
 
 ## Dropped and altered assertions
 
@@ -112,7 +194,8 @@ The Nix-provided `cmocka-2.0.2` needs `GLIBC_ABI_GNU2_TLS` (glibc ≥ 2.42) and
 glibc 2.40 on the build host is older than that, so a suite linked against the
 packaged library fails to launch. The gate therefore needs
 `-Dcmocka-prefix=<dir>` pointing at a cmocka built against the glibc the build
-host runs.
+host runs. **A usable prefix is at the sibling `../cmocka-prefix/lib64`** on
+this host.
 
 **`test/c/build-cmocka.sh` builds it, and the prefix it installs to is a
 sibling of this repository** — `../cmocka-prefix`, on the same volume the
@@ -138,21 +221,26 @@ build would fetch. The header at the top of the script records the two things
 it deliberately does not do — nixpkgs's `uintptr_t.patch`, which is a no-op on
 a host that has `<stdint.h>`, and cmocka's own test suite.
 
-`build.zig:153` declares the option and `build.zig:194-203` adds `include` plus
-both `lib` and `lib64` under it, so one prefix covers either layout (cmocka
-installs into `lib64` here). Nothing is vendored and no path is hardcoded in
-`build.zig`. **A build step that only works because of something done by hand,
-with no record, is a build step that breaks for the next person** — hence this
-section and the script.
+`build.zig`'s `cmocka_prefix` option declares the prefix and the `ctest_exe`
+module adds `include` plus both `lib` and `lib64` under it, so one prefix
+covers either layout (cmocka installs into `lib64` here). The prefix is
+absolutised once, before any of it reaches the module, because a build-time
+path resolves against the build root while a `-L` directory is copied verbatim
+into the linked binary's RUNPATH — and the run step's working directory is
+`test/c/suite`, so a relative prefix would become a RUNPATH entry resolved
+against *that*. Nothing is vendored and no path is hardcoded in `build.zig`.
+**A build step that only works because of something done by hand, with no
+record, is a build step that breaks for the next person** — hence this section
+and the script.
 
 ### Zig 0.16 swallows a failing run step's stdout
 
-`build.zig:255` sets `run_ctest.expectExitCode(0)`, so any failing case fails
-the step, and **Zig 0.16 does not print the run step's output when it fails**.
-The per-case report therefore comes from running the binary `zig build ctest`
-just built, with the working directory `build.zig` uses (`test/c/suite`,
-`build.zig:250` — `doc_tests.c:175` opens `files/brave-ape-49.automerge`
-relative to it, which is what upstream's CMake copy step arranges).
+`run_ctest.expectExitCode(0)` means any failing case fails the step, and **Zig
+0.16 does not print the run step's output when it fails**. The per-case report
+therefore comes from running the binary `zig build ctest` just built, with the
+working directory the run step uses (`test/c/suite` — `doc_tests.c:175` opens
+`files/brave-ape-49.automerge` relative to it, which is what upstream's CMake
+copy step arranges).
 
 ```
 zig build ctest -Dcmocka-prefix="$PWD/../cmocka-prefix"        # build
@@ -177,7 +265,13 @@ This file records **provenance and permanent facts**. **No case in this suite
 is failing**; what is below is either a permanent fact about the suite or the
 record of a defect it caught.
 
-**Measured 2026-10-01: 153 cases in 13 groups, 153 passing, 0 failing.**
+**Current verification (2026-10-04): 160 cases in 13 groups, 160 passing, 0 failing.**
+`zig build ctest -Dcmocka-prefix=../cmocka-prefix -j1 --summary all` passed
+all 7 build steps. The built executable's complete report supplied the case
+count. This run also exercises synchronous stack-callback inspection.
+The older 2026-10-01 result was 153 cases; it does not certify this revision.
+The utility test's source-line forwarding assertion was removed, not re-pinned;
+stack/result ownership and diagnostic-copy behavior remain exercised.
 
 ### The one defect this suite caught that `zig build test` did not, and why
 
@@ -201,11 +295,11 @@ document reported `89abcdef` correctly once it committed first, and the same
 sequence through the Zig API was right.
 
 **Where it was.** `Document.actor` is an `Actor` union whose `Unused` arm is a
-**borrowed** slice over the document's arena (`src/doc.zig:305-311`) and whose
+**borrowed** slice over the document's arena (`src/doc.zig` `Actor`) and whose
 `Cached` arm is an index. `Document.loadIncremental`'s empty-document branch
-copied the **union** across `loadIntoWith` (`src/doc.zig:3613`, `:3623`), which
-resets the document through `Document.deinit` — and so frees that arena
-(`src/doc.zig:2463`). The slice named freed memory, the peer actor the load
+copied the **union** across `loadIntoWith`, which
+resets the document through `Document.deinit` — and so frees that arena.
+The slice named freed memory, the peer actor the load
 interned next was written into those bytes by `Document.adoptActors`, and the
 document then minted its next change under the other actor.
 
@@ -223,11 +317,11 @@ re-establishes them through `Document.setActorId`. `src/c/**` was not the wrong
 side — it was reporting the core's answer faithfully.
 
 **Why `zig build test` stayed green**, which is the part worth remembering:
-every actor in this tree's own tests is a **string literal**
-(`src/doc.zig:5903`, `src/sync/protocol.zig:1122`, `src/sync/v1.zig:822`). A
-literal never dies, so carrying a borrowed slice across a reset looks
-harmless. `AMcreate` interns the caller's bytes into the document's arena
-(`src/c/doc.zig`, `internActor`), so the C ABI is the only caller that can
+every actor in this tree's own tests is a **string literal** (the fixtures in
+`src/doc.zig`, `src/sync/protocol.zig` and `src/sync/v1.zig`). A literal never
+dies, so carrying a borrowed slice across a reset looks harmless. `AMcreate`
+interns the caller's bytes into the document's arena (`src/c/doc.zig`,
+`internActor`), so the C ABI is the only caller that can
 reach the defect, and it reaches it on **every** peer that receives a change
 before it commits — which is the normal order for a newly created document.
 `src/doc.zig`'s

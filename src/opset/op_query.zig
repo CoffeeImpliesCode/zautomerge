@@ -196,8 +196,14 @@ pub fn assertQueryTerm(comptime Q: type) void {
 /// this is the outer half of that composition, and `visible.zig` owns the
 /// inner one.
 ///
-/// `init` allocates nothing: the wrapper is two words beside `I`, and
-/// `Op.fixCounter` writes in place.
+/// `init` allocates nothing: the wrapper is the walk plus a nullable clock
+/// beside it.
+///
+/// **It owns nothing, so it declares no `deinit`.** The fold is upstream's
+/// rather than this adapter's, and the walk is the caller's, so the teardown a
+/// caller writes for a composed walk is the *inner* walk's. A consumer
+/// reaching for the uniform `defer x.deinit()` over this family finds one on
+/// [`MarkIter`](marks.zig), which owns a fold, and none here.
 pub fn FixCounters(comptime I: type) type {
     return struct {
         const Self = @This();
@@ -206,12 +212,21 @@ pub fn FixCounters(comptime I: type) type {
         iter: I,
         /// The clock whose increments are folded in, or null to fold in every
         /// one of them (`op_query.rs:77`).
+        ///
+        /// **`Clock` is stored by value and its slots are the caller's.** The
+        /// copy shares the one allocation [`Clock.init`](../../src/clock.zig)
+        /// and [`next`] reads it on every row through [`Op.fixCounter`], so the
+        /// clock must outlive this walk.
         clock: ?Clock,
 
         pub const shiftable = column.Shiftable(Self);
 
         /// A wrapper that fixes `iter`'s counters against `c`
         /// (`FixCounters::new`, `op_query.rs:82-88`).
+        ///
+        /// `c` is borrowed rather than copied, so the clock the caller holds
+        /// has to outlive the walk — see the `clock` field for what that
+        /// obliges.
         pub fn init(iter: I, c: ?Clock) Self {
             return .{ .iter = iter, .clock = c };
         }
@@ -276,6 +291,10 @@ pub fn FixCounters(comptime I: type) type {
 
         /// The next row, with its counter folded, or null at the end of the
         /// walk (`next`, `op_query.rs:103-107`).
+        ///
+        /// The fold is on the row this hands out. The inner walk holds column
+        /// cursors and no rows, so there is nothing behind it to rewrite, and
+        /// a caller that wants the unfolded row asks the inner walk.
         ///
         /// Null only ever means the walk is over: a counter with no increments
         /// is still a row, and this is the accessor that keeps the two cases

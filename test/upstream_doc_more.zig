@@ -96,6 +96,14 @@ const Allocator = std.mem.Allocator;
 
 /// **The leak arbiter for the whole file.** One allocator, named once.
 const gpa = testing.allocator;
+
+/// The borrowed capability every document constructor below is handed.
+///
+/// **Explicit, because `Document` keeps it.** The op set draws actors through
+/// this value for as long as the document lives, so a constructor cannot
+/// reach for an ambient global and no document can outlive its provider. Here
+/// that value is `std.testing.io`; an executable passes its own `init.io`. It
+/// reads `test/fixtures/` through it too, in [`fixture`].
 const io = std.testing.io;
 
 const Document = am.doc.Document;
@@ -148,7 +156,7 @@ fn mintActor() ActorId {
 
 /// A new document in the autocommit flavour ([`AutoCommit::new`](../src/doc.zig)).
 fn newDoc() !Document {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, io, .auto);
     errdefer doc.deinit();
     doc.setActorId(mintActor());
     return doc;
@@ -157,7 +165,7 @@ fn newDoc() !Document {
 /// The same, with the actor the caller names
 /// ([`automerge_test::new_doc_with_actor`](../github-automerge-automerge/rust/automerge-test/src/lib.rs):17-21).
 fn newDocWithActor(actor: ActorId) !Document {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, io, .auto);
     errdefer doc.deinit();
     doc.setActorId(actor);
     return doc;
@@ -165,12 +173,13 @@ fn newDocWithActor(actor: ActorId) !Document {
 
 /// [`Document.fork`] through [`Document.forkAt`] at the document's own heads.
 ///
-/// **`Document.fork` leaks and this is why.**
-/// [`doc.zig`](../src/doc.zig):3827-3830 stores `ActorId.random(gpa)` — sixteen
-/// bytes taken from `gpa` — in `actor.unused`, and `Document.deinit` frees no
-/// actor bytes, because a caller may have handed `setActorId` a string literal.
-/// [`Document.forkAt`] does the same work correctly (`:3883-3891`): it copies
-/// the minted bytes into the fork's own arena and frees the temporary.
+/// **A named actor, and not [`Document.fork`]'s random one.** `fork` mints
+/// through the source's retained `io` ([`doc.zig`](../src/doc.zig)), so its
+/// actor differs on every run and so does every change hash derived from it.
+/// [`forkAt`] at the document's own heads is the same document with the same
+/// contents. **And this is determinism, not a leak**: `fork` allocates the
+/// actor from the **fork's own** arena, which [`Document.deinit`] frees with
+/// everything else, so a fork it did not free is not the reason for this door.
 fn forkDoc(src: *Document) !Document {
     const heads = try src.getHeads(gpa);
     defer gpa.free(heads);
@@ -585,7 +594,7 @@ test "every upstream fuzz crasher is refused, and the refusal names the file" {
 /// `assert!(Automerge::load(..).is_err())`, and a Zig error union that returns
 /// a document has to be captured by value rather than by pointer.
 fn mustBeRefused(name: []const u8, bytes: []const u8) !void {
-    const outcome = Document.load(gpa, bytes, .unicode_code_point, .auto);
+    const outcome = Document.load(gpa, io, bytes, .unicode_code_point, .auto);
     if (outcome) |document_value| {
         var document = document_value;
         document.deinit();
@@ -626,7 +635,7 @@ test "a wrong length prefix and an overlong LEB are refused, and the well-formed
         try mustBeRefused(name, bytes);
     }
 
-    var loaded = try Document.load(gpa, ok, .unicode_code_point, .auto);
+    var loaded = try Document.load(gpa, io, ok, .unicode_code_point, .auto);
     defer loaded.deinit();
     const counter = try scalarAt(&loaded, root, .{ .key = "a" });
     try testing.expectEqual(@as(i64, 2000), counter.counter.current);
@@ -651,7 +660,7 @@ test "each two-change-chunk fixture loads and holds ROOT.a.a == \"b\"" {
     for (names) |name| {
         const bytes = try fixture(name);
         defer gpa.free(bytes);
-        var loaded = try Document.load(gpa, bytes, .unicode_code_point, .auto);
+        var loaded = try Document.load(gpa, io, bytes, .unicode_code_point, .auto);
         defer loaded.deinit();
 
         const outer = (try am.read.get(&loaded, root, .{ .key = "a" })) orelse {
@@ -711,7 +720,7 @@ test "an opId of 2^42 never truncates to the document root" {
     for (names) |name| {
         const bytes = try fixture(name);
         defer gpa.free(bytes);
-        var loaded = (Document.load(gpa, bytes, .unicode_code_point, .auto)) catch |e| {
+        var loaded = (Document.load(gpa, io, bytes, .unicode_code_point, .auto)) catch |e| {
             // Arm one: refused, which upstream accepts.
             if (e == error.OutOfMemory) return e;
             continue;
@@ -930,7 +939,7 @@ test "an author's footer rides only its actor's first change, and both direction
     // (`test.rs`:3511-3526`).
     const saved = try doc1.save(gpa);
     defer gpa.free(saved);
-    var doc3 = try Document.load(gpa, saved, .unicode_code_point, .auto);
+    var doc3 = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
     defer doc3.deinit();
     const after = try expectAuthors(&doc3, author1, author2);
 
@@ -1033,7 +1042,7 @@ test "one conflicting (actor, seq) in a batch applies none of the batch" {
     // **`seq` 1, not 2, and the first draft of this test said 2.** A fork
     // *mints a new actor id* ([`fork_at`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):
     // `fork.set_actor(ActorId::random())`), so a forked document's next change
-    // is its own actor's first — and the port's [`Document.forkAt`](../src/doc.zig):3883-3891
+    // is its own actor's first — and the port's [`Document.forkAt`](../src/doc.zig)
     // does the same. Nothing in the case depends on the number; what it needs
     // is that `change1` and `change2` are by *different* actors, so `change1`
     // is causally ready while `change3` collides.
@@ -1225,14 +1234,14 @@ test "a rejection leaves the receiver exactly where its queued orphan left it" {
     const base = try base_doc.save(gpa);
     defer gpa.free(base);
 
-    var receiver = try Document.load(gpa, base, .unicode_code_point, .auto);
+    var receiver = try Document.load(gpa, io, base, .unicode_code_point, .auto);
     defer receiver.deinit();
     receiver.setActorId(base_actor);
 
     // The stale branch writes twice, so its second change depends on the first:
     // applying the second alone leaves the first queued as an **orphan**, and
     // the receiver must advertise it as missing (`test.rs`:3688-3692`).
-    var stale = try Document.load(gpa, base, .unicode_code_point, .auto);
+    var stale = try Document.load(gpa, io, base, .unicode_code_point, .auto);
     defer stale.deinit();
     stale.setActorId(branch_actor);
     _ = try am.transaction.put(&stale, root, .{ .key = "stale_missing" }, .{ .uint = 1 });
@@ -1264,7 +1273,7 @@ test "a rejection leaves the receiver exactly where its queued orphan left it" {
     // is the change sitting in the receiver's queue under a *stale* hash. The
     // collision is at seq 2, not seq 1, which is what makes this the queued-orphan
     // case rather than case 19 again.
-    var live = try Document.load(gpa, base, .unicode_code_point, .auto);
+    var live = try Document.load(gpa, io, base, .unicode_code_point, .auto);
     defer live.deinit();
     live.setActorId(branch_actor);
     _ = try am.transaction.put(&live, root, .{ .key = "live_1" }, .{ .uint = 3 });
@@ -1363,7 +1372,7 @@ test "load_incremental preserves the receiver's text encoding for a change and f
     // exactly this and the deviation is recorded in
     // [API.md](../API.md) §Write.
     const encoding: TextEncoding = .utf16_code_unit;
-    var doc = try Document.initWithEncoding(gpa, encoding, .manual);
+    var doc = try Document.initWithEncoding(gpa, io, encoding, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
 
@@ -1417,7 +1426,7 @@ test "load_incremental preserves the receiver's text encoding for a change and f
         // empty-document fast path of [`Document.loadIncremental`](../src/doc.zig):3261-3266,
         // which is the path the case is about. The receiver's encoding is set
         // by the constructor and never written by the load.
-        var reconstructed = try Document.initWithEncoding(gpa, encoding, .auto);
+        var reconstructed = try Document.initWithEncoding(gpa, io, encoding, .auto);
         defer reconstructed.deinit();
         _ = try reconstructed.loadIncremental(gpa, arm.bytes);
 
@@ -1448,7 +1457,7 @@ test "load_incremental preserves the receiver's text encoding for a change and f
 
 test "a rejected branch is dropped from the queue, so the next local change gets the sequence number back" {
     const actor: ActorId = .{ .bytes = "\x7f\x00\x00\x00\x00\x00\x00\x00" };
-    var local = try Document.init(gpa, .auto);
+    var local = try Document.init(gpa, io, .auto);
     defer local.deinit();
     local.setActorId(actor);
     _ = try am.transaction.put(&local, root, .{ .key = "base" }, .{ .int = 0 });
@@ -1520,7 +1529,7 @@ test "a rejected branch is dropped from the queue, so the next local change gets
 
     const saved = try local.save(gpa);
     defer gpa.free(saved);
-    var reloaded = try Document.load(gpa, saved, .unicode_code_point, .auto);
+    var reloaded = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
     defer reloaded.deinit();
 
     // The load is upstream's assertion; what makes it mean something is the

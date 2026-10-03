@@ -69,6 +69,14 @@ const testing = std.testing;
 /// **The leak arbiter for the whole file.** One allocator, named once, and
 /// every owned value below comes out of it.
 const gpa = testing.allocator;
+
+/// The borrowed capability every document constructor below is handed.
+///
+/// **Explicit, because `Document` keeps it.** The op set draws actors through
+/// this value for as long as the document lives, so a constructor cannot
+/// reach for an ambient global and no document can outlive its provider. Here
+/// that value is `std.testing.io`; an executable passes its own `init.io`.
+const io = std.testing.io;
 const Allocator = std.mem.Allocator;
 
 const Document = am.doc.Document;
@@ -173,7 +181,7 @@ fn blockWidth(enc: TextEncoding) usize {
 /// read out before the transaction was opened, then named a different actor
 /// and [`Document.objectType`](doc.zig:4306-4310) answered `error.NotAnObject`.
 fn newDoc(enc: TextEncoding, actor: []const u8, mode: am.doc.Mode) !Document {
-    var doc = try Document.initWithEncoding(gpa, enc, mode);
+    var doc = try Document.initWithEncoding(gpa, io, enc, mode);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = actor });
     return doc;
@@ -1563,9 +1571,9 @@ fn unitWidth(enc: TextEncoding, s: []const u8) usize {
 //   Upstream's `AutoCommit::isolate` takes `&[ChangeHash]`
 //   (`autocommit.rs`) and this port's [`Document.isolate`](../src/doc.zig)
 //   takes the allocator too, because it forks the document and a fork
-//   allocates. **`Document.forkAt` is not `Document.fork`** here: `fork` stores
-//   a random actor it never frees (`doc.zig`:3827-3830), so `testing.allocator`
-//   refuses the test; every actor in this file is named.
+//   allocates. **`Document.forkAt` is not `Document.fork`** here: `fork`
+//   mints its actor through the source's retained `io`, so the actor differs
+//   on every run; every actor in this file is named.
 //
 // * **The three legacy splices are three `test` blocks, where upstream has one
 //   `#[test]` with three cases** (`text.rs:1006-1022`). Split, so a failure in

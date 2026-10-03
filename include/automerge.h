@@ -19,21 +19,89 @@
  *          the comment beside it, so a renumbering fails this project's build
  *          rather than a consumer's.
  *
+ * \warning The five enumerations below must be compiled with the **default C
+ *          enum lowering**, which is what every toolchain applies unless
+ *          `-fshort-enums` is given. `AMobjType`, `AMmarkExpand`, `AMidxType`
+ *          and `AMstatus` then have a four-byte `unsigned int` type, which is
+ *          what the library's entry points take and return. Under
+ *          `-fshort-enums` those four become one byte and a one-byte enum
+ *          argument leaves the rest of its register unspecified, so
+ *          `AMxxxToString()` would read garbage and answer `"???"` for a tag
+ *          that has a name. `AMvalType` is unaffected — its largest tag is
+ *          `1 << 20` — and so is every struct in this header, because the one
+ *          enum any of them embeds is `AMvalType`.
+ *          `test/c/cabi.zig` pins the four-byte lowering against
+ *          `zig translate-c`'s own `c_uint`.
+ *
  * \section ownership Ownership
  *
- * `AMresult` is the one and only owning type in this API. A function that can
- * fail returns `AMresult *`; the caller owns it and must release it with
- * `AMresultFree()` exactly once, on every path, including the error path.
- * Every other pointer this header declares is a **borrow into a live
- * `AMresult`** and has no destructor of its own: there is no `AMdocFree`, no
- * `AMitemFree`, no `AMobjIdFree`, no `AMchangeFree`, no `AMcursorFree`, no
- * `AMmarkFree`, and no `AMsync*Free`. Freeing the owning `AMresult` invalidates
- * every handle taken out of it, including every `AMbyteSpan` view.
+ * `AMresult` is the one owning type in the *result* half of this API. A
+ * function that can fail returns `AMresult *`; the caller owns it and must
+ * release it with `AMresultFree()` exactly once, on every path, including the
+ * error path. Every handle taken out of a result — `AMdoc *`, `AMitem *`,
+ * `AMactorId const *`, `AMchange *`, `AMcursor *`, `AMobjId *`,
+ * `AMsyncHave const *`, `AMsyncMessage const *`, `AMsyncState *` — is a
+ * **borrow into that result** and has no destructor of its own: there is no
+ * `AMdocFree`, no `AMitemFree`, no `AMobjIdFree`, no `AMchangeFree`, no
+ * `AMcursorFree`, no `AMmarkFree`, and no `AMsync*Free`. Freeing the owning
+ * `AMresult` invalidates every handle taken out of it, including every
+ * `AMbyteSpan` view.
  *
- * The single exception is `AMitemResult()`, which clones the item's reference
- * count into a fresh one-item `AMresult` so that the item outlives the
- * collection it came from. That new result is owned by the caller on exactly
- * the same terms.
+ * **Three things in this header are not that, and each owns itself:**
+ *
+ * | Function | Returns | The caller releases it with |
+ * | --- | --- | --- |
+ * | `AMitemResult()` | a fresh one-item `AMresult` that clones the item's reference count | `AMresultFree()`, same as any other result |
+ * | `AMstackCallbackDataInit()` / `AMexpect()` | an `AMstackCallbackData *` from `malloc` | `free()` |
+ * | `AMstrdup()` | a NUL-terminated `char *` from `malloc` | `free()` |
+ *
+ * An `AMstack *` is a fourth kind of value rather than a fifth: it owns the
+ * `AMresult`s pushed onto it, and `AMstackFree()` releases every one of them
+ * and sets the caller's pointer to `NULL`. A result taken back out with
+ * `AMstackPop()` belongs to the caller again and needs `AMresultFree()`.
+ *
+ * \section threads Thread confinement
+ *
+ * \warning **Calls from different threads must use one caller-owned global
+ *          serialization boundary, even across distinct handles.** They must
+ *          not overlap. This is stronger than "do not share one object between
+ *          threads", and the reasons are three.
+ *
+ * 1. **There are no locks.** Several accessors memoise a result inside a
+ *    handle whose prototype is `const`, an item's reference count is a plain
+ *    integer, and there is no interior mutability over which a lock could be
+ *    taken. Handing one `AMresult *`, one handle, one `AMitems`, one
+ *    `AMstack` or one `AMbyteSpan` to a second thread while the first is still
+ *    using it is undefined behaviour.
+ *
+ * 2. **Construction and randomness share one process-wide runtime.** This
+ *    library cannot ask a C caller for a runtime, so it binds one at the ABI
+ *    seam — the standard library's explicitly single-threaded provider, named
+ *    `c_io` in `src/c/doc.zig` — and every entry point that builds a document
+ *    or draws an actor id reaches it: `AMcreate()`, `AMclone()`, `AMfork()`,
+ *    `AMload()`, `AMloadIncremental()`, `AMchangeLoadDocument()` and
+ *    `AMactorIdInit()`. That provider is shared by the whole process and its
+ *    own documentation states that it does not support concurrency, so
+ *    **two independent documents in two threads are not safe either**.
+ *
+ * 3. **A thread-safe allocator is not a thread-safe library.** Allocation
+ *    goes through `malloc` and `free`, which the C standard does require to
+ *    be thread-safe — and that is exactly why this rule is about this library
+ *    rather than about the heap. Reason 1 is what the heap's safety does not
+ *    cover.
+ *
+ * In practice: hold one lock of your own around each outer call into this
+ * library, through its return and any callback it invokes. An `AMstackCallback`
+ * invoked by `AMstackResult()`, `AMstackItem()` or `AMstackItems()` may
+ * synchronously inspect the stack and result on that same thread, including
+ * advancing a local borrowed `AMitems` cursor and copying result diagnostics.
+ * Such nested inspection is inside the already-held boundary:
+ * **do not reacquire or release that lock**.
+ * The callback must keep the stack and result live and must not change their
+ * ownership or links; see the callback contract below. This is not permission
+ * for general mutation, other reentrancy or cross-thread entry. Two threads may
+ * use distinct handles or the same handle only under this one global boundary.
+ * A caller who needs genuine concurrency should use separate processes.
  */
 
 #ifndef AUTOMERGE_H
@@ -310,36 +378,102 @@ typedef struct AMitems {
  * An unrecognised tag reads back as the literal string "???"
  * (`enum-string-functions-gen.cmake:55-57`) and `AMxxxFromString()` returns
  * `false` without writing through `dest` (`:77-79`).
+ *
+ * **This port answers `false` for a `NULL` `dest` as well**, which is a
+ * superset of the generated body rather than a change of contract: the
+ * generator writes `*dest` as its first act inside the matching branch
+ * (`:71-74`), so a caller forwarding an optional out-parameter would otherwise
+ * dereference it rather than report the miss. `src` may be `NULL` for the
+ * same reason and with the same result.
  * ------------------------------------------------------------------------- */
 
-/** \brief Gets the string representation of an `AMobjType` enum tag. */
+/**
+ * \brief Gets the string representation of an `AMobjType` enum tag.
+ * \param[in] tag An `AMobjType` enum tag.
+ * \return The tag's name, or `"???"` for any value that is not one of the
+ *         four. A static string: never freed, and outlives every handle.
+ * \warning \p tag must be compiled with the default enum lowering; see the
+ *          file-level warning.
+ */
 char const *AMobjTypeToString(AMobjType const tag);
 
-/** \brief Gets an `AMobjType` enum tag from its string representation. */
+/**
+ * \brief Gets an `AMobjType` enum tag from its string representation.
+ * \param[out] dest Where the tag is written, or `NULL`.
+ * \param[in] src A null-terminated byte string, or `NULL`.
+ * \return `true` when both pointers are non-NULL and \p src names a tag.
+ *         Otherwise returns `false`; a non-NULL destination is unchanged.
+ */
 bool AMobjTypeFromString(AMobjType *dest, char const *const src);
 
-/** \brief Gets the string representation of an `AMmarkExpand` enum tag. */
+/**
+ * \brief Gets the string representation of an `AMmarkExpand` enum tag.
+ * \param[in] tag An `AMmarkExpand` enum tag.
+ * \return The tag's name, or `"???"` for any other value. A static string.
+ * \warning The default enum lowering applies; see the file-level warning.
+ */
 char const *AMmarkExpandToString(AMmarkExpand const tag);
 
-/** \brief Gets an `AMmarkExpand` enum tag from its string representation. */
+/**
+ * \brief Gets an `AMmarkExpand` enum tag from its string representation.
+ * \param[out] dest Where the tag is written, or `NULL`.
+ * \param[in] src A null-terminated byte string, or `NULL`.
+ * \return `true` when both pointers are non-NULL and \p src names a tag.
+ *         Otherwise returns `false`; a non-NULL destination is unchanged.
+ */
 bool AMmarkExpandFromString(AMmarkExpand *dest, char const *const src);
 
-/** \brief Gets the string representation of an `AMidxType` enum tag. */
+/**
+ * \brief Gets the string representation of an `AMidxType` enum tag.
+ * \param[in] tag An `AMidxType` enum tag.
+ * \return The tag's name, or `"???"` for any other value. A static string.
+ * \warning The default enum lowering applies; see the file-level warning.
+ */
 char const *AMidxTypeToString(AMidxType const tag);
 
-/** \brief Gets an `AMidxType` enum tag from its string representation. */
+/**
+ * \brief Gets an `AMidxType` enum tag from its string representation.
+ * \param[out] dest Where the tag is written, or `NULL`.
+ * \param[in] src A null-terminated byte string, or `NULL`.
+ * \return `true` when both pointers are non-NULL and \p src names a tag.
+ *         Otherwise returns `false`; a non-NULL destination is unchanged.
+ */
 bool AMidxTypeFromString(AMidxType *dest, char const *const src);
 
-/** \brief Gets the string representation of an `AMvalType` enum tag. */
+/**
+ * \brief Gets the string representation of an `AMvalType` enum tag.
+ * \param[in] tag An `AMvalType` enum tag.
+ * \return The tag's name, or `"???"` for any other value. A static string.
+ * \note `-fshort-enums` cannot shrink this enum — its largest tag is
+ *       `1 << 20` — so it is four bytes under every lowering.
+ */
 char const *AMvalTypeToString(AMvalType const tag);
 
-/** \brief Gets an `AMvalType` enum tag from its string representation. */
+/**
+ * \brief Gets an `AMvalType` enum tag from its string representation.
+ * \param[out] dest Where the tag is written, or `NULL`.
+ * \param[in] src A null-terminated byte string, or `NULL`.
+ * \return `true` when both pointers are non-NULL and \p src names a tag.
+ *         Otherwise returns `false`; a non-NULL destination is unchanged.
+ */
 bool AMvalTypeFromString(AMvalType *dest, char const *const src);
 
-/** \brief Gets the string representation of an `AMstatus` enum tag. */
+/**
+ * \brief Gets the string representation of an `AMstatus` enum tag.
+ * \param[in] tag An `AMstatus` enum tag.
+ * \return The tag's name, or `"???"` for any other value. A static string.
+ * \warning The default enum lowering applies; see the file-level warning.
+ */
 char const *AMstatusToString(AMstatus const tag);
 
-/** \brief Gets an `AMstatus` enum tag from its string representation. */
+/**
+ * \brief Gets an `AMstatus` enum tag from its string representation.
+ * \param[out] dest Where the tag is written, or `NULL`.
+ * \param[in] src A null-terminated byte string, or `NULL`.
+ * \return `true` when both pointers are non-NULL and \p src names a tag.
+ *         Otherwise returns `false`; a non-NULL destination is unchanged.
+ * \note The three tags are the whole of what `AMresultStatus()` can return.
+ */
 bool AMstatusFromString(AMstatus *dest, char const *const src);
 
 /* -------------------------------------------------------------------------
@@ -353,8 +487,14 @@ bool AMstatusFromString(AMstatus *dest, char const *const src);
  * \param[in] count The count of bytes to view from the array pointed to by
  *                  \p src.
  * \return An `AMbyteSpan` struct.
- * \pre \p count `<= sizeof(`\p src `)`
- * \post `(`\p src `== NULL) -> (AMbyteSpan){NULL, 0}`
+ * \pre When `src` is not `NULL`, `count` bytes starting at it must be
+ *      readable. **There is no upper bound on `count`.**
+ * \post (`src` `== NULL) -> (AMbyteSpan){NULL, 0}`
+ * \note `count` is *ignored* when `src` is `NULL`, not merely clamped:
+ *       a null pointer normalises the whole span to `{NULL, 0}`, so
+ *       `AMbytes(NULL, SIZE_MAX)` is a call the caller can make. This is
+ *       upstream's `src/byte_span.rs:179` and it is what makes the
+ *       precondition above conditional on `src` rather than on `count`.
  *
  * Rust: `src/byte_span.rs:176`.
  */
@@ -453,8 +593,16 @@ void AMresultFree(AMresult *result);
  *         error result or holds no items.
  * \pre \p result `!= NULL`
  * \warning The returned pointer borrows from \p result. It is invalidated by
- *          `AMresultFree()` and by `AMresultCat()`, which is the only other
- *          function that consumes an `AMitems` view of the same array.
+ *          `AMresultFree()` and by nothing else. In particular
+ *          `AMresultCat()` **does not** invalidate it: `cat` takes two
+ *          `const AMresult *` and no `AMitems` at all, and it leaves both
+ *          inputs alive, so an `AMitem *` taken from either one is still good
+ *          afterwards. (`AMresultFrom()` is the function that consumes its
+ *          inputs, and it frees them.)
+ * \warning Two `AMitem *` values taken from the same result alias the same
+ *          storage, which is why `AMitemRefCount()` exists and why
+ *          `AMitemResult()` exists: it clones the reference count into a
+ *          fresh result so the item can outlive the collection.
  *
  * Rust: `src/result.rs:575-584`.
  */
@@ -507,12 +655,35 @@ AMstatus AMresultStatus(const AMresult *result);
  * \param[in] ... A \p count list of pointers, each of which is an `AMresult`
  *                struct pointer whose items will be transferred out of it and
  *                which is subsequently freed.
- * \return A pointer to an `AMresult` struct or `NULL`.
+ * \return A pointer to an `AMresult` struct, or `NULL`. **`NULL` means
+ *         either of two things and the two cannot be told apart:**
+ *
+ *         * `\p count <= 0`. An empty concatenation is not a result. This is
+ *           upstream's own answer — `result` starts as `NULL` and the loop
+ *           never runs (`src/utils/result.c:6`, `:29-32`) — and the header of
+ *           the reference utility layer says nothing else.
+ *         * An argument whose status was not `AM_STATUS_OK`, per the `\post`
+ *           below.
+ *
+ *         A caller that treats `NULL` as "no items" therefore swallows the
+ *         second case, and a caller that treats it as a failure reports one
+ *         for the first. **Guard on `\p count` before calling**, which is the
+ *         only way to tell them apart.
+ * \pre `\p count >= 0`. A negative count is `NULL`, where upstream's loop
+ *      (`src/utils/result.c:10`) would run until the index wraps and read that
+ *      many garbage pointers.
+ * \pre `\p count` bounds the stack space the implementation needs: the port's
+ *      `src/c/result_from.c` collects the arguments into a `AMresult *[count]`
+ *      on the stack, so a `count` in the millions is a stack overflow before
+ *      it is anything else. Upstream folds as it goes (`result.c:12-25`) and
+ *      has no such bound, so a value that is comfortable there is not
+ *      necessarily comfortable here.
  * \pre `∀𝑥 ∈` \p ... `, AMresultStatus(𝑥) == AM_STATUS_OK`
  * \post `(∃𝑥 ∈` \p ... `, AMresultStatus(𝑥) != AM_STATUS_OK) -> NULL`
  * \attention All `AMresult` struct pointer arguments are passed to
  *            `AMresultFree()` regardless of success. Use `AMresultCat()`
- *            instead if you wish to free them yourself.
+ *            instead if you wish to free them yourself. **This is the exact
+ *            opposite of `AMresultCat()`'s contract, which consumes nothing.**
  * \warning The returned `AMresult` struct pointer must be passed to
  *          `AMresultFree()` in order to avoid a memory leak.
  *
@@ -559,11 +730,30 @@ AMresult *AMactorIdFromBytes(const uint8_t *src, size_t count);
 /** \brief Allocates a new actor identifier from a hexadecimal string view. Rust: `src/actor_id.rs:164`. */
 AMresult *AMactorIdFromStr(AMbyteSpan value);
 
-/** \brief Gets an actor identifier as a UTF-8 hexadecimal string view. Rust: `src/actor_id.rs:188`. */
+/**
+ * \brief Gets an actor identifier as a UTF-8 hexadecimal string view.
+ * \param[in] actor_id An `AMactorId const *`, or `NULL`.
+ * \return Twice as many bytes as the actor id has, lower-case hexadecimal, or
+ *         `(AMbyteSpan){NULL, 0}` when \p actor_id is `NULL`.
+ * \warning The span borrows the handle and is invalidated by
+ *          `AMresultFree()`. The same bytes and the same pointer come back on
+ *          every call.
+ * Rust: `src/actor_id.rs:188`.
+ */
 AMbyteSpan AMactorIdStr(const AMactorId *actor_id);
 
 /* -------------------------------------------------------------------------
  * AMchange. Rust: src/change.rs.
+ *
+ * **A `NULL` `AMchange *` is not an error here.** Upstream dereferences the
+ * handle inside a `match … { None => <this value> }` arm for every one of
+ * these, and the value in the arm is what the `\return` lines below record:
+ * the sentinel `UINT64_MAX` / `INT64_MAX`, the zero span, `0`, `true`. They
+ * are upstream's own answers (`src/change.rs:241`, `:261`, `:279`, `:298`,
+ * `:316`, `:335`), kept because a caller that already checks its handle sees
+ * no difference — but a caller that *forwards* an optional change cannot tell
+ * a real `UINT64_MAX` operation id from the one that means "no change", and
+ * **that is the caller's to resolve by checking the handle first.**
  * ------------------------------------------------------------------------- */
 
 /** \brief Gets the first referenced actor identifier in a change. Rust: `src/change.rs:81`. */
@@ -575,7 +765,14 @@ void AMchangeCompress(AMchange *change);
 /** \brief Gets the dependencies of a change. Rust: `src/change.rs:117`. */
 AMresult *AMchangeDeps(const AMchange *change);
 
-/** \brief Gets a change's extra bytes. Rust: `src/change.rs:135`. */
+/**
+ * \brief Gets a change's extra bytes (the author footer).
+ * \param[in] change An `AMchange *`, or `NULL`.
+ * \return The footer as a view into \p change, or `(AMbyteSpan){NULL, 0}`
+ *         when \p change is `NULL`.
+ * \warning The span borrows from \p change and dies with `AMresultFree()`.
+ * Rust: `src/change.rs:135`.
+ */
 AMbyteSpan AMchangeExtraBytes(const AMchange *change);
 
 /** \brief Loads a change from an array of bytes. Rust: `src/change.rs:160`. */
@@ -584,28 +781,71 @@ AMresult *AMchangeFromBytes(const uint8_t *src, size_t count);
 /** \brief Gets a change's hash. Rust: `src/change.rs:176`. */
 AMbyteSpan AMchangeHash(const AMchange *change);
 
-/** \brief Tests whether a change contains no operations. Rust: `src/change.rs:194`. */
+/**
+ * \brief Tests whether a change contains no operations.
+ * \param[in] change An `AMchange *`, or `NULL`.
+ * \return `true` for a change with no operations, **and `true` for `NULL`**:
+ *         there is nothing there, and nothing there is empty.
+ * Rust: `src/change.rs:194`.
+ */
 bool AMchangeIsEmpty(const AMchange *change);
 
 /** \brief Loads a document containing exactly one change. Rust: `src/change.rs:219`. */
 AMresult *AMchangeLoadDocument(const uint8_t *src, size_t count);
 
-/** \brief Gets a change's maximum operation id. Rust: `src/change.rs:237`. */
+/**
+ * \brief Gets a change's maximum operation id.
+ * \param[in] change An `AMchange *`, or `NULL`.
+ * \return The highest operation id in \p change, or `UINT64_MAX` when \p
+ *         change is `NULL`.
+ * Rust: `src/change.rs:237`.
+ */
 uint64_t AMchangeMaxOp(const AMchange *change);
 
-/** \brief Gets a change's message. Rust: `src/change.rs:257`. */
+/**
+ * \brief Gets a change's message.
+ * \param[in] change An `AMchange *`, or `NULL`.
+ * \return The message as a view into \p change, or `(AMbyteSpan){NULL, 0}`
+ *         when \p change is `NULL`. A change with no message and one with an
+ *         empty message are the same answer.
+ * \warning The span borrows from \p change and dies with `AMresultFree()`.
+ * Rust: `src/change.rs:257`.
+ */
 AMbyteSpan AMchangeMessage(const AMchange *change);
 
-/** \brief Gets a change's sequence number. Rust: `src/change.rs:275`. */
+/**
+ * \brief Gets a change's sequence number.
+ * \param[in] change An `AMchange *`, or `NULL`.
+ * \return The change's index in its actor's change chunk — numbered from
+ *         **one**, not zero — or `UINT64_MAX` when \p change is `NULL`.
+ * Rust: `src/change.rs:275`.
+ */
 uint64_t AMchangeSeq(const AMchange *change);
 
-/** \brief Gets the count of operations in a change. Rust: `src/change.rs:294`. */
+/**
+ * \brief Gets the count of operations in a change.
+ * \param[in] change An `AMchange *`, or `NULL`.
+ * \return The count of operations, or `0` when \p change is `NULL`.
+ * Rust: `src/change.rs:294`.
+ */
 size_t AMchangeSize(const AMchange *change);
 
-/** \brief Gets a change's starting operation id. Rust: `src/change.rs:312`. */
+/**
+ * \brief Gets a change's starting operation id.
+ * \param[in] change An `AMchange *`, or `NULL`.
+ * \return The lowest operation id in \p change, or `UINT64_MAX` when \p
+ *         change is `NULL`.
+ * Rust: `src/change.rs:312`.
+ */
 uint64_t AMchangeStartOp(const AMchange *change);
 
-/** \brief Gets a change's timestamp, in *nix milliseconds. Rust: `src/change.rs:331`. */
+/**
+ * \brief Gets a change's timestamp, in *nix milliseconds.
+ * \param[in] change An `AMchange *`, or `NULL`.
+ * \return The time passed to `AMcommit()`, or `INT64_MAX` when \p change is
+ *         `NULL`.
+ * Rust: `src/change.rs:331`.
+ */
 int64_t AMchangeTime(const AMchange *change);
 
 /** \brief Gets a change's raw bytes. Rust: `src/change.rs:350`. */
@@ -992,10 +1232,20 @@ AMresult *AMmarks(const AMdoc *doc, const AMobjId *obj_id, const AMitems *heads)
 
 /**
  * \brief Creates a mark over a range of a list or text object.
- * \pre \p value `!= NULL`. Upstream dereferences it without checking
- *      (`src/doc/mark.rs:250`), so a `NULL` there is a crash, not an error
- *      result.
- * \pre \p expand `!= AM_MARK_EXPAND_DEFAULT`
+ * \param[in] value The value the mark holds, or `NULL`.
+ * \return An `AMresult` carrying an `AM_VAL_TYPE_MARK` item, or an error
+ *         result.
+ * \pre \p expand `!= AM_MARK_EXPAND_DEFAULT`. The conversion rejects it with
+ *      an error result (`src/doc/mark.rs:59-77`); it is not a crash.
+ * \warning **A `NULL` \p value is an error result here, not a crash.**
+ *          Upstream dereferences it without checking
+ *          (`src/doc/mark.rs:250`), so this port checks and answers
+ *          ``AMresult::error("Invalid `AMitem*`")`` instead of turning a C bug
+ *          into a segfault. Every caller that passes a real item takes the
+ *          same path upstream does; a caller that guards its pointer learns
+ *          that the guard was worth having, not that it was pointless.
+ * \warning \p name is copied into the document, so the span need not outlive
+ *          the call; \p value is stored, not copied, and the item must.
  *
  * Rust: `src/doc/mark.rs:236`.
  */
@@ -1010,33 +1260,99 @@ AMresult *AMmarkClear(AMdoc *doc, const AMobjId *obj_id, size_t start, size_t en
  * `AMsyncState` and `AMsyncMessage` are mutable here because
  * `AMgenerateSyncMessage` and `AMreceiveSyncMessage` take a `*mut` state, but
  * the state itself is still owned by the `AMresult` that produced it.
+ *
+ * **A `NULL` sync handle is answered in one of two ways, and which one
+ * depends on the function.** The accessors that read a list out of a handle —
+ * `AMsyncHaveLastSync()`, `AMsyncMessageHaves()`, `AMsyncMessageHeads()`,
+ * `AMsyncMessageNeeds()` — answer an **empty success**: the status is
+ * `AM_STATUS_OK` and the size is `0`, because upstream's
+ * `None => Default::default()` arm turns an empty slice into an empty result
+ * (`src/sync/have.rs:37-40`, `src/sync/message.rs:98`, `:118`, `:139`).
+ * The two encoders answer an **error result** carrying the reference's own
+ * hard-coded message, ``"Invalid `AMsyncMessage*`"`` and ``"Invalid
+ * `AMsyncState*`"`` (`src/sync/message.rs:12-19`, `src/sync/state.rs:8-15`).
+ * Those strings are reproduced byte for byte because a C caller can match on
+ * them. `AMsyncStateEqual()` is the third case and is documented on itself:
+ * two `NULL`s are **not** equal.
+ *
+ * **A `NULL` `has_value` is a third thing again, and it is an error result
+ * and not undefined behaviour.** Upstream writes through it unconditionally
+ * (`src/sync/state.rs:186-201`, `:218-232`, `:250-264`); this port refuses
+ * with ``AMresult::error("Invalid `bool*`")``. A caller that honours the
+ * precondition sees no difference.
  * ------------------------------------------------------------------------- */
 
-/** \brief Gets a have's last sync sequence. Rust: `src/sync/have.rs:37`. */
+/**
+ * \brief Gets a have's last sync sequence.
+ * \param[in] sync_have An `AMsyncHave const *`, or `NULL`.
+ * \return An `AMresult` of `AM_VAL_TYPE_CHANGE_HASH` items, or an **empty
+ *         success** when \p sync_have is `NULL`.
+ * Rust: `src/sync/have.rs:37`.
+ */
 AMresult *AMsyncHaveLastSync(const AMsyncHave *sync_have);
 
 /** \brief Decodes a sync message from an array of bytes. Rust: `src/sync/message.rs:64`. */
 AMresult *AMsyncMessageDecode(const uint8_t *src, size_t count);
 
-/** \brief Encodes a sync message. Rust: `src/sync/message.rs:82`. */
+/**
+ * \brief Encodes a sync message.
+ * \param[in] sync_message An `AMsyncMessage const *`, or `NULL`.
+ * \return An `AMresult` holding one `AM_VAL_TYPE_BYTES` item, or an error
+ *         result. A `NULL` \p sync_message is the error result
+ *         ``"Invalid `AMsyncMessage*`"``.
+ * Rust: `src/sync/message.rs:82`.
+ */
 AMresult *AMsyncMessageEncode(const AMsyncMessage *sync_message);
 
-/** \brief Gets the haves a sync message carries. Rust: `src/sync/message.rs:100`. */
+/**
+ * \brief Gets the haves a sync message carries.
+ * \param[in] sync_message An `AMsyncMessage const *`, or `NULL`.
+ * \return An `AMresult` of `AM_VAL_TYPE_SYNC_HAVE` items, or an **empty
+ *         success** when \p sync_message is `NULL`.
+ * Rust: `src/sync/message.rs:100`.
+ */
 AMresult *AMsyncMessageHaves(const AMsyncMessage *sync_message);
 
-/** \brief Gets the heads a sync message carries. Rust: `src/sync/message.rs:120`. */
+/**
+ * \brief Gets the heads a sync message carries.
+ * \param[in] sync_message An `AMsyncMessage const *`, or `NULL`.
+ * \return An `AMresult` of `AM_VAL_TYPE_CHANGE_HASH` items, or an **empty
+ *         success** when \p sync_message is `NULL`.
+ * Rust: `src/sync/message.rs:120`.
+ */
 AMresult *AMsyncMessageHeads(const AMsyncMessage *sync_message);
 
-/** \brief Gets the needs a sync message carries. Rust: `src/sync/message.rs:141`. */
+/**
+ * \brief Gets the needs a sync message carries.
+ * \param[in] sync_message An `AMsyncMessage const *`, or `NULL`.
+ * \return An `AMresult` of `AM_VAL_TYPE_CHANGE_HASH` items, or an **empty
+ *         success** when \p sync_message is `NULL`.
+ * Rust: `src/sync/message.rs:141`.
+ */
 AMresult *AMsyncMessageNeeds(const AMsyncMessage *sync_message);
 
 /** \brief Decodes a sync state from an array of bytes. Rust: `src/sync/state.rs:73`. */
 AMresult *AMsyncStateDecode(const uint8_t *src, size_t count);
 
-/** \brief Encodes a sync state. Rust: `src/sync/state.rs:91`. */
+/**
+ * \brief Encodes a sync state.
+ * \param[in] sync_state An `AMsyncState const *`, or `NULL`.
+ * \return An `AMresult` holding one `AM_VAL_TYPE_BYTES` item, or an error
+ *         result. A `NULL` \p sync_state is the error result
+ *         ``"Invalid `AMsyncState*`"``.
+ * Rust: `src/sync/state.rs:91`.
+ */
 AMresult *AMsyncStateEncode(const AMsyncState *sync_state);
 
-/** \brief Tests two sync states for equality. Rust: `src/sync/state.rs:111`. */
+/**
+ * \brief Tests two sync states for equality.
+ * \return `true` only when both handles are non-`NULL` and their thirteen
+ *         fields match. **Two `NULL`s are not equal**, and neither is a
+ *         `NULL` and a real state: that is upstream's own match arm
+ *         (`src/sync/state.rs:118`) and its `\post`
+ *         (`src/sync/state.rs:105`).
+ * Rust: `src/sync/state.rs:111`.
+ */
 bool AMsyncStateEqual(const AMsyncState *sync_state1, const AMsyncState *sync_state2);
 
 /** \brief Allocates a new sync state. Rust: `src/sync/state.rs:129`. */
@@ -1050,18 +1366,43 @@ AMresult *AMsyncStateLastSentHeads(const AMsyncState *sync_state);
 
 /**
  * \brief Gets the other peer's haves.
- * \param[out] has_value Set to `true` when the returned items are relevant.
- * \pre \p has_value `!= NULL`. Upstream writes through it unconditionally
- *      (`src/sync/state.rs:186-201`), so `NULL` there is undefined behaviour.
- *
+ * \param[in] sync_state An `AMsyncState const *`, or `NULL`.
+ * \param[out] has_value Set to `true` when the returned items are relevant,
+ *                      `false` otherwise. May be `NULL`.
+ * \return An `AMresult` of `AM_VAL_TYPE_SYNC_HAVE` items, or an **empty
+ *         success** when the state is `NULL` or has no haves for the peer.
+ * \warning **A `NULL` \p has_value is an error result, not undefined
+ *          behaviour.** Upstream writes through it unconditionally
+ *          (`src/sync/state.rs:186-201`); this port refuses with
+ *          ``AMresult::error("Invalid `bool*`")`` rather than turning a C bug
+ *          into a segfault. Every caller that honours the precondition takes
+ *          the same path upstream does.
  * Rust: `src/sync/state.rs:186`.
  */
 AMresult *AMsyncStateTheirHaves(const AMsyncState *sync_state, bool *has_value);
 
-/** \brief Gets the other peer's heads. \pre \p has_value `!= NULL`. Rust: `src/sync/state.rs:218`. */
+/**
+ * \brief Gets the other peer's heads.
+ * \param[in] sync_state An `AMsyncState const *`, or `NULL`.
+ * \param[out] has_value Set to `true` when the returned items are relevant.
+ *                      May be `NULL`, with the same error result as
+ *                      `AMsyncStateTheirHaves()`.
+ * \return An `AMresult` of `AM_VAL_TYPE_CHANGE_HASH` items, or an **empty
+ *         success** when the state is `NULL` or has no heads for the peer.
+ * Rust: `src/sync/state.rs:218`.
+ */
 AMresult *AMsyncStateTheirHeads(const AMsyncState *sync_state, bool *has_value);
 
-/** \brief Gets the other peer's needs. \pre \p has_value `!= NULL`. Rust: `src/sync/state.rs:250`. */
+/**
+ * \brief Gets the other peer's needs.
+ * \param[in] sync_state An `AMsyncState const *`, or `NULL`.
+ * \param[out] has_value Set to `true` when the returned items are relevant.
+ *                      May be `NULL`, with the same error result as
+ *                      `AMsyncStateTheirHaves()`.
+ * \return An `AMresult` of `AM_VAL_TYPE_CHANGE_HASH` items, or an **empty
+ *         success** when the state is `NULL` or has no needs for the peer.
+ * Rust: `src/sync/state.rs:250`.
+ */
 AMresult *AMsyncStateTheirNeeds(const AMsyncState *sync_state, bool *has_value);
 
 /* -------------------------------------------------------------------------
@@ -1075,9 +1416,17 @@ AMresult *AMsyncStateTheirNeeds(const AMsyncState *sync_state, bool *has_value);
  * `include/automerge-c/utils/{result,string,stack,stack_callback_data}.h`
  * plus `src/utils/{result,string,stack,stack_callback_data}.c`.
  *
- * None of these allocates a type the caller must not free: the stack nodes
- * and the callback data are released by `AMstackFree()` and `free()`
- * respectively, and the strings are released by `free()`.
+ * **Two of these return memory the caller owns**, which is the one place the
+ * ownership section above does not reach: `AMstackCallbackDataInit()` and
+ * `AMexpect()` return a `malloc` allocation that must be passed to `free()`,
+ * and so does `AMstrdup()`. An `AMstack *` is a third kind of value: it owns
+ * the `AMresult`s pushed onto it, `AMstackFree()` releases all of them and
+ * nulls the caller's pointer, and a result taken back out with
+ * `AMstackPop()` is the caller's again. The rest borrow.
+ *
+ * All three of the allocating ones come from the C runtime's `malloc`, which is
+ * what makes `free()` the correct release. Separate results do not exempt calls
+ * from the global serialization rule above.
  * ------------------------------------------------------------------------- */
 
 /**
@@ -1101,6 +1450,31 @@ typedef struct AMstack {
  *         `false` leaves the result on the stack, so it is still freed by
  *         `AMstackFree()`.
  * \pre \p stack `!= NULL`
+ *
+ * `AMstackResult()`, `AMstackItem()` and `AMstackItems()` invoke this callback
+ * synchronously on the invoking thread, after pushing the result and before
+ * returning. It borrows the stack and its result; it receives \p data unchanged,
+ * including `NULL`. The library neither retains nor frees \p data. Keep the
+ * callback code and any context it accesses valid through their last use; a
+ * callback may release context it owns after that last use.
+ *
+ * The callback may inspect the stack, result and borrowed items (for example,
+ * `AMstackSize()`, `AMresultStatus()`, `AMresultItems()`, `AMitemsNext()` on a
+ * local cursor and `AMitemValType()`). Inspection also includes
+ * `AMresultError()`, `AMvalTypeToString()` and copying a diagnostic span with
+ * `AMstrdup()`; release that independently owned copy with `free()`, not the
+ * borrowed result. These nested calls use the outer call's already-held global
+ * lock and **must not reacquire or release it**. No general mutation, other
+ * reentrancy or cross-thread entry is permitted.
+ *
+ * Keep the stack nodes and result live and unchanged in ownership until the
+ * outer call returns: do not pop or free them, replace `*stack`, or relink the
+ * nodes. Returning `false` does not return ownership to the caller. Do not
+ * retain the callback's \p stack address. When the outer call was given a
+ * `NULL` stack, the callback instead borrows a temporary local node, and the
+ * result and all views into it are invalidated when it returns to the outer
+ * call, which frees the result. Otherwise, retained item or byte views require
+ * their owning result to stay live under the usual ownership rules.
  *
  * Rust: `include/automerge-c/utils/stack.h:39`.
  */

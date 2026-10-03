@@ -52,7 +52,14 @@ pub const sync_state_type: u8 = 0x43;
 ///
 /// An empty `Have` is a legal thing to send and is what a reset message
 /// carries (`sync.rs:632`): it claims nothing and asks for everything.
+///
+/// Single-threaded, as every type here is: there is no lock and no callback,
+/// so a record reached from two threads needs external synchronization, and
+/// there is nothing to reenter.
 pub const Have = struct {
+    /// The allocator `last_sync` was taken from and is released with, and the
+    /// one `bloom.bits` carries. It is borrowed, not owned: it must outlive
+    /// this record, and `deinit` frees through it.
     gpa: Allocator,
     /// The heads at the sender's last successful sync with the recipient
     /// (`state.rs:86`).
@@ -75,8 +82,28 @@ pub const Have = struct {
 
 /// What `State.their` returns: the peer's `have` records and the changes it
 /// asked for (`state.rs:202-206`).
+///
+/// **Both slices borrow from the [`State`] that returned the value**, and the
+/// value is a copy of two slice headers, not of the data: they name the
+/// state's own `their_have` and `their_need` allocations.
+///
+/// They stop being readable when the state does any of the following, and a
+/// `Their` held across one of these reads freed bytes:
+/// * [`State.deinit`] frees both lists;
+/// * [`State.setReadOnly`] rebuilds the state in place, which frees both;
+/// * the next [`protocol.receiveSyncMessage`](protocol.zig) frees the lists it
+///   replaces and installs the ones from the message it was given.
+///
+/// The `Have` records in `have` are the state's, not the reader's: do not
+/// `deinit` one, and do not keep it past the events above. A caller that needs
+/// them afterwards has to copy them.
 pub const Their = struct {
+    /// What the peer last said it has. Borrowed from the state's
+    /// `their_have`; see the type comment for what invalidates it and for who
+    /// releases the records.
     have: []const Have,
+    /// What the peer last asked for. Borrowed from the state's `their_need`;
+    /// see the type comment for what invalidates it.
     need: []const ChangeHash,
 };
 
@@ -84,20 +111,39 @@ pub const Their = struct {
 ///
 /// Persist with `encode` when the same peer is expected in a later session;
 /// `encode` writes only what is worth reusing across connections.
+///
+/// Single-threaded, as every type here is: no lock and no callback, so two
+/// threads on one peer need external synchronization, and nothing reenters.
+/// Copying the value copies eleven slice headers over one set of
+/// allocations, so a copy that is deinited frees what the original owns; one
+/// state per peer is deinited once.
 pub const State = struct {
+    /// The allocator every list in the state was taken from and is released
+    /// with, including the ones [`State.parse`] and [`State.decode`] fill in.
+    /// It is borrowed, not owned: it must outlive the state, and `deinit` and
+    /// the allocator-taking calls below all use it.
     gpa: Allocator,
     /// The hashes both peers have (`state.rs:35`). Advanced by
     /// `message.advanceHeads` when changes are applied (`sync.rs:424-427`),
     /// replaced with the peer's heads when we hold all of them
     /// (`sync.rs:442`), and cleared on the way out of read-only mode
     /// (`state.rs:170-174`).
+    ///
+    /// **Ascending and duplicate-free**, because [`State.encode`] asserts it
+    /// and `message.encodeHashes` assumes it (`message.zig:524-530`), and
+    /// because it is persisted. The receive path sorts what a peer advertises
+    /// before it lands here, since a wire order is the peer's to choose.
     shared_heads: []ChangeHash,
     /// Our heads the last time we generated a message (`state.rs:37`).
+    /// Ascending, because it comes from the document's own heads.
     last_sent_heads: []ChangeHash,
     /// The heads the peer last advertised (`state.rs:39`). `Some` with an
     /// empty list is the "the peer has nothing" signal that arms `sendDoc`.
+    /// **In the order the peer wrote them**, which the format does not require
+    /// to be ascending; only `shared_heads` is a sorted set here.
     their_heads: ?[]ChangeHash,
-    /// Changes the peer last explicitly asked for (`state.rs:41`).
+    /// Changes the peer last explicitly asked for (`state.rs:41`). In the
+    /// order the peer wrote them, as above.
     their_need: ?[]ChangeHash,
     /// What the peer last said it has (`state.rs:43`). A decoded state starts
     /// with an *empty* list here rather than `null` (`state.rs:139`), so a
@@ -180,7 +226,14 @@ pub const State = struct {
     ///
     /// `shared_heads` must be ascending, as `message.advanceHeads` leaves it
     /// (`sync.rs:849`) and as the assertion in `message.encodeHashes`
-    /// assumes (`sync.rs:819-824`).
+    /// assumes (`sync.rs:819-824`); a list that is not trips that assertion
+    /// in a safe build and is written as-is in a fast one.
+    ///
+    /// **The caller owns the result** and frees it with `gpa`, the allocator
+    /// given here. On an error the state is untouched and nothing is handed
+    /// over. The `gpa` argument does not have to be the state's own; it is
+    /// this call's allocator and nothing stored in the state is released
+    /// through it.
     pub fn encode(self: State, gpa: Allocator) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);
@@ -292,6 +345,11 @@ pub const State = struct {
 
     /// The peer's `have` list and `need` list, when it has sent both
     /// (`state.rs:202-206`).
+    /// Returns a copy of the value; the two slices inside it borrow from this
+    /// state. The type comment on [`Their`] names what invalidates them.
+    /// `null` means one of the two lists has never been set, which is a state
+    /// a decoded state never reaches (`state.rs:139`) and a fresh one always
+    /// is.
     pub fn their(self: State) ?Their {
         const have = self.their_have orelse return null;
         const need = self.their_need orelse return null;
@@ -333,9 +391,16 @@ pub const State = struct {
     ///
     /// Capabilities are replaced, never accumulated: a peer that stops
     /// advertising sync-reset support loses it.
+    ///
+    /// **The copy is taken before the old list is released**, so
+    /// `error.OutOfMemory` leaves the state holding the capabilities it
+    /// already had instead of a pointer to freed bytes that
+    /// [`State.supportsV2Messages`] and [`State.peerSupportsSyncReset`] would
+    /// then read. `caps` is borrowed and left alone.
     pub fn setTheirCapabilities(self: *State, caps: []const Capability) !void {
+        const owned = try self.gpa.dupe(Capability, caps);
         if (self.their_capabilities) |old| self.gpa.free(old);
-        self.their_capabilities = try self.gpa.dupe(Capability, caps);
+        self.their_capabilities = owned;
     }
 
     /// The capabilities implied by a flags section (`sync.rs:404-411`): V2

@@ -454,6 +454,12 @@ pub const KeyBound = opsetmod.KeyBound;
 /// **A `start` at or past its `end`** is empty rather than a refusal — the
 /// `@max` in [`OpSet.mapRange`](opset/op_set.zig), which is upstream's
 /// `start..end` being a Rust `Range` ([`map_range.rs:204-208`](../../github-automerge-automerge/rust/automerge/src/iter/map_range.rs)).
+///
+/// **The keys are borrowed and the range owns nothing.** Each bound is a
+/// `[]const u8` the caller supplied — usually a key [`get`] handed out, which
+/// is the document's interned bytes — so a range built from one stays valid
+/// until the next mutation of the document, and nothing here is copied or
+/// freed.
 pub const KeyRange = struct {
     /// The first key the reader answers, or null for the start of the object.
     start: ?KeyBound = null,
@@ -1331,9 +1337,16 @@ pub fn valuesAt(
 /// its fold and gives it back with [`Spans.deinit`](iter/spans.zig), which
 /// takes no allocator. **Each span is the caller's** and carries owned text and
 /// an owned mark set, so [`Span.deinit`](iter/spans.zig) frees it with `gpa`;
-/// the mark *names* inside it are the document's and are not freed. The reader
-/// must be freed **after** the spans it handed out, because those spans came
-/// out of its fold.
+/// the mark *names* inside it are the document's and are not freed.
+///
+/// **The two are independent and the order between them is the caller's
+/// business.** A span **shares no storage with the fold** — the run buffer is
+/// handed over rather than borrowed, and the mark set is exported afresh (the
+/// module doc of [iter/spans.zig](iter/spans.zig) is where both are argued) —
+/// so a span may be read *after* the reader is freed, and freeing the reader
+/// does not touch it. What a reader *does* expire is the reader: it reads the
+/// document's borrowed scope clock lazily, so free it before the next scoped
+/// read ([`spansAt`]).
 ///
 /// [API.md](../API.md) gives this method no allocator; the fold allocates and
 /// upstream's `Spans` owns `Arc<MarkSet>`s and a `String`
@@ -1366,9 +1379,11 @@ pub fn spans(doc: *const Document, obj: ExId, gpa: Allocator) ReadError!Spans {
 /// and **naming the document's own heads reads the present**
 /// ([`automerge.rs`:1241-1246](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
 ///
-/// **The clock is borrowed from the document**, and this walk holds the mark
-/// set each span names: free the walk, and the spans it handed out, before
-/// the next `_at` read at other heads.
+/// **The clock is borrowed from the document** and the walk reads it lazily, so
+/// free the reader before the next `_at` read at other heads. **The spans it
+/// has already handed out are not part of that rule** — they are detached, and
+/// the only thing about them that expires is their mark *names*, which are the
+/// document's interned bytes and last until the next mutation.
 pub fn spansAt(
     doc: *const Document,
     obj: ExId,
@@ -1405,6 +1420,13 @@ pub fn spansAt(
 ///
 /// [API.md](../API.md) gives this method no allocator; the return type is a
 /// list, so it takes one. The report names it as a deviation.
+///
+/// `error.NotAnObject` for an id that names no object, from [`liveObj`] —
+/// upstream's `exid_to_obj` (`:1574`) — and **that is the one refusal this
+/// method adds** to the mark fold's own error set. The two cases below are
+/// answers and not errors, which is why they read as rules rather than as
+/// refusals; every sibling that resolves an id states the refusal the same way
+/// ([`get`], [`text`], [`spans`], [`markSetAtScope`]).
 ///
 /// **A non-sequence is the empty list, not an error**: upstream's
 /// `let Some(seq_type) = .. else { return Ok(Vec::new()) }` with its own
@@ -1456,6 +1478,9 @@ pub fn marks(doc: *const Document, obj: ExId, gpa: Allocator) ReadError![]Mark {
 /// and **naming the document's own heads reads the present**
 /// ([`automerge.rs`:1241-1246](../../github-automerge-automerge/rust/automerge/src/automerge.rs))
 /// — upstream's fast arm, in this reader's own case.
+///
+/// `error.NotAnObject` for an id that names no object, from [`liveObj`], on
+/// the same first line as [`marks`]'s and for the same reason.
 pub fn marksAt(
     doc: *const Document,
     obj: ExId,
@@ -1480,6 +1505,17 @@ pub fn marksAt(
 /// **Ownership: the slice is the caller's**, and each mark's bytes are the
 /// document's, exactly as for [`marks`]. [API.md](../API.md) gives this method
 /// no allocator; the return type is a list, so it takes one.
+///
+/// `error.NotAnObject` for an id that names no object, from [`liveObj`] through
+/// the [`marks`] call below: this method answers no window at all for one, and
+/// that is the refusal [`marks`] and [`marksAt`] both state.
+///
+/// **The empty answer is one shared zero-length slice rather than one `gpa`
+/// produced, and a caller neither needs nor can tell the difference**:
+/// `Allocator.free` returns before reaching the allocator for a slice of length
+/// zero, so `defer gpa.free(read.getMarks(..))` is correct on every input, an
+/// empty window included. The shared answer is also not mutable — there is
+/// nothing in a slice of length zero to mutate.
 ///
 /// **The window is half-open and empty when `max <= from`**, which is the
 /// convention [API.md](../API.md) states for its other ranges and the one
@@ -2495,7 +2531,7 @@ const sample_specs = [_]OpSpec{
 /// leaves every row a winner ([`OpSet.visible`](opset/op_set.zig) is
 /// `Op.visible`).
 fn sample(gpa: Allocator) !Document {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     errdefer doc.deinit();
     const a = try doc.putActorRef(gpa, actor_a);
     try testing.expectEqual(@as(types.ActorIdx, 0), a);
@@ -2532,7 +2568,7 @@ fn sample(gpa: Allocator) !Document {
 /// rather than read back as answers in an order the op set does not hold them
 /// in.
 fn rootMap(gpa: Allocator, specs: []const OpSpec) !Document {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     errdefer doc.deinit();
     const a = try doc.putActorRef(gpa, actor_a);
     const ops = try buildOps(gpa, a, specs);
@@ -2629,16 +2665,17 @@ fn insertIntoList(gpa: Allocator, doc: *Document, ctr: u32, index: usize, text_b
 /// splice: the op set's own mutating entry point is
 /// [`OpSet.addSuccWithUndo`](opset/op_set.zig), which writes the edge *and*
 /// takes the row out of the visible index — `:1584-1591` calls that arm a
-/// delete and lists the three things it stops. The undo list it returns is
-/// **not** replayed, which is what "not undoing this" means, and it is freed.
+/// delete and lists the three things it stops. The supplied undo journal is
+/// **not** replayed: its storage is freed after the fixture edit.
 fn deleteElem(gpa: Allocator, doc: *Document, victim: OpId, delete_id: OpId) !void {
     const set = mutableOps(doc);
     const pos = (try set.getOpIdPos(victim)) orelse return error.TestUnexpectedResult;
     var walk = try set.iterRange(.{ .start = pos, .end = pos + 1 });
     const row = (try walk.next()) orelse return error.TestUnexpectedResult;
     const ins = row.addSucc(delete_id, null);
-    const undo = try set.addSuccWithUndo(&.{ins});
-    gpa.free(undo);
+    var undo: std.ArrayList(opmod.SuccUndo) = .empty;
+    defer undo.deinit(gpa);
+    try set.addSuccWithUndo(&.{ins}, &undo);
     try set.rebuildIndex();
 }
 
@@ -3731,7 +3768,7 @@ test "a list and an unknown id are empty map ranges, and a map reads as a one-el
 
 test "an empty document answers every method rather than trapping" {
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     defer doc.deinit();
 
     // **The premise**: a document with no changes, no rows and no actors.
@@ -3957,7 +3994,7 @@ test "getChangeByHash answers null for a hash the document does not hold" {
 
 test "getMissingDeps answers the hashes the document lacks, and none of the ones it holds" {
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     defer doc.deinit();
 
     // **Two empty commits, so the graph has two nodes and the second depends
@@ -4233,7 +4270,7 @@ const TextDoc = struct {
 };
 
 fn textFixture(gpa: Allocator, encoding: TextEncoding, body: []const u8) !TextDoc {
-    var doc = try Document.initWithEncoding(gpa, encoding, .auto);
+    var doc = try Document.initWithEncoding(gpa, std.testing.io, encoding, .auto);
     errdefer doc.deinit();
     // **A named actor, because a random one would make a failure
     // unreproducible.** Upstream draws one (`automerge.rs`:307-317); the
@@ -5460,7 +5497,7 @@ const ScopedDoc = struct {
 };
 
 fn scopedFixture(gpa: Allocator) !ScopedDoc {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, std.testing.io, .manual);
     errdefer doc.deinit();
     // **A named actor, because a random one would make a failure
     // unreproducible** — [`textFixture`] gives the reason.
@@ -5754,7 +5791,7 @@ const AtHeads = struct {
 };
 
 fn atHeadsFixture(gpa: Allocator) !AtHeads {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, std.testing.io, .manual);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = "aaaaaaaa" });
     var tx = try trans.Transaction.open(gpa, &doc);
@@ -7706,7 +7743,7 @@ fn expectMirroredValue(
 /// two things a naive walk gets wrong: **a deleted key** and **a conflicted
 /// key**.
 fn mirrorFixture(gpa: Allocator) !Document {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = "aaaaaaaa" });
 
@@ -7863,7 +7900,7 @@ test "hydrate at null heads mirrors the document, element by element" {
 test "hydrate at heads does not see the writes the heads exclude" {
     const gpa = testing.allocator;
     const enc: TextEncoding = .unicode_code_point;
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = "aaaaaaaa" });
 
@@ -7983,7 +8020,7 @@ test "hydrate reads a list and a text object as themselves" {
     // mutating this method's `.text` arm to build an empty text left all three
     // of them green. This test closes it.
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = "aaaaaaaa" });
 
@@ -8067,7 +8104,7 @@ test "hydrate reads a list and a text object as themselves" {
 
 test "hydrate at null heads is the document's own scope" {
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = "aaaaaaaa" });
     _ = try trans.put(&doc, .root, .{ .key = "kept" }, .{ .str = "yes" });
@@ -8346,7 +8383,7 @@ const Fix = struct {
 ///    actor through the merge renumbers `aaaaaaaa` to 1 and leaves those ids
 ///    carrying a stale index. Only [`Document.resolve`] repairs them.
 fn fix(gpa: Allocator) !Fix {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, std.testing.io, .manual);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = "aaaaaaaa" });
 

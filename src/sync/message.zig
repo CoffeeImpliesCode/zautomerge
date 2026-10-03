@@ -206,9 +206,17 @@ pub const MessageFlags = struct {
 /// or a whole `save()` (`sync/message_builder.rs:43-78`). `join` reassembles
 /// them into the single stream a document's `load_incremental` takes
 /// (`sync.rs:590-599`), and nothing in this file interprets them.
+///
+/// Single-threaded, as every type here is: no lock and no callback, so a list
+/// shared across threads needs external synchronization, and nothing reenters.
 pub const ChunkList = struct {
-    /// The element payloads, owned.
+    /// The element payloads, owned. Each one came from the same `gpa` as the
+    /// list itself, and `deinit` frees them all.
     items: [][]u8,
+    /// The allocator `items` and every payload in it were taken from and are
+    /// released with. Borrowed, not owned: it must outlive the list, and
+    /// `deinit` frees through it. `join` and `writeBytes` take their own
+    /// `gpa` and never store it.
     gpa: Allocator,
 
     /// A list with no elements (`ChunkList::empty`, `sync.rs:572-574`).
@@ -276,7 +284,21 @@ pub const ChunkList = struct {
 /// caller that hands a message to a `State` must clear those three fields
 /// first or not free the message at all. `changes` is the exception: it is
 /// read, joined, and then freed with the message.
+///
+/// `heads`, `need` and every `Have.last_sync` are **ascending**, which
+/// `encode` asserts and `parse` does not check: a message read off the wire
+/// carries whatever order the peer wrote, and a caller that re-encodes one
+/// must sort first.
+///
+/// Single-threaded, as every type here is: no lock and no callback, so a
+/// message shared across threads needs external synchronization, and nothing
+/// reenters.
 pub const Message = struct {
+    /// The allocator every list, every `Have` and the chunk list in the
+    /// message were taken from and are released with — including the three
+    /// lists a receive path moves into a `State`, which then frees them
+    /// through its own `gpa`, so the two must be the same allocator.
+    /// Borrowed, not owned: it must outlive the message.
     gpa: Allocator,
     /// The sender's heads, ascending. This is also the acknowledgement: a
     /// receiver prunes its `sent_hashes` by them (`sync.rs:430-431`).
@@ -297,6 +319,13 @@ pub const Message = struct {
     /// starting point every generated message is built from
     /// (`sync.rs:279-287`) and the shape `Message::reset` fills in
     /// (`sync.rs:625-638`).
+    ///
+    /// **It owns nothing**, so `deinit` on it is valid and releases nothing:
+    /// every field is the empty static slice or an empty chunk list. A caller
+    /// that fills a field in takes over releasing that field, which is what
+    /// makes the [`protocol.MessageBuilder`](protocol.zig) setters transfer
+    /// slices rather than copy them. `gpa` is stored for the caller's later
+    /// fills, and is borrowed.
     pub fn init(gpa: Allocator) Message {
         return .{
             .gpa = gpa,
@@ -328,6 +357,14 @@ pub const Message = struct {
     /// It is always V1 (`sync.rs:636`): a reset asks the peer to forget what
     /// it thinks it has sent, and that is a request about *their* bookkeeping
     /// rather than a payload, so there is nothing for V2 to pack differently.
+    ///
+    /// `our_heads` is copied in the order given and must therefore already be
+    /// ascending, which is what `Message.encode` assumes of `heads`.
+    ///
+    /// **The caller owns the result** and frees it with `Message.deinit`, which
+    /// releases through the `gpa` given here. `our_heads` is borrowed and left
+    /// alone. On an error nothing is handed over and every list built so far is
+    /// released.
     pub fn reset(gpa: Allocator, our_heads: []const ChangeHash) !Message {
         var heads: std.ArrayList(ChangeHash) = .empty;
         errdefer heads.deinit(gpa);
@@ -366,6 +403,15 @@ pub const Message = struct {
     /// `error.LengthExceedsInput` for a declared count or length the rest of
     /// the input cannot hold, and `error.UnexpectedEnd` for a reader that
     /// runs out of bytes.
+    ///
+    /// **The caller owns the result** and frees it with `Message.deinit`, or
+    /// hands it to [`protocol.receiveSyncMessage`](protocol.zig), which frees
+    /// it and moves three of its lists into a `State`. `bytes` is borrowed and
+    /// left alone; every field of the result is a copy. On an error nothing is
+    /// handed over.
+    ///
+    /// The lists come back in **wire order, unsorted** — see the type comment
+    /// on `heads`.
     pub fn decode(gpa: Allocator, bytes: []const u8) ParseError!Message {
         var in: Input = .init(bytes);
         return parse(gpa, &in);
@@ -378,6 +424,11 @@ pub const Message = struct {
     /// a caller that framed the message inside a larger stream can find the
     /// end of it. The flags section itself is read only when at least one
     /// byte remains (`sync.rs:657-663`).
+    ///
+    /// **The caller owns the result** and frees it with `Message.deinit`; the
+    /// same ownership as [`Message.decode`], and the same wire order. On an
+    /// error nothing is handed over, and `in` is left wherever the reader
+    /// stopped rather than at the start of the message.
     pub fn parse(gpa: Allocator, in: *Input) ParseError!Message {
         const version: MessageVersion = switch (try in.takeByte()) {
             message_type_sync => .v1,
@@ -439,9 +490,16 @@ pub const Message = struct {
     ///
     /// `heads`, `need` and every `last_sync` must be ascending: upstream
     /// asserts it (`sync.rs:819-824`) because the receiver prunes by walking
-    /// them as an ordered set. A caller that does not sort gets a panic in a
-    /// safe build and a message no peer can use in a release build, which is
-    /// the same trade upstream makes.
+    /// them as an ordered set, and [`encodeHashes`] asserts it here too. A
+    /// list that is not trips that assertion in a safe build and is written
+    /// out in the order the caller had it in a fast one, where the assertion
+    /// is compiled out. `Message.parse` does not sort, so a message that came
+    /// off the wire has to be sorted by the caller before it is re-encoded.
+    ///
+    /// **The caller owns the result** and frees it with `gpa`, the allocator
+    /// given here; it need not be the message's own, and nothing stored in the
+    /// message is released through it. On an error the message is untouched
+    /// and nothing is handed over.
     pub fn encode(self: Message, gpa: Allocator) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);
@@ -597,7 +655,7 @@ fn takeLengthPrefixedBytes(in: *Input) ParseError![]const u8 {
     // The payload starts after the prefix, so the bound is what remains once
     // the prefix is taken off.
     if (prefix.value > @as(u64, in.remaining() - prefix.len)) return error.LengthExceedsInput;
-    in.pos += prefix.len;
+    in.skip(prefix.len);
     return in.take(@intCast(prefix.value));
 }
 

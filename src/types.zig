@@ -14,7 +14,11 @@
 const std = @import("std");
 const err = @import("error.zig");
 
+/// The document API error set, re-exported so a reader of the identity types
+/// finds both sets in one place. [`error.zig`](error.zig) owns the contract.
 pub const Error = err.Error;
+/// Everything reachable from parsing untrusted bytes, re-exported for the
+/// same reason as [`Error`](types.zig).
 pub const ParseError = err.ParseError;
 
 /// An index into a document's sorted actor table.
@@ -28,10 +32,13 @@ pub const checksum_size = 4;
 
 /// A change hash: SHA-256 over an encoded change.
 pub const ChangeHash = struct {
+    /// The 32 hash bytes.
     bytes: [hash_size]u8,
 
+    /// The hash no change has. A change never compares equal to it.
     pub const zero: ChangeHash = .{ .bytes = @splat(0) };
 
+    /// Whether the two are the same hash.
     pub fn eql(a: ChangeHash, b: ChangeHash) bool {
         return std.mem.eql(u8, &a.bytes, &b.bytes);
     }
@@ -47,6 +54,8 @@ pub const ChangeHash = struct {
         return .{ self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3] };
     }
 
+    /// The hash a stored chunk checksum expands to: the four bytes it carries
+    /// and zeros everywhere else. A chunk header stores only the prefix.
     pub fn fromChecksum(sum: [checksum_size]u8) ChangeHash {
         var h: ChangeHash = .zero;
         @memcpy(h.bytes[0..checksum_size], &sum);
@@ -64,10 +73,16 @@ pub const ChangeHash = struct {
         return n;
     }
 
+    /// Whether `a` sorts before `b`; [`order`](ChangeHash.order) is the
+    /// comparison.
     pub fn lessThan(_: void, a: ChangeHash, b: ChangeHash) bool {
         return a.order(b) == .lt;
     }
 
+    /// The hash `text` spells, or `error.InvalidHex` for a string that is not
+    /// hex and `error.InvalidChangeHashBytes` for one whose length is not
+    /// [`hash_size`](types.zig). The result owns nothing the caller has to
+    /// free.
     pub fn parse(gpa: std.mem.Allocator, text: []const u8) !ChangeHash {
         const decoded = try err.hexFrom(gpa, text);
         defer gpa.free(decoded);
@@ -78,48 +93,68 @@ pub const ChangeHash = struct {
 
 /// An actor: a byte string, unique within a document, ordered lexicographically.
 ///
-/// The bytes are borrowed. An `ActorId` created by a document borrows the
-/// document's intern arena; one created by a caller borrows the caller's
-/// buffer, which must outlive it.
+/// **The bytes are borrowed, and this one type carries three ways to get
+/// them.** Which applies is decided by the call that produced the `ActorId`,
+/// not by the value, so a caller has to remember which one it holds:
+///
+/// | made by | `bytes` points at | released by |
+/// | --- | --- | --- |
+/// | [`init`](ActorId.init) | the caller's own buffer | the caller, whenever it likes |
+/// | a document ([`Document`](doc.zig)) | that document's actor table | that document's `deinit` |
+/// | [`initCopy`](ActorId.initCopy), [`random`](ActorId.random), [`fromHex`](ActorId.fromHex), [`withConcurrency`](ActorId.withConcurrency) | a fresh allocation from the allocator that call was given | the caller, with `gpa.free(id.bytes)` |
+///
+/// A borrow and an owned copy are the same type and the type system cannot
+/// tell them apart, so freeing an `ActorId.bytes` that was borrowed is a
+/// caller error with no diagnostic. That table is the rule.
 pub const ActorId = struct {
+    /// The actor's bytes, borrowed as the table above describes.
     bytes: []const u8,
 
+    /// An actor over `bytes`, which the caller keeps alive. Nothing is copied
+    /// and nothing is retained; see the ownership table on [`ActorId`](types.zig).
     pub fn init(bytes: []const u8) ActorId {
         return .{ .bytes = bytes };
     }
 
-    /// A 16-byte actor id copied into `gpa`. Use this when the actor must own
-    /// its bytes, such as a randomly generated one.
+    /// The actor spelled by `bytes`, copied into `gpa`. Use this when the
+    /// actor has to outlive the buffer it came from: a randomly generated one,
+    /// or one read out of a scratch buffer.
+    ///
+    /// **Any length is legal, including zero.** An automerge actor id is a
+    /// byte string, not a fixed-width number; sixteen is what
+    /// [`random`](ActorId.random) draws and nothing more. The copy is the
+    /// caller's to release with `gpa.free(id.bytes)`.
     pub fn initCopy(gpa: std.mem.Allocator, bytes: []const u8) !ActorId {
         return .{ .bytes = try gpa.dupe(u8, bytes) };
     }
 
-    /// Sixteen distinct bytes copied into `gpa`.
+    /// Sixteen cryptographically secure bytes drawn into `gpa`, which the
+    /// caller frees with `gpa.free(id.bytes)`.
     ///
-    /// Upstream fills a `TinyVec` from the `getrandom` crate
-    /// ([`types.rs:63-68`](../../github-automerge-automerge/rust/automerge/src/types.rs)).
-    /// **Zig 0.16 has no source of randomness in `std`** — `std.crypto.random`
-    /// is gone and every clock is behind `std.Io`, which an identifier
-    /// generator has no business owning — so this is a `DefaultPrng` stepped by
-    /// a process-wide atomic counter.
+    /// `io` supplies the bytes and is not retained. The draw is
+    /// [`std.Io.randomSecure`](../../lib/std/Io.zig), which always leaves
+    /// the process, has no weaker fallback, and blocks; `error.Canceled` is
+    /// the caller's own cancellation and nothing was drawn.
+    /// `error.EntropyUnavailable` means the operating system had no entropy
+    /// to give, and `error.OutOfMemory` that the 16 bytes were not available.
+    /// On either refusal nothing is allocated for the caller.
     ///
-    /// That is a weaker promise than upstream's, and deliberately so: an actor
-    /// id has to be **unique within a document** and never has to be
-    /// unguessable, and the counter is unique for the life of the process,
-    /// which is what [`Document.fork`](doc.zig) and
-    /// [`Document.setAuthor`](doc.zig) need. **A caller that needs
-    /// unguessable ids should draw them itself** and hand the bytes to
-    /// [`ActorId.initCopy`].
-    pub fn random(gpa: std.mem.Allocator) !ActorId {
+    /// Upstream draws the same sixteen bytes from `getrandom` and panics when
+    /// that fails ([`types.rs:63-68`](../../github-automerge-automerge/rust/automerge/src/types.rs)).
+    /// This returns the refusal instead, because a caller that cannot get
+    /// entropy still has to decide what to do, and a caller that cannot tell
+    /// "no id" from "no entropy" cannot decide anything.
+    pub fn random(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+    ) (std.mem.Allocator.Error || std.Io.RandomSecureError)!ActorId {
         const bytes = try gpa.alloc(u8, 16);
         errdefer gpa.free(bytes);
-        var prng = std.Random.DefaultPrng.init(
-            actor_random_counter.fetchAdd(0x9e37_79b9_7f4a_7c15, .monotonic),
-        );
-        prng.random().bytes(bytes);
+        try io.randomSecure(bytes);
         return .{ .bytes = bytes };
     }
 
+    /// Whether the two spell the same actor.
     pub fn eql(a: ActorId, b: ActorId) bool {
         return std.mem.eql(u8, a.bytes, b.bytes);
     }
@@ -130,24 +165,47 @@ pub const ActorId = struct {
         return std.mem.order(u8, a.bytes, b.bytes);
     }
 
+    /// Whether `a` sorts before `b`; [`order`](ActorId.order) is the
+    /// comparison.
     pub fn lessThan(_: void, a: ActorId, b: ActorId) bool {
         return a.order(b) == .lt;
     }
 
+    /// The actor's bytes as lowercase hex, in a fresh allocation from `gpa`
+    /// that the caller frees with that allocator. Every actor length is legal,
+    /// so the result is `2 * bytes.len` characters.
     pub fn toHex(gpa: std.mem.Allocator, self: ActorId) ![]u8 {
         const out = try gpa.alloc(u8, self.bytes.len * 2);
         err.hexInto(self.bytes, out);
         return out;
     }
 
-    pub fn fromHex(gpa: std.mem.Allocator, text: []const u8) !ActorId {
-        return .{ .bytes = try err.hexFrom(gpa, text) };
+    /// The actor `text` spells, decoded into a fresh allocation from `gpa` that
+    /// the caller frees with `gpa.free(id.bytes)`.
+    ///
+    /// Upper and lower case hex are both accepted. **Any even number of hex
+    /// digits is accepted, including none and including a length that is not
+    /// sixteen**: an automerge actor id is a byte string of any length, and
+    /// upstream's `ActorId::try_from(&str)` refuses only a string that is not
+    /// hex ([`types.rs:88-96`](../../github-automerge-automerge/rust/automerge/src/types.rs)).
+    ///
+    /// `error.InvalidActorId` is that refusal and `error.OutOfMemory` the
+    /// only other one. Neither hands the caller an allocation.
+    pub fn fromHex(gpa: std.mem.Allocator, text: []const u8) Error!ActorId {
+        const bytes = err.hexFrom(gpa, text) catch |e| switch (e) {
+            error.InvalidHex => return error.InvalidActorId,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        return .{ .bytes = bytes };
     }
 
     /// The actor id an `automerged`-style concurrency level expands to:
     /// four magic bytes, the level as LEB128, then the original bytes. This
     /// actor id is longer than the original, which is why the magic bytes are
     /// 0x13 0xb2 0x23 0x09 and not arbitrary.
+    ///
+    /// The result is an owned copy even when `self` is one: the caller frees
+    /// it with `gpa.free(id.bytes)`. `self` is unchanged.
     pub fn withConcurrency(gpa: std.mem.Allocator, self: ActorId, level: usize) !ActorId {
         // `unsignedSize` is a size, not a fallible call: it returns the width
         // the value's LEB128 encoding needs and cannot fail
@@ -163,17 +221,23 @@ pub const ActorId = struct {
     }
 };
 
-/// Random bytes prefixed to a concurrency-derived actor id.
+/// The fixed prefix a concurrency-derived actor id carries. Upstream's
+/// `CONCURRENCY_MAGIC_BYTES` ([`types.rs:23`](../../github-automerge-automerge/rust/automerge/src/types.rs));
+/// they sort before most real actors, which is what puts a forked actor at the
+/// front of the table.
 pub const concurrency_magic_bytes = [4]u8{ 0x13, 0xb2, 0x23, 0x09 };
 
-/// The process-wide counter [`ActorId.random`] steps. Container scope, because
-/// Zig has no function-local statics, and private because nothing else has any
-/// business advancing it.
-var actor_random_counter: std.atomic.Value(u64) = .init(0x9e37_79b9_7f4a_7c15);
-
 /// An operation id: a per-actor counter plus the actor index.
+///
+/// A counter is that actor's own operation number and starts at one
+/// ([`types.rs:423`](../../github-automerge-automerge/rust/automerge/src/types.rs));
+/// a zero counter is the head sentinel rather than an operation, which is why
+/// [`root`](OpId.root) and a sequence head are the same value.
 pub const OpId = struct {
+    /// The actor's operation number: one or more for a real operation, zero
+    /// for the root and for a sequence head.
     counter: u32,
+    /// The actor's index in the document's actor table.
     actor: ActorIdx,
 
     /// The root object (`ROOT`, `types.rs:30`). Not the head of a sequence:
@@ -181,10 +245,15 @@ pub const OpId = struct {
     /// share this id (`HEAD`, `types.rs:29`).
     pub const root: OpId = .{ .counter = 0, .actor = 0 };
 
+    /// The id of the operation at `counter` made by actor `actor`. Every pair
+    /// is legal; the constraints on moving between ids are on
+    /// [`prev`](OpId.prev), [`next`](OpId.next) and
+    /// [`withNewActor`](OpId.withNewActor), not here.
     pub fn init(counter: u32, actor: ActorIdx) OpId {
         return .{ .counter = counter, .actor = actor };
     }
 
+    /// Whether the two name the same operation.
     pub fn eql(a: OpId, b: OpId) bool {
         return a.counter == b.counter and a.actor == b.actor;
     }
@@ -195,14 +264,29 @@ pub const OpId = struct {
         return std.math.order(a.actor, b.actor);
     }
 
+    /// Whether `a` sorts before `b`; [`order`](OpId.order) is the comparison.
     pub fn lessThan(_: void, a: OpId, b: OpId) bool {
         return a.order(b) == .lt;
     }
 
+    /// The id of the operation this actor made immediately before this one.
+    ///
+    /// **Precondition: `self.counter` is not zero.** This is a subtraction,
+    /// so a zero counter — [`root`](OpId.root), or a sequence head, which is
+    /// the same value — is a caller error and not an answer: Debug and
+    /// ReleaseSafe trap on it and ReleaseFast and ReleaseSmall do not check
+    /// it. A caller whose counter came off the wire and may therefore be
+    /// corrupt has to test it first, and the op set does exactly that where
+    /// a mark end at counter zero would otherwise wrap
+    /// ([`op.zig:231-237`](opset/op.zig)).
     pub fn prev(self: OpId) OpId {
         return .{ .counter = self.counter - 1, .actor = self.actor };
     }
 
+    /// The id of the operation this actor made immediately after this one.
+    ///
+    /// **Precondition: `self.counter` is below `maxInt(u32)`.** This is the
+    /// same arithmetic and the same obligation as [`prev`](OpId.prev).
     pub fn next(self: OpId) OpId {
         return .{ .counter = self.counter + 1, .actor = self.actor };
     }
@@ -216,6 +300,12 @@ pub const OpId = struct {
     }
 
     /// Inserts a new actor at index `idx`, shifting indices at or above it up.
+    ///
+    /// **Precondition: `self.actor` is below `maxInt(ActorIdx)` whenever
+    /// `self.actor >= idx`.** The shift is a plain addition, so a document
+    /// whose actor table has filled every index and then gains one more
+    /// cannot be renumbered through this call. Debug and ReleaseSafe trap on
+    /// a violation; ReleaseFast and ReleaseSmall do not check it.
     pub fn withNewActor(self: OpId, idx: ActorIdx) OpId {
         if (self.actor >= idx) return .{ .counter = self.counter, .actor = self.actor + 1 };
         return self;
@@ -236,6 +326,9 @@ pub const OpId = struct {
         return .{ .counter = self.counter, .actor = @intCast(actor) };
     }
 
+    /// The id as the single `u64` upstream keeps an operation in: the counter
+    /// in the high 32 bits and the actor index in the low 32
+    /// ([`types.rs:434-437`](../../github-automerge-automerge/rust/automerge/src/types.rs)).
     pub fn toU64(self: OpId) u64 {
         return (@as(u64, self.counter) << 32) | self.actor;
     }
@@ -271,13 +364,17 @@ pub const OpId = struct {
 /// the op set, whose own tables are keyed by [`OpId`] directly
 /// ([`ObjIndex.objectType`](opset/index.zig)).
 pub const ExId = union(enum) {
+    /// An operation named by its counter and actor index alone.
     id: OpId,
     /// Upstream's `ExId::Id` (`exid.rs:17`): the operation and the actor's
     /// bytes, with the index the actor had folded into the operation.
     named: Named,
+    /// The document root, which no operation made.
     root,
 
+    /// An operation identity with a borrowed actor repair hint.
     pub const Named = struct {
+        /// The operation this names.
         op: OpId,
         /// Borrows the actor's bytes from the document that minted the id, the
         /// way every [`ActorId`] in the port does. Upstream's `ExId` owns a
@@ -293,6 +390,10 @@ pub const ExId = union(enum) {
         return .{ .named = .{ .op = op, .actor = who } };
     }
 
+    /// The id a cursor's two halves name: `.root` when neither half is
+    /// present, null when only one is, and null when the counter is wider
+    /// than an [`OpId`]'s. `idsEqual`-style cursors carry the two halves
+    /// separately (`exid.rs:22-28`), so this is the shape a cursor becomes.
     pub fn fromParts(ctr: ?u64, act: ?ActorIdx) ?ExId {
         if (ctr == null and act == null) return .root;
         if (ctr == null or act == null) return null;
@@ -301,6 +402,10 @@ pub const ExId = union(enum) {
         return .{ .id = .{ .counter = @intCast(c), .actor = act.? } };
     }
 
+    /// Whether this names the document root rather than an operation. Only
+    /// `.root` answers true; [`fromParts`](ExId.fromParts) produces it for a
+    /// cursor with neither half, and [`withActor`](ExId.withActor) never
+    /// does.
     pub fn isRoot(self: ExId) bool {
         return self == .root;
     }
@@ -314,10 +419,12 @@ pub const ExId = union(enum) {
         };
     }
 
+    /// The operation counter, or `null` for the root.
     pub fn counter(self: ExId) ?u32 {
         return if (self.opId()) |i| i.counter else null;
     }
 
+    /// The actor-table index, or `null` for the root.
     pub fn actor(self: ExId) ?ActorIdx {
         return if (self.opId()) |i| i.actor else null;
     }
@@ -335,18 +442,22 @@ pub const ExId = union(enum) {
         };
     }
 
+    /// Compares operation identities. Actor repair hints do not affect equality.
     pub fn eql(a: ExId, b: ExId) bool {
         const ai = a.opId() orelse return b == .root;
         const bi = b.opId() orelse return false;
         return ai.eql(bi);
     }
 
+    /// Orders the root first, then operation identities. Ignores actor repair hints.
     pub fn order(a: ExId, b: ExId) std.math.Order {
         const ai = a.opId() orelse return if (b.isRoot()) .eq else .lt;
         const bi = b.opId() orelse return .gt;
         return ai.order(bi);
     }
 
+    /// Removes actor index `idx` and shifts later indices down.
+    /// Returns `null` if this operation used `idx`. The root is unchanged.
     pub fn withoutActor(self: ExId, idx: ActorIdx) ?ExId {
         const i = self.opId() orelse return self;
         const n = i.withoutActor(idx) orelse return null;
@@ -358,6 +469,7 @@ pub const ExId = union(enum) {
 
     /// `OpId::with_new_actor` (`types.rs:447-451`) shifts the **index**; the
     /// bytes it names are the same actor either way, so they ride along.
+    /// The `OpId.withNewActor` index-overflow precondition also applies here.
     pub fn withNewActor(self: ExId, idx: ActorIdx) ExId {
         const i = self.opId() orelse return self;
         const n = i.withNewActor(idx);
@@ -471,6 +583,8 @@ pub const ElemId = struct {
         return a.id.order(b.id);
     }
 
+    /// Whether `a` sorts before `b`; [`compare`](ElemId.compare) is the
+    /// comparison.
     pub fn lessThan(_: void, a: ElemId, b: ElemId) bool {
         return a.compare(b) == .lt;
     }
@@ -498,10 +612,14 @@ pub const ObjType = enum {
     list,
     text,
 
+    /// Whether objects of this type are addressed by position rather than by
+    /// key.
     pub fn isSequence(self: ObjType) bool {
         return self == .list or self == .text;
     }
 
+    /// The sequence flavour of this object type, or null for a map or a
+    /// table.
     pub fn asSequenceType(self: ObjType) ?SequenceType {
         return switch (self) {
             .list => .list,
@@ -510,16 +628,27 @@ pub const ObjType = enum {
         };
     }
 
+    /// Orders the types by their numeric value, which is the order they are
+    /// declared in. Nothing in the wire format depends on it.
     pub fn order(a: ObjType, b: ObjType) std.math.Order {
         return std.math.order(@intFromEnum(a), @intFromEnum(b));
     }
 };
 
 /// A property of an object: a map key, or a sequence index.
+///
+/// **`key` is a borrow.** It points at key bytes that live somewhere else —
+/// for a document that is the op set's key arena, for a value the caller
+/// supplied it is the caller's own buffer. Neither this type nor anything it
+/// is returned with copies the bytes, so they have to outlive the `Prop`.
+/// The same rule governs [`ScalarValueRef.raw`](value.zig) on the value side.
 pub const Prop = union(enum) {
+    /// The map key's bytes, borrowed as described above.
     key: []const u8,
+    /// The position in the sequence.
     index: usize,
 
+    /// The key's bytes, or null when this is a sequence index.
     pub fn asStr(self: Prop) ?[]const u8 {
         return switch (self) {
             .key => |k| k,
@@ -527,6 +656,7 @@ pub const Prop = union(enum) {
         };
     }
 
+    /// The sequence position, or null when this is a map key.
     pub fn asIndex(self: Prop) ?usize {
         return switch (self) {
             .key => null,
@@ -534,6 +664,8 @@ pub const Prop = union(enum) {
         };
     }
 
+    /// Whether the two name the same property. A key and an index are never
+    /// the same property, and two keys are compared by content.
     pub fn eql(a: Prop, b: Prop) bool {
         return switch (a) {
             .key => |x| switch (b) {
@@ -581,6 +713,9 @@ pub const TextEncoding = enum {
         };
     }
 
+    /// The encoding a stored `TEXT_ENCODING_TAG` names.
+    /// `error.InvalidTextEncoding` for a byte outside the four the format
+    /// defines, which is the only refusal.
     pub fn fromTag(t: u8) !TextEncoding {
         return switch (t) {
             0 => .unicode_code_point,
@@ -592,11 +727,14 @@ pub const TextEncoding = enum {
     }
 };
 
-/// An object id plus its type.
+/// An object id plus its type: the pair an object's header records.
 pub const ObjMeta = struct {
+    /// Which object this is. `.root` for the document root.
     id: ExId,
+    /// What kind of object it is.
     typ: ObjType,
 
+    /// The document root, which is a map (`types.rs:30`).
     pub fn root() ObjMeta {
         return .{ .id = .root, .typ = .map };
     }
@@ -748,4 +886,65 @@ test "TextEncoding widths" {
     try std.testing.expectEqual(@as(usize, 2), TextEncoding.grapheme_cluster.width(s));
     try std.testing.expect((try TextEncoding.fromTag(2)) == .utf16_code_unit);
     try std.testing.expectError(error.InvalidTextEncoding, TextEncoding.fromTag(9));
+}
+
+test "an actor id is any byte string, and only a non-hex string is refused" {
+    const gpa = std.testing.allocator;
+
+    // Sixteen is what `random` draws and is not a rule: upstream's actor id
+    // is a byte string (`types.rs:88-96`), so no digits, two digits and
+    // sixty-four all decode.
+    const empty = try ActorId.fromHex(gpa, "");
+    defer gpa.free(empty.bytes);
+    try std.testing.expectEqual(@as(usize, 0), empty.bytes.len);
+
+    const short = try ActorId.fromHex(gpa, "aabb");
+    defer gpa.free(short.bytes);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xaa, 0xbb }, short.bytes);
+
+    // Either case decodes to the same bytes.
+    const upper = try ActorId.fromHex(gpa, "AABB");
+    defer gpa.free(upper.bytes);
+    try std.testing.expect(upper.eql(short));
+
+    const long = try ActorId.fromHex(gpa, "ab" ** 32);
+    defer gpa.free(long.bytes);
+    try std.testing.expectEqual(@as(usize, 32), long.bytes.len);
+
+    // A non-hex digit and an odd count are the two refusals, and both are
+    // `InvalidActorId` rather than a parse error a caller has to guess at.
+    try std.testing.expectError(error.InvalidActorId, ActorId.fromHex(gpa, "zz"));
+    try std.testing.expectError(error.InvalidActorId, ActorId.fromHex(gpa, "0"));
+    // A well-formed hex string of the wrong length is not a refusal here: the
+    // length is a change hash's business, not an actor id's.
+    try std.testing.expectError(error.InvalidChangeHashBytes, ChangeHash.parse(gpa, "aabb"));
+    try std.testing.expectError(error.InvalidHex, ChangeHash.parse(gpa, "zz"));
+}
+
+test "ActorId.random refuses a runtime with no entropy and keeps nothing" {
+    const gpa = std.testing.allocator;
+    // A `std.Io` that differs from the test runtime in exactly one slot.
+    // `randomSecure` has no weaker fallback by design, so this is the refusal
+    // a caller has to handle rather than a degraded draw. The testing
+    // allocator reports a leak at the end of the test, so this also proves
+    // the refusal leaves no allocation behind.
+    var vtable = std.testing.io.vtable.*;
+    vtable.randomSecure = std.Io.failingRandomSecure;
+    const blind: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+
+    try std.testing.expectError(error.EntropyUnavailable, ActorId.random(gpa, blind));
+}
+
+test "ActorId.random draws sixteen secure bytes, and no two draws agree" {
+    const gpa = std.testing.allocator;
+    const a = try ActorId.random(gpa, std.testing.io);
+    defer gpa.free(a.bytes);
+    const b = try ActorId.random(gpa, std.testing.io);
+    defer gpa.free(b.bytes);
+
+    try std.testing.expectEqual(@as(usize, 16), a.bytes.len);
+    try std.testing.expectEqual(@as(usize, 16), b.bytes.len);
+    // Sixteen bytes from a process-wide counter repeat; sixteen bytes from the
+    // operating system do not.
+    try std.testing.expect(!a.eql(b));
 }

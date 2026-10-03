@@ -305,6 +305,13 @@ pub fn init(
 
 /// A slab over bytes the caller already measured, skipping the walk. The
 /// caller guarantees that `len`, `segments` and `tail` describe `data`.
+///
+/// **The slab takes ownership of `data`**: the returned slab stores the
+/// slice itself and its `deinit` releases those bytes, so the caller's own
+/// copy is invalidated by this call and must not be freed or used
+/// afterwards. There is no allocator parameter here, so `data` must come
+/// from whatever allocator the slab will later be released with — the one
+/// the caller's column was built with.
 pub fn fromParts(data: []u8, len: usize, segments: usize, tail: Tail) Slab {
     return .{ .data = data, .len = len, .segments = segments, .tail = tail };
 }
@@ -957,7 +964,10 @@ pub fn splitToBudget(
     var from: usize = 0;
     while (from < segs.len) {
         const to = @min(from + max_segments, segs.len);
-        try out.append(gpa, try slicePiece(gpa, E, slab.data, segs, from, to));
+        // Reserve before the new piece owns bytes. A refused append must not
+        // abandon a finished slab outside `out`'s cleanup guard.
+        try out.ensureUnusedCapacity(gpa, 1);
+        out.appendAssumeCapacity(try slicePiece(gpa, E, slab.data, segs, from, to));
         from = to;
     }
 

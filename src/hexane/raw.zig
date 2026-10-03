@@ -17,6 +17,26 @@
 //! a caller mistake, and it is a refusal here rather than a copy
 //! (`raw.rs:382-405`).
 //!
+//! # Import route and the shortest sequence that works
+//!
+//! `@import("hexane/raw.zig")`, or `zautomerge.hexane.raw` through the root
+//! module. Zig 0.16.0.
+//!
+//! ```zig
+//! var col = try RawColumn.init(gpa);   // an empty arena
+//! defer col.deinit();
+//! try col.spliceSlice(0, 0, "hello");
+//! const out = try col.encode(gpa);      // the caller frees this
+//! defer gpa.free(out);
+//! ```
+//!
+//! # What it deliberately does not do
+//!
+//! It does not know where values begin, and it does not copy them out. A
+//! caller that has to keep a value past the next edit copies it itself — the
+//! rule [`RawColumn.get`] states is the same one [`RawColumn.slabAt`] and
+//! [`RawColumnIter.take`] carry.
+//!
 //! # A standalone column, not a `Column(T, E)`
 //!
 //! Upstream this type is a peer of `Column`, not an encoding for it, and
@@ -42,7 +62,9 @@
 //!
 //!  1. no slab is empty — a delete can empty one, and an empty slab weighs
 //!     nothing in the tree yet is not transparent to a sequential reader, so
-//!     it is dropped (`raw.rs:242-249`);
+//!     it is never built: a splice stages its replacement buffers first, and
+//!     a buffer with no bytes in it is not one of them
+//!     (`raw.rs:242-249`);
 //!  2. `total_len` is the sum of the slab lengths (`raw.rs:234-237`);
 //!  3. the Fenwick tree describes the slabs it indexes, node for node;
 //!  4. and the coalescing rule holds where a splice can reach: two neighbours
@@ -147,6 +169,17 @@ fn onlySlabBytes(col: *const RawColumn, _: usize) indexmod.Bytes {
 pub const RawColumn = struct {
     const Self = @This();
 
+    /// The allocator the arena was built with, and the only one it uses.
+    ///
+    /// Every buffer an arena owns comes from it and goes back to it:
+    /// `spliceSlice`, `spliceChunks`, `copyRanges`, and `stageSpliceSlice`
+    /// allocate with it. `deinit` and publication release with it.
+    /// No mutating method takes an allocator,
+    /// so there is no way to hand this arena a slab one allocator made and
+    /// another frees. The allocator itself is not owned and is not released by
+    /// `deinit`; the methods that hand *caller-owned* memory back — `encode`,
+    /// `saveTo` — still take the caller's, because that memory is the
+    /// caller's to free.
     gpa: std.mem.Allocator,
     /// The slabs, in byte order. Concatenating their `data` is the wire form.
     slabs: std.ArrayList(RawSlab),
@@ -182,7 +215,12 @@ pub const RawColumn = struct {
         };
     }
 
-    /// Frees every slab and the tree.
+    /// Frees every slab and the tree. The allocator came from `init`,
+    /// `withMaxSegments`, `load` or `loadWithMaxSegments` and is **not**
+    /// released: `deinit` returns the arena's own memory to it and leaves the
+    /// allocator alone. Exactly one `deinit` per arena; a copy of an arena is
+    /// a second owner of the same buffers, so releasing both is a double
+    /// free.
     pub fn deinit(self: *Self) void {
         for (self.slabs.items) |*s| s.deinit(self.gpa);
         self.slabs.deinit(self.gpa);
@@ -206,6 +244,12 @@ pub const RawColumn = struct {
     }
 
     /// The slab at `index`, for a caller that walks the layout.
+    ///
+    /// The pointer is into this arena's slab list: `spliceSlice`,
+    /// `spliceChunks` and `copyRanges` move that list, and `deinit` frees it,
+    /// so **a slab from here is valid until the next mutation** — the same
+    /// rule [`get`] states for a byte range, and the same one
+    /// [`RawColumnIter.take`] carries for a read.
     pub fn slabAt(self: *const Self, index: usize) ?*const RawSlab {
         if (index >= self.slabs.items.len) return null;
         return &self.slabs.items[index];
@@ -221,153 +265,295 @@ pub const RawColumn = struct {
     /// Replaces the bytes `index..index + del` with `bytes`
     /// (`try_splice_slice`, `raw.rs:145-261`).
     ///
-    /// The flow mirrors a `Column`'s `Encoding::splice`: find the slab the cut
-    /// lands in, hand it to [`spliceSlab`] which handles that slab and any
-    /// overflow, drain the delete out of the slabs behind it, coalesce the
-    /// undersized neighbours, and update the tree.
+    /// This is [`stageSpliceSlice`] followed by [`StagedSlice.publish`], and
+    /// it is the shape a caller with one edit and nothing to coordinate wants.
+    /// A caller writing several columns, or several edits that have to land
+    /// together, stages each one and publishes them all at the end; see
+    /// [`StagedSlice`].
     ///
     /// `index + del` past the end is `error.InvalidValue`, matching the
     /// out-of-bounds check upstream makes before it touches anything
     /// (`raw.rs:151-160`).
-    pub fn spliceSlice(
+    pub fn spliceSlice(self: *Self, index: usize, del: usize, bytes: []const u8) ParseError!void {
+        var staged = try self.stageSpliceSlice(index, del, bytes);
+        defer staged.deinit();
+        staged.publish(self);
+    }
+
+    /// Plans the edit that replaces the bytes `index..index + del` with
+    /// `bytes`, and takes every allocation it will need (`try_splice_slice`,
+    /// `raw.rs:145-261`).
+    ///
+    /// **The receiver is not touched.** On every path, including every
+    /// `error`, the slabs, their bytes, the length and the tree are exactly
+    /// as the call found them and [`checkInvariants`] still holds. The one
+    /// thing staging may change is the *spare capacity* of the slab list and
+    /// of the tree, which is what makes [`StagedSlice.publish`] unable to
+    /// fail; capacity is not observable through any answer this type gives.
+    ///
+    /// **The allocator is the arena's own, not a parameter**, so a staged edit
+    /// comes out of exactly the allocator [`deinit`] releases it with and
+    /// there is no way to name a second one.
+    ///
+    /// Rebuilds only the touched slabs and the neighbours absorbed by the
+    /// coalescing policy. Plans their lengths first, then copies each final
+    /// replacement buffer once. Untouched buffers remain borrowed.
+    ///
+    /// `index + del` past the end is `error.InvalidValue`, matching the
+    /// out-of-bounds check upstream makes before it touches anything
+    /// (`raw.rs:151-160`). A `del` of zero together with an empty `bytes` plans
+    /// a no-op, and publishing it does nothing.
+    pub fn stageSpliceSlice(
         self: *Self,
-        gpa: std.mem.Allocator,
         index: usize,
         del: usize,
         bytes: []const u8,
-    ) ParseError!void {
+    ) ParseError!StagedSlice {
+        const gpa = self.gpa;
         if (index > self.total_len or del > self.total_len - index) return error.InvalidValue;
-        if (del == 0 and bytes.len == 0) return;
 
-        if (self.slabs.items.len == 0) {
-            // Somewhere for the bytes to land, and a tree that describes it.
-            try self.slabs.append(gpa, .{ .data = try gpa.alloc(u8, 0) });
-            try self.bit.rebuildFrom(gpa, self, 1, onlySlabBytes);
-        }
+        var staged: StagedSlice = .{
+            .owner = self,
+            .at = 0,
+            .drop = 0,
+            .slots = undefined,
+            .len = 0,
+            .new_total = self.total_len,
+            .old_weight = indexmod.Bytes.zero,
+            .count_before = self.slabs.items.len,
+            .spent = false,
+        };
+        // A refusal anywhere below hands back the buffers this call already
+        // built, and the receiver is untouched because nothing was written.
+        errdefer staged.deinit();
 
-        const start = self.findSlab(index);
-        var range: Range = .{ .start = start.slab, .end = start.slab + 1 };
-        // The bytes this splice removes, counted from the slabs it touches
-        // rather than from `del`, because a delete can reach past the end of
-        // the slab it started in (`raw.rs:174`, `:192-212`).
-        var old_bytes: usize = self.slabs.items[start.slab].data.len;
-        const old_weight: indexmod.Bytes = .{ .n = old_bytes };
-        const old_slab_count = self.slabs.items.len;
+        if (del == 0 and bytes.len == 0) return staged;
 
-        const spill = try spliceSlab(
-            gpa,
-            &self.slabs.items[start.slab],
-            start.offset,
-            del,
-            bytes,
-            self.max_segments,
-        );
-        if (spill.overflow) |right| {
-            try self.slabs.insert(gpa, range.end, right);
-            range.end += 1;
-        }
+        const count_before = staged.count_before;
+        const start: indexmod.SlabPos = if (count_before == 0)
+            .{ .slab = 0, .offset = 0 }
+        else
+            self.findSlab(index);
+        const first_len = if (count_before == 0) 0 else self.slabs.items[start.slab].data.len;
+        const local_del = @min(del, first_len - start.offset);
+        staged.new_total = std.math.add(usize, self.total_len - del, bytes.len) catch return error.Overflow;
 
-        var remaining = spill.overflow_del;
-        const drain_start = range.end;
-        while (remaining > 0 and range.end < self.slabs.items.len) {
-            const slab_len = self.slabs.items[range.end].data.len;
+        // Ranges use the edited arena's byte coordinates. Split only at the
+        // splice points; an oversize value is never split through its bytes.
+        var plans: [max_staged_slabs]Range = undefined;
+        var plan_count: usize = 0;
+        var output_at = index - start.offset;
+        const first_new_len = std.math.add(usize, first_len - local_del, bytes.len) catch return error.Overflow;
+        self.planSlab(&plans, &plan_count, &output_at, first_new_len, start.offset, bytes.len);
+
+        var next = if (count_before == 0) 0 else start.slab + 1;
+        var remaining = del - local_del;
+        while (remaining > 0) {
+            const slab_len = self.slabs.items[next].data.len;
             if (remaining >= slab_len) {
-                old_bytes += slab_len;
                 remaining -= slab_len;
-                range.end += 1;
             } else {
-                // The delete reaches into this slab without finishing it, so
-                // the slab stays in the range with only its head cut.
-                old_bytes += slab_len;
-                const partial = try spliceSlab(
-                    gpa,
-                    &self.slabs.items[range.end],
-                    0,
-                    remaining,
-                    &.{},
-                    self.max_segments,
-                );
-                range.end += 1;
-                if (partial.overflow) |right| {
-                    try self.slabs.insert(gpa, range.end, right);
-                    range.end += 1;
-                }
-                break;
+                self.planSlab(&plans, &plan_count, &output_at, slab_len - remaining, 0, 0);
+                remaining = 0;
             }
+            next += 1;
         }
-        if (drain_start < range.end) {
-            // Every slab the delete finished with goes in one shift. The last
-            // one stays when the delete stopped inside it (`raw.rs:215-226`).
-            const drop = if (remaining == 0) range.end - drain_start else range.end - drain_start - 1;
-            if (drop > 0) {
-                for (self.slabs.items[drain_start..][0..drop]) |*s| s.deinit(gpa);
-                self.slabs.replaceRangeAssumeCapacity(drain_start, drop, &.{});
-                range.end -= drop;
-            }
+        staged.at = start.slab;
+        staged.drop = next - start.slab;
+
+        // Same boundary order as try_merge_range_skeleton
+        // (rust/hexane/src/column.rs:185-229). No buffers exist yet.
+        if (plan_count >= 3) {
+            _ = self.mergePlans(&plans, &plan_count, plan_count - 3);
+        }
+        if (plan_count >= 2) {
+            _ = self.mergePlans(&plans, &plan_count, plan_count - 2);
+        }
+        while (plan_count > 0 and next < count_before) {
+            const last = &plans[plan_count - 1];
+            const neighbour_len = self.slabs.items[next].data.len;
+            if (!self.canMerge(last.end - last.start, neighbour_len)) break;
+            last.end += neighbour_len;
+            next += 1;
+            staged.drop += 1;
+        }
+        if (plan_count >= 2) {
+            _ = self.mergePlans(&plans, &plan_count, 0);
+        }
+        while (plan_count > 0 and staged.at > 0) {
+            const first = &plans[0];
+            const neighbour_len = self.slabs.items[staged.at - 1].data.len;
+            if (!self.canMerge(neighbour_len, first.end - first.start)) break;
+            first.start -= neighbour_len;
+            staged.at -= 1;
+            staged.drop += 1;
         }
 
-        // The length is the old total less what the cut removed, plus what the
-        // affected range now holds (`raw.rs:229-233`).
-        var new_bytes: usize = 0;
-        for (self.slabs.items[range.start..range.end]) |s| {
-            new_bytes = std.math.add(usize, new_bytes, s.data.len) catch return error.Overflow;
+        for (plans[0..plan_count]) |range| {
+            const buffer = try gpa.alloc(u8, range.end - range.start);
+            self.copySplicedRange(buffer, range, index, del, bytes);
+            staged.put(.{ .data = buffer });
         }
-        const kept = std.math.sub(usize, self.total_len, old_bytes) catch return error.Overflow;
-        self.total_len = std.math.add(usize, kept, new_bytes) catch return error.Overflow;
-
-        range = self.tryMergeRangeSkeleton(range.start, range.end);
-
-        // A delete can leave an empty slab behind — a tiny value inserted at
-        // the front of a loaded oversize slab and then removed again. An empty
-        // slab weighs nothing in the tree but is not transparent to a
-        // sequential reader, so it goes before the tree is rebuilt
-        // (`raw.rs:242-249`).
-        var removed_empty = false;
-        var i: usize = 0;
-        while (i < self.slabs.items.len) {
-            if (self.slabs.items[i].data.len != 0) {
-                i += 1;
-                continue;
-            }
-            self.slabs.items[i].deinit(gpa);
-            _ = self.slabs.orderedRemove(i);
-            removed_empty = true;
-        }
-
-        // A point update when exactly one slab's weight changed, a rebuild
-        // otherwise (`raw.rs:251-258`).
-        if (!removed_empty and self.slabs.items.len == old_slab_count and range.end - range.start == 1) {
-            self.bit.pointUpdate(range.start, old_weight, .{ .n = self.slabs.items[range.start].data.len });
-        } else {
-            try self.bit.rebuildFrom(gpa, self, self.slabs.items.len, slabBytes);
-        }
+        if (staged.drop > 0) staged.old_weight = .{ .n = self.slabs.items[staged.at].data.len };
+        const new_count = count_before - staged.drop + staged.len;
+        try self.slabs.ensureTotalCapacity(gpa, new_count);
+        try self.bit.items.ensureTotalCapacity(gpa, new_count + 1);
+        return staged;
     }
+
+    /// An edit an arena has planned but not yet applied.
+    ///
+    /// It owns the replacement buffers and it borrows the arena it was planned
+    /// against: **the arena must outlive the staged edit**, and
+    /// [`publish`](RawColumn.StagedSlice.publish) takes that same arena and no
+    /// other.
+    ///
+    /// The whole shape is the contract. `publish` is infallible and consumes,
+    /// so every allocation the hand-over needs is taken by
+    /// [`stageSpliceSlice`](RawColumn.stageSpliceSlice) instead; `deinit` is
+    /// the abort and is a no-op once a publish has run, so the safe pattern is
+    ///
+    /// ```zig
+    /// var staged = try col.stageSpliceSlice(index, del, bytes);
+    /// defer staged.deinit();      // the abort; a no-op once published
+    /// // ... stage the other columns ...
+    /// staged.publish(col);         // cannot fail
+    /// ```
+    ///
+    /// Staging every write before publishing any of them is what makes a group
+    /// of edits all-or-nothing: the only failure left to see happens before
+    /// the first byte of any column has moved.
+    pub const StagedSlice = struct {
+        const This = @This();
+
+        /// The arena the edit was planned against. It owns every staged buffer
+        /// through its own allocator.
+        owner: *RawColumn,
+        /// The first old slab the edit replaces.
+        at: usize,
+        /// How many old slabs it replaces. Zero together with an empty `len`
+        /// is a staged no-op.
+        drop: usize,
+        /// The buffers that replace them, in byte order. At most
+        /// [`max_staged_slabs`] of them, and only the first `len` are ever
+        /// read.
+        slots: [max_staged_slabs]RawSlab,
+        /// How many of `slots` are filled.
+        len: usize,
+        /// The arena's length once the edit has landed.
+        new_total: usize,
+        /// The old weight of the slab at `at`, which the tree's point update
+        /// needs and which is only the right number when the edit replaced one
+        /// slab.
+        old_weight: indexmod.Bytes,
+        /// The arena's slab count before the edit.
+        count_before: usize,
+        /// Whether `publish` or `deinit` has already taken the buffers.
+        spent: bool,
+
+        /// Applies the staged edit to `col`, which must be the arena it was
+        /// staged against.
+        ///
+        /// **This cannot fail.** Every allocation the hand-over needs was
+        /// taken by [`stageSpliceSlice`](RawColumn.stageSpliceSlice). What is
+        /// left frees the replaced slabs, moves the tail, writes the staged
+        /// buffers and brings the tree back in step.
+        ///
+        /// It consumes the edit: publishing the same staged value twice would
+        /// apply it twice and is a programmer error. A staged no-op does
+        /// nothing at all.
+        pub fn publish(self: *This, col: *RawColumn) void {
+            std.debug.assert(!self.spent);
+            std.debug.assert(col == self.owner);
+            self.spent = true;
+            if (self.drop == 0 and self.len == 0) return;
+
+            const gpa = col.gpa;
+            const added = self.len;
+            // Nothing below allocates.
+            for (col.slabs.items[self.at..][0..self.drop]) |*old| old.deinit(gpa);
+            // The tail moves as one block. It never reads the range just
+            // released, which is why the move is here and not in
+            // `replaceRangeAssumeCapacity`: that one copies forwards out of
+            // the replaced range whenever the list shrinks. The destination
+            // can end past `items.len` — a split that grows the range is the
+            // case where it does — so it is built from the backing array,
+            // whose room staging took, rather than sliced out of the list.
+            if (added != self.drop) {
+                const tail = col.slabs.items[self.at + self.drop ..];
+                const base: [*]RawSlab = col.slabs.items.ptr + (self.at + added);
+                @memmove(base[0..tail.len], tail);
+            }
+            col.slabs.items.len = self.count_before - self.drop + added;
+            @memcpy(col.slabs.items[self.at..][0..added], self.slots[0..added]);
+            self.len = 0;
+            col.total_len = self.new_total;
+
+            // A like-for-like single-slab replacement needs one weight update;
+            // every other prepared layout needs a tree rebuild (raw.rs:251-258).
+            if (self.drop == 1 and added == 1) {
+                col.bit.pointUpdate(self.at, self.old_weight, .{ .n = col.slabs.items[self.at].data.len });
+            } else {
+                // Preparation reserved this exact tree before publication.
+                col.bit.rebuildFrom(gpa, col, col.slabs.items.len, slabBytes) catch unreachable;
+            }
+        }
+
+        /// Releases the staged buffers without applying the edit, which is
+        /// the abort.
+        ///
+        /// **A no-op once `publish` has run**, so the `defer` beside it costs
+        /// nothing on the success path and cannot double free.
+        pub fn deinit(self: *This) void {
+            if (self.spent) return;
+            self.spent = true;
+            const gpa = self.owner.gpa;
+            for (self.slots[0..self.len]) |*s| s.deinit(gpa);
+            self.len = 0;
+        }
+
+        fn put(self: *This, slab: RawSlab) void {
+            std.debug.assert(self.len < max_staged_slabs);
+            self.slots[self.len] = slab;
+            self.len += 1;
+        }
+    };
 
     /// Replaces the bytes `index..index + del` with the concatenation of
     /// `chunks` (`try_splice`, `raw.rs:103-130`).
+    ///
+    /// The scratch buffer is allocated with the arena's own allocator, the
+    /// same one the staged buffers come out of.
     ///
     /// This is the shape a caller already has per-item byte slices in — one
     /// `raw_value()` per op — and it exists so the caller does not have to
     /// concatenate them first. Zero and one chunk skip the buffer entirely,
     /// as upstream (`raw.rs:111-117`).
+    ///
+    /// An `error` leaves the arena as it was: the concatenation buffer is
+    /// released and [`spliceSlice`] has not been reached, or has left the
+    /// arena alone. `chunks` are borrowed and are never retained.
     pub fn spliceChunks(
         self: *Self,
-        gpa: std.mem.Allocator,
         index: usize,
         del: usize,
         chunks: []const []const u8,
     ) ParseError!void {
         if (chunks.len <= 1) {
-            return self.spliceSlice(gpa, index, del, if (chunks.len == 0) &.{} else chunks[0]);
+            return self.spliceSlice(index, del, if (chunks.len == 0) &.{} else chunks[0]);
         }
+        const gpa = self.gpa;
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(gpa);
         for (chunks) |c| try buf.appendSlice(gpa, c);
-        return self.spliceSlice(gpa, index, del, buf.items);
+        return self.spliceSlice(index, del, buf.items);
     }
 
     /// Splices byte ranges of `src` into this arena at several points in one
     /// pass (`copy_ranges`, `raw.rs:321-348`).
+    ///
+    /// The list is normalized with the arena's own allocator, the same one
+    /// the staged buffers come out of.
     ///
     /// The splices are applied back to front, so each edit lands above every
     /// one still to be applied and the positions stay valid without any shift
@@ -378,16 +564,30 @@ pub const RawColumn = struct {
     /// never coalescing, so a chain of small merges fragmented the arena into
     /// one slab per insertion point (`raw.rs:303-312`).
     ///
+    /// **Each splice is atomic; the pass as a whole is not.** Every one of
+    /// them goes through [`stageSpliceSlice`] and [`StagedSlice.publish`], so
+    /// an `error` from any single splice leaves this arena exactly as that
+    /// splice found it. The splices already applied stand, though: a splice's
+    /// offsets are measured in the layout the splices below it leave behind,
+    /// so they cannot all be planned before the first byte moves. A caller
+    /// that needs the whole pass to be all-or-nothing drives
+    /// [`StagedSlice`] itself over offsets it has already resolved, which is
+    /// what a caller writing several columns wants and what no bookkeeping
+    /// here can do for it.
+    ///
+    /// `src` must not be this arena: the source's slabs are read while the
+    /// destination's are being rewritten.
+    ///
     /// `pos` and `delete` are in this arena's pre-merge coordinates and must
     /// ascend without overlapping; `range` is a byte range of `src` that does
     /// the same (`raw.rs:298-301`). Every endpoint must be on a value
     /// boundary, or a value will end up spanning a slab.
     pub fn copyRanges(
         self: *Self,
-        gpa: std.mem.Allocator,
         src: *const RawColumn,
         splices_in: []const Splice,
     ) ParseError!void {
+        const gpa = self.gpa;
         const splices = try normalizeSplices(gpa, splices_in, src.len(), self.total_len);
         defer gpa.free(splices);
         var k = splices.len;
@@ -404,13 +604,15 @@ pub const RawColumn = struct {
             // at value boundaries (`raw.rs:334-341`).
             var chunks = src.chunksIn(sp.range.start, sp.range.end);
             while (chunks.next()) |chunk| {
-                try self.spliceSlice(gpa, at, del, chunk);
+                var staged = try self.stageSpliceSlice(at, del, chunk);
+                staged.publish(self);
                 at += chunk.len;
                 del = 0;
             }
             if (del > 0) {
                 // A pure delete, or one whose splice inserted nothing.
-                try self.spliceSlice(gpa, at, del, &.{});
+                var staged = try self.stageSpliceSlice(at, del, &.{});
+                staged.publish(self);
             }
         }
     }
@@ -512,9 +714,8 @@ pub const RawColumn = struct {
     ///
     /// This is the arena's canonical-coalescing rule, and it is about *sizes*
     /// and not about values: two adjacent slabs holding identical bytes stay
-    /// split. The rule is applied to the boundaries around a splice
-    /// (`tryMergeRangeSkeleton`), never globally, so it is a predicate to ask
-    /// rather than a postcondition to assert.
+    /// split. The rule applies only at the splice's prepared boundaries,
+    /// never globally.
     pub fn canMerge(self: *const Self, a_len: usize, b_len: usize) bool {
         const min = self.max_segments / 4;
         return (a_len < min or b_len < min) and a_len + b_len <= self.max_segments;
@@ -563,72 +764,72 @@ pub const RawColumn = struct {
         return self.bit.findSlab(index);
     }
 
-    /// Merges slab `b` into slab `a` and removes it, if the policy says the
-    /// two are one (`try_merge_pair`, `raw.rs:275-291`).
-    ///
-    /// The two must be neighbours, which every caller already guarantees:
-    /// `tryMergeRangeSkeleton` only ever tests the pairs around a range
-    /// (`column.rs:209-225`). The test is a refusal where upstream has none,
-    /// because merging two slabs that are not adjacent would silently drop
-    /// whatever sits between them. A merge that cannot allocate is a refusal
-    /// too: upstream's `extend_from_slice` would abort, and the arena's answer
-    /// is to stay as it was.
-    fn tryMergePair(self: *Self, a: usize, b: usize) bool {
-        if (a >= self.slabs.items.len or b >= self.slabs.items.len or b != a + 1) return false;
-        const a_len = self.slabs.items[a].data.len;
-        const b_len = self.slabs.items[b].data.len;
-        if (!self.canMerge(a_len, b_len)) return false;
-        const moved = self.slabs.items[b].data;
-        if (a_len == 0) {
-            // Nothing to shift: take the neighbour's buffer whole. This is
-            // also the only case that avoids reallocating an empty slab, whose
-            // buffer a zero-length allocation does not really have.
-            self.gpa.free(self.slabs.items[a].data);
-            self.slabs.items[a].data = moved;
-        } else {
-            const grown = self.gpa.realloc(self.slabs.items[a].data, a_len + b_len) catch return false;
-            self.slabs.items[a].data = grown;
-            @memcpy(grown[a_len..], moved);
-            self.gpa.free(moved);
+    // Record one slab's split without allocating or copying its bytes.
+    fn planSlab(
+        self: *const Self,
+        plans: *[max_staged_slabs]Range,
+        count: *usize,
+        position: *usize,
+        size: usize,
+        prefix: usize,
+        inserted: usize,
+    ) void {
+        if (size == 0) return;
+        const split = if (size <= self.max_segments) 0 else pickSplit(prefix, inserted, size);
+        const end = position.* + size;
+        if (split != 0 and split != size) {
+            plans[count.*] = .{ .start = position.*, .end = position.* + split };
+            count.* += 1;
+            position.* += split;
         }
-        _ = self.slabs.orderedRemove(b);
+        plans[count.*] = .{ .start = position.*, .end = end };
+        count.* += 1;
+        position.* = end;
+    }
+
+    fn mergePlans(self: *const Self, plans: *[max_staged_slabs]Range, count: *usize, at: usize) bool {
+        const a = plans[at];
+        const b = plans[at + 1];
+        if (!self.canMerge(a.end - a.start, b.end - b.start)) return false;
+        plans[at].end = b.end;
+        @memmove(plans[at + 1 .. count.* - 1], plans[at + 2 .. count.*]);
+        count.* -= 1;
         return true;
     }
 
-    /// Walks the four slab boundaries around a recently modified range and
-    /// merges the undersized neighbours, returning the adjusted range
-    /// (`try_merge_range_skeleton`, `column.rs:185-229`).
-    ///
-    /// The range is non-empty on entry and may come back empty. The end
-    /// shrinks by one for every merge that collapses two in-range slabs, and
-    /// the start moves with the end when a merge reaches out to the left.
-    fn tryMergeRangeSkeleton(self: *Self, start_in: usize, end_in: usize) Range {
-        var start = start_in;
-        var end = end_in;
-        if (end_in <= start_in) return .{ .start = start, .end = end };
-
-        // Only three slabs of a rebuilt range can be undersized, so only the
-        // pairs around them are worth testing — a splice that spills a
-        // thousand slabs should not walk them. The spills in the middle were
-        // cut at the budget, so they are full by construction; what can be
-        // short is the first slab a delete shrank, the last spill, and the
-        // last slab a cascading delete only partly consumed
-        // (`column.rs:192-207`).
-        //
-        // The right end goes first, because merging there shortens the range
-        // and the left end's indices do not move (`column.rs:208-209`).
-        if (end >= start + 3 and self.tryMergePair(end - 3, end - 2)) end -= 1;
-        if (end >= start + 2 and self.tryMergePair(end - 2, end - 1)) end -= 1;
-        // External right: keep merging outward.
-        while (end >= 1 and self.tryMergePair(end - 1, end)) {}
-        // The edited slab against the first slab that follows it.
-        if (end >= start + 2 and self.tryMergePair(start, start + 1)) end -= 1;
-        // External left: keep merging outward.
-        while (start > 0 and self.tryMergePair(start - 1, start)) {
-            start -= 1;
-            end -= 1;
+    fn copySplicedRange(
+        self: *const Self,
+        out: []u8,
+        range: Range,
+        index: usize,
+        del: usize,
+        bytes: []const u8,
+    ) void {
+        var at = range.start;
+        if (at < index) {
+            const end = @min(range.end, index);
+            self.copyOriginalRange(out[0 .. end - at], at, end);
+            at = end;
+            if (at == range.end) return;
         }
-        return .{ .start = start, .end = end };
+        const insert_end = index + bytes.len;
+        if (at < insert_end) {
+            const end = @min(range.end, insert_end);
+            @memcpy(out[at - range.start ..][0 .. end - at], bytes[at - index .. end - index]);
+            at = end;
+            if (at == range.end) return;
+        }
+        self.copyOriginalRange(out[at - range.start ..], at - bytes.len + del, range.end - bytes.len + del);
+    }
+
+    fn copyOriginalRange(self: *const Self, out: []u8, start: usize, end: usize) void {
+        var chunks = self.chunksIn(start, end);
+        var written: usize = 0;
+        while (chunks.next()) |chunk| {
+            @memcpy(out[written..][0..chunk.len], chunk);
+            written += chunk.len;
+        }
+        std.debug.assert(written == out.len);
     }
 
     /// The byte slices covering `start..end_in`, one per slab the range
@@ -647,78 +848,9 @@ pub const RawColumn = struct {
     }
 };
 
-/// What one slab of a splice spilled: at most one overflow slab, and how much
-/// of the delete is still owed to the slabs behind it.
-const Spill = struct {
-    /// The slab that could not stay where it was.
-    overflow: ?RawSlab,
-    /// The delete count the following slabs still have to absorb.
-    overflow_del: usize,
-};
-
-/// Splices one slab: delete up to `del` bytes at `index`, insert `values`
-/// (`splice_slab`, `raw.rs:504-554`).
-///
-/// `del` may run past the end of the slab, in which case the excess comes back
-/// as `overflow_del` for the caller to apply to the slabs behind. If the
-/// insert pushes the slab past `max_segments` the slab is split at the splice
-/// point — before or after the inserted bytes, whichever is more balanced —
-/// and the right half comes back as `overflow`. At most one overflow slab is
-/// ever produced, because the arena's invariant only permits splits at splice
-/// points, so there is nowhere else to cut (`raw.rs:489-502`).
-fn spliceSlab(
-    gpa: std.mem.Allocator,
-    slab: *RawSlab,
-    index: usize,
-    del: usize,
-    values: []const u8,
-    max_segments: usize,
-) ParseError!Spill {
-    const slab_len = slab.data.len;
-    const local_del = @min(del, slab_len - index);
-    const overflow_del = del - local_del;
-    const kept = std.math.sub(usize, slab_len, local_del) catch return error.Overflow;
-    const new_len = std.math.add(usize, kept, values.len) catch return error.Overflow;
-
-    if (new_len <= max_segments) {
-        try spliceBytes(gpa, slab, index, local_del, values);
-        return .{ .overflow = null, .overflow_del = overflow_del };
-    }
-
-    const split_at = pickSplit(index, values.len, new_len);
-    if (split_at == 0 or split_at == new_len) {
-        // The edge split would not reduce the size, which happens when the
-        // inserted blob is itself wider than the budget. The slab stays
-        // oversize and the blob lives as one unit: the invariant still holds,
-        // because it does not cross the boundary (`raw.rs:526-532`).
-        try spliceBytes(gpa, slab, index, local_del, values);
-        return .{ .overflow = null, .overflow_del = overflow_del };
-    }
-
-    // Split before splicing: the suffix is copied out first, because a
-    // realloc may move the buffer, and the original is truncated to the
-    // prefix. That saves the in-place suffix memmove a post-splice split
-    // would do (`raw.rs:534-552`).
-    const suffix = slab.data[index + local_del ..];
-    var right = try gpa.alloc(u8, if (split_at == index) values.len + suffix.len else suffix.len);
-    errdefer gpa.free(right);
-    var left_len = index;
-    if (split_at == index) {
-        // Split before the inserted bytes: left = prefix, right = values
-        // followed by the suffix.
-        @memcpy(right[0..values.len], values);
-        @memcpy(right[values.len..], suffix);
-    } else {
-        // Split after the inserted bytes: left = prefix followed by the
-        // values, right = the suffix.
-        @memcpy(right[0..suffix.len], suffix);
-        left_len = index + values.len;
-    }
-    const grown = try gpa.realloc(slab.data, left_len);
-    slab.data = grown;
-    if (split_at != index) @memcpy(slab.data[index..][0..values.len], values);
-    return .{ .overflow = .{ .data = right }, .overflow_del = overflow_del };
-}
+// A touched slab splits at most once; a partial tail adds at most two plans.
+// Coalescing only removes plans and absorbs neighbouring byte ranges.
+const max_staged_slabs = 4;
 
 /// The byte offset to split an overflowing slab at (`pick_split`,
 /// `raw.rs:568-578`).
@@ -738,44 +870,6 @@ fn pickSplit(offset_before_insert: usize, inserted_len: usize, total_len: usize)
 
 fn absDiff(a: usize, b: usize) usize {
     return if (a > b) a - b else b - a;
-}
-
-/// Byte-level `Vec::splice` without the per-element dance (`splice_bytes`,
-/// `column.rs:277-296`).
-///
-/// The inserted bytes go in as one memcpy rather than a byte-at-a-time
-/// `ptr::write` loop, which is what the stdlib splice does for `u8`. The
-/// suffix shift is one `memmove`, which is what upstream's `copy_within` is:
-/// the destination starts after the source on the grow path and before it on
-/// the shrink path, so the copy has to run the right way in each.
-fn spliceBytes(
-    gpa: std.mem.Allocator,
-    slab: *RawSlab,
-    index: usize,
-    del: usize,
-    values: []const u8,
-) !void {
-    const old_len = slab.data.len;
-    if (old_len == 0) {
-        // Nothing to shift and nothing to shift past: a zero-length slab's
-        // buffer is not a real allocation to resize.
-        slab.data = try gpa.dupe(u8, values);
-        return;
-    }
-    const new_len = old_len - del + values.len;
-    // The bytes behind the cut, which move by the difference between what the
-    // insert adds and what the delete removes.
-    const shift = old_len - del - index;
-    if (values.len > del) {
-        const grown = try gpa.realloc(slab.data, new_len);
-        slab.data = grown;
-        @memmove(slab.data[index + values.len ..][0..shift], slab.data[index + del ..][0..shift]);
-    } else if (values.len < del) {
-        @memmove(slab.data[index + values.len ..][0..shift], slab.data[index + del ..][0..shift]);
-        const shrunk = try gpa.realloc(slab.data, new_len);
-        slab.data = shrunk;
-    }
-    @memcpy(slab.data[index..][0..values.len], values);
 }
 
 /// Normalizes a multi-point splice list: clamps the source ranges to
@@ -823,6 +917,10 @@ pub fn normalizeSplices(
 /// The natural unit of reading an arena is a variable-sized blob, so this is
 /// not a `next() ?T` iterator over bytes: it yields the slab-aligned pieces
 /// `copyRanges` splices in, and each piece is copied whole.
+///
+/// The pieces are windows on the source arena's slabs, so they are valid only
+/// until that arena is mutated. `copyRanges` reads them and splices each one
+/// in before asking for the next.
 const ChunksIter = struct {
     col: *const RawColumn,
     /// The next byte to hand out.
@@ -852,6 +950,14 @@ const ChunksIter = struct {
 /// `next`, and the state carries across calls so consecutive reads do not
 /// re-look-up the slab (`raw.rs:582-588`). It is a value: a reader costs no
 /// allocation, and copies of it are independent.
+///
+/// **What the copies are independent of is the reader, not the arena.** A
+/// reader borrows its [`RawColumn`] and every value [`take`] returns is a
+/// window on one of that arena's slabs, so a value held across a
+/// `spliceSlice`, `spliceChunks`, `copyRanges` or `deinit` on it reads freed
+/// memory. The rule is the one [`RawColumn.get`] states, and it belongs to
+/// the column, which has to outlive the reader and every value read through
+/// it.
 pub const RawColumnIter = struct {
     col: *const RawColumn,
     slab_idx: usize,
@@ -869,6 +975,12 @@ pub const RawColumnIter = struct {
     }
 
     /// Reads the next `n` bytes and advances (`take`, `raw.rs:609-634`).
+    ///
+    /// The slice is borrowed from the slab it lands in and is **valid until
+    /// the next mutation of the column it reads** — `spliceSlice`,
+    /// `spliceChunks`, `copyRanges` or `deinit` each move or free that slab.
+    /// `take` itself only moves the cursor, so two reads in a row do not
+    /// invalidate each other.
     ///
     /// A read that would cross a slab boundary is `error.InvalidValue`: by the
     /// column's invariant that only happens when `n` does not describe one
@@ -956,8 +1068,8 @@ test "one slab takes appends, a middle insert, a delete and a replace" {
     const gpa = testing.allocator;
     var col = try RawColumn.withMaxSegments(gpa, 32);
     defer col.deinit();
-    try col.spliceSlice(gpa, 0, 0, "hello");
-    try col.spliceSlice(gpa, 5, 0, ", world");
+    try col.spliceSlice(0, 0, "hello");
+    try col.spliceSlice(5, 0, ", world");
     try expectArena(&col, gpa, "hello, world");
     try testing.expectEqual(@as(usize, 1), col.slabCount());
 }
@@ -966,12 +1078,12 @@ test "an insert in the middle, a delete and a replace all land in one slab" {
     const gpa = testing.allocator;
     var col = try RawColumn.withMaxSegments(gpa, 32);
     defer col.deinit();
-    try col.spliceSlice(gpa, 0, 0, "helloworld");
-    try col.spliceSlice(gpa, 5, 0, ", ");
+    try col.spliceSlice(0, 0, "helloworld");
+    try col.spliceSlice(5, 0, ", ");
     try expectArena(&col, gpa, "hello, world");
-    try col.spliceSlice(gpa, 5, 2, "");
+    try col.spliceSlice(5, 2, "");
     try expectArena(&col, gpa, "helloworld");
-    try col.spliceSlice(gpa, 5, 5, "hexane");
+    try col.spliceSlice(5, 5, "hexane");
     try expectArena(&col, gpa, "hellohexane");
 }
 
@@ -979,13 +1091,13 @@ test "chunks are concatenated, and one chunk skips the buffer" {
     const gpa = testing.allocator;
     var col = try RawColumn.withMaxSegments(gpa, 32);
     defer col.deinit();
-    try col.spliceChunks(gpa, 0, 0, &.{ "ab", "cd", "ef" });
+    try col.spliceChunks(0, 0, &.{ "ab", "cd", "ef" });
     try expectArena(&col, gpa, "abcdef");
-    try col.spliceChunks(gpa, 6, 0, &.{});
-    try col.spliceChunks(gpa, 6, 0, &.{"gh"});
+    try col.spliceChunks(6, 0, &.{});
+    try col.spliceChunks(6, 0, &.{"gh"});
     try expectArena(&col, gpa, "abcdefgh");
     // A pure delete is a splice with no chunks at all.
-    try col.spliceChunks(gpa, 0, 2, &.{});
+    try col.spliceChunks(0, 2, &.{});
     try expectArena(&col, gpa, "cdefgh");
 }
 
@@ -993,10 +1105,10 @@ test "an insert that overflows the budget splits the slab" {
     const gpa = testing.allocator;
     var col = try RawColumn.withMaxSegments(gpa, 8);
     defer col.deinit();
-    try col.spliceSlice(gpa, 0, 0, "abcdef");
+    try col.spliceSlice(0, 0, "abcdef");
     try expectArena(&col, gpa, "abcdef");
     // "abcXYZdef" is nine bytes, so the slab has to give some up.
-    try col.spliceSlice(gpa, 3, 0, "XYZ");
+    try col.spliceSlice(3, 0, "XYZ");
     try expectArena(&col, gpa, "abcXYZdef");
     try testing.expectEqual(@as(usize, 2), col.slabCount());
 }
@@ -1008,8 +1120,8 @@ test "the split falls on the side that balances the two halves" {
         // balances better, so it wins (`raw.rs:731-754`).
         var col = try RawColumn.withMaxSegments(gpa, 12);
         defer col.deinit();
-        try col.spliceSlice(gpa, 0, 0, "PPPPSSSSSSSS");
-        try col.spliceSlice(gpa, 4, 0, "X");
+        try col.spliceSlice(0, 0, "PPPPSSSSSSSS");
+        try col.spliceSlice(4, 0, "X");
         try expectArena(&col, gpa, "PPPPXSSSSSSSS");
         try testing.expectEqual(@as(usize, 2), col.slabCount());
         try expectSlab(&col, 0, "PPPPX");
@@ -1020,8 +1132,8 @@ test "the split falls on the side that balances the two halves" {
         // balances better, so it wins (`raw.rs:756-769`).
         var col = try RawColumn.withMaxSegments(gpa, 10);
         defer col.deinit();
-        try col.spliceSlice(gpa, 0, 0, "PPPPPPPPPS");
-        try col.spliceSlice(gpa, 9, 0, "X");
+        try col.spliceSlice(0, 0, "PPPPPPPPPS");
+        try col.spliceSlice(9, 0, "X");
         try expectArena(&col, gpa, "PPPPPPPPPXS");
         try testing.expectEqual(@as(usize, 2), col.slabCount());
         try expectSlab(&col, 0, "PPPPPPPPP");
@@ -1036,11 +1148,11 @@ test "a blob wider than the budget keeps a slab of its own" {
     // (`raw.rs:526-532`).
     var col = try RawColumn.withMaxSegments(gpa, 4);
     defer col.deinit();
-    try col.spliceSlice(gpa, 0, 0, "xxxxxxxxxxxxxxxx");
+    try col.spliceSlice(0, 0, "xxxxxxxxxxxxxxxx");
     try expectArena(&col, gpa, "xxxxxxxxxxxxxxxx");
     try testing.expectEqualStrings("xxxxxxxxxxxxxxxx", try col.get(0, 16));
     // And it is still editable, in the middle.
-    try col.spliceSlice(gpa, 8, 0, "-");
+    try col.spliceSlice(8, 0, "-");
     try expectArena(&col, gpa, "xxxxxxxx-xxxxxxxx");
 }
 
@@ -1048,7 +1160,7 @@ test "get answers every range inside a slab and refuses the rest" {
     const gpa = testing.allocator;
     var col = try RawColumn.withMaxSegments(gpa, 32);
     defer col.deinit();
-    try col.spliceSlice(gpa, 0, 0, "hello, world");
+    try col.spliceSlice(0, 0, "hello, world");
     try testing.expectEqualStrings("hello", try col.get(0, 5));
     try testing.expectEqualStrings("world", try col.get(7, 12));
     try testing.expectEqualStrings("hello, world", try col.get(0, 12));
@@ -1060,8 +1172,8 @@ test "a range that crosses a slab is refused, not copied" {
     const gpa = testing.allocator;
     var col = try RawColumn.withMaxSegments(gpa, 4);
     defer col.deinit();
-    try col.spliceSlice(gpa, 0, 0, "abcd");
-    try col.spliceSlice(gpa, 4, 0, "efgh");
+    try col.spliceSlice(0, 0, "abcd");
+    try col.spliceSlice(4, 0, "efgh");
     try testing.expectEqual(@as(usize, 2), col.slabCount());
     try testing.expectEqualStrings("bc", try col.get(1, 3));
     // "bcd" + "e" spans two slabs, which by the column's invariant means the
@@ -1073,9 +1185,9 @@ test "an out of bounds splice is a refusal" {
     const gpa = testing.allocator;
     var col = try RawColumn.init(gpa);
     defer col.deinit();
-    try col.spliceSlice(gpa, 0, 0, "abc");
-    try testing.expectError(error.InvalidValue, col.spliceSlice(gpa, 5, 0, "x"));
-    try testing.expectError(error.InvalidValue, col.spliceSlice(gpa, 0, 10, ""));
+    try col.spliceSlice(0, 0, "abc");
+    try testing.expectError(error.InvalidValue, col.spliceSlice(5, 0, "x"));
+    try testing.expectError(error.InvalidValue, col.spliceSlice(0, 10, ""));
     // The refusals changed nothing.
     try expectArena(&col, gpa, "abc");
 }
@@ -1084,13 +1196,13 @@ test "a delete across a slab boundary drains the slabs behind it" {
     const gpa = testing.allocator;
     var col = try RawColumn.withMaxSegments(gpa, 4);
     defer col.deinit();
-    try col.spliceSlice(gpa, 0, 0, "aaaa");
-    try col.spliceSlice(gpa, 4, 0, "bbbb");
-    try col.spliceSlice(gpa, 8, 0, "cccc");
+    try col.spliceSlice(0, 0, "aaaa");
+    try col.spliceSlice(4, 0, "bbbb");
+    try col.spliceSlice(8, 0, "cccc");
     try expectArena(&col, gpa, "aaaabbbbcccc");
     // Six bytes from position 3 reaches into the second slab and empties the
     // third.
-    try col.spliceSlice(gpa, 3, 6, "");
+    try col.spliceSlice(3, 6, "");
     try expectArena(&col, gpa, "aaaccc");
 }
 
@@ -1100,11 +1212,11 @@ test "a mass delete coalesces the slabs it leaves behind" {
     defer col.deinit();
     for (0..100) |i| {
         const byte = [_]u8{@as(u8, 'a') + @as(u8, @intCast(i % 26))};
-        try col.spliceSlice(gpa, col.len(), 0, &byte);
+        try col.spliceSlice(col.len(), 0, &byte);
     }
     try testing.expect(col.slabCount() > 1);
     const before = col.slabCount();
-    try col.spliceSlice(gpa, 0, col.len() - 10, "");
+    try col.spliceSlice(0, col.len() - 10, "");
     try testing.expectEqual(@as(usize, 10), col.len());
     try testing.expect(col.slabCount() <= before);
     // The last ten bytes are the ones the loop wrote last, so the delete left
@@ -1130,14 +1242,14 @@ test "the coalescing rule is about sizes, not about the bytes" {
     // of 7 is what makes the second insert overflow at all.
     var split = try RawColumn.withMaxSegments(gpa, 7);
     defer split.deinit();
-    try split.spliceSlice(gpa, 0, 0, "xxxx");
-    try split.spliceSlice(gpa, 4, 0, "xxxx");
+    try split.spliceSlice(0, 0, "xxxx");
+    try split.spliceSlice(4, 0, "xxxx");
     try testing.expectEqual(@as(usize, 2), split.slabCount());
     try expectSlab(&split, 0, "xxxx");
     try expectSlab(&split, 1, "xxxx");
     // Deleting the second leaves one, and the two that were identical were
     // never merged into one before that.
-    try split.spliceSlice(gpa, 4, 4, "");
+    try split.spliceSlice(4, 4, "");
     try testing.expectEqual(@as(usize, 1), split.slabCount());
     try expectSlab(&split, 0, "xxxx");
     try expectArena(&split, gpa, "xxxx");
@@ -1150,9 +1262,9 @@ test "the layout is canonical: no empty slab, the total agrees, the tree is in s
     try testing.expectEqual(@as(usize, 1), col.slabCount());
     // A tiny value inserted at the front of a loaded oversize slab and then
     // removed again is what leaves an empty slab behind (`raw.rs:912-923`).
-    try col.spliceSlice(gpa, 0, 0, "X");
+    try col.spliceSlice(0, 0, "X");
     try expectSlab(&col, 0, "X");
-    try col.spliceSlice(gpa, 0, 1, "");
+    try col.spliceSlice(0, 1, "");
     try expectArena(&col, gpa, "abcdef");
     try testing.expectEqualStrings("a", try col.get(0, 1));
 }
@@ -1202,9 +1314,9 @@ test "the reader takes and skips, across slabs" {
     const gpa = testing.allocator;
     var col = try RawColumn.withMaxSegments(gpa, 4);
     defer col.deinit();
-    try col.spliceSlice(gpa, 0, 0, "abcd");
-    try col.spliceSlice(gpa, 4, 0, "efgh");
-    try col.spliceSlice(gpa, 8, 0, "ijkl");
+    try col.spliceSlice(0, 0, "abcd");
+    try col.spliceSlice(4, 0, "efgh");
+    try col.spliceSlice(8, 0, "ijkl");
 
     var it = col.iterator();
     try testing.expectEqual(@as(usize, 0), it.pos());
@@ -1228,8 +1340,8 @@ test "the reader seeks to a position, and past the end it stops" {
     const gpa = testing.allocator;
     var col = try RawColumn.withMaxSegments(gpa, 4);
     defer col.deinit();
-    try col.spliceSlice(gpa, 0, 0, "abcd");
-    try col.spliceSlice(gpa, 4, 0, "efgh");
+    try col.spliceSlice(0, 0, "abcd");
+    try col.spliceSlice(4, 0, "efgh");
     var it = try col.iteratorAt(4);
     try testing.expectEqual(@as(usize, 4), it.pos());
     try testing.expectEqualStrings("efgh", try it.take(4));
@@ -1261,8 +1373,8 @@ test "load, encode and saveTo round trip" {
     {
         var col = try RawColumn.withMaxSegments(gpa, 4);
         defer col.deinit();
-        try col.spliceSlice(gpa, 0, 0, "abcd");
-        try col.spliceSlice(gpa, 4, 0, "efgh");
+        try col.spliceSlice(0, 0, "abcd");
+        try col.spliceSlice(4, 0, "efgh");
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(gpa);
         try out.appendSlice(gpa, "prefix:");
@@ -1277,12 +1389,12 @@ test "copyRanges applies one splice" {
     const gpa = testing.allocator;
     var dst = try RawColumn.withMaxSegments(gpa, 32);
     defer dst.deinit();
-    try dst.spliceSlice(gpa, 0, 0, "abcd");
+    try dst.spliceSlice(0, 0, "abcd");
     var src = try RawColumn.withMaxSegments(gpa, 32);
     defer src.deinit();
-    try src.spliceSlice(gpa, 0, 0, "WXYZ");
+    try src.spliceSlice(0, 0, "WXYZ");
 
-    try dst.copyRanges(gpa, &src, &.{.{ .pos = 4, .range = .{ .start = 0, .end = 4 } }});
+    try dst.copyRanges(&src, &.{.{ .pos = 4, .range = .{ .start = 0, .end = 4 } }});
     try expectArena(&dst, gpa, "abcdWXYZ");
 }
 
@@ -1290,12 +1402,12 @@ test "copyRanges applies several ascending splices with deletes" {
     const gpa = testing.allocator;
     var dst = try RawColumn.withMaxSegments(gpa, 32);
     defer dst.deinit();
-    try dst.spliceSlice(gpa, 0, 0, "aaaabbbbcccc");
+    try dst.spliceSlice(0, 0, "aaaabbbbcccc");
     var src = try RawColumn.withMaxSegments(gpa, 32);
     defer src.deinit();
-    try src.spliceSlice(gpa, 0, 0, "XXXXYYYY");
+    try src.spliceSlice(0, 0, "XXXXYYYY");
 
-    try dst.copyRanges(gpa, &src, &.{
+    try dst.copyRanges(&src, &.{
         .{ .pos = 0, .delete = 4, .range = .{ .start = 0, .end = 4 } },
         .{ .pos = 8, .delete = 4, .range = .{ .start = 4, .end = 8 } },
     });
@@ -1309,11 +1421,11 @@ test "copyRanges skips the parts of the source no range names" {
     const gpa = testing.allocator;
     var dst = try RawColumn.withMaxSegments(gpa, 4);
     defer dst.deinit();
-    try dst.spliceSlice(gpa, 0, 0, "..");
+    try dst.spliceSlice(0, 0, "..");
     var src = try RawColumn.loadWithMaxSegments(gpa, "AAAABBBBCCCC", 4);
     defer src.deinit();
 
-    try dst.copyRanges(gpa, &src, &.{
+    try dst.copyRanges(&src, &.{
         .{ .pos = 1, .range = .{ .start = 0, .end = 4 } },
         .{ .pos = 2, .range = .{ .start = 8, .end = 12 } },
     });
@@ -1327,20 +1439,20 @@ test "copyRanges into an empty arena, and with nothing to do" {
         defer dst.deinit();
         var src = try RawColumn.load(gpa, "hello");
         defer src.deinit();
-        try dst.copyRanges(gpa, &src, &.{.{ .pos = 0, .range = .all }});
+        try dst.copyRanges(&src, &.{.{ .pos = 0, .range = .all }});
         try expectArena(&dst, gpa, "hello");
     }
     {
         var dst = try RawColumn.withMaxSegments(gpa, 8);
         defer dst.deinit();
-        try dst.spliceSlice(gpa, 0, 0, "abcd");
+        try dst.spliceSlice(0, 0, "abcd");
         var src = try RawColumn.load(gpa, "xyz");
         defer src.deinit();
-        try dst.copyRanges(gpa, &src, &.{});
+        try dst.copyRanges(&src, &.{});
         try expectArena(&dst, gpa, "abcd");
         // A range past the end of the source clamps, and a splice that names
         // no source bytes and deletes nothing is dropped.
-        try dst.copyRanges(gpa, &src, &.{.{ .pos = 4, .range = .{ .start = 0, .end = 99 } }});
+        try dst.copyRanges(&src, &.{.{ .pos = 4, .range = .{ .start = 0, .end = 99 } }});
         try expectArena(&dst, gpa, "abcdxyz");
     }
 }
@@ -1353,14 +1465,14 @@ test "copyRanges carries the source's slab boundaries across whole" {
     defer src.deinit();
     for (0..12) |i| {
         const v = [_]u8{@as(u8, 'a') + @as(u8, @intCast(i))} ** 4;
-        try src.spliceSlice(gpa, src.len(), 0, &v);
+        try src.spliceSlice(src.len(), 0, &v);
     }
     try testing.expectEqual(@as(usize, 12), src.slabCount());
 
     var dst = try RawColumn.withMaxSegments(gpa, 4);
     defer dst.deinit();
-    try dst.spliceSlice(gpa, 0, 0, "0000");
-    try dst.copyRanges(gpa, &src, &.{
+    try dst.spliceSlice(0, 0, "0000");
+    try dst.copyRanges(&src, &.{
         .{ .pos = 0, .range = .{ .start = 0, .end = 24 } },
         .{ .pos = 4, .range = .{ .start = 24, .end = 48 } },
     });
@@ -1382,13 +1494,13 @@ test "a chain of small copies does not fragment the arena" {
     const filler = try gpa.alloc(u8, 8 * budget);
     defer gpa.free(filler);
     @memset(filler, 'x');
-    try dst.spliceSlice(gpa, 0, 0, filler);
+    try dst.spliceSlice(0, 0, filler);
 
     for (0..400) |i| {
         var src = try RawColumn.load(gpa, "abcd");
         defer src.deinit();
         const at = ((i * 37) % (dst.len() - 4)) & ~@as(usize, 3);
-        try dst.copyRanges(gpa, &src, &.{.{ .pos = at, .range = .{ .start = 0, .end = 4 } }});
+        try dst.copyRanges(&src, &.{.{ .pos = at, .range = .{ .start = 0, .end = 4 } }});
     }
     // Bounded by the byte count, not by the 400 insertion points: the bug
     // this guards is a policy that cut at every splice point and never
@@ -1465,14 +1577,14 @@ test "random splices agree with a plain array" {
                 const bytes = try gpa.alloc(u8, n);
                 defer gpa.free(bytes);
                 random.bytes(bytes);
-                try col.spliceSlice(gpa, at, 0, bytes);
+                try col.spliceSlice(at, 0, bytes);
                 try model.insertSlice(gpa, at, bytes);
             },
             1 => {
                 if (len == 0) continue;
                 const at = random.intRangeLessThan(usize, 0, len);
                 const del = random.intRangeAtMost(usize, 1, @min(len - at, 6));
-                try col.spliceSlice(gpa, at, del, "");
+                try col.spliceSlice(at, del, "");
                 try model.replaceRange(gpa, at, del, &.{});
             },
             else => {
@@ -1483,7 +1595,7 @@ test "random splices agree with a plain array" {
                 const bytes = try gpa.alloc(u8, n);
                 defer gpa.free(bytes);
                 random.bytes(bytes);
-                try col.spliceSlice(gpa, at, del, bytes);
+                try col.spliceSlice(at, del, bytes);
                 try model.replaceRange(gpa, at, del, bytes);
             },
         }
@@ -1529,10 +1641,10 @@ test "random multi-point copies agree with a plain array" {
 
         var dst = try RawColumn.withMaxSegments(gpa, max_seg);
         defer dst.deinit();
-        try dst.spliceSlice(gpa, 0, 0, dst_bytes);
+        try dst.spliceSlice(0, 0, dst_bytes);
         var src = try RawColumn.withMaxSegments(gpa, max_seg);
         defer src.deinit();
-        try src.spliceSlice(gpa, 0, 0, src_bytes);
+        try src.spliceSlice(0, 0, src_bytes);
 
         // The model, applying the same splices front to back with a shift.
         var model: std.ArrayList(u8) = .empty;
@@ -1546,7 +1658,7 @@ test "random multi-point copies agree with a plain array" {
             shift += @as(isize, @intCast(bytes.len)) - @as(isize, @intCast(sp.delete));
         }
 
-        try dst.copyRanges(gpa, &src, splices.items);
+        try dst.copyRanges(&src, splices.items);
         try testing.expectEqual(model.items.len, dst.len());
         const got = try dst.encode(gpa);
         defer gpa.free(got);
@@ -1568,7 +1680,7 @@ test "a caller can walk the slab layout" {
     const gpa = testing.allocator;
     var col = try RawColumn.withMaxSegments(gpa, 4);
     defer col.deinit();
-    try col.spliceSlice(gpa, 0, 0, "0123456789");
+    try col.spliceSlice(0, 0, "0123456789");
     try testing.expectEqual(@as(usize, 1), col.slabCount());
     const s = col.slabAt(0) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("0123456789", s.data);
@@ -1612,7 +1724,7 @@ fn wordOf(v: u32) [4]u8 {
 fn multiSlabArena(gpa: std.mem.Allocator, n: usize, budget: usize) !RawColumn {
     var col = try RawColumn.withMaxSegments(gpa, budget);
     errdefer col.deinit();
-    for (0..n) |i| try col.spliceSlice(gpa, i * 4, 0, &wordOf(@intCast(i)));
+    for (0..n) |i| try col.spliceSlice(i * 4, 0, &wordOf(@intCast(i)));
     return col;
 }
 
@@ -1641,7 +1753,7 @@ test "cross_slab_delete_all" {
     defer col.deinit();
     try testing.expect(col.slabCount() > 1);
 
-    try col.spliceSlice(gpa, 0, 10 * 4, &.{});
+    try col.spliceSlice(0, 10 * 4, &.{});
     try testing.expectEqual(@as(usize, 0), col.len());
     try testing.expect(col.isEmpty());
     // Every slab the delete emptied is dropped rather than left behind
@@ -1657,7 +1769,7 @@ test "cross_slab_delete_from_start" {
     defer col.deinit();
     try testing.expect(col.slabCount() > 1);
 
-    try col.spliceSlice(gpa, 0, 5 * 4, &.{});
+    try col.spliceSlice(0, 5 * 4, &.{});
     try expectWords(&col, &.{ 5, 6, 7, 8, 9 });
 }
 
@@ -1669,7 +1781,7 @@ test "cross_slab_delete_middle" {
     defer col.deinit();
     try testing.expect(col.slabCount() > 1);
 
-    try col.spliceSlice(gpa, 3 * 4, 4 * 4, &.{});
+    try col.spliceSlice(3 * 4, 4 * 4, &.{});
     try expectWords(&col, &.{ 0, 1, 2, 7, 8, 9 });
 }
 
@@ -1681,7 +1793,7 @@ test "cross_slab_delete_to_end" {
     defer col.deinit();
     try testing.expect(col.slabCount() > 1);
 
-    try col.spliceSlice(gpa, 6 * 4, 4 * 4, &.{});
+    try col.spliceSlice(6 * 4, 4 * 4, &.{});
     try expectWords(&col, &.{ 0, 1, 2, 3, 4, 5 });
 }
 
@@ -1697,7 +1809,7 @@ test "cross_slab_replace" {
     var payload: [8]u8 = undefined;
     @memcpy(payload[0..4], &wordOf(99));
     @memcpy(payload[4..8], &wordOf(88));
-    try col.spliceSlice(gpa, 3 * 4, 4 * 4, &payload);
+    try col.spliceSlice(3 * 4, 4 * 4, &payload);
     try expectWords(&col, &.{ 0, 1, 2, 99, 88, 7, 8, 9 });
 }
 
@@ -1746,7 +1858,7 @@ fn crossSlabRound(gpa: std.mem.Allocator, seed: u64) !void {
             @memcpy(payload[k * 4 ..][0..4], &wordOf(v.*));
         }
 
-        try col.spliceSlice(gpa, idx * 4, del * 4, payload[0 .. ins_count * 4]);
+        try col.spliceSlice(idx * 4, del * 4, payload[0 .. ins_count * 4]);
         try mirror.replaceRange(gpa, idx, del, inserted[0..ins_count]);
 
         if (col.len() != mirror.items.len * 4) {
@@ -1791,11 +1903,222 @@ test "copy_ranges_rejects_overlap" {
     var dst = try multiSlabArena(gpa, 4, 16);
     defer dst.deinit();
 
-    try testing.expectError(error.InvalidValue, dst.copyRanges(gpa, &src, &.{
+    try testing.expectError(error.InvalidValue, dst.copyRanges(&src, &.{
         .{ .pos = 0, .range = .{ .start = 10, .end = 30 } },
         .{ .pos = 0, .range = .{ .start = 20, .end = 40 } },
     }));
     try expectWords(&dst, &.{ 0, 1, 2, 3 });
+}
+
+/// Runs `stageSpliceSlice` with each of its allocations refused in turn,
+/// asserting after every refusal that the arena is still the one `check`
+/// describes, and leaving the last attempt — the one that allocated the whole
+/// way through — published.
+///
+/// `check` is a value with a `check` method. It allocates, so it runs with
+/// `fail_index` disarmed: a check refused by the very failure it is reporting
+/// on would report nothing.
+fn sweepStageRefusals(
+    failing: *testing.FailingAllocator,
+    col: *RawColumn,
+    index: usize,
+    del: usize,
+    bytes: []const u8,
+    check: anytype,
+) !void {
+    var skip: usize = 0;
+    while (true) {
+        failing.fail_index = failing.alloc_index + skip;
+        const outcome = col.stageSpliceSlice(index, del, bytes);
+        // The check below allocates, and it has to be able to.
+        failing.fail_index = std.math.maxInt(usize);
+        if (outcome) |prepared| {
+            var staged = prepared;
+            staged.publish(col);
+            break;
+        } else |failure| {
+            try testing.expectEqual(error.OutOfMemory, failure);
+            try @call(.auto, @TypeOf(check).check, .{ col, failing.allocator(), check });
+            skip += 1;
+            // An edit that never lands is a test that never ends. The widest
+            // edit below makes fewer allocations than this bound allows.
+            if (skip > 256) return error.Fail;
+        }
+    }
+    // An edit that allocated nothing could not have been refused, and the sweep
+    // would not have proved anything.
+    try testing.expect(skip > 0);
+}
+
+/// The check every refusal sweep here runs: the bytes, the length, the layout
+/// and the tree. `checkInvariants` is the part that fails when an edit gave up
+/// after rewriting the slabs and not the tree, or the other way round.
+const UnchangedWords = struct {
+    want: []const u32,
+
+    fn check(col: *RawColumn, gpa: std.mem.Allocator, self: UnchangedWords) !void {
+        try expectWords(col, self.want);
+        try col.checkInvariants(gpa);
+    }
+};
+
+/// Asserts that two arenas hold the same bytes, the same length and the same
+/// number of slabs. The edit a sweep finally lands is compared this way rather
+/// than against pinned bytes, because the two arenas differ only in how many
+/// allocations they made and the point is that they do not differ at all.
+fn expectSameArena(got: *const RawColumn, want: *const RawColumn) !void {
+    const gpa = testing.allocator;
+    const got_bytes = try got.encode(gpa);
+    defer gpa.free(got_bytes);
+    const want_bytes = try want.encode(gpa);
+    defer gpa.free(want_bytes);
+    try testing.expectEqualSlices(u8, want_bytes, got_bytes);
+    try testing.expectEqual(want.len(), got.len());
+    try testing.expectEqual(want.slabCount(), got.slabCount());
+}
+
+test "a splice that cannot be staged leaves the arena exactly as it was" {
+    // **This is the contract `stageSpliceSlice` makes and an in-place rewrite
+    // cannot.** An `error.OutOfMemory` from anywhere in the stage returns with
+    // the slabs, the bytes, the length and the tree as the call found them, so
+    // a caller may retry. The sweep is what makes it a claim about the whole
+    // stage rather than about one allocation.
+    //
+    // A real allocator through a counter, and the arena is built with the same
+    // allocator it stages from — which is now the only allocator there is,
+    // because the stage takes none.
+    {
+        // The shape that reaches the most steps: the delete runs off the end
+        // of the slab it starts in, the drain stops inside the next one and
+        // cuts its head off, and an insert lands in the first slab too.
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var col = try multiSlabArena(gpa, 6, 8);
+        defer col.deinit();
+        try sweepStageRefusals(&failing, &col, 6, 5, "ABCD", UnchangedWords{ .want = &.{ 0, 1, 2, 3, 4, 5 } });
+        // The attempt that allocated the whole way through landed, and it
+        // landed the edit a plain arena lands.
+        var plain = try multiSlabArena(gpa, 6, 8);
+        defer plain.deinit();
+        try plain.spliceSlice(6, 5, "ABCD");
+        try expectSameArena(&col, &plain);
+    }
+    {
+        // The shape where the staged range is longer than the range it
+        // replaces, so publishing moves the tail backwards rather than
+        // forwards.
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var col = try multiSlabArena(gpa, 6, 8);
+        defer col.deinit();
+        try sweepStageRefusals(&failing, &col, 0, 0, "ABCDEFGHIJ", UnchangedWords{ .want = &.{ 0, 1, 2, 3, 4, 5 } });
+        var plain = try multiSlabArena(gpa, 6, 8);
+        defer plain.deinit();
+        try plain.spliceSlice(0, 0, "ABCDEFGHIJ");
+        try expectSameArena(&col, &plain);
+    }
+}
+
+test "prepared neighbour coalescing publishes with allocation refused" {
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var col = try RawColumn.withMaxSegments(gpa, 16);
+    defer col.deinit();
+    const original = "abcdefghijklmnop";
+    try col.spliceSlice(0, 0, original);
+    try col.spliceSlice(2, 0, "ABCDEFGHIJKLMNOPQRST");
+
+    // Removing the oversized insertion leaves a two-byte slab beside a
+    // fourteen-byte neighbour. Preparation must coalesce them before handoff.
+    var staged = try col.stageSpliceSlice(2, 20, &.{});
+    defer staged.deinit();
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    staged.publish(&col);
+    try testing.expectEqualStrings(original, try col.get(0, original.len));
+    var cursor = try col.iteratorAt(7);
+    try testing.expectEqualStrings("hijklmnop", try cursor.take(9));
+    try testing.expectEqual(@as(usize, original.len), col.len());
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try col.checkInvariants(gpa);
+}
+
+test "publish consumes the staged edit, and deinit beside it is a no-op" {
+    // `testing.allocator` is the arbiter: if `deinit` released buffers
+    // `publish` had already handed over, the second free is a double free it
+    // reports at the end of this test. Nothing here can pass by accident.
+    const gpa = testing.allocator;
+    var col = try RawColumn.withMaxSegments(gpa, 32);
+    defer col.deinit();
+    try col.spliceSlice(0, 0, "hello");
+
+    var staged = try col.stageSpliceSlice(5, 0, ", world");
+    defer staged.deinit();
+    staged.publish(&col);
+    try expectArena(&col, gpa, "hello, world");
+
+    // A staged no-op publishes to nothing at all.
+    var noop = try col.stageSpliceSlice(0, 0, &.{});
+    defer noop.deinit();
+    noop.publish(&col);
+    try expectArena(&col, gpa, "hello, world");
+
+    // An abort releases the staged buffers and leaves the arena where it was.
+    var aborted = try col.stageSpliceSlice(5, 6, "!");
+    aborted.deinit();
+    try expectArena(&col, gpa, "hello, world");
+
+    // And a refusal is a refusal, with the arena untouched.
+    try testing.expectError(error.InvalidValue, col.stageSpliceSlice(0, 99, ""));
+    try testing.expectError(error.InvalidValue, col.stageSpliceSlice(99, 0, ""));
+    try expectArena(&col, gpa, "hello, world");
+}
+
+/// Stages one edit on each of two arenas and publishes both, which is the
+/// shape a caller writing several columns uses.
+fn stagePair(left: *RawColumn, right: *RawColumn, a: []const u8, b: []const u8) !void {
+    var first = try left.stageSpliceSlice(0, 4, a);
+    defer first.deinit();
+    var second = try right.stageSpliceSlice(8, 4, b);
+    defer second.deinit();
+    first.publish(left);
+    second.publish(right);
+}
+
+test "staging every column before publishing any keeps a group all-or-nothing" {
+    // Two arenas, each staged before either is published. A refusal under the
+    // second stage aborts the first through its own `defer`, and neither arena
+    // has moved — which is the whole reason `deinit` is separate from
+    // `publish` and why `publish` cannot fail. There is no full column copy
+    // anywhere: each edit rebuilds only the slab it reaches into.
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var left = try multiSlabArena(gpa, 4, 16);
+    defer left.deinit();
+    var right = try multiSlabArena(gpa, 4, 16);
+    defer right.deinit();
+    const a = wordOf(99);
+    const b = wordOf(77);
+    const before = UnchangedWords{ .want = &.{ 0, 1, 2, 3 } };
+
+    var skip: usize = 0;
+    while (true) {
+        failing.fail_index = failing.alloc_index + skip;
+        const outcome = stagePair(&left, &right, &a, &b);
+        // The checks below allocate, and they have to be able to.
+        failing.fail_index = std.math.maxInt(usize);
+        if (outcome) |_| break else |failure| {
+            try testing.expectEqual(error.OutOfMemory, failure);
+            try UnchangedWords.check(&left, gpa, before);
+            try UnchangedWords.check(&right, gpa, before);
+            skip += 1;
+            if (skip > 256) return error.Fail;
+        }
+    }
+    try testing.expect(skip > 0);
+    try expectWords(&left, &.{ 99, 1, 2, 3 });
+    try expectWords(&right, &.{ 0, 1, 77, 3 });
 }
 
 test "max_segments_zero_rejected" {
@@ -1834,12 +2157,12 @@ test "max_segments_two_full_cycle" {
 
     for (0..100) |i| {
         const v: u32 = @intCast(i);
-        try col.spliceSlice(gpa, i * 4, 0, &wordOf(v));
+        try col.spliceSlice(i * 4, 0, &wordOf(v));
         try mirror.append(gpa, v);
     }
     try expectWords(&col, mirror.items);
 
-    try col.spliceSlice(gpa, 10 * 4, 4, &.{});
+    try col.spliceSlice(10 * 4, 4, &.{});
     _ = mirror.orderedRemove(10);
     try expectWords(&col, mirror.items);
 
@@ -1851,7 +2174,7 @@ test "max_segments_two_full_cycle" {
 
     // And mutate the reloaded arena once more, which is the half a save/load
     // pair on its own never reaches.
-    try reloaded.spliceSlice(gpa, 0, 0, &wordOf(7));
+    try reloaded.spliceSlice(0, 0, &wordOf(7));
     try mirror.insert(gpa, 0, 7);
     try expectWords(&reloaded, mirror.items);
 }
@@ -1884,7 +2207,7 @@ test "max_segments_two_full_cycle" {
 //   slab anywhere has a neighbour pair that would still fit
 //   (`tests.rs:4022-4054`). `canMerge` states the same rule, but this file
 //   applies it **only to the boundaries around a splice**
-//   (`tryMergeRangeSkeleton`), deliberately never globally, so a port would have
+//   (`stageSpliceSlice`), deliberately never globally, so a port would have
 //   to weaken the case into a per-boundary predicate. **A weaker assertion
 //   wearing the same name would inflate the coverage count and prove less** — it
 //   is recorded as blocked instead.

@@ -147,7 +147,33 @@ pub const AutoSerde = struct {
     ///
     /// **`gpa` is for the key lists** and nothing else: `writeMap` copies each
     /// map's keys before it recurses, for the reason in the module doc. The
-    /// document is borrowed and is not allocated through.
+    /// document is borrowed and is not allocated through, and **nothing this
+    /// call takes survives it** — every key it copied is freed before the error
+    /// leaves, so `gpa` holds nothing on either path.
+    ///
+    /// **What the writer holds when this fails, and it is not nothing.**
+    ///
+    /// **`w` is written progressively, and a failure leaves it holding a
+    /// truncated, unterminated JSON fragment — never nothing.** [`writeMap`]
+    /// writes `{`, then one `"key":value` pair at a time, recursing for nested
+    /// values, so an error can stop it in one of three states:
+    ///
+    /// | stopped at | what `w` holds |
+    /// |---|---|
+    /// | before the root `{` | whatever the caller had written |
+    /// | inside a map or a list | an open brace or bracket, with every pair before the failure complete |
+    /// | inside a pair | the same, plus a `"key":` with no value |
+    ///
+    /// Any of [`read.keys`], [`read.get`], [`read.length`], [`read.text`],
+    /// `error.Invariant` (a key the walk yielded has no value), a key copy, or
+    /// the writer itself can stop it there. **Nothing rolls the sink back and
+    /// nothing closes the fragment**, so the residue is not detectable as bad:
+    /// a caller that retries into the same writer emits two documents back to
+    /// back, and a caller that reads only the error tag cannot tell a truncated
+    /// write from a complete one. **Discard `w` and write into a fresh one.**
+    ///
+    /// [`toJson`] is the same walk with a sink nobody can see, and it says
+    /// what that costs.
     pub fn serialize(self: AutoSerde, gpa: Allocator, w: *std.Io.Writer) SerializeError!void {
         try self.writeMap(.root, gpa, w);
     }
@@ -159,13 +185,25 @@ pub const AutoSerde = struct {
     /// **Ownership: the slice is the caller's**, free it with `gpa`. This is
     /// [`serialize`] into a [`std.Io.Writer.Allocating`], which is the shape
     /// `storage/chunk.zig:195-216` already uses.
+    ///
+    /// **On an error the caller owns nothing.** The allocating writer is
+    /// deinited before the error leaves, so there is no partial slice to free
+    /// and no buffer to discard — the truncated fragment [`serialize`] describes
+    /// went into a writer that no longer exists, and a retry starts from
+    /// nothing. **That also means a caller cannot see how far the walk got:**
+    /// the residue [`serialize`] leaves in its own writer is not observable
+    /// here, and neither is whether anything was written.
+    ///
+    /// **`error.WriteFailed` is reported as `error.OutOfMemory`**, because it
+    /// is the allocating writer's out-of-memory signal and nothing else: a
+    /// caller matching `error.WriteFailed` here would be matching a tag this
+    /// never returns. The same mapping is `chunk.zig:211-214`.
     pub fn toJson(self: AutoSerde, gpa: Allocator) SerializeError![]u8 {
         var aw: std.Io.Writer.Allocating = .init(gpa);
         errdefer aw.deinit();
         self.serialize(gpa, &aw.writer) catch |e| switch (e) {
-            // `WriteFailed` is the allocating writer's out-of-memory signal and
-            // nothing else: it has no other way to fail. The same mapping is
-            // `chunk.zig:211-214`.
+            // The one mapping, and the reason for it are on the declaration
+            // above; `chunk.zig:211-214` is the same one.
             error.WriteFailed => return error.OutOfMemory,
             else => |rest| return rest,
         };
@@ -584,7 +622,7 @@ const golden = "{\"a_bool\":false,\"a_string\":\"he\\\"llo\\\\ /\\u0001\\n\x7f" 
 
 test "the reference's own document renders the reference's own bytes" {
     const gpa = testing.allocator;
-    var doc = try Document.load(gpa, &reference_bytes, .unicode_code_point, .auto);
+    var doc = try Document.load(gpa, std.testing.io, &reference_bytes, .unicode_code_point, .auto);
     defer doc.deinit();
 
     const json = try AutoSerde.from(&doc).toJson(gpa);
@@ -616,7 +654,7 @@ test "the reference's own document renders the reference's own bytes" {
 
 test "an empty document is two braces, which is what the reference's own test says" {
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     defer doc.deinit();
     doc.setActorId(actor_a);
 
@@ -733,7 +771,7 @@ test "a string is escaped the way serde_json escapes it, and nothing else is" {
 
 test "every scalar type a document can hold reaches the output, and the allocator sees nothing" {
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     defer doc.deinit();
     doc.setActorId(actor_a);
 

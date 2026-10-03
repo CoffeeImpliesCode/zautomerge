@@ -9,12 +9,18 @@
 //! directions; change hashes match byte for byte. `save()` output is not
 //! byte-identical, because DEFLATE is not reproducible across implementations.
 //! See `docs/plan.md` §1.
+//!
+//! Published as dependency module `zautomerge` and static artifact
+//! `zautomerge` with `automerge.h`. Requires Zig 0.16.0; the manifest floor is
+//! not a claim about later compiler releases. Native document constructors
+//! borrow a live `std.Io` capability for secure actor generation.
 
 const std = @import("std");
 
 pub const error_types = @import("error.zig");
 pub const types = @import("types.zig");
 pub const value = @import("value.zig");
+/// Storage codecs, columns, edit cursors, and weight indexes.
 pub const hexane = struct {
     pub const rle = @import("hexane/rle.zig");
     pub const bool_codec = @import("hexane/bool.zig");
@@ -32,10 +38,12 @@ pub const change_graph = @import("change_graph.zig");
 pub const change_queue = @import("change_queue.zig");
 pub const sequence_tree = @import("sequence_tree.zig");
 pub const change_record = @import("change.zig");
+/// Columnar operation encoding and column descriptors.
 pub const columnar = struct {
     pub const encoding = @import("columnar/encoding.zig");
     pub const columns = @import("columnar/columns.zig");
 };
+/// Wire parsers, framed chunks, and encoded payload owners.
 pub const storage = struct {
     pub const parse = @import("storage/parse.zig");
     pub const chunk = @import("storage/chunk.zig");
@@ -52,6 +60,7 @@ pub const cursor = @import("cursor.zig");
 pub const patches = @import("patches.zig");
 pub const hydrate = @import("hydrate.zig");
 pub const doc = @import("doc.zig");
+/// Per-peer sync state and protocol drivers.
 pub const sync = struct {
     pub const bloom = @import("sync/bloom.zig");
     pub const message = @import("sync/message.zig");
@@ -61,6 +70,7 @@ pub const sync = struct {
 };
 pub const textdiff = @import("textdiff.zig");
 pub const autoserde = @import("autoserde.zig");
+/// Operation rows, indexes, queries, and batch application.
 pub const opset = struct {
     pub const ids = @import("opset/ids.zig");
     pub const types = @import("opset/types.zig");
@@ -79,11 +89,13 @@ pub const opset = struct {
     pub const batch = @import("opset/batch.zig");
     pub const parents = @import("opset/parents.zig");
 };
+/// C implementation types. Link the static artifact for C symbols.
 pub const c_abi = struct {
     pub const result = @import("c/result.zig");
     pub const doc = @import("c/doc.zig");
     pub const sync = @import("c/sync.zig");
 };
+/// Borrowed readers and fallible document traversal.
 pub const iter = struct {
     pub const tools = @import("iter/tools.zig");
     pub const slice = @import("iter/slice.zig");
@@ -95,8 +107,6 @@ pub const iter = struct {
     pub const doc = @import("iter/doc.zig");
 };
 
-// The three error sets, re-exported because every public function in this
-// crate returns one of them.
 pub const Error = error_types.Error;
 pub const ParseError = error_types.ParseError;
 pub const InternalError = error_types.InternalError;
@@ -114,6 +124,7 @@ pub const ActorIdx = types.ActorIdx;
 pub const OpId = types.OpId;
 pub const ExId = types.ExId;
 pub const ElemId = types.ElemId;
+/// Public object identity, the same type as `ExId`.
 pub const ObjId = types.ExId;
 pub const ObjType = types.ObjType;
 pub const ObjMeta = types.ObjMeta;

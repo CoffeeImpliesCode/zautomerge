@@ -147,6 +147,14 @@ const testing = std.testing;
 
 /// **The leak arbiter for the whole file.** One allocator, named once.
 const gpa = testing.allocator;
+
+/// The borrowed capability every document constructor below is handed.
+///
+/// **Explicit, because `Document` keeps it.** The op set draws actors through
+/// this value for as long as the document lives, so a constructor cannot
+/// reach for an ambient global and no document can outlive its provider. Here
+/// that value is `std.testing.io`; an executable passes its own `init.io`.
+const io = std.testing.io;
 const Allocator = std.mem.Allocator;
 
 const Document = am.doc.Document;
@@ -235,7 +243,7 @@ fn commitAs(doc: *Document, actors: *Actors, bytes: []const u8) !void {
 /// A document in the autocommit flavour, which is upstream's `AutoCommit` and
 /// which [`transact.*`](../src/transact.zig) requires.
 fn newDoc(actors: *Actors) !Document {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, io, .auto);
     errdefer doc.deinit();
     doc.setActorId(try actors.mint());
     return doc;
@@ -244,8 +252,10 @@ fn newDoc(actors: *Actors) !Document {
 /// Upstream's `doc.fork()`, which is [`Document.forkAt`](../src/doc.zig) at the
 /// source's own heads.
 ///
-/// **Not [`Document.fork`](../src/doc.zig)**: that stores `ActorId.random(gpa)`
-/// in `actor.unused` and `Document.deinit` frees no actor bytes, so it leaks.
+/// **Not [`Document.fork`](../src/doc.zig)**, because that mints its actor
+/// through the source's retained `io` and the fork's actor would differ on
+/// every run. **Determinism, not a leak**: `fork` allocates that actor from the
+/// **fork's own** arena, which [`Document.deinit`](../src/doc.zig) frees.
 fn forkDoc(actors: *Actors, src: *Document) !Document {
     const heads = try src.getHeads(gpa);
     defer gpa.free(heads);
@@ -323,7 +333,7 @@ fn saveLoad(doc: *Document) !Document {
 
     const bytes = try doc.save(gpa);
     defer gpa.free(bytes);
-    var loaded = try Document.load(gpa, bytes, .unicode_code_point, .auto);
+    var loaded = try Document.load(gpa, io, bytes, .unicode_code_point, .auto);
     errdefer loaded.deinit();
 
     var after = try am.hydrate.hydrateMap(am.doc.Set, &loaded.ops, gpa, root, null);
@@ -346,7 +356,7 @@ fn saveLoad(doc: *Document) !Document {
 fn expectReloadable(doc: *Document) !void {
     const bytes = try doc.save(gpa);
     defer gpa.free(bytes);
-    var reloaded = try Document.load(gpa, bytes, .unicode_code_point, .auto);
+    var reloaded = try Document.load(gpa, io, bytes, .unicode_code_point, .auto);
     reloaded.deinit();
 }
 
@@ -525,7 +535,7 @@ test "a zero width unmark on an empty text object survives a sync both ways" {
     // `MarkOrderValidator` accepts, which is exactly what used to panic.
     const saved = try left.save(gpa);
     defer gpa.free(saved);
-    var reloaded = try Document.load(gpa, saved, .unicode_code_point, .auto);
+    var reloaded = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
     reloaded.deinit();
 }
 
@@ -771,6 +781,7 @@ test "load refuses the historical zero width mark end before begin fixture" {
     // checksum failure or any other refusal fails here.
     const result = Document.load(
         gpa,
+        io,
         broken_mark_bytes[0..],
         .unicode_code_point,
         .auto,
@@ -795,7 +806,7 @@ test "load refuses the historical zero width mark end before begin fixture" {
     // `loadIncremental`, `c/doc.zig:356-359`, and the strict path is
     // `Document.load`). A loader that refused the snapshot but accepted the
     // same bytes as an incremental stream would be half a fix.
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, io, .auto);
     defer doc.deinit();
     const incremental = doc.loadIncremental(gpa, broken_mark_bytes[0..]);
     try testing.expectError(error.InvalidMarkOrder, incremental);
@@ -949,11 +960,13 @@ test "load refuses the historical zero width mark end before begin fixture" {
 //   the outside — so this is a strengthening against the reference, not a
 //   rewrite of the case.
 //
-// ## `fork()` is `forkAt` at the document's own heads
+// ## `fork()` is `forkAt` at the document's own heads, under a minted actor
 //
-// [`Document.fork`](../src/doc.zig) stores `ActorId.random(gpa)` in
-// `actor.unused` and `Document.deinit` frees no actor bytes, so it leaks;
-// [`forkDoc`] forks at the current heads, which is what `fork` means.
+// [`Document.fork`](../src/doc.zig) mints its actor through the source's
+// retained `io`, so it differs on every run; [`forkDoc`] forks at the current
+// heads — which is what `fork` means — and names the actor. **Determinism, not
+// a leak**: `fork` allocates that actor from the **fork's own** arena, which
+// [`Document.deinit`](../src/doc.zig) frees.
 //
 // ## Owned values, and who frees each
 //

@@ -1,9 +1,13 @@
 # zautomerge
 
-A direct Zig 0.16 translation of the `automerge` library: a JSON-like CRDT
-that several devices can edit concurrently and merge without conflict
-resolution code, with an efficient binary document format and a sync protocol
-for any reliable in-order transport.
+A direct translation of the `automerge` library into **Zig 0.16.0**: a
+JSON-like CRDT that several devices can edit concurrently and merge without
+conflict resolution code, with an efficient binary document format and a sync
+protocol for any reliable in-order transport. **0.16.0 is the only toolchain
+this repository claims**, and `build.zig.zon` says so in its
+`minimum_zig_version`. Nothing here asserts anything about a later or earlier
+Zig, a different target, or a different compiler: if a claim about the
+toolchain cannot be checked by running something on 0.16.0, it does not go in.
 
 The upstream reference is `automerge` 0.12.0 plus its `hexane` storage engine,
 checked out read-only at `../github-automerge-automerge` (commit
@@ -12,10 +16,10 @@ file). This repository is the Zig port, not a wrapper.
 
 ## Implemented
 
-**1228** tests pass in the library suite, **6** in the fixture suite, **3** in
-the crate-root example suite and **117** in the ported upstream
-`tests/test.rs` suite (`zig test -ODebug -Mroot=src/root.zig`, measured
-2026-10-01). What exists today:
+The current API-design repair uses Zig 0.16.0 on x86-64 Linux.
+[docs/STATUS.md](docs/STATUS.md) records its source, compilation, and runtime evidence.
+Earlier measurements remain labeled with their dates. They do not certify this revision.
+The published contract and consumer costs are in [API.md](API.md#api-design-decisions).
 
 - **The contract.** `error.zig` with the three error sets, `types.zig` with the
   identity and value types, `value.zig`, `clock.zig`, `leb128.zig` written from
@@ -41,23 +45,40 @@ the crate-root example suite and **117** in the ported upstream
   column read surface — ranged iteration, prefix arithmetic, run iteration,
   position scoping, value and range search, actor remapping, default-suppressing
   export, and the `Shiftable` repositioning abstraction the iteration phase is
-  built on. The forward-only edit cursor holds one slab open across a batch —
-  one partition, one byte splice, one index update — and abandoning it
-  mid-batch leaves the column sound.
+  built on. The forward-only edit cursor holds one rebuild across a batch.
+  Publication stages replacement buffers and slab/index metadata. Abandoning
+  the cursor discards its held rebuild, not batches already published.
 - **The wire formats.** The sync message, the bloom filter and the per-peer
   sync state: the payload-bearing records in `test/golden/sync.jsonl` decode and
   re-encode byte-identically. The mark value types and the fold; the vendored
   Myers text diff with its Apache-2.0 notice.
 - **The op set and the merge.** Fifteen modules under `src/opset/`: the row
-  and its `Op.step` row-order invariant, the sixteen data columns and five
-  index columns, the mark index and its cache, the row iterators, the index
+  and its `Op.step` row-order invariant, the sixteen data columns and the five
+  index columns maintained alongside them (the mark index's extra resource is a
+  cache, not a column), the mark index and its cache, the row iterators, the index
   rebuild, the visibility and winner iterators, the query surface, the op set
   root with both invariant checkers, and the merge with its two walkers. Both
   checkers are demonstrated failing, and a merge is checked against the same
   operations applied one change at a time.
-- **The C binding's contract.** `include/automerge.h` and `src/c/result.zig`,
-  with every enum discriminant proved by generating the reference's own header
-  with cbindgen at the pinned version and diffing.
+- **The C binding, as a shipped artifact.** `include/automerge.h` (installed as
+  `automerge.h`) and `src/c/result.zig`, with every enum discriminant proved by
+  generating the reference's own header with cbindgen at the pinned version and
+  diffing. `zig build` installs the static library `libzautomerge.a` from the
+  production root `src/c/root.zig`; `test/c/cabi.zig` is a **separate** library
+  that compiles the real header and checks name existence, by-value layout, enum
+  discriminants and the comparable signatures; `zig build ctest` links the
+  artifact and runs the cmocka suite. **Calls from different threads must share
+  one caller-owned global serialization boundary**, even across distinct handles,
+  because the bridge binds one process-wide
+  `std.Io.Threaded.global_single_threaded.io()`. Hold the lock through the outer
+  call and its callbacks. An invoked `AMstackCallback` may synchronously inspect
+  its live stack/result and advance a local borrowed cursor on the invoking
+  thread under that already-held lock, without reacquiring or releasing it.
+  Preserve stack/result ownership and links; no general mutation, other
+  reentrancy or cross-thread entry is permitted. The header's callback contract
+  states the keep-live rules, including the temporary null-stack path.
+  Inspection includes result diagnostics and an `AMstrdup` diagnostic copy,
+  released with `free`, not destruction of the borrowed stack or result.
 
 - **The iteration toolkit and the range readers.** `Unshift`, `PeekShift`,
   `SkipIter`, `Diff`, `DiffIter` and `Shiftable`; a map's keys, a sequence's
@@ -69,33 +90,94 @@ the crate-root example suite and **117** in the ported upstream
 - **The cursor**, with the v1 codec pinned as literal bytes in both
   directions and the legacy v0 parser alongside.
 
-**What is not written** is narrower than it was, and the list below has
-**shrunk three times over** — a record whose reason has expired is a defect, so
-expired records are deleted rather than amended. Still open, and named in
-`API.md` §Known gaps: `Automerge::get_authors` (`automerge.rs:410`, which is
-`&[Author]`, not the actor-id list this port has), a document-level `hydrate`,
-a document-level `bundle`, and `AutoCommit::diff_cache` (deliberately, and
-§Diffing of `API.md` says why).
+**What is not written is narrower than it was, and the list below has shrunk
+repeatedly** — a record whose reason has expired is a defect, so expired records
+are deleted rather than amended. **Exactly one item remains, and it is a
+deliberate omission rather than a hole**: `AutoCommit::diff_cache` is not
+ported, `API.md` §Diffing argues why from the port's `Patches` ownership, and
+that argument makes **no performance claim** — nothing in this repository
+measures a cached diff against an uncached one.
 
-**Three of the six items this list used to carry are now closed.** The `_at`
-historical variants are ported — fourteen readers plus
-`Document.clockAtScope`, upstream's `Automerge::clock_at`
-(`automerge.rs:1236-1247`). `UpdateSpansConfig` is `src/marks.zig:731`, and
-`transact.updateSpansWithConfig` / `Transaction.updateSpansWithConfig` thread it
-to the mark pass without changing any other signature.
-`ReadDoc::iter_at` and `DocIter` are **not the same gap and must not be counted
-as one**: the walk itself is ported — `DocIter` and its six item types in
-`src/iter/doc.zig`, upstream's `doc_iter` (`iter/doc.rs:532-602`) transcribed
-with all 22 answers — while the document-layer **entry point**
-`Automerge::iter` (`automerge.rs:1669-1674`) is still not ported. `DocIter.init`
-takes the op-set-and-encoding handle instead, which is all `iter/doc.rs` ever
-reaches a document for (`iter/doc.rs:44,100,186`).
+**Six items this list used to carry are closed**, and three of them were closed
+in the tree before this paragraph was last read:
+  - `Automerge::get_authors` (`automerge.rs:410`) is `Document.getAuthors(gpa)
+    Error![]const []const u8` — the array is the caller's, the names are the
+    document's arena — and it sits beside `getActors(gpa) Error![]ActorId` for
+    the actor-id list. **Both** exist; the earlier version of this file claimed
+    neither did the first.
+  - The document-level **entry point** `Automerge::iter` /
+    `ReadDoc::iter_at` (`automerge.rs:1669-1674`, `read.rs:60`) is
+    `read.iter(doc, gpa)` and `read.iterAt(doc, obj, heads, gpa)`; the walk it
+    returns is `src/iter/doc.zig`'s `DocIter` with its six item types,
+    upstream's `doc_iter` (`iter/doc.rs:532-602`). The claim that only the walk
+    existed and the door did not was out of date.
+  - The document-level **bundle** `Automerge::bundle(hashes)`
+    (`automerge.rs:1141`) is `Document.bundle(gpa, hashes)
+    DocumentError!Bundle`, and the fragment API beside it —
+    `Document.fragments`, `getFragment`, `bundleFragments` over
+    `change_graph.zig`'s `Fragment` — is ported too. The caller owns the bundle,
+    the fragment array and each fragment's buffers.
+  - The `_at` historical variants: fourteen readers plus
+    `Document.clockAtScope`, upstream's `Automerge::clock_at`
+    (`automerge.rs:1236-1247`).
+  - `UpdateSpansConfig` is `src/marks.zig`'s `UpdateSpansConfig`, and
+    `transact.updateSpansWithConfig` / `Transaction.updateSpansWithConfig` thread
+    it to the mark pass without changing any other signature.
+  - The entry point into the hydrate mirror, `read.hydrate`, is
+    `ReadDoc::hydrate` (`read.rs:273-277`).
+
 The read, transact and transaction surfaces, all six iterators, sync's state
-machine, `anonymize.zig`, `autoserde.zig` and the C ABI are all written, wired
-and passing — including `src/doc.zig`'s change encoder, proved byte-exact
-against the reference in both directions. **The gates, and what does and does
-not meet them, are in [docs/STATUS.md](docs/STATUS.md) and
-[docs/plan.md](docs/plan.md).**
+machine, `anonymize.zig`, `autoserde.zig` and the C ABI are all written and
+wired — including `src/doc.zig`'s change encoder, proved byte-exact against the
+reference in both directions by running the reference. "Passing" is a dated
+measurement: see the note at the top of this section and
+[docs/STATUS.md](docs/STATUS.md). **The gates, and what does and does not meet
+them, are in [docs/STATUS.md](docs/STATUS.md) and [docs/plan.md](docs/plan.md).**
+
+### Six contract decisions and their consumer costs
+
+1. **A constructor takes a borrowed `std.Io` and the document keeps it.**
+   `Document.init(gpa, io, mode)` and `initWithEncoding(gpa, io, encoding, mode)`
+   answer `InitError` — exactly `Allocator.Error || std.Io.RandomSecureError` —
+   and `load(gpa, io, bytes, encoding, mode)` answers `LoadError`, because it
+   parses after it builds. **Caller cost: hold a live capability for the
+   document's lifetime.** A test passes `std.testing.io`; an executable passes
+   its own; the C bridge passes its process-wide single-threaded provider.
+2. **A fresh document draws a secure 16-byte actor id and a refusal is an
+   error.** `ActorId.random(gpa, io)` has no weaker fallback, and
+   `error.Canceled` / `error.EntropyUnavailable` are `Error` variants rather
+   than the panic upstream raises. **Caller cost: handle two refusals that used
+   to be impossible**, and use `Document.setActorId` wherever the id must be
+   deterministic.
+3. **A refused commit leaves the transaction open and a rollback is resumable.**
+   **Caller cost: `Failure(O)` is a five-field struct, not `{ err, cancelled }`**
+   — `rollback_error`, a recovery `transaction` and the retained `result` all
+   have to be read. A refused rollback hands the caller a progressed
+   transaction to finish, not an unusable document.
+   Native automatic wrappers retain published or queued work in
+   `Document.auto_recovery` without allocating. `recoverAuto()` retries rollback;
+   the next native write recovers before assigning new IDs. Keep the document
+   at its address and do not read rows until recovery finishes. Disposal frees
+   the retained owner without attempting rollback.
+4. **`Document` is single-owner.** No shallow copy; a move only while no borrow
+   of its address remains. **Caller cost: hold a `*Document`, and use `clone` /
+   `fork` / `forkAt` for a second owner.**
+5. **The C ABI is a shipped artifact with a global threading contract.**
+   **Caller cost: a C consumer links `libzautomerge.a` and `automerge.h`, and
+   uses one global serialization boundary for calls from different threads,
+   even across distinct handles**, because the bridge's `std.Io` provider is
+   process-wide and single-threaded. Synchronous stack/result inspection by an
+   invoked `AMstackCallback` on the invoking thread stays under the outer call's
+   already-held lock and must not reacquire or release it. Keep the stack/result
+   live and preserve ownership and links; this is not general mutation, other
+   reentrancy or cross-thread entry. The Rust crate's `Send`/`Sync` story does
+   not transfer.
+6. **Text values remain UTF-8-backed.** `ConcreteTextValue.removeRange` deletes a complete encoded span atomically.
+   **Caller cost:** use scalar or current grapheme boundaries. A split UTF-16 surrogate returns `error.InvalidCharacter`.
+   An ordinary owner releases the old buffer only after a replacement changes its pointer.
+   Zero-length and out-of-range deletions retain the buffer.
+   `hydrate.Text` handles this ownership itself.
+   This representation does not support arbitrary native-unit edits or preserve Rust's stored grapheme units.
 
 ## Planned
 
@@ -110,11 +192,11 @@ The full port of the `automerge` and `hexane` crates, phase by phase, is in
 | P3 | columnar encoding, chunk framing, document and change chunks | all 17 corpus fixtures load with the recorded outcome, all 8 fuzz crashers return `ParseError` |
 | P4 | change graph, change encoding | change hashes byte-identical to the reference |
 | P5 | the op set, merge, batch apply | `tests/test.rs` **140/140** and `tests/batch_insert.rs` **46/46** ported; the gate's `save()`-modulo-DEFLATE clause is not asserted |
-| P6 | the document and transaction API | every `ReadDoc` and `Transactable` method tested |
+| P6 | the document and transaction API | every `ReadDoc` and `Transactable` method tested, and every constructor call site supplies a live `std.Io` — a test with `std.testing.io`, an executable with its own, the C bridge with its process-wide provider |
 | P7 | iterators and historical reads | `text.rs` **21/21** and `text_encoding.rs` **15/15** ported, verified case by case; **34 of the 36 run under all four `TextEncoding`s**, the two exceptions named and reasoned in `docs/STATUS.md`. **The `8/21` and `10/15` this row carried until 2026-10-01 were wrong in both halves** — the cases were already in the tree. |
 | P8 | sync, including v1 compatibility | convergence, cross-implementation sync both ways |
 | P9 | patches, marks, cursors, text diff, hydrate, serde | `diff_marks.rs` **36/36** and `test_mark_patches.rs` **1/1** — gate met |
-| P10 | the C ABI | the upstream C test suite passes: **153/153** cmocka cases |
+| P10 | the C ABI | `zig build ctest` runs the upstream C suite against the production artifact and compiles the real header's 187 function signatures, 37 enum names across five enums, and five exposed struct layouts. **A green suite alone is not this gate**: linking does not prove layout or signature parity. |
 
 ## Compatibility contract
 
@@ -127,26 +209,45 @@ The full port of the `automerge` and `hexane` crates, phase by phase, is in
   implementations, and equivalence is checked by loading and comparing the
   materialized document instead.
 
+
+**Licensing.** The root `LICENSE` is the MIT licence of the Automerge
+contributors and ships with the package (`build.zig.zon`'s `paths` includes
+it). `src/textdiff/LICENSE` is a **separate, vendored Apache-2.0** notice for
+the Myers text diff ported from `mitsuhiko/similar`, and
+`test/c/suite/LICENSE` is upstream's own for the vendored C test tree. **Three
+licences, three files, and none of them may be merged or dropped**: the MIT
+root licence does not cover the vendored Apache code and does not cover the
+vendored C suite.
+
 ## Commands
 
 Run at the repository root:
 
-- `zig build` makes the `zautomerge` module available to consumers. It
-  installs no artifact.
+- `zig build` makes the `zautomerge` module available to consumers **and
+  installs one artifact plus one header**: the static library
+  `libzautomerge.a`, built from the production root `src/c/root.zig`, and
+  `automerge.h` from `include/`. The package's `paths` in `build.zig.zon` list
+  `build.zig`, `build.zig.zon`, `src`, `include` and `LICENSE`, so a consumer
+  that takes the package takes the header and the licence with it. **The native
+  module's name is unchanged** — `zautomerge` — and it is a separate thing from
+  the C library that happens to share the name.
 - `zig build test` runs the unit tests.
 - `zig build conformance` drives the oracle once per vector and checks each
   against the copy committed in `test/golden/`; `zig build conformance --
   <name>` checks one. `-Dconformance-record` rewrites them from the reference
   instead. `zig build conformance -- fixtures` prints the 18 corpus results the
   manifest records.
-- `zig build ctest` builds and runs the upstream cmocka suite. It needs
-  `-Dcmocka-prefix` (pointing at a cmocka built by `test/c/build-cmocka.sh`)
-  **and an absolute** `LD_LIBRARY_PATH` including that prefix's `lib64`, because
-  the step sets no rpath. **The step's working directory is `test/c/suite`, so a
-  relative path on either variable resolves against that directory**: the binary
-  compiles and then fails to launch with `libcmocka.so.0: cannot open shared
-  object file` and the step reports **exit 127** — a build failure that is not
-  one.
+- `zig build ctest` builds the production library, **builds the separate ABI
+  check library against the real header**, links the suite against the
+  production artifact, and runs the cmocka suite. It needs `-Dcmocka-prefix`
+  (pointing at a cmocka built by `test/c/build-cmocka.sh`); the prefix is
+  absolutised inside the build and `each_lib_rpath` is set, so
+  `libcmocka.so.0` resolves from the binary's own RUNPATH and **`LD_LIBRARY_PATH`
+  is not required**. A relative `-Dcmocka-prefix` works for that reason. **The
+  step's working directory is `test/c/suite`**, which is why an absolute path
+  used to be needed at all, and why a prefix that reached the binary as a
+  relative RUNPATH entry produced exit 127 — a build failure that is not one.
+  A usable prefix is the sibling `../cmocka-prefix`.
 - `zig fmt --check .` checks formatting. `gate` runs the house gate.
 - `jj st` shows working-copy status. Use `jj`, not raw Git, for mutations.
 

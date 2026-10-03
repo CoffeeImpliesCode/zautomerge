@@ -155,7 +155,14 @@ const Edge = struct {
 pub const Node = struct {
     /// The change's metadata, owned: the actor bytes, the dependency hashes,
     /// the message and the referenced actor bytes are all copies, so a node
-    /// outlives the chunk it was parsed from. Free it with `deinit`.
+    /// outlives the chunk it was parsed from. **There is no `Node.deinit`** —
+    /// `Node` is four fields and no methods. The metadata is released by
+    /// [`ChangeMetadata.deinit`](change.zig), and the only thing in this file
+    /// that calls it is [`ChangeGraph.deinit`](ChangeGraph.deinit), walking
+    /// `nodes` once. A node reached through [`nodeAt`](ChangeGraph.nodeAt) or
+    /// [`nodeFor`](ChangeGraph.nodeFor) is therefore read-only in practice:
+    /// the graph that owns it is the only thing that may free it, and exactly
+    /// once.
     meta: ChangeMetadata,
     /// The change author as an index into the document's actor table. This is
     /// the `ActorIdx` upstream stores in its `actor` column
@@ -395,13 +402,42 @@ pub const Fragment = struct {
 /// `0..0` is `.{ .start = 0, .end = 0 }`. An inclusive range and a
 /// half-open one cannot both be the spelling here, and half-open is the one
 /// the rest of this port's ranges use.
+///
+/// **`.{}` is `[0, ∞)`: every level, loose and cached.** That default is
+/// what [`fragments`](ChangeGraph.fragments) is handed when a caller asks for
+/// the whole history, and it is why `end` is `null` rather than a large
+/// number: the bound is not knowable, so it is absent.
+///
+/// **A range that contains nothing is written, not inferred.** `end` at or
+/// below `start` — `0..0`, or `9..5` — is representable and
+/// [`contains`](LevelRange.contains) answers false for every input, so the
+/// query returns no fragments at all. Nothing rejects it and nothing clamps
+/// it; that is what makes "drop the loose fragments and keep the cached ones"
+/// expressible at all, and the two are different questions:
+///
+/// * `.{ .start = 0, .end = 0 }` — nothing, loose or cached. This is the
+///   spelling [`fragments`](ChangeGraph.fragments) tests
+///   `contains(0)` against before it walks the loose fragments, so it is what
+///   turns the loose walk off.
+/// * `.{ .start = 1 }` — cached fragments only. Level zero is the loose
+///   walk's own level, so a start of one leaves every cached entry in and
+///   excludes the loose ones, which is the "only what the cache holds"
+///   question `.{}` does not answer.
 pub const LevelRange = struct {
-    /// The lowest level included, inclusive.
+    /// The lowest level included, inclusive. **Defaults to 0**, which is
+    /// the loose walk's level as well as every cached fragment's floor — so
+    /// the default covers the whole history, and `.{}` is `0..∞`.
     start: usize = 0,
-    /// The level one past the last included, exclusive; null for no bound.
+    /// The level one past the last included, exclusive; **null — the
+    /// default — for no bound.** It is `null` rather than a sentinel maximum
+    /// because a level is a count of leading zero bits of a hash, so no
+    /// caller can know the highest one in advance. `.{ .start = 1 }` is
+    /// therefore `1..∞` and not `1..0`, which would be empty.
     end: ?usize = null,
 
-    /// True when `level` is in the range.
+    /// True when `level` is in the range. Never fails and never clamps: a
+    /// level below `start` or at or above `end` is simply not contained, and
+    /// an inverted range (`end <= start`) contains nothing at all.
     pub fn contains(self: LevelRange, level: usize) bool {
         if (level < self.start) return false;
         const end = self.end orelse return true;
@@ -633,6 +669,17 @@ pub const ChangeGraph = struct {
     }
 
     /// Adds a change, and every actor it references, to the graph.
+    ///
+    /// **`meta` is borrowed, on every path, and is deep-copied.** It is an
+    /// owning type — four allocations — but this method never frees it and
+    /// never takes it: `pushNode` stores `meta.intoOwned(gpa)`, its own copy,
+    /// so the graph's node outlives whatever the caller had. That holds on the
+    /// two early returns, on every `try` refusal, and on the success path, so
+    /// **the caller still owns `meta` after this returns, and still owes it a
+    /// `deinit`.** A caller that reads `Error!void` and a by-value owning type
+    /// as a transfer frees the graph's own actor bytes; a caller that treats
+    /// it as borrowed and forgets the `defer` leaks four allocations per
+    /// added change. `meta.deinit` is valid on it whatever this method did.
     ///
     /// Refused:
     ///
@@ -1647,6 +1694,24 @@ pub const ChangeGraph = struct {
     /// call this, or the graph's clocks stay shorter than the document's actor
     /// table and `Clock.covers` refuses to compare them.
     ///
+    /// ## The bound on `idx`, and the two refusals
+    ///
+    /// **`idx <= numActors()`**, which is `idx <= seq_index.items.len`: equal
+    /// appends one slot at the end, less inserts one in the middle. Anything
+    /// above that is refused with `error.InvalidIndex`, checked before
+    /// anything is reserved. The bound is not `idx < numActors()` — `numActors()`
+    /// is the count, and this accepts the count as well as every index below
+    /// it, so a caller that has just interned an actor can pass what it got
+    /// without subtracting. [`removeActor`](ChangeGraph.removeActor) takes the
+    /// same `ActorIdx` and accepts only `idx < numActors()`, so every slot this
+    /// can create is a slot that one can take away, and none other is.
+    ///
+    /// Those two are the whole refusal set: `error.InvalidIndex` for a bad
+    /// `idx`, and `error.OutOfMemory` from the reservation below. A refusal
+    /// from the reservation leaves the graph's *room* taken and nothing else
+    /// moved — a reservation moves no length, so the next attempt finds the
+    /// space already there.
+    ///
     /// ## A refusal renumbers nothing
     ///
     /// Everything the insertion allocates is allocated first
@@ -1657,7 +1722,6 @@ pub const ChangeGraph = struct {
     /// is not a smaller wrong answer: it is a clock that reads as covering a
     /// different actor, which is the whole of what `AGENTS.md`'s actor-mirror
     /// rule is about.
-    ///
     pub fn insertActor(self: *ChangeGraph, gpa: Allocator, idx: ActorIdx) Error!void {
         const at: usize = idx;
         if (at > self.seq_index.items.len) return error.InvalidIndex;
@@ -1706,15 +1770,34 @@ pub const ChangeGraph = struct {
     /// cache, every cached fragment and `fragment_top` (`remove_actor`,
     /// `change_graph.rs:169-186`).
     ///
-    /// The actor must have no changes in the graph. Upstream asserts it
-    /// (`change_graph.rs:175-177`) and panics, because an actor whose changes
-    /// are still here would have them retarget another actor. A rollback of a
-    /// first change is the only caller that should ever get here, and it passes
-    /// an actor the graph has just emptied.
+    /// The actor must have no changes in the graph: `seqForActor(idx) == 0`.
+    /// Upstream asserts it (`change_graph.rs:175-177`) and panics, because an
+    /// actor whose changes are still here would have them retarget another
+    /// actor. A rollback of a first change is the only caller that should ever
+    /// get here, and it passes an actor the graph has just emptied.
     ///
-    /// Nothing here allocates, so there is no half-removed state to be in: the
-    /// two refusals above are the whole of what can go wrong, and both are
-    /// decided before the first index moves.
+    /// ## The two refusals, by name
+    ///
+    /// **`idx < numActors()`**, and both refusals carry the *same* tag, so a
+    /// caller cannot tell them apart by the error:
+    ///
+    /// * `error.InvalidIndex` when `idx >= seq_index.items.len` — there is no
+    ///   such slot;
+    /// * `error.InvalidIndex` when `seq_index.items[idx].items.len != 0` —
+    ///   the slot exists but the actor still has a change in the graph.
+    ///
+    /// Both are decided before the first index moves, and nothing after them
+    /// allocates — `SeqClock.removeActor` is a `copyForwards` and a length
+    /// decrement — so **once a caller has established `idx < numActors()` and
+    /// `seqForActor(idx) == 0` this method cannot fail**, and a caller that
+    /// has other fallible steps to run first should run them first and leave
+    /// this one last: it is the step that renumbers every actor index above
+    /// `idx` down by one, and it also drops `numActors()` by one, because the
+    /// emptied `seq_index[idx]` list is freed with the slot.
+    ///
+    /// The graph holds no mirror of the actor table itself, so it cannot tell
+    /// a caller whether that table is in step. The `seqForActor == 0` half of
+    /// the precondition is the graph-side of the rule only.
     pub fn removeActor(self: *ChangeGraph, idx: ActorIdx) Error!void {
         const at: usize = idx;
         if (at >= self.seq_index.items.len) return error.InvalidIndex;

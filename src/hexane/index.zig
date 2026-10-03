@@ -75,8 +75,14 @@ pub const Bytes = struct {
     /// The weight of no slabs at all.
     pub const zero: Bytes = .{};
 
+    /// The weight contract the two index backends consume. `identity`,
+    /// `merge`, `itemCount` and `eql` are the shared shape described under
+    /// "The weight contract" above; `sub` is the Fenwick's extra and the
+    /// reason this weight is not one of `column.zig`'s.
     pub const Aggregate = struct {
+        /// The weight of no slabs at all.
         pub const identity: Bytes = .zero;
+        /// The weight of two adjacent spans, in order.
         pub fn merge(l: Bytes, r: Bytes) Bytes {
             return .{ .n = l.n + r.n };
         }
@@ -86,9 +92,12 @@ pub const Bytes = struct {
         pub fn sub(a: Bytes, b: Bytes) Bytes {
             return .{ .n = a.n - b.n };
         }
+        /// How many column rows the weight covers. For a byte slab that is
+        /// its byte length, so it is both counts at once.
         pub fn itemCount(w: Bytes) usize {
             return w.n;
         }
+        /// Whether two weights describe the same span.
         pub fn eql(a: Bytes, b: Bytes) bool {
             return a.n == b.n;
         }
@@ -126,6 +135,11 @@ pub fn Fenwick(comptime W: type) type {
     return struct {
         const Self = @This();
 
+        /// The allocator the tree is allocated and released with: the one
+        /// `init` was given. `deinit` releases the tree, not the allocator.
+        /// A per-call allocator — `rebuildFrom`'s and `rebuild`'s — has to
+        /// be this one: the tree it reserves with it is handed back to
+        /// `deinit`, which frees it with `self.gpa`.
         gpa: std.mem.Allocator,
         /// The tree, one-indexed. It always holds at least the unused slot,
         /// so a fresh tree can answer a query over no slabs.
@@ -225,7 +239,20 @@ pub fn Fenwick(comptime W: type) type {
         /// The caller supplies the old weight because a caller holding the
         /// slabs — rather than a weight cache — reads it off the slab it just
         /// rewrote (`raw.rs:255`).
+        ///
+        /// `si` has to name a slab the tree holds, `si < len()`. There is no
+        /// error channel: a position at or past the end has no ancestor
+        /// node to fold the change into, so the walk never runs and the call
+        /// is a silent no-op that leaves the tree describing the old weight.
+        /// [`BitIndex.updateSlab`](BitIndex) checks the bound first and
+        /// reports `error.InvalidIndex` for the same mistake, so a caller
+        /// holding an index should go through it. The one caller that keeps
+        /// the tree on its own — the byte arena's splice, which rewrote the
+        /// slab it is naming — is inside that bound by construction.
         pub fn pointUpdate(self: *Self, si: usize, old: W, new: W) void {
+            // A precondition, not validation of hostile input: a released
+            // caller is a bug, and `si + 1` below must stay in range.
+            std.debug.assert(si < self.len());
             var i = si + 1; // the tree is one-indexed
             while (i < self.items.items.len) {
                 self.items.items[i] = W.Aggregate.sub(W.Aggregate.merge(self.items.items[i], new), old);
@@ -241,6 +268,14 @@ pub fn Fenwick(comptime W: type) type {
         /// function and the byte arena passes a slab length
         /// (`column.rs:144-146`). Reading one weight at a time keeps that
         /// shape without a temporary array.
+        ///
+        /// **Failure leaves the tree as it was.** The whole new tree is
+        /// reserved before the old one is dropped, so `error.OutOfMemory`
+        /// cannot leave a tree that is shorter than the weights it was built
+        /// from — which would make every later query answer as though the
+        /// index held fewer slabs than it does. Nothing is allocated after
+        /// that point, and `gpa` has to be the tree's own allocator: the
+        /// storage reserved here is released by `deinit` with `self.gpa`.
         pub fn rebuildFrom(
             self: *Self,
             gpa: std.mem.Allocator,
@@ -248,11 +283,11 @@ pub fn Fenwick(comptime W: type) type {
             n: usize,
             comptime weightOf: fn (@TypeOf(ctx), usize) W,
         ) std.mem.Allocator.Error!void {
-            self.items.clearRetainingCapacity();
-            try self.items.append(gpa, W.Aggregate.identity);
             try self.items.ensureTotalCapacity(gpa, n + 1);
+            self.items.clearRetainingCapacity();
+            self.items.appendAssumeCapacity(W.Aggregate.identity);
             var i: usize = 0;
-            while (i < n) : (i += 1) try self.items.append(gpa, weightOf(ctx, i));
+            while (i < n) : (i += 1) self.items.appendAssumeCapacity(weightOf(ctx, i));
             // Standard O(n) construction: every node hands its total to its
             // parent, so each node ends up holding the sum of its span.
             var j: usize = 1;
@@ -264,7 +299,8 @@ pub fn Fenwick(comptime W: type) type {
             }
         }
 
-        /// Rebuilds the tree from a slice of weights, in O(S).
+        /// Rebuilds the tree from a slice of weights, in O(S). As
+        /// `rebuildFrom`, failure leaves the tree as it was.
         pub fn rebuild(self: *Self, gpa: std.mem.Allocator, weights: []const W) std.mem.Allocator.Error!void {
             return self.rebuildFrom(gpa, weights, weights.len, weightOfSlice(W));
         }
@@ -277,14 +313,24 @@ pub fn Fenwick(comptime W: type) type {
 /// The byte arena holds only the tree — [`Fenwick`] — because it reads each
 /// weight off its slab. This is the shape an index takes when its caller would
 /// rather keep the weights than the slabs.
+///
+/// The cache and the tree are one answer kept twice: `len`, `isEmpty` and
+/// `updateSlab` read the cache, `findSlab` and `itemsBefore` walk the tree,
+/// and a caller that sees one count sees the other's. Every mutating
+/// operation stages its allocations first, so no reachable state has the
+/// two halves describing different slab counts.
 pub fn BitIndex(comptime W: type) type {
     return struct {
         const Self = @This();
 
+        /// The allocator both halves are allocated and released with. Not
+        /// released itself: it is the caller's.
         gpa: std.mem.Allocator,
         /// One weight per slab, in slab order. The old value of a point
         /// update is read from here (`index.rs:111`).
         weights: std.ArrayList(W),
+        /// The tree the positional queries walk. Its slab count always
+        /// equals `weights.items.len`.
         bit: Fenwick(W),
 
         /// An index over no slabs.
@@ -340,14 +386,30 @@ pub fn BitIndex(comptime W: type) type {
             self.bit.pointUpdate(slab_idx, old, new_weight);
         }
 
-        /// Replaces the weights of slabs `start..end` with `new_weights`, in
-        /// O(S) (`splice`, `index.rs:116-119`). A Fenwick tree cannot absorb
-        /// a structural change in O(log S): every ancestor of every slab
-        /// behind the range moves, so the tree is rebuilt.
+        /// Replaces the weights of slabs `start..end` with `new_weights`
+        /// (`splice`, `index.rs:116-119`). Time is O(S + N), where S and N
+        /// are the old and resulting slab counts: replacement shifts the
+        /// cache's suffix and the whole resulting Fenwick tree is rebuilt.
+        /// Growth reserves O(N) storage; neither buffer is cloned.
+        ///
+        /// `start > end` or `end > len()` returns `error.InvalidIndex`.
+        /// An unrepresentable storage size or a refused allocation returns
+        /// `error.OutOfMemory`. On error, weights, slab counts and all
+        /// positional answers remain unchanged, but capacity may grow and
+        /// storage may move. Both buffers are reserved before replacement,
+        /// so publication and the capacity-guaranteed rebuild cannot fail.
+        /// `new_weights` is copied and must not alias the index's storage.
         pub fn splice(self: *Self, start: usize, end: usize, new_weights: []const W) IndexError!void {
             if (start > end or end > self.weights.items.len) return error.InvalidIndex;
-            self.weights.replaceRange(self.gpa, start, end, new_weights) catch return error.OutOfMemory;
-            try self.bit.rebuild(self.gpa, self.weights.items);
+            const kept = self.weights.items.len - (end - start);
+            const new_len = std.math.add(usize, kept, new_weights.len) catch return error.OutOfMemory;
+            const tree_len = std.math.add(usize, new_len, 1) catch return error.OutOfMemory;
+            try self.weights.ensureTotalCapacity(self.gpa, new_len);
+            try self.bit.items.ensureTotalCapacity(self.gpa, tree_len);
+            self.weights.replaceRangeAssumeCapacity(start, end - start, new_weights);
+            // The rebuild's reservation is already satisfied; no allocation
+            // remains after the cache publishes the new weight sequence.
+            self.bit.rebuild(self.gpa, self.weights.items) catch unreachable;
         }
     };
 }
@@ -620,7 +682,7 @@ test "index_items_before_parity" {
     for (0..50) |i| {
         var word: [4]u8 = undefined;
         std.mem.writeInt(u32, &word, @intCast(i * 37 % 1000), .big);
-        try col.spliceSlice(gpa, i * 4, 0, &word);
+        try col.spliceSlice(i * 4, 0, &word);
     }
     // Upstream's own guard: with one slab there is nothing to be in parity
     // about.
@@ -658,6 +720,110 @@ test "index_items_before_parity" {
     // And one past the end is the total, which is upstream's last line.
     try testing.expectEqual(running, bit.itemsBefore(lens.items.len));
     try testing.expectEqual(running, tree.itemsBeforeSlab(lens.items.len));
+}
+
+test "a refused growing splice leaves the weight cache and the tree unchanged" {
+    const gpa = testing.allocator;
+    const before = [_]Bytes{ .{ .n = 3 }, .{ .n = 0 }, .{ .n = 5 }, .{ .n = 1 }, .{ .n = 4 } };
+    var after: [64]Bytes = undefined;
+    for (&after, 0..) |*weight, i| weight.* = .{ .n = i % 8 };
+    const start: usize = 1;
+    const end: usize = 3;
+    const spliced_len = before.len - (end - start) + after.len;
+    var spliced: [spliced_len]Bytes = undefined;
+    @memcpy(spliced[0..start], before[0..start]);
+    @memcpy(spliced[start..][0..after.len], &after);
+    @memcpy(spliced[start + after.len ..], before[end..]);
+
+    // Grow both buffers while replacing existing weights. Each fault gets a
+    // fresh fixture, so an earlier successful reservation cannot hide a later
+    // allocation boundary. Disallow in-place resizing to expose those faults.
+    var refusals: usize = 0;
+    var skip: usize = 0;
+    while (true) : (skip += 1) {
+        var failing: testing.FailingAllocator = .init(gpa, .{});
+        const arm = failing.allocator();
+        var idx = try BitIndex(Bytes).fromWeights(arm, &before);
+        defer idx.deinit();
+        try testing.expect(spliced_len > idx.weights.capacity);
+        try testing.expect(spliced_len + 1 > idx.bit.items.capacity);
+        failing.fail_index = failing.alloc_index + skip;
+        failing.resize_fail_index = failing.resize_index;
+
+        var committed = true;
+        idx.splice(start, end, &after) catch |e| switch (e) {
+            error.OutOfMemory => {
+                committed = false;
+                refusals += 1;
+            },
+            error.InvalidIndex => return error.TestUnexpectedResult,
+        };
+        const expected: []const Bytes = if (committed) &spliced else &before;
+        try testing.expectEqualSlices(Bytes, expected, idx.weights.items);
+        try testing.expectEqual(expected.len, idx.len());
+        try testing.expectEqual(expected.len, idx.bit.len());
+        for (0..expected.len + 1) |i| {
+            try testing.expectEqual(referenceBefore(expected, i), idx.itemsBefore(i));
+        }
+        const total = referenceBefore(expected, expected.len);
+        for (0..total + 1) |k| {
+            try testing.expectEqual(referencePos(expected, k), idx.findSlab(k));
+        }
+        if (committed) break;
+    }
+    // Both real growth reservations must have been refused, without pinning
+    // an exact allocator count or permitting setup failures to count as coverage.
+    try testing.expect(refusals >= 2);
+}
+
+test "a refused rebuild leaves the tree whole" {
+    const gpa = testing.allocator;
+    const before = [_]Bytes{ .{ .n = 3 }, .{ .n = 0 }, .{ .n = 5 }, .{ .n = 1 }, .{ .n = 4 } };
+    const after = [_]Bytes{ .{ .n = 2 }, .{ .n = 7 }, .{ .n = 9 }, .{ .n = 1 } };
+
+    // A tree over no slabs at all answers every query as though it held
+    // none, so a rebuild that dropped the old tree before reserving the new
+    // one would turn a refused call into a silently wrong answer rather than
+    // an error. After every refusal the tree still describes `before` in
+    // full — or the whole of `after`, if the rebuild got through.
+    const needed = blk: {
+        var failing: testing.FailingAllocator = .init(gpa, .{});
+        var bit = try Fenwick(Bytes).init(failing.allocator());
+        defer bit.deinit();
+        try bit.rebuild(failing.allocator(), &before);
+        try bit.rebuild(failing.allocator(), &after);
+        break :blk failing.alloc_index;
+    };
+
+    for (0..needed) |fail_index| {
+        var failing: testing.FailingAllocator = .init(gpa, .{ .fail_index = fail_index });
+        const arm = failing.allocator();
+        var bit = Fenwick(Bytes).init(arm) catch continue;
+        defer bit.deinit();
+        bit.rebuild(arm, &before) catch continue;
+
+        // `OutOfMemory` is the only error a rebuild can report, so a refusal
+        // is the only way it can leave. The two lists have different slab
+        // counts, which is what tells a committed rebuild from a refused
+        // one; the value sequence below then pins what the tree really holds.
+        var committed = true;
+        bit.rebuild(arm, &after) catch {
+            committed = false;
+        };
+        const expected: []const Bytes = if (committed) after[0..] else before[0..];
+
+        try testing.expectEqual(expected.len, bit.len());
+        for (0..expected.len + 1) |i| {
+            try testing.expectEqual(referenceBefore(expected, i), bit.prefixQuery(i));
+        }
+        const total = referenceBefore(expected, expected.len);
+        for (0..total + 1) |k| {
+            try testing.expectEqual(referencePos(expected, k), bit.findSlab(k));
+        }
+        // Teardown is `testing.allocator`'s to check: a tree whose reserve
+        // was refused has to keep the bytes it already held and give them
+        // back.
+    }
 }
 
 // Zig 0.16.0 / upstream / Rust / port

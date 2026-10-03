@@ -114,10 +114,8 @@
 //!
 //! # Ownership rules
 //!
-//! * `Document` must not be moved after it is built, and neither must
-//!   [`Anonymize`] nor [`Shape`]: both hold a **heap allocated** arena because
-//!   their contents point into it ([`Document.strings`](doc.zig) is the same
-//!   rule and the same reason). Hold them by pointer.
+//! * These values have one owner. Do not shallow-copy them.
+//!   Move them only when no caller retains their address.
 //! * Every [`Anonymize`]'s arena and permutation tables are released by
 //!   `Anonymize.deinit`; every [`Shape`]'s by `Shape.deinit`.
 
@@ -220,8 +218,8 @@ pub fn anonymize(
 /// actor map, the hash map, and the arena every rewritten byte belongs to.
 ///
 /// Upstream's `Anonymization` ([`anonymize.rs:31-51`](../../github-automerge-automerge/rust/automerge/src/anonymize.rs)).
-/// **Hold it by pointer and do not copy it**: the arena is reached through a
-/// heap pointer this struct owns, and the whole rewrite allocates from it.
+/// Owns the arena and tables. A shallow copy is not a second owner.
+/// The allocator must remain live through `deinit`.
 pub const Anonymize = struct {
     /// The allocator every buffer in this struct belongs to, except the arena's
     /// own bookkeeping.
@@ -245,9 +243,7 @@ pub const Anonymize = struct {
     /// different replacements, and a run of letters does not collapse onto one
     /// letter.
     synthetic_position: usize = 0,
-    /// Every rewritten string, byte run and actor id, for the life of one run.
-    /// Heap allocated so this struct can be moved before `run` is called and
-    /// never after.
+    /// Owned, heap-allocated arena for rewritten strings, byte runs, and actor ids.
     arena: *std.heap.ArenaAllocator,
     /// The source actor set, sorted, mapped to fresh ids. An empty map is a
     /// document with no changes.
@@ -274,6 +270,7 @@ pub const Anonymize = struct {
 
     /// Releases the arena, the permutation tables, the actor map and the hash
     /// map. Everything a run allocated goes with the arena.
+    /// The value is `undefined` afterward. Dispose exactly once.
     pub fn deinit(self: *Anonymize) void {
         self.structural.deinit(self.gpa);
         self.content.deinit(self.gpa);
@@ -302,7 +299,7 @@ pub const Anonymize = struct {
         defer changes.deinit(self.gpa);
         try self.buildActorMap(changes.slice());
 
-        var out = try Document.initWithEncoding(self.gpa, document.textEncoding(), document.documentMode());
+        var out = try Document.initWithEncoding(self.gpa, document.io, document.textEncoding(), document.documentMode());
         // **On failure nothing has moved into `out` that `out` does not own**:
         // every change is applied, and a failure inside `applyChanges` frees
         // what it copied. So this one `errdefer` is right and needs no second
@@ -388,7 +385,7 @@ pub const Anonymize = struct {
         }
     }
 
-    /// The fresh id for `actor`, or null when this document never mentioned it.
+    /// Fresh borrowed id for `actor`, or `error.MissingActor` if absent.
     ///
     /// Upstream panics here ([`anonymize.rs:365-370`](../../github-automerge-automerge/rust/automerge/src/anonymize.rs));
     /// the port's rule is a named error, and this is the honest name: a column
@@ -1277,15 +1274,14 @@ fn valueAt(list: ?[]const ScalarValue, i: usize) ParseError!ScalarValue {
 ///
 /// # Ownership
 ///
-/// Every slice in a [`Shape`] is allocated from an arena this struct owns, and
-/// `deinit` releases it in one call. The arena is **heap allocated** because
-/// `init` returns by value: an inline arena would leave every slice pointing
-/// at a moved address ([`Document.strings`](doc.zig) is the same rule and the
-/// same reason).
+/// Owns all shape slices through a heap-allocated arena. Call `deinit` exactly
+/// once. A shallow copy shares ownership and must not be disposed separately.
+/// The allocator must remain live through disposal.
 pub const Shape = struct {
     /// The allocator the arena was built on. Everything this struct owns is
     /// freed with it.
     gpa: Allocator,
+    /// Owned, address-stable arena for all shape slices; freed by `deinit`.
     arena: *std.heap.ArenaAllocator,
     /// How the document measures text, which is part of its shape: the same
     /// history in two encodings is two different documents.
@@ -1368,6 +1364,7 @@ pub const Shape = struct {
     }
 
     /// Releases every slice in the tree, the arena's state, and the arena.
+    /// The value is `undefined` afterward. A second disposal is invalid.
     pub fn deinit(self: *Shape) void {
         self.arena.deinit();
         self.gpa.destroy(self.arena);
@@ -1424,6 +1421,7 @@ pub const ChangeId = struct {
 
 /// One change's shape ([`shape.rs:30-38`](../../github-automerge-automerge/rust/automerge/src/anonymize/shape.rs)).
 pub const ChangeShape = struct {
+    /// Actor rank and sequence, independent of the original actor bytes.
     id: ChangeId,
     /// The counter of the change's first op. **Kept, not canonicalised**: the
     /// counters are what the rewrite leaves alone, so a change that moved
@@ -1466,7 +1464,9 @@ pub const ChangeShape = struct {
 
 /// One operation's shape ([`shape.rs:40-47`](../../github-automerge-automerge/rust/automerge/src/anonymize/shape.rs)).
 pub const OperationShape = struct {
+    /// Object targeted by this operation.
     object: ObjectShape,
+    /// Map property or sequence element targeted by this operation.
     key: KeyShape,
     /// The op's predecessors as canonical op ids, **sorted**. The order is
     /// normalised because the wire requires ascending counters for the delta
@@ -1475,6 +1475,7 @@ pub const OperationShape = struct {
     predecessors: []CanonicalOpId,
     /// Whether the op inserts rather than overwrites.
     insert: bool,
+    /// Operation kind with private scalar content removed.
     action: ActionShape,
 
     fn eql(a: OperationShape, b: OperationShape) bool {
@@ -1492,7 +1493,9 @@ pub const OperationShape = struct {
 /// The object an operation acts on: the root, or an op id
 /// ([`shape.rs:49-53`](../../github-automerge-automerge/rust/automerge/src/anonymize/shape.rs)).
 pub const ObjectShape = union(enum) {
+    /// The document root.
     root,
+    /// Canonical id of an object-creation operation.
     id: CanonicalOpId,
 
     fn eql(a: ObjectShape, b: ObjectShape) bool {
@@ -1515,8 +1518,11 @@ pub const ObjectShape = union(enum) {
 /// element, and `(absent, absent, zero)` is the head. **A present key string
 /// decides**, because the other two both have it absent.
 pub const KeyShape = union(enum) {
+    /// Map key reduced to structural character classes.
     map: StructuralStringShape,
+    /// Position before the first sequence element.
     head,
+    /// Canonical id of the addressed sequence element.
     element: CanonicalOpId,
 
     fn eql(a: KeyShape, b: KeyShape) bool {
@@ -1548,6 +1554,7 @@ pub const ActionShape = union(enum) {
     increment,
     /// A put, with the scalar reduced to its type and encoded shape.
     put: ScalarShape,
+    /// Mark begin retaining its structural name and expansion policy.
     mark_begin: MarkBeginShape,
     /// A mark end, with its expand flag. **No name and no value**, because an
     /// end row's name column is null and the name is read back from the begin
@@ -1557,8 +1564,11 @@ pub const ActionShape = union(enum) {
     /// A mark's beginning: a structural name, a content value, and the expand
     /// flag ([`shape.rs:68-72`](../../github-automerge-automerge/rust/automerge/src/anonymize/shape.rs)).
     pub const MarkBeginShape = struct {
+        /// Mark name reduced to structural character classes.
         name: StructuralStringShape,
+        /// Mark value reduced to scalar shape.
         value: ScalarShape,
+        /// Whether an adjacent insertion extends this endpoint.
         expand: bool,
 
         fn eql(a: MarkBeginShape, b: MarkBeginShape) bool {
@@ -1601,10 +1611,15 @@ pub const ScalarShape = union(enum) {
     bytes: usize,
     /// A string, reduced to its content character classes.
     string: ContentStringShape,
+    /// Signed integer, without its value.
     int,
+    /// Unsigned integer, without its value.
     uint,
+    /// Floating-point value, without its bits.
     float,
+    /// Counter, without its initial or current value.
     counter,
+    /// Timestamp, without its time value.
     timestamp,
     /// A boolean. **Nothing else about it is the shape**, and there is no
     /// different value of this type to compare against.
@@ -1619,7 +1634,9 @@ pub const ScalarShape = union(enum) {
     /// A future value's type code and byte count
     /// ([`shape.rs:86`](../../github-automerge-automerge/rust/automerge/src/anonymize/shape.rs)).
     pub const UnknownShape = struct {
+        /// Unknown four-bit wire scalar code.
         type_code: u8,
+        /// Encoded payload byte count, without the payload.
         bytes: usize,
 
         fn eql(a: UnknownShape, b: UnknownShape) bool {
@@ -1730,14 +1747,19 @@ pub const ContentCharacterShape = union(enum) {
 /// the same UTF-16 width, and a text object measured in either has the same
 /// length afterwards.
 pub const CharacterClass = union(enum) {
+    /// Printable seven-bit ASCII character.
     printable_ascii,
+    /// ASCII control character.
     ascii_control,
+    /// Non-ASCII character classified by encoding widths.
     unicode: UnicodeWidths,
 
     /// A non-ASCII character's UTF-8 and UTF-16 widths
     /// ([`shape.rs:112`](../../github-automerge-automerge/rust/automerge/src/anonymize/shape.rs)).
     pub const UnicodeWidths = struct {
+        /// UTF-8 byte count of this character.
         utf8: u8,
+        /// UTF-16 code-unit count of this character.
         utf16: u8,
 
         fn eql(a: UnicodeWidths, b: UnicodeWidths) bool {
@@ -2808,7 +2830,7 @@ const messages = [_][]const u8{ "private-message", "second private message", "th
 /// at [`fuzz.rs:34-64`](../../github-automerge-automerge/rust/automerge/src/anonymize/fuzz.rs)):
 /// a list, a text object and a counter, and a commit that carries a message.
 fn buildFuzzBase(gpa: Allocator, actor: []const u8) !struct { doc: Document, head: ChangeHash, list: ExId, text: ExId } {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     errdefer doc.deinit();
     const idx = try doc.putActorRef(gpa, .{ .bytes = actor });
     const list = ExId{ .id = OpId.init(1, idx) };
@@ -2847,7 +2869,7 @@ fn buildFuzzBase(gpa: Allocator, actor: []const u8) !struct { doc: Document, hea
 fn loadCopy(gpa: Allocator, source: *Document) !Document {
     const bytes = try source.save(gpa);
     defer gpa.free(bytes);
-    return Document.load(gpa, bytes, source.textEncoding(), .auto);
+    return Document.load(gpa, std.testing.io, bytes, source.textEncoding(), .auto);
 }
 
 fn documentFromProgram(gpa: Allocator, program: []const u8) !Document {
@@ -3540,7 +3562,7 @@ fn keepValue(a: Allocator, v: ScalarValue) !ScalarValue {
 /// | 27 | the second actor inserting into the first actor's list | a change with an `other_actors` entry |
 /// | 28 | the second actor writing the shared key into the map | key consistency across actors too |
 fn buildRich(gpa: Allocator) !Document {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     errdefer doc.deinit();
     const a = try doc.putActorRef(gpa, .{ .bytes = actor_a });
     const b = try doc.putActorRef(gpa, .{ .bytes = actor_b });
@@ -3630,7 +3652,7 @@ fn buildRich(gpa: Allocator) !Document {
 /// is a document but not *this* document: there is no second operation to
 /// cross-check the shape against, and no object to carry a key's consistency.
 fn buildBareScalar(gpa: Allocator, value: ScalarValue) !Document {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     errdefer doc.deinit();
     _ = try applySpec(gpa, &doc, .{
         .actor = actor_a,
@@ -3673,7 +3695,7 @@ fn richPair(gpa: Allocator, seed: [seed_length]u8) !Pair {
     const built_bytes = try built.save(gpa);
     defer gpa.free(built_bytes);
 
-    var source = try Document.load(gpa, built_bytes, built.textEncoding(), .auto);
+    var source = try Document.load(gpa, std.testing.io, built_bytes, built.textEncoding(), .auto);
     errdefer source.deinit();
     const source_bytes = try source.save(gpa);
     errdefer gpa.free(source_bytes);
@@ -3708,7 +3730,7 @@ test "an anonymized document with a map, a nested map, a list, text, a counter, 
     var pair = try richPair(gpa, @splat(7));
     defer pair.deinit(gpa);
 
-    var loaded = try Document.load(gpa, pair.anonymized_bytes, pair.anonymized.textEncoding(), .auto);
+    var loaded = try Document.load(gpa, std.testing.io, pair.anonymized_bytes, pair.anonymized.textEncoding(), .auto);
     defer loaded.deinit();
     try testing.expect(!loaded.isEmpty());
     // The reloaded document is the same document the rewrite produced, which is
@@ -3894,7 +3916,7 @@ test "a deleted key stays deleted, and a conflicted register's conflict is prese
 /// every field a rule looks at, so a test that puts one field back is the only
 /// thing wrong.
 fn oneChange(gpa: Allocator, spec: ChangeSpec) !Document {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     errdefer doc.deinit();
     _ = try applySpec(gpa, &doc, spec);
     return doc;
@@ -4972,7 +4994,7 @@ test "the same seed rewrites the same document the same way, and a different see
     defer built.deinit();
     const built_bytes = try built.save(gpa);
     defer gpa.free(built_bytes);
-    var source = try Document.load(gpa, built_bytes, built.textEncoding(), .auto);
+    var source = try Document.load(gpa, std.testing.io, built_bytes, built.textEncoding(), .auto);
     defer source.deinit();
 
     var first = try anonymize(gpa, &source, @splat(7));

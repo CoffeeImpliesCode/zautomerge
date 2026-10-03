@@ -51,6 +51,26 @@
 //! port narrows that check to the array's own width, and
 //! `prefixArray` reports the same overflow `error.Overflow` the
 //! transform's own callers get.
+//!
+//! # Import route and the shortest sequence that works
+//!
+//! `@import("hexane/prefix.zig")`, or `zautomerge.hexane.prefix` through the
+//! root module. Zig 0.16.0. What a column imports from here is [`Prefix`] and
+//! the [`Prefix.Decoder`] it drives.
+//!
+//! ```zig
+//! var out: std.ArrayList(u8) = .empty;
+//! try Prefix(u32).append(&out, gpa, &.{ 2, 3, 5 }); // canonical bytes
+//! var it = try Prefix(u32).Decoder.init(out.items);   // borrows `out`
+//! while (try it.next()) |len| { _ = len; }
+//! ```
+//!
+//! # What it deliberately does not do
+//!
+//! It does not own the bytes whose offsets it accumulates, and it does not
+//! widen the sum the way upstream does. The cursor's running sum is checked
+//! against `Element` on every row, so a slab whose offsets do not fit the
+//! column's own width is refused rather than carried.
 
 const std = @import("std");
 const rle = @import("rle.zig");
@@ -264,6 +284,10 @@ pub fn Prefix(comptime T: type) type {
         /// carrying the offsets alongside them the way upstream's
         /// `PrefixedValue` does (`prefix.rs:699-720`).
         pub const Decoder = struct {
+            /// The value cursor underneath, over the same borrowed slab. It
+            /// carries this decoder's borrow: the `bytes` given to [`init`]
+            /// must outlive the cursor, the same way `rle.zig`'s own value
+            /// decoder borrows the slab it walks.
             inner: WireDecoder,
             /// The running sum through the last row returned, which is
             /// the offset just past it.
@@ -295,12 +319,21 @@ pub fn Prefix(comptime T: type) type {
                 return self.sum;
             }
 
-            /// The next row length, null at the end of the slab. A null
-            /// row contributes nothing to the running sum, which is what
-            /// upstream's `None` does in `PrefixValue::accumulate`
+            /// The next row length, null at the end of the slab. A null row
+            /// contributes nothing to the running sum, which is what upstream's
+            /// `None` does in `PrefixValue::accumulate`
             /// (`prefix.rs:287-312`). The sum is checked as it goes, so a
             /// slab whose offsets do not fit `Element` is
             /// `error.Overflow` rather than a wrap.
+            ///
+            /// **For a nullable `T` such as `Prefix(?u32)` the return is
+            /// `??u32`, and the two nulls are different things.** The outer one
+            /// is the end of the slab; the inner one is a row that is absent.
+            /// An absent row stays distinct from the end of the slab, which is
+            /// the same distinction [`rle.RleGeneric.Decoder.next`] draws for
+            /// `RleOption`: a caller that stops at the first `null` reads a
+            /// truncated column. `while (try it.next()) |len|` is the loop, and
+            /// a nullable column wants the inner value tested against null.
             pub fn next(self: *Decoder) ParseError!?T {
                 const stored = (try self.inner.next()) orelse return null;
                 const len: ?Payload = stored;

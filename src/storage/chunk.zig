@@ -44,7 +44,9 @@ const Input = parse.Input;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const flate = std.compress.flate;
 
-/// The bytes that open every chunk (`storage.rs:26`).
+/// The bytes that open every chunk (`storage.rs:26`). Read back with
+/// [`parseChunk`], which refuses anything else with `error.InvalidMagic`, and
+/// written by [`writeChunk`] and [`compressChunk`].
 pub const magic: [4]u8 = .{ 0x85, 0x6f, 0x4a, 0x83 };
 
 /// What a chunk's body holds (`chunk.rs:126-131`). The tag is the byte on the
@@ -78,15 +80,33 @@ pub const ChunkType = enum(u8) {
 /// out of a multi-chunk stream hands back the bytes the stream carried, byte
 /// for byte, with nothing re-framed and nothing copied.
 pub const Chunk = struct {
+    /// What the body holds. A tag read off the wire is one of the four
+    /// [`ChunkType`] values, or the parse was refused with
+    /// `error.InvalidChunkType`.
     typ: ChunkType,
+    /// The four header bytes as they were stored, never a recomputation. For
+    /// every type but `compressed` this equals `checksumOf(typ, data)`; for
+    /// `compressed` it covers the *inflated* body and is checked by
+    /// [`decompressChunk`] instead.
     checksum: [checksum_size]u8,
+    /// The body as stored, borrowed from the buffer the chunk was parsed
+    /// from — still deflated for `ChunkType.compressed`.
     data: []const u8,
+    /// The whole chunk, header included, borrowed from the same buffer:
+    /// `frame` is exactly `data`'s bytes with the header prepended, so
+    /// `frame.ptr + frame.len == data.ptr + data.len`.
     frame: []const u8,
 };
 
 /// The change hash of a chunk body: `SHA-256(typ || uleb128(len) || data)`
 /// (`chunk.rs:300-312`). For a `change` chunk this is the change's identity
 /// and is what the sync protocol compares.
+///
+/// The type byte and the length prefix are hashed ahead of `data`, so two
+/// chunks over the same body under different types hash differently. Nothing
+/// is allocated: the prefix is built on the stack, because a length prefix
+/// cannot be wider than `leb128.max_unsigned_size`. `data` is only read, and
+/// the result is an owned value that borrows nothing.
 pub fn changeHashOf(typ: ChunkType, data: []const u8) ChangeHash {
     // Upstream builds this same five-ish byte prefix into a `Vec` and hashes it
     // before the data; a fixed stack buffer is the same two updates without
@@ -103,7 +123,11 @@ pub fn changeHashOf(typ: ChunkType, data: []const u8) ChangeHash {
     return .{ .bytes = out };
 }
 
-/// The four header bytes of `changeHashOf`.
+/// The four header bytes of `changeHashOf`, that is the first four bytes of
+/// the hash. This is what a chunk header stores in its checksum field, and
+/// what [`parseChunk`] compares against the body it just read. It is a value,
+/// not a borrow: it copies four bytes off the hash and takes nothing of
+/// `data`.
 pub fn checksumOf(typ: ChunkType, data: []const u8) [checksum_size]u8 {
     return changeHashOf(typ, data).checksum();
 }
@@ -119,6 +143,25 @@ pub fn checksumOf(typ: ChunkType, data: []const u8) [checksum_size]u8 {
 /// given, and for a compressed chunk the checksum must cover the *inflated*
 /// body, so the result is a chunk no reader accepts. `compressChunk` is the
 /// writer for that type.
+///
+/// ## What is left in `out` when this fails
+///
+/// `out` belongs to the caller and this function only ever appends to it. Each
+/// of the five appends is separately fallible and each is all-or-nothing —
+/// `ArrayList` grows before it copies — so the only error here,
+/// `error.OutOfMemory`, returns with the list holding one of the prefixes of
+/// a whole chunk: nothing, the magic, the magic and the checksum, those plus
+/// the type byte, those plus the length prefix, or — only on success — the
+/// body as well. Nothing is rolled back and nothing truncates the list, so
+/// the residue is a partial chunk that no reader accepts. The caller decides
+/// whether `out` can still be used: a caller that appends another chunk
+/// after a failure writes a stream whose first chunk is corrupt. Discard the
+/// partial tail — `out.shrinkRetainingCapacity` back to the length the caller
+/// recorded before the call, or `out.clearRetainingCapacity` if the list held
+/// nothing before — or drop `out` and start again.
+///
+/// `gpa` is used for the list's growth only; `data` is copied into `out` and
+/// stays owned by whoever supplied it.
 pub fn writeChunk(
     out: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
@@ -139,6 +182,19 @@ pub fn writeChunk(
 /// The stored checksum is `checksumOf(.change, body)` over the **uncompressed**
 /// body, exactly as upstream copies the change's own checksum. Only the data
 /// is deflated, and the length written is the deflated length.
+///
+/// ## What is left in `out` when this fails
+///
+/// The body is deflated first, into a buffer this function frees before it
+/// returns, so a failure inside the deflate — the only error here,
+/// `error.OutOfMemory` — leaves `out` exactly as the caller passed it. A
+/// failure in one of the five appends that follow leaves the same residue
+/// [`writeChunk`] describes: a prefix of a whole chunk, with no rollback and
+/// no truncation. The caller owns `out` and must discard that partial tail
+/// before it writes another chunk.
+///
+/// `body` is only read. The returned chunk borrows nothing: everything this
+/// appends is copied into `out`.
 pub fn compressChunk(
     out: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
@@ -159,11 +215,17 @@ pub fn compressChunk(
 /// checks it against the checksum in the chunk's own header, hashed as a
 /// `ChunkType.change` (`chunk.rs:80-100`, `:213-225`).
 ///
-/// Returns a buffer owned by the caller. A chunk of any other type is
-/// `error.InvalidChunkType`; a body that inflates to something other than what
-/// the header records is `error.InvalidChecksum`. Callers must run a compressed
-/// body through this before parsing it, because `parseChunk` cannot check the
-/// checksum without inflating.
+/// Returns a buffer owned by the caller, freed with `gpa`. A chunk of any
+/// other type is `error.InvalidChunkType`; a body that is not a raw DEFLATE
+/// stream is `error.InvalidDeflate`; a growth the allocator cannot satisfy is
+/// `error.OutOfMemory`; and a body that inflates to something other than what
+/// the header records is `error.InvalidChecksum`. Nothing is returned on any
+/// of them, and the inflated buffer is freed on the way out.
+///
+/// Callers must run a compressed body through this before parsing it, because
+/// `parseChunk` cannot check the checksum without inflating. The expansion is
+/// unbounded — see [`decompressRaw`] — so this is where a caller with a
+/// resource ceiling imposes one.
 pub fn decompressChunk(gpa: std.mem.Allocator, chunk: Chunk) ParseError![]u8 {
     if (chunk.typ != .compressed) return error.InvalidChunkType;
     const body = try decompressRaw(gpa, chunk.data);
@@ -201,7 +263,11 @@ fn outputCapacity(data_len: usize) usize {
 /// Deflates `data` into a raw DEFLATE stream: no zlib or gzip wrapper, which
 /// is what a compressed chunk's body is (`change/compressed.rs:23-30`).
 ///
-/// Returns a buffer owned by the caller. The level is zlib's default, the one
+/// Returns a buffer owned by the caller, freed with `gpa`. The only error is
+/// `error.OutOfMemory`: from the 64 KiB scratch window, from the output
+/// buffer's first allocation, or from growth while the body is written. No
+/// input causes a refusal — the caller supplies the bytes and the format
+/// accepts any length. The level is zlib's default, the one
 /// `flate2::Compression::default()` selects upstream.
 pub fn compressRaw(gpa: std.mem.Allocator, data: []const u8) std.mem.Allocator.Error![]u8 {
     // `Compress.init` asserts the scratch window is at least `max_window_len`;
@@ -226,11 +292,44 @@ pub fn compressRaw(gpa: std.mem.Allocator, data: []const u8) std.mem.Allocator.E
     return aw.toOwnedSlice();
 }
 
-/// Inflates a raw DEFLATE stream. Returns a buffer owned by the caller.
+/// Inflates a raw DEFLATE stream. Returns a buffer owned by the caller,
+/// freed with `gpa`.
 ///
-/// A stream that ends early, carries an invalid code, or over-runs a match is
-/// `error.InvalidDeflate`; upstream maps the same failure to
-/// `error::Chunk::Deflate` (`chunk.rs:85-86`).
+/// ## The output is unbounded, and there is no way to bound it here
+///
+/// The result grows into a `std.Io.Writer.Allocating` seeded with no
+/// capacity, and it grows until the stream ends: nothing in this function
+/// compares the inflated length against a limit, because `flate.Decompress.init`
+/// takes an input, a container and a scratch buffer and **no limit at all**
+/// (`std/compress/flate/Decompress.zig:79`). A caller cannot impose a ceiling
+/// through this signature, and this crate adds no arbitrary cap of its own,
+/// because a cap that is wrong for one document is a compatibility change and
+/// the bound a real caller wants is a resource bound, not a format one.
+///
+/// That leaves the ceiling where it belongs: with the caller. Both reachable
+/// entry points, [`decompressChunk`] and
+/// [`storage/change_chunk.zig`](change_chunk.zig)'s `parseFramedChunk`, hand
+/// this a body parsed straight out of an input buffer, so a small hostile
+/// chunk costs an allocation in proportion to its own expansion ratio — the
+/// ratio a deflate stream is free to choose, and the one this file's own
+/// round-trip test pins by inflating sixty-four kilobytes of zeroes back out
+/// of a stream well under a kilobyte. A caller that accepts untrusted
+/// documents bounds it with the allocator it passes, which is the only lever
+/// the signature offers.
+///
+/// ## The refusals
+///
+/// * `error.InvalidDeflate` — a stream that ends early, carries an invalid
+///   code, over-runs a match, or is not a raw DEFLATE stream at all.
+///   Upstream maps the same failure to `error::Chunk::Deflate`
+///   (`chunk.rs:85-86`).
+/// * `error.OutOfMemory` — the output could not be grown to the size the
+///   stream encodes. This is the allocating writer's own failure, not a
+///   defect in the input, and it is the only way a bounded allocator answers
+///   here.
+///
+/// Nothing is returned on either, and the partial output is freed on the way
+/// out. `data` is only read and stays owned by the caller.
 pub fn decompressRaw(gpa: std.mem.Allocator, data: []const u8) ParseError![]u8 {
     var in: std.Io.Reader = .fixed(data);
     var aw: std.Io.Writer.Allocating = .init(gpa);
@@ -254,6 +353,27 @@ pub fn decompressRaw(gpa: std.mem.Allocator, data: []const u8) ParseError![]u8 {
 /// reads (`load.rs:100-102`, `automerge.rs:907-911`) — except for
 /// `ChunkType.compressed`, whose checksum covers the inflated body and is left
 /// to `decompressChunk`.
+///
+/// The signature returns the crate-wide `ParseError`, so a caller cannot
+/// narrow the refusals from it. These are the tags this reaches, and they fall
+/// into three groups a caller may want to tell apart:
+///
+/// * **Truncation.** `error.UnexpectedEnd` — the input stops inside a header
+///   or inside the body the declared length delimits. An empty input is one.
+/// * **Corruption.** `error.InvalidMagic` for four bytes that are not
+///   [`magic`]; `error.InvalidChunkType` for a type byte outside 0 to 3;
+///   `error.InvalidLeb128` for an overlong length prefix; `error.Overflow` for
+///   a tenth prefix byte wider than the one bit that is left;
+///   `error.TooLarge` for a declared length that does not fit `usize`, which
+///   is unreachable where `usize` is 64 bits wide; `error.LengthExceedsInput`
+///   for a declared length larger than the bytes behind it; and
+///   `error.InvalidChecksum` for a body that does not hash to the recorded
+///   checksum, on every type but `compressed`.
+/// * **Framing.** `error.TrailingBytes` — the chunk parsed and bytes remain.
+///
+/// On any of them nothing is returned and nothing is allocated. The `Chunk`
+/// returned on success borrows `bytes`: `data`, `frame` and every slice
+/// derived from them are valid only while that buffer is.
 pub fn parseChunk(bytes: []const u8) ParseError!Chunk {
     var in: Input = .init(bytes);
     const chunk = try readChunk(&in);
@@ -263,10 +383,25 @@ pub fn parseChunk(bytes: []const u8) ParseError!Chunk {
 
 /// Parses a stream of chunks, which is what a saved document is: chunk after
 /// chunk until the input runs out (`load.rs:75-99`). The returned slice belongs
-/// to the caller; the chunks inside it borrow `bytes`.
+/// to the caller, who frees it with `gpa`; the chunks inside it borrow `bytes`.
 ///
 /// An input that stops in the middle of a chunk is an error, not a short
 /// result. Every chunk but a `compressed` one is checksum-verified here.
+///
+/// The refusals are those of [`parseChunk`] — `error.UnexpectedEnd`,
+/// `error.InvalidMagic`, `error.InvalidChunkType`, `error.InvalidLeb128`,
+/// `error.Overflow`, `error.TooLarge`, `error.LengthExceedsInput` and
+/// `error.InvalidChecksum`, grouped there as truncation, corruption and
+/// framing — plus `error.OutOfMemory` from the list this grows. Every chunk
+/// that parsed before the refusal is discarded: `errdefer` frees the whole
+/// list, so there is no partial result to recover. A caller that wants the
+/// prefix that did parse uses [`parseChunksPartial`], which is the same walk
+/// with the error captured rather than propagated.
+///
+/// The walk is bounded by the input: a chunk is at least
+/// `magic + checksum + type + uleb128(0)` = 10 bytes, so the loop runs at most
+/// `bytes.len / 10` times, and each declared length is checked against
+/// `remaining()` before any of the body is taken.
 pub fn parseChunks(bytes: []const u8, gpa: std.mem.Allocator) ParseError![]Chunk {
     var out: std.ArrayList(Chunk) = .empty;
     errdefer out.deinit(gpa);
@@ -283,14 +418,31 @@ pub fn parseChunks(bytes: []const u8, gpa: std.mem.Allocator) ParseError![]Chunk
 /// ([`storage/load.rs`:51-64](../github-automerge-automerge/rust/automerge/src/storage/load.rs))
 /// is the same shape: `Complete(Vec<Change>)` when the whole stream parsed,
 /// and `Partial { loaded, remaining, error }` when a prefix did.
+///
+/// The caller owns the result and releases it with [`PartialChunks.deinit`],
+/// exactly once. The value is a plain struct with one owned slice, so copying
+/// it duplicates that slice's pointer: a copy is a second handle on the same
+/// allocation, and deinitializing both frees the bytes twice. Copy a
+/// `PartialChunks` only when exactly one of the copies is deinitialized, and
+/// do not read `chunks` afterwards — the slices inside it borrow the input
+/// buffer the walk read, which outlives this value but not a freed list.
 pub const PartialChunks = struct {
-    /// The chunks that parsed, in order. The caller owns the slice; the
-    /// chunks inside it borrow the input they were read from.
+    /// The chunks that parsed, in order. The caller owns the slice and frees
+    /// it with [`PartialChunks.deinit`]; the chunks inside it borrow the
+    /// input they were read from, which the caller also owns.
     chunks: []Chunk,
-    /// What stopped the walk, or null when the input ran out cleanly.
+    /// What stopped the walk, or null when the input ran out cleanly. A null
+    /// here means `chunks` covers the whole of `bytes`; a non-null one names
+    /// the first refusal, of the vocabulary [`parseChunks`] lists.
     err: ?ParseError,
 
-    /// Frees the slice and nothing else.
+    /// Frees the slice and nothing else: the chunks borrow the input they
+    /// were read from, so nothing inside `chunks` is owned here.
+    ///
+    /// Called once. The receiver is by value and `chunks` is a plain pointer,
+    /// so a copied `PartialChunks` reaches the same allocation through
+    /// [`PartialChunks.deinit`] twice and frees it twice. After it runs, this
+    /// value and every copy of it are spent, and `chunks` must not be read.
     pub fn deinit(self: PartialChunks, gpa: std.mem.Allocator) void {
         gpa.free(self.chunks);
     }
@@ -309,6 +461,15 @@ pub const PartialChunks = struct {
 /// `parseChunks` stays the all-or-nothing spelling, because `Document.load`
 /// *is* all-or-nothing: upstream's default is `OnPartialLoad::Error`
 /// ([`automerge.rs`:107-110, :177](../github-automerge-automerge/rust/automerge/src/automerge.rs)).
+///
+/// The signature therefore returns only `error.OutOfMemory`, which the list
+/// this grows can produce; a refusal to parse is not returned but stored in
+/// [`PartialChunks.err`], which names one of the tags [`parseChunks`] lists.
+/// An `error.OutOfMemory` still discards everything: `errdefer` frees the list
+/// and nothing is returned, so this is the one case with no prefix to
+/// recover. On the returned value, `err == null` means the input ran out
+/// cleanly, and a caller that ignores `err` reads a prefix that may stop
+/// mid-stream.
 pub fn parseChunksPartial(
     bytes: []const u8,
     gpa: std.mem.Allocator,
@@ -338,6 +499,13 @@ pub fn parseChunksPartial(
 /// with no allocation, no copy, and no arithmetic about how wide the header
 /// turned out to be — the one thing this layer knows exactly and a reader
 /// downstream of it cannot work out.
+///
+/// The refusals are the ones [`parseChunk`] lists: the header reads give
+/// `error.UnexpectedEnd`, `error.InvalidMagic`, `error.InvalidChunkType`,
+/// `error.InvalidLeb128` and `error.Overflow`; the length gives
+/// `error.TooLarge` and `error.LengthExceedsInput`; and the checksum gives
+/// `error.InvalidChecksum` for every type but `compressed`. On any of them the
+/// cursor stands where the refusal found it, and nothing is returned.
 fn readChunk(in: *Input) ParseError!Chunk {
     const start = in.pos;
     if (!std.mem.eql(u8, &try in.takeArray(u32), &magic)) return error.InvalidMagic;
@@ -624,6 +792,139 @@ test "malformed chunks are rejected" {
     // A stream that stops inside a header never reaches a length at all.
     try testing.expectError(error.UnexpectedEnd, parseChunk(out.items[0..7]));
     try testing.expectError(error.UnexpectedEnd, parseChunk(""));
+}
+
+test "an overlong length prefix is a malformed length, not a short read" {
+    const gpa = testing.allocator;
+    // A complete header — magic, checksum, type 1 — and then eleven
+    // continuation bytes, one more than the widest legal uleb128. The prefix
+    // spends a byte the length did not need, so the strict reader refuses it
+    // as `InvalidLeb128` rather than as `Overflow`, which is what a tenth
+    // byte carrying more than the one bit that is left produces.
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(gpa);
+    try bytes.appendSlice(gpa, &magic);
+    try bytes.appendSlice(gpa, &[_]u8{ 0, 0, 0, 0 }); // never verified
+    try bytes.append(gpa, @intFromEnum(ChunkType.change));
+    try bytes.appendNTimes(gpa, 0x80, 11);
+
+    try testing.expectError(error.InvalidLeb128, parseChunk(bytes.items));
+    try testing.expectError(error.InvalidLeb128, parseChunks(bytes.items, gpa));
+
+    // A truncated prefix is a different refusal: the input ran out rather
+    // than the encoding being wrong.
+    var cut: std.ArrayList(u8) = .empty;
+    defer cut.deinit(gpa);
+    try cut.appendSlice(gpa, bytes.items[0 .. bytes.items.len - 4]);
+    try testing.expectError(error.UnexpectedEnd, parseChunk(cut.items));
+}
+
+test "a failed write leaves the bytes it had already appended" {
+    const gpa = testing.allocator;
+    // A failing allocator is the only way these writers can fail, and each of
+    // the five appends is separately fallible. The residue is whatever the
+    // appends that did succeed left behind: there is no rollback and nothing
+    // truncates the list, so a caller that keeps using it would write a
+    // corrupt chunk.
+    //
+    // Each append is all-or-nothing — `ArrayList` grows before it copies — so
+    // the residue is always one of the six prefix lengths a whole chunk
+    // passes through, and never something inside the body. How many of those
+    // appends fit in one allocation is `ArrayList`'s growth policy and not
+    // this function's, so the test asserts the property over every
+    // allocation index rather than one hard-coded residue.
+    var whole: std.ArrayList(u8) = .empty;
+    defer whole.deinit(gpa);
+    try writeChunk(&whole, gpa, .change, "body");
+
+    for (0..8) |fail_index| {
+        var failing: testing.FailingAllocator = .init(gpa, .{ .fail_index = fail_index });
+        var partial: std.ArrayList(u8) = .empty;
+        defer partial.deinit(gpa);
+
+        writeChunk(&partial, failing.allocator(), .change, "body") catch |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            // One of the prefix lengths a whole chunk passes through, and
+            // strictly shorter than the whole chunk: nothing, the magic,
+            // magic + checksum, + type byte, + length prefix. Nothing between
+            // them is reachable, because no append is half done, and the
+            // full length is not reachable either — a body that was appended
+            // is a chunk that was written.
+            const prefixes = [_]usize{ 0, 4, 8, 9, 10 };
+            var a_prefix = false;
+            for (prefixes) |len| {
+                if (partial.items.len != len) continue;
+                a_prefix = true;
+                try testing.expectEqualSlices(u8, whole.items[0..len], partial.items);
+            }
+            try testing.expect(a_prefix);
+            continue;
+        };
+        // No failure at this index means the whole write fitted, so there is
+        // nothing to assert about a residue here.
+        try testing.expectEqualSlices(u8, whole.items, partial.items);
+    }
+
+    // The first append onto an empty list has to allocate, so this is the
+    // residue a caller sees when the very first byte cannot be written: the
+    // list is untouched, because nothing had been appended to it before.
+    var reused: std.ArrayList(u8) = .empty;
+    defer reused.deinit(gpa);
+    var at_start: testing.FailingAllocator = .init(gpa, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        writeChunk(&reused, at_start.allocator(), .change, "body"),
+    );
+    try testing.expectEqual(@as(usize, 0), reused.items.len);
+
+    // Discarding the partial tail is the caller's job, and on a list whose
+    // only residue is what the failed call left, clearing it is enough: the
+    // same list then writes a chunk a reader accepts.
+    reused.clearRetainingCapacity();
+    try writeChunk(&reused, gpa, .change, "body");
+    const chunk = try parseChunk(reused.items);
+    try testing.expectEqual(ChunkType.change, chunk.typ);
+    try testing.expectEqualStrings("body", chunk.data);
+
+    // `compressChunk` deflates before it appends anything, so a failure in
+    // the deflate itself cannot leave a residue: the list is untouched.
+    var deflate_fails: testing.FailingAllocator = .init(gpa, .{ .fail_index = 0 });
+    var untouched: std.ArrayList(u8) = .empty;
+    defer untouched.deinit(gpa);
+    try untouched.append(gpa, 0x77);
+    try testing.expectError(
+        error.OutOfMemory,
+        compressChunk(&untouched, deflate_fails.allocator(), "a body that compresses well " ** 8),
+    );
+    try testing.expectEqualSlices(u8, &[_]u8{0x77}, untouched.items);
+}
+
+test "an inflate grows to what the stream encodes, and a bounded allocator is what stops it" {
+    const gpa = testing.allocator;
+    // Nothing in the inflate bounds the output, and this is what that looks
+    // like: a body of zeroes deflates to a small stream and comes back at
+    // full size, so the cost of the inflate is a function of the expansion
+    // ratio the stream chose, not of the bytes on the wire.
+    const body = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(body);
+    @memset(body, 0);
+
+    const deflated = try compressRaw(gpa, body);
+    defer gpa.free(deflated);
+    // A run of zeroes deflates to a tiny stream, so the inflate below asks
+    // the allocator for sixty-four times the bytes that reached it.
+    try testing.expect(deflated.len * 64 < body.len);
+
+    const inflated = try decompressRaw(gpa, deflated);
+    defer gpa.free(inflated);
+    try testing.expectEqualSlices(u8, body, inflated);
+
+    // The signature offers no cap a caller could pass, so the ceiling is the
+    // allocator: a writer that cannot grow answers `OutOfMemory` rather than
+    // truncating the output into a document that looks whole.
+    var failing: testing.FailingAllocator = .init(gpa, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, decompressRaw(failing.allocator(), deflated));
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
 }
 
 test "a length past the end of the input is refused without allocating" {

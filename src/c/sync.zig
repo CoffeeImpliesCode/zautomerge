@@ -43,7 +43,7 @@
 //! message itself over instead** — an `owns_payload` flag set before the
 //! receive, which is what this file used to do — has two answers, both wrong:
 //! the receive frees `changes` with the message
-//! ([`src/sync/message.zig:315-322`](../../github-automerge-automerge/rust/automerge/src/sync/message.zig)),
+//! ([`src/sync/message.zig:344-351`](../../github-automerge-automerge/rust/automerge/src/sync/message.zig)),
 //! which the flag never covered, so `AMresultFree` freed the chunk list a
 //! second time; and a second receive of the same handle read the lists the
 //! first one had already handed to the peer state.
@@ -54,7 +54,7 @@
 //! the port's [`State`](../sync/state.zig) has no `eql`, so
 //! [`statesEqual`] compares its thirteen fields. That is a derive, not a
 //! document answer, and the field list is the port's `State` declaration
-//! (`src/sync/state.zig:87-133`) field for field.
+//! ([`state.zig:120-177`](../../github-automerge-automerge/rust/automerge/src/sync/state.zig)) field for field.
 //!
 //! ## A null `has_value` is an error result, not a trap
 //!
@@ -65,6 +65,34 @@
 //! checks and returns an error result. That is a superset of the
 //! precondition, not a change of contract: every caller that honours the
 //! precondition takes the same path as upstream.
+//!
+//! # Thread confinement
+//!
+//! **These three handles are confined to one thread at a time, like every
+//! other value in the ABI.** Nothing here synchronises: the handles own their
+//! bodies outright and share nothing, but they are reached *through* an
+//! `AMresult`, and the item holding one counts its references in a plain
+//! `usize` ([`AMitem.retain`](../c/doc.zig)).
+//!
+//! **Calls from different threads must use one caller-owned global
+//! serialization boundary, even across distinct handles; they must not
+//! overlap.** These handles own their bodies outright and share nothing with
+//! each other, but the whole ABI shares one process-wide single-threaded
+//! `std.Io` provider ([`c_io`](../c/doc.zig)) for document constructors and
+//! actor-id entropy. Lazy handle caches elsewhere and non-atomic item reference
+//! counts also need serialization; a thread-safe `malloc` is not sufficient.
+//!
+//! Hold the caller's lock through each outer call and its callbacks. An
+//! `AMstackCallback` invoked by `AMstackResult`, `AMstackItem` or `AMstackItems`
+//! may synchronously inspect the stack and result, including advancing a local
+//! borrowed `AMitems` cursor or copying diagnostics with `AMstrdup`, on the
+//! invoking thread under that already-held lock; nested inspection must not
+//! reacquire or release it. Diagnostic copies are independently owned and need
+//! `free`. Keep the stack and result live without popping, freeing, replacing
+//! or relinking them.
+//! This does not permit general mutation, other reentrancy or cross-thread
+//! entry. `include/automerge.h`'s `\section threads` and `AMstackCallback`
+//! contract state the full rule and callback lifetimes.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -112,6 +140,8 @@ pub const AMsyncHave = struct {
     /// The allocator that built the body, because [`Have.deinit`](../sync/state.zig)
     /// takes none.
     gpa: Allocator,
+    /// The have itself. Rust: `body: am::sync::Have` (`src/sync/have.rs:9-10`),
+    /// owned by value because the reference's newtype owns it the same way.
     body: statemod.Have,
 
     /// `AMsyncHave::new`. Rust: `src/sync/have.rs:14-16`.
@@ -119,6 +149,12 @@ pub const AMsyncHave = struct {
         return .{ .gpa = alloc, .body = have };
     }
 
+    /// Releases the filter and the hash list, then poisons the cell.
+    ///
+    /// **A span from [`lastSync`] dies here.** A handle reaches a C caller
+    /// only inside an `AMitem` inside an `AMresult`, so this runs from
+    /// `AMresultFree` and there is no `AMsyncHaveFree`; a caller that reads
+    /// the span after freeing the result has a use-after-free.
     pub fn deinit(self: *AMsyncHave) void {
         self.body.deinit();
         self.* = undefined;
@@ -171,6 +207,12 @@ pub const AMsyncMessage = struct {
         return .{ .gpa = alloc, .body = message };
     }
 
+    /// Releases the message's heads, needs, haves and change chunks, then
+    /// poisons the cell. Rust: the `Drop` upstream gets from its own fields.
+    ///
+    /// **A handle is reusable because the receive path is handed a copy**, not
+    /// because this is a no-op; see the module doc. Calling it twice, or
+    /// after the owning result has been freed, is a double free.
     pub fn deinit(self: *AMsyncMessage) void {
         self.body.deinit();
         self.* = undefined;
@@ -189,7 +231,7 @@ pub const AMsyncMessage = struct {
 ///
 /// `#[derive(Clone)]` over `am::sync::Message` (`sync.rs:529-547`) is the same
 /// thing. A filter is cloned through its own round trip — `toBytes` then
-/// `parse`, [`src/sync/bloom.zig:136-147`, `:179-235`](../sync/bloom.zig) — so
+/// `parse`, [`src/sync/bloom.zig:137-157`, `:184-251`](../sync/bloom.zig) — so
 /// one built by `addHash` and one decoded from the wire clone alike. Nothing
 /// is assigned into the result until every allocation has succeeded, so each
 /// `errdefer` owns exactly the buffer it made.
@@ -271,6 +313,12 @@ pub const AMsyncState = struct {
         return .{ .gpa = alloc, .body = state };
     }
 
+    /// Releases the state's thirteen fields and poisons the cell.
+    ///
+    /// **A handle reaches a C caller only inside an item inside a result**,
+    /// so this runs from `AMresultFree`; `AMgenerateSyncMessage` and
+    /// `AMreceiveSyncMessage` mutate through `AMitemToSyncState` and never
+    /// free. There is no `AMsyncStateFree`.
     pub fn deinit(self: *AMsyncState) void {
         self.body.deinit();
         self.* = undefined;
@@ -279,7 +327,7 @@ pub const AMsyncState = struct {
 
 /// `#[derive(Eq, PartialEq)]` over `am::sync::State` (Rust:
 /// `src/sync/state.rs:22`). The port's [`State`](../sync/state.zig) declares
-/// thirteen fields (`src/sync/state.zig:87-133`) and has no `eql`, so this
+/// thirteen fields (`src/sync/state.zig:120-177`) and has no `eql`, so this
 /// compares each of them, in declaration order. **The optional lists compare by
 /// presence and then by content**: `None != Some(&.{})`, which is what a derive
 /// over `Option<Vec<T>>` gives.

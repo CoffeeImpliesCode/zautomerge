@@ -417,17 +417,22 @@ the `## Zig mapping notes` section of each survey file.
 | `serde` derive | hand-written encoder/decoder | only `autoserde` and the wasm JSON shapes need it |
 | `panic!` / `unwrap` | `unreachable` where a preceding check proves it, else a real error | no `unreachable` on parser input |
 | `#[cfg(test)]` invariant checks | `comptime` debug flag or a `slow_path` build option | a struct field behind `-Dslow-path`, not a separate code path |
-| allocator-generic `impl Allocator` | `std.mem.Allocator` parameter | every public entry point takes one, except pure functions |
+| allocator-generic `impl Allocator` | `std.mem.Allocator` parameter | **every entry point that allocates takes one, and nothing else does** — a reader takes the document first and the allocator only where it needs one, a constructor takes it first, and an output-only door takes it where the answer is produced. The allocator an output-only door is given is the one that must free the answer |
+| randomness reaching the OS directly | `std.Io` parameter | a constructor takes `io: std.Io`, borrows it, and the `Document` **keeps** it for later actor draws; tests pass `std.testing.io`, an executable passes its own live capability, and the C ABI binds one process-wide `std.Io.Threaded.global_single_threaded.io()`. **Nothing reaches for an ambient runtime**, and a refusal (`Canceled`, `EntropyUnavailable`) is an error rather than the panic upstream raises |
 
 ### 3.1 Error sets
 
 Upstream has 13 error types, **31** variants on `AutomergeError`
 (`automerge/src/error.rs:13-79`; this said 30, and the survey said 30 while
-listing 31 rows), with hand-written `Display` strings. Zig has one global error
-namespace, so three sets:
+listing 31 rows), with hand-written `Display` strings. **Zig has no global
+error namespace** — an error set is whatever a declaration names — so the
+mapping is not "three sets in one namespace" but **three named sets plus a
+per-declaration union wherever a surface refuses a different set**:
 
 - `Error` — the document API surface: the `AutomergeError` variants that are
-  observable through the public API, plus `OutOfMemory`.
+  observable through the public API, plus `OutOfMemory`. **It also carries two
+  variants upstream does not have**, `Canceled` and `EntropyUnavailable`,
+  because upstream panics where the port returns.
 - `ParseError` — anything reachable from parsing untrusted bytes: chunk
   framing, column decode, sync message decode, change decode. Every fuzz
   crasher in `tests/fuzz-crashers/` must produce a `ParseError`, never a crash
@@ -441,6 +446,17 @@ namespace, so three sets:
   `SlabBTree.assertSound` (`src/hexane/btree.zig`). Off by default, which is
   upstream's default feature set; `zig build slow-path` runs the unit tests in
   a build where it cannot be off.
+
+**And the derived unions, each named after what it adds** rather than
+repeating its parts: `doc.InitError` (`Allocator.Error ||
+std.Io.RandomSecureError`, exactly, because it is what a fresh actor draw can
+refuse), `doc.LoadError`, `doc.DocumentError`, `doc.OpError`, `doc.DiffError`,
+`read.ReadError`, `read.ChangeError`, `read.HydrateError`,
+`transact.WriteError` (aliased as `transaction.TransactionError`),
+`patches.MakeError`, `sync.protocol.ProtocolError` and
+`anonymize.AnonymizeError`. **`doc.load` answers `LoadError`, not
+`InitError`**, because it constructs and then parses; a caller handling entropy
+refusal there handles `Canceled` / `EntropyUnavailable` out of the larger set.
 
 An upstream `panic!` that guards a reachable state becomes a `ParseError`
 variant. The `too_many_ops`, `too_many_deps`, `overflow_in_length`, and
@@ -505,6 +521,20 @@ Every public module is a separate file under `src/`, flat, mirroring the Rust
 layout. `src/opset/` and `src/hexane/` are the only subdirectories, because
 they are the only ones with more than six files.
 
+**The C ABI is a separate tree and has two roots, on purpose.**
+`src/c/**` is `extern "C"` over libc and is reachable from `src/root.zig` as the
+`c_abi` namespace — which is **lazy**, so nothing pulls `c/doc.zig` or
+`c/sync.zig` in until something references them, and an unanalysed `export fn`
+emits no symbol. The two roots are therefore:
+
+| Root | What it is | Built as |
+| --- | --- | --- |
+| `src/c/root.zig` | the **production** entry point: imports `c_abi` and forces the exports to be analysed | the installed static library `libzautomerge.a`, together with `src/c/result_from.c` |
+| `test/c/cabi.zig` | the **ABI check**: translates `include/automerge.h` and compares it against the library at comptime | a separate static library, `zautomerge-abi-check`, that `zig build ctest` depends on and that nothing links into the suite |
+
+**`zig test` cannot do either job**: it links no libc, which is why
+`src/root.zig`'s test block leaves the C modules out.
+
 ## 5. Core data model
 
 ### 5.1 Identity
@@ -565,8 +595,11 @@ encoder is §6.3.
 
 ### 5.3 The op set
 
-Sixteen columns, from `op_set2/columns.rs:16-35`, of which five are index
-columns maintained alongside:
+The op set's columns, from `op_set2/columns.rs:16-35`: **sixteen data columns
+and five index columns maintained alongside** — the split `src/opset/columns.zig`
+states in its own module doc, and the shape the table below lists. The index
+count includes the mark index, whose extra resource is a cache and not a
+column:
 
 | Column | Zig type | Role |
 | --- | --- | --- |
@@ -611,6 +644,40 @@ where `DocItem` is a copy, and `pub fn keyStr(doc: *const Document, idx: Interne
 where the slice lives in the document's intern arena. No public function
 returns memory the caller must free except the `save()` byte buffer and the
 explicitly-owned `OwnedTransaction`.
+
+**The rules the port actually applies, in the order a caller meets them:**
+
+- **A returned buffer is the caller's, and the `gpa` that produced it is the
+  one that frees it.** `save`, `saveWithOptions`, `saveAfter`,
+  `saveIncremental`, `bundleFragments`, `getHeads`, `getAuthors`,
+  `getActors` and every sync encode answer carry this. The document never
+  frees a buffer it handed out, so a mismatch is the caller's error rather than
+  something `Document.deinit` cleans up.
+- **A borrowed answer stays borrowed**, valid until the next mutation, and a
+  caller who needs it across a mutation takes a copy at the documented door.
+- **`Document` is single-owner.** `deinit` exactly once; no shallow copy (the
+  string table is heap-allocated and the op set holds a pointer into it, so two
+  copies are two owners of one block); a move only while no borrow of its
+  address remains; `clone` / `fork` / `forkAt` for a second owner.
+- **A constructor borrows a `std.Io` and the document keeps it**, so the
+  capability's provider must outlive the document. Entropy refusal
+  (`error.Canceled`, `error.EntropyUnavailable`) is an error, not a silent
+  fallback, because upstream panics in the same two places.
+- **`Transaction` is single-owner and refuses writes once closed.** A refused
+  commit leaves it open for retry or rollback; `rollback` is resumable and
+  pops what it has already undone, so a refusal hands the caller a *progressed*
+  transaction rather than an unusable document.
+- **Native automatic failure retains recovery in the document.** Ownership
+  transfer allocates nothing and preserves the primary error. `recoverAuto`
+  resumes rollback; the next native write recovers before allocating new IDs.
+  Keep the document address stable and do not read rows while recovery is
+  pending. Manual producer partial publication is rollback-only, while a
+  refused manual commit still permits commit retry.
+- **Synchronization is the caller's, for every access including reads.** A
+  `*const Document` receiver can still update shared scratch and caches, so two
+  concurrent readers are a race; and a walk borrows state an apply or a commit
+  invalidates. The C ABI widens this to global serialization because its
+  `std.Io` provider is process-wide.
 
 `Transaction` upstream holds `&mut Document` for its whole life
 (`manual_transaction.rs`); the Zig `Transaction` holds `*Document` plus a
@@ -677,6 +744,13 @@ at `src/storage/change_chunk.zig:1329`).
 - The per-type `Encoding` dispatch in Rust is a type-level map. In Zig it is a
   comptime switch inside a generic `Column(T, Encoding)`, so the type parameter
   carries the codec and there is no vtable.
+- Refusal contract: public splices prepare replacement storage. Typed splices
+  also copy slab/index metadata before publication. A refused stage leaves its
+  owner unchanged. The edit
+  cursor publishes multiple stages: `deinit` discards only the held rebuild,
+  and `delete` recovery flushes held work before consuming the remaining span.
+  Actor renumbering stages columns, mark rows/cache, and object metadata before
+  moving the authoritative actor table.
 - Gate: every codec round-trips bytes for random inputs against the Rust
   encoder; `SlabBTree` passes the upstream invariant checker, ported as a
   `-Dslow-path` test; the 193 KB `hexane/src/tests.rs` unit suite is ported
@@ -901,6 +975,20 @@ diff_marks` is green. `tests/test_mark_patches.rs` is **1 of 1** in
 `test/mark_patches_test.zig`, wired. The hydrate clause holds, with the log
 dropped before the mirror is read.
 
+**Current text representation:** `ConcreteTextValue` owns UTF-8 bytes and measures indices with a runtime `TextEncoding`.
+`removeRange` deletes one complete encoded span with one replacement allocation.
+Encoding or allocation refusal leaves the original buffer unchanged.
+Zero length and an out-of-range start retain the buffer without allocation.
+An overshooting end clamps without arithmetic overflow.
+An ordinary owner frees an old buffer only after the replacement changes its pointer.
+Patch coalescing and `hydrate.Text` use this range operation instead of repeated one-unit deletion.
+
+**Reference gap:** native-unit trees support edits that can split UTF-8 scalars or UTF-16 surrogate pairs (`text_value.rs:36,113,152`).
+Rust renders incomplete units lossily (`:60-62`, `:137-139`).
+The UTF-8-backed port refuses split scalar boundaries and recomputes current grapheme segmentation.
+It does not preserve incomplete native units or Rust's stored grapheme units.
+See [API.md](../API.md#concretetextvalue) for the caller contract and [STATUS.md](STATUS.md) for exercised paths.
+
 **The correction, because the error was mine and it was load-bearing.** This row
 said *partly satisfied, and the weakest gate in the plan*, on a name-presence
 count of **12 of 36**. **That instrument is wrong for this port**: every ported
@@ -917,25 +1005,56 @@ case of `block_tests.rs`. **See STATUS.md's table.**
   single-destructor rule, the 5 enums with pinned discriminants, and the
   `AMitems` cursor.
 - wasm second, only if wanted; see §9.
-- Gate: `automerge-c`'s 21 cmocka files, including the three ported-from-wasm
-  suites, pass against the Zig library.
+- Gate: the upstream cmocka suite passes against the **installed artifact**, and
+  **the real header compiles against the library**. The second clause is not
+  optional decoration: a linked C suite proves a symbol exists, not that the
+  struct the C side reads matches the one the Zig side writes.
 
-**Verdict 2026-10-01 — SATISFIED; the count is wrong.** `zig build ctest` is
-**5/5 steps, 153 cmocka cases, 0 failed** (measured 2026-10-01). 136 of those
-cases are upstream's own: `test/c/suite/` is a verbatim copy of
-`rust/automerge-c/test/`, re-verified file by file on 2026-10-01 (24 of 25
-non-`CMakeLists` files identical; `main.c` lives at `test/c/main.c`, which that
-file's header explains). The other 17 are this port's `abi_coverage.c`.
+**Verdict 2026-10-01 — SATISFIED; the case count is a dated measurement.** On
+the last measured run `zig build ctest` was **5/5 steps, 153 cmocka cases, 0
+failed**. 136 of those cases are upstream's own: `test/c/suite/` is a verbatim
+copy of `rust/automerge-c/test/`, re-verified file by file on 2026-10-01 (24 of
+25 non-`CMakeLists` files identical; `main.c` lives at `test/c/main.c`, which
+that file's header explains). The other 17 were this port's `abi_coverage.c`.
+**Current C evidence:** [STATUS.md](STATUS.md#current-api-design-repair-evidence) records the fresh suite, header guard, diagnostics, and fetched C consumer.
+The counts above remain historical.
+
+**What `zig build` ships, and which of the two C gates that is.** The default
+step installs **one artifact and one header**: the static library
+`libzautomerge.a`, built from the production root `src/c/root.zig`, and
+`automerge.h` from `include/`. `src/c/result_from.c` is compiled into that
+library rather than into a test binary, because a C consumer linking
+`libzautomerge.a` expects the symbol there. The package's `paths` in
+`build.zig.zon` include `include` and `LICENSE`, so the header and the MIT
+licence travel with the package; the native module is still named `zautomerge`
+and is unchanged.
+
+- `test/c/cabi.zig` is the root of a **separate** static library
+  (`zautomerge-abi-check`). It translates the shipped header with `zig
+  translate-c` and compares, at comptime: the **187** declared function names,
+  the **36** enum tags across the five enums, and the size, alignment and field
+  offsets of the **five** structs that cross the boundary by value. A mismatch
+  is a compile error. `ctest` depends on that step so the header is analysed
+  even when no C case reaches a declaration; **nothing else links it.**
+- `zig build ctest` links the suite against **the production artifact**, not
+  against the check. The two are independent by construction: each catches the
+  failure the other cannot.
 
 "21 cmocka files" is not a measurable count. Upstream's
 `rust/automerge-c/test/` holds **19** `.c` files, 5 headers, one data file and
 `CMakeLists.txt` — 26 files in all. Two upstream fixtures are worth recording:
 the suite needs `-Dcmocka-prefix=<dir>` pointing at a cmocka built against the
-running glibc. It also used to need `LD_LIBRARY_PATH` to include that prefix's
-`lib64`, because the build step set no rpath; that requirement is obsolete
-since `build.zig:539` absolutises the prefix and `build.zig:612` sets
-`ctest_bin.each_lib_rpath`, so `libcmocka.so.0` resolves from the binary's own
-`RUNPATH` whatever the working directory is.
+running glibc, and the build absolutises that prefix and sets `each_lib_rpath`,
+so `libcmocka.so.0` resolves from the binary's own
+`RUNPATH` whatever the working directory is and `LD_LIBRARY_PATH` is obsolete.
+
+**The threading contract belongs to this phase and is a gate clause.** A C
+caller cannot supply a capability, so the bridge binds one at the ABI seam —
+`std.Io.Threaded.global_single_threaded.io()` — and it is process-wide. That
+makes `include/automerge.h`'s `\section threads` obligation global rather than
+per-handle: **no two calls may overlap in time, whatever they touch**, and two
+independent documents on two threads are not safe either. There is no mutex in
+`src/c/`, and the header promises none.
 
 ## 7. Verification strategy
 

@@ -412,6 +412,16 @@ pub const Indexes = struct {
         };
     }
 
+    /// Frees the five index columns and the mark cache, and leaves the
+    /// receiver as it was — **no poisoning here**, unlike
+    /// [`Columns.deinit`] next door, because nothing in this file frees a
+    /// standalone `Indexes` twice and a moved-from one is never read.
+    ///
+    /// The mark column owns two things
+    /// ([`MarkIndexColumn`](mark_index.zig:461-475)): the rows, and the cache
+    /// of every open mark's `MarkData`, whose names are borrows from the
+    /// document's string table. Both go here, and neither outlives the op set
+    /// that holds them.
     pub fn deinit(self: *Indexes) void {
         self.text.deinit();
         self.top.deinit();
@@ -437,11 +447,22 @@ pub const Indexes = struct {
 
 /// The five index columns' row counts, which the index rebuild and
 /// `removeOps` both have to keep true.
+///
+/// **`text`, `top`, `visible` and `mark` are row counts and `inc` is a
+/// successor count**, so the four must equal the row count and the fifth must
+/// not exceed the successor count. [`Indexes.checkLengths`] is the check that
+/// says so, and [`Indexes.lengths`](columns.zig) is where a caller gets this
+/// shape.
 pub const IndexLengths = struct {
+    /// Rows in `index.text`, which must equal the row count.
     text: usize,
+    /// Rows in `index.top`, which must equal the row count.
     top: usize,
+    /// Rows in `index.visible`, which must equal the row count.
     visible: usize,
+    /// Successors in `index.inc`, which must not exceed the successor count.
     inc: usize,
+    /// Rows in `index.mark`, which must equal the row count.
     mark: usize,
 };
 
@@ -493,22 +514,6 @@ pub const Exported = struct {
 
 // ── The op set's columns ───────────────────────────────────────────────────
 
-/// The op set's columns, generic over the op type `O` it is handed.
-///
-/// `O` is anything with the accessors `op.zig` publishes: `id`, `obj`,
-/// `action`, `key`, `insert`, `expand`, `visible`, `top`, `width`,
-/// `value`, `metaValue`, `markName`, `markIndex`, `succCount`, `succAt`,
-/// `succIncCount` and `succIncAt`. This file reads those and nothing else, so
-/// a loaded `Op`, a decoded change op and a test op are the same code here.
-///
-/// The value's payload is written from `value` rather than from `rawValue`,
-/// because `rawValue` is the *borrowed* half of upstream's `as_raw`
-/// (`op_set2/types.rs:369-394`): it answers for a string, a byte string and
-/// an unknown value and has nothing to say for the numeric tags, whose bytes
-/// have to be built. `appendRaw` and `rawLen` are that other half
-/// ([types.zig:290-338](types.zig)), and for every variant the two together
-/// are exactly the bytes `as_raw` returns — the two it declines are `Null`
-/// and `Boolean`, which occupy none (`:375-376`).
 /// The element type of what [`Columns.removeOps`] accepts: a `[]const T`, or a
 /// `*const [N]T` standing for the whole of its array.
 ///
@@ -562,6 +567,30 @@ fn opElementType(comptime T: type) type {
     };
 }
 
+/// The op set's columns, generic over the op type `O` it is handed.
+///
+/// `O` is anything with the accessors `op.zig` publishes: `id`, `obj`,
+/// `action`, `key`, `insert`, `expand`, `visible`, `top`, `width`,
+/// `value`, `metaValue`, `markName`, `markIndex`, `succCount`, `succAt`,
+/// `succIncCount` and `succIncAt`. This file reads those and nothing else, so
+/// a loaded `Op`, a decoded change op and a test op are the same code here.
+///
+/// The value's payload is written from `value` rather than from `rawValue`,
+/// because `rawValue` is the *borrowed* half of upstream's `as_raw`
+/// (`op_set2/types.rs:369-394`): it answers for a string, a byte string and
+/// an unknown value and has nothing to say for the numeric tags, whose bytes
+/// have to be built. `appendRaw` and `rawLen` are that other half
+/// ([types.zig:290-338](types.zig)), and for every variant the two together
+/// are exactly the bytes `as_raw` returns — the two it declines are `Null`
+/// and `Boolean`, which occupy none (`:375-376`).
+///
+/// **The sixteen data columns and the five index columns are the whole of the
+/// state, and the index is derived.** A load builds the five empty
+/// (`columns.rs:252-330`) and every document rebuilds them, so a caller that
+/// has rows and an empty `index` holds a value no query can read — that is what
+/// [`OpSet.fromParts`](op_set.zig) is for, and what [`OpSet.load`](op_set.zig)
+/// exists to avoid.
+///
 pub fn Columns(comptime O: type) type {
     return struct {
         const Self = @This();
@@ -662,6 +691,21 @@ pub fn Columns(comptime O: type) type {
             };
         }
 
+        /// Frees the sixteen data columns and the five index columns, and then
+        /// **poisons the receiver** with `self.* = undefined`.
+        ///
+        /// **That line is why this function exists at all** and why it is
+        /// written the way every caller in this slice writes its own teardown.
+        /// A second call is a use-after-free with no diagnostic, and — worse —
+        /// the idiom `X.deinit(); try …; X = …` frees the columns, poisons
+        /// `X`, and then reads the poisoned value if the `try` fails. That is
+        /// the defect [`OpSet.fromParts`](op_set.zig) documents at length, and
+        /// it reached a release build through `test/fixtures/missing_actor.automerge`.
+        /// So: **load first, free second, and assign third.**
+        ///
+        /// The columns hold no borrow of the string table that outlives it
+        /// beyond the mark cache's names, which the module doc's lifetime rule
+        /// covers; nothing here frees the table itself.
         pub fn deinit(self: *Self) void {
             self.id_actor.deinit();
             self.id_ctr.deinit();
@@ -973,20 +1017,76 @@ pub fn Columns(comptime O: type) type {
         /// remapped here: upstream's `MarkIndexColumn::rewrite_with_new_actor`
         /// (`op_set/mark_index.rs:252-259`) is a separate call the op set
         /// makes, because the mark column is an index and this is the data.
+        ///
+        /// **All four are renumbered before any of them is committed**, which is
+        /// what makes the pass all-or-nothing. A column renumbered in place is
+        /// atomic on its own ([`Column.remap`]: it builds a new column and
+        /// releases the old one only once the build has succeeded), but four
+        /// sequential calls are four atomic steps and not one atomic pass — a
+        /// refusal in the third would return with `id_actor` and `succ_actor`
+        /// renumbered and the other two not, and two columns of one row
+        /// disagreeing about that row's actor is the one state no reader here
+        /// survives. So each column is staged with [`Column.remapped`], which
+        /// reads one column and builds another and **leaves its source holding
+        /// every byte it held** — there is nothing to copy first, and nothing
+        /// is released before the commit — and the four are published together
+        /// at the end, where nothing can fail.
+        ///
+        /// **The commit is four swaps.** Each column trades its contents with
+        /// its staged copy ([`Column.swapContents`]) and the local is then
+        /// released as the retired half, so the old bytes go back to the
+        /// allocator they were taken from and none is freed twice. The swap
+        /// also moves both counters past either column's, which is what
+        /// invalidates a cursor suspended over the pre-renumbering rows: it
+        /// cannot resume against the renamed ones
+        /// ([`Column.IterState.tryResume`] compares the counter first). The run
+        /// budget is the one thing a swap does not trade, and both halves
+        /// already hold the same one, `remapped` having built on the source's.
+        ///
+        /// **The allocator moves with the contents**, for all four columns:
+        /// they are holding `gpa`'s bytes when this returns, so ask
+        /// [`Column.allocator`] again afterwards rather than reusing a value
+        /// cached before it.
+        ///
+        /// **What it costs.** Four staged columns are alive at once at the
+        /// moment before the commit, so the peak is higher than a column-at-a-
+        /// time pass reaches — four rewrites' worth of slabs rather than one.
+        /// This is an actor insertion or a removal, which is rare and not on any
+        /// read path, and the alternative is a pass that can fail half way.
         pub fn remapActors(
             self: *Self,
             gpa: Allocator,
             ctx: anytype,
             comptime f: fn (@TypeOf(ctx), ActorIdx) ActorIdx,
         ) ParseError!void {
-            try self.id_actor.remap(gpa, ctx, f);
-            try self.succ_actor.remap(gpa, ctx, f);
-            try self.obj_actor.remap(gpa, ctx, shiftOptActor(@TypeOf(ctx), f));
-            try self.key_actor.remap(gpa, ctx, shiftOptActor(@TypeOf(ctx), f));
+            var id_actor = try stagedRemap(ActorColumn, ActorIdx, &self.id_actor, gpa, ctx, f);
+            errdefer id_actor.deinit();
+            var succ_actor = try stagedRemap(ActorColumn, ActorIdx, &self.succ_actor, gpa, ctx, f);
+            errdefer succ_actor.deinit();
+            const opt = shiftOptActor(@TypeOf(ctx), f);
+            var obj_actor = try stagedRemap(ActorOptColumn, ?ActorIdx, &self.obj_actor, gpa, ctx, opt);
+            errdefer obj_actor.deinit();
+            var key_actor = try stagedRemap(ActorOptColumn, ?ActorIdx, &self.key_actor, gpa, ctx, opt);
+            errdefer key_actor.deinit();
+            // The commit. Nothing below can fail, so no `errdefer` above can
+            // fire after the column it guards has been swapped, and the four
+            // columns move together or none of them does.
+            self.id_actor.swapContents(&id_actor);
+            id_actor.deinit();
+            self.succ_actor.swapContents(&succ_actor);
+            succ_actor.deinit();
+            self.obj_actor.swapContents(&obj_actor);
+            obj_actor.deinit();
+            self.key_actor.swapContents(&key_actor);
+            key_actor.deinit();
         }
 
         /// Renumber the actor indices as if a new actor had been interned at
         /// `idx` (`Columns::rewrite_with_new_actor`, `columns.rs:342-348`).
+        ///
+        /// All-or-nothing, by [`Columns.remapActors`]: **an error leaves the
+        /// four columns exactly as they were**, and the mark index is not this
+        /// function's business.
         pub fn rewriteWithNewActor(self: *Self, gpa: Allocator, idx: ActorIdx) ParseError!void {
             try self.remapActors(gpa, idx, actorShiftedUp);
         }
@@ -996,18 +1096,47 @@ pub fn Columns(comptime O: type) type {
         ///
         /// Upstream panics if the actor being removed is still referenced
         /// (`:355-357`); the port refuses instead, before it has changed
-        /// anything. The check walks the same four columns the remap does.
+        /// anything. The check walks the same four columns the remap does, and
+        /// it is a read, so a refusal there is as safe as one from the remap
+        /// itself: **an error leaves the columns exactly as they were.**
+        ///
+        /// **The check also asks the mark index.** This function renumbers the
+        /// four data columns and leaves `index.mark` alone, so a mark row or a
+        /// cache key still naming `idx` would end up naming an actor half of
+        /// this set has forgotten: the `MarkIdx` in a row and the `OpId` in the
+        /// cache are actor indices too (`mark_index.rs:25-34`). Upstream never
+        /// asks, because upstream's `OpSet::remove_actor`
+        /// (`op_set2/op_set.rs:1419-1429`) renumbers neither the mark rows nor
+        /// anything else here — `columns.rs:350-358` is the whole of it.
+        ///
+        /// **In a well-formed set that arm refuses nothing the four columns have
+        /// not already refused**: a mark's begin is a row, and a row names its
+        /// actor in `id_actor`. It is here because
+        /// [`MarkIndexColumn.stageRemap`](mark_index.zig) is a public seam that
+        /// cannot renumber such a row downwards — a mark row cannot become "no
+        /// mark", because the index is aligned with the op set and has nothing
+        /// to drop — and because a function whose name says "no store of this
+        /// set names the actor" should be true of the whole set.
         pub fn rewriteWithoutActor(self: *Self, gpa: Allocator, idx: ActorIdx) ParseError!void {
             if (try self.referencesActor(idx)) return error.InvalidValue;
             try self.remapActors(gpa, idx, actorShiftedDown);
         }
 
-        /// Whether any of the four actor columns still names `idx`.
+        /// Whether any of the four actor columns, or the mark index, still
+        /// names `idx`.
+        ///
+        /// **Every store of this set that holds an actor index is asked**, so
+        /// there is no half-renumbered refusal hiding behind a narrower check.
+        /// The mark index's half is
+        /// [`MarkIndexColumn.referencesActor`](mark_index.zig) — the same
+        /// predicate [`MarkIndexColumn.stageRemap`](mark_index.zig) refuses on,
+        /// asked of the two stores it keeps an actor index in.
         fn referencesActor(self: *const Self, idx: ActorIdx) ParseError!bool {
             if (try hasActor(&self.id_actor, idx)) return true;
             if (try hasActor(&self.succ_actor, idx)) return true;
             if (try hasOptActor(&self.obj_actor, idx)) return true;
             if (try hasOptActor(&self.key_actor, idx)) return true;
+            if (try self.index.mark.referencesActor(idx)) return true;
             return false;
         }
 
@@ -1025,6 +1154,23 @@ pub fn Columns(comptime O: type) type {
         /// The two prefix positions are read first, before any column moves
         /// (`:425-426`), because both are sums over columns this function is
         /// about to splice.
+        ///
+        /// **What an error leaves.** Every value is built before the first
+        /// column moves, so a refusal while *building* — an interner out of
+        /// memory, a counter that does not fit a `u32` — leaves the columns as
+        /// they were.
+        ///
+        /// A refusal in the twenty-one column writes that follow used to leave
+        /// the columns holding some of the new rows and not the rest.
+        /// **Upstream's sequence at `:428-492` is not the precedent for that.**
+        /// Its `?`s are packing and bounds — `Column::splice` returns
+        /// `Result<_, PackError>` because a value may not pack, not because
+        /// memory ran out; a Rust allocation failure aborts the process rather
+        /// than returning an error (`handle_alloc_error`). **The port's heap is
+        /// fallible where upstream's is not, so upstream's shape says nothing
+        /// about what this port owes its caller on an `error.OutOfMemory`.**
+        /// That is why the twenty-one writes are staged and published together
+        /// rather than run in sequence.
         ///
         /// The mark index is written from a builder per row rather than from a
         /// word, because upstream's `MarkIndexColumn` is the column *and* the
@@ -1101,9 +1247,19 @@ pub fn Columns(comptime O: type) type {
             var inc_total: usize = 0;
 
             // Every value is built before any column is touched, so a splice
-            // that cannot finish — an interner that runs out of memory, a
+            // that cannot *build* — an interner that runs out of memory, a
             // counter that does not fit a u32 — leaves the columns as they
             // were rather than half written.
+            //
+            // After this build phase comes the twenty-one column writes, and
+            // each of them is staged and published together rather than run in
+            // sequence, so a refusal there leaves the whole set as it was.
+            // **Upstream's `?`s at columns.rs:428-492 are packing and bounds,
+            // not memory** — `Column::splice` returns `Result<_, PackError>`
+            // because a value may not pack, and a Rust allocation failure
+            // aborts rather than returning an error. This port's heap is
+            // fallible where upstream's is not, so upstream's shape is not a
+            // precedent and the staging is not optional here.
             for (rows, 0..) |o, i| {
                 const id = o.id();
                 id_actors[i] = id.actor;
@@ -1166,33 +1322,87 @@ pub fn Columns(comptime O: type) type {
             }
 
             // columns.rs:428-441 — the row columns, in upstream's order.
-            try self.id_actor.splice(gpa, pos, 0, id_actors);
-            try self.id_ctr.splice(gpa, pos, 0, id_ctrs);
-            try self.obj_actor.splice(gpa, pos, 0, obj_actors);
-            try self.obj_ctr.splice(gpa, pos, 0, obj_ctrs);
-            try self.key_actor.splice(gpa, pos, 0, key_actors);
-            try self.key_ctr.splice(gpa, pos, 0, key_ctrs);
-            try self.key_str.splice(gpa, pos, 0, key_strs);
-            try self.insert.splice(gpa, pos, 0, inserts);
-            try self.action.splice(gpa, pos, 0, actions);
-            try self.expand.splice(gpa, pos, 0, expands);
-            try self.mark_name.splice(gpa, pos, 0, mark_names);
-            try self.value_meta.splice(gpa, pos, 0, metas);
-            // columns.rs:443-444 — the payloads, at the offset read above.
-            try self.value.spliceSlice(gpa, value_pos, 0, raw.items);
-
+            //
+            // **Every column is staged before any is published.** A stage
+            // reads its column and writes nothing, and its `publish` cannot
+            // fail, so a refusal from any of the twenty-one leaves the set
+            // exactly as it was instead of holding some of the new rows and not
+            // the rest. The two that are not `Column`s — `value` and
+            // `index.mark` — are written directly below, **after** every stage
+            // is in hand, for the same reason: the only remaining fallible
+            // steps are then the last two, and each one's own failure still
+            // leaves every stage unpublished.
+            var s_id_actor = try self.id_actor.stageSplice(pos, 0, id_actors);
+            defer s_id_actor.deinit();
+            var s_id_ctr = try self.id_ctr.stageSplice(pos, 0, id_ctrs);
+            defer s_id_ctr.deinit();
+            var s_obj_actor = try self.obj_actor.stageSplice(pos, 0, obj_actors);
+            defer s_obj_actor.deinit();
+            var s_obj_ctr = try self.obj_ctr.stageSplice(pos, 0, obj_ctrs);
+            defer s_obj_ctr.deinit();
+            var s_key_actor = try self.key_actor.stageSplice(pos, 0, key_actors);
+            defer s_key_actor.deinit();
+            var s_key_ctr = try self.key_ctr.stageSplice(pos, 0, key_ctrs);
+            defer s_key_ctr.deinit();
+            var s_key_str = try self.key_str.stageSplice(pos, 0, key_strs);
+            defer s_key_str.deinit();
+            var s_insert = try self.insert.stageSplice(pos, 0, inserts);
+            defer s_insert.deinit();
+            var s_action = try self.action.stageSplice(pos, 0, actions);
+            defer s_action.deinit();
+            var s_expand = try self.expand.stageSplice(pos, 0, expands);
+            defer s_expand.deinit();
+            var s_mark_name = try self.mark_name.stageSplice(pos, 0, mark_names);
+            defer s_mark_name.deinit();
+            var s_value_meta = try self.value_meta.stageSplice(pos, 0, metas);
+            defer s_value_meta.deinit();
+            var s_text = try self.index.text.stageSplice(pos, 0, widths);
+            defer s_text.deinit();
+            var s_top = try self.index.top.stageSplice(pos, 0, tops);
+            defer s_top.deinit();
+            var s_visible = try self.index.visible.stageSplice(pos, 0, visibles);
+            defer s_visible.deinit();
             // columns.rs:446-462 — the successor counts, then the flattened
             // pair and the increments, at the offset read above.
-            try self.succ_count.splice(gpa, pos, 0, succ_counts);
-            try self.succ_actor.splice(gpa, succ_pos, 0, succ_actors);
-            try self.succ_ctr.splice(gpa, succ_pos, 0, succ_ctrs);
-            try self.index.inc.splice(gpa, succ_pos, 0, incs);
+            var s_succ_count = try self.succ_count.stageSplice(pos, 0, succ_counts);
+            defer s_succ_count.deinit();
+            var s_succ_actor = try self.succ_actor.stageSplice(succ_pos, 0, succ_actors);
+            defer s_succ_actor.deinit();
+            var s_succ_ctr = try self.succ_ctr.stageSplice(succ_pos, 0, succ_ctrs);
+            defer s_succ_ctr.deinit();
+            var s_inc = try self.index.inc.stageSplice(succ_pos, 0, incs);
+            defer s_inc.deinit();
 
+            // columns.rs:443-444 — the payloads, at the offset read above.
+            var s_value = try self.value.stageSpliceSlice(value_pos, 0, raw.items);
+            defer s_value.deinit();
             // columns.rs:464-492 — the five index columns.
-            try self.index.mark.extend(gpa, pos, mark_builders);
-            try self.index.text.splice(gpa, pos, 0, widths);
-            try self.index.top.splice(gpa, pos, 0, tops);
-            try self.index.visible.splice(gpa, pos, 0, visibles);
+            var s_mark = try self.index.mark.stageExtend(pos, mark_builders);
+            defer s_mark.deinit();
+
+            // The commit. Every publish is infallible and consumes its stage,
+            // and the `defer`s above are no-ops afterwards.
+            s_id_actor.publish(&self.id_actor);
+            s_id_ctr.publish(&self.id_ctr);
+            s_obj_actor.publish(&self.obj_actor);
+            s_obj_ctr.publish(&self.obj_ctr);
+            s_key_actor.publish(&self.key_actor);
+            s_key_ctr.publish(&self.key_ctr);
+            s_key_str.publish(&self.key_str);
+            s_insert.publish(&self.insert);
+            s_action.publish(&self.action);
+            s_expand.publish(&self.expand);
+            s_mark_name.publish(&self.mark_name);
+            s_value_meta.publish(&self.value_meta);
+            s_text.publish(&self.index.text);
+            s_top.publish(&self.index.top);
+            s_visible.publish(&self.index.visible);
+            s_succ_count.publish(&self.succ_count);
+            s_succ_actor.publish(&self.succ_actor);
+            s_succ_ctr.publish(&self.succ_ctr);
+            s_inc.publish(&self.index.inc);
+            s_value.publish(&self.value);
+            s_mark.publish(&self.index.mark);
             return n;
         }
 
@@ -1258,37 +1468,93 @@ pub fn Columns(comptime O: type) type {
             }
 
             // columns.rs:371-390 — the row columns, in upstream's order.
-            try self.id_actor.splice(gpa, pos, del, &.{});
-            try self.id_ctr.splice(gpa, pos, del, &.{});
-            try self.obj_actor.splice(gpa, pos, del, &.{});
-            try self.obj_ctr.splice(gpa, pos, del, &.{});
-            try self.key_actor.splice(gpa, pos, del, &.{});
-            try self.key_ctr.splice(gpa, pos, del, &.{});
-            try self.key_str.splice(gpa, pos, del, &.{});
-            try self.insert.splice(gpa, pos, del, &.{});
-            try self.action.splice(gpa, pos, del, &.{});
-            try self.expand.splice(gpa, pos, del, &.{});
-            try self.mark_name.splice(gpa, pos, del, &.{});
-            try self.value_meta.splice(gpa, pos, del, &.{});
-
-            // columns.rs:396-401 — the raw payloads, by their byte length.
-            try self.value.spliceSlice(gpa, value_pos, raw_len, &.{});
-
-            // columns.rs:403-416 — the successor counts, then the flattened
-            // pair and the increments.
-            try self.succ_count.splice(gpa, pos, del, &.{});
-            if (succ_del > 0) {
-                try self.succ_actor.splice(gpa, succ_pos, succ_del, &.{});
-                try self.succ_ctr.splice(gpa, succ_pos, succ_del, &.{});
-                try self.index.inc.splice(gpa, succ_pos, succ_del, &.{});
-            }
-
+            //
+            // **Staged, then published together**, for the reason
+            // [`Columns.splice`] gives: twenty-one columns spliced in sequence
+            // can be refused half way and leave a set whose columns disagree
+            // about how many rows it has. `publish` cannot fail, so every stage
+            // is built before any is published and the commit below is
+            // infallible. `value` and `index.mark` are the two that are not
+            // `Column`s and are written directly, after every stage is in hand.
+            var s_id_actor = try self.id_actor.stageSplice(pos, del, &.{});
+            defer s_id_actor.deinit();
+            var s_id_ctr = try self.id_ctr.stageSplice(pos, del, &.{});
+            defer s_id_ctr.deinit();
+            var s_obj_actor = try self.obj_actor.stageSplice(pos, del, &.{});
+            defer s_obj_actor.deinit();
+            var s_obj_ctr = try self.obj_ctr.stageSplice(pos, del, &.{});
+            defer s_obj_ctr.deinit();
+            var s_key_actor = try self.key_actor.stageSplice(pos, del, &.{});
+            defer s_key_actor.deinit();
+            var s_key_ctr = try self.key_ctr.stageSplice(pos, del, &.{});
+            defer s_key_ctr.deinit();
+            var s_key_str = try self.key_str.stageSplice(pos, del, &.{});
+            defer s_key_str.deinit();
+            var s_insert = try self.insert.stageSplice(pos, del, &.{});
+            defer s_insert.deinit();
+            var s_action = try self.action.stageSplice(pos, del, &.{});
+            defer s_action.deinit();
+            var s_expand = try self.expand.stageSplice(pos, del, &.{});
+            defer s_expand.deinit();
+            var s_mark_name = try self.mark_name.stageSplice(pos, del, &.{});
+            defer s_mark_name.deinit();
+            var s_value_meta = try self.value_meta.stageSplice(pos, del, &.{});
+            defer s_value_meta.deinit();
             // columns.rs:410-416 — the index columns, all four row-aligned
             // ones at the same `pos` and `del` the rows had.
-            try self.index.mark.undo(gpa, pos, mark_builders);
-            try self.index.text.splice(gpa, pos, del, &.{});
-            try self.index.top.splice(gpa, pos, del, &.{});
-            try self.index.visible.splice(gpa, pos, del, &.{});
+            var s_text = try self.index.text.stageSplice(pos, del, &.{});
+            defer s_text.deinit();
+            var s_top = try self.index.top.stageSplice(pos, del, &.{});
+            defer s_top.deinit();
+            var s_visible = try self.index.visible.stageSplice(pos, del, &.{});
+            defer s_visible.deinit();
+            // columns.rs:403-416 — the successor counts, then the flattened
+            // pair and the increments.
+            var s_succ_count = try self.succ_count.stageSplice(pos, del, &.{});
+            defer s_succ_count.deinit();
+            // The successor columns are only touched when there is something to
+            // take out, which is upstream's `:406-416` and is why `spliceSlice`
+            // below is conditional in the same way.
+            var s_succ_actor: ?ActorColumn.StagedSplice = null;
+            defer if (s_succ_actor) |*st| st.deinit();
+            var s_succ_ctr: ?CounterColumn.StagedSplice = null;
+            defer if (s_succ_ctr) |*st| st.deinit();
+            var s_inc: ?IncColumn.StagedSplice = null;
+            defer if (s_inc) |*st| st.deinit();
+            if (succ_del > 0) {
+                s_succ_actor = try self.succ_actor.stageSplice(succ_pos, succ_del, &.{});
+                s_succ_ctr = try self.succ_ctr.stageSplice(succ_pos, succ_del, &.{});
+                s_inc = try self.index.inc.stageSplice(succ_pos, succ_del, &.{});
+            }
+
+            // columns.rs:396-401 — the raw payloads, by their byte length.
+            var s_value = try self.value.stageSpliceSlice(value_pos, raw_len, &.{});
+            defer s_value.deinit();
+            var s_mark = try self.index.mark.stageUndo(pos, mark_builders);
+            defer s_mark.deinit();
+
+            // The commit.
+            s_id_actor.publish(&self.id_actor);
+            s_id_ctr.publish(&self.id_ctr);
+            s_obj_actor.publish(&self.obj_actor);
+            s_obj_ctr.publish(&self.obj_ctr);
+            s_key_actor.publish(&self.key_actor);
+            s_key_ctr.publish(&self.key_ctr);
+            s_key_str.publish(&self.key_str);
+            s_insert.publish(&self.insert);
+            s_action.publish(&self.action);
+            s_expand.publish(&self.expand);
+            s_mark_name.publish(&self.mark_name);
+            s_value_meta.publish(&self.value_meta);
+            s_text.publish(&self.index.text);
+            s_top.publish(&self.index.top);
+            s_visible.publish(&self.index.visible);
+            s_succ_count.publish(&self.succ_count);
+            if (s_succ_actor) |*st| st.publish(&self.succ_actor);
+            if (s_succ_ctr) |*st| st.publish(&self.succ_ctr);
+            if (s_inc) |*st| st.publish(&self.index.inc);
+            s_value.publish(&self.value);
+            s_mark.publish(&self.index.mark);
             return del;
         }
 
@@ -1577,6 +1843,35 @@ fn hasActor(col: *const ActorColumn, idx: ActorIdx) ParseError!bool {
         if (a == idx) return true;
     }
     return false;
+}
+
+/// One column's renumbering, built beside the column and handed back for
+/// [`Columns.remapActors`] to publish.
+///
+/// It is [`Column.remapped`]: the borrowed build that reads this column and
+/// writes a fresh one. **The column handed in is not written, not released,
+/// and holds every byte it held** — so the caller still owns it, whole, while
+/// the four stages are being built and again if one of them is refused.
+///
+/// The value returned is a whole column of the caller's own, in `gpa` and on
+/// the source's run budget, and it is the only thing this hands over: a
+/// refusal frees the partial build and propagates with nothing to release.
+///
+/// (This used to copy the column and remap the copy. A column is a slab list,
+/// an index and a weight array rather than one byte buffer, so that copy was
+/// an alias of the original's storage: remapping it released slabs the
+/// original still named, and the publication released them a second time. The
+/// whole-column clone a stage wants is a copy of the *values*, which is what
+/// this build already does, run at a time.)
+fn stagedRemap(
+    comptime C: type,
+    comptime V: type,
+    col: *const C,
+    gpa: Allocator,
+    ctx: anytype,
+    comptime f: fn (@TypeOf(ctx), V) V,
+) ParseError!C {
+    return col.remapped(gpa, ctx, f);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -3142,7 +3437,7 @@ test "a mark begin and a mark end fill the mark index and its cache" {
     // (`mark_index.rs:271-278`), which is why a mark whose row moved still
     // answers for its data afterwards.
     try cols.rewriteWithNewActor(gpa, 0);
-    try cols.index.mark.remapValues(gpa, 0);
+    try cols.index.mark.remapValues(0);
     try checkLengths(&cols, gpa, 4, 0);
     const lifted = begin.withNewActor(0);
     try testing.expect(!lifted.eql(begin));
@@ -3253,18 +3548,123 @@ test "renumbering an actor moves every index that names it" {
     // A new actor at index 1 lifts every index at or above it
     // (columns.rs:344-347), and nothing names index 1 afterwards because the
     // new actor is the only thing that did.
+    var raised_marks = try cols.index.mark.stageRemap(1, .up);
+    defer raised_marks.deinit();
     try cols.rewriteWithNewActor(gpa, 1);
+    raised_marks.publish(&cols.index.mark);
     const lifted = try actorsOf(&cols, gpa);
     defer gpa.free(lifted);
     try testing.expectEqualSlices(ActorIdx, &.{ 0, 0, 2, 2, 0, 2, 0, 0, 0 }, lifted);
     try checkLengths(&cols, gpa, 4, 2);
 
     // And removing it again puts every index back where it was.
+    var lowered_marks = try cols.index.mark.stageRemap(1, .down);
+    defer lowered_marks.deinit();
     try cols.rewriteWithoutActor(gpa, 1);
+    lowered_marks.publish(&cols.index.mark);
     const lowered = try actorsOf(&cols, gpa);
     defer gpa.free(lowered);
     try testing.expectEqualSlices(ActorIdx, before, lowered);
     try checkLengths(&cols, gpa, 4, 2);
+}
+
+/// The four columns that hold an actor index, as decoded values, so a refused
+/// [`Columns.remapActors`] can be asked whether it moved any of them.
+const ActorColumns = struct {
+    id_actor: []ActorIdx,
+    succ_actor: []ActorIdx,
+    obj_actor: []?ActorIdx,
+    key_actor: []?ActorIdx,
+
+    fn take(gpa: Allocator, c: *const Columns(Row)) !ActorColumns {
+        const id_actor = try valuesOf(ActorColumn, &c.id_actor, gpa);
+        errdefer gpa.free(id_actor);
+        const succ_actor = try valuesOf(ActorColumn, &c.succ_actor, gpa);
+        errdefer gpa.free(succ_actor);
+        const obj_actor = try valuesOf(ActorOptColumn, &c.obj_actor, gpa);
+        errdefer gpa.free(obj_actor);
+        const key_actor = try valuesOf(ActorOptColumn, &c.key_actor, gpa);
+        return .{
+            .id_actor = id_actor,
+            .succ_actor = succ_actor,
+            .obj_actor = obj_actor,
+            .key_actor = key_actor,
+        };
+    }
+
+    fn deinit(self: ActorColumns, gpa: Allocator) void {
+        gpa.free(self.id_actor);
+        gpa.free(self.succ_actor);
+        gpa.free(self.obj_actor);
+        gpa.free(self.key_actor);
+    }
+
+    fn expectSame(self: ActorColumns, gpa: Allocator, c: *const Columns(Row)) !void {
+        const id_actor = try valuesOf(ActorColumn, &c.id_actor, gpa);
+        defer gpa.free(id_actor);
+        try testing.expectEqualSlices(ActorIdx, self.id_actor, id_actor);
+        const succ_actor = try valuesOf(ActorColumn, &c.succ_actor, gpa);
+        defer gpa.free(succ_actor);
+        try testing.expectEqualSlices(ActorIdx, self.succ_actor, succ_actor);
+        const obj_actor = try valuesOf(ActorOptColumn, &c.obj_actor, gpa);
+        defer gpa.free(obj_actor);
+        try testing.expectEqualSlices(?ActorIdx, self.obj_actor, obj_actor);
+        const key_actor = try valuesOf(ActorOptColumn, &c.key_actor, gpa);
+        defer gpa.free(key_actor);
+        try testing.expectEqualSlices(?ActorIdx, self.key_actor, key_actor);
+    }
+};
+
+test "a refused actor renumbering leaves all four actor columns where they were" {
+    // **The claim is all-or-nothing across the four columns.** A column
+    // renumbered in place is atomic on its own ([`Column.remap`], which
+    // releases the old bytes only once the new column has been built), so four
+    // sequential calls are four atomic steps and not one atomic pass: a
+    // refusal in the third used to return with `id_actor` and `succ_actor`
+    // renumbered and `obj_actor` and `key_actor` not, so two columns of the
+    // same row disagreed about that row's actor — the one state no reader in
+    // this slice survives. It is also the claim a stage has to earn from the
+    // other side: a refused `remapped` must leave its source exactly as it
+    // found it, or the sources themselves are half-renumbered.
+    const gpa = testing.allocator;
+    var failing: testing.FailingAllocator = .init(gpa, .{});
+    const agpa = failing.allocator();
+    var table = Table.init(agpa);
+    defer table.deinit();
+    var cols = try Columns(Row).init(agpa);
+    defer cols.deinit();
+    _ = try cols.splice(agpa, 0, &rich, .unicode_code_point, table.asTable());
+
+    const before = try ActorColumns.take(agpa, &cols);
+    defer before.deinit(agpa);
+    // The arm is a base captured once, so `skip` walks this pass's own
+    // allocations one at a time however much a check took in between.
+    const base = failing.alloc_index;
+    var skip: usize = 0;
+    var landed = false;
+    while (skip <= 512) : (skip += 1) {
+        failing.fail_index = base + skip;
+        const outcome = cols.rewriteWithNewActor(agpa, 1);
+        failing.fail_index = std.math.maxInt(usize);
+        if (outcome) |_| {
+            landed = true;
+            break;
+        } else |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            try before.expectSame(agpa, &cols);
+        }
+    }
+    try testing.expect(landed);
+    // A pass that allocated nothing could not have been refused, so the sweep
+    // would have proved nothing.
+    try testing.expect(skip > 0);
+    // And the pass that landed did the whole renumbering, which is the other
+    // half: staging four columns must not have cost the move itself.
+    const after = try ActorColumns.take(agpa, &cols);
+    defer after.deinit(agpa);
+    try testing.expectEqualSlices(ActorIdx, &.{ 0, 0, 2, 2 }, after.id_actor);
+    try testing.expectEqualSlices(ActorIdx, &.{ 0, 2 }, after.succ_actor);
+    try checkLengths(&cols, agpa, 4, 2);
 }
 
 test "removing an actor the op set still names is refused" {

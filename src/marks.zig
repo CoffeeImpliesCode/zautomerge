@@ -23,8 +23,8 @@
 //! set they currently resolve to (`marks.rs:242-247`). An op id orders by
 //! counter first, then actor (`src/types.zig:163-170`), so "above" a mark means
 //! "a mark with a higher op id": a later operation, or a concurrent one from a
-//! higher-numbered actor. `mark_above` scans only the entries above the
-//! insertion point and `mark_below` only the entries below it
+//! higher-numbered actor. `mark_above` scans only the entries strictly above
+//! the mark being decided on and `mark_below` only the entries below it
 //! (`marks.rs:325-337`, `:339-353`), so the state behaves as a stack — the
 //! nearest mark of the same name above shadows this one, the nearest below is
 //! what this one restores to.
@@ -197,20 +197,34 @@ pub const MarkAccItem = struct {
 /// and assumes both are sorted (`iter/spans.rs:342-387`) — and this reproduces
 /// it exactly.
 pub const MarkAccumulator = struct {
+    /// The allocator the run lists are allocated with. It is retained for the
+    /// accumulator's whole life, so it must outlive it; every name this
+    /// accumulator stores is borrowed, not allocated with it.
     gpa: Allocator,
     /// The per-name run lists, sorted by name.
     names: std.ArrayList(NameRuns) = .empty,
 
-    const NameRuns = struct {
+    /// One mark name and the runs recorded under it. Published because
+    /// [`MarkAccumulatorIter.names`] is a slice of these and an out-of-tree
+    /// consumer holding that iterator can read the field.
+    pub const NameRuns = struct {
+        /// The mark name. Borrowed from whatever [`MarkAccumulator.add`] was
+        /// given; the accumulator never frees it.
         name: []const u8,
         /// The coalesced runs of this name, in the order they were added.
         runs: std.ArrayList(MarkAccItem) = .empty,
     };
 
+    /// An empty accumulator that stores `gpa` for its own run lists and for
+    /// [`MarkAccumulator.deinit`]. Allocates nothing.
     pub fn init(gpa: Allocator) MarkAccumulator {
         return .{ .gpa = gpa };
     }
 
+    /// Releases every per-name run list and the array of them. **The names are
+    /// not freed** — they are borrowed, see [`MarkAccumulator.add`] — and no
+    /// mark value owns bytes. The accumulator is `undefined` afterward and a
+    /// second call is a double free.
     pub fn deinit(self: *MarkAccumulator) void {
         for (self.names.items) |*entry| entry.runs.deinit(self.gpa);
         self.names.deinit(self.gpa);
@@ -224,6 +238,15 @@ pub const MarkAccumulator = struct {
     /// values are equal and the previous run ends exactly where this one
     /// starts. That is the whole reason a mark read back from the document
     /// comes out as one span rather than one span per position.
+    ///
+    /// **The names are retained by borrow, not copied.** A name already in the
+    /// accumulator keeps pointing at the storage it was first added from, so
+    /// every `MarkSet` fed here must outlive this accumulator and the marks it
+    /// yields. A mark value is copied by value and carries no bytes.
+    ///
+    /// On `error.OutOfMemory` the entries appended before the refusal are
+    /// kept; the accumulator stays usable and the marks already added are
+    /// still there.
     pub fn add(
         self: *MarkAccumulator,
         index: usize,
@@ -265,7 +288,9 @@ pub const MarkAccumulator = struct {
     }
 
     /// Every run as a `Mark`, unmark tombstones included (`marks.rs:68-74`).
-    /// The iterator borrows the accumulator.
+    /// The iterator borrows the accumulator and is invalidated by the next
+    /// [`MarkAccumulator.add`] or [`MarkAccumulator.deinit`], and a `Mark` it
+    /// returns borrows the same names.
     pub fn intoIter(self: *const MarkAccumulator) MarkAccumulatorIter {
         return .{ .names = self.names.items };
     }
@@ -274,6 +299,8 @@ pub const MarkAccumulator = struct {
     /// (`marks.rs:76-85`). This is what a document hands back when asked for
     /// the marks over a range (`automerge.rs:1630`, `op_set2/op_set.rs:1023`):
     /// an unmark is a tombstone, not a mark.
+    ///
+    /// The borrow rules are [`MarkAccumulator.intoIter`]'s.
     pub fn intoIterNoUnmark(self: *const MarkAccumulator) MarkAccumulatorIter {
         return .{ .names = self.names.items, .drop_nulls = true };
     }
@@ -282,6 +309,9 @@ pub const MarkAccumulator = struct {
 /// The iterator over an accumulator's runs (`marks.rs:68-85`). Upstream spells
 /// it as a `flat_map` over a `BTreeMap`; the two cursors are explicit here.
 pub const MarkAccumulatorIter = struct {
+    /// The per-name run lists being walked, borrowed from the accumulator
+    /// [`MarkAccumulator.intoIter`] was made from. A `Mark` this returns
+    /// borrows its `name` from the same place.
     names: []const MarkAccumulator.NameRuns,
     /// Which per-name run list we are walking.
     name_index: usize = 0,
@@ -291,6 +321,9 @@ pub const MarkAccumulatorIter = struct {
     /// (`marks.rs:80`); `into_iter` keeps them.
     drop_nulls: bool = false,
 
+    /// The next run as a `Mark`, or `null` at the end. The `Mark` borrows its
+    /// name and copies its value; it is invalidated by the next
+    /// [`MarkAccumulator.add`] on the accumulator this walks.
     pub fn next(self: *MarkAccumulatorIter) ?Mark {
         while (self.name_index < self.names.len) {
             const runs = self.names[self.name_index];
@@ -323,6 +356,9 @@ pub const MarkAccumulatorIter = struct {
 /// document and has been removed, which is different from the name being
 /// absent (`marks.rs:170-171`, `:180-187`).
 pub const MarkSet = struct {
+    /// The allocator the entries array is allocated with. It is retained for
+    /// the set's whole life, so it must outlive it; the names the set holds
+    /// are borrowed, not allocated with it.
     gpa: Allocator,
     /// The entries, sorted by name. See `MarkAccumulator` for why this is a
     /// flat array rather than a map.
@@ -330,10 +366,14 @@ pub const MarkSet = struct {
 
     /// One mark name and the value it holds here.
     pub const Entry = struct {
+        /// The mark name. **Borrowed**: whoever produced it keeps it alive, and
+        /// a caller that frees the storage this points at leaves the set and
+        /// every iterator over it naming freed bytes. See [`MarkSet.put`].
         name: []const u8,
         value: ScalarValue,
     };
 
+    /// An empty set that stores `gpa` for its entries array. Allocates nothing.
     pub fn init(gpa: Allocator) MarkSet {
         return .{ .gpa = gpa };
     }
@@ -347,12 +387,19 @@ pub const MarkSet = struct {
         return set;
     }
 
+    /// Releases the entries array. **The names are not freed** — they are
+    /// borrowed, see [`MarkSet.put`] — and no mark value owns bytes. The set is
+    /// `undefined` afterward and a second call is a double free.
     pub fn deinit(self: *MarkSet) void {
         self.entries.deinit(self.gpa);
         self.* = undefined;
     }
 
     /// The entries, in name order (`marks.rs:136-139`).
+    ///
+    /// The iterator borrows this set and is invalidated by the next
+    /// [`MarkSet.put`], [`MarkSet.remove`] or [`MarkSet.deinit`], any of which
+    /// can reallocate or shift the entries array it points into.
     pub fn iter(self: *const MarkSet) MarkSetIter {
         return .{ .entries = self.entries.items };
     }
@@ -371,6 +418,14 @@ pub const MarkSet = struct {
 
     /// Sets `name` to `value`, replacing any value it already had
     /// (`marks.rs:152-155`, `BTreeMap::insert`).
+    ///
+    /// **The name is retained by borrow and never copied.** A caller that
+    /// frees the storage `name` points at leaves this set, and every iterator
+    /// over it, naming freed bytes; the in-tree producers point into the op
+    /// set's string table, which outlives every mark set made from it. Pass a
+    /// literal or a permanent buffer when the source is not.
+    ///
+    /// On `error.OutOfMemory` nothing is stored and the set is unchanged.
     pub fn put(self: *MarkSet, name: []const u8, v: ScalarValue) Error!void {
         const at = self.lowerBound(name);
         if (at < self.entries.items.len and
@@ -387,13 +442,24 @@ pub const MarkSet = struct {
         if (self.find(name)) |index| _ = self.entries.orderedRemove(index);
     }
 
+    /// Whether the set holds no names at all. A set holding only unmark
+    /// tombstones is not empty.
     pub fn isEmpty(self: *const MarkSet) bool {
         return self.entries.items.len == 0;
     }
 
     /// This set without the marks whose value is `Null`, i.e. without the
-    /// unmark tombstones (`marks.rs:180-187`). Consumes and frees `self` as
-    /// upstream does, so the caller must not deinit it afterwards.
+    /// unmark tombstones (`marks.rs:180-187`).
+    ///
+    /// **The receiver is consumed on both outcomes.** It is taken by value and
+    /// its entries buffer is released before this returns, whether it returns
+    /// a set or `error.OutOfMemory`, so the caller must not [`MarkSet.deinit`]
+    /// the value it passed and has no release route for it afterwards. On
+    /// error the partially built result is released as well and nothing is
+    /// handed back.
+    ///
+    /// The names in the result are the same borrowed names the receiver held;
+    /// see [`MarkSet.put`].
     pub fn withoutUnmarks(self: MarkSet) Error!MarkSet {
         // Upstream clones the whole map and retains on the clone
         // (`marks.rs:183-186`, with its own `FIXME - do I need this clone?`).
@@ -401,14 +467,17 @@ pub const MarkSet = struct {
         // original is freed rather than dropped, because Zig has no drop.
         var out = MarkSet.init(self.gpa);
         errdefer out.deinit();
+        // **A plain `defer`, not `errdefer` plus a call on the success path.**
+        // The release is the same on both, and one deferred call cannot be
+        // reached twice.
+        var consumed = self;
+        defer consumed.deinit();
         for (self.entries.items) |entry| {
             switch (entry.value) {
                 .null_value => {},
                 else => try out.put(entry.name, entry.value),
             }
         }
-        var consumed = self;
-        consumed.deinit();
         return out;
     }
 
@@ -464,9 +533,16 @@ pub const MarkSet = struct {
 /// and can stand for "no marks" (`iter/spans.rs:330`, `:338`); a zero-valued
 /// `MarkSetIter` is empty in the same way, with no allocation behind it.
 pub const MarkSetIter = struct {
+    /// The entries being walked, borrowed from the set [`MarkSet.iter`] was
+    /// made from. A `null` name here is not possible; the zero value walks
+    /// nothing.
     entries: []const MarkSet.Entry = &.{},
+    /// How many entries have been handed out.
     index: usize = 0,
 
+    /// The next entry, or `null` at the end. The returned pointer is into the
+    /// set's own entries array and is invalidated by the next
+    /// [`MarkSet.put`], [`MarkSet.remove`] or [`MarkSet.deinit`].
     pub fn next(self: *MarkSetIter) ?*const MarkSet.Entry {
         if (self.index >= self.entries.len) return null;
         const entry = &self.entries[self.index];
@@ -480,9 +556,14 @@ pub const MarkSetIter = struct {
 /// is built; it is a value type with no behaviour, so it lives here and the op
 /// set imports it. The name is borrowed.
 pub const MarkData = struct {
+    /// The mark name. Borrowed, and this type owns nothing: a holder keeps
+    /// the bytes alive for as long as the value.
     name: []const u8,
     value: ScalarValue,
 
+    /// The name and value as one value type. **The name is borrowed** and is
+    /// retained by whatever stores this, so it must outlive it. Allocates
+    /// nothing and frees nothing.
     pub fn init(name: []const u8, v: ScalarValue) MarkData {
         return .{ .name = name, .value = v };
     }
@@ -502,6 +583,9 @@ pub const MarkData = struct {
 /// the crate are the text diff's `before` and `after` machines, which each own
 /// theirs separately (`iter/spans.rs:648-651`).
 pub const MarkStateMachine = struct {
+    /// The allocator the open-mark array is allocated with. It is retained
+    /// for the machine's whole life, so it must outlive it; the mark names the
+    /// machine holds are borrowed, not allocated with it.
     gpa: Allocator,
     /// The open marks, sorted by op id.
     state: std.ArrayList(Entry) = .empty,
@@ -525,10 +609,16 @@ pub const MarkStateMachine = struct {
         insert_at: usize,
     };
 
+    /// An empty machine that stores `gpa` for its open-mark array and for the
+    /// [`MarkSet`] it resolves into. Allocates nothing.
     pub fn init(gpa: Allocator) MarkStateMachine {
         return .{ .gpa = gpa, .resolved = MarkSet.init(gpa) };
     }
 
+    /// Releases the open-mark array and the resolved set. **The mark names are
+    /// not freed** — they are borrowed, see [`MarkData`] — and no mark value
+    /// owns bytes. The machine is `undefined` afterward and a second call is a
+    /// double free.
     pub fn deinit(self: *MarkStateMachine) void {
         self.state.deinit(self.gpa);
         self.resolved.deinit();
@@ -537,6 +627,10 @@ pub const MarkStateMachine = struct {
 
     /// The set at the current position, or null when nothing is marked
     /// (`marks.rs:250-256`).
+    ///
+    /// The pointer is into this machine's own `resolved` set and is invalidated
+    /// by the next [`MarkStateMachine.process`], [`MarkStateMachine.markBegin`]
+    /// or [`MarkStateMachine.markEnd`], and by [`MarkStateMachine.deinit`].
     pub fn current(self: *const MarkStateMachine) ?*const MarkSet {
         if (self.resolved.isEmpty()) return null;
         return &self.resolved;
@@ -560,6 +654,14 @@ pub const MarkStateMachine = struct {
 
     /// Opens a mark. Returns whether the current set changed
     /// (`marks.rs:266-292`).
+    ///
+    /// **Every decision is taken before anything is written, and an error
+    /// leaves the machine exactly as it was.** The fold this drives keeps going
+    /// after a caught error (`op_set.zig`'s `calculateMarksSlow`), so a
+    /// half-applied step would leave a mark value with no open mark behind it,
+    /// and every later end for that id would be dropped. `MarkSet.put` leaves
+    /// its set unchanged when it fails, and `orderedRemove` allocates nothing,
+    /// so the rollback is exact.
     pub fn markBegin(self: *MarkStateMachine, id: OpId, mark: MarkData) Error!bool {
         // An id already in the state is a corrupt document: op ids are unique,
         // so upstream drops the operation rather than opening it twice
@@ -569,56 +671,82 @@ pub const MarkStateMachine = struct {
             .insert_at => |at| at,
         };
 
-        var result = false;
-        // A same-name mark above shadows this one entirely: whatever is in the
-        // set stays until that mark ends (`marks.rs:274`).
-        if (markAbove(self.state.items, index, mark) == null) {
+        const changes = decision: {
+            // A same-name mark above shadows this one entirely: whatever is in
+            // the set stays until that mark ends (`marks.rs:274`).
+            if (markAbove(self.state.items, index, mark) != null) break :decision false;
             if (markBelow(self.state.items, index, mark)) |below| {
                 // The value below is already the one being opened, so the set
                 // does not change and the caller is told so (`marks.rs:276`).
-                if (!below.value.eql(mark.value)) {
-                    try self.resolved.put(mark.name, mark.value);
-                    result = true;
-                }
-            } else {
-                // Nothing above and nothing below: this mark decides the value
-                // from here on (`marks.rs:281-286`).
-                try self.resolved.put(mark.name, mark.value);
-                result = true;
+                break :decision !below.value.eql(mark.value);
             }
-        }
+            // Nothing above and nothing below: this mark decides the value
+            // from here on (`marks.rs:281-286`).
+            break :decision true;
+        };
 
+        // **The open mark goes in first and comes back out if the resolved set
+        // refuses the value.** The reverse order would publish the value and
+        // then fail to record the mark that owns it.
         try self.state.insert(self.gpa, index, .{ .id = id, .mark = mark });
-        return result;
+        errdefer _ = self.state.orderedRemove(index);
+        if (changes) try self.resolved.put(mark.name, mark.value);
+        return changes;
     }
 
     /// Closes the mark that `id` ends, which is the one opened at `id.prev()`
     /// (`marks.rs:294-319`). Returns whether the current set changed.
+    ///
+    /// An `id.prev()` that is not in the state is ignored (`marks.rs:296-299`)
+    /// and reports no change. The atomicity guarantee is
+    /// [`MarkStateMachine.markBegin`]'s.
+    ///
+    /// **The scans run against the state with the closed mark still in it, so
+    /// the one above starts one entry past it.** Upstream removes the entry
+    /// first (`marks.rs:301`) and only then looks for its neighbours, which is
+    /// why its `mark_above` never sees the mark being closed; asking here with
+    /// the closed mark's own index would let a mark answer the question asked
+    /// about itself, and every end would report no change and write nothing —
+    /// every mark would then run to the end of the object.
     pub fn markEnd(self: *MarkStateMachine, id: OpId) Error!bool {
         const index = switch (self.find(id.prev())) {
             .at => |at| at,
             .insert_at => return false,
         };
 
-        const mark = self.state.orderedRemove(index).mark;
+        const mark = self.state.items[index].mark;
 
-        var result = false;
-        if (markAbove(self.state.items, index, mark) == null) {
+        // **One past the closed mark.** Upstream's `state.remove(index)`
+        // happens before `mark_above` (`marks.rs:301-303`), so upstream's
+        // `state[index..]` is this port's `state[index + 1..]`.
+        const above = index + 1;
+
+        const changes = decision: {
+            if (markAbove(self.state.items, above, mark) != null) break :decision false;
             if (markBelow(self.state.items, index, mark)) |below| {
                 // Restoring the value below is a change only when it differs
                 // from the value being closed (`marks.rs:305`).
-                if (!below.value.eql(mark.value)) {
-                    try self.resolved.put(below.name, below.value);
-                    result = true;
-                }
+                break :decision !below.value.eql(mark.value);
+            }
+            break :decision true;
+        };
+
+        // **The resolved set is settled while the mark is still open.**
+        // Removing first and re-inserting after a failed `put` would need an
+        // allocation that can itself fail, which is the same hazard one level
+        // down; `MarkSet.remove` and `MarkSet.put` are the two steps here and
+        // only one of them can fail, with the mark still in place to unwind.
+        if (changes) {
+            if (markBelow(self.state.items, index, mark)) |below| {
+                try self.resolved.put(below.name, below.value);
             } else {
                 // Nothing of this name is left, so the name leaves the set
                 // (`marks.rs:311-314`).
                 self.resolved.remove(mark.name);
-                result = true;
             }
         }
-        return result;
+        _ = self.state.orderedRemove(index);
+        return changes;
     }
 
     /// Binary search for `target` in the open marks, by op id
@@ -638,9 +766,12 @@ pub const MarkStateMachine = struct {
     }
 };
 
-/// The first mark of the same name above `index`, if any (`marks.rs:325-337`).
-fn markAbove(state: []const MarkStateMachine.Entry, index: usize, mark: MarkData) ?MarkData {
-    for (state[index..]) |entry| {
+/// The first mark of the same name in `state[from..]`, if any
+/// (`marks.rs:325-337`). `from` is where the first entry **strictly above** the
+/// mark the caller is deciding on sits: the insertion point for a begin, and
+/// one past the mark itself for an end, which upstream has already removed.
+fn markAbove(state: []const MarkStateMachine.Entry, from: usize, mark: MarkData) ?MarkData {
+    for (state[from..]) |entry| {
         if (std.mem.eql(u8, entry.mark.name, mark.name)) return entry.mark;
     }
     return null;
@@ -658,13 +789,17 @@ fn markBelow(state: []const MarkStateMachine.Entry, index: usize, mark: MarkData
     return null;
 }
 
-/// The name and value of a mark, owned (`marks.rs:355-359`). Upstream's
-/// `SmolStr` owns its bytes; here, as everywhere in this port, the name is
-/// borrowed and the owner keeps it alive.
+/// The name and value of a mark (`marks.rs:355-359`). Upstream's `SmolStr`
+/// owns its bytes; here, as everywhere in this port, the name is borrowed and
+/// the owner keeps it alive. This type frees nothing.
 pub const OldMarkData = struct {
+    /// The mark name, borrowed.
     name: []const u8,
     value: ScalarValue,
 
+    /// Whether the two carry the same name **and** the same value
+    /// (`marks.rs:355-359`, upstream's derived `PartialEq` over a
+    /// `SmolStr`/`ScalarValue` pair). Allocates nothing.
     pub fn eql(a: OldMarkData, b: OldMarkData) bool {
         return std.mem.eql(u8, a.name, b.name) and a.value.eql(b.value);
     }
@@ -728,6 +863,11 @@ pub const ExpandMark = enum {
 /// type; it is here because two ported cases set flags
 /// (`diff_marks.rs`:864-903`, `:906-944`) and there is no way to ask for a
 /// non-default flag without it.
+///
+/// **One owner, and a copy is not one.** The table and every name in it belong
+/// to this value and [`UpdateSpansConfig.deinit`] frees them, so a second copy
+/// deinited as well is a double free and a flag set through one copy is
+/// visible through the other. There is no method here that hands a copy back.
 pub const UpdateSpansConfig = struct {
     /// The allocator the map and the copies of the names in it were made with.
     gpa: Allocator,
@@ -748,21 +888,29 @@ pub const UpdateSpansConfig = struct {
     /// **The names are freed here, not by the map.**
     /// [`std.StringHashMapUnmanaged`] frees its table and nothing else: a key
     /// it did not allocate is a key its caller must free, and
-    /// [`setMarkExpand`] `dupe`s every name it stores.
+    /// [`setMarkExpand`] `dupe`s every name it stores. The allocator itself is
+    /// not released. A second call is a double free.
     pub fn deinit(self: *UpdateSpansConfig) void {
         var names = self.per_mark_expands.keyIterator();
         while (names.next()) |name| self.gpa.free(name.*);
         self.per_mark_expands.deinit(self.gpa);
     }
 
-    /// [`with_default_expand`](../../github-automerge-automerge/rust/automerge/src/marks.rs):476-479.
-    pub fn withDefaultExpand(self: UpdateSpansConfig, expand: ExpandMark) UpdateSpansConfig {
-        var out = self;
-        out.default_expand = expand;
-        return out;
+    /// Sets [`default_expand`](UpdateSpansConfig.default_expand) and returns
+    /// the same config ([`with_default_expand`](../../github-automerge-automerge/rust/automerge/src/marks.rs):476-479).
+    ///
+    /// **In place, because a returned-by-value copy would be a second owner.**
+    /// Upstream consumes the config and hands it back so the calls chain; here
+    /// the table and the duped names have one owner, so handing back a copy
+    /// would give two `deinit`s one set of bytes. The return is `self` so the
+    /// call still reads as a builder step, and it may be discarded. Cannot
+    /// fail and allocates nothing.
+    pub fn withDefaultExpand(self: *UpdateSpansConfig, expand: ExpandMark) *UpdateSpansConfig {
+        self.default_expand = expand;
+        return self;
     }
 
-    /// [`per_mark_expands.insert`](../../github-automerge-automerge/rust/automerge/src/marks.rs):481-485.
+    /// Records the flag for `name` ([`per_mark_expands.insert`](../../github-automerge-automerge/rust/automerge/src/marks.rs):481-485).
     ///
     /// **A statement, not upstream's consuming builder.** Upstream returns the
     /// config by value so the calls chain; a Zig insertion into a hash map can
@@ -770,17 +918,26 @@ pub const UpdateSpansConfig = struct {
     /// as well would be the only place in this file that owns a value twice.
     /// The name is copied, so a caller may pass a literal or a slice into the
     /// document.
+    ///
+    /// **Nothing is lost when the copy or the insert fails.** The new entry
+    /// goes in before any old one goes out, so a name that already had a flag
+    /// still has it — the one change an error must not make is a silent
+    /// fallback to [`default_expand`](UpdateSpansConfig.default_expand) on a
+    /// retry.
     pub fn setMarkExpand(
         self: *UpdateSpansConfig,
         name: []const u8,
         expand: ExpandMark,
     ) Allocator.Error!void {
         const entry = try self.gpa.dupe(u8, name);
-        // The old name, if any, belongs to this map and the new one would not
-        // be freed by `deinit` if the insert replaced it.
-        if (self.per_mark_expands.fetchRemove(name)) |old| self.gpa.free(old.key);
         errdefer self.gpa.free(entry);
-        try self.per_mark_expands.put(self.gpa, entry, expand);
+        const slot = try self.per_mark_expands.getOrPut(self.gpa, entry);
+        if (slot.found_existing) {
+            // **The map keeps the copy of the name it already had**, so the
+            // one just made is not stored and would otherwise leak.
+            self.gpa.free(entry);
+        }
+        slot.value_ptr.* = expand;
     }
 
     /// The flag for `name`: its own, or [`default_expand`]
@@ -805,6 +962,111 @@ fn expectMarks(set: ?*const MarkSet, want: []const MarkSet.Entry) !void {
     for (want, got.items) |w, g| {
         try testing.expectEqualStrings(w.name, g.name);
         try testing.expect(w.value.eql(g.value));
+    }
+}
+
+/// Opens a mark, closes it, and frees the machine. A step that fails must
+/// leave the machine exactly as the step before it left it.
+fn openThenCloseThenFree(gpa: Allocator) !void {
+    var machine = MarkStateMachine.init(gpa);
+    defer machine.deinit();
+
+    if (machine.markBegin(OpId.init(1, 0), MarkData.init("bold", .{ .bool_value = true }))) |_| {
+        if (machine.markEnd(OpId.init(2, 0))) |changed| {
+            try testing.expect(changed);
+            try expectMarks(machine.current(), &.{});
+            return;
+        } else |_| {
+            // **A refused close puts the mark back.** The value is still
+            // resolved and the mark is still open, so the fold that keeps
+            // going after a caught error still finds it.
+            try expectMarks(machine.current(), &.{
+                .{ .name = "bold", .value = .{ .bool_value = true } },
+            });
+            try testing.expectEqual(@as(usize, 1), machine.state.items.len);
+            return error.OutOfMemory;
+        }
+    } else |_| {
+        // **A refused open leaves nothing at all**: no open mark, and no
+        // resolved value with no mark behind it. The other order would leave
+        // the value, and every later end for that id would be dropped.
+        try testing.expectEqual(@as(usize, 0), machine.state.items.len);
+        try expectMarks(machine.current(), &.{});
+        return error.OutOfMemory;
+    }
+}
+
+test "a refused mark step leaves the state machine as the step before it left it" {
+    const gpa = testing.allocator;
+    // **The sweep is written out rather than run through
+    // `testing.checkAllAllocationFailures`.** That harness reports leaks, and
+    // a half-applied step leaks nothing: it is the state after the refusal
+    // that a caller reads next.
+    const needed = blk: {
+        var failing: testing.FailingAllocator = .init(gpa, .{});
+        try openThenCloseThenFree(failing.allocator());
+        break :blk failing.alloc_index;
+    };
+    for (0..needed) |fail_index| {
+        var failing: testing.FailingAllocator = .init(gpa, .{ .fail_index = fail_index });
+        try testing.expectError(error.OutOfMemory, openThenCloseThenFree(failing.allocator()));
+        // **Live bytes, and not `allocated_bytes`.** `FailingAllocator` never
+        // decrements `allocated_bytes` on a free, it adds to `freed_bytes`
+        // ([`std/testing/FailingAllocator.zig`](../../lib/std/testing/FailingAllocator.zig)),
+        // so the count of bytes still held is the difference.
+        try testing.expectEqual(@as(usize, 0), failing.allocated_bytes - failing.freed_bytes);
+    }
+}
+
+/// Strips the tombstones off a copy of a set and frees the result.
+fn stripThenFree(gpa: Allocator) !void {
+    const set: MarkSet = try MarkSet.fromPairs(gpa, &.{
+        .{ .name = "bold", .value = .{ .bool_value = true } },
+        .{ .name = "gone", .value = .null_value },
+    });
+    // **There is deliberately no `defer set.deinit()` here.** The receiver is
+    // consumed on both outcomes, so a refusal frees it too; adding the defer
+    // is the double free the contract rules out. A leak-failing allocator is
+    // what notices that the refusal released it.
+    var stripped = try set.withoutUnmarks();
+    defer stripped.deinit();
+    try expectMarks(&stripped, &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
+}
+
+test "withoutUnmarks frees the set it was given on the error path too" {
+    try testing.checkAllAllocationFailures(testing.allocator, stripThenFree, .{});
+}
+
+/// Records one per-mark flag, overwrites it, and frees the config.
+fn flagThenOverwriteThenFree(gpa: Allocator) !void {
+    var config = UpdateSpansConfig.init(gpa);
+    defer config.deinit();
+    if (config.setMarkExpand("bold", .before)) |_| {
+        if (config.setMarkExpand("bold", .after)) |_| {
+            try testing.expectEqual(ExpandMark.after, config.expandFor("bold"));
+            return;
+        } else |_| {
+            // **The flag the caller set first is still the one in force.** A
+            // refusal that took it with it would answer a retry with
+            // `ExpandMark.after` — the default — and write this mark the wrong
+            // way at both boundaries.
+            try testing.expectEqual(ExpandMark.before, config.expandFor("bold"));
+            return error.OutOfMemory;
+        }
+    } else |_| return error.OutOfMemory;
+}
+
+test "a refused per-mark flag leaves the flag that was already there" {
+    const gpa = testing.allocator;
+    const needed = blk: {
+        var failing: testing.FailingAllocator = .init(gpa, .{});
+        try flagThenOverwriteThenFree(failing.allocator());
+        break :blk failing.alloc_index;
+    };
+    for (0..needed) |fail_index| {
+        var failing: testing.FailingAllocator = .init(gpa, .{ .fail_index = fail_index });
+        try testing.expectError(error.OutOfMemory, flagThenOverwriteThenFree(failing.allocator()));
+        try testing.expectEqual(@as(usize, 0), failing.allocated_bytes - failing.freed_bytes);
     }
 }
 
@@ -1297,7 +1559,7 @@ const MarkFixture = struct {
 };
 
 fn markFixture(gpa: Allocator) !MarkFixture {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     errdefer doc.deinit();
     // A named actor, so a change hash does not come out of the allocator
     // (`std.testing.allocator` is the arbiter).
@@ -2059,7 +2321,9 @@ test "diff_marks: a mark with expand none stays where it is" {
     // `UpdateSpansConfig::default().with_default_expand(ExpandMark::None)`
     // (`diff_marks.rs`:910) — the default for **every** name, so this is the
     // config's [`default_expand`](UpdateSpansConfig) and not its map.
-    const config = UpdateSpansConfig.init(gpa).withDefaultExpand(.none);
+    var config = UpdateSpansConfig.init(gpa);
+    defer config.deinit();
+    _ = config.withDefaultExpand(.none);
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();

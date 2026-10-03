@@ -633,7 +633,25 @@ pub fn DiffItem(comptime O: type) type {
         map: maprange.MapDiffItem(O),
         /// A sequence element ([`listrange.ListDiffItem`](list_range.zig), `iter/doc.rs`:392`).
         list: listrange.ListDiffItem(O),
-        /// A text span ([`spans.SpanDiff`](spans.zig), `iter/doc.rs`:393`).
+        /// A text span ([`spans.SpanDiff`](spans.zig), `iter/doc.rs:393`).
+        ///
+        /// **The only arm of the three that owns anything, and so the only one
+        /// a caller has to give back.** The run's bytes and the exported mark
+        /// set come out of the allocator the walk was built with, and
+        /// [`SpanDiff.deinit`](spans.zig) returns them — which in a loop over
+        /// [`DiffIter.next`] reads
+        /// `switch (item.item) { .text => |*t| t.deinit(gpa), else => {} }`,
+        /// with `gpa` the walk's own [`DiffIter.gpa`]. **The `map` and `list`
+        /// arms own nothing**: their key, op id and value point into the op
+        /// set's string table and value column and stay valid until the next
+        /// mutation of the document, and releasing them would be wrong.
+        ///
+        /// **Detached is not the same as independent.** The span's *bytes* are
+        /// its own and outlive the walk; its mark *names* are the document's
+        /// interned strings and are not freed with it, and the block arm's
+        /// [`maprange.ExIdPromise`](map_range.zig) still holds the op set it
+        /// will resolve against. So a released span shortens nobody else's
+        /// life, and a retained one still does not outlive the document.
         text: spans.SpanDiff(O),
 
         /// The property this item sits at ([`DocDiffItem::prop`](../../github-automerge-automerge/rust/automerge/src/iter/doc.rs),
@@ -726,6 +744,9 @@ pub const ObjQueue = struct {
 
     /// Gives back the queue's own buffer. **The objects in it are values** —
     /// an id and an enum — and own nothing, so there is nothing else to free.
+    /// **The queue is unusable once this returns**: `self.* = undefined` is
+    /// the last line, so a second call reads undefined memory rather than
+    /// reaching an allocator that could diagnose the double free.
     pub fn deinit(self: *Self) void {
         self.items.deinit(self.gpa);
         self.* = undefined;
@@ -781,7 +802,13 @@ pub fn DiffIter(comptime O: type) type {
         /// makes the patches come out in id order.
         next_objs: ObjQueue,
         /// Where each nested object the diff surfaced lives
-        /// (`BTreeMap<ObjId, (Prop, ObjId)>`, `iter/doc.rs`:68`).
+        /// (`BTreeMap<ObjId, (Prop, ObjId)>`, `iter/doc.rs:68`).
+        ///
+        /// **The walk's own, and empty until an item names a nested object.**
+        /// [`log`](Self.log) **moves this field out to its caller and leaves
+        /// it empty**, so from that call on one allocation has exactly one
+        /// owner; a caller that drives [`next`](Self.next) instead finds the
+        /// map here.
         path_map: patches.PathMap = .{},
         /// The object walk, positioned just past the starting object's rows.
         obj_id_iter: ObjIdIter,
@@ -838,7 +865,17 @@ pub fn DiffIter(comptime O: type) type {
             };
         }
 
-        /// Gives back the span fold's buffers, the queue and the path map.
+        /// Gives back the span fold's buffers, the queue and **whatever path
+        /// map the walk still holds** — which is all of
+        /// [`path_map`](Self.path_map) unless [`log`](Self.log) has already
+        /// moved it out.
+        ///
+        /// **The walk is unusable once this returns**: `self.* = undefined` is
+        /// the last line, so a second call reads undefined memory rather than
+        /// reaching an allocator that could diagnose the double free.
+        /// **Everything the walk has already handed out belongs to the caller** —
+        /// a [`DocObjDiffItem`], text arm included, and a path map
+        /// [`log`](Self.log) returned — and none of it is touched here.
         pub fn deinit(self: *Self) void {
             self.span_iter.deinit();
             self.next_objs.deinit();
@@ -851,24 +888,63 @@ pub fn DiffIter(comptime O: type) type {
         /// ([`DiffIter::log`](../../github-automerge-automerge/rust/automerge/src/iter/doc.rs),
         /// `iter/doc.rs:79-92`).
         ///
-        /// **`sink` is a comptime parameter and not `&mut PatchLog`.** Upstream
-        /// names the concrete type because Rust's borrow checker is what
-        /// guarantees the log outlives the walk; here the caller's `var` does
-        /// the same job, and `anytype` is what lets one walk serve
-        /// `patches.PatchLog` and a test's recording sink with the same body —
-        /// the same reason [`batchmod.applyChangesBatchToSink`] takes its sink
-        /// that way.
+        /// `sink` is a runtime value whose inferred type is checked at comptime.
+        /// Its container must provide `putMap`, `incrementMap`, `flagConflict`,
+        /// `deleteMap`, `putSeq`, `insertAndMaybeExpose`, `incrementSeq`,
+        /// `deleteSeq`, `splice` and `mark`, with `PatchLog`'s parameter and
+        /// return types apart from the receiver. The receiver may be the
+        /// container value or its mutable or const pointer.
+        /// Argument slices are borrowed for each callback; copy them before
+        /// returning if the sink retains them. Callbacks return `void`, so
+        /// sink failures use the sink's own channel (`PatchLog.failed`).
+        /// A walk error may leave both the walk and sink progressed; the path
+        /// map stays owned by the walk on that path.
         ///
-        /// The returned [`patches.PathMap`] is upstream's second half of the
-        /// return value (`iter/doc.rs:92`). **Both of `diff`'s callers throw it
-        /// away** (`automerge.rs:1423`, `:1454`) — only the `pub(crate)`
-        /// `log_current_state` (`automerge.rs:1078`) feeds it to `path_hint`,
-        /// and the port's [`patches.PatchLog`] builds the same map lazily in
-        /// `getPathMap` when it needs one. It is returned rather than dropped
-        /// here because dropping it would make this walk lose an object whose
-        /// path a caller may need, and the port's [`DiffIter`] is the only
-        /// place that walks this far.
+        /// **The returned [`patches.PathMap`] is upstream's second half of the
+        /// return value (`iter/doc.rs:92`), and it is this walk's own — moved
+        /// out, not copied.** [`path_map`](Self.path_map) is emptied before
+        /// this returns, so from that call on one allocation has exactly one
+        /// owner: hand it to [`patches.PatchLog.pathHint`], which takes it over
+        /// and frees the log's previous map in its place, or free it with
+        /// [`patches.PathMap.deinit`] and this walk's [`gpa`](Self.gpa).
+        /// **Returning a copy is what would name one allocation twice** — this
+        /// walk's [`deinit`](Self.deinit) and the caller's would both free it —
+        /// and upstream's `log` returns a map it owns alone (`iter/doc.rs:91-92`).
+        ///
+        /// **A caller that throws the map away still has to free it**, as
+        /// upstream's two do (`automerge.rs:1423`, `:1454`): the walk no longer
+        /// holds it. [`Document.patchTo`](../../src/doc.zig) is that caller, and
+        /// the port's [`patches.PatchLog`] builds the same map lazily in
+        /// `getPathMap` when it needs one.
         pub fn log(self: *Self, sink: anytype) DiffError!patches.PathMap {
+            comptime {
+                const P = @TypeOf(sink);
+                const Sink = switch (@typeInfo(P)) {
+                    .pointer => |p| p.child,
+                    else => P,
+                };
+                switch (@typeInfo(Sink)) {
+                    .@"struct", .@"union", .@"enum", .@"opaque" => {},
+                    else => @compileError("DiffIter.log requires a sink container"),
+                }
+                for (.{ "putMap", "incrementMap", "flagConflict", "deleteMap", "putSeq", "insertAndMaybeExpose", "incrementSeq", "deleteSeq", "splice", "mark" }) |name| {
+                    if (!@hasDecl(Sink, name)) @compileError("DiffIter.log sink is missing " ++ name);
+                    const info = @typeInfo(@TypeOf(@field(Sink, name)));
+                    if (info != .@"fn") @compileError("DiffIter.log sink " ++ name ++ " must be a function");
+                    const got = info.@"fn";
+                    const want = @typeInfo(@TypeOf(@field(patches.PatchLog, name))).@"fn";
+                    if (got.is_generic or got.is_var_args or got.params.len != want.params.len or got.return_type != want.return_type) {
+                        @compileError("DiffIter.log sink " ++ name ++ " has an incompatible signature");
+                    }
+                    const receiver = got.params[0].type.?;
+                    if (receiver != Sink and receiver != *Sink and receiver != *const Sink) {
+                        @compileError("DiffIter.log sink " ++ name ++ " has an incompatible receiver");
+                    }
+                    for (got.params[1..], want.params[1..]) |actual, expected| {
+                        if (actual.type != expected.type) @compileError("DiffIter.log sink " ++ name ++ " has an incompatible parameter");
+                    }
+                }
+            }
             const enc = self.text_encoding;
             while (try self.next()) |got| {
                 // **`var`, because the text arm frees what it read.** The span
@@ -884,7 +960,13 @@ pub fn DiffIter(comptime O: type) type {
                     },
                 }
             }
-            return self.path_map;
+            // **Moved, and not copied.** `PathMap` holds its array by value, so
+            // returning the field unchanged would hand the caller a second name
+            // for one allocation — and `deinit` frees it. After this the walk
+            // holds nothing, and the caller owns the map.
+            const out = self.path_map;
+            self.path_map = .{};
+            return out;
         }
 
         /// The next changed property, or null at the end of the diff
@@ -896,6 +978,17 @@ pub fn DiffIter(comptime O: type) type {
         /// (`iter/doc.rs:309-314`): an object the queue names can turn out to
         /// hold nothing that changed, and `next_object` answers that with
         /// `Some(None)`, which is not the end of the walk.
+        ///
+        /// **A `.text` item is the caller's, and it is the only arm with
+        /// anything to release.** The span's bytes and its exported mark set
+        /// come from this walk's [`gpa`](Self.gpa) and nothing below here frees
+        /// them, so a caller driving this method owes
+        /// `switch (item.item) { .text => |*t| t.deinit(it.gpa), else => {} }`
+        /// for every item it takes — which is exactly what
+        /// [`log`](Self.log) does with its own. **The `map` and `list` arms own
+        /// nothing** and are not released; what they borrow from the document
+        /// lasts until the next mutation of it. [`DiffItem.text`] is the whole
+        /// of it.
         pub fn next(self: *Self) DiffError!?DocObjDiffItem(O) {
             if (try self.nextProp()) |item| return item;
             while (self.next_objs.popLowest()) |queued| {
@@ -938,10 +1031,22 @@ pub fn DiffIter(comptime O: type) type {
         fn nextObject(self: *Self, queued: MadeObj) DiffError!?DocObjDiffItem(O) {
             const rows = try self.obj_id_iter.ids.seekToValue(queued.obj);
             if (rows.start >= rows.end) return null;
-            const item: DiffItem(O) = switch (queued.typ) {
+            var item: DiffItem(O) = switch (queued.typ) {
                 .map => .{ .map = (try self.map_iter.shiftNext(rows)) orelse return null },
                 .list => .{ .list = (try self.list_iter.shiftNext(rows)) orelse return null },
                 .text => .{ .text = (try self.span_iter.shiftNext(rows)) orelse return null },
+            };
+            // **The queue append and the path-map insert can both fail, and
+            // this item is the only thing in the block that owns anything** —
+            // the same guard [`DocIterInternal.nextObject`] carries, so that
+            // "it either escapes or is released" is true of both walks and not
+            // of one. **It frees nothing on the only failure path there is
+            // today**: the one arm [`DiffItem.makeObj`] can name an object by
+            // is a block marker, and a block marker owns no bytes. It is here
+            // for a text arm that does own something.
+            errdefer switch (item) {
+                .text => |*t| t.deinit(self.gpa),
+                else => {},
             };
             self.obj = queued.obj;
             self.iter_type = queued.typ;
@@ -952,10 +1057,16 @@ pub fn DiffIter(comptime O: type) type {
         /// ([`DiffIter::next_prop`](../../github-automerge-automerge/rust/automerge/src/iter/doc.rs),
         /// `iter/doc.rs:149-161`).
         fn nextProp(self: *Self) DiffError!?DocObjDiffItem(O) {
-            const item: DiffItem(O) = switch (self.iter_type) {
+            var item: DiffItem(O) = switch (self.iter_type) {
                 .map => .{ .map = (try self.map_iter.next()) orelse return null },
                 .list => .{ .list = (try self.list_iter.next()) orelse return null },
                 .text => .{ .text = (try self.span_iter.next()) orelse return null },
+            };
+            // The same guard, and for the same reason, as
+            // [`nextObject`](Self.nextObject)'s.
+            errdefer switch (item) {
+                .text => |*t| t.deinit(self.gpa),
+                else => {},
             };
             return try self.processItem(item);
         }
@@ -1044,6 +1155,9 @@ pub fn DocItemInternal(comptime O: type) type {
 
         /// Gives back the run's bytes and its mark set, if this item is one.
         /// The map and list arms borrow and own nothing.
+        /// **The item is unusable once this returns**: `self.* = undefined` is
+        /// the last line, so a second call reads undefined memory rather than
+        /// reaching an allocator that could diagnose the double free.
         pub fn deinit(self: *Self, gpa: Allocator) void {
             switch (self.*) {
                 .text => |*t| t.deinit(gpa),
@@ -1111,6 +1225,9 @@ pub fn DocObjItemInternal(comptime O: type) type {
 
         /// Gives back the span this item read, if it is one. The map and list
         /// arms borrow the document and own nothing.
+        /// **The item is unusable once this returns**, as every other `deinit`
+        /// here is: `self.* = undefined` is the last line, and a second call
+        /// reads undefined memory rather than reaching an allocator.
         pub fn deinit(self: *Self, gpa: Allocator) void {
             self.item.deinit(gpa);
             self.* = undefined;
@@ -1169,7 +1286,11 @@ pub fn DocObjItem(comptime O: type) type {
         }
 
         /// Gives back the span this item carries, if it carries one. The map
-        /// and list arms borrow the document and own nothing.
+        /// and list arms borrow the document and own nothing. **The item is
+        /// unusable once this returns**: `self.* = undefined` is the last line,
+        /// so a second call reads undefined memory rather than reaching an
+        /// allocator — and the document is untouched, so a released span leaves
+        /// the mark names the next item borrows valid.
         pub fn deinit(self: *Self, gpa: Allocator) void {
             switch (self.item) {
                 .text => |*t| t.deinit(gpa),
@@ -1254,6 +1375,9 @@ pub fn DocIterInternal(comptime O: type) type {
 
         /// Gives back the spans fold's buffers and the queue. **The items
         /// already handed out are the caller's** and are not touched here.
+        /// **The walk is unusable once this returns**: `self.* = undefined` is
+        /// the last line, so a second call reads undefined memory rather than
+        /// reaching an allocator that could diagnose the double free.
         pub fn deinit(self: *Self) void {
             self.span_iter.deinit();
             self.next_objs.deinit();
@@ -1404,7 +1528,10 @@ pub fn DocIter(comptime O: type) type {
 
         /// Gives back the spans fold and the queue. **The items already handed
         /// out are the caller's**, and each is freed with
-        /// [`DocObjItem.deinit`](DocObjItem.deinit).
+        /// [`DocObjItem.deinit`](DocObjItem.deinit) and this walk's
+        /// [`gpa`](Self.gpa). **The walk is unusable once this returns**:
+        /// `self.* = undefined` is the last line, so a second call reads
+        /// undefined memory rather than reaching an allocator.
         pub fn deinit(self: *Self) void {
             self.inner.deinit();
             self.* = undefined;
@@ -2361,6 +2488,89 @@ test "the document diff reads the root's rows and then descends into each child,
         try testing.expect(it.path_map.get(list_one) != null);
         try testing.expect(it.path_map.get(list_two) != null);
     }
+}
+
+test "the diff walk hands its path map over, and the walk keeps nothing of it" {
+    const gpa = testing.allocator;
+    // **One child, and it is a map**, because `PathMap.put` is what grows the
+    // buffer: an empty map's `deinit` is a no-op, so a walk that surfaced no
+    // nested object would free nothing twice and pass against the defect.
+    const map_child = made(1, 0);
+    const doc = try Fixture.build(gpa, encoding, &.{actor_a}, &.{
+        row(opId(1, 0), .root, .{ .map = "m" }, false, .make_map, .null_value, null),
+        row(opId(2, 0), map_child, .{ .map = "z" }, false, .set, .{ .str = "two" }, null),
+    });
+    defer doc.destroy();
+    const handle: Doc(opmod.Op) = .init(&doc.set, encoding);
+
+    var sink: patches.PatchLog = .inactive(gpa);
+    defer sink.deinit();
+    var handed = blk: {
+        var it = try DiffIter(opmod.Op).init(gpa, &handle, .root, .map, .{ .current = null }, true);
+        defer it.deinit();
+        break :blk try it.log(&sink);
+    };
+    defer handed.deinit(gpa);
+
+    // The transferred map must remain readable after the walk is destroyed.
+    const at = handed.get(map_child) orelse return error.TestExpectedItem;
+    try testing.expect(at.parent.eql(.root));
+    try testing.expectEqualStrings("m", at.prop.key);
+}
+
+test "a text item the diff walk hands out is the caller's, and the caller's release is all of it" {
+    const gpa = testing.allocator;
+    // **A text child holding a block**, because those are the two arms
+    // `DiffItem.text` answers with and only one of them owns anything: the run
+    // is the span that carries bytes, and the block marker is the span that
+    // names an object. The root's own row is the `.map` arm, which owns
+    // nothing, so all three arms are driven here.
+    const text_child = made(1, 0);
+    const doc = try Fixture.build(gpa, encoding, &.{actor_a}, &.{
+        row(opId(1, 0), .root, .{ .map = "t" }, false, .make_text, .null_value, null),
+        row(opId(3, 0), text_child, head(), true, .set, .{ .str = "hi" }, null),
+        row(opId(4, 0), text_child, anchored(opId(3, 0)), true, .make_map, .null_value, null),
+    });
+    defer doc.destroy();
+    const handle: Doc(opmod.Op) = .init(&doc.set, encoding);
+
+    var it = try DiffIter(opmod.Op).init(gpa, &handle, .root, .map, .{ .current = null }, true);
+    defer it.deinit();
+
+    var runs: usize = 0;
+    var blocks: usize = 0;
+    var maps: usize = 0;
+    while (try it.next()) |got| {
+        // **`var`, because the text arm is released below** — the span owns
+        // its buffer and the walk allocated it, so the walk's `deinit` is not
+        // what gives it back.
+        var item = got;
+        switch (item.item) {
+            .text => |*t| {
+                defer t.deinit(gpa);
+                switch (t.span) {
+                    .text => |s| {
+                        runs += 1;
+                        // **Read before the release**: the bytes are the span's,
+                        // so this is the last moment they are readable.
+                        try testing.expectEqualStrings("hi", s.text);
+                    },
+                    .obj => {
+                        blocks += 1;
+                    },
+                }
+            },
+            else => {
+                maps += 1;
+            },
+        }
+    }
+
+    // **All three arms were driven**, so the run above released something and
+    // the two that own nothing were not released.
+    try testing.expectEqual(@as(usize, 1), maps);
+    try testing.expectEqual(@as(usize, 1), runs);
+    try testing.expectEqual(@as(usize, 1), blocks);
 }
 
 test "the recursive walk reads the root's rows, then every child, parents before children" {

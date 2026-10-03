@@ -156,6 +156,12 @@ const VisibleSkipper = column.BoolColumnSkipper(column.Bool);
 /// (`columns.rs:314`): a load rebuilds it from the op stream
 /// (`index.rs:220-231`), which is why the two flavours can be held to
 /// answering the same thing.
+///
+/// **It is not a [`column.Shiftable`] cursor.** It carries `next` and
+/// `shiftNext` and none of the other six the kernel requires
+/// (`column.zig:6129-6142`): a skip iterator of *distances* has no position to
+/// advance to or seek to. [`VisIter`], the wrapper that holds this walk or the
+/// scan one, is not a cursor either, for the same reason.
 pub fn IndexedVisIter(comptime O: type) type {
     return struct {
         const Self = @This();
@@ -163,6 +169,7 @@ pub fn IndexedVisIter(comptime O: type) type {
         /// The column set the walk reads.
         pub const Ops = opcols.Columns(O);
 
+        /// The walk itself: a cursor over the column and three numbers.
         iter: VisibleSkipper,
 
         /// A walk over the visible rows of `rows` (`IndexedVisIter::new`,
@@ -231,6 +238,12 @@ pub fn ScanVisIter(comptime O: type) type {
         /// The row's successors, and their increments (`visible.rs:108`).
         succ: op_iter.SuccIterIter,
         /// The clock the read is scoped to, borrowed from the caller.
+        ///
+        /// **`Clock` is stored by value and its slots are the caller's.** The
+        /// copy shares the one allocation [`Clock.init`](../../src/clock.zig)
+        /// and every row's visibility is judged against it, so the clock must
+        /// outlive this walk. That obligation is what "borrowed from the
+        /// caller" means here, and nothing in this type pays it.
         clock: Clock,
 
         /// A walk over the rows of `rows`, scoped to `clock`
@@ -381,6 +394,13 @@ pub fn ScanVisIter(comptime O: type) type {
 /// Upstream boxes the scan variant (`visible.rs:46`); the port's union is
 /// already inline, and [`ScanVisIter`] is three column cursors and a
 /// `Clock` value, so there is nothing to box and nothing to allocate.
+///
+/// **The union is not a [`column.Shiftable`] cursor either.** It carries
+/// `next` and `shiftNext` and none of the other six the kernel requires
+/// (`column.zig:6129-6142`), so a consumer cannot reposition it the way its
+/// own [`Scan`] arm can. [`ScanVisIter`] carries the full kernel because it
+/// is a multi-column *row* cursor, while this is a wrapper over a skip
+/// iterator, whose unit is a distance rather than a row.
 pub fn VisIter(comptime O: type) type {
     return struct {
         const Self = @This();
@@ -463,6 +483,12 @@ pub fn VisibleOpIter(comptime I: type) type {
         /// The clock the read is scoped to, borrowed from the caller. Null
         /// means "the present", and it is the unscoped answer, not an empty
         /// one: [`op.Op.scopeToClock`] documents why.
+        ///
+        /// **`Clock` is stored by value and its slots are the caller's.** The
+        /// copy shares the one allocation [`Clock.init`](../../src/clock.zig)
+        /// and [`next`] reads it on every row, so the clock must outlive this
+        /// filter. This type owns nothing and declares no `deinit`: the walk it
+        /// holds is the caller's, and its teardown is that walk's own.
         clock: ?Clock,
         /// The walk this filters.
         iter: I,

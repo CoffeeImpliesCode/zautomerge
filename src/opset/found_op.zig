@@ -51,9 +51,17 @@
 //!
 //! [`OpsFoundIter`] holds a walk, a clock and a `null` group
 //! (`found_op.rs:34-42`). The first group is built by the first `next` and it
-//! too allocates nothing; only a row that survives both filters allocates, in
-//! `ops`. `OpsFound` therefore carries the allocator, and `deinit` gives the
-//! bytes back.
+//! too allocates nothing. Only a row that survives both filters allocates, in
+//! `ops`.
+//!
+//! # The group leaves the walk, and the allocator goes with it
+//!
+//! [`OpsFound`] holds no allocator. Its `init` takes one so a caller never has
+//! to know that ([`OpsFound.init`]), and [`OpsFound.deinit`] takes it back,
+//! because a group is moved out of [`OpsFoundIter.next`] rather than lent.
+//! **Each group `next` returns is the caller's**, freed with the allocator
+//! [`OpsFoundIter.init`] was given, and [`OpsFoundIter.deinit`] frees only
+//! the group still being collected.
 
 const std = @import("std");
 const err = @import("../error.zig");
@@ -99,6 +107,10 @@ pub const OpsFound = struct {
     index: usize,
     /// The rows of the register that survived both filters, in row order — so
     /// ascending in op id, and the first is the winner.
+    ///
+    /// This list is the group's one allocation. A group a caller receives from
+    /// [`OpsFoundIter.next`] carries it out, and [`deinit`] is what gives the
+    /// bytes back.
     ops: std.ArrayList(Op),
     /// One past the register's last row, including the rows the filters
     /// dropped (`op_set2/op_set.rs:1459`).
@@ -116,6 +128,10 @@ pub const OpsFound = struct {
     }
 
     /// Frees `ops` and nothing else: the rows themselves own nothing.
+    ///
+    /// Once only, and on the one owner of the group. The free poisons the
+    /// receiver, so a second call reads undefined storage, and two copies of
+    /// one group freed through both free its buffer twice.
     pub fn deinit(self: *OpsFound, gpa: Allocator) void {
         self.ops.deinit(gpa);
         self.* = undefined;
@@ -208,6 +224,18 @@ pub const OpsFound = struct {
 /// (`op_set2/op_set/op_query.rs:43`) — has no answer for it. Upstream agrees:
 /// the `OpQueryTerm` impls are for `OpIter`, `SkipIter`, `FixCounters`,
 /// `MarkIter`, `NoMarkIter` and `VisibleOpIter`, and this is not one of them.
+///
+/// # Repositioning does not reset the group
+///
+/// `found`, `last_key` and `start_pos` are written by [`next`] and by nothing
+/// else. Every repositioning method here — [`setMax`], [`advanceTo`],
+/// [`advanceBy`], [`shift`], [`shiftNext`] and [`seekTo`] — moves the inner
+/// walk and leaves a half-collected group standing. The next [`next`] then
+/// keeps appending into that group while `start_pos` still names the row it
+/// opened on, so the group's [`OpsFound.range`] and [`OpsFound.end_pos`] span
+/// rows the walk stepped over and never entered [`OpsFound.ops`]. A group is
+/// not a row cursor and cannot be rewound, so a caller that repositions
+/// part-way through a register starts a new iterator.
 pub fn OpsFoundIter(comptime I: type) type {
     return struct {
         const Self = @This();
@@ -221,6 +249,13 @@ pub fn OpsFoundIter(comptime I: type) type {
         start_pos: usize,
         /// The clock rows are filtered against, or null for the document's
         /// current state (`found_op.rs:28`).
+        ///
+        /// **`Clock` is stored by value and its slots are the caller's.** The
+        /// copy shares the one allocation [`Clock.init`](../../src/clock.zig)
+        /// made, and [`next`] reads it on every row through
+        /// [`Op.scopeToClock`], so the clock must outlive this walk. Null means
+        /// the present rather than an empty clock, as
+        /// [`Op.scopeToClock`] documents.
         clock: ?Clock,
         /// The register of the row just seen (`last_key`, `found_op.rs:29`).
         last_key: ?KeyRef,
@@ -233,6 +268,10 @@ pub fn OpsFoundIter(comptime I: type) type {
         /// A grouper over `iter`, filtering against `c` (`OpsFoundIter::new`,
         /// `found_op.rs:34-42`). Allocates nothing: the walk is the caller's
         /// and the first group is built by the first `next` rather than here.
+        ///
+        /// `gpa` is the allocator every group this walk builds is allocated
+        /// from and the one the caller frees each of them with. It is stored
+        /// here, which is why [`deinit`] is called with nothing.
         pub fn init(gpa: Allocator, iter: I, c: ?Clock) Self {
             return .{
                 .gpa = gpa,
@@ -245,6 +284,11 @@ pub fn OpsFoundIter(comptime I: type) type {
         }
 
         /// Frees the group still being collected, and nothing else.
+        ///
+        /// A group [`next`] has already handed back belongs to that caller.
+        /// Calling this twice on one walk is harmless — `found` is set to null
+        /// — but two copies of a walk that has read rows share one group, and
+        /// only one of them may free it.
         pub fn deinit(self: *Self) void {
             if (self.found) |*group| group.deinit(self.gpa);
             self.found = null;
@@ -252,6 +296,11 @@ pub fn OpsFoundIter(comptime I: type) type {
 
         /// The next register that has a row left in it, or null at the end of
         /// the walk (`next`, `found_op.rs:48-76`).
+        ///
+        /// **The group handed back is the caller's**, moved out of this walk
+        /// rather than borrowed: it owns [`OpsFound.ops`], and the caller
+        /// frees it with the allocator this walk was built with. The walk
+        /// carries on with the register after it.
         ///
         /// A register whose rows were all filtered out is dropped rather than
         /// handed back empty, so a `null` is always the end of the walk (the
@@ -315,23 +364,35 @@ pub fn OpsFoundIter(comptime I: type) type {
         }
 
         /// Truncates the walk at `at` (`OpIter.setMax`).
+        ///
+        /// The group being collected is not reset: see the type documentation's
+        /// rule for repositioning.
         pub fn setMax(self: *Self, at: usize) void {
             self.iter.setMax(at);
         }
 
         /// Advances so the next `next` is the row at `target`
         /// (`OpIter.advanceTo`).
+        ///
+        /// The group being collected is not reset: see the type documentation's
+        /// rule for repositioning.
         pub fn advanceTo(self: *Self, target: usize) ParseError!void {
             return self.iter.advanceTo(target);
         }
 
         /// Advances past `amount` rows (`OpIter.advanceBy`).
+        ///
+        /// The group being collected is not reset: see the type documentation's
+        /// rule for repositioning.
         pub fn advanceBy(self: *Self, amount: usize) ParseError!void {
             return self.iter.advanceBy(amount);
         }
 
         /// Moves the walk's window to `rows` — the window only, not the
         /// position (`OpIter.shift`).
+        ///
+        /// The group being collected is not reset: see the type documentation's
+        /// rule for repositioning.
         pub fn shift(self: *Self, rows: RowRange) void {
             self.iter.shift(rows);
         }
@@ -348,6 +409,9 @@ pub fn OpsFoundIter(comptime I: type) type {
 
         /// Consumes through `at` and reads the row there, or null when `at` is
         /// behind the walk (`OpIter.seekTo`).
+        ///
+        /// The group being collected is not reset: see the type documentation's
+        /// rule for repositioning.
         pub fn seekTo(self: *Self, at: usize) ReadOpError!?Op {
             return self.iter.seekTo(at);
         }

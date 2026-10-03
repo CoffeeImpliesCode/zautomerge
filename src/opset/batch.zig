@@ -74,7 +74,7 @@
 const std = @import("std");
 const err = @import("../error.zig");
 const types = @import("../types.zig");
-const value = @import("../value.zig");
+const valuemod = @import("../value.zig");
 const marksmod = @import("../marks.zig");
 const column = @import("../hexane/column.zig");
 const changerec = @import("../change.zig");
@@ -110,7 +110,7 @@ const ObjType = types.ObjType;
 const Op = opmod.Op;
 const OpId = types.OpId;
 const OpRange = opmod.OpRange;
-const OpType = value.OpType;
+const OpType = valuemod.OpType;
 const ParseError = err.ParseError;
 const Prop = types.Prop;
 const PropRef = optypes.PropRef;
@@ -263,11 +263,41 @@ pub const log_decls = [_][]const u8{
     "migrateActors",
 };
 
-/// Fails to compile unless `L` carries every declaration in [`log_decls`].
+/// Each sink method's parameters, in order, after the receiver.
+///
+/// The guard checks arity and parameter types in order. It cannot distinguish
+/// two parameters with the same type; their meaning is on `NullLog`'s methods.
+///
+/// The receiver is not here: it is the sink's own type, and a sink is free to
+/// be a pointer to whatever holds it.
+const log_sig_params = .{
+    .insert = [_]type{ ObjId, usize, PatchValue, OpId, bool },
+    .putMap = [_]type{ ObjId, []const u8, PatchValue, OpId, bool, bool },
+    .putSeq = [_]type{ ObjId, usize, PatchValue, OpId, bool, bool },
+    .deleteMap = [_]type{ ObjId, []const u8 },
+    .deleteSeq = [_]type{ ObjId, usize, usize },
+    .flagConflict = [_]type{ ObjId, Prop },
+    .incrementMap = [_]type{ ObjId, []const u8, i64, OpId },
+    .incrementSeq = [_]type{ ObjId, usize, i64, OpId },
+    .splice = [_]type{ ObjId, usize, []const u8, ?*const MarkSet },
+    .replaceSeq = [_]type{
+        ObjId, usize, PatchValue,   PatchValue,   OpId,
+        bool,  bool,  SequenceType, TextEncoding, ?*const MarkSet,
+    },
+    .mark = [_]type{ ObjId, usize, usize, *const MarkSet },
+    .migrateActors = [_]type{[]const ActorId},
+};
+
+/// Fails to compile unless `L` carries every declaration in [`log_decls`] with
+/// the parameters [`log_sig_params`] gives it.
 ///
 /// The whole of the sink contract, and the reason it is a comptime check
 /// rather than a trait: every call site in this file resolves at comptime and
 /// inlines, so a [`NullLog`] merge has no indirect calls in it at all.
+///
+/// Eleven methods return `void`. `migrateActors` returns an error union with
+/// a `void` payload; its errors must be compatible with the calling operation.
+/// The call site checks that error-set compatibility.
 ///
 /// **A sink method that takes a mark set is handed a borrowed one and must copy
 /// whatever it keeps.** [`ValueState.mapFlush`] and
@@ -280,46 +310,196 @@ pub fn assertLog(comptime L: type) void {
             @compileError("patch sink " ++ @typeName(L) ++ " has no " ++ name ++
                 "; the sink op_set2/change/batch.rs:665-832 writes to is declared in log_decls");
         }
+        if (comptime !sameParams(L, name)) {
+            @compileError("patch sink " ++ @typeName(L) ++ " declares " ++ name ++
+                " with parameters the sink contract does not give it; the order and" ++
+                " types are in log_sig_params." ++ name);
+        }
     }
+}
+
+/// Whether `L`'s `name` takes the parameters [`log_sig_params`] gives it,
+/// receiver excluded.
+///
+/// Compares receiver, parameter, and return types. Generic and variadic
+/// methods do not satisfy this fixed sink protocol.
+fn sameParams(comptime L: type, comptime name: []const u8) bool {
+    const have = switch (@typeInfo(@TypeOf(@field(L, name)))) {
+        .@"fn" => |f| f,
+        else => return false,
+    };
+    const want = @field(log_sig_params, name);
+    if (have.is_generic or have.is_var_args or have.params.len != want.len + 1) return false;
+    const receiver = have.params[0].type orelse return false;
+    if (receiver != *L and receiver != *const L) return false;
+    inline for (want, 0..) |w, i| {
+        const t = have.params[i + 1].type orelse return false;
+        if (t != w) return false;
+    }
+    const result = have.return_type orelse return false;
+    if (std.mem.eql(u8, name, "migrateActors")) {
+        return switch (@typeInfo(result)) {
+            .error_union => |eu| eu.payload == void,
+            else => false,
+        };
+    }
+    return result == void;
 }
 
 /// The sink a merge nobody is watching writes to
 /// ([`PatchLog::inactive`](../github-automerge-automerge/rust/automerge/src/patches/patch_log.rs):245-247).
 ///
-/// **A deviation, and a deliberate one.** Upstream's inactive log still records
-/// every event and drops them at `make_patches`, so it costs one `Vec` push per
-/// patch. Here there is nothing to drop them *into* — the port has no
-/// `PatchLog` — so a null sink discards at the call and a merge nobody is
-/// diffing allocates nothing for patches at all. The observable result for the
-/// caller is the same, and a caller that wants the events writes a sink that
-/// keeps them.
+/// Discards patch events when the consumer does not request them.
+/// Use `PatchLog` when the consumer needs an owned patch stream.
+///
+/// **The twelve methods below are the published statement of the sink
+/// signature**, and each one's parameters are named and explained because a
+/// sink author has nothing else to read. [`assertLog`] checks a sink against
+/// them.
 pub const NullLog = struct {
     const Self = @This();
 
-    pub fn insert(_: *Self, _: ObjId, _: usize, _: PatchValue, _: OpId, _: bool) void {}
-    pub fn putMap(_: *Self, _: ObjId, _: []const u8, _: PatchValue, _: OpId, _: bool, _: bool) void {}
-    pub fn putSeq(_: *Self, _: ObjId, _: usize, _: PatchValue, _: OpId, _: bool, _: bool) void {}
-    pub fn deleteMap(_: *Self, _: ObjId, _: []const u8) void {}
-    pub fn deleteSeq(_: *Self, _: ObjId, _: usize, _: usize) void {}
-    pub fn flagConflict(_: *Self, _: ObjId, _: Prop) void {}
-    pub fn incrementMap(_: *Self, _: ObjId, _: []const u8, _: i64, _: OpId) void {}
-    pub fn incrementSeq(_: *Self, _: ObjId, _: usize, _: i64, _: OpId) void {}
-    pub fn splice(_: *Self, _: ObjId, _: usize, _: []const u8, _: ?*const MarkSet) void {}
+    /// One or more elements inserted into the sequence `obj` at `index`.
+    ///
+    /// `value` is the whole insertion: a list element, or — in the text arm at
+    /// `batch.rs:712-717` — the scalar a text object receives. `id` is the op
+    /// that made it, which is what a sink re-keys when actors migrate, and
+    /// `conflict` says the register it landed in is already in conflict.
+    pub fn insert(
+        _: *Self,
+        obj: ObjId,
+        index: usize,
+        value: PatchValue,
+        id: OpId,
+        conflict: bool,
+    ) void {
+        _ = .{ obj, index, value, id, conflict };
+    }
+
+    /// A key put in the map `obj`.
+    ///
+    /// **`conflict` and `expose` are different things and the order is
+    /// upstream's** (`patch_log.rs:365-373`). `conflict` is the value's own
+    /// flag: the register is in conflict. `expose` says the put *revealed* a
+    /// losing object — a delete in the same batch uncovered it
+    /// (`batch.rs:808-809`) — which is what queues that object's content for
+    /// the consumer (`patch_log.rs:374-376`).
+    pub fn putMap(
+        _: *Self,
+        obj: ObjId,
+        key: []const u8,
+        value: PatchValue,
+        id: OpId,
+        conflict: bool,
+        expose: bool,
+    ) void {
+        _ = .{ obj, key, value, id, conflict, expose };
+    }
+
+    /// An index put in the sequence `obj`, with the same two flags as
+    /// [`putMap`](NullLog.putMap) and in the same order
+    /// (`patch_log.rs:388-409`).
+    pub fn putSeq(
+        _: *Self,
+        obj: ObjId,
+        index: usize,
+        value: PatchValue,
+        id: OpId,
+        conflict: bool,
+        expose: bool,
+    ) void {
+        _ = .{ obj, index, value, id, conflict, expose };
+    }
+
+    /// The key `key` was deleted from the map `obj` (`patch_log.rs:309-311`).
+    pub fn deleteMap(_: *Self, obj: ObjId, key: []const u8) void {
+        _ = .{ obj, key };
+    }
+
+    /// `num` units of the sequence `obj` were deleted, starting at `index`.
+    ///
+    /// **`num` is a width, not a row count.** One text element can be wider
+    /// than one unit in the object's encoding, so a merge deletes
+    /// `value.width(seq_type, text_encoding)` and says so here
+    /// (`batch.rs:777-779`; `patch_log.rs:305-307`). The two `usize` are the
+    /// index and then the width, in that order.
+    pub fn deleteSeq(_: *Self, obj: ObjId, index: usize, num: usize) void {
+        _ = .{ obj, index, num };
+    }
+
+    /// The register `prop` names in `obj` is in conflict. `prop` is a key or
+    /// an index, which is what tells a map key from a sequence element
+    /// (`batch.rs:918`; `patch_log.rs:335-340`).
+    pub fn flagConflict(_: *Self, obj: ObjId, prop: Prop) void {
+        _ = .{ obj, prop };
+    }
+
+    /// The counter at `key` in `obj` moved by `n`, which may be negative. A
+    /// merge reports only a change that is not zero (`batch.rs:823-827`).
+    pub fn incrementMap(_: *Self, obj: ObjId, key: []const u8, n: i64, id: OpId) void {
+        _ = .{ obj, key, n, id };
+    }
+
+    /// The counter at `index` in `obj` moved by `n`, which may be negative
+    /// (`batch.rs:684-687`).
+    pub fn incrementSeq(_: *Self, obj: ObjId, index: usize, n: i64, id: OpId) void {
+        _ = .{ obj, index, n, id };
+    }
+
+    /// `text` was inserted into `obj` at `index`, carrying `marks`.
+    ///
+    /// **`marks` is borrowed and is freed as soon as this returns**, so a sink
+    /// that keeps it copies it; null means nothing is marked there. The same
+    /// rule is on [`mark`](NullLog.mark) and on the last argument of
+    /// [`replaceSeq`](NullLog.replaceSeq).
+    pub fn splice(_: *Self, obj: ObjId, index: usize, text: []const u8, marks: ?*const MarkSet) void {
+        _ = .{ obj, index, text, marks };
+    }
+
+    /// One element of `obj` at `index` was replaced by another.
+    ///
+    /// `old_value` is what was there, and a sink needs it because a text
+    /// replacement is a delete of the old width followed by an insert
+    /// (`patch_log.rs:425-435`) — which is also what `seq_type` and
+    /// `text_encoding` are for: they measure `old_value`
+    /// (`patch_log.rs:430`). `marks` is borrowed, as on
+    /// [`splice`](NullLog.splice).
     pub fn replaceSeq(
         _: *Self,
-        _: ObjId,
-        _: usize,
-        _: PatchValue,
-        _: PatchValue,
-        _: OpId,
-        _: bool,
-        _: bool,
-        _: SequenceType,
-        _: TextEncoding,
-        _: ?*const MarkSet,
-    ) void {}
-    pub fn mark(_: *Self, _: ObjId, _: usize, _: usize, _: *const MarkSet) void {}
-    pub fn migrateActors(_: *Self, _: []const ActorId) Error!void {}
+        obj: ObjId,
+        index: usize,
+        old_value: PatchValue,
+        value: PatchValue,
+        id: OpId,
+        conflict: bool,
+        expose: bool,
+        seq_type: SequenceType,
+        text_encoding: TextEncoding,
+        marks: ?*const MarkSet,
+    ) void {
+        _ = .{ obj, index, old_value, value, id, conflict, expose, seq_type, text_encoding, marks };
+    }
+
+    /// The marks over `len` units of `obj` from `index` are `marks`.
+    ///
+    /// **The two `usize` are the index and then the length**, in the object's
+    /// own units. The types cannot distinguish this pair's order.
+    /// `marks` is borrowed and is freed as soon as this returns.
+    pub fn mark(_: *Self, obj: ObjId, index: usize, len: usize, marks: *const MarkSet) void {
+        _ = .{ obj, index, len, marks };
+    }
+
+    /// The merge interned actors, so every id this sink stored has to be
+    /// re-keyed to `others`, the op set's actor table.
+    ///
+    /// Borrowed, and the **only** one of the twelve that can fail: a sink
+    /// holding ids minted against a different actor table answers
+    /// `error.PatchLogMismatch` (`patch_log.rs:634-658`, whose one `Err` is at
+    /// `:655`). Every other method
+    /// answers `void`.
+    pub fn migrateActors(_: *Self, others: []const ActorId) Error!void {
+        _ = .{others};
+    }
 };
 
 // ── Marks in flight ────────────────────────────────────────────────────────
@@ -348,6 +528,12 @@ pub const RichTextDiff = struct {
         };
     }
 
+    /// Frees both folds' arrays and poisons the receiver, so a second call
+    /// reads undefined memory rather than double-freeing.
+    ///
+    /// A [`MarkDiff`] taken from this borrows it, so anything that must
+    /// outlive the diff has to be exported first; that is what
+    /// [`MarkDiff.exportSet`] is for.
     pub fn deinit(self: *RichTextDiff) void {
         self.before.deinit();
         self.after.deinit();
@@ -473,11 +659,10 @@ pub const MarkDiff = union(enum) {
 /// One side's value for one register, and what happened to it
 /// ([`OpValue`], `batch.rs:524-532`).
 ///
-/// `deleted` and `expose` are **two different facts and both are kept**:
-/// `deleted` is that an op overwrote the value, and `expose` is that a *delete*
-/// did so while the value was still showing, which is what makes a text patch a
-/// replace rather than a delete. Collapsing them loses the old value's text,
-/// which is exactly what a `replace_seq` has to name.
+/// `deleted` says the batch overwrote this row; `expose` says a surviving
+/// value must be re-emitted after a conflict was deleted. A text exposure
+/// replaces the pre-batch rendered winner, which may be the survivor itself.
+/// Keeping that payload separately lets `replace_seq` remove its full width.
 pub const OpValue = struct {
     /// The operation that put it, which is what the conflict rules compare.
     id: OpId,
@@ -487,10 +672,10 @@ pub const OpValue = struct {
     deleted: bool,
     /// Whether a visible op from the other side already held this register.
     conflict: bool,
-    /// Whether a delete removed it while it was still showing.
+    /// Whether a surviving value must be re-emitted after a delete.
     expose: bool,
-    /// The value `expose` replaced, which a text replace names as the text it
-    /// replaces (`batch.rs:759-763`).
+    /// The pre-batch rendered winner, required whenever `expose` is true
+    /// (`batch.rs:759-763`).
     replaced: ?PatchValue,
 };
 
@@ -522,8 +707,8 @@ pub const OpValueOption = struct {
         }
     }
 
-    /// Records that a delete removed this value, keeping what it was so a text
-    /// replace can name it ([`OpValueOption::expose`](batch.rs):550-555).
+    /// Records an exposure together with the value its replacement removes
+    /// ([`OpValueOption::expose`](batch.rs):550-555).
     pub fn expose(self: *OpValueOption, replaced: PatchValue) void {
         const v = &(self.item orelse return);
         v.expose = true;
@@ -557,9 +742,15 @@ pub const OpValueOption = struct {
             .value = v,
             .deleted = deleted,
             .conflict = was_conflict,
-            .expose = was_expose,
+            .expose = false,
             .replaced = null,
         };
+        // The deleted→surviving arm also exposes (`batch.rs:562`), but
+        // upstream leaves its replacement empty (`:569`) while the text
+        // flush requires one (`:759-774`). This later survivor was already
+        // the pre-batch winner, so re-emit it over its own full width.
+        // Reusing expose keeps the flag and replacement payload together.
+        if (was_expose) self.expose(v);
     }
 
     /// Whether this side had nothing here
@@ -644,6 +835,12 @@ pub fn ValueState(comptime L: type) type {
             };
         }
 
+        /// Frees the two mark folds and poisons the receiver, so a second call
+        /// is a use-after-free rather than a double free.
+        ///
+        /// The two [`OpValueOption`]s hold no allocations of their own — the
+        /// values they carry are borrows of the rows being walked — so this is
+        /// the mark folds and nothing else.
         pub fn deinit(self: *Self) void {
             self.marks.deinit();
             self.* = undefined;
@@ -801,10 +998,6 @@ pub fn ValueState(comptime L: type) type {
             change: OpValueOption,
             log: *L,
         ) WalkError!void {
-            // **Lazily exported, and that is the point**: three of the nine
-            // arms need no marks, and `MarkDiff.export` allocates.
-            var marks: ?MarkSet = null;
-            defer if (marks) |*m| m.deinit();
             const d = doc.item;
             const c = change.item;
             if (c) |cv| {
@@ -815,8 +1008,7 @@ pub fn ValueState(comptime L: type) type {
                     if (cv.value.isObject()) {
                         log.insert(self.obj, index, cv.value, cv.id, cv.conflict);
                     } else {
-                        marks = try self.marks.current().exportSet(self.gpa);
-                        log.splice(self.obj, index, cv.value.asStr(), marksPtr(marks));
+                        log.splice(self.obj, index, cv.value.asStr(), self.marks.after.current());
                     }
                     return;
                 };
@@ -825,14 +1017,12 @@ pub fn ValueState(comptime L: type) type {
                     // render as more than one unit, so the patch is a delete
                     // and an insert. This arm is **before** the equal-id and
                     // greater-id arms on purpose (`batch.rs:720-737`).
-                    marks = try self.marks.current().exportSet(self.gpa);
-                    self.replaceSeq(log, index, dv.value, cv, marks, false);
+                    self.replaceSeq(log, index, dv.value, cv, cv.conflict, false);
                     return;
                 }
                 if (dv.id.eql(cv.id)) return; // counter increments change no text
                 if (cv.id.order(dv.id) == .gt) {
-                    marks = try self.marks.current().exportSet(self.gpa);
-                    self.replaceSeq(log, index, dv.value, cv, marks, false);
+                    self.replaceSeq(log, index, dv.value, cv, !dv.deleted or cv.conflict, false);
                     return;
                 }
                 if (!dv.conflict) log.flagConflict(self.obj, .{ .index = index });
@@ -841,29 +1031,33 @@ pub fn ValueState(comptime L: type) type {
             const dv = d orelse return;
             if (dv.expose) {
                 const replaced = dv.replaced orelse return error.Invariant; // :763
-                marks = try self.marks.current().exportSet(self.gpa);
-                self.replaceSeq(log, index, replaced, dv, marks, true);
+                self.replaceSeq(log, index, replaced, dv, dv.conflict, true);
                 return;
             }
             if (dv.deleted) {
                 log.deleteSeq(self.obj, index, dv.value.width(self.seq_type, self.text_encoding));
                 return;
             }
-            marks = try self.marks.current().exportSet(self.gpa);
+            var marks = try self.marks.current().exportSet(self.gpa);
+            defer if (marks) |*m| m.deinit();
             if (marks) |*m| {
                 log.mark(self.obj, index, dv.value.width(self.seq_type, self.text_encoding), m);
             }
         }
 
-        /// One `replace_seq` call, so the eleven arguments are written once
-        /// rather than four times.
+        /// The shared replacement sink call for the three text transition arms.
+        ///
+        /// Replacement deletes before inserting (`patch_log.rs:430-434`), so
+        /// the inserted run needs all after-marks, not just the mark delta.
+        /// This is MarkDiff's insertion rule (`spans.rs:316-323`), also used
+        /// by upstream's text insert walk (`batch.rs:229-242`).
         fn replaceSeq(
             self: *Self,
             log: *L,
             index: usize,
             old_value: PatchValue,
             new: OpValue,
-            marks: ?MarkSet,
+            conflict: bool,
             expose: bool,
         ) void {
             log.replaceSeq(
@@ -872,11 +1066,11 @@ pub fn ValueState(comptime L: type) type {
                 old_value,
                 new.value,
                 new.id,
-                !new.deleted or new.conflict,
+                conflict,
                 expose,
                 self.seq_type,
                 self.text_encoding,
-                marksPtr(marks),
+                self.marks.after.current(),
             );
         }
     };
@@ -992,7 +1186,7 @@ pub fn hydrateChangeValueFixCounters(op: ChangeOp) InternalError!PatchValue {
 /// A row's action and value combined, for the mark fold
 /// ([`Op::action`](../github-automerge-automerge/rust/automerge/src/op_set2/op.rs):1118-1120).
 fn opTypeOf(op: Op) ParseError!OpType {
-    return value.opTypeFromActionAndValue(op.action(), op.value(), op.markName(), op.expand());
+    return valuemod.opTypeFromActionAndValue(op.action(), op.value(), op.markName(), op.expand());
 }
 
 /// Whether `op` overwrites `id`
@@ -1763,6 +1957,14 @@ pub fn MapWalker(comptime L: type) type {
             return self;
         }
 
+        /// Frees the [`ValueState`] this walk accumulated and poisons the
+        /// receiver, so a second call is a use-after-free rather than a double
+        /// free.
+        ///
+        /// **Flush first if the last register matters.** Nothing here flushes:
+        /// a walk that stops mid-register has a [`ValueState`] holding a value
+        /// no patch has been emitted for, and `deinit` throws it away. That is
+        /// the point of the boundary-triggered flushes the module describes.
         pub fn deinit(self: *Self) void {
             self.value.deinit();
             self.* = undefined;
@@ -1891,6 +2093,15 @@ pub fn BatchApply(comptime L: type) type {
             return .{ .gpa = gpa, .ops = ops };
         }
 
+        /// Frees the successor cache and the object-span list and poisons the
+        /// receiver, so a second call is a use-after-free rather than a double
+        /// free.
+        ///
+        /// **The decoded ops are the caller's.** `ops` was handed to
+        /// [`BatchApply.init`] and is not freed here
+        /// ([`BatchApply.orderOpsForDoc`] mutates it in place and the caller
+        /// releases it), because the same slice is walked again by
+        /// [`applyChangesBatch`](batch.zig)'s caller after the merge.
         pub fn deinit(self: *Self) void {
             freePred(self.gpa, &self.pred);
             self.obj_spans.deinit(self.gpa);
@@ -3091,23 +3302,85 @@ const Event = union(enum) {
 
 /// A sink that records every call, so that the four conflict rules and the two
 /// list/text arms can be read off the emitted events instead of inferred.
+///
+/// **It owns every borrowed byte it keeps.** The sink contract hands over a
+/// value borrowed from the row or the change op that carries it
+/// ([`PatchValue`]) and frees an exported mark set as soon as the call returns,
+/// so a sink that keeps either copies it. This one keeps values and keys, and
+/// outlives the `apply` that filled it — and that apply has by then spliced
+/// its rows into the document, which moves the raw column a value read out of a
+/// row points into. [`PatchLog`](patches.zig), the sink that has to survive a
+/// merge the same way, copies for the same reason; a mark set is the exception
+/// here, because [`marksOf`] keeps only its entry count.
 const Recorder = struct {
     gpa: Allocator,
     items: std.ArrayList(Event) = .empty,
+    /// The byte payloads the events point at, copied here because a recorder
+    /// outlives the walk that borrowed them. [`deinit`](Recorder.deinit) frees
+    /// every one.
+    owned: std.ArrayList([]u8) = .empty,
+
+    /// A copy of `bytes` this recorder frees in
+    /// [`deinit`](Recorder.deinit), or null when it could not allocate.
+    fn own(self: *Recorder, bytes: []const u8) ?[]const u8 {
+        const copy = self.gpa.dupe(u8, bytes) catch return null;
+        self.owned.append(self.gpa, copy) catch {
+            self.gpa.free(copy);
+            return null;
+        };
+        return copy;
+    }
+
+    /// A patch payload whose byte payloads this recorder owns, or null when it
+    /// could not allocate. Only the four arms that carry bytes are copied;
+    /// the rest are numbers and object types that carry nothing.
+    fn ownValue(self: *Recorder, v: PatchValue) ?PatchValue {
+        return switch (v) {
+            .object => |o| .{ .object = o },
+            .scalar => |s| .{ .scalar = self.ownScalar(s) orelse return null },
+        };
+    }
+
+    fn ownScalar(self: *Recorder, v: ScalarValue) ?ScalarValue {
+        return switch (v) {
+            .str => |s| .{ .str = self.own(s) orelse return null },
+            .bytes => |b| .{ .bytes = self.own(b) orelse return null },
+            .actor_id => |a| .{ .actor_id = .{ .bytes = self.own(a.bytes) orelse return null } },
+            .unknown => |u| .{ .unknown = .{
+                .type_code = u.type_code,
+                .bytes = self.own(u.bytes) orelse return null,
+            } },
+            else => v,
+        };
+    }
+
+    /// A register reference whose key this recorder owns, or null when it
+    /// could not allocate.
+    fn ownProp(self: *Recorder, p: Prop) ?Prop {
+        return switch (p) {
+            .key => |k| .{ .key = self.own(k) orelse return null },
+            .index => p,
+        };
+    }
+
     /// The mark set's entry count, or zero for "no marks". The set is borrowed,
-    /// as the sink contract requires; a test reads the count before the set is
-    /// freed.
+    /// as the sink contract requires, and is freed as soon as the method
+    /// returns; a recorder reads the count here rather than keeping the set.
     fn marksOf(m: ?*const MarkSet) usize {
         const set = m orelse return 0;
         return set.len();
     }
 
+    /// Frees the copied payloads and the events. Once only.
     fn deinit(self: *Recorder) void {
+        for (self.owned.items) |bytes| self.gpa.free(bytes);
+        self.owned.deinit(self.gpa);
         self.items.deinit(self.gpa);
     }
 
     pub fn insert(self: *Recorder, _: ObjId, index: usize, val: PatchValue, id_: OpId, conflict: bool) void {
-        self.items.append(self.gpa, .{ .insert = .{ .index = index, .value = val, .id = id_, .conflict = conflict } }) catch {};
+        const value = self.ownValue(val) orelse return;
+        self.items.append(self.gpa, .{ .insert = .{ .index = index, .value = value, .id = id_, .conflict = conflict } }) catch {};
     }
 
     pub fn putMap(
@@ -3119,7 +3392,9 @@ const Recorder = struct {
         conflict: bool,
         expose: bool,
     ) void {
-        self.items.append(self.gpa, .{ .put_map = .{ .key = key, .value = val, .id = id_, .conflict = conflict, .expose = expose } }) catch {};
+        const k = self.own(key) orelse return;
+        const value = self.ownValue(val) orelse return;
+        self.items.append(self.gpa, .{ .put_map = .{ .key = k, .value = value, .id = id_, .conflict = conflict, .expose = expose } }) catch {};
     }
 
     pub fn putSeq(
@@ -3131,11 +3406,13 @@ const Recorder = struct {
         conflict: bool,
         expose: bool,
     ) void {
-        self.items.append(self.gpa, .{ .put_seq = .{ .index = index, .value = val, .id = id_, .conflict = conflict, .expose = expose } }) catch {};
+        const value = self.ownValue(val) orelse return;
+        self.items.append(self.gpa, .{ .put_seq = .{ .index = index, .value = value, .id = id_, .conflict = conflict, .expose = expose } }) catch {};
     }
 
     pub fn deleteMap(self: *Recorder, _: ObjId, key: []const u8) void {
-        self.items.append(self.gpa, .{ .delete_map = .{ .key = key } }) catch {};
+        const k = self.own(key) orelse return;
+        self.items.append(self.gpa, .{ .delete_map = .{ .key = k } }) catch {};
     }
 
     pub fn deleteSeq(self: *Recorder, _: ObjId, index: usize, num: usize) void {
@@ -3143,11 +3420,13 @@ const Recorder = struct {
     }
 
     pub fn flagConflict(self: *Recorder, _: ObjId, prop: Prop) void {
-        self.items.append(self.gpa, .{ .flag_conflict = .{ .prop = prop } }) catch {};
+        const p = self.ownProp(prop) orelse return;
+        self.items.append(self.gpa, .{ .flag_conflict = .{ .prop = p } }) catch {};
     }
 
     pub fn incrementMap(self: *Recorder, _: ObjId, key: []const u8, n: i64, id_: OpId) void {
-        self.items.append(self.gpa, .{ .increment_map = .{ .key = key, .n = n, .id = id_ } }) catch {};
+        const k = self.own(key) orelse return;
+        self.items.append(self.gpa, .{ .increment_map = .{ .key = k, .n = n, .id = id_ } }) catch {};
     }
 
     pub fn incrementSeq(self: *Recorder, _: ObjId, index: usize, n: i64, id_: OpId) void {
@@ -3155,7 +3434,8 @@ const Recorder = struct {
     }
 
     pub fn splice(self: *Recorder, _: ObjId, index: usize, text: []const u8, m: ?*const MarkSet) void {
-        self.items.append(self.gpa, .{ .splice = .{ .index = index, .text = text, .marks = marksOf(m) } }) catch {};
+        const t = self.own(text) orelse return;
+        self.items.append(self.gpa, .{ .splice = .{ .index = index, .text = t, .marks = marksOf(m) } }) catch {};
     }
 
     pub fn replaceSeq(
@@ -3171,10 +3451,12 @@ const Recorder = struct {
         _: TextEncoding,
         m: ?*const MarkSet,
     ) void {
+        const old = self.ownValue(old_value) orelse return;
+        const value = self.ownValue(val) orelse return;
         self.items.append(self.gpa, .{ .replace_seq = .{
             .index = index,
-            .old = old_value,
-            .value = val,
+            .old = old,
+            .value = value,
             .id = id_,
             .conflict = conflict,
             .expose = expose,
@@ -4230,6 +4512,86 @@ test "a document op whose key sorts between two incoming keys is read between th
 
 // ── 3. The four conflict-winner rules, each with a distinguishing case ─────
 
+test "text exposure records the rendered winner in either document row order" {
+    // The deleted→surviving transition in `OpValueOption::set`
+    // (`batch.rs:557-570`) must satisfy the replacement invariant at
+    // `batch.rs:759-774` too. A later survivor was already the visible
+    // winner, so the replacement removes its own width, not the earlier
+    // deleted row's width.
+    const gpa = testing.allocator;
+    const PatchLog = @import("../patches.zig").PatchLog;
+    const text: PatchValue = .{ .scalar = .{ .str = "\u{1F98A}\u{1F43B}" } };
+    const object: PatchValue = .{ .object = .map };
+    const deleted: PatchValue = .{ .scalar = .{ .bytes = "deleted" } };
+    const encodings = [_]TextEncoding{ .unicode_code_point, .utf8_code_unit, .utf16_code_unit, .grapheme_cluster };
+    const text_widths = [_]usize{ 2, 8, 4, 2 };
+    const replacement_widths = [_]usize{ 1, 3, 1, 1 };
+    for (encodings, 0..) |encoding, e| {
+        for ([_]bool{ false, true }) |deleted_first| {
+            for ([_]PatchValue{ text, object }) |survivor| {
+                var state = ValueState(PatchLog).init(gpa, .root, .text, encoding);
+                defer state.deinit();
+                const survivor_id = opId(3, if (deleted_first) 2 else 1);
+                const deleted_id = opId(3, if (deleted_first) 1 else 2);
+                state.key = .{ .index = 7 };
+                if (deleted_first) {
+                    state.doc.set(deleted, deleted_id, true);
+                    state.doc.set(survivor, survivor_id, false);
+                } else {
+                    state.doc.set(survivor, survivor_id, false);
+                    state.doc.set(deleted, deleted_id, true);
+                }
+                const value = state.doc.item.?;
+                try testing.expect(value.expose);
+                try testing.expect(!value.deleted);
+                try testing.expect(!value.conflict);
+                try testing.expect(value.id.eql(survivor_id));
+                try testing.expect(std.meta.eql(value.value, survivor));
+                try testing.expect(value.replaced != null);
+                try testing.expect(std.meta.eql(value.replaced.?, if (deleted_first) survivor else deleted));
+
+                // A replacement is an insertion: unchanged marks must survive
+                // alongside marks introduced by the batch.
+                const bold = MarkData.init("bold", .{ .bool_value = true });
+                _ = try state.marks.before.markBegin(opId(4, 0), bold);
+                _ = try state.marks.after.markBegin(opId(4, 0), bold);
+                _ = try state.marks.after.markBegin(opId(6, 0), MarkData.init("italic", .{ .bool_value = true }));
+                var log = PatchLog.active(gpa);
+                defer log.deinit();
+                try state.listFlush(7, &log);
+                try testing.expectEqual(@as(usize, 2), log.events.items.len);
+                const removal = log.events.items[0].event;
+                try testing.expect(removal == .delete_seq);
+                try testing.expectEqual(@as(usize, 7), removal.delete_seq.index);
+                const old_width = if (deleted_first and !survivor.isObject()) text_widths[e] else replacement_widths[e];
+                try testing.expectEqual(old_width, removal.delete_seq.num);
+                const insertion = log.events.items[1].event;
+                if (survivor.isObject()) {
+                    try testing.expect(insertion == .insert);
+                    try testing.expectEqual(@as(usize, 7), insertion.insert.index);
+                    try testing.expectEqual(survivor.object, insertion.insert.value.object);
+                    try testing.expect(insertion.insert.id.eql(survivor_id));
+                    try testing.expect(!insertion.insert.conflict);
+                    try testing.expect(log.expose.contains(survivor_id));
+                    try testing.expectEqual(@as(usize, 1), log.expose.count());
+                } else {
+                    try testing.expect(insertion == .splice);
+                    try testing.expectEqual(@as(usize, 7), insertion.splice.index);
+                    try testing.expectEqualStrings(survivor.asStr(), insertion.splice.text);
+                    try testing.expect(insertion.splice.marks != null);
+                    const marks = insertion.splice.marks.?;
+                    try testing.expectEqual(@as(usize, 2), marks.len());
+                    try testing.expectEqualStrings("bold", marks.entries.items[0].name);
+                    try testing.expect(marks.entries.items[0].value.eql(.{ .bool_value = true }));
+                    try testing.expectEqualStrings("italic", marks.entries.items[1].name);
+                    try testing.expect(marks.entries.items[1].value.eql(.{ .bool_value = true }));
+                    try testing.expectEqual(@as(usize, 0), log.expose.count());
+                }
+            }
+        }
+    }
+}
+
 test "rule one: a greater change id wins, and a deleted document value means no conflict" {
     const gpa = testing.allocator;
     const changes = [_]Change{bareChange(fixture_actors[1], 1, 3, 0x11)};
@@ -4430,7 +4792,7 @@ test "rule four: a deleted document value is replaced on text and put on a list"
     });
     try expectEvents(gpa, &text_rec, &.{
         "migrate 3",
-        "replace_seq 0 abc->X 3@1 conflict=true expose=false marks=0",
+        "replace_seq 0 abc->X 3@1 conflict=false expose=false marks=0",
     });
     try expectRowIds(gpa, &text_doc.set, &.{ opId(1, 0), opId(2, 0), opId(3, 1) });
     try expectBothCheckers(&text_doc.set);

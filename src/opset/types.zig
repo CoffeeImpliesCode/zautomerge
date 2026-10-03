@@ -61,6 +61,35 @@ pub const ScalarValue = value.ScalarValue;
 
 /// The word that carries a value's byte length and its type tag
 /// (`op_set2/meta.rs:19-43`).
+///
+/// A `u64` in two fields: the low four bits are the type tag and the high
+/// sixty are the value's width in the value arena (`op_set2/meta.rs:19-43`).
+/// It is declared once, in `value.zig`, and aliased here so the op set's code
+/// reads like upstream's `op_set2.rs:12-15`.
+///
+/// # Constructing one is trusted; decoding one is checked
+///
+/// The two halves of this word are not the same kind of thing.
+///
+/// * [`value.ValueMeta.init`] is **infallible and trusted**. It takes a
+///   `usize` length and a `ValueType` and packs them, which is right for a
+///   writer that already knows the payload's width — [`metaOf`] is the only
+///   such writer here, and it measures a value it is holding. Its
+///   precondition is that the length fits in sixty bits and the type's code
+///   fits in the low four; `value.zig` states and asserts it. A length that
+///   did not fit would shift bits out of the word, so this is a programmer
+///   precondition and not a silent truncation.
+/// * A word that came **out of a column** is untrusted: `ValueMeta.fromRaw`
+///   is total and `ValueMeta.length` reads the sixty bits back through a
+///   checked cast, so a column that declares a width nothing can hold is
+///   `error.Overflow` rather than a truncated length. That is the path every
+///   reader of a stored value takes — [`op_iter.ValueIter`] reads the word
+///   and then takes exactly `meta.length()` bytes from the raw column.
+///
+/// So: `init` for a width this code just measured, `fromRaw` plus `length`
+/// for a width that arrived in bytes. There is no third spelling, and a
+/// parser that wants to *build* a word from untrusted bytes has to check the
+/// width against sixty bits itself rather than call `init`.
 pub const ValueMeta = value.ValueMeta;
 
 /// The type tag in a value metadata word (`op_set2/meta.rs:4-17`).
@@ -401,6 +430,14 @@ pub fn asRaw(v: ScalarValue) ?[]const u8 {
 /// where the logical type folds both into `leb`. An `unknown` keeps the type
 /// code its writer gave it (`op_set2/meta.rs:88-90`), even a code below 10
 /// that a reader will see as the defined tag it collides with.
+///
+/// **This is the trusted construction path**, and the only one in the op
+/// set: the length it packs is [`rawLen`] of a `ScalarValue` this code is
+/// already holding, so it is measured rather than declared and the sixty-bit
+/// precondition [`ValueMeta`] states holds by construction. It is infallible
+/// for that reason. A word built out of bytes someone else wrote is *not*
+/// built here — it comes back through [`ValueMeta.fromRaw`] and is read with
+/// the checked `length`.
 pub fn metaOf(v: ScalarValue) ValueMeta {
     return ValueMeta.init(switch (v) {
         .null_value => .null_value,
@@ -422,8 +459,10 @@ pub fn metaOf(v: ScalarValue) ValueMeta {
 /// The scalar a metadata word and its payload describe
 /// (`op_set2/types.rs:314-341`).
 ///
-/// `raw` is exactly the `meta.length()` bytes the word declares, and nothing
-/// else. Upstream's `parse_uleb128`/`parse_leb128`
+/// `raw` is exactly the bytes the word declares — `try meta.length()` of
+/// them, a checked read, because a word that arrived in bytes can declare a
+/// width no target can hold — and nothing else. Upstream's
+/// `parse_uleb128`/`parse_leb128`
 /// (`op_set2/types.rs:471-481`) take the first number in the slice and ignore
 /// whatever follows; this refuses a payload that is not one whole number,
 /// because the load path already refuses it (`column_range/value.rs:288-311`)

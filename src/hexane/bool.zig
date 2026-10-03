@@ -29,6 +29,25 @@
 //! `checked_add` at `bool.rs:817-820`). Canonical-form checks beyond that
 //! (the zero-count rules) belong to the column loader, which is the only
 //! place upstream runs them, on whole columns rather than on slabs.
+//!
+//! # Import route and the shortest sequence that works
+//!
+//! `@import("hexane/bool.zig")`, or `zautomerge.hexane.bool` through the root
+//! module. Zig 0.16.0. What a column imports from here is [`Bool`] and its
+//! [`Bool.Decoder`].
+//!
+//! ```zig
+//! var out: std.ArrayList(u8) = .empty;
+//! try Bool.append(&out, gpa, &.{ true, false, false }); // canonical bytes
+//! var it = try Bool.Decoder.init(out.items);             // borrows `out`
+//! while (try it.next()) |v| { _ = v; }
+//! ```
+//!
+//! # What it deliberately does not do
+//!
+//! It carries no payload. A value costs no bytes of its own, so a boolean slab
+//! is a bare sequence of run counts and the codec has nothing to copy out of
+//! it — [`Bool.Decoder`] hands back `bool` values, never windows.
 
 const std = @import("std");
 const leb128 = @import("../leb128.zig");
@@ -135,6 +154,11 @@ pub const Bool = struct {
     /// reads one LEB128 count. The document walk pulls booleans one at a
     /// time, so this never materialises the whole slab.
     pub const Decoder = struct {
+        /// The slab being walked, borrowed: it must stay alive and unmodified
+        /// for as long as this decoder is used, and its owner must outlive the
+        /// decoder. Nothing a boolean column hands back points into it — the
+        /// wire form carries no value bytes — so this is the only borrow a
+        /// caller has to honour.
         bytes: []const u8,
         /// The offset of the next unread run count.
         pos: usize,
@@ -145,7 +169,8 @@ pub const Bool = struct {
         /// (upstream `bool.rs:490-502`).
         value: bool,
 
-        /// A cursor standing at the start of `bytes`.
+        /// A cursor standing at the start of `bytes`, which it borrows; see
+        /// the `bytes` field.
         pub fn init(bytes: []const u8) ParseError!Decoder {
             return .{ .bytes = bytes, .pos = 0, .remaining = 0, .value = true };
         }

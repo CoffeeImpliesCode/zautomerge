@@ -40,11 +40,19 @@
 //! `error.Invariant`, because the port's [`TopOps.next`] keeps upstream's two
 //! `assert!`s as [`InternalError`] rather than as a panic
 //! ([`top_op.rs:49-56,781-784`](../opset/top_op.zig); upstream's `AutomergeError`
-//! has no way to say it). So `assertQueryTerm(TopQuery(O))` **does not compile**
+//! has no way to say it).
+//! So `assertQueryTerm(TopQuery(O))` **does not compile**
 //! and is not claimed, while `assertQueryTerm(RowQuery(O))` and
 //! `assertQueryTerm(marks.MarkIter(RowQuery(O)))` both do — the test
 //! "the query-term contract is a comptime check, over two different walks" is
 //! the proof, and it is the honest shape of the claim.
+//!
+//! **And [`Values`] checks the wider surface itself**, with
+//! [`assertValueTerm`]: the same five declarations against
+//! [`ValuesError`] rather than `QueryError`. That is what lets the winner walk —
+//! which is the production inner — be a `Values` inner at all, and it is why a
+//! third term gets one `@compileError` per missing declaration instead of a
+//! member-not-found from the body.
 //!
 //! # `getMarks` forwards, and that is the whole point
 //!
@@ -144,18 +152,36 @@ pub const ValuesError = opquery.QueryError || InternalError;
 /// reason [`op_set.OpAndVisible`] has one
 /// ([`op_set.zig:258-270`](../opset/op_set.zig)).
 ///
-/// The value is **borrowed**: the scalar out of the value column and the map key
-/// out of the string table, both owned by the op set and valid until the next
-/// mutation ([`AGENTS.md`](../../AGENTS.md) *Invariants*). Upstream's
-/// `types::Value<'a>` is a `Cow`, so an owned copy is `ValueRef.intoOwned`
-/// ([`opset/types.zig:269-276`](../opset/types.zig)).
+/// The value is **borrowed**: its payload is read out of the op set's value
+/// column, which a splice rewrites, so it is valid **until the next mutation**
+/// ([`AGENTS.md`](../../AGENTS.md) *Invariants*). Upstream's `types::Value<'a>`
+/// is a `Cow`, so an owned copy is [`ValueRef.intoOwned`](../opset/types.zig).
+///
+/// **The id is a second borrow, and it is the one a caller forgets.** It is
+/// resolved against the op set's actor table and holds **the actor's bytes**,
+/// which in a document are that document's arena
+/// ([`ExId.Named.actor`](../../src/types.zig), `types.zig:280-288`). An
+/// [`ExId`] resolved from an op index cannot be made to own its bytes without
+/// copying them, so **an item still has to be read while the document is
+/// alive**, and `ValueRef.intoOwned` does not change that: it copies the
+/// *value*, never the *id*.
 pub const ValuesItem = struct {
     /// What the operation carries: the object a make action produces, or the
     /// scalar a put carries
     /// (`op_set2/types.rs:667-675`, `op.rs:1096-1106`).
+    ///
+    /// **Borrowed out of the op set's value column**, valid until the next
+    /// mutation; [`ValueRef.intoOwned`](../opset/types.zig) is the copy that
+    /// outlives one. A `.str` scalar's bytes live there; the numbers, the
+    /// counter and an object reference are values and borrow nothing.
     value: ValueRef,
     /// The id the operation itself has, resolved against the op set's actor
     /// table (`OpSet::id_to_exid`, `op_set.rs:1054-1060`).
+    ///
+    /// **Borrows the actor's bytes** from the document that interned the actor
+    /// ([`ExId.Named.actor`](../../src/types.zig), `types.zig:280-288`), so it
+    /// is valid for as long as that document and not one step longer. Nothing
+    /// on this type copies it.
     id: ExId,
 };
 
@@ -181,10 +207,24 @@ pub fn RowQuery(comptime O: type) type {
 
         /// The row walk this instantiation is ([`opiter.OpIter`](../opset/op_iter.zig),
         /// `op_set.rs:1291-1341`).
+        ///
+        /// **It borrows the op set's shared successor buffer**, so only one
+        /// `RowQuery` over one op set may be live at a time, and the op set
+        /// must not be mutated while it is. The type's own section says so; the
+        /// field is where a reader looks.
         walk: opiter.OpIter(O),
 
         /// A query term over `rows` of `op_set` (`OpSet::iter_range`,
         /// `op_set.rs:1317-1341`).
+        ///
+        /// **Borrows, and takes no teardown**: the buffer is the op set's, so
+        /// there is nothing for this term to free — which is why
+        /// [`Values`], which holds a `*I`, cannot free its inner on the caller's
+        /// behalf either.
+        ///
+        /// **No clock is taken here**, unlike [`TopQuery.ofObj`]: a `RowQuery`
+        /// is built by a caller that wants raw rows, and the clock, if any, was
+        /// applied by whatever scoped the walk it came from.
         pub fn over(op_set: *opset.OpSet(O), rows: RowRange) ParseError!Self {
             return .{ .walk = try opiter.OpIter(O).init(
                 &op_set.cols,
@@ -250,8 +290,15 @@ pub fn TopQuery(comptime O: type) type {
     return struct {
         const Self = @This();
 
-        /// The winner walk, with the successor buffers it borrowed
+        /// The winner walk, **together with the three successor buffers it owns**
         /// ([`TopWalk`](../opset/op_set.zig), `op_set.rs:1085-1091`).
+        ///
+        /// **These buffers are this walk's and no other walk's**, whether the
+        /// walk came from [`ofObj`](TopQuery.ofObj) or [`over`](TopQuery.over),
+        /// so **two of these may be live over one op set at once** — the port's
+        /// one-live-at-a-time rule ([`op_set.zig:40-49`](../opset/op_set.zig)) is
+        /// about the walks that borrow the op set's *shared* buffer, which a top
+        /// walk does not. [`deinit`](TopQuery.deinit) releases them.
         walk: opset.TopWalk(O),
 
         /// The winners of `obj`'s registers as they stand at `clock`
@@ -259,9 +306,19 @@ pub fn TopQuery(comptime O: type) type {
         /// [`automerge.rs:1703`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
         ///
         /// **Takes no allocator, because it allocates none of its own**: it is
-        /// `OpSet.topOps` and the op set is the owner of the scratch
-        /// ([`op_set.zig:2111-2119`](../opset/op_set.zig)). [`over`] is the
-        /// constructor that does allocate, and it takes the allocator first.
+        /// `OpSet.topOps`, and the op set allocates the scratch
+        /// ([`topScratch`](../opset/top_op.zig), `top_op.zig:730-744`) — which is
+        /// also **the allocator [`deinit`](TopQuery.deinit) must be given**,
+        /// the op set's own. [`over`](TopQuery.over) is the constructor that
+        /// allocates from the caller's allocator, and it takes it first.
+        ///
+        /// **`clock` is borrowed and `null` is the present.** It is a
+        /// [`Clock`](../../src/clock.zig) by value — a `[]u32` plus the
+        /// allocator that allocated it — and the walk reads through it on every
+        /// row, so **the caller's clock has to outlive the walk**: a
+        /// `Clock.deinit` while this walk is still being read leaves it reading
+        /// released counters. A non-null clock bounds the walk to the operations
+        /// it covers. `op_set` is borrowed too.
         pub fn ofObj(op_set: *opset.OpSet(O), obj: ExId, clock: ?Clock) ValuesError!Self {
             return .{ .walk = try op_set.topOps(obj, clock) };
         }
@@ -270,8 +327,19 @@ pub fn TopQuery(comptime O: type) type {
         /// ([`TopIter`](../opset/top_op.zig)'s `rows` parameter, `top_op.rs:178-196`).
         ///
         /// This is the constructor a sub-range read uses, and the reason
-        /// [`op_set.TopWalk`] is spelled out here rather than reached through
+        /// [`opset.TopWalk`] is spelled out here rather than reached through
         /// `topOps`: `topOps` is always a whole object.
+        ///
+        /// **`gpa` is the allocator of both halves**: the three buffers are
+        /// taken with it here and must be given back to
+        /// [`deinit`](TopQuery.deinit) with the same one. **Failure leaves
+        /// nothing behind** — the scratch is registered with `errdefer` before
+        /// the one other fallible step, so an error frees what was allocated and
+        /// returns no walk.
+        ///
+        /// **`clock` and `op_set` are borrowed**, with the same window
+        /// [`ofObj`](TopQuery.ofObj) gives: the caller's clock has to outlive the
+        /// walk, and `null` is the present.
         pub fn over(
             gpa: Allocator,
             op_set: *opset.OpSet(O),
@@ -288,6 +356,24 @@ pub fn TopQuery(comptime O: type) type {
 
         /// Frees the three successor buffers and nothing else
         /// ([`TopWalk.deinit`](../opset/op_set.zig)).
+        ///
+        /// **Which allocator depends on which constructor built it**, and the
+        /// answer is the same in both cases: the allocator the buffers were
+        /// allocated with. A walk from [`ofObj`](TopQuery.ofObj) was allocated
+        /// by the op set and must be freed with the **op set's own `gpa`** —
+        /// for a document, [`Document.allocator`](../../doc.zig) — and a walk
+        /// from [`over`](TopQuery.over) with the `gpa` that call was given. Any
+        /// other allocator is a mismatched free.
+        ///
+        /// **Once, on the one owner.** The receiver is a pointer and the body
+        /// ends in `self.* = undefined`, so a second call reads undefined
+        /// storage rather than freeing the same three buffers again. **A copy
+        /// carries the buffers but not the teardown**: `var b = a;
+        /// a.deinit(gpa); b.deinit(gpa);` frees them twice, because the copy's
+        /// own outer state was never poisoned. Moving the walk is fine.
+        ///
+        /// Nothing this walk borrowed is freed here — not the op set, not the
+        /// string table, not the caller's clock.
         pub fn deinit(self: *Self, gpa: Allocator) void {
             self.walk.deinit(gpa);
             self.* = undefined;
@@ -326,10 +412,59 @@ pub fn TopQuery(comptime O: type) type {
 
         /// The next register's winner, or null at the end of the rows
         /// ([`TopOps::next`](../opset/top_op.zig), `top_op.rs:44-65`).
+        ///
+        /// **The row it returns borrows three things**: its successors out of the
+        /// buffers above, its value out of the op set's value column, and its
+        /// key out of the string table. All three are valid only while the op
+        /// set is, and the row is over the moment the next `next` runs — which
+        /// is why a caller that keeps one copies what it needs rather than
+        /// keeping the `Op`.
+        ///
+        /// **Null is the end of the rows**, and a register with no visible row
+        /// is skipped rather than answered.
         pub fn next(self: *Self) ValuesError!?Op {
             return self.walk.next();
         }
     };
+}
+
+/// The surface a [`Values`] inner has to carry, checked once when the type is
+/// instantiated.
+///
+/// **Not [`opquery.assertQueryTerm`], and the difference is the error set.** A
+/// query term's `next` answers [`opquery.QueryError`], which is what the trait
+/// requires; the winner walk's answers [`ValuesError`] as well, because the
+/// port keeps upstream's two `assert!`s as
+/// [`InternalError`](../../src/error.zig) rather than as a panic
+/// ([`top_op.zig:781-784`](../opset/top_op.zig)) and `QueryError` cannot name it.
+/// So this asks for the **wider** set — the one [`Values`] forwards — and a
+/// third term that can raise `InternalError` is a valid inner here where it
+/// would not be a query term. The five names are
+/// [`opquery.query_term_decls`], so there is one list.
+///
+/// **One `@compileError` per missing declaration, naming the name**, so a
+/// caller who writes a third term recovers the contract from the failure
+/// instead of from this file's body. The signature checks are the point as much
+/// as the names: a `getMarks` answering something other than
+/// `?*const MarkSet`, or a `next` answering a bare `?Op` with no error, would
+/// otherwise be a mistake at the call site.
+fn assertValueTerm(comptime I: type) void {
+    inline for (opquery.query_term_decls) |name| {
+        if (!@hasDecl(I, name)) {
+            @compileError("a Values inner needs this method: " ++ @typeName(I) ++
+                " has no " ++ name ++ "; see op_query.zig's query_term_decls");
+        }
+    }
+    const pos: *const fn (*const I) usize = &I.pos;
+    const max_pos: *const fn (*const I) usize = &I.maxPos;
+    const range: *const fn (*const I) RowRange = &I.range;
+    const get_marks: *const fn (*const I) ?*const MarkSet = &I.getMarks;
+    const next: *const fn (*I) ValuesError!?Op = &I.next;
+    _ = pos;
+    _ = max_pos;
+    _ = range;
+    _ = get_marks;
+    _ = next;
 }
 
 // ── The walk ────────────────────────────────────────────────────────────────
@@ -348,22 +483,56 @@ pub fn TopQuery(comptime O: type) type {
 /// takes no allocator and `TopQuery.deinit(gpa)` takes one, so there is no one
 /// free this could call on the caller's behalf.
 ///
+/// # What `I` has to be
+///
+/// **A duck-typed comptime parameter with a checked surface, checked here and
+/// not left to the body.** `I` needs the five declarations
+/// [`opquery.query_term_decls`] — `pos`, `maxPos`, `range`, `getMarks`, `next`
+/// — with the signatures [`assertValueTerm`] checks, and it is `Values`' own
+/// check rather than [`opquery.assertQueryTerm`]'s because the inner's `next`
+/// may raise the wider [`ValuesError`] (see that function). A third term that
+/// is missing one fails to compile with the name of the declaration and the
+/// list to read, which is the whole point of asking a caller for a type rather
+/// than a vtable.
+///
+/// **One reader, no `deinit`, and nothing owned.** `op_set` and `iter` are both
+/// borrowed: the op set has to outlive the walk, and so does the term — which
+/// is why the term's own teardown is the caller's to call.
+///
 /// Constructing one allocates nothing: two pointers.
 pub fn Values(comptime O: type, comptime I: type) type {
     return struct {
         const Self = @This();
 
+        comptime {
+            // **The check is the instantiation.** Naming `I` in a `comptime`
+            // block is what makes it a contract rather than a convention: a
+            // third term missing a declaration fails here, where the error names
+            // the declaration, instead of at the first `next` with a
+            // member-not-found.
+            assertValueTerm(I);
+        }
+
         /// The op set an id is resolved against (`values.rs:10`).
         ///
         /// **Not optional, and that is a departure from upstream**, for the
         /// reason [map_range.zig](map_range.zig)'s `MapDiff` records
-        /// (`map_range.zig:628-634`): upstream's is `Option<&OpSet>` and its
+        /// (`map_range.zig:740-749`): upstream's is `Option<&OpSet>` and its
         /// empty reader is a `Default`, which `automerge.rs:1701-1704` reaches
         /// for when an id names nothing. A caller with no object scopes to an
         /// **empty row range** and builds the same reader, which answers
         /// nothing for the same reason and needs no second shape.
+        ///
+        /// **Borrowed, and not just for the id**: it is the table the inner term
+        /// walks, so it must not be mutated, moved or freed while the walk is
+        /// alive.
         op_set: *opset.OpSet(O),
         /// The query term (`values.rs:10`).
+        ///
+        /// **Borrowed, and the teardown is the caller's** — the type's second
+        /// section. Its own buffer rules apply too: a [`RowQuery`] borrows the
+        /// op set's shared successor buffer, so only one such walk may be live
+        /// over one op set, while a [`TopQuery`] brings its own.
         iter: *I,
 
         /// A read of `iter` against `op_set`, as `clock` saw it
@@ -373,6 +542,17 @@ pub fn Values(comptime O: type, comptime I: type) type {
         /// **`clock` is accepted and dropped**, under upstream's own `FIXME`
         /// ([`values.rs:14`](../../github-automerge-automerge/rust/automerge/src/iter/values.rs));
         /// the module's fifth section says why the parameter is still here.
+        ///
+        /// **Because it is dropped, no clock is retained and so no clock has to
+        /// outlive this reader.** The clock was already applied by the term the
+        /// walk was built with — that is what the module's fifth section says,
+        /// and it is why the caller builds the term with the clock rather than
+        /// handing it over here. A caller that wants a read at a past state
+        /// passes the clock to [`TopQuery.ofObj`] or [`TopQuery.over`], and the
+        /// term **does** borrow it from there.
+        ///
+        /// **`op_set` and `iter` are both borrowed** and both must outlive the
+        /// walk; see the fields.
         pub fn init(op_set: *opset.OpSet(O), iter: *I, clock: ?Clock) Self {
             _ = clock;
             return .{ .op_set = op_set, .iter = iter };
@@ -415,6 +595,15 @@ pub fn Values(comptime O: type, comptime I: type) type {
         /// `op.value().to_value()` (`values.rs:32`), which is
         /// [`ValueRef.fromActionValue`] here — see the module's last section for
         /// the one action where that is not upstream-identical and why.
+        ///
+        /// **The item it returns is borrowed in both halves** — the value's
+        /// payload out of the op set's value column, and the id's actor bytes
+        /// out of its actor table. See [`ValuesItem`]'s first section for each
+        /// window, and [`ValueRef.intoOwned`](../../opset/types.zig) for the
+        /// copy that detaches the value.
+        ///
+        /// **Null is the end of the walk**, and a register whose rows have all
+        /// been deleted is not a register and yields nothing.
         pub fn next(self: *Self) ValuesError!?ValuesItem {
             const op = (try self.iter.next()) orelse return null;
             return .{

@@ -116,7 +116,7 @@
 //!
 //! | what | upstream | here |
 //! | --- | --- | --- |
-//! | the op set | `self.ops()` (`hydrate.rs`:233`, `:236`, `:239`) | `doc.ops`, the `OpSet(ChangeOp)` the document already holds. [`hydrateMap`], [`hydrateList`], [`hydrateText`] and [`hydrateOp`] take it as `set: *Set` and read everything else off it. |
+//! | the op set | `self.ops()` (`hydrate.rs`:233`, `:236`, `:239`) | `doc.ops`, the `OpSet(ChangeOp)` the document already holds. [`hydrateMap`], [`hydrateList`], [`hydrateText`] and [`hydrateOp`] take it as `set: *Set` and read everything else off it; the six methods they read are [`set_decls`] and [`assertSet`] checks them at every call site. |
 //! | the text encoding | `self.text_encoding()` (`hydrate.rs`:233`) | **Nothing.** `OpSet` already carries it (`op_set.rs`:64`) and the four above read it from the set. A document that kept a second copy would be a second thing to get wrong. |
 //! | a clock for some heads | `self.clock_at(heads)` (`automerge.rs`:1634`, `:1644`) | `doc.clockAt(heads) ?Clock` — the name [`patches.doc_decls`](patches.zig) already requires, over [`ChangeGraph.clockAt`](change_graph.zig). |
 //! | an `ExId` and its type | `self.exid_to_obj(exid)` (`automerge.rs`:1643`, `:2225`) | `doc.objectType(exid) ?ObjType`, which the document already exposes for [`patches.doc_decls`](patches.zig). The port's [`ExId`] *is* the internal object id ([`patches.internalObjOf`](patches.zig)), so there is no reverse mapping to write. |
@@ -267,6 +267,15 @@ pub const Applied = union(enum) {
     /// The stream stopped here. **The mirror holds every action before it** —
     /// upstream applies in order and returns on the first error
     /// (`hydrate.rs`:83-86`) — and nothing after it was applied.
+    ///
+    /// **The refused action itself may already have changed the mirror.** One
+    /// arm does that, and it is [`List.apply`]'s `delete_seq`. It
+    /// removes **one element per iteration** and stops at the first index the
+    /// list does not have, so a delete of five elements against a list of two
+    /// removes and frees both and then refuses — the mirror is left holding
+    /// neither, and a caller that retries the same action removes nothing
+    /// further because the index it names is gone. [`List.apply`] says which
+    /// arms have no residue and which has this one.
     refused: Failure,
 };
 
@@ -299,10 +308,32 @@ pub const Object = union(enum) {
 /// beats three that differ only in arity. The common case costs nothing: a
 /// scalar with no bytes never builds a record at all.
 pub const Owned = struct {
+    /// The allocator every buffer in `items` was taken with, and the one
+    /// [`Owned.deinit`] frees them with.
+    ///
+    /// **It must not be replaced once a buffer is in `items`**, and nothing
+    /// checks it: a write between a [`Owned.keep`] and the `deinit` hands the
+    /// allocator a pointer it never lent. [`Map.gpa`] says the same for a
+    /// container, which is where the field is reached from.
     gpa: Allocator,
+    /// The buffers this record owns, each one a block `gpa` lent.
+    ///
+    /// **`deinit` frees every element through `gpa`, so appending a slice that
+    /// came from anywhere else makes it hand a foreign pointer to the
+    /// allocator.** The two functions that reach this list — [`ownScalar`] and
+    /// [`ownMark`] — both go through [`Owned.keep`], which copies first, and
+    /// nothing else appends to it.
     items: std.ArrayList([]const u8) = .empty,
 
     /// Frees every buffer and the list itself.
+    ///
+    /// **`self` is unusable afterwards and exactly one owner may run this on a
+    /// given record**: `self.* = undefined` is what turns a second run into a
+    /// walk over undefined bytes instead of a silent double free.
+    ///
+    /// A `MapValue`, a `ListValue` and a `Text` each hold this record by value,
+    /// so a by-value copy of one of those is a move — the same rule
+    /// [`Map.deinit`] states for the containers that hold one.
     pub fn deinit(self: *Owned) void {
         for (self.items.items) |bytes| self.gpa.free(bytes);
         self.items.deinit(self.gpa);
@@ -414,6 +445,27 @@ fn markNameHeld(set: *const MarkSet, name: []const u8) bool {
 /// `Value` that has not been stored yet points at whatever its caller had.
 /// [`Value.deinit`] frees the structure only; the bytes are the
 /// [`MapValue`], [`ListValue`] or [`Text`] record's to free.
+///
+/// **A value no container holds is released by one [`Value.deinit`], and the
+/// containers in its `object` arm are what it frees.** The constructors that
+/// produce one — [`Value.map`], [`Value.list`], [`Value.text`] and
+/// [`Value.fromPatch`] — take the `gpa` it was built with and record it on it,
+/// so `deinit` needs no allocator; a value from those, or from a make arm of
+/// [`hydrateOp`] through [`hydrateMap`], [`hydrateList`] or [`hydrateText`], is
+/// freed whole by the one call.
+///
+/// A scalar built by [`Value.fromScalar`] holds no container, and the bytes in
+/// it are its caller's until some [`Map.putOwned`] or [`List.push`] takes it —
+/// so it frees nothing and needs no allocator.
+///
+/// **A by-value copy is a move, and not a second owner.** [`Value.applyOne`]
+/// takes a `*Value`, [`Map.putOwned`] and [`List.push`] take a `Value` by
+/// value, and the `object` arm holds a [`Map`], a [`List`] or a [`Text`] by
+/// value, so every one of those copies the owner. Exactly one copy may call
+/// `deinit`; a second frees the same table twice. Zig has no move-only type
+/// and no `Drop`, so nothing checks this and this comment is the whole
+/// contract — [`Map.deinit`] states it again for the container, and
+/// [`List.deinit`] and [`Text.deinit`] for the other two.
 pub const Value = union(enum) {
     /// A null.
     null_value,
@@ -610,6 +662,16 @@ pub const Value = union(enum) {
     /// holds the value, and that record's `deinit` frees it. A value that has
     /// not been stored holds whatever its caller's buffer held, and there is
     /// nothing of the caller's to free here.
+    ///
+    /// **The containers in the `object` arm are freed with the allocator each
+    /// one recorded**, which is why this takes none: a mirror handed back by
+    /// one of the four `hydrate*` functions or built by [`Value.map`],
+    /// [`Value.list`] or [`Value.text`] is released whole by this one call.
+    ///
+    /// **`self` is unusable afterwards, and only one owner of a given value may
+    /// call this** — a by-value copy is a move, which the type doc says why.
+    /// Calling it twice walks undefined bytes rather than reporting a double
+    /// free.
     pub fn deinit(self: *Value) void {
         const o = switch (self.*) {
             .object => |*o| o,
@@ -916,6 +978,18 @@ pub const MapValue = struct {
 pub const Map = struct {
     /// Every allocation this map makes, and every `deinit` frees, is taken
     /// with this. See the module doc's "the allocator lives in the containers".
+    ///
+    /// **This is the allocator `init` was handed, and it must not be replaced
+    /// once the map has allocated.** Nothing checks it, and the field is
+    /// reachable, because Zig has no private fields: a write between a
+    /// [`Map.putOwned`] and a [`Map.deinit`] would have the key copy, the
+    /// table and every [`MapValue`] buffer freed through an allocator that lent
+    /// none of them. `deinit` frees with **this field** and not with the one
+    /// the allocations came from, so a replaced field is a wrong free rather
+    /// than a reported error.
+    ///
+    /// The allocator itself is borrowed, never released: it is an interface
+    /// value the caller keeps.
     gpa: Allocator,
     /// Which object of the document this is the mirror of. See the module doc's
     /// "refuse, do not invent".
@@ -924,6 +998,10 @@ pub const Map = struct {
     entries: std.StringHashMapUnmanaged(MapValue) = .empty,
 
     /// An empty map over `id` ([`Map::new`](hydrate/map.rs):75-77`).
+    ///
+    /// Allocates nothing. `gpa` is recorded on the map and is not released by
+    /// [`Map.deinit`] — the caller keeps it — and the map is usable for
+    /// [`Map.putOwned`] from here on.
     pub fn init(gpa: Allocator, id: ExId) Map {
         return .{ .gpa = gpa, .id = id };
     }
@@ -1028,6 +1106,15 @@ pub const Map = struct {
     /// `increment` and `conflict` — and each of the other five is upstream's
     /// `Err(HydrateError::InvalidMapOp)` (`hydrate/map.rs`:63`), which is
     /// [`Failure.invalid_map_op`] here.
+    ///
+    /// **A refusal here leaves the map exactly as it was.** `increment` and
+    /// `conflict` are reads that either find their register or refuse before
+    /// writing, and `delete_map` cannot fail; `put_map` allocates a value, a
+    /// key copy and a table slot, and every one of those failures releases the
+    /// value it had built and stores nothing, so the register count and every
+    /// value in it are what they were. The residue an action leaves when it
+    /// **refuses** rather than failing is [`Applied.refused`]'s, and this is
+    /// not one of the arms that leaves any.
     pub fn apply(self: *Map, enc: TextEncoding, action: PatchAction) ApplyError!Applied {
         const out: Applied = switch (action) {
             .delete_map => |a| blk: {
@@ -1035,7 +1122,15 @@ pub const Map = struct {
                 break :blk .ok;
             },
             .put_map => |a| blk: {
-                const v = try Value.fromPatch(self.gpa, a.value, a.obj, enc);
+                var v = try Value.fromPatch(self.gpa, a.value, a.obj, enc);
+                // Scoped to this body, and the same sentence as `List.apply`'s
+                // `put_seq` arm: a successful `putOwned` has taken the value and
+                // a failing one has not. `Map.putOwned`'s own doc promises the
+                // caller still owns the register on an error, so the release is
+                // this arm's to make — and what it drops is exactly the value's
+                // own storage, because the register it would have gone into is
+                // not in the map on either path.
+                errdefer v.deinit();
                 try self.putOwned(a.key, MapValue.init(v, a.conflict));
                 break :blk .ok;
             },
@@ -1160,6 +1255,14 @@ pub const ListValue = struct {
 /// an index-addressed patch needs.
 pub const List = struct {
     /// The allocator every element's mark set and every node is taken with.
+    ///
+    /// **This is the allocator `init` was handed, and it must not be replaced
+    /// once the list has allocated** — see [`Map.gpa`], which states the rule
+    /// and why nothing catches a breach of it. Here the buffer that goes with
+    /// the wrong allocator is the tree's own nodes and every [`ListValue`]
+    /// mark set, and [`List.deinit`] frees them through this field.
+    ///
+    /// The allocator itself is borrowed, never released.
     gpa: Allocator,
     /// Which object of the document this is the mirror of. See the module doc's
     /// "refuse, do not invent".
@@ -1168,6 +1271,9 @@ pub const List = struct {
     items: seqtree.SequenceTree(ListValue),
 
     /// An empty list over `id` ([`List::new`](hydrate/list.rs):107-109`).
+    ///
+    /// Allocates nothing. `gpa` is recorded on the list and on the tree it
+    /// builds, and is not released by [`List.deinit`] — the caller keeps it.
     pub fn init(gpa: Allocator, id: ExId) List {
         return .{ .gpa = gpa, .id = id, .items = .init(gpa) };
     }
@@ -1240,6 +1346,27 @@ pub const List = struct {
     /// `increment` and `conflict` — plus `mark`, which upstream leaves as
     /// `todo!()` (`hydrate/list.rs`:88-90`) and this file fills. The other four
     /// are upstream's `Err(HydrateError::InvalidListOp)` (`hydrate/list.rs`:91`).
+    ///
+    /// **A refusal leaves the list exactly as it was, except in `delete_seq`.**
+    /// `put_seq`, `increment` and `conflict` find their element or refuse
+    /// before writing to it, `insert` refuses nothing, and `mark` returns
+    /// without a tag; so `delete_seq` is the one arm that can answer
+    /// `.refused = .{ .invalid_index }` **with the list already shorter than it
+    /// was.** It removes one element per iteration at `a.index` and stops at
+    /// the first index the list does not have, so a delete of five elements
+    /// against a list of two removes and frees both, leaves nothing at that
+    /// index, and then refuses. **A caller must not retry the action as
+    /// written**: the elements before the miss are gone and cannot be restored
+    /// from the mirror, and a shorter `length` would name an index that is no
+    /// longer there. [`Applied.refused`] states the same from the other side.
+    ///
+    /// **An `error.OutOfMemory` from the same arm is not a refusal and the
+    /// residue is not the one above.** `SequenceTree.remove`
+    /// (sequence_tree.zig:540) can fail after it has begun restructuring a
+    /// node, so the list is left in whatever state that walk reached and the
+    /// caller must not read it. This arm tells that failure apart from the
+    /// index miss for exactly that reason: an `error.InvalidIndex` is a
+    /// statement about the patch, and an `error.OutOfMemory` is not.
     pub fn apply(self: *List, enc: TextEncoding, action: PatchAction) ApplyError!Applied {
         const out: Applied = switch (action) {
             .put_seq => |a| blk: {
@@ -1273,9 +1400,27 @@ pub const List = struct {
                 // (`hydrate/list.rs`:63-67`); a delete past the end of the
                 // sequence is a stream that cannot be applied and is refused
                 // here.
+                //
+                // **Element by element, and no rollback.** Every element this
+                // loop got through is removed and freed before the miss, which
+                // is the residue `List.apply`'s doc and `Applied.refused` both
+                // promise. Upstream has the same shape and hides it by
+                // dropping the result and answering `Ok` — the port refuses
+                // instead, and says what the refusal cost.
+                //
+                // **`error.InvalidIndex` is the miss and nothing else.**
+                // `SequenceTree.remove` can also fail on allocation, after it
+                // has begun restructuring a node, and that is a different
+                // fault with a different residue: the list is not readable
+                // afterwards. Reporting it as `invalid_index` would tell the
+                // caller the patch is wrong when the list is, so it is
+                // propagated instead. Both error tags are already in
+                // `ApplyError`, so nothing about the signature widens.
                 for (0..a.length) |_| {
-                    var gone = self.items.remove(a.index) catch
-                        break :blk .{ .refused = .{ .invalid_index = a.index } };
+                    var gone = self.items.remove(a.index) catch |e| switch (e) {
+                        error.InvalidIndex => break :blk .{ .refused = .{ .invalid_index = a.index } },
+                        else => return e,
+                    };
                     gone.deinit();
                 }
                 break :blk .ok;
@@ -1363,7 +1508,21 @@ pub const List = struct {
 /// one buffer at a time, so [`Text.splice`] and [`Text.removeAt`] free the
 /// buffer they replace.
 pub const Text = struct {
-    /// The allocator the text buffer and the mark set are taken with.
+    /// The allocator the text buffer, the mark set and every byte in
+    /// `owned` are taken with.
+    ///
+    /// **This is the allocator `init` was handed, and it must not be replaced
+    /// once the text has allocated** — see [`Map.gpa`], which states the rule
+    /// and why nothing catches a breach of it.
+    ///
+    /// **This field and `value.gpa` are two records of one allocator, and both
+    /// must stay the one `init` was given.** [`Text.splice`] and
+    /// [`Text.removeAt`] free the buffer they replace through *this* field
+    /// while [`ConcreteTextValue.splice`] takes the next one from *its* own, so
+    /// a pair that disagreed would free a block with an allocator that never
+    /// lent it. Nothing compares them.
+    ///
+    /// The allocator itself is borrowed, never released.
     gpa: Allocator,
     /// Which object of the document this is the mirror of. See the module doc's
     /// "refuse, do not invent".
@@ -1385,6 +1544,12 @@ pub const Text = struct {
     owned: ?Owned = null,
 
     /// A text object holding `s` ([`Text::new`](hydrate/text.rs):64-69`).
+    ///
+    /// **This is the one constructor that allocates**, one buffer for `s`; a
+    /// failure leaves nothing to release. `gpa` is recorded on the text, on
+    /// its [`patches.ConcreteTextValue`] and on its mark set, and the caller
+    /// keeps it — [`Text.deinit`] frees the three with it and never with
+    /// anything else.
     pub fn init(gpa: Allocator, id: ExId, enc: TextEncoding, s: []const u8) Error!Text {
         return .{
             .gpa = gpa,
@@ -1421,13 +1586,24 @@ pub const Text = struct {
 
     /// Inserts `text` at unit `index` ([`TextValue::splice`](hydrate/text.rs):40`).
     ///
-    /// **This frees the buffer it replaces.** `ConcreteTextValue.splice` drops
-    /// its old reference without freeing, which is right for an arena and wrong
-    /// for an owning mirror.
+    /// **This frees the buffer it replaces, and the free is not optional.**
+    /// `ConcreteTextValue.splice` drops its old reference without freeing, which
+    /// is right for a patch inside an arena and wrong for an owning mirror: an
+    /// ordinary allocator reports the old buffer as leaked on every call that
+    /// skips this line. The `old` local is what makes it a free of the
+    /// *previous* block and not of the one `splice` just installed, and it is
+    /// freed with [`Text.gpa`].
+    ///
     /// **`error.InvalidCharacter` is upstream's `InvalidEncoding`**
     /// (`hydrate/text.rs`:32`): `byteOffset` reached a byte that is not valid
     /// UTF-8. The refusal is made by [`Text.apply`], which is where an
     /// [`Applied`] exists.
+    ///
+    /// **On either error the text is unchanged and nothing was allocated.**
+    /// `ConcreteTextValue.splice` resolves the index before it allocates, so
+    /// neither `error.InvalidCharacter` nor `error.OutOfMemory` reaches the
+    /// free below, and `value.bytes` still names the buffer it named before the
+    /// call.
     pub fn splice(self: *Text, index: usize, text: []const u8) Error!void {
         const old = self.value.bytes;
         try self.value.splice(index, text);
@@ -1437,13 +1613,26 @@ pub const Text = struct {
     /// Removes the one unit at `index`
     /// ([`TextValue::remove`](hydrate/text.rs):51-56`).
     ///
-    /// Out of range is a no-op and not an error: `byteOffset` clamps to the end
-    /// of the text for every one of the four encodings, so upstream's
-    /// `self.value.remove(index)` in a loop over `length` is total.
+    /// Out of range is a no-op. This UTF-8-backed value cannot retain a partial
+    /// scalar: deleting one UTF-8 byte or UTF-16 unit that splits a scalar
+    /// returns `error.InvalidCharacter` without changing the text.
+    ///
+    /// A replacement buffer is freed with [`Text.gpa`] only after success;
+    /// no-ops retain their buffer. Allocation and encoding errors leave the
+    /// text unchanged.
     pub fn removeAt(self: *Text, index: usize) Error!void {
         const old = self.value.bytes;
         try self.value.remove(index);
-        self.gpa.free(old);
+        if (self.value.bytes.ptr != old.ptr) self.gpa.free(old);
+    }
+
+    /// Removes a bounded span in one mutation. Overshoot clamps to the end;
+    /// zero length and out-of-range starts retain the original buffer.
+    /// Both boundaries must be valid for the text's encoding.
+    fn removeRange(self: *Text, index: usize, length: usize) Error!void {
+        const old = self.value.bytes;
+        try self.value.removeRange(index, length);
+        if (self.value.bytes.ptr != old.ptr) self.gpa.free(old);
     }
 
     /// Applies one action to this text ([`Text::apply`](hydrate/text.rs):23-62`).
@@ -1458,6 +1647,30 @@ pub const Text = struct {
     /// as a separate `mark` action; `MarkSet.put` is idempotent, so applying
     /// both leaves the one value and there is no arm in which the mirror's
     /// marks depend on which of the two a stream happens to carry.
+    ///
+    /// **Three arms can leave partial changes when they fail or refuse.**
+    /// A caller that needs to know what the mirror holds after a non-`.ok`
+    /// answer needs the following rules:
+    ///
+    /// * `delete_seq` **removes the bounded span in one mutation**. Lengths
+    ///   past the end remove only what is there and report success; zero
+    ///   length and out-of-range starts change nothing. This UTF-8-backed
+    ///   mirror refuses boundaries that split a scalar (or a grapheme in
+    ///   grapheme mode) as [`Failure.invalid_encoding`]. Allocation failure
+    ///   and encoding refusal leave the whole action's text unchanged.
+    /// * `insert` splices **one value at a time**, so a refusal on the third
+    ///   value leaves the first two in the text. Invalid text encountered
+    ///   while resolving the insertion index is refused as
+    ///   [`Failure.invalid_encoding`].
+    /// * `put_seq` removes the unit at `a.index` **before** it splices the
+    ///   replacement, so a refusal from the splice leaves the text one unit
+    ///   shorter with nothing in its place. `splice_text` commits its splice
+    ///   first and stores its marks after, so an `error.OutOfMemory` from
+    ///   [`Text.putMarks`] leaves the text changed and the marks not all there.
+    /// * Every other arm either refuses before it writes or, for `mark`, has no
+    ///   partial state to leave: [`Text.putMark`] copies each name and payload
+    ///   before it stores either, so a failure leaves the marks already stored
+    ///   and the one that failed absent.
     pub fn apply(self: *Text, enc: TextEncoding, action: PatchAction) ApplyError!Applied {
         const out: Applied = switch (action) {
             .splice_text => |a| blk: {
@@ -1488,9 +1701,7 @@ pub const Text = struct {
                 break :blk .ok;
             },
             .delete_seq => |a| blk: {
-                for (0..a.length) |_| {
-                    self.removeAt(a.index) catch |e| break :blk encodingRefusal(e) orelse return e;
-                }
+                self.removeRange(a.index, a.length) catch |e| break :blk encodingRefusal(e) orelse return e;
                 break :blk .ok;
             },
             .mark => |a| blk: {
@@ -1552,6 +1763,98 @@ pub const Text = struct {
 
 // ── Hydration from the op set ────────────────────────────────────────────────
 
+/// The op-set surface [`hydrateMap`], [`hydrateList`], [`hydrateText`] and
+/// [`hydrateOp`] read, by name ([`assertSet`]).
+///
+/// **Six methods, and they are upstream's own.** `topOps` is
+/// `OpSet::top_ops` (`hydrate.rs`:251`), `opIdText` is `OpSet::to_string`
+/// (`hydrate.rs`:252`, `op_set.rs`:1093-1098`), `idToExid` is
+/// `OpSet::id_to_exid` (`hydrate.rs`:253`), `textEncoding` is the
+/// `text_encoding` field of `OpSet` (`op_set.rs`:64`) read out, and `text` and
+/// `calculateMarksAt` are `OpSet::text` (`hydrate.rs`:284`) and
+/// `OpSet::calculate_marks` (`automerge.rs`:1569-1573`).
+///
+/// **The list is one and not one per entry point**, because
+/// [`hydrateOp`] dispatches to the other three: a `Set` handed to
+/// [`hydrateMap`], [`hydrateList`] or [`hydrateOp`] reaches all six, and one
+/// type has to satisfy all four. [`hydrateText`] reads three of them and is
+/// checked against the same list, which costs a caller that wants only a text
+/// three declarations it will not call.
+pub const set_decls = [_][]const u8{
+    "topOps",
+    "opIdText",
+    "idToExid",
+    "textEncoding",
+    "text",
+    "calculateMarksAt",
+};
+
+/// The error set `OpSet.topOps` answers, written out because it is private
+/// to `op_set.zig` (`:188`) and [`assertSet`] has to name it.
+///
+/// It is `TopError` itself — the three sets `op_set.zig` composes it from, in
+/// the same three terms.
+const TopReadError = opiter.ReadOpError || InternalError || Error;
+
+/// The type `Set.topOps` yields once the error union is off.
+///
+/// **`OpSet.topOps` answers `TopError!Self.Winners`** (`op_set.zig`:2581`) and
+/// `Self.Winners` is the cursor's own type, so for a `Set` this file has never
+/// seen there is no way to write it down. [`assertSet`] takes it off the
+/// declaration instead, so what it checks is that the result is an error union
+/// and that the parameter list matches; the caller still names its own cursor
+/// in the one place it builds one.
+fn topOpsSuccess(comptime Set: type) type {
+    const R = @typeInfo(@TypeOf(@field(Set, "topOps"))).@"fn".return_type.?;
+    return switch (@typeInfo(R)) {
+        .error_union => |e| e.payload,
+        else => @compileError("op set " ++ @typeName(Set) ++
+            ".topOps must return an error union; OpSet.topOps answers TopError!Self.Winners" ++
+            " (op_set.zig:2581)"),
+    };
+}
+
+/// Fails to compile unless `Set` carries every declaration in
+/// [`set_decls`], and carries it with these signatures.
+///
+/// **This is the whole of the op-set contract in this file**, and it is a
+/// comptime check rather than a trait for the reason
+/// [`patches.assertDoc`](patches.zig) gives: every call site below resolves at
+/// comptime and inlines, so nothing here is dynamic and nothing here allocates.
+/// A `Set` that is missing a name gets one `@compileError` naming the
+/// declaration and this list, rather than a member error with no
+/// replacement — which is what the four signatures would otherwise publish as
+/// their entire contract.
+///
+/// **The signature checks are the point as much as the names**, the argument
+/// [`assertQueryTerm`](../opset/op_query.zig) makes. A `text` that answered a
+/// plain `[]const u8` would need an adapter inventing a free the walk does not
+/// describe; a `topOps` that took no `?Clock` could not answer a historical
+/// read at all; and a `calculateMarksAt` that dropped the clock would silently
+/// give a mirror built at past heads the present's marks, which is the mistake
+/// [`hydrateText`]'s own doc is about. [`topOpsSuccess`] says why its success
+/// type is the one thing not checked.
+pub fn assertSet(comptime Set: type) void {
+    inline for (set_decls) |name| {
+        if (!@hasDecl(Set, name)) {
+            @compileError("op set " ++ @typeName(Set) ++ " has no " ++ name ++
+                "; the reads hydrate.rs:244-302 make are in set_decls");
+        }
+    }
+    const top_ops: *const fn (*Set, ExId, ?Clock) TopReadError!topOpsSuccess(Set) = &Set.topOps;
+    const op_id_text: *const fn (*const Set, Allocator, OpId) Error![]u8 = &Set.opIdText;
+    const id_to_exid: *const fn (*const Set, OpId) ExId = &Set.idToExid;
+    const text_encoding: *const fn (*const Set) TextEncoding = &Set.textEncoding;
+    const text: *const fn (*Set, Allocator, ExId, ?Clock) TopReadError![]u8 = &Set.text;
+    const marks_at: *const fn (*Set, Allocator, ExId, ?Clock) TopReadError![]Mark = &Set.calculateMarksAt;
+    _ = top_ops;
+    _ = op_id_text;
+    _ = id_to_exid;
+    _ = text_encoding;
+    _ = text;
+    _ = marks_at;
+}
+
 /// The key a winner hangs by, as a string
 /// ([`OpSet::to_string(top.elemid_or_key())`](hydrate.rs):252`,
 /// `op_set2/op_set.rs`:1093-1098`).
@@ -1568,6 +1871,24 @@ fn winnerKey(comptime Set: type, set: *const Set, gpa: Allocator, key: KeyRef) E
 /// One walk over the register winners, in order. The conflict flag is the
 /// winner's own ([`Op.conflict`](opset/op.zig), read at `hydrate.rs`:254`) and
 /// the value is [`hydrateOp`].
+///
+/// **The caller owns the result, and `set` is borrowed for the call only.**
+/// Every byte the mirror holds — each key [`winnerKey`] produced and each
+/// value's payload — is copied on the way in ([`Map.putOwned`]), so the mirror
+/// outlives the next mutation of `set` and nothing in it points into the op
+/// set. Release it with **one** [`Value.deinit`], which frees the whole tree;
+/// [`Value`] says why a copy of the result is a move and not a second owner.
+///
+/// **On an error the caller owns nothing.** The map and every value built
+/// before the failure are released by the `errdefer` before the error leaves,
+/// so no tag of [`OpHydrateError`] returns a partial object: a map that is
+/// empty, a map that is short and a map that is complete are not three
+/// outcomes a caller has to tell apart. `gpa` is recorded on the containers and
+/// is never released here — the caller keeps it.
+///
+/// `clock` is borrowed too, for the call: it is a [`Clock`] view and the
+/// mirror holds no part of it. `Set` must carry [`set_decls`]; [`assertSet`]
+/// says what that means and fails the build naming what is missing.
 pub fn hydrateMap(
     comptime Set: type,
     set: *Set,
@@ -1575,6 +1896,7 @@ pub fn hydrateMap(
     obj: ExId,
     clock: ?Clock,
 ) OpHydrateError!Value {
+    assertSet(Set);
     var map = Map.init(gpa, obj);
     errdefer map.deinit();
     var tops = try set.topOps(obj, clock);
@@ -1590,6 +1912,29 @@ pub fn hydrateMap(
 }
 
 /// The mirror of `obj` as a list ([`OpSet::hydrate_list`](hydrate.rs):261-276`).
+///
+/// One walk over the register winners, in order; the conflict flag is the
+/// winner's own ([`Op.conflict`](opset/op.zig), read at `hydrate.rs`:271`) and
+/// the value is [`hydrateOp`]. The order of the winners **is** the element
+/// order, which is why there is no index to pass.
+///
+/// **The caller owns the result, and `set` is borrowed for the call only.**
+/// Every byte the mirror holds — each element's payload, and the name and
+/// payload of each mark [`List.push`] stores — is copied on the way in, so the
+/// mirror outlives the next mutation of `set` and nothing in it points into the
+/// op set. Release it with **one** [`Value.deinit`], which frees the tree and
+/// every element's mark set; [`Value`] says why a copy of the result is a move
+/// and not a second owner.
+///
+/// **On an error the caller owns nothing.** The list and every element built
+/// before the failure are released by the `errdefer` before the error leaves,
+/// so no tag of [`OpHydrateError`] returns a partial list: an empty list and a
+/// complete one are the only two answers. `gpa` is recorded on the containers
+/// and is never released here — the caller keeps it.
+///
+/// `clock` is borrowed for the call and the mirror holds no part of it. `Set`
+/// must carry [`set_decls`]; [`assertSet`] says what that means and fails the
+/// build naming what is missing.
 pub fn hydrateList(
     comptime Set: type,
     set: *Set,
@@ -1597,6 +1942,7 @@ pub fn hydrateList(
     obj: ExId,
     clock: ?Clock,
 ) OpHydrateError!Value {
+    assertSet(Set);
     var list = List.init(gpa, obj);
     errdefer list.deinit();
     var tops = try set.topOps(obj, clock);
@@ -1638,6 +1984,25 @@ pub fn hydrateList(
 /// that no longer exists in that state. [`OpSet.calculateMarksAt`]
 /// (opset/op_set.zig) is upstream's own dispatch over that clock, so this is
 /// upstream's rule applied to a fold the port added, not a second fold.
+///
+/// **The caller owns the result, and `set` is borrowed for the call only.**
+/// The text itself is a copy ([`Text.init`] dupes it) and every mark's name and
+/// payload is a copy too, both through [`Text.putMark`], so the mirror outlives
+/// the next mutation of `set` and nothing in it points into the op set. Release
+/// it with **one** [`Value.deinit`], which frees the text buffer, the mark set
+/// and the mark bytes; [`Value`] says why a copy of the result is a move and
+/// not a second owner. `gpa` is recorded on the text and is never released
+/// here — the caller keeps it — and `clock` is borrowed for the call.
+///
+/// **On an error the caller owns nothing.** The text built so far and its
+/// marks are released by the `errdefer` and the two buffers this function
+/// allocated for itself are freed by their `defer`s, so a failure after three
+/// marks and a failure after none are the same thing to the caller: no value.
+/// [`Text.init`] registers nothing itself, and its own failure to duplicate
+/// `text` leaves nothing to release either.
+///
+/// `Set` must carry [`set_decls`]; [`assertSet`] says what that means and
+/// fails the build naming what is missing.
 pub fn hydrateText(
     comptime Set: type,
     set: *Set,
@@ -1645,6 +2010,7 @@ pub fn hydrateText(
     obj: ExId,
     clock: ?Clock,
 ) OpHydrateError!Value {
+    assertSet(Set);
     const text = try set.text(gpa, obj, clock);
     defer gpa.free(text);
     var out = try Text.init(gpa, obj, set.textEncoding(), text);
@@ -1673,14 +2039,26 @@ pub fn hydrateText(
 /// walk — but it is reachable from a caller who hands this an arbitrary row, and
 /// a refusal is the right answer there.
 ///
-/// **The `set` arm borrows the op set, and the caller owns the result.**
-/// [`ownValue`] copies the payload the moment the value is stored, and the
-/// only two callers here ([`hydrateMap`], [`hydrateList`]) store through
-/// [`Map.putOwned`] and [`List.push`] at once, so nothing here is read past
-/// the end of a walk. A caller holding this `Value` on its own must copy it,
-/// or consume it, before the next mutation of `set` — which is what
-/// upstream's `'static` `Value` ([`hydrate.rs`](hydrate.rs):22-27`, over the
-/// owned [`ScalarValue`] at `value.rs`:519-522`) spares its callers.
+/// **The result is owned in one of two different ways, and which one the tag
+/// decides.** A `make` arm returns a container that was built here: it owns its
+/// storage, it is taken with `gpa`, and one [`Value.deinit`] frees all of it. A
+/// `.set` arm returns a scalar whose bytes are **the op set's, not the
+/// caller's** — [`Value.fromScalar`] copies nothing — so that `Value` owns no
+/// buffer at all, its `deinit` frees nothing, and the caller must copy or
+/// consume it before the next mutation of `set`. Upstream's `'static` `Value`
+/// ([`hydrate.rs`](hydrate.rs):22-27`, over the owned [`ScalarValue`] at
+/// `value.rs`:519-522`) has no such split, and [`Value`] spells out which
+/// release applies to which tag.
+///
+/// The two callers here ([`hydrateMap`], [`hydrateList`]) store through
+/// [`Map.putOwned`] and [`List.push`] at once, so nothing is read past the end
+/// of a walk and neither split is observable to them. `clock` is borrowed for
+/// the call. `Set` must carry [`set_decls`]; [`assertSet`] says what that means.
+///
+/// **On an error the caller owns nothing**: `error.InvalidOp` is the only tag
+/// this function raises for the row itself, and the four `make` arms forward
+/// the residue of the function they call — which is none, each of them
+/// releasing everything it had built before the error left.
 pub fn hydrateOp(
     comptime Set: type,
     set: *Set,
@@ -1688,6 +2066,7 @@ pub fn hydrateOp(
     op: opmod.Op,
     clock: ?Clock,
 ) OpHydrateError!Value {
+    assertSet(Set);
     const id = set.idToExid(op.id());
     return switch (op.action()) {
         .make_map => try hydrateMap(Set, set, gpa, id, clock),
@@ -3117,6 +3496,43 @@ test "an increment of a non-counter and a delete past the end are refused" {
     }
 }
 
+test "a delete_seq that runs out of elements refuses with the ones it removed already gone" {
+    const gpa = testing.allocator;
+    const to_list = [_]PathElem{.{ .obj = .root, .prop = .{ .key = "list" } }};
+
+    // **Five elements asked of a list of two.** The arm removes at `a.index`
+    // once per iteration, so it takes both and only then misses — and the two
+    // it took are gone. Counting them is the whole claim: a mirror that
+    // reported the refusal with its two elements still there would contradict
+    // the residue `Applied.refused` and `List.apply` promise, and a mirror
+    // that reported `.ok` would be upstream's silent under-delete instead.
+    var ps = try onePatch(gpa, sk_list, &to_list, .{ .delete_seq = .{ .index = 0, .length = 5 } });
+    defer ps.deinit();
+    var seed = try seeded(gpa);
+    defer seed.deinit();
+
+    // The list is read through its own accessor, and the pointer is taken
+    // before the removal because the register holding it is not the one that
+    // moved.
+    const l = &seed.value.object.map.get("list").?.object.list;
+    try testing.expectEqual(@as(usize, 2), l.count());
+
+    const f = try expectRefusal(&seed.value, &ps, "a delete of five over a list of two");
+    switch (f) {
+        .invalid_index => |i| try testing.expectEqual(@as(usize, 0), i),
+        else => {
+            std.debug.print("expected invalid_index, got {s}\n", .{@tagName(f)});
+            return error.TestUnexpectedResult;
+        },
+    }
+
+    // **Both elements are gone and the rest of the mirror is untouched**, so
+    // the residue is exactly the two removals and not a broken tree.
+    try testing.expectEqual(@as(usize, 0), l.count());
+    try testing.expectEqual(@as(usize, 3), seed.value.object.map.count());
+    try testing.expect(l.get(0) == null);
+}
+
 // ── 4. The expose queue, both arms ──────────────────────────────────────────
 
 const ex_list: ExId = .{ .id = opId(1, 0) };
@@ -3540,6 +3956,73 @@ test "constructing a mirror allocates only its own storage" {
     try testing.expectEqual(@as(usize, 1), counting.frees);
 }
 
+/// One `put_map` of `value` onto an empty root map built with `gpa`.
+///
+/// The patch is built with `testing.allocator` and never with `gpa`, so
+/// `checkAllAllocationFailures` counts only the allocations the **mirror** is
+/// responsible for: the copies [`Map.putOwned`] makes and the table slot it
+/// takes. Every one of them is on the critical path, so every failure index
+/// produces an `error.OutOfMemory` and the walk is deterministic.
+///
+/// **The value is passed in rather than written here** because the two shapes
+/// fail at different places and both matter: a `str` makes [`ownValue`] copy a
+/// buffer before the key is duped, and an object makes [`Value.fromPatch`]
+/// build a container before the same point. The mirror is read back through
+/// its public accessors, so a half-applied put cannot pass by agreeing with
+/// itself.
+fn putOntoRoot(gpa: Allocator, value: patches.Value, want: []const u8) !void {
+    var ps = try onePatch(testing.allocator, .root, &.{}, .{
+        .put_map = .{ .key = "k", .value = value, .obj = ex(90, 0), .conflict = false },
+    });
+    defer ps.deinit();
+
+    var m = Value.map(gpa);
+    defer m.deinit();
+
+    switch (try m.applyPatches(doc_enc, ps.slice())) {
+        .ok => {},
+        .refused => |f| {
+            std.debug.print("the put_map was refused: {s}\n", .{@tagName(f)});
+            return error.TestUnexpectedResult;
+        },
+    }
+    try testing.expectEqual(@as(usize, 1), m.object.map.count());
+    try testing.expectEqualStrings(want, m.object.map.get("k").?.asStr());
+}
+
+/// The object shape: a `put_map` whose payload is a **text object**, which is
+/// the one patch value [`Value.fromPatch`] builds a container for. An object
+/// renders as the replacement character, not as its text — [`Value.asStr`]
+/// says which arms do that, and this is the assertion that it still does.
+fn putObjectOntoRoot(gpa: Allocator) !void {
+    try putOntoRoot(gpa, .{ .object = .text }, "\u{fffc}");
+}
+
+/// The scalar shape: a `put_map` whose payload is a **string**, so the copy
+/// [`ownValue`] makes is a buffer the mirror really owns.
+fn putScalarOntoRoot(gpa: Allocator) !void {
+    try putOntoRoot(gpa, .{ .scalar = .{ .str = "payload" } }, "payload");
+}
+
+test "a put_map that cannot store its value leaves the mirror exactly as it was" {
+    // **The property is the contract, not the allocation.** `Map.putOwned`
+    // promises its caller that the register is still the caller's on an
+    // error, and `Map.apply` is that caller: it built a value, handed it over,
+    // and has to release it when the hand-over fails. `checkAllAllocationFailures`
+    // walks every acquisition on that path — the value's own copy, the key copy
+    // and the table's first slot — and `testing.allocator` behind it turns a
+    // dropped buffer into a failure rather than into a leak nobody sees.
+    //
+    // **At this revision the value `Value.fromPatch` builds owns no buffer at
+    // all**: every container it makes is empty, and `gpa.dupe(u8, "")` does
+    // not call the allocator, so the object arm cannot fail before the key copy
+    // and the two shapes differ only by that one copy. It is run anyway — the
+    // arm is typed fallible and stays so, and a mirror holding a half-stored
+    // register is the failure this pins.
+    try testing.checkAllAllocationFailures(testing.allocator, putObjectOntoRoot, .{});
+    try testing.checkAllAllocationFailures(testing.allocator, putScalarOntoRoot, .{});
+}
+
 // ── 9. Hydration from the op set ────────────────────────────────────────────
 
 /// The three objects [`os_first`] makes, which are the ids of the ops that
@@ -3718,7 +4201,7 @@ const RtDoc = struct {
 /// a list holding a map and a counter, a counter at the root, a text object with
 /// two marks of different types, and a key the second stage deletes.
 fn roundTripDoc(gpa: Allocator) !RtDoc {
-    var d = try rtdoc.Document.init(gpa, .auto);
+    var d = try rtdoc.Document.init(gpa, std.testing.io, .auto);
     errdefer d.deinit();
     d.setActorId(.{ .bytes = "0123456789abcdef" });
 
@@ -3920,7 +4403,7 @@ test "hydrate: an incremental stream deletes a key and marks a span, and the mir
 
 test "hydrate: a patch stream crosses an isolation the mirror was built before" {
     const gpa = testing.allocator;
-    var doc = try rtdoc.Document.init(gpa, .auto);
+    var doc = try rtdoc.Document.init(gpa, std.testing.io, .auto);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = "7f" });
 
@@ -4071,7 +4554,7 @@ test "hydrate: a register and an element own the bytes they were handed" {
 
 test "hydrate: two reads of one op set give two mirrors different bytes" {
     const gpa = testing.allocator;
-    var doc = try rtdoc.Document.init(gpa, .auto);
+    var doc = try rtdoc.Document.init(gpa, std.testing.io, .auto);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = "7f" });
 
@@ -4764,9 +5247,7 @@ test "a text takes an insert, takes a put_seq, and refuses text that is not text
     //
     // **U+1F600 is four UTF-8 code units, one code point and two UTF-16 code
     // units**, so a test in `unicode_code_point` cannot tell the two rules
-    // apart at all. **`utf8_code_unit` and not `utf16_code_unit`**: the UTF-16
-    // arm of [`byteOffset`](patches.zig):433-444` is a crash, not an offset —
-    // see the diff block at the foot of this file.
+    // apart at all. This test uses `utf8_code_unit` to distinguish them.
     {
         // **The first value is four units wide in this encoding**, so the index
         // the second value lands on is the claim.
@@ -4824,12 +5305,11 @@ test "a text takes an insert, takes a put_seq, and refuses text that is not text
 
     // **And the encoding refusal** — upstream's `InvalidEncoding`, which is
     // `splice_text_value`'s error turned into a [`Failure`] (`hydrate/text.rs`:32`,
-    // `hydrate.rs`:174`). **The only way to raise it is text that is not valid
-    // in the document's encoding**, because a patch's own text is spliced in
-    // without being read ([`ConcreteTextValue.splice`](patches.zig)) and an
-    // index past the end clamps rather than complaining
-    // ([`byteOffset`](patches.zig):419-449`). So the mirror starts out holding
-    // bytes no text can hold, and the walk over them is what fails.
+    // `hydrate.rs`:174`). This case exercises invalid stored bytes; the
+    // range-deletion regression below also checks unrepresentable boundaries
+    // in otherwise valid UTF-16 text. An index past the end clamps rather
+    // than complaining. Here the mirror starts out holding bytes no text can
+    // hold, and the walk over them is what fails.
     {
         var t = try Value.text(gpa, doc_enc, "\xffab");
         defer t.deinit();
@@ -4849,27 +5329,107 @@ test "a text takes an insert, takes a put_seq, and refuses text that is not text
     }
 }
 
-test "a document in three of the four encodings hydrates to the same bytes, and its marks are read by hand" {
+test "Text.apply delete_seq preserves the suffix after a supplementary scalar in every encoding" {
     const gpa = testing.allocator;
-    // **Every encoding that holds today, one at a time.** `Document.init` takes
+    const emoji = "\xf0\x9f\x98\x80";
+    for ([_]TextEncoding{ .unicode_code_point, .utf8_code_unit, .utf16_code_unit, .grapheme_cluster }) |enc| {
+        var text = try Text.init(gpa, .root, enc, "ab" ++ emoji ++ "cd");
+        defer text.deinit();
+        const applied = try text.apply(enc, .{ .delete_seq = .{
+            .index = enc.width("ab"),
+            .length = enc.width(emoji),
+        } });
+        switch (applied) {
+            .ok => {},
+            .refused => return error.TestUnexpectedResult,
+        }
+        try testing.expectEqualStrings("abcd", text.asStr());
+        try testing.expectEqual(enc.width("abcd"), text.count());
+    }
+}
+
+test "Text.apply delete_seq leaves the whole action unchanged on allocation refusal" {
+    for (0..2) |offset| {
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var text = try Text.init(gpa, .root, .unicode_code_point, "abcd");
+        defer text.deinit();
+        const old = text.value.bytes;
+        failing.fail_index = failing.alloc_index + offset;
+        const applied = text.apply(.unicode_code_point, .{ .delete_seq = .{ .index = 1, .length = 2 } });
+        failing.fail_index = std.math.maxInt(usize);
+        if (applied) |out| {
+            switch (out) {
+                .ok => {},
+                .refused => return error.TestUnexpectedResult,
+            }
+            try testing.expectEqualStrings("ad", text.asStr());
+        } else |failure| {
+            try testing.expectEqual(error.OutOfMemory, failure);
+            try testing.expectEqualStrings("abcd", text.asStr());
+            try testing.expectEqual(old.ptr, text.value.bytes.ptr);
+        }
+    }
+}
+
+test "Text.apply delete_seq refuses split UTF16 boundaries without changing text" {
+    const initial = "ab\xf0\x9f\x98\x80cd";
+    for ([_]struct { index: usize, length: usize }{
+        .{ .index = 2, .length = 1 },
+        .{ .index = 3, .length = 1 },
+    }) |span| {
+        var text = try Text.init(testing.allocator, .root, .utf16_code_unit, initial);
+        defer text.deinit();
+        const old = text.value.bytes;
+        const applied = try text.apply(.utf16_code_unit, .{ .delete_seq = .{
+            .index = span.index,
+            .length = span.length,
+        } });
+        switch (applied) {
+            .refused => |failure| switch (failure) {
+                .invalid_encoding => {},
+                else => return error.TestUnexpectedResult,
+            },
+            .ok => return error.TestUnexpectedResult,
+        }
+        try testing.expectEqualStrings(initial, text.asStr());
+        try testing.expectEqual(old.ptr, text.value.bytes.ptr);
+    }
+}
+
+test "Text.apply delete_seq clamps overshoot and preserves no-op buffers" {
+    for ([_]TextEncoding{ .unicode_code_point, .utf8_code_unit, .utf16_code_unit, .grapheme_cluster }) |enc| {
+        var text = try Text.init(testing.allocator, .root, enc, "ab\xf0\x9f\x98\x80cd");
+        defer text.deinit();
+        const old = text.value.bytes;
+        for ([_]struct { index: usize, length: usize }{
+            .{ .index = 1, .length = 0 },
+            .{ .index = std.math.maxInt(usize), .length = std.math.maxInt(usize) },
+        }) |span| {
+            switch (try text.apply(enc, .{ .delete_seq = .{ .index = span.index, .length = span.length } })) {
+                .ok => {},
+                .refused => return error.TestUnexpectedResult,
+            }
+            try testing.expectEqual(old.ptr, text.value.bytes.ptr);
+            try testing.expectEqualStrings("ab\xf0\x9f\x98\x80cd", text.asStr());
+        }
+        switch (try text.apply(enc, .{ .delete_seq = .{ .index = 2, .length = std.math.maxInt(usize) } })) {
+            .ok => {},
+            .refused => return error.TestUnexpectedResult,
+        }
+        try testing.expectEqualStrings("ab", text.asStr());
+        try testing.expectEqual(enc.width("ab"), text.count());
+    }
+}
+
+test "a document in all four encodings hydrates to the same bytes, and its marks are read by hand" {
+    const gpa = testing.allocator;
+    // **Every encoding, one at a time.** `Document.init` takes
     // the platform default ([`doc.zig`](doc.zig):2413-2415`) and that is a
     // code-point document on this host, so a test that only ever calls it
     // reaches [`TextEncoding.width`]'s first arm and no other.
-    //
-    // **`.utf16_code_unit` is named and not omitted, and the reason is a
-    // defect and not a gap in this test.** The UTF-16 arm of
-    // [`byteOffset`](patches.zig):433-444` hands the *whole remaining slice* to
-    // `std.unicode.utf8Decode`, and that function **panics** for a slice that
-    // is not one to four bytes long (`else => unreachable`, std
-    // `unicode.zig`:107) or that does not begin with a lead byte of exactly
-    // that length (`utf8Decode2`'s `assert`, `unicode.zig`:116). Both were
-    // measured, and the measured failure through *this* test was
-    // `reached unreachable code` from `Text.apply`'s `splice_text` arm
-    // ([`hydrate.zig`](hydrate.zig):1448) — **a UTF-16 document cannot be
-    // replayed into a mirror at all.** It is reported, not worked around, and
-    // the list below is the three that hold.
-    for ([_]TextEncoding{ .unicode_code_point, .utf8_code_unit, .grapheme_cluster }) |enc| {
-        var doc = try rtdoc.Document.initWithEncoding(gpa, enc, .auto);
+    for ([_]TextEncoding{ .unicode_code_point, .utf8_code_unit, .utf16_code_unit, .grapheme_cluster }) |enc| {
+        var doc = try rtdoc.Document.initWithEncoding(gpa, std.testing.io, enc, .auto);
         defer doc.deinit();
         doc.setActorId(.{ .bytes = "0123456789abcdef" });
         const text = try rttrans.putObject(&doc, .root, .{ .key = "text" }, .text);
@@ -4897,8 +5457,7 @@ test "a document in three of the four encodings hydrates to the same bytes, and 
 
         // **The bytes are the document's, whatever the encoding measured them
         // in.**
-        const t = asText(rootMap(&mirror).get("text") orelse return error.TestUnexpectedResult)
-            orelse return error.TestUnexpectedResult;
+        const t = asText(rootMap(&mirror).get("text") orelse return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
         try testing.expectEqualStrings("a\xf0\x9f\x98\x80b", t.asStr());
         // **And the length is the encoding's**, read back off the mirror's own
         // text and not off the string: this is the assertion that says the
@@ -5272,23 +5831,8 @@ test "two marks on one element, and the second one does not lose the first" {
 //   refusal costs one branch and its removal would turn a future refactor of
 //   the guard into a crash.
 //
-// * **`.utf16_code_unit` is a defect in `src/patches.zig` and not a gap in this
-//   file, and it is measured.** The UTF-16 arm of
-//     [`byteOffset`](patches.zig):433-444` hands the *whole remaining slice* to
-//   `std.unicode.utf8Decode`, which **panics** for a slice that is not one to
-//   four bytes long (`else => unreachable`, std `unicode.zig`:107) or that does
-//   not begin with a lead byte of exactly that length (`utf8Decode2`'s
-//   `assert`, `unicode.zig`:116). Both were measured with a two-line program,
-//   and the measured failure through §12's own test was
-//   `reached unreachable code` from [`Text.apply`]'s `splice_text` arm
-//   (`:1464`) — **so a UTF-16 document cannot be replayed into a mirror at
-//   all.** The encoding loop therefore names the fourth encoding and says why
-//   it is not in the list. The fix is in `patches.zig` and is not this file's
-//   to make: `utf8ByteSequenceLength` first, then `utf8Decode` on exactly
-//   `bytes[i..][0..n]`.
-//
 // * **`Text.eql` is `asStr()` alone, and §12 does not use it.** Every mark
 //   assertion in the new tests is made against the name and the value by
-//   hand, and the three-encoding loop says so in as many words: a mirror whose
+//   hand, and the four-encoding loop says so in as many words: a mirror whose
 //   marks were dropped entirely passes a comparison written with that helper,
 //   which is why the round trip may use it and this section may not.

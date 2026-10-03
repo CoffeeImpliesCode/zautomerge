@@ -843,7 +843,10 @@ The `exemplar` is a fixed input document whose *interpretation* is specified in 
 
 **Iterators -> methods, not `Iterator`.** `AMitems` is a random-access cursor, not a Rust `Iterator`: `next(n)` gets-then-advances, `prev(n)` advances-then-gets (`src/items.rs:69-93`). A `Iterator` interface + `next()` cannot express the `n`-step form. Model it as `amItemsNext(items: *AMitems, n: isize) ?*AMitem` and port the `Detail` arithmetic verbatim, including the reversed-encoding-by-negative-offset trick (`:36-59`) and the `is_stopped` bound `offset < -len || offset == len` (`:80-83`).
 
-**`to_result` / `Box::into_raw` -> allocator-generic `create`.** The Rust code uses the global allocator (`Box`). A Zig port should thread an `std.mem.Allocator` through — every `*mut AMresult` returned by the 166 exports is a heap allocation whose matching free is `AMresultFree`, so a single `_ = gpa.create(AMresult)` + `gpa.destroy` pair is the whole story. Making the allocator a parameter is a strict improvement and costs one extra argument on ~90 functions.
+**C allocation preserves the ABI.** The port keeps the header's signatures without allocator or I/O arguments.
+The C bridge uses libc allocation and one process-wide, single-threaded I/O provider.
+`AMresultFree` releases result-owned state. Standalone stack and string allocations have the separate release rules in `include/automerge.h`.
+Native Zig entry points retain explicit allocator and capability contracts.
 
 **`Result<T, E>` -> error unions.** Straightforward inside Zig. But the C ABI deliberately *erases* `E` into a string (`AMresult::error(&e.to_string())`, `src/result.rs:12-14` and ~35 `From` impls). A Zig C ABI should keep the erase-to-string behaviour for compatibility while retaining the typed error internally.
 
@@ -851,9 +854,15 @@ The `exemplar` is a fixed input document whose *interpretation* is specified in 
 
 **`HashMap<Datatype, ExternalTypeConstructor>` -> `std.StringHashMap`.** `src/lib.rs:450`; in a Zig port this only exists in the wasm layer, which is out of scope for a native port.
 
-**`unsafe` blocks and their invariants.** Every `extern "C"` fn in the crate is `unsafe`; the invariants are (1) non-null pointers are valid and live, (2) `AMbyteSpan.src` points to at least `count` bytes, (3) borrowed sub-handles outlive neither their `AMresult` nor a reallocation of it, (4) the `*mut` accessors need a uniquely-owned `Rc`. A Zig port should document these as `!` on the function plus a `/// Safety:`-style note; Zig has no `unsafe fn`, so the only enforcement is convention.
+**Pointer validity remains a caller obligation.** Non-NULL pointers must identify live storage with the documented size and lifetime.
+The header specifies NULL answers, borrowed-handle invalidation, and release functions.
+Every C call requires global caller serialization, including calls on different documents.
 
-**`no_mangle` + `cbindgen` codegen has no Zig equivalent.** The entire header is *generated* by a third-party tool from doc comments, then regex-patched twice (`CMakeLists.txt:141-159`). A Zig port should hand-write `automerge.h` (or generate it with `zig translate-c`, which handles `export fn` + `callconv(.C)` + `extern struct` but **not** the `#[repr(C)] enum` non-sequential tags, and **not** the `union(enum)` `AMresult` layout needed for a stable pointer-only ABI). A hand-written header plus `comptime` layout assertions is the safer route.
+**The port ships a hand-written header.** `zig translate-c` translates C into Zig. It does not generate C declarations from Zig exports.
+`test/c/cabi.zig` imports the real header and checks all function ABI signatures, enum values, and by-value layouts.
+`src/c/root.zig` is the separate production library root.
+`zig build` installs the static library and header.
+These checks certify only the target and compiler configuration in which they run.
 
 ### Constructs with no clean Zig equivalent in this slice
 

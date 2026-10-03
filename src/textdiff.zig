@@ -614,6 +614,10 @@ pub fn Replace(comptime D: type) type {
             }
         }
 
+        /// Buffers the equal run and flushes any buffered delete and insert
+        /// first, so a consumer sees `equal` events in the order the diff
+        /// produced them. Adjacent `equal` events coalesce into one
+        /// (`text_diff/replace.rs:41-46`, `:34-39`).
         pub fn equal(self: *Self, old_index: usize, new_index: usize, len: usize) !void {
             try self.flushDelIns();
             self.eq = if (self.eq) |e|
@@ -622,6 +626,16 @@ pub fn Replace(comptime D: type) type {
                 .{ .old_index = old_index, .new_index = new_index, .new_len = len };
         }
 
+        /// Buffers the deleted run, flushing any equal run first
+        /// (`text_diff/replace.rs:28-32`).
+        ///
+        /// **The contiguity precondition is asserted, not validated**
+        /// (`text_diff/replace.rs:98-103`): `old_index` must be the position
+        /// the buffered delete stopped at, which [`diff`] guarantees by
+        /// producing contiguous, increasing events. `std.debug.assert` is a
+        /// programmer precondition — it is compiled out in `ReleaseFast` and
+        /// `ReleaseSmall`, where a violated contract folds two runs into one
+        /// instead of trapping.
         pub fn delete(self: *Self, old_index: usize, old_len: usize, new_index: usize) !void {
             try self.flushEq();
             if (self.del) |del| {
@@ -636,6 +650,13 @@ pub fn Replace(comptime D: type) type {
             }
         }
 
+        /// Buffers the inserted run, flushing any equal run first
+        /// (`text_diff/replace.rs:33-35`).
+        ///
+        /// **The contiguity precondition is asserted, not validated**, on the
+        /// new side this time (`text_diff/replace.rs:114-117`): `new_index`
+        /// must be where the buffered insert stopped, with the same
+        /// `std.debug.assert` caveat as [`delete`].
         pub fn insert(self: *Self, old_index: usize, new_index: usize, new_len: usize) !void {
             try self.flushEq();
             self.ins = if (self.ins) |ins| run: {
@@ -648,11 +669,19 @@ pub fn Replace(comptime D: type) type {
             } else .{ .old_index = old_index, .new_index = new_index, .new_len = new_len };
         }
 
+        /// Forwards one replacement immediately
+        /// (`text_diff/replace.rs:36-37`). **This is the event a consumer's own
+        /// hook sees for an adjacent delete and insert**: the two are folded
+        /// into one `replace` by the buffered runs, not by two calls here.
         pub fn replace(self: *Self, old_index: usize, old_len: usize, new_index: usize, new_len: usize) !void {
             try self.flushEq();
             try self.d.replace(old_index, old_len, new_index, new_len);
         }
 
+        /// Flushes every buffered run, in the order `equal`, then the combined
+        /// delete-and-insert, then the wrapped hook's own `finish`
+        /// (`text_diff/replace.rs:40`). **A diff that returns without this has
+        /// emitted nothing**, because the last runs are still buffered.
         pub fn finish(self: *Self) !void {
             try self.flushEq();
             try self.flushDelIns();
@@ -712,8 +741,8 @@ pub fn BlockOrGrapheme(comptime Block: type) type {
 ///
 /// The marks a `Text` span carries (`text_diff.rs:181`) are not here, because
 /// the diff drops them (`text_diff.rs:478-485`); they are the subject of the
-/// second pass, `apply_marks_diff` (`text_diff.rs:165-248`), which belongs with
-/// the `marks` module.
+/// mark pass, which is **not** in this module. See [`myersBlockDiff`] for
+/// where a consumer runs it.
 pub fn BlockOrText(comptime Block: type) type {
     return union(enum) {
         /// `Span::Block` (`text_diff.rs:479`).
@@ -724,8 +753,13 @@ pub fn BlockOrText(comptime Block: type) type {
 }
 
 /// `span_as_grapheme` (`text_diff.rs:475-488`): expands spans into blocks and
-/// grapheme clusters, which is the new side of a block diff. The caller frees
-/// the list with the same allocator.
+/// grapheme clusters, which is the new side of a block diff.
+///
+/// **The returned list owns its array and none of its payloads.** Only the
+/// `.grapheme` entries borrow: they are subslices of `spans[i].text`, cut by
+/// [`graphemes`], so the caller's spans must stay alive and unmodified for as
+/// long as the list is read. The caller frees the list itself with the same
+/// allocator.
 pub fn spanAsGrapheme(
     gpa: Allocator,
     comptime Block: type,
@@ -761,8 +795,18 @@ pub fn spanAsGrapheme(
 /// | `textEncoding() TextEncoding` | `doc.text_encoding` (`text_diff.rs:26`) |
 /// | `spliceText(obj, index, del, insert) !void` | `tx.splice_text` (`text_diff.rs:85-92`) |
 ///
-/// The slice `textFor` returns belongs to the sink and stays valid for the
-/// call.
+/// **What a `Sink` owes this hook, all four obligations in one place.**
+///
+/// | | |
+/// |---|---|
+/// | **arguments** | `obj` is the object every call in one run names; `index` and `del` are in the object's own encoding, the one `textEncoding()` reports; `insert` is the text to add, already counted in that encoding. |
+/// | **validity window** | the slice `textFor` returns stays valid for the whole of [`myersDiff`], not for one call — the grapheme array is cut from it — and **the `insert` slice dies when `spliceText` returns.** [`TxHook.insert`] and [`TxHook.replace`] build it with `gpa` and free it in the same statement, and [`BlockDiffHook.insert`] passes a buffer it frees on return, so a sink that queues the slice for later reads freed memory. Copy it if it has to outlive the call. |
+/// | **thread** | every method is called on the thread that called [`myersDiff`] or [`myersBlockDiff`], inside that call, before it returns. Nothing here hops threads and no callback is deferred. |
+/// | **reentry** | the callee may call back into the hook or the sink, but not into the diff currently running: the hook's `idx` is a running position and a second walk over the same object would interleave splices at the wrong offsets. Reentering the *sink's own* document with a different object is what a sink that dispatches on `obj` already does. |
+///
+/// The two slice obligations are the ones a caller gets wrong: `textFor`'s
+/// result is read long after the call that produced it, and `insert`'s is dead
+/// the moment the call returns.
 pub fn TxHook(comptime Sink: type) type {
     return struct {
         const Self = @This();
@@ -1070,9 +1114,19 @@ pub fn BlockDiffHook(comptime Sink: type, comptime Block: type) type {
 /// the `iter` types this module does not own. `new_spans` is the target, and
 /// this function expands it (`text_diff.rs:147`).
 ///
-/// Upstream then runs a second pass over the marks (`apply_marks_diff`,
-/// `text_diff.rs:165-248`), which belongs with the `marks` module; call it
-/// after this returns.
+/// `old` and `new_spans` are **borrowed for the whole call and for everything
+/// it emits**: the hook's events hand `old`'s graphemes straight to the sink,
+/// and the new side is expanded from `new_spans` into graphemes that borrow the
+/// spans' own text, so both must outlive this call.
+///
+/// **The mark pass is not here.** Upstream runs a second pass over the marks
+/// after this one (`apply_marks_diff`, `text_diff.rs:165-248`), and this module
+/// does not publish it — it needs the `marks` and `iter` types this module does
+/// not own. The port runs it inside the transaction instead:
+/// [`Transaction.updateSpansWithConfig`](transact.zig) and the free
+/// [`transact.updateSpansWithConfig`](transact.zig) both call this function for
+/// the first pass and apply the mark diff for the second, so a consumer never
+/// sequences the two by hand.
 pub fn myersBlockDiff(
     gpa: Allocator,
     comptime Sink: type,

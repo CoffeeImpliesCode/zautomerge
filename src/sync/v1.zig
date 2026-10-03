@@ -81,7 +81,7 @@ const ChangeHash = types.ChangeHash;
 const Document = docmod.Document;
 
 /// Everything a call in this file can return, and it is the same set
-/// `protocol.zig` returns (`ProtocolError`, `protocol.zig:65-69`): a v1 message
+/// `protocol.zig` returns (`ProtocolError`, `protocol.zig:84-88`): a v1 message
 /// is a v2 message with two fields held at their v1 values.
 pub const ProtocolError = docmod.DocumentError || err.Error || err.InternalError;
 
@@ -92,7 +92,7 @@ pub const ProtocolError = docmod.DocumentError || err.Error || err.InternalError
 /// byte of `0x42`, a heads list, a need list, a have list, a change list and
 /// nothing else (`v1_compat_test/mod.rs:427-444`), which is exactly `Message`
 /// with `version == .v1` and `flags == null`: `Message.encode` writes the flags
-/// section last and only when `flags` is set (`message.zig:454`), so the two
+/// section last and only when `flags` is set (`message.zig:512`), so the two
 /// encoders agree byte for byte.
 pub const Message = msg.Message;
 
@@ -126,15 +126,30 @@ pub const message_type_sync: u8 = msg.message_type_sync;
 /// `BTreeSet` — the same representation `sync/state.rs` uses, and the same
 /// reason: [`State.insertSent`] puts a hash in its sorted place and the receive
 /// path rebuilds the list by filtering, so it stays a set.
+///
+/// Single-threaded, as every type here is: no lock and no callback, so two
+/// threads on one peer need external synchronization, and nothing reenters. A
+/// copy names the same allocations as the original, so one state per peer is
+/// deinited once.
 pub const State = struct {
+    /// The allocator every list in the state was taken from and is released
+    /// with. Borrowed, not owned: it must outlive the state, and `deinit` and
+    /// the allocating calls on it all use it.
     gpa: Allocator,
     /// The hashes both peers are known to have (`v1_compat_test/state.rs:35`).
+    /// **Ascending and duplicate-free**, because that is the order
+    /// `message.advanceHeads` produces and the order a later `sync.State`
+    /// would assert on.
     shared_heads: []ChangeHash = &.{},
-    /// The heads we last sent (`v1_compat_test/state.rs:36`).
+    /// The heads we last sent (`v1_compat_test/state.rs:36`). Ascending,
+    /// because it comes from the document's own heads.
     last_sent_heads: []ChangeHash = &.{},
-    /// The heads we last received (`v1_compat_test/state.rs:37`).
+    /// The heads we last received (`v1_compat_test/state.rs:37`), **in the
+    /// order the peer wrote them**: the format does not require them to be
+    /// ascending, and `Message.parse` does not sort.
     their_heads: ?[]ChangeHash = null,
-    /// What they last asked for (`v1_compat_test/state.rs:38`).
+    /// What they last asked for (`v1_compat_test/state.rs:38`), in the order
+    /// the peer wrote them, as above.
     their_need: ?[]ChangeHash = null,
     /// What they last said they had (`v1_compat_test/state.rs:39`).
     their_have: ?[]Have = null,
@@ -192,6 +207,12 @@ pub const State = struct {
     /// What the peer last told us, or null before it has said anything
     /// (the `if let (Some(their_have), Some(their_need))` at
     /// `v1_compat_test/mod.rs:61-64`).
+    ///
+    /// The two slices inside the result **borrow from this state**; the type
+    /// comment on [`Their`] names what invalidates them and who releases the
+    /// `Have` records. `null` means one of the two lists has never been set,
+    /// which is the state a fresh peer is in until it has received a message.
+    /// [`generateSyncMessage`] reads it and keeps nothing from it.
     pub fn their(self: *const State) ?Their {
         const have = self.their_have orelse return null;
         const need = self.their_need orelse return null;
@@ -218,15 +239,32 @@ pub const State = struct {
 /// The message carries **no flags**, which is the reason a v1 peer stays a v1
 /// peer: the peer's capability list is replaced from the flags section and
 /// replaced with nothing (`sync.rs:404-411`), so it never learns that v2 exists.
+///
+/// **The caller owns a non-null result** and releases it with
+/// `Message.deinit`, or hands it to [`receiveSyncMessage`], which frees it and
+/// moves `heads`, `need` and `have` into `state`. `null` owns nothing. The
+/// `Message` carries `state`'s own `gpa`, which must be the allocator `state`
+/// and `doc` were built with.
+///
+/// **What an error leaves behind.** Nothing this call allocated survives it:
+/// the three lists and the builder are released before the error returns, and
+/// `state` is never left holding a freed list, because `last_sent_heads` is
+/// replaced only from an allocation that completed first
+/// (`v1_compat_test/mod.rs:100-104`). Nothing is rolled back past that point,
+/// so a caller that retries may find `have_responded` already set and
+/// `sent_hashes` already extended by the hashes that went in before the
+/// failure. What no error path reaches is the tail: `in_flight` is never set.
 pub fn generateSyncMessage(
     gpa: Allocator,
     doc: *Document,
     state: *State,
 ) ProtocolError!?Message {
-    // No `errdefer` on this one: it is **moved** into the builder below and
-    // copied into the reset, and an `errdefer` that only runs on failure is a
-    // double free on every error path once the builder owns it.
-    const our_heads = try doc.getHeads(gpa);
+    // Owned here and **moved** into the builder below. The guard is emptied at
+    // each hand-over — the reset arms and `setHeads` — because an `errdefer`
+    // reads its local when the function unwinds, and a guard that still named
+    // a list the builder owns would free it on every error path from there on.
+    var our_heads = try doc.getHeads(gpa);
+    errdefer gpa.free(our_heads);
 
     // `v1_compat_test/mod.rs:29`. The **queue is chained in front of the peer's
     // heads**, which is what `get_missing_deps` means (`automerge.rs:2289-2292`)
@@ -257,15 +295,21 @@ pub fn generateSyncMessage(
         if (their_have.len > 0) {
             for (their_have[0].last_sync) |hash| {
                 if (!try canRebuild(gpa, doc, hash)) {
-                    // The reset carries none of what was computed above, so both
-                    // lists are released here rather than left to an `errdefer`
-                    // that only runs on failure.
-                    const reset = v1Reset(gpa, our_heads) catch |e| {
-                        gpa.free(our_need);
-                        freeHaves(gpa, our_have);
-                        gpa.free(our_heads);
-                        return e;
-                    };
+                    // `v1Reset` **borrows** `our_heads` — it dupes them into
+                    // its own list — so the reset owns none of what was
+                    // computed above, and all three lists are released here.
+                    //
+                    // The `errdefer`s do **not** do it on this path: this is a
+                    // successful return, and an `errdefer` that only runs on
+                    // failure is a leak on every early return.
+                    //
+                    // `try`, not a `catch` that frees: the failure path leaves
+                    // all three to the armed `errdefer`s, so each is freed
+                    // exactly once either way. A `catch` that freed them here
+                    // would free them twice, and a `catch` that emptied the
+                    // locals instead would lose the only owner and leak all
+                    // three.
+                    const reset = try v1Reset(gpa, our_heads);
                     gpa.free(our_need);
                     freeHaves(gpa, our_have);
                     gpa.free(our_heads);
@@ -311,10 +355,14 @@ pub fn generateSyncMessage(
     builder.setHeads(our_heads);
     builder.setNeed(our_need);
     builder.setHave(our_have);
+    // The three guards above read these locals at unwind time, and the builder
+    // owns all three lists from here on, so they are emptied before anything
+    // else can fail.
+    our_heads = &.{};
     our_need = &.{};
     our_have = &.{};
     // No flags. `Message.encode` writes the section only when it is set
-    // (`message.zig:454`), which is what pins this peer to v1.
+    // (`message.zig:512`), which is what pins this peer to v1.
 
     // `v1_compat_test/mod.rs:71-98`, in full. Both comparisons are order
     // sensitive, as upstream's `Vec` equality is. **There is no read-only arm**,
@@ -360,11 +408,28 @@ pub fn generateSyncMessage(
 ///    (`v1_compat_test/mod.rs:214-233`).
 ///
 /// **A message that arrived with a V2 type byte is not detectable here.**
-/// `Message.decode` accepts both (`message.zig:381-389`) and this function is
+/// `Message.decode` accepts both (`message.zig:432-440`) and this function is
 /// handed an already decoded struct with no type byte left to look at, so a
 /// caller that reads a v2 message with it produces a v1 exchange carrying a flags
 /// section this peer must not write. [`decodeV1`] is the reader a caller on a
 /// v1-only link wants, and it is the only way to get the type byte checked.
+///
+/// **What an error leaves behind.** `in_flight` is cleared on every path, and
+/// `message` is freed on every path including the error one. Everything else
+/// is in the order above, so an error reaches the caller with whichever of
+/// these had already happened:
+///
+/// * `shared_heads` is replaced only from an allocation that completed first,
+///   so it is either the old list or the new one and never a freed pointer.
+/// * **`sent_hashes` is the one field an error can empty**: it is cleared
+///   before the pruned list is appended and the append is the fallible step
+///   (`v1_compat_test/mod.rs:208`). An emptied set costs a resend, not a wrong
+///   answer.
+/// * `their_have`, `their_heads` and `their_need` still hold what they held
+///   before the call. The hand-over is the last thing the function does, and
+///   nothing after it can fail.
+/// * `doc` is whatever `Document.loadIncremental` made it, which is that
+///   function's own contract and not restated here.
 pub fn receiveSyncMessage(
     gpa: Allocator,
     doc: *Document,
@@ -372,11 +437,14 @@ pub fn receiveSyncMessage(
     message: Message,
 ) ProtocolError!void {
     state.in_flight = false;
-    const before_heads = try doc.getHeads(gpa);
-    defer gpa.free(before_heads);
-
+    // The message is this call's from the first statement, so its guard is
+    // armed **before** the first fallible one, for the reason the v2 receive
+    // path gives: `getHeads` used to fail with the message owned by nobody.
     var owned = message;
     errdefer owned.deinit();
+
+    const before_heads = try doc.getHeads(gpa);
+    defer gpa.free(before_heads);
 
     // `v1_compat_test/mod.rs:194-205`.
     const changes_is_empty = owned.changes.isEmpty();
@@ -421,7 +489,11 @@ pub fn receiveSyncMessage(
             if (try canRebuild(gpa, doc, head)) try known.append(gpa, head);
         }
         if (known.items.len == owned.heads.len) {
-            const all = try gpa.dupe(ChangeHash, owned.heads);
+            // We can rebuild everything the peer claims, so its heads are
+            // ours — as a **set**, and sorted: the wire order is the peer's to
+            // choose, and `shared_heads` is documented as the ascending,
+            // duplicate-free list `message.advanceHeads` produces.
+            const all = try sortedUniqueHeads(gpa, owned.heads);
             gpa.free(state.shared_heads);
             state.shared_heads = all;
             if (owned.heads.len == 0) {
@@ -471,13 +543,21 @@ pub fn receiveSyncMessage(
 /// Upstream's v1 decoder checks the type byte against its own constant and
 /// nothing else (`v1_compat_test/mod.rs:368-374`), so a v2 message is a
 /// `WrongType` there. This one parses with the shared reader — which accepts both
-/// bytes (`message.zig:381-389`) and is total over them — and then applies the
+/// bytes (`message.zig:432-440`) and is total over them — and then applies the
 /// same check. The parse is total; the *type* check is what makes the result a v1
 /// message.
 ///
 /// **`error.InvalidMagic` is the refusal**, which is the same answer the shared
 /// reader gives for a byte that is neither type. Every other parse failure
 /// propagates unchanged.
+///
+/// **The caller owns the result** and frees it with `Message.deinit`, or hands
+/// it to [`receiveSyncMessage`], which frees it and moves three of its lists
+/// into the state. `bytes` is borrowed and left alone; a message that came
+/// from a v1 peer still arrives in whatever order that peer wrote its heads,
+/// because the shared reader does not sort them. On the refusal and on any
+/// parse error the message built so far is released and nothing is handed
+/// over.
 pub fn decodeV1(gpa: Allocator, bytes: []const u8) err.ParseError!Message {
     const parsed = try msg.Message.decode(gpa, bytes);
     errdefer {
@@ -491,7 +571,7 @@ pub fn decodeV1(gpa: Allocator, bytes: []const u8) err.ParseError!Message {
 // --- internals --------------------------------------------------------------
 
 /// A change as the builder sees it: the framed chunk and its hash
-/// (`ChangePayload`, `protocol.zig:81-92`, over `Change::raw_bytes`,
+/// (`ChangePayload`, `protocol.zig:100-106`, over `Change::raw_bytes`,
 /// `sync/message_builder.rs:30`).
 const ChangePayload = protocol.ChangePayload;
 
@@ -571,6 +651,29 @@ fn hashesEqual(a: []const ChangeHash, b: []const ChangeHash) bool {
         if (!x.eql(y)) return false;
     }
     return true;
+}
+
+/// `heads` as a head set: ascending and duplicate-free.
+///
+/// A list that came off the wire is in the peer's order — `Message.parse`
+/// appends in wire order and never sorts (`message.zig:640-645`) — and
+/// `shared_heads` is documented as a sorted set, because that is the order
+/// `message.advanceHeads` produces and the order `message.encodeHashes`
+/// asserts. `heads` is borrowed and left alone; the caller owns the result.
+fn sortedUniqueHeads(gpa: Allocator, heads: []const ChangeHash) ![]ChangeHash {
+    var sorted: std.ArrayList(ChangeHash) = .empty;
+    errdefer sorted.deinit(gpa);
+    try sorted.appendSlice(gpa, heads);
+    std.mem.sort(ChangeHash, sorted.items, {}, ChangeHash.lessThan);
+    var kept: usize = 0;
+    for (sorted.items) |head| {
+        if (kept == 0 or !sorted.items[kept - 1].eql(head)) {
+            sorted.items[kept] = head;
+            kept += 1;
+        }
+    }
+    sorted.shrinkRetainingCapacity(kept);
+    return sorted.toOwnedSlice(gpa);
 }
 
 /// Frees a list of `have` records and the list.
@@ -817,7 +920,7 @@ fn carriesDocument(m: *const Message) bool {
 /// are the reference's own change chunks: see the note on `fixture_paths` for
 /// why this file cannot commit a change of its own.
 fn docWith(gpa: Allocator, parts: []const []const u8) !Document {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = "cccccccccccccccccccccccccccccccc" });
     for (parts) |part| _ = try doc.loadIncremental(gpa, part);
@@ -827,7 +930,7 @@ fn docWith(gpa: Allocator, parts: []const []const u8) !Document {
 /// An empty document with the same actor id as [`docWith`], so the only
 /// difference between the two is what they hold.
 fn emptyDoc(gpa: Allocator) !Document {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = "cccccccccccccccccccccccccccccccc" });
     return doc;
@@ -1398,7 +1501,7 @@ test "a v1 peer refuses a v2 message" {
     // A truncated body is a `ParseError` and never a trap. **Every truncation is
     // `LengthExceedsInput`, not `UnexpectedEnd`**, and that is the better answer:
     // each declared count is proved against what is left before a single byte is
-    // taken (`parse.rs:234`, `message.zig:599`), so the reader declines the length
+    // taken (`parse.rs:234`, `message.zig:653`), so the reader declines the length
     // rather than discovering the shortage one element at a time. Two of them,
     // one mid-head and one mid-flags, to show both sites refuse.
     try testing.expectError(error.LengthExceedsInput, decodeV1(gpa, reference[0..20]));
@@ -1463,6 +1566,158 @@ test "a v1 reset is a reset with no flags section" {
     try testing.expectEqualSlices(u8, v1_bytes, generated_bytes);
 }
 
+/// Generation for a peer whose **first** `have` names a change this document
+/// cannot rebuild, for the allocation-failure test below.
+fn generateV1ResetArm(gpa: Allocator) !void {
+    const chain = try readFixture(gpa, two_changes_fixture);
+    defer gpa.free(chain);
+    var doc = try docWith(gpa, &.{chain});
+    defer doc.deinit();
+    var state = State.new(gpa);
+    defer state.deinit();
+
+    const heads = try doc.getHeads(gpa);
+    defer gpa.free(heads);
+    // A peer advertising a head this document cannot rebuild. That head goes on
+    // our `need` list (`v1_compat_test/mod.rs:29`) and, because the peer
+    // advertised exactly what we need, on our `have` list too
+    // (`v1_compat_test/mod.rs:38-42`). **So all three locals the reset arm
+    // releases are real allocations** and the three guards above them are armed
+    // with something to free — the only way a guard can be shown to free the
+    // wrong thing.
+    const unknown = ChangeHash{ .bytes = @splat(0x5a) };
+    state.their_heads = try gpa.dupe(ChangeHash, &.{unknown});
+
+    // Only the **first** `have` is inspected (`v1_compat_test/mod.rs:45-47`), so
+    // this is one record and not a list, and its `last_sync` names the same
+    // change the peer advertised.
+    var slots: []Have = try gpa.alloc(Have, 1);
+    errdefer gpa.free(slots);
+    slots[0] = Have.empty(gpa);
+    slots[0].last_sync = try gpa.dupe(ChangeHash, &.{unknown});
+    state.their_have = slots;
+    // The state owns the list from here on and `deinit` releases it on every
+    // path below, so the guard above is emptied rather than left to fire a
+    // second time.
+    slots = &.{};
+
+    var reset = (try generateSyncMessage(gpa, &doc, &state)) orelse
+        return error.TestUnexpectedResult;
+    defer reset.deinit();
+    // The reset carries our heads **copied**, which is the proof that `v1Reset`
+    // borrows the argument rather than taking it over.
+    try testing.expectEqual(heads.len, reset.heads.len);
+    for (heads, reset.heads) |want, got| try testing.expect(want.eql(got));
+    try testing.expectEqual(@as(usize, 1), reset.have.len);
+}
+
+test "the v1 reset arm releases its lists once under every allocation failure" {
+    const gpa = testing.allocator;
+    // `v1Reset` borrows `our_heads` and allocates twice itself, so the arm has
+    // two returns that each release all three locals and one failure path that
+    // must release them exactly once. The `errdefer`s handle the failure path
+    // and the explicit frees handle the success path; a `catch` that freed as
+    // well freed them twice, and one that emptied the locals instead leaked all
+    // three. Neither shows up in a test that only ever succeeds, because the
+    // failure path needs an allocation to fail first.
+    try testing.checkAllAllocationFailures(gpa, generateV1ResetArm, .{});
+}
+
+/// Generation for a peer that has said what it has and what it wants, which is
+/// the only state in which the payload is built at all
+/// (`v1_compat_test/mod.rs:60-69`) and so the only state in which the five
+/// fallible steps between `getHeads` and the builder's `setHeads` run.
+fn generateV1WithPayload(gpa: Allocator) !void {
+    const chain = try readFixture(gpa, two_changes_fixture);
+    defer gpa.free(chain);
+    var doc = try docWith(gpa, &.{chain});
+    defer doc.deinit();
+    var state = State.new(gpa);
+    defer state.deinit();
+
+    const heads = try doc.getHeads(gpa);
+    defer gpa.free(heads);
+    var slots: []Have = try gpa.alloc(Have, 1);
+    errdefer gpa.free(slots);
+    slots[0] = Have.empty(gpa);
+    state.their_have = slots;
+    slots = &.{};
+    state.their_need = try gpa.dupe(ChangeHash, heads);
+
+    var message = (try generateSyncMessage(gpa, &doc, &state)) orelse
+        return error.TestUnexpectedResult;
+    defer message.deinit();
+    try testing.expect(!message.changes.isEmpty());
+}
+
+test "the v1 generator releases the heads it moves into the builder under every allocation failure" {
+    const gpa = testing.allocator;
+    // `our_heads` is **moved** into the builder, so a guard on it that is not
+    // emptied at the hand-over frees what the builder owns on every error path
+    // after it, and a run with no guard at all leaks it on the five fallible
+    // steps between the `getHeads` and the `setHeads`. Neither is visible to a
+    // test that only ever succeeds.
+    try testing.checkAllAllocationFailures(gpa, generateV1WithPayload, .{});
+}
+
+test "a v1 peer's heads are stored as a set, whatever order the peer wrote them" {
+    // The same contract as the v2 path: `Message.parse` appends the heads list
+    // in wire order and never sorts it (`message.zig:640-645`), and
+    // `shared_heads` is a sorted set. This arm answers the question with
+    // `canRebuild` rather than `has_change`, so it is written separately from
+    // the v2 one and answers separately to the same input.
+    const gpa = testing.allocator;
+    const chain = try readFixture(gpa, two_changes_fixture);
+    defer gpa.free(chain);
+    const solo = try readFixture(gpa, other_actor_fixture);
+    defer gpa.free(solo);
+    var doc = try docWith(gpa, &.{ chain, solo });
+    defer doc.deinit();
+    const heads = try doc.getHeads(gpa);
+    defer gpa.free(heads);
+    try testing.expectEqual(@as(usize, 2), heads.len);
+
+    // **The bytes, not the struct.** `Message.encode` is the very thing that
+    // asserts the order, so a descending list cannot be produced by encoding
+    // one; the wire format writes the hashes back to back, so exchanging the
+    // two blocks of an encoded message produces the one message a conforming
+    // encoder would never write and a conforming reader still has to accept.
+    var encoded = try handMessage(gpa, heads, &.{}, &.{});
+    defer encoded.deinit();
+    const bytes = try encoded.encode(gpa);
+    defer gpa.free(bytes);
+    const first = std.mem.indexOf(u8, bytes, &heads[0].bytes) orelse
+        return error.TestUnexpectedResult;
+    const second = std.mem.indexOf(u8, bytes, &heads[1].bytes) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(first + heads[0].bytes.len, second);
+    for (0..heads[0].bytes.len) |i| {
+        std.mem.swap(u8, &bytes[first + i], &bytes[second + i]);
+    }
+
+    // The reader takes the list as it was written. This is the premise of the
+    // test: without it the receive below would be sorting something that had
+    // never been out of order.
+    var decoded = try decodeV1(gpa, bytes);
+    try testing.expectEqual(@as(usize, 2), decoded.heads.len);
+    try testing.expect(decoded.heads[0].eql(heads[1]));
+    try testing.expect(decoded.heads[1].eql(heads[0]));
+
+    var state = State.new(gpa);
+    defer state.deinit();
+    try receiveSyncMessage(gpa, &doc, &state, decoded);
+
+    // Both heads are ours, so they are the shared heads — as a set, ascending,
+    // duplicate free.
+    try testing.expectEqual(@as(usize, 2), state.shared_heads.len);
+    for (state.shared_heads, 0..) |head, index| try testing.expect(head.eql(heads[index]));
+    // The peer's own record keeps the order the peer wrote, because that is
+    // what the peer said and nothing here re-sorts it.
+    try testing.expectEqual(@as(usize, 2), state.their_heads.?.len);
+    try testing.expect(state.their_heads.?[0].eql(heads[1]));
+    try testing.expect(state.their_heads.?[1].eql(heads[0]));
+}
+
 /// A message written by hand, for the shapes a generator never produces: a
 /// `have` whose `last_sync` names a change the receiver cannot have, and a
 /// payload of nothing.
@@ -1482,15 +1737,24 @@ fn handMessage(
         for (slots.items) |chunk| gpa.free(chunk);
         slots.deinit(gpa);
     }
-    for (chunks) |source| try slots.append(gpa, try gpa.dupe(u8, source));
+    for (chunks) |source| {
+        const copy = try gpa.dupe(u8, source);
+        errdefer gpa.free(copy);
+        try slots.append(gpa, copy);
+    }
 
+    // The record is complete before the guard is armed and before the one
+    // fallible field is filled in. A `try` inside a struct literal leaves the
+    // destination untouched, so a guard armed across one releases a `have`
+    // slot that was never written — and the array the record lives in belongs
+    // to this call, because `Have.deinit` frees the fields and not the list.
     const have = try gpa.alloc(Have, 1);
-    errdefer have[0].deinit();
-    have[0] = .{
-        .gpa = gpa,
-        .last_sync = try gpa.dupe(ChangeHash, last_sync),
-        .bloom = bloommod.BloomFilter.empty(gpa),
-    };
+    have[0] = Have.empty(gpa);
+    errdefer {
+        have[0].deinit();
+        gpa.free(have);
+    }
+    have[0].last_sync = try gpa.dupe(ChangeHash, last_sync);
     return .{
         .gpa = gpa,
         .heads = owned_heads,
@@ -1675,7 +1939,7 @@ fn convergeBase(gpa: Allocator) !Document {
         defer parsed.deinit();
         const bytes = try err.hexFrom(gpa, parsed.value.hex);
         defer gpa.free(bytes);
-        return Document.load(gpa, bytes, docmod.defaultTextEncoding(), .manual);
+        return Document.load(gpa, std.testing.io, bytes, docmod.defaultTextEncoding(), .manual);
     }
     std.debug.print("converge.jsonl has no `converge-base` record\n", .{});
     return error.GoldenVectorsNotFound;

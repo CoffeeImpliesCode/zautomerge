@@ -19,14 +19,12 @@
 //! * a view is built by `init`, which refuses columns that disagree, and
 //!   `checkLengths` re-checks it — the columns come from bytes a peer sent,
 //!   so a disagreement is a `ParseError` and never a trap;
-//! * a splice builds every replacement *value* before it rewrites a
-//!   column, so the only way it can fail on a well-formed column is an
+//! * a splice builds every replacement *column* before it rewrites any of
+//!   them, so the only way it can fail on a well-formed column is an
 //!   allocation, and it fails before anything has changed. A composite's
-//!   columns therefore cannot be left out of step by a failed splice; a
-//!   group, whose payload columns are rewritten one after another, is the
-//!   one exception, and a group out of step is still a value a
-//!   `checkLengths` reports rather than a value a cursor reads.
-//!
+//!   columns therefore cannot be left out of step by a failed splice, a
+//!   group included: [`Group.splice`] stages its payload columns and its
+//!   count column alike, and moves none of them in until all are built.
 //! * a splice's replacement rows are **borrowed for the call**: a composite
 //!   takes what it needs out of them — a string into the string table, an
 //!   integer into its column — before it rewrites anything, so the caller may
@@ -35,6 +33,22 @@
 //!   raw buffer and live until that buffer is spliced. One is a borrow the
 //!   caller lends the callee for one call, the other a borrow the callee
 //!   lends the caller until the next write; neither outlives its own rule.
+//!
+//! # What a view is, and what a copy of one is
+//!
+//! Every composite here holds pointers to columns somebody else owns. **A
+//! copy of a composite is a second handle on the same columns**, not a
+//! second set of them: a splice through either copy rewrites what both
+//! see, and a copy taken before a splice still points at the storage that
+//! splice put in its place. A cursor is different — it walks the columns it
+//! was built over as they are at each step, so two cursors are two
+//! independent walks of the same live storage and neither freezes the
+//! other.
+//!
+//! **Nothing in this file synchronises.** Several threads may read a view
+//! while none writes through it; a write through one handle while another
+//! reads or walks is a race in the caller's, and this file documents that
+//! rather than preventing it.
 //!
 //! # What each composite is a view over
 //!
@@ -124,15 +138,21 @@ const opid_list_reserve_cap: usize = 100;
 /// the whole buffer, which is why replacing it whole is the natural
 /// operation.
 pub const Raw = struct {
+    /// **The allocator that owns the buffer**, and the one `deinit` frees it
+    /// with. It is fixed at `init` or `rebuilt`.
     gpa: std.mem.Allocator,
+    /// The payload bytes, in row order and owned by this column.
     bytes: std.ArrayList(u8) = .empty,
 
-    /// An empty raw column.
+    /// An empty raw column, owned by `gpa` for as long as it lives.
     pub fn init(gpa: std.mem.Allocator) Raw {
         return .{ .gpa = gpa };
     }
 
-    /// Frees the buffer.
+    /// Frees the buffer with the allocator the column was built with. **The
+    /// allocator is not released**, the column is unusable afterwards — the
+    /// receiver is poisoned — and a second call frees twice, so this is
+    /// called once per column and on the allocator `init` took.
     pub fn deinit(self: *Raw) void {
         self.bytes.deinit(self.gpa);
         self.* = undefined;
@@ -149,13 +169,18 @@ pub const Raw = struct {
         return self.bytes.items;
     }
 
-    /// Appends one row's payload.
+    /// Appends one row's payload. `gpa` must be **the allocator the column
+    /// was built with**: the column does not own what is appended under
+    /// another allocator, and `deinit` would free it with the stored one.
+    /// `payload` is borrowed for the call and copied, so the caller may
+    /// reuse or free it the instant this returns; `error.OutOfMemory` leaves
+    /// the column exactly as it was, because the copy is one piece.
     pub fn append(self: *Raw, gpa: std.mem.Allocator, payload: []const u8) ParseError!void {
         try self.bytes.appendSlice(gpa, payload);
     }
 
-    /// A fresh column holding exactly `payload`, for a splice to move in
-    /// once every other column of its composite is built.
+    /// A fresh column holding exactly `payload`, owned by `gpa`, for a
+    /// splice to move in once every other column of its composite is built.
     pub fn rebuilt(gpa: std.mem.Allocator, payload: []const u8) ParseError!Raw {
         var fresh: Raw = .init(gpa);
         errdefer fresh.deinit();
@@ -163,14 +188,18 @@ pub const Raw = struct {
         return fresh;
     }
 
-    /// A read cursor over the column's bytes.
+    /// A read cursor over the column's bytes. **The cursor borrows them**:
+    /// the buffer must stay alive and unmodified for as long as the cursor
+    /// walks it.
     pub fn cursor(self: *const Raw) Cursor {
         return .{ .bytes = self.bytes.items };
     }
 
     /// A read cursor positioned at the column's first byte.
     pub const Cursor = struct {
+        /// The column's bytes, borrowed for the cursor's life.
         bytes: []const u8,
+        /// The offset the next `take` hands out from.
         at: usize = 0,
 
         /// The next `n` bytes, or `error.LengthExceedsInput` when the column
@@ -202,7 +231,11 @@ pub fn Counted(comptime Col: type) type {
     return struct {
         const Self = @This();
 
+        /// The column's own iterator, which `next` and `skip` drive.
         it: Col.Iterator,
+        /// The rows still owed, from the column's length at `init`. It is
+        /// what tells an exhausted column from a row that spells nothing
+        /// out in it.
         left: usize,
 
         /// A cursor over `col`, positioned at its first row.
@@ -211,6 +244,13 @@ pub fn Counted(comptime Col: type) type {
         }
 
         /// The next row, or null when the column has no rows left.
+        ///
+        /// **The count is spent before the row is read**, so a failure leaves
+        /// the cursor one row on: a column that runs out where a row was owed
+        /// reports `error.InvalidValue` and stops wherever its own iterator
+        /// stopped. A caller that catches the error and carries on therefore
+        /// reads a shifted column — the rule the typed readers in
+        /// `encoding.zig` state at their own declarations.
         pub fn next(self: *Self) ParseError!?Col.Value {
             if (self.left == 0) return null;
             self.left -= 1;
@@ -218,8 +258,9 @@ pub fn Counted(comptime Col: type) type {
         }
 
         /// Steps over one row, for a caller that knows the row is there and
-        /// does not want its value. A column that has run out is a
-        /// malformed one.
+        /// does not want its value. A column that has run out is a malformed
+        /// one. **It spends the count before the row is read too**, so it
+        /// leaves the cursor one row on when it fails.
         pub fn skip(self: *Self) ParseError!void {
             if (self.left == 0) return error.InvalidValue;
             self.left -= 1;
@@ -394,24 +435,17 @@ pub const Value = struct {
 
     /// Replaces the whole column with `metas` and the payloads they
     /// describe: what [`Value.splice`] builds, split out for a caller that
-    /// has both already.
-    ///
-    /// A group splice needs it, because it has to gather the payloads of the
-    /// rows it keeps — whose values borrow a raw buffer it does not own —
-    /// before it can rewrite anything, so it cannot splice the column it is
-    /// reading.
+    /// has both already. **Both columns are built before either is moved
+    /// in**, so a failure here leaves the value column as it was.
     pub fn replaceAll(
         self: Value,
         gpa: std.mem.Allocator,
         metas: []const ?u64,
         payload: []const u8,
     ) ParseError!void {
-        var fresh_meta = try rebuilt(UintCol, gpa, metas);
-        errdefer fresh_meta.deinit();
-        var fresh_raw = try Raw.rebuilt(gpa, payload);
-        errdefer fresh_raw.deinit();
-        commit(self.meta, fresh_meta);
-        commit(self.raw, fresh_raw);
+        const staged = try stageAll(gpa, metas, payload);
+        commit(self.meta, staged.value.meta);
+        commit(self.raw, staged.value.raw);
     }
 
     /// Appends one row.
@@ -425,8 +459,15 @@ pub const Value = struct {
     }
 
     /// A cursor over the values of a value column.
+    ///
+    /// **The values borrow the raw buffer**, and the metadata words are read
+    /// out of the metadata column, so both columns must stay alive and
+    /// unmodified for as long as the cursor walks them.
     pub const Cursor = struct {
+        /// The metadata column, read one word at a time.
         metas: Counted(UintCol),
+        /// The payload column, read one row at a time. Its bytes are what the
+        /// values `next` hands back point into.
         payload: Raw.Cursor,
 
         /// A cursor over `col`, positioned at its first row.
@@ -451,7 +492,7 @@ pub const Value = struct {
         pub fn skip(self: *Cursor) ParseError!void {
             const raw_word = (try self.metas.next()) orelse return error.InvalidValue;
             const word = raw_word orelse return error.UnexpectedNull;
-            _ = try self.payload.take(ValueMeta.fromRaw(word).length());
+            _ = try self.payload.take(try ValueMeta.fromRaw(word).length());
         }
 
         /// Whether every row has been read.
@@ -469,7 +510,7 @@ fn keep(
     payload: *std.ArrayList(u8),
     row: ScalarValue,
 ) ParseError!void {
-    try metas.append(gpa, metaOf(row).raw);
+    try metas.append(gpa, (try metaOf(row)).raw);
     try appendPayload(gpa, payload, row);
 }
 
@@ -479,8 +520,16 @@ fn keep(
 /// type the document API sees, and it folds a counter and a timestamp into
 /// `leb`, while the wire has a code for each of them
 /// (`value.zig:141-151`, `value.rs:415-432`).
-fn metaOf(row: ScalarValue) ValueMeta {
-    return ValueMeta.init(switch (row) {
+///
+/// **A `ScalarValue.unknown` whose type code is above `0x0f` is
+/// `error.InvalidValueType`**, the same refusal the columnar encoder makes
+/// for the same reason: the word's type field is four bits wide, and a wider
+/// code's excess bits would land on the length half and write the value with
+/// a length that is not its own. A code the field can carry is written as
+/// it stands, which is what makes a document from a future version survive
+/// a round trip through this one.
+fn metaOf(row: ScalarValue) ParseError!ValueMeta {
+    const typ: ValueType = switch (row) {
         .null_value => .null_value,
         .bool_value => |b| if (b) .true_value else .false_value,
         .uint => .uleb,
@@ -490,8 +539,12 @@ fn metaOf(row: ScalarValue) ValueMeta {
         .bytes, .actor_id => .bytes,
         .counter => .counter,
         .timestamp => .timestamp,
-        .unknown => |u| ValueType{ .unknown = u.type_code },
-    }, payloadLen(row));
+        .unknown => |u| blk: {
+            if (u.type_code > 0x0f) return error.InvalidValueType;
+            break :blk ValueType{ .unknown = u.type_code };
+        },
+    };
+    return ValueMeta.init(typ, payloadLen(row));
 }
 
 /// The payload a value's metadata word counts: its bytes on the wire, which
@@ -536,7 +589,7 @@ fn appendPayload(gpa: std.mem.Allocator, out: *std.ArrayList(u8), row: ScalarVal
 /// The value a metadata word and its payload describe
 /// (`column_range/value.rs:203-311`).
 fn decode(word: ValueMeta, payload: *Raw.Cursor) ParseError!ScalarValue {
-    const bytes = try payload.take(word.length());
+    const bytes = try payload.take(try word.length());
     return switch (word.typeCode()) {
         .null_value => ScalarValue.null_value,
         .false_value => ScalarValue{ .bool_value = false },
@@ -708,10 +761,15 @@ pub const KeyColumn = struct {
         try self.splice(gpa, self.len(), 0, keys);
     }
 
-    /// A cursor over the keys of a key column.
+    /// A cursor over the keys of a key column. It walks the three columns
+    /// live, so all three must stay alive and unmodified while it does; a
+    /// key it hands back is a value, not a borrow.
     pub const Cursor = struct {
+        /// The actor column, one cell per row.
         actor: Counted(IndexCol),
+        /// The delta-coded counter column, one cell per row.
         counter: Counted(CounterCol),
+        /// The string counter column, one cell per row.
         string: Counted(IndexCol),
 
         /// A cursor over `col`, positioned at its first row.
@@ -872,9 +930,12 @@ pub const ObjIdColumn = struct {
         try self.splice(gpa, self.len(), 0, ids);
     }
 
-    /// A cursor over the object ids of an object-id column.
+    /// A cursor over the object ids of an object-id column. It walks both
+    /// columns live, so both must stay alive and unmodified while it does.
     pub const Cursor = struct {
+        /// The actor column, one cell per row.
         actor: Counted(IndexCol),
+        /// The counter column, one cell per row.
         counter: Counted(UintCol),
 
         /// A cursor over `col`, positioned at its first row.
@@ -1087,11 +1148,19 @@ pub const OpIdList = struct {
         try self.splice(gpa, self.len(), 0, rows);
     }
 
-    /// A cursor over the rows of an op-id list.
+    /// A cursor over the rows of an op-id list. It walks all three columns
+    /// live, so they must stay alive and unmodified while it does. The row
+    /// it hands back is its own buffer, not a borrow of a column.
     pub const Cursor = struct {
+        /// The allocator the row buffer is grown on, and the one `deinit`
+        /// frees it with. The columns themselves are borrowed and are not
+        /// freed here.
         gpa: std.mem.Allocator,
+        /// The count column: how many ids each row holds.
         num: Counted(UintCol),
+        /// The actor column, flattened across the rows.
         actor: Counted(UintCol),
+        /// The delta-coded counter column, flattened across the rows.
         counter: Counted(CounterCol),
         /// The ids of the row being read. It is cleared per row, so the
         /// slice `next` hands back is valid until the next call — upstream
@@ -1108,7 +1177,11 @@ pub const OpIdList = struct {
             };
         }
 
-        /// Frees the row buffer.
+        /// Frees the row buffer. **The allocator is not released**, and
+        /// neither are the three columns: they are borrowed, and this cursor
+        /// never owned them. The cursor is unusable afterwards, so a second
+        /// call is a double free: release once per cursor, on the allocator
+        /// `iterator` took.
         pub fn deinit(self: *Cursor) void {
             self.row.deinit(self.gpa);
             self.* = undefined;
@@ -1163,7 +1236,10 @@ pub const SimpleValue = union(enum) {
     /// A boolean (`SimpleColRange::Boolean`). Never absent: a boolean column
     /// has no null run.
     boolean: bool,
-    /// A scalar value: a metadata word and the bytes it describes.
+    /// A scalar value: a metadata word and the bytes it describes. **Its
+    /// bytes borrow the raw buffer the value column points at**, on the rule
+    /// [`Value.iterator`] states: they are valid until that buffer is
+    /// spliced, which for a grouped value is a splice of the whole group.
     value: ScalarValue,
 
     /// Whether two cells hold the same value.
@@ -1218,11 +1294,13 @@ pub const GroupedColumn = union(enum) {
         };
     }
 
-    /// Replaces this column's values `[start, start + dropped)` with
-    /// `added` — the values a group splice has for payload column `i` of a
-    /// group with `cols` columns. In place, so the view keeps pointing at
-    /// the storage it was built over and a group owns nothing.
-    fn replacement(
+    /// This column's replacement for the values `[start, start + dropped)`,
+    /// built and **not published**: the values a group splice has for
+    /// payload column `i` of a group with `cols` columns. Staging is what
+    /// makes a group splice all-or-nothing, and publishing is where the view
+    /// keeps pointing at the storage it was built over, so a group owns
+    /// nothing.
+    fn stage(
         self: *GroupedColumn,
         gpa: std.mem.Allocator,
         start: usize,
@@ -1230,24 +1308,34 @@ pub const GroupedColumn = union(enum) {
         added: []const SimpleValue,
         i: usize,
         cols: usize,
-    ) ParseError!void {
+    ) ParseError!StagedColumn {
         switch (self.*) {
-            .value => |c| try rebuildValue(gpa, c, start, dropped, added, i, cols),
-            .uint => |c| try rebuildSimple(UintCol, gpa, c, start, dropped, added, i, cols, .uint),
-            .index => |c| try rebuildSimple(IndexCol, gpa, c, start, dropped, added, i, cols, .index),
-            .int => |c| try rebuildSimple(SignedCol, gpa, c, start, dropped, added, i, cols, .int),
-            .boolean => |c| try rebuildSimple(BoolCol, gpa, c, start, dropped, added, i, cols, .boolean),
+            .value => |c| return stageValue(gpa, c, start, dropped, added, i, cols),
+            .uint => |c| return .{ .uint = try stageSimple(UintCol, .uint, gpa, c, start, dropped, added, i, cols) },
+            .index => |c| return .{ .index = try stageSimple(IndexCol, .index, gpa, c, start, dropped, added, i, cols) },
+            .int => |c| return .{ .int = try stageSimple(SignedCol, .int, gpa, c, start, dropped, added, i, cols) },
+            .boolean => |c| return .{ .boolean = try stageSimple(BoolCol, .boolean, gpa, c, start, dropped, added, i, cols) },
         }
     }
 };
 
 /// A cursor over one grouped column: a union of the five cursors a group
 /// can carry (`column_range/generic/group.rs:111-138`).
+///
+/// **The `.value` arm hands out values that borrow the raw buffer** the
+/// group's value column points at, on the rule [`Value.iterator`] states:
+/// they are valid until that buffer is spliced, which for a group is a
+/// splice of the group itself.
 pub const GroupedCursor = union(enum) {
+    /// A value column's cursor. Its values borrow the raw buffer.
     value: Value.Cursor,
+    /// A nullable unsigned integer.
     uint: Counted(UintCol),
+    /// A nullable counter into the string table.
     index: Counted(IndexCol),
+    /// A nullable signed integer.
     int: Counted(SignedCol),
+    /// A boolean.
     boolean: Counted(BoolCol),
 
     /// The next value, or null when the column has none left.
@@ -1305,7 +1393,12 @@ pub const GroupedCursor = union(enum) {
 /// the first value of column 1, and so on, then the second of each
 /// (`column_range/generic/group.rs:70-97`).
 pub const GroupRow = struct {
-    /// The row's values: `count * columns` of them.
+    /// The row's values: `count * columns` of them. **A `.value` among them
+    /// borrows the raw buffer the group's value column points at**, so it is
+    /// valid only until that buffer is spliced — a splice of the group — the
+    /// same rule [`Value.iterator`] states for a value column of its own.
+    /// The slice itself is the cursor's row buffer: valid until the next
+    /// `next` on the cursor that handed it back.
     values: []const SimpleValue,
     /// How many inner rows the row holds.
     count: usize,
@@ -1386,7 +1479,11 @@ pub const Group = struct {
         }
     }
 
-    /// A cursor over every row, in order.
+    /// A cursor over every row, in order. **The rows borrow the columns**:
+    /// a `.value` row's values borrow the raw buffer the group view points
+    /// at, so a splice through the group invalidates them, and the cursor's
+    /// own buffers must be released with [`Group.Cursor.deinit`] on the same
+    /// allocator.
     pub fn iterator(self: Group, gpa: std.mem.Allocator) ParseError!Cursor {
         return try Group.Cursor.init(self, gpa);
     }
@@ -1397,6 +1494,23 @@ pub const Group = struct {
     /// the row range has to be translated into a range of each grouped
     /// column's own rows before it can be spliced — the same translation a
     /// predecessor list does (`column_range/opid_list.rs:163-180`).
+    ///
+    /// `rows` is **borrowed for the call**: every value is taken out of it
+    /// before anything is rewritten, so the caller may reuse or free the
+    /// slice the instant this returns.
+    ///
+    /// **The splice is all-or-nothing.** Every payload column *and* the count
+    /// column are staged first, and only a complete set is moved into the
+    /// view; so `error.OutOfMemory` anywhere in the middle leaves the group
+    /// exactly as it was, in step, and `checkLengths` still passes. A group
+    /// is the one composite whose payloads are read out of a buffer it does
+    /// not own, so it is also the one that could not be staged — it now is.
+    /// The price is peak memory: every replacement column is alive at once,
+    /// beside the columns it replaces.
+    ///
+    /// A row of `rows` whose value list is not `count` long for this group
+    /// is `error.InvalidValue`, and so is a value of the wrong kind for the
+    /// column it lands in; both are checked before anything is staged.
     pub fn splice(
         self: Group,
         gpa: std.mem.Allocator,
@@ -1437,16 +1551,30 @@ pub const Group = struct {
             if (maybe_count) |n| removed = std.math.add(usize, removed, try asCount(n)) catch return error.Overflow;
         }
 
-        // Every value is in hand, so the columns are rewritten one after
-        // another. The count column goes last: it is the row count the
-        // group reports, and until it agrees with the payloads a
-        // `checkLengths` failure names a payload rather than the count.
+        // Every replacement column is built before any of them is moved in,
+        // so the only failure left is an allocation and it leaves the group
+        // untouched. Publishing cannot fail: it frees the old storage and
+        // moves the staged one in.
+        var staged: std.ArrayList(StagedColumn) = .empty;
+        defer staged.deinit(gpa);
+        errdefer for (staged.items) |*s| s.deinitOwned();
+        try staged.ensureTotalCapacity(gpa, cols);
         for (self.columns, 0..) |*col, c| {
-            try col.replacement(gpa, start, removed, added.items, c, cols);
+            staged.appendAssumeCapacity(
+                try col.stage(gpa, start, removed, added.items, c, cols),
+            );
         }
+        // The count column is staged with the payloads and published with
+        // them: it is the row count the group reports, and it has to land
+        // in the same step or not at all.
         var fresh_num = try replacement(UintCol, gpa, self.num, index, del, counts.items);
         errdefer fresh_num.deinit();
+
+        for (self.columns, staged.items) |*col, s| s.publish(col);
         commit(self.num, fresh_num);
+        // The staged columns are the view's now; freeing them here would
+        // free what was just published.
+        staged.clearRetainingCapacity();
     }
 
     /// Appends one row.
@@ -1459,10 +1587,17 @@ pub const Group = struct {
         try self.splice(gpa, self.len(), 0, rows);
     }
 
-    /// A cursor over the rows of a group.
+    /// A cursor over the rows of a group. It walks the count column and
+    /// every grouped column live, so they must stay alive and unmodified
+    /// while it does; a `.value` row's values borrow the group's raw buffer
+    /// on the rule [`GroupRow`] states.
     pub const Cursor = struct {
+        /// The allocator the row buffer is grown on, and the one `deinit`
+        /// frees it with. The columns are borrowed and are not freed here.
         gpa: std.mem.Allocator,
+        /// The count column: how many values each row holds.
         num: Counted(UintCol),
+        /// One cursor per grouped column, in the group's own column order.
         columns: std.ArrayList(GroupedCursor) = .empty,
         /// The values of the row being read. Cleared per row, so the slice
         /// `next` hands back is valid until the next call.
@@ -1478,7 +1613,11 @@ pub const Group = struct {
             return self;
         }
 
-        /// Frees the per-column cursors and the row buffer.
+        /// Frees the per-column cursor array and the row buffer. **The
+        /// allocator is not released** and neither are the group's columns —
+        /// they are borrowed, and this cursor never owned them. The cursor is
+        /// unusable afterwards, so a second call is a double free: release
+        /// once per cursor, on the allocator `iterator` took.
         pub fn deinit(self: *Cursor) void {
             self.columns.deinit(self.gpa);
             self.row.deinit(self.gpa);
@@ -1486,6 +1625,10 @@ pub const Group = struct {
         }
 
         /// The next row, or null at the end of the group.
+        ///
+        /// The row borrows the cursor's own buffer and the columns' bytes:
+        /// it is valid until the next `next` on this cursor, and a `.value`
+        /// in it only until the group's raw buffer is spliced.
         pub fn next(self: *Cursor) ParseError!?GroupRow {
             const raw_count = (try self.num.next()) orelse return null;
             // A row with no count says nothing about how long it is.
@@ -1512,27 +1655,107 @@ pub const Group = struct {
     };
 };
 
-/// One simple grouped column's replacement, in place.
-fn rebuildSimple(
+/// One grouped column's replacement, built and not yet published. A value
+/// column is two columns of one logical column, so its arm carries both.
+const StagedColumn = union(enum) {
+    /// A value column: its metadata words and its payload buffer, which are
+    /// published together or not at all.
+    value: struct { meta: UintCol, raw: Raw },
+    uint: UintCol,
+    index: IndexCol,
+    int: SignedCol,
+    boolean: BoolCol,
+
+    /// Releases what was staged. Called on the failure path only: once a
+    /// staged column is published it belongs to the view.
+    fn deinitOwned(self: *StagedColumn) void {
+        switch (self.*) {
+            .value => |*v| {
+                v.raw.deinit();
+                v.meta.deinit();
+            },
+            .uint => |*c| c.deinit(),
+            .index => |*c| c.deinit(),
+            .int => |*c| c.deinit(),
+            .boolean => |*c| c.deinit(),
+        }
+    }
+
+    /// Moves the staged columns into `col` and frees the ones it replaces.
+    /// **This is the whole publish half of a splice and it cannot fail** —
+    /// it allocates nothing — so a group cannot be caught half-published,
+    /// whatever order the columns are published in.
+    ///
+    /// **The two unions are matched arm by arm, and each arm checks its own
+    /// tag before it reads the other's field.** A tag read is always safe; a
+    /// field read through the wrong arm is not, which is why the check sits
+    /// inside the arm rather than once beside the switch. The pairing holds
+    /// by construction — [`GroupedColumn.stage`] builds each arm from the
+    /// same switch over the same view — so these are the programmer
+    /// precondition `commit` states, not a check on untrusted input.
+    fn publish(self: StagedColumn, col: *GroupedColumn) void {
+        switch (col.*) {
+            .value => |c| {
+                std.debug.assert(std.meta.activeTag(self) == .value);
+                commit(c.meta, self.value.meta);
+                commit(c.raw, self.value.raw);
+            },
+            .uint => |c| {
+                std.debug.assert(std.meta.activeTag(self) == .uint);
+                commit(c, self.uint);
+            },
+            .index => |c| {
+                std.debug.assert(std.meta.activeTag(self) == .index);
+                commit(c, self.index);
+            },
+            .int => |c| {
+                std.debug.assert(std.meta.activeTag(self) == .int);
+                commit(c, self.int);
+            },
+            .boolean => |c| {
+                std.debug.assert(std.meta.activeTag(self) == .boolean);
+                commit(c, self.boolean);
+            },
+        }
+    }
+};
+
+/// A value column's two halves, staged: the metadata words and the payload
+/// buffer they describe. Both are built before either is published, which is
+/// what makes [`Value.replaceAll`] atomic and lets a group splice stage the
+/// column it cannot splice in place.
+fn stageAll(gpa: std.mem.Allocator, metas: []const ?u64, payload: []const u8) ParseError!StagedColumn {
+    var fresh_meta = try rebuilt(UintCol, gpa, metas);
+    errdefer fresh_meta.deinit();
+    return .{ .value = .{
+        .meta = fresh_meta,
+        .raw = try Raw.rebuilt(gpa, payload),
+    } };
+}
+
+/// One simple grouped column's replacement, built and not yet published.
+fn stageSimple(
     comptime Col: type,
+    comptime tag: std.meta.Tag(SimpleValue),
     gpa: std.mem.Allocator,
-    col: *Col,
+    col: *const Col,
     start: usize,
     dropped: usize,
     added: []const SimpleValue,
     i: usize,
     cols: usize,
-    comptime tag: std.meta.Tag(SimpleValue),
-) ParseError!void {
+) ParseError!Col {
     const vals = try addedFor(Col.Value, tag, gpa, added, i, cols);
     defer gpa.free(vals);
-    try col.splice(gpa, start, dropped, vals);
+    return replacement(Col, gpa, col, start, dropped, vals);
 }
 
 /// One value grouped column's replacement: the metadata words of the rows
 /// that stay and of the rows that land, and the payloads they describe
-/// (`column_range/value.rs:87-196`).
-fn rebuildValue(
+/// (`column_range/value.rs:87-196`). Built and not yet published, because a
+/// group reads its payloads out of a buffer it does not own and so cannot
+/// splice the column it is reading in place.
+fn stageValue(
     gpa: std.mem.Allocator,
     col: Value,
     start: usize,
@@ -1540,7 +1763,7 @@ fn rebuildValue(
     added: []const SimpleValue,
     i: usize,
     cols: usize,
-) ParseError!void {
+) ParseError!StagedColumn {
     const vals = try addedFor(ScalarValue, .value, gpa, added, i, cols);
     defer gpa.free(vals);
     var metas: std.ArrayList(?u64) = .empty;
@@ -1558,7 +1781,7 @@ fn rebuildValue(
     for (vals) |row| try keep(gpa, &metas, &payload, row);
     while (try it.next()) |row| try keep(gpa, &metas, &payload, row);
 
-    try col.replaceAll(gpa, metas.items, payload.items);
+    return stageAll(gpa, metas.items, payload.items);
 }
 
 /// The values `added` carries for grouped column `i` of a group with `cols`
@@ -2435,6 +2658,126 @@ test "a group column splices at the start, the middle and the end" {
     try group.splice(gpa, 0, group.len(), &.{});
     try expectGroupInStep(group, 0);
     try testing.expect(group.isEmpty());
+}
+
+/// The row the sweep below splices in, stated once: three values for the row
+/// of two it replaces, so **every payload column and the count column** are
+/// rewritten. A refusal in any one of them must leave the others alone too,
+/// and a success has to publish all of them together.
+const spliced_row: GroupInput = .{ .count = 3, .values = &.{
+    .{ .value = .{ .uint = 7 } },
+    .{ .uint = 7 },
+    .{ .int = 7 },
+    .{ .boolean = false },
+    .{ .value = .{ .str = "kept" } },
+    .{ .uint = 8 },
+    .{ .int = 8 },
+    .{ .boolean = true },
+    .{ .value = .{ .uint = 9 } },
+    .{ .uint = 9 },
+    .{ .int = 9 },
+    .{ .boolean = false },
+} };
+
+/// One attempt at the group splice the sweep below refuses: build a two-row
+/// group, splice a row of three values over its row of two on `arm`, and read
+/// the group back afterwards — exactly what it held when the splice was
+/// refused, and the whole of what was spliced in when it was not. A fresh
+/// group per attempt, because a refused splice is only meaningful against a
+/// group that was in step when it started, and a published one only against
+/// the values it published.
+fn groupSpliceAttempt(arm: std.mem.Allocator) !void {
+    const gpa = testing.allocator;
+    var cols = try GroupFixture.init(gpa);
+    defer cols.deinit(gpa);
+    const group = try cols.view();
+    try group.splice(gpa, 0, 0, &.{
+        .{ .count = 2, .values = &.{
+            .{ .value = .{ .uint = 1 } },
+            .{ .uint = 1 },
+            .{ .int = 1 },
+            .{ .boolean = true },
+            .{ .value = .{ .uint = 2 } },
+            .{ .uint = 2 },
+            .{ .int = 2 },
+            .{ .boolean = false },
+        } },
+        .{ .count = 1, .values = &.{
+            .{ .value = .{ .uint = 3 } },
+            .{ .uint = 3 },
+            .{ .int = 3 },
+            .{ .boolean = true },
+        } },
+    });
+    // What the group holds, stated once, so the check after a refusal
+    // compares against the rows rather than against itself.
+    const before = [_]WantRow{
+        .{ .count = 2, .values = &.{
+            .{ .value = .{ .uint = 1 } },
+            .{ .uint = 1 },
+            .{ .int = 1 },
+            .{ .boolean = true },
+            .{ .value = .{ .uint = 2 } },
+            .{ .uint = 2 },
+            .{ .int = 2 },
+            .{ .boolean = false },
+        } },
+        .{ .count = 1, .values = &.{
+            .{ .value = .{ .uint = 3 } },
+            .{ .uint = 3 },
+            .{ .int = 3 },
+            .{ .boolean = true },
+        } },
+    };
+    try expectGroup(group, &before);
+
+    // What the group holds once the splice lands: the spliced row where the
+    // first one was, and the row the splice never touches — which is what says
+    // the rewrite ran once, over the first row alone.
+    const after = [_]WantRow{
+        .{ .count = spliced_row.count, .values = spliced_row.values },
+        before[1],
+    };
+
+    if (group.splice(arm, 0, 1, &.{spliced_row})) |_| {
+        // **A success publishes every column in one step.** `expectGroup`
+        // reads the count column, every payload column and their lengths, so
+        // a payload column moved in without the count — the residue a group
+        // splice could leave if it published before it had staged all of
+        // them — fails here on the row count, and a rewrite that ran over
+        // the row the splice was not asked to touch fails on its values.
+        try expectGroup(group, &after);
+    } else |e| {
+        try testing.expectEqual(error.OutOfMemory, e);
+        // **The group is whole and in step.** `expectGroup` reads the count
+        // column, every payload column and their lengths, so a payload
+        // column committed without the count — the residue a group splice
+        // could leave before it staged all of them — fails here on the row
+        // count rather than passing quietly.
+        try expectGroup(group, &before);
+        return e;
+    }
+}
+
+test "a group splice refused an allocation leaves every column in step" {
+    const gpa = testing.allocator;
+    // Each real allocation is refused in a fresh splice attempt. Refused
+    // resize/remap requests fall back to the allocation channel. The helper
+    // checks all columns before propagating the refusal to this sweep.
+    const needed = blk: {
+        var counting: testing.FailingAllocator = .init(gpa, .{ .resize_fail_index = 0 });
+        try groupSpliceAttempt(counting.allocator());
+        break :blk counting.alloc_index;
+    };
+    // A sweep that walked no acquisition at all would assert nothing.
+    try testing.expect(needed > 0);
+    for (0..needed) |fail_index| {
+        var failing: testing.FailingAllocator = .init(gpa, .{
+            .fail_index = fail_index,
+            .resize_fail_index = 0,
+        });
+        try testing.expectError(error.OutOfMemory, groupSpliceAttempt(failing.allocator()));
+    }
 }
 
 test "a group row that does not spell out every column is rejected" {

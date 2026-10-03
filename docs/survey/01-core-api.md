@@ -2047,33 +2047,27 @@ marked `[INFERENCE]`.
 ### `Option` / `Result`
 
 * `Option<T>` → `?T`; `Option<&T>` → `?*const T`.
-* `Result<T, E>` → `T!E` when `E` is a plain enum, but **`AutomergeError` cannot be a
-  Zig error set**: 31 variants, of which **24** declare a payload
-  (`error.rs:13-79`; the "15" and the "30" here were both wrong) and Zig error
-  sets are tag-only. Two workable shapes:
-  1. Tag-only error set + out-parameter payload:
-     `pub fn exidToOpId(self: *const Automerge, id: ExId, out: *OpId) Error!void`.
-  2. `AutomergeError = union(enum) { changeGraph: MissingDep, deflate: anyerror,
-     duplicateSeq: struct { seq: u64, actor: ActorId }, … }` returned by value, with a
-     `pub fn toErrorSet(e: AutomergeError) ?ErrNoPayload`.
-  Option 1 keeps every public call site's shape (`Result<Option<(Value, ExId)>,
-  AutomergeError>` → `!?struct { Value, ExId }`) and is the smaller diff. The cost is
-  that a payload-carrying variant cannot be returned through `!` without the out-param.
-* `Result<T, Self>` (the `into_scalar` / `into_bytes` / `into_string` idiom,
-  `value.rs:146`, `201`, `229`, `668`, `693`) → `T || Self` (an error union whose error
-  type is the value type itself). Zig supports this directly and it is idiomatic.
-* `transaction::Result<O, E> = Result<Success<O>, Failure<E>>` → `Success(O) ||
-  Failure(E)`; `Success { result: O, hash: ?ChangeHash, patch_log: PatchLog }` is a
-  plain struct.
+* `Result<T, E>` maps to `E!T` when `E` is a Zig error set.
+  Error sets carry tags, not the payloads in Rust's `AutomergeError`.
+  The port uses named error sets. Each declaration states its refusal contract.
+* `Result<T, Self>` requires a tagged union with success and failure payloads.
+  A Zig error union cannot use an ordinary value type as its error set.
+* The port's `transaction.Outcome(O)` contains `Success(O)` or `Failure(O)`.
+  Success owns the body result and carries the optional change hash.
+  Failure preserves the primary error, rollback progress, and any recovery transaction.
+  A refused commit also retains the successful body result.
+  The document owns its patch log. These result types do not own another log.
 
 ### Ownership and lifetimes
 
-* `&'a self` → `*const Self`; `&mut self` → `*Self`. `Transaction<'a>` holding
-  `doc: &'a mut Automerge` (`transaction/manual_transaction.rs:28`) becomes
-  `doc: *Automerge` with a hand-rolled `deinit` that calls `rollback` — Zig `deinit` is
-  the exact analogue of Rust `Drop`, and the "take the inner out first" dance
-  (`transaction/manual_transaction.rs:26-29`) maps to a `?TransactionInner` field set
-  to `null` before commit.
+* Rust references map to Zig pointers. The port's transaction borrows `*Document`.
+  Commit or complete rollback before `Transaction.deinit`.
+  Disposal releases transaction storage. It does not undo document rows.
+  A refused rollback retains an owner that the caller must retry and dispose.
+* `Document` retains the borrowed `std.Io` supplied to its constructor.
+  The provider and allocator must outlive the document.
+  `ActorId.random(gpa, io)` draws 16 secure bytes or returns an error.
+  A caller can select a deterministic identity with `Document.setActorId`.
 * Borrowed *return* values are the hard part. `ReadDoc::get` returns
   `Result<Option<(Value<'_>, ExId)>, _>` (`read.rs:275`) where the `Value` may borrow
   from `self`; `keys`, `values`, `iter`, `map_range`, `list_range`, `spans`, `parents`

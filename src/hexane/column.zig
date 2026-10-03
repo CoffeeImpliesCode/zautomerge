@@ -82,14 +82,23 @@ pub const LenWeight = struct {
     /// The weight of no slabs at all.
     pub const zero: LenWeight = .{};
 
+    /// The aggregate contract [`btree.Tree`](btree.zig) and
+    /// [`index.Fenwick`](index.zig) consume: four names, resolved at
+    /// comptime, so one weight serves both index backends. A column picks
+    /// its weight here, and the index follows.
     pub const Aggregate = struct {
+        /// The weight of no slabs at all.
         pub const identity: LenWeight = .zero;
+        /// The weight of two adjacent spans, in order.
         pub fn merge(l: LenWeight, r: LenWeight) LenWeight {
             return .{ .len = l.len + r.len };
         }
+        /// How many column rows the weight covers. The only component a
+        /// Fenwick prefix query reads.
         pub fn itemCount(w: LenWeight) usize {
             return w.len;
         }
+        /// Whether two weights describe the same span.
         pub fn eql(a: LenWeight, b: LenWeight) bool {
             return a.len == b.len;
         }
@@ -114,14 +123,23 @@ pub const PrefixWeight = struct {
         return self.prefix;
     }
 
+    /// The aggregate contract [`btree.Tree`](btree.zig) and
+    /// [`index.Fenwick`](index.zig) consume. Same four names as
+    /// [`LenWeight.Aggregate`](LenWeight); the prefix sum travels beside
+    /// the item count so a delta or prefix column can seek by either.
     pub const Aggregate = struct {
+        /// The weight of no slabs at all.
         pub const identity: PrefixWeight = .zero;
+        /// The weight of two adjacent spans, in order.
         pub fn merge(l: PrefixWeight, r: PrefixWeight) PrefixWeight {
             return .{ .len = l.len + r.len, .prefix = l.prefix + r.prefix };
         }
+        /// How many column rows the weight covers. The only component a
+        /// Fenwick prefix query reads.
         pub fn itemCount(w: PrefixWeight) usize {
             return w.len;
         }
+        /// Whether two weights describe the same span.
         pub fn eql(a: PrefixWeight, b: PrefixWeight) bool {
             return a.len == b.len and a.prefix == b.prefix;
         }
@@ -916,6 +934,9 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
         /// not all carry the same value and a caller accumulating a
         /// per-item aggregate has to see each one (`rle/load.rs:131-137`).
         /// A repeat or absent run is one step with its whole count.
+        /// The slab being walked, read-only. It is the caller's and must stay
+        /// alive and unmodified for as long as the cursor is used; nothing
+        /// the cursor hands back points into it.
         pub const LoadCursor = struct {
             bytes: []const u8,
             /// The byte offset of the next run header.
@@ -933,10 +954,17 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
             /// Items left in the literal run being served, and the byte
             /// offset of the next one.
             lit_left: usize,
-            lit_pos: usize,
             /// One past the last byte of the literal run being served.
             lit_end: usize,
+            /// The byte offset of the next item of the literal run being
+            /// served. A literal run's payload is read one value at a time,
+            /// so this walks the run rather than decoding it whole.
+            lit_pos: usize,
 
+            /// A cursor standing at the start of `bytes`. The bytes are only
+            /// read, and must stay alive and unmodified for as long as the
+            /// cursor is used; the cursor keeps no copy of them and hands
+            /// back no slice into them.
             pub fn init(bytes: []const u8) LoadCursor {
                 return .{
                     .bytes = bytes,
@@ -1093,25 +1121,38 @@ fn RleEncoder(comptime Payload: type, comptime Nullable: bool) type {
         /// What one append takes: the column value, which for a run-length
         /// column is the wire value itself.
         pub const Value = rleElement(Payload, Nullable);
+        /// What one append takes, which for a run-length column is the value
+        /// itself: there is no difference and no prefix to measure from.
         pub const Wire = Value;
 
+        /// The run writer that owns the encode buffer. Everything this
+        /// encoder allocates goes through it, and everything it hands back
+        /// comes out of it, so the canonical bytes are one implementation's.
         writer: RunWriter(Payload, Nullable),
-        /// Values appended so far.
+        /// Values appended so far. It counts every value the encoder has been
+        /// given, across every buffer `take` has handed over — which is what
+        /// lets a caller roll a slab and keep counting.
         total: usize,
 
+        /// An encoder holding nothing, over one contiguous buffer. The
+        /// allocator is the caller's and is not released; `deinit` is.
         pub fn init(gpa: std.mem.Allocator) Self {
             return .{ .writer = RunWriter(Payload, Nullable).init(gpa), .total = 0 };
         }
 
+        /// Frees the encode buffer. The allocator itself is the caller's, and
+        /// a buffer already handed over by `take` was not freed by it.
         pub fn deinit(self: *Self) void {
             self.writer.deinit();
             self.* = undefined;
         }
 
+        /// Values appended so far, over every buffer this encoder has held.
         pub fn len(self: *const Self) usize {
             return self.total;
         }
 
+        /// Whether nothing has been appended.
         pub fn isEmpty(self: *const Self) bool {
             return self.total == 0;
         }
@@ -1121,11 +1162,17 @@ fn RleEncoder(comptime Payload: type, comptime Nullable: bool) type {
             return self.writer.segmentCount();
         }
 
+        /// Appends one value. Malformed bytes are not a case here — this
+        /// writes them — so the only error is the allocator's.
         pub fn append(self: *Self, v: Wire) ParseError!void {
             try self.writer.append(v);
             self.total += 1;
         }
 
+        /// Appends `n` copies of `v`. For a run-length column the copies
+        /// *are* one run, and a repeat run needs at least two, so a single
+        /// value is written as the start of a literal run instead
+        /// (`RleState`, `rle/state.rs:60-70`).
         pub fn appendN(self: *Self, v: Wire, n: usize) ParseError!void {
             try self.writer.appendN(v, n);
             self.total += n;
@@ -1156,40 +1203,68 @@ fn BoolEncoder(comptime V: type) type {
     return struct {
         const Self = @This();
 
+        /// A boolean value. The stored value is the value, so the wire value
+        /// is the value and there is no payload to speak of.
         pub const Value = V;
+        /// What one append takes: the value itself.
         pub const Wire = V;
 
+        /// The allocator the encode buffer is allocated and released with: the
+        /// one `init` was given. `deinit` releases the buffer, not the
+        /// allocator, and a buffer already handed over by `take` was not
+        /// freed by it.
         gpa: std.mem.Allocator,
+        /// The bytes written so far. A run is one LEB128 count and nothing
+        /// else; the value is the run's position in the sequence, which is
+        /// why no payload is stored (`bool.rs:609-800`).
         out: std.ArrayList(u8),
         /// The value the run in progress carries, and how far it has grown.
         pending: ?V,
+        /// How many items the run in progress holds.
         count: usize,
-        /// Values appended so far.
+        /// Values appended so far. It counts every value the encoder has been
+        /// given, across every buffer `take` has handed over.
         total: usize,
-        /// Runs written to `out`.
+        /// Runs written to `out`. Reset by `take`, and it has to be: the
+        /// count is what decides whether the next run is written with the
+        /// opening pad, and a column's second slab starts at run zero
+        /// however many runs the first one had (`bool.rs:988-1002`).
         segments: usize,
 
+        /// An encoder holding nothing, with no run in progress. The allocator
+        /// is the caller's and is not released; `deinit` is.
         pub fn init(gpa: std.mem.Allocator) Self {
             return .{ .gpa = gpa, .out = .empty, .pending = null, .count = 0, .total = 0, .segments = 0 };
         }
 
+        /// Frees the encode buffer. The allocator itself is the caller's, and
+        /// a buffer already handed over by `take` was not freed by it.
         pub fn deinit(self: *Self) void {
             self.out.deinit(self.gpa);
             self.* = undefined;
         }
 
+        /// Values appended so far, over every buffer this encoder has held.
         pub fn len(self: *const Self) usize {
             return self.total;
         }
 
+        /// Whether nothing has been appended.
         pub fn isEmpty(self: *const Self) bool {
             return self.total == 0;
         }
 
+        /// The runs already written plus the one still in progress, which is
+        /// what a run budget is compared against.
         pub fn segmentCount(self: *const Self) usize {
             return self.segments + @intFromBool(self.pending != null);
         }
 
+        /// Appends one value. A value equal to the run in progress extends
+        /// that run rather than starting a new one, which is what makes the
+        /// grouping canonical; a different one flushes it first, so
+        /// `error.OutOfMemory` there leaves the run in progress and nothing
+        /// written for the new value.
         pub fn append(self: *Self, v: V) ParseError!void {
             if (self.pending) |p| {
                 if (p == v) {
@@ -1204,6 +1279,8 @@ fn BoolEncoder(comptime V: type) type {
             self.total += 1;
         }
 
+        /// Appends `n` copies of `v` as one run, extending the run in
+        /// progress when it already carries `v`. `n == 0` appends nothing.
         pub fn appendN(self: *Self, v: V, n: usize) ParseError!void {
             if (n == 0) return;
             if (self.pending) |p| {
@@ -1219,6 +1296,9 @@ fn BoolEncoder(comptime V: type) type {
             self.total += n;
         }
 
+        /// Writes the run in progress, so every appended value is in the
+        /// bytes. Consumed by [`Self.take`](BoolEncoder.take), which needs
+        /// it: a slab cut at a run boundary cannot leave a run half-written.
         pub fn finish(self: *Self) ParseError!void {
             try self.flush();
         }
@@ -1308,6 +1388,8 @@ fn RunWriter(comptime Payload: type, comptime Nullable: bool) type {
         /// The runs written to `out` so far.
         segments: usize,
 
+        /// A writer holding nothing, over an empty buffer. The allocator is
+        /// the caller's and is not released; `deinit` is.
         pub fn init(gpa: std.mem.Allocator) Self {
             return .{
                 .gpa = gpa,
@@ -1320,6 +1402,8 @@ fn RunWriter(comptime Payload: type, comptime Nullable: bool) type {
             };
         }
 
+        /// Frees the encode buffer and the literal run's payload buffer. The
+        /// allocator itself is the caller's.
         pub fn deinit(self: *Self) void {
             self.out.deinit(self.gpa);
             self.lit.deinit(self.gpa);
@@ -1491,13 +1575,21 @@ fn RleBase(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
     return struct {
         const Base = WireRle(Payload, Nullable, Utf8);
 
+        /// The column value type, and the wire form too: a run-length column
+        /// stores the values themselves, so there is no difference and no
+        /// length to measure.
         pub const Value = rleElement(Payload, Nullable);
         pub const Wire = Base.Wire;
         pub const has_lit_header = Base.has_lit_header;
         pub const runAtOrAfter = Base.runAtOrAfter;
         pub const firstRunValue = Base.firstRunValue;
         pub const literalValueAt = Base.literalValueAt;
+        /// The per-slab weight, and so the index type this column builds.
+        /// `tracks_prefix` false means the column keeps no per-slab bases: a
+        /// run-length column stores the values themselves.
         pub const Weight = LenWeight;
+        /// Whether this column keeps the per-slab weight prefixes. False: a
+        /// run-length column stores the values themselves.
         pub const tracks_prefix = false;
         /// Whether the stored value is a row's own *length*, so the
         /// column answers the prefix-sum questions (`PrefixValue`,
@@ -1543,6 +1635,9 @@ fn RleBase(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
             return .{ .len = slab.len };
         }
 
+        /// How far a slab's weight advances a prefix sum: zero, because a
+        /// run-length column is not a prefix column and its weight carries
+        /// no running value.
         pub fn weightIncrement(w: Weight) i64 {
             _ = w;
             return 0;
@@ -1653,13 +1748,20 @@ pub fn Prefix(comptime T: type) type {
     const Nullable = isNullable(T);
     const Base = WireRle(Payload, Nullable, false);
     return struct {
+        /// The column value type: a row's own length. The wire form is the
+        /// same number, so the two are the same type.
         pub const Value = T;
         pub const Wire = Base.Wire;
         pub const has_lit_header = Base.has_lit_header;
         pub const runAtOrAfter = Base.runAtOrAfter;
         pub const firstRunValue = Base.firstRunValue;
         pub const literalValueAt = Base.literalValueAt;
+        /// The per-slab weight, and so the index type this column builds.
+        /// `tracks_prefix` true means the column keeps per-slab bases, which
+        /// is what turns a row length into an absolute prefix position.
         pub const Weight = PrefixWeight;
+        /// Whether this column keeps the per-slab weight prefixes, and why
+        /// that matters here, is said on the weight above.
         pub const tracks_prefix = true;
         /// Whether the stored value is a row's own *length*, so the
         /// column answers the prefix-sum questions (`PrefixValue`,
@@ -1715,10 +1817,15 @@ pub fn Prefix(comptime T: type) type {
             return .{ .len = slab.len, .prefix = sum };
         }
 
+        /// How far a slab's weight advances a prefix sum: the sum of the row
+        /// lengths the slab holds, which is the weight's `prefix` half.
         pub fn weightIncrement(w: Weight) i64 {
             return w.increment();
         }
 
+        /// The column value a wire entry stands for. A prefix column stores
+        /// the row length itself, so `running` is untouched and the returned
+        /// value is the wire entry.
         pub fn valueOfWire(w: Wire, running: *i64) ParseError!Value {
             _ = running;
             return w;
@@ -1744,11 +1851,19 @@ pub fn Prefix(comptime T: type) type {
             return .{ .wire = v, .running = running };
         }
 
+        /// The wire entries an insert takes, and the running value behind
+        /// them. A prefix column stores the row length itself, so the entries
+        /// are the values unchanged and the running value does not move; the
+        /// returned slice is the caller's to release with `gpa`.
         pub fn wireOfInsert(gpa: std.mem.Allocator, running: i64, values: []const Value) ParseError!Inserted(Wire) {
             const out = try gpa.dupe(Wire, values);
             return .{ .wires = out, .running = running };
         }
 
+        /// Nothing to re-anchor: a prefix column stores the row length
+        /// rather than a difference, so no wire entry is measured against a
+        /// running value. Always null, and the column's re-anchor step reads
+        /// that as "no row to fix".
         pub fn reanchor(wire: Wire, before: i64, after: i64) ParseError!?Wire {
             _ = wire;
             _ = before;
@@ -1773,6 +1888,9 @@ pub fn Delta(comptime T: type) type {
     const Nullable = isNullable(T);
 
     return struct {
+        /// The column value type, and what a run's difference is measured
+        /// against. The wire form is a difference rather than the value, so
+        /// the two are not the same type.
         pub const Value = T;
         /// A difference, or absent for a row that holds no value and so
         /// leaves the running value alone.
@@ -1781,7 +1899,13 @@ pub fn Delta(comptime T: type) type {
         pub const runAtOrAfter = Base.runAtOrAfter;
         pub const firstRunValue = Base.firstRunValue;
         pub const literalValueAt = Base.literalValueAt;
+        /// The per-slab weight, and so the index type this column builds.
+        /// `tracks_prefix` true means the column keeps per-slab bases: a
+        /// delta column's rows are differences measured against a running
+        /// value, so every read needs the value in front of its slab.
         pub const Weight = btree.SlabAgg;
+        /// Whether this column keeps the per-slab weight prefixes, and why
+        /// that matters here, is said on the weight above.
         pub const tracks_prefix = true;
         /// Whether the stored value is a row's own *length*, so the
         /// column answers the prefix-sum questions (`PrefixValue`,
@@ -1875,6 +1999,9 @@ pub fn Delta(comptime T: type) type {
             return .{ .len = slab.len, .total = partial, .min_offset = lo, .max_offset = hi };
         }
 
+        /// How far a slab's weight advances a prefix sum. A delta column's
+        /// weight carries the slab's own prefix increment, so this is the
+        /// sum its rows add to the running value in front of the slab.
         pub fn weightIncrement(w: Weight) i64 {
             return w.total;
         }
@@ -1995,13 +2122,19 @@ pub const DeltaOption = Delta(?u32);
 /// boundary has to be told which value its first run now carries — the
 /// `opens_with_true` argument every codec's encoder takes.
 pub const Bool = struct {
+    /// The column value type: a boolean is its own wire value.
     pub const Value = bool;
+    /// The wire value type, which for a boolean column is the value itself.
     pub const Wire = bool;
     /// A boolean run is a length in the byte stream and its value is the
     /// run's position in the sequence, so there is no header behind it at
     /// all (`bool.rs:13-25`) — not even for a one-item run.
     pub const has_lit_header = false;
+    /// The per-slab weight, and so the index type this column builds.
+    /// `tracks_prefix` false means the column keeps no per-slab bases.
     pub const Weight = LenWeight;
+    /// Whether this column keeps the per-slab weight prefixes. False: a
+    /// boolean column stores the values themselves.
     pub const tracks_prefix = false;
     /// Whether the stored value is a row's own *length*, so the column
     /// answers the prefix-sum questions (`prefix.rs:44-108`). A boolean
@@ -2049,6 +2182,9 @@ pub const Bool = struct {
         return out.toOwnedSlice(gpa);
     }
 
+    /// The wire values for rows `from..to` of `bytes`, as a fresh
+    /// caller-owned slice. Decodes the whole slab and copies the window out
+    /// of it, so `from > to` or `to` past the end is `error.InvalidValue`.
     pub fn wireRange(gpa: std.mem.Allocator, bytes: []const u8, from: usize, to: usize) ParseError![]Wire {
         const all = try wireAll(gpa, Bool, bytes);
         defer gpa.free(all);
@@ -2285,6 +2421,8 @@ pub const Bool = struct {
         }
     }
 
+    /// The slab's weight: its item count, which is all a boolean column's
+    /// index needs (`column.rs:115-137`).
     pub fn weightOf(gpa: std.mem.Allocator, slab: *const Slab) ParseError!Weight {
         _ = gpa;
         return .{ .len = slab.len };
@@ -2318,6 +2456,9 @@ pub const Bool = struct {
     /// and a run sequence whose first run is a pad alternates from there on
     /// without the pad flipping anything (`bool.rs:784-824`).
     pub const LoadCursor = struct {
+        /// The slab being walked, read-only. It is the caller's and must
+        /// stay alive and unmodified for as long as the cursor is used;
+        /// nothing the cursor returns points into it.
         bytes: []const u8,
         /// The byte offset of the next run header.
         pos: usize,
@@ -2329,10 +2470,14 @@ pub const Bool = struct {
         /// Whether the next run is still the opening one.
         first: bool,
 
+        /// A cursor standing at the start of `bytes`. The bytes are only
+        /// read, and must stay alive and unmodified for as long as the
+        /// cursor is used.
         pub fn init(bytes: []const u8) LoadCursor {
             return .{ .bytes = bytes, .pos = 0, .item = 0, .value = false, .first = true };
         }
 
+        /// Items served so far, which is also the row the next run starts at.
         pub fn items(self: *const LoadCursor) usize {
             return self.item;
         }
@@ -2342,6 +2487,12 @@ pub const Bool = struct {
             return self.pos;
         }
 
+        /// The next run, or null at the end of the input. A run is served
+        /// whole, so every step has `last_of_run` set and a value that is
+        /// null only for the opening pad. Malformed bytes are
+        /// `error.InvalidValue` — a zero-count run anywhere but the opening
+        /// pad, or a trailing one — and `error.Overflow` where a count
+        /// will not fit a `usize`.
         pub fn next(self: *LoadCursor) ParseError!?Step {
             if (self.pos >= self.bytes.len) return null;
             const c = try leb128.readUnsigned(self.bytes[self.pos..]);
@@ -2368,11 +2519,17 @@ pub const Bool = struct {
         }
     };
 
+    /// How far a slab's weight advances a prefix sum: zero, because a
+    /// boolean column is not a prefix column and its weight carries no
+    /// running value.
     pub fn weightIncrement(w: Weight) i64 {
         _ = w;
         return 0;
     }
 
+    /// The column value one wire entry stands for. A boolean column stores
+    /// the value itself, so `running` is untouched and the returned value
+    /// is the wire entry.
     pub fn valueOfWire(w: Wire, running: *i64) ParseError!Value {
         _ = running;
         return w;
@@ -2383,6 +2540,10 @@ pub const Bool = struct {
         running.* = try addChecked(running.*, @as(i64, @intCast(w)));
     }
 
+    /// The wire entries an insert takes, and the running value behind them.
+    /// A boolean column's value is its position in the sequence, so the
+    /// wire entries are the values unchanged; the returned slice is the
+    /// caller's to release with `gpa`.
     pub fn wireOfInsert(gpa: std.mem.Allocator, running: i64, values: []const Value) ParseError!Inserted(Wire) {
         const out = try gpa.dupe(Wire, values);
         return .{ .wires = out, .running = running };
@@ -2395,6 +2556,9 @@ pub const Bool = struct {
         return .{ .wire = v, .running = running };
     }
 
+    /// Nothing to re-anchor: a boolean column stores the value itself, so
+    /// no wire entry is measured against a running value. Always null, and
+    /// the column's re-anchor step reads that as "no row to fix".
     pub fn reanchor(wire: Wire, before: i64, after: i64) ParseError!?Wire {
         _ = wire;
         _ = before;
@@ -2412,6 +2576,23 @@ pub const Bool = struct {
 /// Every entry point that allocates takes the allocator, because the
 /// column's slabs, the index's arena and the per-slab weight array all live
 /// in it and `deinit` has to give every byte back.
+///
+/// # What the column owns
+///
+/// * **The allocator is borrowed.** `deinit` releases what was allocated in
+///   it and leaves the allocator itself alone.
+/// * **A copy is a second owner of everything.** Zig has no move semantics,
+///   so `var b = a;` gives two columns that both free the same slabs. Move a
+///   column by pointer, or hand it back through a call that returns it.
+/// * **A slab handed to the column is taken by value.** `fromWeights` and
+///   `initWithBudget`'s loaders move slab lists in and leave the caller's
+///   copy empty; a slab built by the caller with a different allocator is
+///   freed by [`deinit`](Column.deinit) with the column's.
+/// * **The allocator moves with the contents** through
+///   [`remap`](Column.remap) and [`swapContents`](Column.swapContents), so
+///   ask [`allocator`](Column.allocator) again after either.
+/// * **Not thread-safe.** A column, its slabs and its index are one mutable
+///   state with no synchronisation.
 pub fn Column(comptime T: type, comptime E: type) type {
     if (T != E.Value) @compileError("a column's value type is its codec's value type");
     return struct {
@@ -2436,9 +2617,24 @@ pub fn Column(comptime T: type, comptime E: type) type {
         const Tree = btree.Tree(Weight);
         const identity = Weight.Aggregate.identity;
 
+        /// The allocator every slab, the index and the weight array live
+        /// in. It is not the column's to release: `deinit` gives back what
+        /// was allocated here and leaves the allocator alone.
+        ///
+        /// It moves with the contents. [`remap`](Column.remap) and
+        /// [`swapContents`](Column.swapContents) hand a column's storage to
+        /// another allocator, so a value of `allocator()` taken before
+        /// either call names a different allocator afterwards.
         gpa: std.mem.Allocator,
+        /// The encoded slabs, in column order. Every entry's `data` belongs
+        /// to `gpa`.
         slabs: std.ArrayList(Slab),
+        /// The positional index: one weight per slab, answered in O(log S).
         tree: Tree,
+        /// How many values the slabs hold together. It is the count
+        /// `len` reports, and it is updated with the slabs it describes —
+        /// every mutation that can fail stages what it needs first, so a
+        /// refused mutation leaves both describing the column as it was.
         total_len: usize,
         /// The merged weight of the slabs before each slab, plus one slot
         /// for the whole column. Only a codec whose weight carries a prefix
@@ -2455,6 +2651,13 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// never interpreted, so one `usize` that only ever goes up is
         /// enough.
         counter: usize,
+
+        /// Set only on the provisional column a [`StagedSplice`] builds:
+        /// what the stage owns, and which slabs its rebuild detached while
+        /// their buffers stayed the real column's. `null` on every ordinary
+        /// column, and every check against it is a pointer test on a path a
+        /// plain splice runs once per slab it rewrites.
+        staging: ?*Staging = null,
 
         /// A column with no values and no slabs, on the default run
         /// budget.
@@ -2498,7 +2701,8 @@ pub fn Column(comptime T: type, comptime E: type) type {
             return self.budget;
         }
 
-        /// Frees every slab, the index and the weight array.
+        /// Frees every slab, the index and the weight array. The allocator
+        /// itself is the caller's and is not released.
         pub fn deinit(self: *Self) void {
             for (self.slabs.items) |*s| s.deinit(self.gpa);
             self.slabs.deinit(self.gpa);
@@ -2511,6 +2715,12 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// in, and the one `deinit` gives every byte back with. A caller
         /// that hands the column a slab has to be handed this one, or the
         /// column frees it with an allocator it was not taken from.
+        ///
+        /// It is not stable across [`remap`](Column.remap) or
+        /// [`swapContents`](Column.swapContents): both move a column's
+        /// storage, allocator and contents together, so a cached copy names
+        /// whichever allocator the column held before. Ask again after
+        /// either call.
         pub fn allocator(self: *const Self) std.mem.Allocator {
             return self.gpa;
         }
@@ -3310,28 +3520,84 @@ pub fn Column(comptime T: type, comptime E: type) type {
             try self.splice(gpa, index, n, &.{});
         }
 
-        /// Replaces the column with a re-encoded copy in which every value
-        /// has been through `f` (`Column::remap`, `column.rs:1263-1273`).
+        /// Builds a second column in which every value has been through `f`,
+        /// and leaves this one exactly as it was. This is the borrowed half of
+        /// [`remap`](Column.remap), and the one implementation both of them
+        /// are made of: `remap` publishes the result over the receiver, and
+        /// `Columns::remapActors` has to stage four columns before it can
+        /// publish any of them (`op_set2/columns.rs:332-348`).
         ///
-        /// The walk is run-at-a-time, so one `f` call covers a whole
-        /// repeat run and a column of ten million copies of one actor
-        /// costs ten million nothing (`encoding.rs:66-86`). The op set
-        /// needs exactly this: its columns hold *actor indices*, and an
-        /// insertion into the sorted actor table shifts every index above
-        /// it, which `Columns::remap_actors` applies to `id_actor`,
-        /// `succ_actor`, `obj_actor` and `key_actor`
-        /// (`op_set2/columns.rs:332-348`).
+        /// **One `f` call per run, and the values are laid out per row.** The
+        /// walk is run-at-a-time, so a repeat run is mapped by a single call
+        /// rather than one per copy (`encoding.rs:66-86`,
+        /// `column.rs:1263-1273`), and a run that maps to one value stays one
+        /// run. The *copying* behind that is per row: the mapped value is
+        /// filled into a fixed 256-element stack buffer once per row and the
+        /// buffer is handed to `extend` once per 256 rows, so the rebuild is
+        /// O(rows) writes and O(rows / 256) extensions whatever the run
+        /// lengths are.
         ///
-        /// `ctx` is passed to `f` unchanged, so a closure over the shift
-        /// or the table is a plain pointer. The mapped values are staged
-        /// in a fixed buffer and flushed a run at a time, so the rebuild
-        /// costs one buffer rather than a copy of the whole column.
-        pub fn remap(
-            self: *Self,
+        /// **`f` is handed one borrowed value per run, and a row is never
+        /// what it is handed.** `ctx` comes through unchanged; the value is
+        /// the run's, read out of the source's slab. For a `T` that carries a
+        /// payload — `[]const u8` over `RleUtf8` or `Rle([]const u8)` — that
+        /// value *is* a window on the slab's own bytes rather than a copy of
+        /// them (`rle.zig:117-120`: a payload read is a window on the encoded
+        /// bytes), so `f` must not retain it past the walk and must not hand
+        /// back a window into memory it does not own.
+        ///
+        /// **What `f` returns is read again later.** The result of a call may
+        /// sit in the stack buffer across further calls and is only copied
+        /// into the result column when that buffer is flushed, so a returned
+        /// slice or pointer must stay readable until then — long enough to
+        /// cover the rest of the walk, not just the call. `f` must not write
+        /// to the source column or re-enter this method while the walk is
+        /// running: the iterator and the slab the run's value names are both
+        /// live across the loop.
+        ///
+        /// **The result is the caller's column.** It is built in `gpa`, it is
+        /// released by `deinit` with `gpa`, and it is held on **this column's
+        /// own run budget** — `maxSegmentsOf` of the source and of the result
+        /// answer the same number — so a staged column is byte for byte the
+        /// one `remap` would have installed.
+        ///
+        /// **The source is untouched on both paths.** Nothing here writes it,
+        /// and a refusal — `error.OutOfMemory` from the new column or from a
+        /// flush, or an encoding refusal from a value `f` produced — frees the
+        /// partial result before the error leaves, so neither side keeps
+        /// residue: the caller holds the same whole column it handed in, and
+        /// can read it, remap it again or `deinit` it exactly as it would have
+        /// without this call.
+        ///
+        /// **What it costs.** One pass over the rows, one `f` call per run,
+        /// a fixed 256-element stack buffer, and the result's own storage —
+        /// which is a **whole second column**, materialised in `gpa` before
+        /// this returns, so the peak is the source and the finished result
+        /// both live. That is what `remap` costs too, because the result is
+        /// the column that gets installed. What it does *not* cost is a copy
+        /// of the source: it is read, never cloned, so the source's own bytes
+        /// are not duplicated to keep the input intact — which is what lets a
+        /// caller stage four columns at once and pay that peak four times over
+        /// instead of paying for four source copies as well.
+        ///
+        /// **The result's counter is the result's own**: `initWithBudget`
+        /// starts it at zero and every flush of the 256-element buffer bumps
+        /// it once, so it counts this build's writes and says nothing about
+        /// the column the result replaces. Installing it in place of a live
+        /// column is the caller's step, and so is invalidating the cursors
+        /// over the rows it replaces:
+        /// `remap` keeps the receiver's counter and adds one, and
+        /// `Columns::remapActors` publishes through
+        /// [`swapContents`](Column.swapContents), which moves both counters
+        /// past either column's. A caller that installs a result any other way
+        /// has to do that itself, or an [`IterState`](Column.IterState) taken
+        /// over the old rows may resume against the new ones.
+        pub fn remapped(
+            self: *const Self,
             gpa: std.mem.Allocator,
             ctx: anytype,
             comptime f: fn (@TypeOf(ctx), T) T,
-        ) ParseError!void {
+        ) ParseError!Self {
             var src = try self.iterator();
             var out = try Self.initWithBudget(gpa, self.budget);
             errdefer out.deinit();
@@ -3339,6 +3605,17 @@ pub fn Column(comptime T: type, comptime E: type) type {
             // enough that the staging buffer is a stack frame.
             var buf: [256]T = undefined;
             var held: usize = 0;
+            // **The flushes go through the private mutating core, not
+            // [`extend`](Column.extend).** `out` is a local this function
+            // owns whole — nothing else names it and the `errdefer` gives it
+            // back — so the atomicity [`splice`](Column.splice) buys by
+            // staging the column beside itself buys nothing here, and costs a
+            // copy of `out`'s slab list and a copy of its index on every
+            // flush. The core is the same splice either way: same rows, same
+            // encoding, same run budget, one counter bump per flush. A
+            // refusal leaves `out` holding part of the result and the error
+            // leaves through the `errdefer` that frees it; the borrowed source
+            // is not touched on any path.
             while (try src.nextRun()) |run| {
                 const mapped = f(ctx, run.value);
                 // A run that maps to one value stays one run: the whole
@@ -3351,24 +3628,63 @@ pub fn Column(comptime T: type, comptime E: type) type {
                     held += room;
                     left -= room;
                     if (held == buf.len) {
-                        try out.extend(gpa, &buf);
+                        try out.spliceInPlace(gpa, out.total_len, 0, &buf);
                         held = 0;
                     }
                 }
             }
-            if (held != 0) try out.extend(gpa, buf[0..held]);
-            // The mapping is total, so the new column has the same values
-            // in the same order and the same length; only the encoding may
-            // differ. The swap is what upstream's `*self = remap(..)`
-            // does (`column.rs:1272`). The budget and the counter are this
-            // column's, not the fresh one's: a remap rewrites the rows and
-            // keeps every guarantee the column already made, and a cursor
-            // suspended over the old rows has been invalidated by it.
-            const budget = self.budget;
+            if (held != 0) try out.spliceInPlace(gpa, out.total_len, 0, buf[0..held]);
+            return out;
+        }
+
+        /// Replaces the column with a re-encoded copy in which every value
+        /// has been through `f` (`Column::remap`, `column.rs:1263-1273`).
+        ///
+        /// The rewrite itself is [`remapped`](Column.remapped) — the same
+        /// borrowed build the op set's four-column stage is made of — and this
+        /// is the publishing half of it: **every byte the receiver holds
+        /// survives until the new column has been built in full**, so a
+        /// refusal returns with the column exactly as it was.
+        ///
+        /// `ctx` is passed to `f` unchanged, so a closure over the shift or
+        /// the table is a plain pointer, and `f` sees one borrowed value per
+        /// run.
+        ///
+        /// **The column adopts `gpa`.** The re-encoded copy is built in it
+        /// and takes the receiver's place, so afterwards the column's slabs,
+        /// its index and its bases all live in `gpa` and `deinit` gives them
+        /// back with it. `gpa` need not be the allocator the column was
+        /// built with — building a column into an arena is the reason the
+        /// parameter exists — but a value of
+        /// [`allocator`](Column.allocator) taken before this call names a
+        /// different allocator afterwards, so ask again rather than reusing
+        /// it on a slab taken from the column.
+        ///
+        /// The run budget and the suspension counter are the receiver's own
+        /// and do not travel with the contents: the budget is the number the
+        /// result was built with, and the counter is the receiver's plus one.
+        /// A remap rewrites the rows and keeps every guarantee the column
+        /// already made, while a cursor suspended over the old rows has been
+        /// invalidated by it and cannot resume against the new ones.
+        pub fn remap(
+            self: *Self,
+            gpa: std.mem.Allocator,
+            ctx: anytype,
+            comptime f: fn (@TypeOf(ctx), T) T,
+        ) ParseError!void {
+            const out = try self.remapped(gpa, ctx, f);
+            // The mapping is total — every value comes back through `f`, in
+            // the source's order — so the new column has the same rows in the
+            // same order and the same length, with every value *mapped*: only
+            // the encoding and the values differ, never the shape. The swap
+            // is what upstream's `*self = remap(..)` does (`column.rs:1272`).
+            // The budget is the result's own — it was built with the
+            // receiver's — so the counter is the only thing carried across by
+            // hand, and `+% 1` past the receiver's is what stops a cursor
+            // suspended over the rows this replaces.
             const counter = self.counter +% 1;
             self.deinit();
             self.* = out;
-            self.budget = budget;
             self.counter = counter;
         }
 
@@ -3377,9 +3693,106 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// is a real case: an empty column, a splice at either end, a
         /// splice that removes everything, and a splice that spans slabs.
         ///
+        /// **Every return leaves the column exactly as it was.** Not merely a
+        /// column that still describes itself: the same values, the same
+        /// `len`, the same slab list, the same index, the same per-slab
+        /// bases, the same allocator and the same suspension counter. The
+        /// write is [`stageSplice`](Column.stageSplice) followed by
+        /// [`publish`](Column.StagedSplice.publish) — the same splice runs
+        /// against a provisional column whose slab list shares this one's
+        /// buffers, and the publish is the one step that cannot be refused.
+        ///
+        /// **Why the seam and not a reservation.** The rebuild publishes the
+        /// cut's bytes before the last step that allocates. `settle` splits
+        /// the rebuilt slab at the run budget and coalesces the neighbours of
+        /// the rebuilt range, and both take their room from `reserveSlabs`
+        /// before the first byte moves, so neither can fail after the list has
+        /// moved. The index rebuild behind them cannot: `reindexFrom` hands
+        /// the new list to `Tree.splice`, which grows nodes and leaf buffers
+        /// out of the tree's own arena (`btree.zig:402-416`, `:422-439`), and
+        /// that arena is not the column's to reserve. A column that reserved
+        /// everything it could reach would still be refused there, holding
+        /// new slabs against an index that describes the old ones — which is
+        /// what a caller reads afterwards. Staging puts that step on a column
+        /// whose refusal costs nothing.
+        ///
+        /// **What it costs.** One shallow copy of the slab list and one copy
+        /// of the index — both proportional to the slab count, the same order
+        /// as the per-splice cache rebuilds this write already ran — plus one
+        /// copy of each slab the cut re-encodes, and that one is bounded by
+        /// the run budget. It is a fixed price per call, not per value:
+        /// [`extend`](Column.extend) and [`remapped`](Column.remapped) hand a
+        /// whole run to one splice.
+        ///
+        /// **`gpa` must be this column's own** —
+        /// [`allocator`](Column.allocator), the value `deinit` releases it
+        /// with. The write is made there whatever `gpa` says, because the
+        /// slabs, the index and the bases of a published stage move with the
+        /// contents; passing a second allocator would already have mixed two
+        /// inside one splice, so it is refused by assertion rather than
+        /// honoured — on the allocator's vtable, which is the whole of the
+        /// identity an allocator can be compared on; the body says exactly
+        /// what that does and does not separate. This is the same rule as
+        /// [`remap`](Column.remap), and for the same reason: the allocator
+        /// moves with the storage, so it is named once at the boundary rather
+        /// than chosen per write.
+        ///
         /// `index + del` past the end is `error.InvalidValue`, matching
         /// upstream's out-of-bounds assertion (`column.rs:1773`).
+        ///
+        /// A length that does not fit `usize` is `error.Overflow`, from the
+        /// stage's own count of what publishing would produce.
         pub fn splice(
+            self: *Self,
+            gpa: std.mem.Allocator,
+            index: usize,
+            del: usize,
+            values: []const T,
+        ) ParseError!void {
+            // **The write is made in the column's own allocator.** The stage,
+            // and everything it builds, come out of — and go back into — the
+            // allocator [`deinit`](Column.deinit) releases the column with,
+            // which is the one `reserveSlabs` and the two cache rebuilds
+            // already spend and the one `deinit` already frees. `gpa` names
+            // that allocator and must be this column's own: a caller that
+            // passed a different one was already mixing allocators inside a
+            // single splice, so this is a statement of the precondition rather
+            // than a relaxation of it. It is an assertion because a mismatch is
+            // a programmer error and not a condition to answer, and it is
+            // compiled out of `ReleaseFast` — the duty is the caller's there.
+            //
+            // **The vtable, and only the vtable.** That is the identity a
+            // `std.mem.Allocator` can be compared on: `ptr` is `undefined` for
+            // every stateless allocator std ships — `page_allocator`,
+            // `c_allocator`, `smp_allocator`, `brk_allocator` — so reading it
+            // to compare two of them is undefined behaviour and can fold to
+            // `false` under optimisation. The vtable is a static pointer in
+            // every allocator, so it names the implementation exactly. What it
+            // does not separate is two *instances* of one implementation,
+            // which was already a hazard before this write existed and is not
+            // what this seam introduces.
+            std.debug.assert(gpa.vtable == self.gpa.vtable);
+            var stage = try self.stageSplice(index, del, values);
+            // A no-op in either direction: `publish` spends the stage, and a
+            // `deinit` after a publish is documented as a no-op rather than
+            // a second free.
+            defer stage.deinit();
+            stage.publish(self);
+        }
+
+        /// The splice itself: rebuild the cut range in this column and bring
+        /// the two caches back into step.
+        ///
+        /// **A refusal is only survivable on a provisional column.** The
+        /// rebuilt range goes into the slab list before `settle` runs, and
+        /// `settle`'s coalescing and index rebuild are the steps that
+        /// allocate after that — so a refusal in either leaves a column
+        /// holding new slabs against an index that describes the old ones.
+        /// [`splice`](Column.splice) is therefore this plus a publish, and
+        /// this runs only on the provisional column a
+        /// [`StagedSplice`](Column.StagedSplice) builds, which a refusal
+        /// discards whole.
+        fn spliceInPlace(
             self: *Self,
             gpa: std.mem.Allocator,
             index: usize,
@@ -3392,10 +3805,13 @@ pub fn Column(comptime T: type, comptime E: type) type {
             // write can move the row it stands on under it. The counter is
             // what `tryResume` compares, so it is bumped here — at the one
             // place every row-level write passes through, rather than in
-            // the slab machinery a caller never sees.
+            // the slab machinery a caller never sees. On the provisional
+            // column this bump is carried out by the stage's own counter,
+            // which `publish` installs.
             self.counter +%= 1;
             if (self.slabs.items.len == 0) {
                 try self.slabs.append(gpa, .empty);
+                self.stagedGrew(self.slabs.items.len - 1, 0, 1);
                 try self.reindex();
             }
 
@@ -3407,7 +3823,353 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 try self.spliceAcrossSlabs(gpa, index, del, values, s0, s1);
             }
             try self.rebuildAggs();
-            self.total_len = self.total_len - del + values.len;
+        }
+
+        // ── The staged splice ───────────────────────────────────────────
+
+        /// What a staged splice owns on a provisional column: one flag per
+        /// slab of that column's list, and the slabs the rebuild took out of
+        /// the list without owning their buffers.
+        ///
+        /// The provisional column is a real `Column(T, E)` — that is what
+        /// makes a staged splice the *same* splice, merge policy, split and
+        /// re-anchor included, rather than a second implementation of it.
+        /// What it is not is a copy: its slab list starts as struct copies of
+        /// the real one's, sharing every buffer. A stage only ever re-encodes
+        /// the range the cut covers, plus whichever neighbour the merge
+        /// policy reaches for — so the work is O(the cut and the slabs in
+        /// the index), never O(the values).
+        const Staging = struct {
+            /// One flag per slab, the same length as the provisional list:
+            /// true when this stage owns that slab's buffer, false when the
+            /// buffer is still the original column's. A slab the provisional
+            /// column made for itself has no flag and counts as owned.
+            owned: std.ArrayList(bool),
+            /// Slabs the original column named and the provisional list no
+            /// longer does — either dropped outright, or overwritten in place
+            /// by a copy the stage made. **Both spellings of "no longer
+            /// named" matter**, and both end here: after the provisional list
+            /// stops naming a slab, only the original column's own list still
+            /// does, and a publish is exactly the moment that list goes away.
+            /// So an abort must leave these alone — the column still holds
+            /// them, and this list releases only its own buffer — and a
+            /// publish must free them, once each, because the column's own
+            /// list is about to stop naming anything.
+            detached: std.ArrayList(Slab),
+        };
+
+        /// Whether the provisional column owns slab `i`, as opposed to
+        /// sharing the original column's buffer.
+        fn ownedByStage(self: *Self, i: usize) bool {
+            const st = self.staging orelse return true;
+            if (i >= st.owned.items.len) return true;
+            return st.owned.items[i];
+        }
+
+        /// Hands slab `i` over from the original column to this stage,
+        /// copying its bytes the first time. Every step that rewrites a slab
+        /// in place calls this first, because those steps free the slab's old
+        /// buffer and that buffer is still the original column's until here.
+        ///
+        /// **The original is recorded before it is overwritten.** The
+        /// provisional list is about to stop naming the slab the column
+        /// named at this index, and after this assignment nothing else names
+        /// it: not the provisional list, which holds the copy, and not the
+        /// column, whose own list a publish replaces wholesale. So an abort
+        /// must hand it back to the column (it only releases this list's
+        /// buffer) and a publish must free it (it releases each entry once).
+        /// Leaving it unrecorded leaks the column's buffer for the rest of
+        /// the process — which is what an integrated run reported.
+        ///
+        /// Both fallible steps are done before anything is overwritten: the
+        /// record is appended first and rolled back if the copy is refused,
+        /// so a refusal leaves the provisional slab exactly as it was —
+        /// still shared, still the column's, and named by both lists, which
+        /// is the one state in which an abort and a publish agree on who
+        /// owns it. The flag makes the pair exactly-once: it is the guard
+        /// above, so a second call for the same slab finds it already owned.
+        fn takeOwnership(self: *Self, i: usize) ParseError!void {
+            if (self.ownedByStage(i)) return;
+            const st = self.staging.?;
+            try st.detached.append(self.gpa, self.slabs.items[i]);
+            errdefer _ = st.detached.orderedRemove(st.detached.items.len - 1);
+            self.slabs.items[i] = try self.slabs.items[i].clone(self.gpa);
+            st.owned.items[i] = true;
+        }
+
+        /// Releases slab `i` as the provisional list drops it. An owned slab
+        /// is freed; a shared one is recorded for the publish, which is the
+        /// only path after which the original column no longer names it.
+        fn dropSlab(self: *Self, i: usize) ParseError!void {
+            if (self.ownedByStage(i)) {
+                self.slabs.items[i].deinit(self.gpa);
+                return;
+            }
+            try self.staging.?.detached.append(self.gpa, self.slabs.items[i]);
+        }
+
+        /// Keeps the ownership flags the same length as the slab list after
+        /// `added` slabs took the place of `dropped` at `at`. The added ones
+        /// are the stage's: the provisional rebuild built them.
+        ///
+        /// **Not fallible, deliberately.** A flag list that fell behind the
+        /// slab list would have the stage free a buffer the original column
+        /// still names, and the two would free it twice. Every caller has
+        /// already reserved through `reserveSlabs`, which reserves this list
+        /// for the same count it reserves the slab list for, so the appends
+        /// and inserts below fit.
+        fn stagedGrew(self: *Self, at: usize, dropped: usize, added: usize) void {
+            const st = self.staging orelse return;
+            while (st.owned.items.len < at + dropped) st.owned.appendAssumeCapacity(false);
+            var i = dropped;
+            while (i != 0) {
+                i -= 1;
+                _ = st.owned.orderedRemove(at + i);
+            }
+            var k: usize = 0;
+            while (k < added) : (k += 1) st.owned.insertAssumeCapacity(at, true);
+        }
+
+        /// A splice built beside the column instead of inside it. This is
+        /// how [`splice`](Column.splice) makes itself atomic, and it is the
+        /// seam `Columns.splice` and `Columns.removeOps` need so that a
+        /// refusal in one of twenty columns leaves all twenty as they were:
+        /// twenty stages, then twenty infallible publishes.
+        ///
+        /// # What it owns, and what it does not
+        ///
+        /// * **The staged column is the stage's**, together with the buffers
+        ///   of the slabs it re-encoded — exactly the slabs the cut covered
+        ///   plus whichever neighbour the merge policy reached for. Every
+        ///   other slab is *borrowed*: the provisional list holds a struct
+        ///   copy and both lists name one buffer.
+        /// * **[`deinit`](StagedSplice.deinit) is the abort** and is the
+        ///   caller's to make: it frees the staged slabs and nothing else,
+        ///   leaving the original column byte-for-byte as it was. The slabs
+        ///   the rebuild detached are *not* freed, because the original
+        ///   column still names them.
+        /// * **[`publish`](StagedSplice.publish) consumes the stage** and
+        ///   hands the column the whole staged list — borrowed buffers
+        ///   included, since the column's own list is being replaced — plus
+        ///   the staged index, the staged bases and the staged length, and
+        ///   frees the detached slabs that are then in neither list. It
+        ///   cannot fail.
+        /// * **One stage per splice point.** A caller with several points
+        ///   stages each of them against columns that have not changed
+        ///   since, and only then publishes; it never publishes before every
+        ///   stage is in hand.
+        /// * A returned stage has no pointer into the constructor's stack.
+        ///   It can move while no caller borrows its address. A shallow copy
+        ///   is not a second owner.
+        /// * The stage borrows the original column and its untouched buffers.
+        ///   Keep that column live, at the same address, and unchanged until
+        ///   the stage is published or aborted.
+        ///
+        /// The allocator is the original column's own, taken from
+        /// [`allocator`](Column.allocator) rather than as a parameter, so
+        /// every byte the stage holds comes out of — and goes back into —
+        /// exactly the allocator [`deinit`](Column.deinit) will release the
+        /// column with. It is the same rule as [`remap`](Column.remap): the
+        /// allocator moves with the contents, and a stage does not move it.
+        ///
+        /// A stage is bound to the column it was built from. Publishing it
+        /// into another column, or into one written since, is a programmer
+        /// error that the publish asserts rather than a recoverable case.
+        pub const StagedSplice = struct {
+            /// The column this stage was built against. `publish` checks it.
+            col: *Self,
+            /// The provisional column the splice ran against: the same type,
+            /// the same run budget and the same allocator, over a slab list
+            /// that starts as copies of the original's.
+            /// Undefined for a no-op stage; use `newLen`, `publish`, or `deinit`.
+            staged: Self,
+            /// What the stage owns, and what it detached.
+            stage: Staging,
+            /// How many values the column holds once this is published.
+            new_len: usize,
+            /// The suspension counter the column carries afterwards, so a
+            /// cursor suspended over it cannot resume across the splice.
+            counter: usize,
+            /// Whether the splice asked for nothing at all, in which case
+            /// both `deinit` and `publish` leave the column alone.
+            noop: bool,
+            /// Whether the stage has been published or aborted. A `deinit`
+            /// after a publish is a no-op, so `defer s.deinit()` beside
+            /// `col.publish(s)` is safe rather than a double free.
+            spent: bool,
+
+            /// **The abort.** Frees the slabs this stage re-encoded and its
+            /// own bookkeeping, and leaves the original column exactly as it
+            /// was: no value, no length, no index and no base moved, and not
+            /// one of its buffers freed. After this the stage is spent and
+            /// `publish` is no longer valid.
+            ///
+            /// Reads ownership flags from this stage. The provisional
+            /// column's construction-only stack link is cleared before return.
+            /// A slab beyond the flags was created by the provisional column.
+            pub fn deinit(self: *StagedSplice) void {
+                if (self.spent) return;
+                if (self.noop) {
+                    self.spent = true;
+                    return;
+                }
+                const flags = self.stage.owned.items;
+                for (self.staged.slabs.items, 0..) |*s, i| {
+                    if (i >= flags.len or flags[i]) s.deinit(self.staged.gpa);
+                }
+                // Only the list buffer: those slabs' buffers are still the
+                // original column's, which is the whole reason they are
+                // recorded rather than freed.
+                self.stage.detached.deinit(self.staged.gpa);
+                self.stage.owned.deinit(self.staged.gpa);
+                self.staged.slabs.deinit(self.staged.gpa);
+                self.staged.agg_before.deinit(self.staged.gpa);
+                self.staged.tree.deinit();
+                self.spent = true;
+            }
+
+            /// **Publishes the splice.** Hands `col` the staged slab list —
+            /// borrowed buffers included, because `col`'s own list stops
+            /// naming them the moment it is replaced — the staged index, the
+            /// staged bases and the staged length, and frees the slabs the
+            /// staged rebuild had detached, which are then in neither list.
+            /// Consumes the stage.
+            ///
+            /// **Cannot fail.** Every allocation the hand-over needs was
+            /// taken by [`stageSplice`](Column.stageSplice), which is what
+            /// lets a caller stage twenty columns and know that publishing
+            /// them cannot leave the set half-applied.
+            ///
+            /// A stage for a splice that asked for nothing leaves `col`
+            /// untouched, counter included, and allocates nothing to say so —
+            /// which is what keeps [`splice`](Column.splice) free for a splice
+            /// that removes nothing and inserts nothing.
+            pub fn publish(self: *StagedSplice, col: *Self) void {
+                std.debug.assert(!self.spent);
+                std.debug.assert(col == self.col);
+                // The column must not have been written since the stage was
+                // built, or the staged layout describes a column that no
+                // longer exists.
+                std.debug.assert(col.counter +% 1 == self.counter);
+                if (self.noop) {
+                    self.deinit();
+                    return;
+                }
+                // `ArrayList.deinit` releases the buffer, not the slabs, and
+                // the staged list names every slab this column had.
+                col.slabs.deinit(col.gpa);
+                col.slabs = self.staged.slabs;
+                col.tree.deinit();
+                col.tree = self.staged.tree;
+                col.agg_before.deinit(col.gpa);
+                col.agg_before = self.staged.agg_before;
+                col.total_len = self.new_len;
+                col.counter = self.counter;
+                // In neither list now: the staged one dropped them and the
+                // column's own is gone.
+                for (self.stage.detached.items) |*s| s.deinit(col.gpa);
+                self.stage.detached.deinit(col.gpa);
+                self.stage.owned.deinit(col.gpa);
+                self.staged.slabs = .empty;
+                self.staged.agg_before = .empty;
+                self.spent = true;
+            }
+
+            /// How many values the column holds once this stage is published.
+            /// A caller that has to size something from the staged column — a
+            /// successor buffer, a companion prefix column — asks here rather
+            /// than adding up the values itself.
+            pub fn newLen(self: *const StagedSplice) usize {
+                return self.new_len;
+            }
+        };
+
+        /// Builds the splice that replaces `[index, index + del)` with
+        /// `values` beside the column instead of inside it, and returns it
+        /// staged (`StagedSplice`).
+        ///
+        /// **The column is not touched on any path**, including every error
+        /// path: same values, same `len`, same slabs, same index, same bases,
+        /// same allocator. Every allocation the eventual publish needs is
+        /// taken here, which is what makes the publish infallible — so a
+        /// caller with twenty columns to write can stage all twenty and only
+        /// then publish, and a refusal anywhere leaves the set whole.
+        ///
+        /// This is the splice run against a provisional column whose slab list
+        /// shares the original's buffers, so the staged result is the same
+        /// merge policy, the same split, the same delta re-anchor and the same
+        /// canonical bytes a direct splice produces — not a second
+        /// implementation of them. The slabs the cut did not cover are never
+        /// re-encoded; only their struct copies are made.
+        ///
+        /// Bounds past the end return `error.InvalidValue`; a resulting length
+        /// that does not fit `usize` returns `error.Overflow`.
+        /// A splice that asks for nothing stages an allocation-free no-op.
+        /// Both `deinit` and `publish` leave the column alone.
+        ///
+        /// The returned stage is the caller's to release — `defer
+        /// stage.deinit()` — or to publish, which consumes it.
+        pub fn stageSplice(
+            self: *Self,
+            index: usize,
+            del: usize,
+            values: []const T,
+        ) ParseError!StagedSplice {
+            if (index > self.total_len or del > self.total_len - index) return error.InvalidValue;
+
+            var st = StagedSplice{
+                .col = self,
+                .staged = undefined,
+                .stage = Staging{ .owned = .empty, .detached = .empty },
+                .new_len = std.math.add(usize, self.total_len - del, values.len) catch return error.Overflow,
+                .counter = self.counter +% 1,
+                .noop = del == 0 and values.len == 0,
+                .spent = false,
+            };
+            if (st.noop) return st;
+            st.staged = .{
+                .gpa = self.gpa,
+                .slabs = .empty,
+                .tree = try self.tree.clone(self.gpa),
+                .total_len = self.total_len,
+                .agg_before = .empty,
+                .budget = self.budget,
+                .counter = self.counter,
+            };
+            errdefer st.deinit();
+
+            // Room for the flags and for the one empty slab an empty column
+            // is seeded with, so `stagedGrew` never has to allocate on a path
+            // where the slab list is already moving.
+            // `resize` grows to `slabs.len + 1` and leaves the new slot
+            // uninitialized, so every flag is written before it is read; the
+            // spare slot is the one an empty column's seeded empty slab will
+            // take. The length then drops back to the slab count, and the
+            // spare capacity stays for `stagedGrew`.
+            try st.stage.owned.resize(self.gpa, self.slabs.items.len + 1);
+            @memset(st.stage.owned.items, false);
+            try st.stage.detached.ensureTotalCapacity(self.gpa, self.slabs.items.len + 1);
+            try st.staged.agg_before.appendSlice(self.gpa, self.agg_before.items);
+            // The provisional layout: the same slab structs, sharing their
+            // buffers, and a flag per slab saying the buffer is not ours.
+            try st.staged.slabs.appendSlice(self.gpa, self.slabs.items);
+            st.stage.owned.items.len = self.slabs.items.len;
+            st.staged.staging = &st.stage;
+
+            // **The mutating core, not [`splice`](Column.splice).** `splice`
+            // is this stage plus a publish, so routing it back through the
+            // public entry would stage the provisional column a second time
+            // and never finish.
+            if (!st.noop) try st.staged.spliceInPlace(self.gpa, index, del, values);
+            // **The provisional column gives the pointer back before the
+            // stage moves.** `st` lives in this frame and is returned by
+            // value, so `&st.stage` is the address of a local — clearing it
+            // here is what keeps the returned stage from carrying a pointer
+            // into a frame that ends with this call. Only the staged splice
+            // needs it, and it has run. `deinit` and `publish` read the
+            // flags out of `self.stage` directly and never through this.
+            st.staged.staging = null;
+            return st;
         }
 
         // ── The wire form ───────────────────────────────────────────────
@@ -3867,6 +4629,12 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// pulled, so a caller that pulls a few runs and then meets a
         /// malformed one is refused there — it never sees the rest of bytes
         /// it was not going to believe.
+        ///
+        /// The stream owns every slab it has cut and their buffers, plus the
+        /// weight list; the input bytes are the caller's and are only read.
+        /// A stream abandoned part-way is released with [`deinit`](LoadIter.deinit)
+        /// and the column is untouched, which is the other half of what
+        /// [`finalize`](LoadIter.finalize) promises.
         pub const LoadIter = struct {
             gpa: std.mem.Allocator,
             bytes: []const u8,
@@ -3894,7 +4662,17 @@ pub fn Column(comptime T: type, comptime E: type) type {
             length: ?usize,
             budget: usize,
 
-            fn deinit(self: *LoadIter) void {
+            /// Frees every slab cut so far and the weight list, so a stream
+            /// the caller abandons before [`finalize`](LoadIter.finalize)
+            /// gives its bytes back. The input is the caller's and is not
+            /// released.
+            ///
+            /// **Not callable after `finalize`.** That takes the stream by
+            /// value and moves the slabs into the column it returns, so the
+            /// caller's own copy then names storage the column owns;
+            /// calling this on it frees every slab out from under that
+            /// column.
+            pub fn deinit(self: *LoadIter) void {
                 for (self.slabs.items) |*s| s.deinit(self.gpa);
                 self.slabs.deinit(self.gpa);
                 self.weights.deinit(self.gpa);
@@ -3934,14 +4712,28 @@ pub fn Column(comptime T: type, comptime E: type) type {
             }
 
             /// The row count of completed slab `i`, so a caller can
-            /// attribute the runs it pulled to individual slabs.
-            pub fn completedSlabLen(self: *const LoadIter, i: usize) usize {
+            /// attribute the runs it pulled to individual slabs. `i` at or
+            /// past `slabsCompleted` is `error.InvalidValue`, which is how a
+            /// caller that has pulled further than the stream has finished
+            /// slabs finds out.
+            pub fn completedSlabLen(self: *const LoadIter, i: usize) ParseError!usize {
                 if (i >= self.slabs.items.len) return error.InvalidValue;
                 return self.slabs.items[i].len;
             }
 
             /// Drains and validates whatever was not pulled, applies the
             /// length check, and returns the finished column.
+            ///
+            /// **This consumes the stream.** The slabs it has cut become the
+            /// returned column's — `fromWeights` takes the list by pointer
+            /// and empties it — so the receiver must not be read, freed or
+            /// finalized again. `slabsCompleted` and `completedSlabLen`
+            /// would answer through storage the column now owns, a second
+            /// `finalize` would consume nothing, and `deinit` would free
+            /// every slab out from under the column. The returned column's
+            /// own `deinit` is what releases them; a stream the caller wants
+            /// to drop instead is released with [`deinit`](LoadIter.deinit)
+            /// *before* this call.
             pub fn finalize(self: LoadIter) ParseError!Self {
                 var it = self;
                 defer it.deinit();
@@ -4084,7 +4876,16 @@ pub fn Column(comptime T: type, comptime E: type) type {
             /// which is what a delta column's differences are measured
             /// from.
             running: i64,
+            /// Whether every value has been handed over: `intoColumn`
+            /// always, `save` when no run budget was set. A spent encoder
+            /// holds nothing — its buffer is gone and its rolled slabs are
+            /// the returned column's — so `len` answers zero, `isEmpty`
+            /// answers true, and a second `save` yields an empty buffer
+            /// rather than the bytes that were already given away.
+            spent: bool,
 
+            /// An encoder holding nothing, on one contiguous buffer. The
+            /// allocator is the caller's and is not released; `deinit` is.
             pub fn init(gpa: std.mem.Allocator) Encoder {
                 return .{
                     .gpa = gpa,
@@ -4094,9 +4895,12 @@ pub fn Column(comptime T: type, comptime E: type) type {
                     .budget = null,
                     .len_flushed = 0,
                     .running = 0,
+                    .spent = false,
                 };
             }
 
+            /// Frees the encoder's buffer, its rolled slabs and its weight
+            /// list. The allocator itself is the caller's.
             pub fn deinit(self: *Encoder) void {
                 for (self.slabs.items) |*s| s.deinit(self.gpa);
                 self.slabs.deinit(self.gpa);
@@ -4105,12 +4909,17 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 self.* = undefined;
             }
 
-            /// Values appended so far.
+            /// Values appended so far and still held by the encoder. Zero
+            /// once it has been spent by `save` or `intoColumn`.
             pub fn len(self: *const Encoder) usize {
+                if (self.spent) return 0;
                 return self.inner.len();
             }
 
+            /// Whether the encoder holds no values — which is also true of
+            /// a spent one, whatever it appended before the handover.
             pub fn isEmpty(self: *const Encoder) bool {
+                if (self.spent) return true;
                 return self.inner.isEmpty();
             }
 
@@ -4129,6 +4938,11 @@ pub fn Column(comptime T: type, comptime E: type) type {
             }
 
             /// Appends one value.
+            ///
+            /// A spent encoder is outside this contract: its buffer is gone
+            /// with the `save` or `intoColumn` that spent it, so what is
+            /// appended here would never reach the values the caller was
+            /// handed.
             pub fn append(self: *Encoder, v: T) ParseError!void {
                 try self.maybeCut();
                 const one = try E.wireOfOne(self.running, v);
@@ -4172,12 +4986,35 @@ pub fn Column(comptime T: type, comptime E: type) type {
             /// first when a budget was set, then folds the slabs back into
             /// one canonical run sequence, which is what a column's `save`
             /// does (`RleEncoder::save_to`, `encoder.rs:281-304`).
+            ///
+            /// **A save spends the encoder.** Both paths hand over what they
+            /// hold: the one-buffer path takes the contiguous buffer, and
+            /// the budgeted path builds a column out of the rolled slabs,
+            /// which `fromWeights` consumes from this encoder rather than
+            /// borrowing. So afterwards `len` answers zero, `isEmpty`
+            /// answers true, and a second `save` yields an empty buffer
+            /// rather than the bytes that were already given away. A caller
+            /// that wants the values again has them — they are the returned
+            /// `[]u8`, and they are the caller's to free.
             pub fn save(self: *Encoder) ParseError![]u8 {
-                if (self.slabs.items.len == 0) {
+                if (self.spent) {
+                    // Already handed over. `finish` over an empty writer
+                    // writes nothing and `take` hands over nothing, which is
+                    // exactly the empty buffer the contract above promises.
                     try self.inner.finish();
                     return self.inner.take();
                 }
+                if (self.slabs.items.len == 0) {
+                    try self.inner.finish();
+                    const bytes = try self.inner.take();
+                    self.spent = true;
+                    return bytes;
+                }
                 try self.rollSlab();
+                // Set before the hand-over rather than after it: the slab
+                // list leaves this encoder inside `fromWeights`, so from
+                // here on it holds nothing whatever the encode does.
+                self.spent = true;
                 var col = try fromWeights(self.gpa, &self.slabs, &self.weights, self.budget.?);
                 defer col.deinit();
                 return col.encode(self.gpa);
@@ -4186,14 +5023,32 @@ pub fn Column(comptime T: type, comptime E: type) type {
             /// The finished column, with no decode pass: the slabs are
             /// already measured and their weights already known
             /// (`Column::from_slabs`, `column.rs:1202-1223`).
+            ///
+            /// **This spends the encoder.** The rolled slabs become the
+            /// returned column's and the contiguous buffer is handed over to
+            /// it, so on every path out of here the encoder holds nothing:
+            /// `len` answers zero, `isEmpty` answers true, and a later
+            /// `save` or `intoColumn` produces an empty column rather than
+            /// the values that were already given away. `deinit` still
+            /// releases what is left — the weight list, which is the
+            /// encoder's own.
             pub fn intoColumn(self: *Encoder) ParseError!Self {
                 const budget = self.budget orelse max_segments;
                 if (self.slabs.items.len != 0) {
                     try self.rollSlab();
+                    // Before the hand-over rather than after it: the slab
+                    // list leaves this encoder inside `fromWeights`, so
+                    // from here on it holds nothing whatever that returns.
+                    self.spent = true;
                     return fromWeights(self.gpa, &self.slabs, &self.weights, budget);
                 }
+
                 try self.inner.finish();
                 const bytes = try self.inner.take();
+                // The buffer is the column's from here; every path below
+                // either hands it over or gives it back, and neither leaves
+                // the encoder holding it.
+                self.spent = true;
                 // One owner on every path out: this function while the
                 // buffer is still a local, and `slabs` from the append on.
                 // The buffer is freed by hand until then rather than by a
@@ -4684,6 +5539,16 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// cursor suspended over either column cannot resume against the
         /// data it swapped into (`Column::swap_contents`,
         /// `column.rs:1752-1760`).
+        ///
+        /// **The allocator moves with the contents.** The two columns trade
+        /// everything they hold, `gpa` included, so each keeps its slabs,
+        /// its index and its bases in the allocator it can release them
+        /// with — which is the point: the swap is sound, and only a caller
+        /// that cached [`allocator`](Column.allocator) beforehand is not.
+        /// Ask each column again after this, and do not free a slab taken
+        /// from one with the other's cached allocator. The budget is the one
+        /// exception: it is deliberately *not* traded, so both columns come
+        /// out of this with the budget they went in with.
         pub fn swapContents(self: *Self, other: *Self) void {
             const counter = @max(self.counter, other.counter) +% 1;
             const mine = self.*;
@@ -4723,9 +5588,37 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// up (`edit.rs:167-171`): a column with no slabs cannot answer a
         /// locate, and a splice into an empty column still has to have
         /// somewhere to put its first slab.
+        ///
+        /// **Both caches are seeded with it, not left for the first write.**
+        /// A column with one slab and no base for it answers every read of
+        /// that slab's base as the identity, which is right and says nothing
+        /// about the omission — `checkInvariants` is what notices, and the
+        /// array it checks is this step's to fill.
+        ///
+        /// **A refusal leaves the column exactly as it was: still no slabs.**
+        /// The seeded slab goes into a list whose room was taken first, and
+        /// the two rebuilds are the only steps after that which allocate —
+        /// so the order is what makes the undo possible. `rebuildAggs` runs
+        /// first and measures into room past the end of the array it
+        /// replaces, shrinking back on a refusal; `reindex` runs second and
+        /// builds the fresh tree before it tears the old one down. Whichever
+        /// of the two refuses, the other has not run and the tree is still
+        /// the one the column came in with. What is left to undo is a
+        /// length and a flag, because an empty slab owns nothing.
         pub fn ensureSlab(self: *Self) ParseError!void {
             if (self.slabs.items.len != 0) return;
-            try self.slabs.append(self.gpa, .empty);
+            // Room for the seeded slab, its ownership flag and the bases it
+            // will need, taken while the column is still the empty one.
+            try self.reserveSlabs(1);
+            const seeded_len = self.agg_before.items.len;
+            self.slabs.appendAssumeCapacity(.empty);
+            self.stagedGrew(self.slabs.items.len - 1, 0, 1);
+            errdefer {
+                self.agg_before.shrinkRetainingCapacity(seeded_len);
+                self.slabs.items.len = 0;
+                self.stagedGrew(0, 1, 0);
+            }
+            try self.rebuildAggs();
             try self.reindex();
         }
 
@@ -4828,6 +5721,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
         fn reanchorRow(self: *Self, gpa: std.mem.Allocator, at: usize, wire: E.Wire) ParseError!void {
             const si = self.slabHolding(at);
             const in_slab = at - self.tree.itemsBeforeSlab(si);
+            try self.takeOwnership(si);
             try slabmod.splice(gpa, E, &self.slabs.items[si], in_slab, 1, &.{wire}, null);
             try self.settle(si, 1);
         }
@@ -4877,7 +5771,24 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 }
             }
 
+            // Room for everything the rewrite invalidates, taken while the
+            // column is still exactly as the caller left it: the slabs the
+            // split in `settle` below can spill into, and the bases
+            // `rebuildAggs` refills afterwards. Every run is at least one
+            // byte, so the spliced slab holds no more runs than the ones it
+            // had plus one per inserted value.
+            const spills = (s.segments + values.len) / self.budget;
+            try self.reserveSlabs(self.slabs.items.len + spills + 1);
+
+            try self.takeOwnership(si);
             try slabmod.splice(gpa, E, &self.slabs.items[si], in_slab, del_now, insert, postfix);
+            // **The length is published with the bytes that back it.**
+            // `settle` below can be refused, and a column still counting the
+            // rows from before the splice would bounds-check every later read
+            // against a count its slabs no longer have. `del_now` and
+            // `insert` carry the absent rows a re-anchor took and put back,
+            // so this is the same total the caller asked for.
+            self.total_len = self.total_len - del_now + insert.len;
             try self.settle(si, 1);
             if (fix) |f| {
                 if (!in_this_slab) {
@@ -4903,13 +5814,22 @@ pub fn Column(comptime T: type, comptime E: type) type {
         ) ParseError!void {
             var pieces: std.ArrayList(Slab) = .empty;
             defer pieces.deinit(gpa);
+            // **The pieces are slabs, not wire runs.** Between the first one
+            // being built and the list taking them over, a refusal leaves
+            // them owned by nobody: `pieces.deinit` gives back the array that
+            // names them and not the buffers behind it, which is what an
+            // integrated run reported — one slab's bytes per refused
+            // allocation, for the length of the whole sweep. The swap below
+            // empties the list, and from there the column owns them, so this
+            // guard has nothing left to do on the paths that follow it.
+            errdefer for (pieces.items) |*p| p.deinit(gpa);
 
             // The head of the first slab, the inserted values, the tail of
             // the last, in that order: the column order.
             const head = try E.wireRange(gpa, self.slabs.items[s0].data, 0, index - self.tree.itemsBeforeSlab(s0));
             defer gpa.free(head);
             if (head.len != 0) {
-                try pieces.append(gpa, try slabOf(gpa, E, head));
+                try appendPiece(gpa, &pieces, try slabOf(gpa, E, head));
             }
 
             const running = if (comptime E.tracks_prefix) try self.runningAt(index) else 0;
@@ -4934,21 +5854,41 @@ pub fn Column(comptime T: type, comptime E: type) type {
                         const anchored = try gpa.dupe(E.Wire, tail);
                         defer gpa.free(anchored);
                         anchored[f.skip] = f.wire;
-                        try pieces.append(gpa, try slabOf(gpa, E, anchored));
+                        try appendPiece(gpa, &pieces, try slabOf(gpa, E, anchored));
                         anchored_in_tail = true;
                     }
                 }
-                if (!anchored_in_tail) try pieces.append(gpa, try slabOf(gpa, E, tail));
+                if (!anchored_in_tail) try appendPiece(gpa, &pieces, try slabOf(gpa, E, tail));
             }
 
-            // Drop the slabs the cut spanned, then put the pieces in their
-            // place. The old slabs are freed by hand because the list is
-            // holding them, not copies of them.
+            // **Room first, then the swap.** The old slabs are freed on the
+            // next line and cannot be rebuilt, and the pieces are the column's
+            // only copy of the range until they are in its list — so the list
+            // has to be able to hold them before either happens. An
+            // `insertSlice` that had to grow would come back with the range
+            // gone from the column and the pieces still owned by `pieces`,
+            // which is the one owner that gives them back. The bound covers
+            // the split `settle` below makes at the run budget: a run is at
+            // least one byte, so a piece's own run count bounds what it can
+            // spill into.
             const placed = pieces.items.len;
-            for (self.slabs.items[s0 .. s1 + 1]) |*old| old.deinit(gpa);
-            try self.slabs.replaceRange(gpa, s0, s1 + 1 - s0, &.{});
-            try self.slabs.insertSlice(gpa, s0, pieces.items);
+            const dropped = s1 + 1 - s0;
+            const head_spill = if (placed == 0) 0 else pieces.items[placed - 1].segments / self.budget;
+            try self.reserveSlabs(self.slabs.items.len - dropped + placed + head_spill + 1);
+            // Drop the slabs the cut spanned and put the pieces in their
+            // place, in one non-fallible step. The old slabs are freed by hand
+            // because the list is holding them, not copies of them.
+            var i = s0;
+            while (i <= s1) : (i += 1) try self.dropSlab(i);
+            self.slabs.replaceRangeAssumeCapacity(s0, dropped, pieces.items);
+            self.stagedGrew(s0, dropped, placed);
             pieces.items.len = 0;
+            // **The length is published with the bytes that back it.** The
+            // range in the list is the spliced range now, and `settle` below
+            // can be refused; a column still counting the rows from before
+            // the splice would bounds-check every later read against a count
+            // its slabs no longer have.
+            self.total_len = self.total_len - del + values.len;
             // The rebuilt range is every piece, not the first one: a cut
             // that spans slabs puts a whole run of budgeted slabs where the
             // old range stood, and the merge policy is a property of the
@@ -4963,6 +5903,25 @@ pub fn Column(comptime T: type, comptime E: type) type {
                     try self.reanchorRow(gpa, f.at + values.len - del, f.wire);
                 }
             }
+        }
+
+        /// Appends `piece` to `pieces`, freeing it if the list cannot grow.
+        ///
+        /// **A piece is a slab, and a slab owns its buffer.** `try
+        /// pieces.append(gpa, try slabOf(..))` reads as one step and is two:
+        /// the piece is built first, and an `append` that had to grow would
+        /// drop the finished value on the floor, owned by nobody and freed by
+        /// nobody. This is the one place the rebuilt range's pieces go into a
+        /// list, so it is the one place that has to carry the buffer across a
+        /// refusal.
+        fn appendPiece(
+            gpa: std.mem.Allocator,
+            pieces: *std.ArrayList(Slab),
+            piece: Slab,
+        ) ParseError!void {
+            var owned_piece = piece;
+            errdefer owned_piece.deinit(gpa);
+            try pieces.append(gpa, piece);
         }
 
         /// Split `wires` into slabs at the run budget and append them.
@@ -4980,7 +5939,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
             var from: usize = 0;
             while (from < segs.len) {
                 const to = @min(from + self.budget, segs.len);
-                try pieces.append(gpa, try cutPiece(gpa, E, bytes, segs, from, to));
+                try appendPiece(gpa, pieces, try cutPiece(gpa, E, bytes, segs, from, to));
                 from = to;
             }
         }
@@ -5003,15 +5962,49 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// same order over a range of one slab plus its spills, which is
         /// why it is this method rather than a second copy
         /// (`edit.rs:566-593`).
-        pub fn settle(self: *Self, lo: usize, count: usize) ParseError!void {
+        ///
+        /// **The split is the last step that can lose a value, so the room
+        /// it needs is taken before it runs.** `splitToBudget` replaces the
+        /// slab in place, and the pieces that spill out live in memory the
+        /// column does not name until they are in its list — so a list that
+        /// had to grow at that point could only be answered by freeing them,
+        /// which drops the tail of the column rather than refusing the
+        /// write. The bound is the slab's own run count over the budget, and
+        /// the bases are reserved with it because `rebuildAggs` refills them
+        /// from the list this step leaves behind.
+        ///
+        /// **A refusal past the split is only survivable on a provisional
+        /// column.** Everything up to and including the spill insert is
+        /// non-fallible, but the coalescing that follows and the index
+        /// rebuild behind it allocate against a list that has already moved:
+        /// a refusal in either leaves this column holding the new slabs
+        /// against an index that still describes the old ones. That is why
+        /// [`splice`](Column.splice) runs this on the provisional column a
+        /// [`StagedSplice`](Column.StagedSplice) builds, which a refusal
+        /// discards whole. The whole of this method's refusal contract is
+        /// that: it is not atomic on a column the caller means to keep, and
+        /// the row-level steps that call it are reached only that way.
+        ///
+        /// Private for the same reason. The edit cursor was the one caller
+        /// that ran it on a live column, and it does so no more — its
+        /// write-back goes through the same stage and publish as
+        /// [`splice`](Column.splice) — so nothing outside this file is left
+        /// that could reach a non-atomic step.
+        fn settle(self: *Self, lo: usize, count: usize) ParseError!void {
             if (self.slabs.items.len == 0) {
                 // A cut that spanned every slab and put nothing in its
                 // place. An empty column still keeps one empty slab, the
                 // one the next splice lands in (`column.rs:1298-1306`).
                 try self.slabs.append(self.gpa, .empty);
+                self.stagedGrew(self.slabs.items.len - 1, 0, 1);
                 try self.reindex();
                 return;
             }
+            // Room for the split and for the bases that follow it, taken
+            // while the column still holds every value it had. `Slab.segments`
+            // is the run count `splitToBudget` cuts on, so this is the exact
+            // number of pieces that can come out of it, not an estimate.
+            try self.reserveSlabs(self.slabs.items.len + self.slabs.items[lo].segments / self.budget);
             // `spilled` has exactly one owner at every point and no guard
             // outlives it. The previous shape armed an `errdefer` that closed
             // over `spilled`, called `spilled.deinit` on the success path, and
@@ -5023,18 +6016,15 @@ pub fn Column(comptime T: type, comptime E: type) type {
             // items transfer to `self.slabs` on success; the list buffer is
             // released once, here, and the two fallible calls after it hold no
             // reference to `spilled` at all.
+            try self.takeOwnership(lo);
             var spilled = try slabmod.splitToBudget(self.gpa, E, &self.slabs.items[lo], self.budget);
             const spill = spilled.items.len;
             if (spill != 0) {
-                // On failure `insertSlice` has taken nothing, so every piece
-                // is still ours; `self.slabs[lo]` already holds the piece
-                // `splitToBudget` kept, so freeing the spills here leaves the
-                // column in the state the split itself produced.
-                self.slabs.insertSlice(self.gpa, lo + 1, spilled.items) catch |e| {
-                    for (spilled.items) |*p| p.deinit(self.gpa);
-                    spilled.deinit(self.gpa);
-                    return e;
-                };
+                // Non-fallible: the room was taken above, so the pieces are
+                // put in their place rather than freed on a refusal that
+                // would drop the tail of the column.
+                self.slabs.insertSliceAssumeCapacity(lo + 1, spilled.items);
+                self.stagedGrew(lo + 1, 0, spill);
                 spilled.items.len = 0;
             }
             spilled.deinit(self.gpa);
@@ -5068,6 +6058,14 @@ pub fn Column(comptime T: type, comptime E: type) type {
             const sa = self.slabs.items[a].segments;
             const sb = self.slabs.items[b].segments;
             if (!((sa < min_seg or sb < min_seg) and sa + sb <= self.budget)) return null;
+            // Room for the split below, taken before the merge has put its
+            // values into `a`: after `splitToBudget` the spills are the only
+            // copy of the tail of the pair, and a list that had to grow at
+            // that point could only be answered by freeing them. The merge
+            // pre-check admits a pair of at most `budget` runs, and its seam
+            // costs at most three, so this is a bound and not an estimate.
+            try self.reserveSlabs(self.slabs.items.len + (sa + sb) / self.budget + 1);
+            try self.takeOwnership(a);
             try slabmod.merge(self.gpa, E, &self.slabs.items[a], &self.slabs.items[b]);
             var spilled = try slabmod.splitToBudget(self.gpa, E, &self.slabs.items[a], self.budget);
             errdefer {
@@ -5075,12 +6073,13 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 spilled.deinit(self.gpa);
             }
             const spill = spilled.items.len;
-            self.slabs.items[b].deinit(self.gpa);
+            try self.dropSlab(b);
             _ = self.slabs.orderedRemove(b);
             if (spill != 0) {
                 // Where `b` stood: the merge put its values into `a`, and
                 // the spill is the tail of the pair that did not fit.
-                try self.slabs.insertSlice(self.gpa, b, spilled.items);
+                self.slabs.insertSliceAssumeCapacity(b, spilled.items);
+                self.stagedGrew(b, 1, spill);
                 spilled.items.len = 0;
             }
             spilled.deinit(self.gpa);
@@ -5182,18 +6181,9 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// back with `self.tree` still the tree the column already had, so
         /// the caller's `errdefer self.deinit()` frees a real tree. Tearing
         /// the old one down first left `self.tree` undefined — `Tree.deinit`
-        /// ends in `self.* = undefined` (`btree.zig:248`) — for every
-        /// caller that has a `deinit` of its own, which is all of them:
-        /// `load` at `column.zig:2778` and `:2883`, `splice` at `:2562`,
-        /// `baseOf` at `:2953` and `settle` at `:3219`.
-        ///
-        /// **Every line number in this package's cross-references was
-        /// re-measured on 2026-10-01, and the ones in this paragraph were
-        /// wrong** — by 32 to 140 lines each, which is the tell that they
-        /// were being carried rather than read. A `path:line` that points at
-        /// the wrong lines is worse than none, because a reader who follows
-        /// it lands on unrelated code and concludes the claim is unfounded
-        /// rather than that the pointer is stale.
+        /// poisons its receiver — for every
+        /// caller that has a teardown, including `splice`, `loadWithBudget`,
+        /// `fill`, `fillWithBudget`, `ensureSlab` and `settle`.
         fn reindex(self: *Self) ParseError!void {
             var weights: std.ArrayList(Weight) = .empty;
             defer weights.deinit(self.gpa);
@@ -5209,22 +6199,72 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// Rebuild the per-slab weight prefixes. Only a codec whose weight
         /// carries a prefix keeps them.
         ///
-        /// Public because the edit cursor has to run it wherever it
-        /// changes the slab list: it is the same "a structural change
-        /// happened, re-seed the bases" step `splice` runs it for
-        /// (`edit.rs:566-593`).
-        pub fn rebuildAggs(self: *Self) ParseError!void {
+        /// **A refusal leaves the column's previous bases in place, whole.**
+        /// The array is read as a slab's base — a delta or prefix column's
+        /// running value in front of that slab — and `aggWeight` answers the
+        /// identity for a slab past its end, so an array shortened by a
+        /// failed rebuild would not fail loudly: every slab past the
+        /// truncation would read its base as zero and decode against it.
+        /// The new bases are therefore measured into the room past the end
+        /// of the array the column is still reading and only take its place
+        /// once every weight is in, so neither the allocation nor a weight
+        /// that will not measure can leave a short array behind.
+        fn rebuildAggs(self: *Self) ParseError!void {
             if (!comptime E.tracks_prefix) {
                 self.agg_before.clearRetainingCapacity();
                 return;
             }
-            self.agg_before.clearRetainingCapacity();
+            const n = self.slabs.items.len;
+            const old = self.agg_before.items.len;
+            // Room for the bases and for the weights they are summed from,
+            // both past the end of the entries the column is still reading.
+            try self.agg_before.ensureTotalCapacity(self.gpa, old + n + 1);
+            const weights = self.agg_before.addManyAsSliceAssumeCapacity(n + 1)[0..n];
+            errdefer self.agg_before.shrinkRetainingCapacity(old);
+            for (self.slabs.items, weights) |*s, *w| w.* = try E.weightOf(self.gpa, s);
             var acc = identity;
-            for (self.slabs.items) |*s| {
-                try self.agg_before.append(self.gpa, acc);
-                acc = Weight.Aggregate.merge(acc, try E.weightOf(self.gpa, s));
+            for (weights, 0..) |w, i| {
+                self.agg_before.items[i] = acc;
+                acc = Weight.Aggregate.merge(acc, w);
             }
-            try self.agg_before.append(self.gpa, acc);
+            self.agg_before.items[n] = acc;
+            self.agg_before.shrinkRetainingCapacity(n + 1);
+        }
+
+        /// Room in the slab list for `n` slabs, and in the base array for
+        /// the rebuild `rebuildAggs` makes from whatever the list holds
+        /// afterwards.
+        ///
+        /// Both are taken by the steps that invalidate them — a rewrite of
+        /// the bytes, or the split that cuts an over-budget slab — and
+        /// neither can be undone: a slab `splitToBudget` has already
+        /// replaced is gone even though the pieces that spilled out of it
+        /// are not yet in the list. Reserving at the point the change starts
+        /// is what turns those steps from ones that can fail half-way into
+        /// ones that cannot fail at all.
+        ///
+        /// Both lists live in the column's own allocator, which is the one
+        /// `settle` and `tryMerge` already grow them with — so this takes no
+        /// allocator of its own and cannot be pointed at a second one.
+        fn reserveSlabs(self: *Self, n: usize) ParseError!void {
+            try self.slabs.ensureTotalCapacity(self.gpa, n);
+            // The ownership flags move with the list: `stagedGrew` cannot
+            // allocate, so the room for every flag a staged splice inserts
+            // is taken here, alongside the room for the slab it belongs to.
+            if (self.staging) |st| try st.owned.ensureTotalCapacity(self.gpa, n);
+            // A codec whose weight carries no prefix keeps no bases, so it
+            // has nothing to reserve: `rebuildAggs` clears the array and
+            // never fills it, and an allocation here would be memory every
+            // splice of such a column pays for and never uses.
+            if (!comptime E.tracks_prefix) return;
+            // Room for the bases `rebuildAggs` writes and for the weights it
+            // sums them from, which it measures past the end of the array it
+            // is replacing. That array is as long as the slab list is now,
+            // so the bound is the larger of the two counts twice over: a
+            // splice that collapses many slabs into one leaves `n` below the
+            // count the array already has.
+            const count = @max(n, self.slabs.items.len);
+            try self.agg_before.ensureTotalCapacity(self.gpa, count + n + 2);
         }
 
         // ── The invariants ──────────────────────────────────────────────
@@ -5418,10 +6458,40 @@ pub fn Column(comptime T: type, comptime E: type) type {
             }
         };
 
+        /// A forward-only cursor over a window of a column's rows, and the
+        /// window into the slab it currently stands in.
+        ///
+        /// Built by [`iterator`](Column.iterator) and
+        /// [`iterRange`](Column.iterRange), held by value inside a
+        /// [`Runs`](Column.Runs) cursor, by [`BoolColumnSkipper`](Column)
+        /// and behind [`Ranges`](Column) and [`Unshift`](Column), and
+        /// rebuilt from a saved [`IterState`](Column) by
+        /// [`tryResume`](Column.IterState.tryResume). It allocates nothing
+        /// to construct and nothing to read, and it has no teardown: it owns
+        /// no memory, and the decoder it holds is a view over a slab's
+        /// bytes.
+        ///
+        /// **What invalidates it is the column.** `col` is a borrow of a
+        /// column that must outlive the cursor, and the column must not be
+        /// written while the cursor is open: any of `splice`, `set`,
+        /// `removeN`, `remap`, `swapContents`, `settle` or `edit` may
+        /// rewrite, split, free or replace the slab the cursor is standing
+        /// in, and the decoder would then read bytes that are gone or a
+        /// different row entirely. A cursor that has to outlive a write is
+        /// recorded as an [`IterState`](Column) instead, which
+        /// [`tryResume`](Column.IterState.tryResume) checks against the
+        /// column's suspension counter. Fields are reachable without a
+        /// method, so treat every one of them as cursor state: only `next`,
+        /// `peek`, the run cursor and `tryResume` maintain them.
         pub const Iterator = struct {
+            /// The column being walked, borrowed for the cursor's life.
             col: *const Self,
+            /// The slab the cursor is standing in.
             slab_idx: usize,
+            /// The decoder over that slab's bytes, positioned at the row
+            /// after the one the cursor last returned.
             dec: E.WireDecoder,
+            /// Rows left in the cursor's window.
             items_left: usize,
             /// The realized value in front of the current row. Only a delta
             /// column reads it, and it starts at the current slab's base.
@@ -6236,6 +7306,17 @@ pub fn Ranges(comptime I: type) type {
         /// The next range to take.
         at: usize,
 
+        /// The adapter over `cursor`, positioned to yield `ranges` in turn.
+        ///
+        /// **The cursor's own window is discarded.** `init` empties it with
+        /// `setMax(pos)` before anything is pulled, so the first `next`
+        /// takes the first range rather than whatever the cursor had left
+        /// (`shift.rs:92-95`). A caller that wants the cursor's current
+        /// window walked as well has to name it as the first range; there is
+        /// no way to keep it and start the ranges from here.
+        ///
+        /// `ranges` is borrowed, not copied, and must outlive the adapter.
+        /// The cursor is taken by value and owned from here.
         pub fn init(cursor: I, ranges: []const RowRange) Self {
             // The window is emptied so the first `next` pulls the first
             // range rather than whatever was left of the old one
@@ -7332,6 +8413,449 @@ test "a streaming encoder gives its bytes back on every allocation failure" {
     const values = [_]u64{ 3, 3, 3, 1, 2, 2, 9, 9, 0, 4, 4, 4, 4, 7 };
     try testing.checkAllAllocationFailures(gpa, streamOneBufferThenRead, .{values[0..]});
     try testing.checkAllAllocationFailures(gpa, streamBudgetedThenRead, .{values[0..]});
+}
+
+/// One refused splice over a column of `model`, built and spliced with
+/// `gpa`. Whatever the outcome, the column has to come out readable: its
+/// own invariant check passing, `len` counting the rows it decodes, and its
+/// values being either the ones it started with or the ones the splice
+/// asked for — never a mixture, and never a set of rows the count does not
+/// cover.
+///
+/// The read is deliberately taken with `testing.allocator` rather than
+/// `gpa`, so that a refusal inside the splice is the only refusal this
+/// helper can see and the assertions always run.
+fn oomSpliceThenRead(
+    comptime T: type,
+    comptime E: type,
+    gpa: std.mem.Allocator,
+    model: []const T,
+    index: usize,
+    del: usize,
+    ins: []const T,
+) !void {
+    var col = try Column(T, E).initWithBudget(gpa, 4);
+    defer col.deinit();
+    try col.extend(gpa, model);
+
+    var want: std.ArrayList(T) = .empty;
+    defer want.deinit(testing.allocator);
+    try want.appendSlice(testing.allocator, model[0..index]);
+    try want.appendSlice(testing.allocator, ins);
+    try want.appendSlice(testing.allocator, model[index + del ..]);
+
+    var committed = true;
+    if (col.splice(gpa, index, del, ins)) |_| {} else |e| {
+        // The bounds are checked before anything moves, so the only error a
+        // valid request can come back with is the allocator.
+        if (e != error.OutOfMemory) return e;
+        committed = false;
+    }
+
+    try testing.expect((try col.checkInvariants()) == null);
+    const got = try col.toSlice(testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(got.len, col.len());
+    if (committed) {
+        try testing.expectEqualSlices(T, want.items, got);
+    } else {
+        // **A refusal leaves the column exactly as it was.** A half-applied
+        // splice — rows written but not counted, a range dropped but not
+        // rebuilt, bases measured from the wrong slab, an index describing
+        // the layout before the cut — is what the stage seam exists to
+        // prevent, and each of them would show here as a value sequence that
+        // is neither list.
+        try testing.expectEqualSlices(T, model, got);
+    }
+    // Teardown is `testing.allocator`'s to check: a column whose splice was
+    // refused has to give back every byte it was holding.
+}
+
+/// Sweeps every allocation the one splice of `oomSpliceThenRead` makes.
+fn sweepSplice(
+    comptime T: type,
+    comptime E: type,
+    model: []const T,
+    ins: []const T,
+    index: usize,
+    del: usize,
+) !void {
+    const gpa = testing.allocator;
+    const needed = blk: {
+        var failing: testing.FailingAllocator = .init(gpa, .{});
+        try oomSpliceThenRead(T, E, failing.allocator(), model, index, del, ins);
+        break :blk failing.alloc_index;
+    };
+    for (0..needed) |fail_index| {
+        var failing: testing.FailingAllocator = .init(gpa, .{ .fail_index = fail_index });
+        // A refusal in the *setup* says nothing about the splice, so it is
+        // skipped rather than counted as a pass: `fail_index` counts from the
+        // first allocation of the run, and the run's first allocations are
+        // the column's own.
+        oomSpliceThenRead(T, E, failing.allocator(), model, index, del, ins) catch |e| switch (e) {
+            error.OutOfMemory => continue,
+            else => return e,
+        };
+    }
+}
+
+test "a refused splice leaves the length, the values and the caches in step" {
+    // **A splice rewrites the slab bytes before the last step that can be
+    // refused.** The splice path takes that step's room while the column is
+    // still intact, and the length is published with the bytes rather than
+    // after them, so the only thing a refusal can leave behind is the column
+    // as it was. Three shapes, because the three rewrite steps differ: a
+    // cut across slabs (which frees the old slabs before installing the
+    // pieces), a cut inside one slab (which splits it), and a plain column
+    // (which keeps no per-slab bases at all).
+    const model = [_]i64{ 100, 250, 400, 550, 700, 850, 1000, 1150 };
+    const ins = [_]i64{ -50, -50, 2000, 0, 0, -900 };
+
+    // Across slabs: eight distinct rows over a budget of four, so the cut
+    // drops two of one slab's runs and rebuilds several budgeted slabs in
+    // their place.
+    try sweepSplice(i64, Delta(i64), &model, &ins, 3, 2);
+    // Inside one slab, through `settle`'s split.
+    try sweepSplice(i64, Delta(i64), &model, &ins, 1, 1);
+    // A plain column: `len` is the only cache in play, and the split is the
+    // only step that can be refused after the bytes move.
+    try sweepSplice(i64, Rle(i64), &model, &ins, 3, 2);
+}
+
+/// The column reads exactly as `want`, and its length counts what it decodes.
+fn expectColumn(comptime T: type, comptime E: type, col: *const Column(T, E), want: []const T) !void {
+    try testing.expect((try col.checkInvariants()) == null);
+    const got = try col.toSlice(testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(got.len, col.len());
+    try testing.expectEqualSlices(T, want, got);
+}
+
+/// One refused pair of staged splices, on two columns of `model`.
+///
+/// **Both stages are built before either is published** — the order the seam
+/// exists for — so after a refusal in either one there is a stage in hand and
+/// nothing has moved, and both columns have to read exactly as they did. The
+/// reads are taken with `testing.allocator` rather than `gpa`, so a refusal
+/// inside a stage is the only refusal this helper can see.
+fn oomTwoStagesThenPublish(
+    comptime T: type,
+    comptime E: type,
+    gpa: std.mem.Allocator,
+    model: []const T,
+    ins: []const T,
+    left_at: usize,
+    left_del: usize,
+    right_at: usize,
+    right_del: usize,
+) !void {
+    var left = try Column(T, E).initWithBudget(gpa, 4);
+    defer left.deinit();
+    var right = try Column(T, E).initWithBudget(gpa, 4);
+    defer right.deinit();
+    try left.extend(gpa, model);
+    try right.extend(gpa, model);
+
+    var want_left: std.ArrayList(T) = .empty;
+    defer want_left.deinit(testing.allocator);
+    try want_left.appendSlice(testing.allocator, model[0..left_at]);
+    try want_left.appendSlice(testing.allocator, ins);
+    try want_left.appendSlice(testing.allocator, model[left_at + left_del ..]);
+    var want_right: std.ArrayList(T) = .empty;
+    defer want_right.deinit(testing.allocator);
+    try want_right.appendSlice(testing.allocator, model[0..right_at]);
+    try want_right.appendSlice(testing.allocator, ins);
+    try want_right.appendSlice(testing.allocator, model[right_at + right_del ..]);
+
+    var a = left.stageSplice(left_at, left_del, ins) catch |e| switch (e) {
+        error.OutOfMemory => {
+            // The first stage refused. There is nothing in hand and nothing
+            // published; the second column was never even asked.
+            try expectColumn(T, E, &left, model);
+            try expectColumn(T, E, &right, model);
+            return;
+        },
+        // Anything else is an answer about the request rather than about the
+        // allocator, and this is a fixed in-range point, so it is propagated
+        // rather than turned into a pass.
+        else => return e,
+    };
+    defer a.deinit();
+
+    var b = right.stageSplice(right_at, right_del, ins) catch |e| switch (e) {
+        error.OutOfMemory => {
+            // **A stage is in hand and is still discarded.** Nothing has been
+            // published, so both columns still read as they did — which is
+            // the whole point of staging both before publishing either, and
+            // the case that is a half-applied write if the publish comes
+            // first.
+            try expectColumn(T, E, &left, model);
+            try expectColumn(T, E, &right, model);
+            return;
+        },
+        else => return e,
+    };
+    defer b.deinit();
+
+    // Both in hand, and both publishes infallible: the set is whole or it is
+    // untouched, never half.
+    a.publish(&left);
+    b.publish(&right);
+    try expectColumn(T, E, &left, want_left.items);
+    try expectColumn(T, E, &right, want_right.items);
+}
+
+/// Sweeps every allocation the two stages of `oomTwoStagesThenPublish` make.
+fn sweepTwoStages(
+    comptime T: type,
+    comptime E: type,
+    model: []const T,
+    ins: []const T,
+    left_at: usize,
+    left_del: usize,
+    right_at: usize,
+    right_del: usize,
+) !void {
+    const gpa = testing.allocator;
+    const needed = blk: {
+        var failing: testing.FailingAllocator = .init(gpa, .{});
+        try oomTwoStagesThenPublish(T, E, failing.allocator(), model, ins, left_at, left_del, right_at, right_del);
+        break :blk failing.alloc_index;
+    };
+    for (0..needed) |fail_index| {
+        var failing: testing.FailingAllocator = .init(gpa, .{ .fail_index = fail_index });
+        // A refusal in the *setup* says nothing about a stage, so it is
+        // skipped rather than counted as a pass: `fail_index` counts from the
+        // first allocation of the run, and the run's first allocations are
+        // the two columns' own.
+        oomTwoStagesThenPublish(T, E, failing.allocator(), model, ins, left_at, left_del, right_at, right_del) catch |e| switch (e) {
+            error.OutOfMemory => continue,
+            else => return e,
+        };
+    }
+}
+
+test "a staged splice publishes whole, and a refused one moves nothing" {
+    // **The seam `Columns.splice` and `Columns.removeOps` are waiting on.**
+    // Twenty columns written one after another is all-or-nothing only if the
+    // twenty can each be prepared first and committed afterwards: a refusal
+    // after the seventh commit leaves seven columns longer than the other
+    // thirteen. Here it is two columns and every allocation of both stages
+    // is swept, and the assertion is that a refusal leaves **both** reading
+    // as they did — including the case where the first stage is already in
+    // hand and the second is the one that refuses.
+    //
+    // One codec of each shape, because the staging machinery has to hold for
+    // all of them: the plain one keeps no per-slab bases, the delta one
+    // re-anchors a row behind the cut and keeps those bases, and the
+    // nullable prefix one makes the cut land past absent rows. A removal is
+    // the same call with `del > 0`, which is why the four shapes below run
+    // both an insert and a delete.
+    const model = [_]i64{ 100, 250, 400, 550, 700, 850, 1000, 1150 };
+    const ins = [_]i64{ -50, -50, 2000, 0, 0, -900 };
+    const none = [_]i64{};
+
+    try sweepTwoStages(i64, Rle(i64), &model, &ins, 2, 1, 5, 2);
+    try sweepTwoStages(i64, Rle(i64), &model, &none, 2, 3, 5, 2);
+    try sweepTwoStages(i64, Delta(i64), &model, &ins, 2, 1, 5, 2);
+    try sweepTwoStages(i64, Delta(i64), &model, &none, 2, 3, 5, 2);
+
+    // A nullable prefix column, where a cut can land past absent rows and
+    // the row behind it still has to be re-anchored — the case the delta and
+    // prefix base caches exist for.
+    const opt_model = [_]?i64{ 100, null, 250, null, 400, 550, null, 700 };
+    const opt_ins = [_]?i64{ null, -50, 2000, null, -900 };
+    const opt_none = [_]?i64{};
+    try sweepTwoStages(?i64, Prefix(?i64), &opt_model, &opt_ins, 2, 1, 4, 2);
+    try sweepTwoStages(?i64, Prefix(?i64), &opt_model, &opt_none, 2, 3, 4, 2);
+}
+
+/// Stages a splice in a frame of its own and hands the stage back **by
+/// value**, so by the time the caller has it the address it was built at no
+/// longer exists. This is the ordinary way a caller will use it — a helper
+/// that stages on the caller's behalf — and it is the shape that caught the
+/// provisional column's ownership flags outliving their frame.
+fn stageOutOfHelper(
+    comptime T: type,
+    comptime E: type,
+    col: *Column(T, E),
+    index: usize,
+    del: usize,
+    ins: []const T,
+) ParseError!Column(T, E).StagedSplice {
+    return col.stageSplice(index, del, ins);
+}
+
+/// Writes over more stack than a call frame holds, so whatever a returned
+/// helper left at that address is gone before the caller reads the stage.
+fn clobberStack() void {
+    var junk: [4096]u64 = undefined;
+    for (&junk, 0..) |*w, i| w.* = @intCast(i);
+    std.mem.doNotOptimizeAway(&junk);
+}
+
+/// One refused abort of a stage that has been moved out of the frame it was
+/// built in. The column has to come out exactly as it went in: same values,
+/// same length, same slab count, and the same bytes — which is the whole of
+/// what a stage promises, and the thing a dangling read of the ownership
+/// flags would take away.
+fn oomMovedStageThenAbort(gpa: std.mem.Allocator, model: []const i64, ins: []const i64) !void {
+    const T = i64;
+    const E = Rle(i64);
+    var col = try Column(T, E).initWithBudget(gpa, 4);
+    defer col.deinit();
+    try col.extend(gpa, model);
+
+    // What the abort must not disturb, taken with `testing.allocator` so a
+    // refusal inside the stage is the only refusal this helper can see.
+    const before = try col.encode(testing.allocator);
+    defer testing.allocator.free(before);
+    const before_len = col.len();
+    const before_slabs = col.slabCount();
+
+    var s = stageOutOfHelper(T, E, &col, 2, 1, ins) catch |e| switch (e) {
+        error.OutOfMemory => {
+            // The stage never existed. The column is untouched and the
+            // provisional column's own scaffolding has already given its
+            // bytes back.
+            try expectColumn(T, E, &col, model);
+            try testing.expectEqual(before_len, col.len());
+            try testing.expectEqual(before_slabs, col.slabCount());
+            return;
+        },
+        else => return e,
+    };
+    // The stage is on the caller's stack now; the frame it was built in is
+    // gone. Overwrite that ground before touching it.
+    clobberStack();
+
+    s.deinit();
+    // The abort after an abort, on a moved stage: a no-op rather than a
+    // second free of the same staged slabs.
+    s.deinit();
+
+    try expectColumn(T, E, &col, model);
+    try testing.expectEqual(before_len, col.len());
+    try testing.expectEqual(before_slabs, col.slabCount());
+    const after = try col.encode(testing.allocator);
+    defer testing.allocator.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+    // `testing.allocator` sees the teardown: the stage's staged slabs, its
+    // weight list, its index arena and its bookkeeping all go back, and not
+    // one of the column's own buffers is freed.
+}
+
+/// Sweeps every allocation the moved stage of `oomMovedStageThenAbort` makes.
+fn sweepMovedStage(gpa: std.mem.Allocator, model: []const i64, ins: []const i64) !void {
+    const needed = blk: {
+        var failing: testing.FailingAllocator = .init(gpa, .{});
+        try oomMovedStageThenAbort(failing.allocator(), model, ins);
+        break :blk failing.alloc_index;
+    };
+    for (0..needed) |fail_index| {
+        var failing: testing.FailingAllocator = .init(gpa, .{ .fail_index = fail_index });
+        // A refusal in the *setup* — the column the stage runs against never
+        // got built — says nothing about the stage, so it is skipped rather
+        // than counted as a pass.
+        oomMovedStageThenAbort(failing.allocator(), model, ins) catch |e| switch (e) {
+            error.OutOfMemory => continue,
+            else => return e,
+        };
+    }
+}
+
+test "a stage moved out of the frame it was built in aborts to nothing" {
+    // **The stage is a value, so a caller may move it.** It was not: the
+    // provisional column inside it held a pointer to the ownership flags on
+    // the stack frame `stageSplice` was building in, and returning the stage
+    // by value left that pointer naming a frame that had ended. The abort
+    // read through it. This is the consumer-visible shape of that: stage
+    // through a helper, move the result, overwrite the ground it came from,
+    // abort — and the column must be exactly what it was.
+    //
+    // No assertion here looks at an address or a layout. What is checked is
+    // the promise a caller can see: the values, the length, the slab count,
+    // the invariants, and the bytes the column encodes to.
+    const model = [_]i64{ 100, 250, 400, 550, 700, 850, 1000, 1150 };
+    const ins = [_]i64{ -50, -50, 2000, 0, 0, -900 };
+    try sweepMovedStage(testing.allocator, &model, &ins);
+}
+
+/// One refused seed of the first slab, over a fresh column.
+///
+/// **`ensureSlab` puts the slab in the list before the caches are rebuilt**,
+/// and both rebuilds allocate. Whatever the seed comes back with, the column
+/// has to be the one it started with — and, either way, a column a write
+/// lands in, because that is the whole reason the seed exists.
+fn oomEnsureSlabThenWrite(
+    comptime T: type,
+    comptime E: type,
+    gpa: std.mem.Allocator,
+) !void {
+    var col = try Column(T, E).initWithBudget(gpa, 4);
+    defer col.deinit();
+    // What the column is on entry, so the refusal arm asserts "as it was"
+    // rather than a number this test would otherwise have to keep true.
+    const before_slabs = col.slabCount();
+
+    var committed = true;
+    if (col.ensureSlab()) |_| {} else |e| {
+        // The column is empty and the request is a constant one, so the only
+        // error a seed can come back with is the allocator.
+        if (e != error.OutOfMemory) return e;
+        committed = false;
+    }
+
+    try testing.expect((try col.checkInvariants()) == null);
+    try testing.expectEqual(@as(usize, 0), col.len());
+    if (committed) {
+        try testing.expectEqual(@as(usize, 1), col.slabCount());
+    } else {
+        // **A refusal puts the slab back out.** One slab against an index that
+        // still describes none is a column that does not describe itself, and
+        // the check above is what names it.
+        try testing.expectEqual(before_slabs, col.slabCount());
+    }
+    // Either way the column is still a column a write lands in.
+    const row = [_]T{genValue(T, 1)};
+    try col.splice(gpa, 0, 0, &row);
+    try expectColumn(T, E, &col, &row);
+    // Teardown is `testing.allocator`'s to check: a column whose seed was
+    // refused has to give back every byte it was holding.
+}
+
+/// Sweeps every allocation the one seed of `oomEnsureSlabThenWrite` makes.
+fn sweepEnsureSlab(comptime T: type, comptime E: type) !void {
+    const gpa = testing.allocator;
+    const needed = blk: {
+        var failing: testing.FailingAllocator = .init(gpa, .{});
+        try oomEnsureSlabThenWrite(T, E, failing.allocator());
+        break :blk failing.alloc_index;
+    };
+    for (0..needed) |fail_index| {
+        var failing: testing.FailingAllocator = .init(gpa, .{ .fail_index = fail_index });
+        // A refusal in the *setup* — the column the seed runs against never
+        // got built — says nothing about the seed, so it is skipped rather
+        // than counted as a pass.
+        oomEnsureSlabThenWrite(T, E, failing.allocator()) catch |e| switch (e) {
+            error.OutOfMemory => continue,
+            else => return e,
+        };
+    }
+}
+
+test "a refused slab seed leaves a column with no slabs and no caches" {
+    // **The edit cursor opens on a fresh column and asks for a slab to land
+    // in.** A seed that refuses has to leave that column exactly as it was:
+    // the slab it may already have put in the list comes back out, and the
+    // index and the bases agree with a column that has none.
+    //
+    // Three codecs, because the seed's two halves are shaped by the codec: one
+    // that keeps no bases, one nullable that keeps none either, and one that
+    // carries a prefix sum and so has an array to seed alongside the slab.
+    try sweepEnsureSlab(i64, Rle(i64));
+    try sweepEnsureSlab(?i64, RleOption(i64));
+    try sweepEnsureSlab(?i64, Prefix(?i64));
 }
 
 // ── The row cursor across slab boundaries ──────────────────────────────────
@@ -12202,6 +13726,40 @@ test "remap_runs_preserved" {
     @memset(mapped, 8);
     try expectModel(u64, Rle(u64), &col, mapped);
     try expectRoundTrip(u64, Rle(u64), &col, mapped);
+}
+
+//  `remapped` builds *beside* the column rather than through it. That is what
+//  `Columns.remapActors` stands on: it has four columns to renumber and may
+//  publish none of them until all four are staged, so a stage cannot release
+//  or borrow the source's storage — which is exactly what remapping a shallow
+//  copy of a column did.
+test "remapped_leaves_the_source_column_whole" {
+    const gpa = testing.allocator;
+    var col = try v1Build(gpa, &.{ 1, 2, 3, 4, 5 });
+    defer col.deinit();
+
+    var staged = try col.remapped(gpa, {}, bumpByOne);
+    defer staged.deinit();
+
+    // The source still answers for its own rows, at its own run budget, and
+    // is still a column that can be written to and freed.
+    try testing.expectEqual(col.maxSegmentsOf(), staged.maxSegmentsOf());
+    try expectSound(u64, Rle(u64), &col);
+    try expectSound(u64, Rle(u64), &staged);
+    try testing.expectEqual(@as(?u64, 1), try col.get(0));
+    try testing.expectEqual(@as(?u64, 5), try col.get(4));
+
+    const mapped = try gpa.alloc(u64, 5);
+    defer gpa.free(mapped);
+    for (mapped, 0..) |*v, i| v.* = @intCast(i + 2);
+    try expectModel(u64, Rle(u64), &staged, mapped);
+    try expectRoundTrip(u64, Rle(u64), &staged, mapped);
+
+    // The two are independent: a write to the source leaves the staged copy
+    // exactly as it was built.
+    try col.extend(gpa, &.{6});
+    try testing.expectEqual(@as(usize, 5), staged.len());
+    try expectSound(u64, Rle(u64), &col);
 }
 
 //  `remap` after arbitrary mutation, against the same mapping applied to a

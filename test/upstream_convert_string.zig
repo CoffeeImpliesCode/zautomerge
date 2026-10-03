@@ -9,7 +9,7 @@
 //!
 //! It is a **consumer test**: it imports `zautomerge` by name, sets no working
 //! directory and reads no fixture — the same shape
-//! [`upstream_batch_test.zig`](upstream_batch_test.zig) has.
+//! [`upstream_batch_insert.zig`](upstream_batch_insert.zig) has.
 //!
 //! # The gap, at its own upstream line, and what these cases therefore drive
 //!
@@ -76,6 +76,14 @@ const testing = std.testing;
 
 /// **The leak arbiter for the whole file.** One allocator, named once.
 const gpa = testing.allocator;
+
+/// The borrowed capability every document constructor below is handed.
+///
+/// **Explicit, because `Document` keeps it.** The op set draws actors through
+/// this value for as long as the document lives, so a constructor cannot
+/// reach for an ambient global and no document can outlive its provider. Here
+/// that value is `std.testing.io`; an executable passes its own `init.io`.
+const io = std.testing.io;
 const Allocator = std.mem.Allocator;
 
 const Document = am.doc.Document;
@@ -106,8 +114,8 @@ const all_encodings = [_]TextEncoding{
 /// Upstream draws an actor at random ([`automerge.rs`:314](../github-automerge-automerge/rust/automerge/src/automerge.rs));
 /// this file mints them from a counter instead — distinct bytes, a stable
 /// order, the same bytes on every run — for the reason
-/// [`test/upstream_batch_test.zig`](upstream_batch_test.zig) gives: a failure
-/// nobody can reproduce is not a finding.
+/// [`test/upstream_batch_insert.zig`](upstream_batch_insert.zig) gives: a
+/// failure nobody can reproduce is not a finding.
 ///
 /// The bytes start at one so that no document ever has an **empty** actor,
 /// which is a different value from every other one.
@@ -136,7 +144,7 @@ fn mintActor() ActorId {
 /// below needs, because upstream's runs on the inner `Automerge` before
 /// `AutoCommit` wraps it (`automerge.rs:991-993`, `:2015`).
 fn newDoc(encoding: TextEncoding) !Document {
-    var doc = try Document.initWithEncoding(gpa, encoding, .manual);
+    var doc = try Document.initWithEncoding(gpa, io, encoding, .manual);
     errdefer doc.deinit();
     doc.setActorId(mintActor());
     return doc;
@@ -402,7 +410,7 @@ fn expectSameThroughApplyChanges(doc: *Document) !void {
     const view = try changeViews(&all);
     defer gpa.free(view);
 
-    var applied = try Document.initWithEncoding(gpa, doc.textEncoding(), .auto);
+    var applied = try Document.initWithEncoding(gpa, io, doc.textEncoding(), .auto);
     defer applied.deinit();
     _ = try applied.applyChanges(gpa, view);
 
@@ -669,7 +677,7 @@ test "strings in maps are converted to text" {
         // of this file: the port has no `LoadOptions`, so this is the load and
         // then the conversion, which is the whole of what the option does
         // (`automerge.rs:991-993`).
-        var loaded = try Document.load(gpa, saved, enc, .manual);
+        var loaded = try Document.load(gpa, io, saved, enc, .manual);
         defer loaded.deinit();
 
         try convertScalarStringsToText(&loaded);
@@ -729,7 +737,7 @@ test "strings in lists are converted to text" {
         const saved = try doc.save(gpa);
         defer gpa.free(saved);
 
-        var loaded = try Document.load(gpa, saved, enc, .manual);
+        var loaded = try Document.load(gpa, io, saved, enc, .manual);
         defer loaded.deinit();
 
         try convertScalarStringsToText(&loaded);
@@ -784,7 +792,7 @@ test "conversion adds no size when there is nothing to convert" {
         const empty_document = try src.save(gpa);
         defer gpa.free(empty_document);
 
-        var loaded = try Document.load(gpa, empty_document, enc, .manual);
+        var loaded = try Document.load(gpa, io, empty_document, enc, .manual);
         defer loaded.deinit();
 
         try convertScalarStringsToText(&loaded);
@@ -816,7 +824,7 @@ test "conversion adds no size when there is nothing to convert" {
 
         // **The document is still loadable**, so "the same bytes" is a claim
         // about a document and not about a buffer.
-        var round = try Document.load(gpa, saved_again, enc, .manual);
+        var round = try Document.load(gpa, io, saved_again, enc, .manual);
         defer round.deinit();
         try testing.expectEqual(@as(usize, 0), try changeCount(&round));
     }

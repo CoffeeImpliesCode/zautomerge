@@ -49,9 +49,18 @@ const ParseError = err.ParseError;
 /// The maximum number of bytes a u64 occupies: nine whole bytes plus one
 /// bit-carrying byte.
 pub const max_unsigned_size = 10;
+/// The maximum number of bytes an i64 occupies, which is the same ten: the
+/// tenth byte carries the sign and a whole byte of sign extension where the
+/// unsigned tenth byte carries a single bit (see the module doc).
+///
+/// It is the size of the stack buffer `appendSigned` and `writeSigned` use,
+/// so a caller sizing one of its own needs no arithmetic.
 pub const max_signed_size = 10;
 
-/// The number of bytes `writeUnsigned` will emit for `value`.
+/// The number of bytes `writeUnsigned` will emit for `value`, which must be a
+/// non-negative integer no wider than `u64`. A signed argument is clamped at
+/// zero here, so it answers for `0` where `writeUnsigned` refuses the same
+/// value: clamp with `@max(value, 0)` before calling either.
 pub fn unsignedSize(value: anytype) usize {
     const v: u64 = @intCast(@max(value, 0));
     var n: usize = 1;
@@ -60,8 +69,11 @@ pub fn unsignedSize(value: anytype) usize {
     return n;
 }
 
-/// The number of bytes `writeSigned` will emit for `value`. It runs the same
-/// loop as the encoder, so the two cannot disagree.
+/// The number of bytes `writeSigned` will emit for `value`, which must be an
+/// integer no wider than `i64` — `@intCast` refuses anything wider at compile
+/// time, so the domain is checked where it is written down rather than at
+/// run time. It runs the same loop as the encoder, so the two cannot
+/// disagree.
 pub fn signedSize(value: anytype) usize {
     const v: i64 = @intCast(value);
     var n: usize = 1;
@@ -77,6 +89,12 @@ pub fn signedSize(value: anytype) usize {
 
 /// Writes `value` as unsigned LEB128 into `out`, returning the bytes written.
 /// The caller guarantees `out` has room; use `unsignedSize` to size it.
+///
+/// `value` must be a non-negative integer no wider than `u64`, and the
+/// `@intCast` is what enforces it: a negative or a wider integer traps in
+/// Debug and ReleaseSafe rather than encoding a wrapped one. This is the
+/// domain `unsignedSize` assumes, and the two disagree on a negative
+/// argument on purpose — there is one shape for the caller to hold to.
 pub fn writeUnsigned(out: []u8, value: anytype) usize {
     var v: u64 = @intCast(value);
     var i: usize = 0;
@@ -90,6 +108,10 @@ pub fn writeUnsigned(out: []u8, value: anytype) usize {
 }
 
 /// Writes `value` as signed LEB128 into `out`, returning the bytes written.
+/// The caller guarantees `out` has room; use `signedSize` to size it.
+///
+/// `value` must be an integer no wider than `i64`, the domain `signedSize`
+/// shares and the `@intCast` here enforces at compile time.
 pub fn writeSigned(out: []u8, value: anytype) usize {
     var v: i64 = @intCast(value);
     var i: usize = 0;
@@ -109,8 +131,18 @@ pub fn writeSigned(out: []u8, value: anytype) usize {
 }
 
 /// Reads an unsigned LEB128 from `in`, returning the value and the number of
-/// bytes consumed. Errors on truncation, on an overlong encoding, and on a
-/// value that does not fit in `u64`.
+/// bytes consumed. **Exactly the bytes the encoding needed are consumed**, so
+/// a caller reads the next value from `in[n.len..]`.
+///
+/// * `error.UnexpectedEnd` — `in` ran out mid-value, a missing last byte
+///   included.
+/// * `error.InvalidLeb128` — the encoding is overlong: a zero group above a
+///   non-zero one, or an eleventh byte (`storage/parse/leb128.rs:32-33`).
+/// * `error.Overflow` — the tenth byte carries more than the one bit that is
+///   left, or a group would sit above bit 64.
+///
+/// The three are distinct on purpose: a truncated stream is not an overlong
+/// encoding, and neither is a value too wide for a `u64`.
 pub fn readUnsigned(in: []const u8) ParseError!struct { value: u64, len: usize } {
     var result: u64 = 0;
     var shift: usize = 0;
@@ -145,6 +177,19 @@ pub fn readUnsigned(in: []const u8) ParseError!struct { value: u64, len: usize }
 }
 
 /// Reads a signed LEB128 from `in`, returning the value and bytes consumed.
+/// **Exactly the bytes the encoding needed are consumed**, so a caller reads
+/// the next value from `in[n.len..]`.
+///
+/// * `error.UnexpectedEnd` — `in` ran out mid-value, a missing last byte
+///   included.
+/// * `error.InvalidLeb128` — the encoding is overlong, which here is a
+///   terminator that continues the sign of the byte before it, or an
+///   eleventh byte (`storage/parse/leb128.rs:63-65`).
+/// * `error.Overflow` — the tenth byte is neither all zeros nor all ones, or
+///   a group above bit 64 is neither.
+///
+/// The three are the same three the unsigned reader reports, under the same
+/// rule and with the same meaning.
 pub fn readSigned(in: []const u8) ParseError!struct { value: i64, len: usize } {
     var result: u64 = 0;
     var shift: usize = 0;
@@ -197,14 +242,23 @@ pub fn readSigned(in: []const u8) ParseError!struct { value: i64, len: usize } {
     return .{ .value = @bitCast(result), .len = i };
 }
 
-/// Appends `value` as unsigned LEB128 to `list`.
+/// Appends `value` as unsigned LEB128 to `list`. `value` is
+/// `writeUnsigned`'s domain: a non-negative integer no wider than `u64`.
+///
+/// The only error reachable is `error.OutOfMemory`, and **nothing is
+/// appended when it fires**: the encoding is copied in as one piece, so a
+/// list that took a failure is byte for byte the list it was.
 pub fn appendUnsigned(list: *std.ArrayList(u8), gpa: std.mem.Allocator, value: anytype) !void {
     var buf: [max_unsigned_size]u8 = undefined;
     const n = writeUnsigned(&buf, value);
     try list.appendSlice(gpa, buf[0..n]);
 }
 
-/// Appends `value` as signed LEB128 to `list`.
+/// Appends `value` as signed LEB128 to `list`. `value` is `writeSigned`'s
+/// domain: an integer no wider than `i64`.
+///
+/// The only error reachable is `error.OutOfMemory`, and **nothing is
+/// appended when it fires**, as `appendUnsigned` says.
 pub fn appendSigned(list: *std.ArrayList(u8), gpa: std.mem.Allocator, value: anytype) !void {
     var buf: [max_signed_size]u8 = undefined;
     const n = writeSigned(&buf, value);

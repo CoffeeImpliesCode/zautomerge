@@ -4,9 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // `zautomerge` is a library. Consumers get the module; no artifact is
-    // installed. Executables and the C ABI live in the test and example
-    // targets below until the port grows a command-line tool.
+    // Published native module and static C artifact share the same core.
     const mod = b.addModule("zautomerge", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -461,14 +459,31 @@ pub fn build(b: *std.Build) void {
 
     // `zig build ctest` builds the upstream C conformance suite — the cmocka
     // suite from `rust/automerge-c/test/`, copied verbatim into
-    // `test/c/suite/` — against the C ABI, and runs it. This is the only gate
-    // that can see an ABI or signature mismatch: the suite is C, compiled
-    // against `include/automerge.h` and linked against the library's symbols,
-    // so a declaration the library does not export is a link error, a wrong
-    // integer width is a silently wrong answer, and a missing
-    // `AMresultFree` is a leak the Zig side cannot see. `zig test` cannot do
-    // this job at all: `src/c/**` is `extern "C"` over libc and the test
-    // binary links none, which is why `src/root.zig:222-226` leaves it out.
+    // `test/c/suite/` — against the C ABI, and runs it. It also depends on
+    // `abi_check` declared below, and the two are different jobs that fail
+    // differently.
+    //
+    // **The link is a name check.** The suite is C, compiled against
+    // `include/automerge.h` and linked against the library's symbols, so a
+    // declaration the library does not export is a link error here — and that
+    // is the whole of what a link can see. A renamed struct field, a
+    // reordered `AMitems`, a widened enum or a flipped signedness all still
+    // compile, still link, and then read a value the other side laid out
+    // differently: a silently wrong answer rather than a build failure. A
+    // missing `AMresultFree` is a leak neither a link nor the Zig side can
+    // see at all.
+    //
+    // **`abi_check` is the shape check.** `test/c/cabi.zig` translates that
+    // same header and compares it against the library at comptime, so each of
+    // those mismatches is a compile error there instead of a silent answer
+    // here. It is a **check-only** artifact: a separate static library that
+    // nothing links into the suite, which is linked against `cabi_lib` and so
+    // against the production root `src/c/root.zig`. The thing that checks the
+    // ABI is never the thing the ABI is checked on.
+    //
+    // `zig test` can do neither job: `src/c/**` is `extern "C"` over libc and
+    // the test binary links none, which is why `src/root.zig:233-237` leaves it
+    // out.
     //
     // cmocka is a build-time-only dependency, reached the same way a system
     // library is: with no option the compiler's own default search paths are
@@ -479,13 +494,12 @@ pub fn build(b: *std.Build) void {
         "platform whose compiler wrapper has no default search path. Empty " ++
         "means the compiler's defaults.");
 
-    // The library, not the module: the C suite needs real symbols, and
-    // `test/c/cabi.zig` is what forces the `export fn`s to be analyzed.
+    // Production root forces C exports without depending on test sources.
     const cabi_lib = b.addLibrary(.{
         .name = "zautomerge",
         .linkage = .static,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test/c/cabi.zig"),
+            .root_source_file = b.path("src/c/root.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -504,6 +518,23 @@ pub fn build(b: *std.Build) void {
         .root = b.path("src/c"),
         .files = &.{"result_from.c"},
     });
+    cabi_lib.installHeader(b.path("include/automerge.h"), "automerge.h");
+    b.installArtifact(cabi_lib);
+
+    // Compile all signature/layout/discriminant checks against the shipped
+    // header. The C suite links the production artifact, not this check root.
+    const abi_check = b.addLibrary(.{
+        .name = "zautomerge-abi-check",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/c/cabi.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "zautomerge", .module = mod }},
+        }),
+    });
+    abi_check.root_module.addIncludePath(b.path("include"));
 
     const ctest_exe = b.createModule(.{
         .root_source_file = b.path("test/c/main.zig"),
@@ -595,7 +626,10 @@ pub fn build(b: *std.Build) void {
     const ctest_bin = b.addExecutable(.{
         .name = "automerge-c-test",
         .root_module = ctest_exe,
+        // The header checks must be analyzed even when no C case reaches a
+        // given declaration.
     });
+    ctest_bin.step.dependOn(&abi_check.step);
     // **This line has no measured effect on Zig 0.16.0 and is not the fix.**
     // `readelf -d` reports the same RUNPATH with this flag set and unset,
     // because the toolchain already copies every `-L` directory into the

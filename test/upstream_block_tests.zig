@@ -71,6 +71,14 @@ const testing = std.testing;
 
 /// **The leak arbiter for the whole file.** One allocator, named once.
 const gpa = testing.allocator;
+
+/// The borrowed capability every document constructor below is handed.
+///
+/// **Explicit, because `Document` keeps it.** The op set draws actors through
+/// this value for as long as the document lives, so a constructor cannot
+/// reach for an ambient global and no document can outlive its provider. Here
+/// that value is `std.testing.io`; an executable passes its own `init.io`.
+const io = std.testing.io;
 const Allocator = std.mem.Allocator;
 
 const Document = am.doc.Document;
@@ -122,16 +130,18 @@ fn mintActor() am.ActorId {
 
 /// A document in the autocommit flavour, which is upstream's `AutoCommit`.
 fn newDoc() !Document {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, io, .auto);
     errdefer doc.deinit();
     doc.setActorId(mintActor());
     return doc;
 }
 
 /// [`Document.forkAt`](../src/doc.zig) at the source's own heads, which is what
-/// upstream's `doc.fork()` means. [`Document.fork`](../src/doc.zig) stores
-/// `ActorId.random` in `actor.unused` and `Document.deinit` frees no actor
-/// bytes, so this file goes through the one that copies them.
+/// upstream's `doc.fork()` means. [`Document.fork`](../src/doc.zig) mints its
+/// actor through the source's retained `io`, so this file goes through the
+/// door that takes a nameable one. **Determinism, not a leak**: `fork`
+/// allocates that actor from the **fork's own** arena, which
+/// [`Document.deinit`](../src/doc.zig) frees.
 fn forkDoc(src: *Document) !Document {
     const heads = try src.getHeads(gpa);
     defer gpa.free(heads);
@@ -246,7 +256,7 @@ fn expectSameThroughApplyChanges(doc: *Document) !void {
     const view = try changeViews(&all);
     defer gpa.free(view);
 
-    var applied = try Document.init(gpa, .auto);
+    var applied = try Document.init(gpa, io, .auto);
     defer applied.deinit();
     applied.setActorId(mintActor());
     _ = try applied.applyChanges(gpa, view);
@@ -1363,7 +1373,7 @@ test "block: update spans takes the expand flags from its config" {
     // literal below is fine and `deinit` frees the copy.
     var config = UpdateSpansConfig.init(gpa);
     defer config.deinit();
-    config = config.withDefaultExpand(.none);
+    _ = config.withDefaultExpand(.none);
     try config.setMarkExpand("bold", .after);
 
     const want = try spanList(

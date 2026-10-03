@@ -103,6 +103,14 @@ const testing = std.testing;
 /// **The leak arbiter for the whole file.** One allocator, named once.
 const gpa = testing.allocator;
 
+/// The borrowed capability every document constructor below is handed.
+///
+/// **Explicit, because `Document` keeps it.** The op set draws actors through
+/// this value for as long as the document lives, so a constructor cannot
+/// reach for an ambient global and no document can outlive its provider. Here
+/// that value is `std.testing.io`; an executable passes its own `init.io`.
+const io = std.testing.io;
+
 const Document = am.doc.Document;
 const ExId = am.ExId;
 const ObjType = am.ObjType;
@@ -153,7 +161,7 @@ fn mintActor() ActorId {
 
 /// A new document in the autocommit flavour ([`AutoCommit::new`](../src/doc.zig)).
 fn newDoc() !Document {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, io, .auto);
     errdefer doc.deinit();
     doc.setActorId(mintActor());
     return doc;
@@ -163,7 +171,7 @@ fn newDoc() !Document {
 /// is what a transaction and a rollback need: the autocommit door commits
 /// every call.
 fn newManualDoc() !Document {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     errdefer doc.deinit();
     doc.setActorId(mintActor());
     return doc;
@@ -335,11 +343,12 @@ fn headsOf(doc: *const Document) ![]ChangeHash {
 }
 
 /// [`Document.fork`](../src/doc.zig) through [`Document.forkAt`](../src/doc.zig)
-/// at the document's own heads — which is what `fork` means, and
-/// [`forkAt`](../src/doc.zig) is the one that frees the actor bytes it mints.
-/// **Upstream's `doc.fork()` is this here, and that is not cosmetic**:
-/// [`Document.fork`](../src/doc.zig) stores `ActorId.random(gpa)` in
-/// `actor.unused` and `Document.deinit` frees no actor bytes.
+/// at the document's own heads, which is what `fork` means.
+///
+/// **A named actor, not [`Document.fork`](../src/doc.zig)'s random one.** That
+/// call mints through the source's retained `io`, so its actor differs on
+/// every run. **And this is determinism, not a leak**: `fork` allocates the
+/// actor from the **fork's own** arena, which [`Document.deinit`] frees.
 fn forkDoc(src: *Document) !Document {
     const heads = try src.getHeads(gpa);
     defer gpa.free(heads);
@@ -417,7 +426,7 @@ fn expectSameThroughApplyChanges(doc: *Document) !void {
     const view = try changeViews(&all);
     defer gpa.free(view);
 
-    var applied = try Document.init(gpa, .auto);
+    var applied = try Document.init(gpa, io, .auto);
     defer applied.deinit();
     applied.setActorId(mintActor());
     _ = try applied.applyChanges(gpa, view);
@@ -859,7 +868,7 @@ test "batch: batch_insert_survives_save_load" {
 
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var doc2 = try Document.load(gpa, saved, .unicode_code_point, .auto);
+    var doc2 = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
     defer doc2.deinit();
 
     const data_id = try objectAt(&doc2, root, .{ .key = "data" });
@@ -1384,7 +1393,7 @@ test "batch: batch_init_map_survives_save_load" {
 
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var doc2 = try Document.load(gpa, saved, .unicode_code_point, .auto);
+    var doc2 = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
     defer doc2.deinit();
 
     try expectStr(&doc2, root, .{ .key = "name" }, "test");
@@ -1645,7 +1654,7 @@ test "batch: splice_survives_save_load" {
 
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var doc2 = try Document.load(gpa, saved, .unicode_code_point, .auto);
+    var doc2 = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
     defer doc2.deinit();
 
     const list_id2 = try objectAt(&doc2, root, .{ .key = "list" });
@@ -1781,7 +1790,7 @@ test "batch: a batch written locally and the same changes applied elsewhere mate
     defer gpa.free(views);
     for (0..changes.len()) |i| views[i] = changes.at(i);
 
-    var applied = try Document.init(gpa, .auto);
+    var applied = try Document.init(gpa, io, .auto);
     defer applied.deinit();
     _ = try applied.applyChanges(gpa, views);
 
@@ -1935,13 +1944,14 @@ fn spliceScalars(
 // upstream's `AutoCommit::merge` returns them too and every test here frees
 // them, because [`Document.getHeads`](../src/doc.zig) hands back a copy.
 //
-// ## A fork goes through `forkAt`
+// ## A fork goes through `forkAt`, under a named actor
 //
 // Upstream's `doc.fork()` is [`Document.forkAt`](../src/doc.zig) at the
-// document's own heads here, and that is not cosmetic:
-// [`Document.fork`](../src/doc.zig) stores `ActorId.random(gpa)` in
-// `actor.unused` and `Document.deinit` frees no actor bytes, so it leaks.
-// Forking at the current heads is what `fork` means.
+// document's own heads here, and that is determinism rather than a leak:
+// [`Document.fork`](../src/doc.zig) mints its actor through the source's
+// retained `io`, so the actor and every change hash below it differ on every
+// run. `fork` allocates that actor from the **fork's own** arena, which
+// [`Document.deinit`](../src/doc.zig) frees, so nothing is leaked either way.
 //
 // ## `doc.commit()` has no separate spelling
 //

@@ -86,13 +86,29 @@ fn opensCluster(st: *Scanner, cp: u21) bool {
 /// `error.InvalidUtf8` rather than being skipped, so untrusted bytes are an
 /// error and never a spin.
 pub const GraphemeBoundaryIter = struct {
+    /// The string being walked, **borrowed for the walk's whole life**: the
+    /// caller must keep it alive and must not change its bytes while the
+    /// iterator lives, because `cursor` is a byte position in it and every
+    /// answer is an offset into it.
     s: []const u8,
+    /// The cluster-break scanner, carried across calls so the string is
+    /// decoded exactly once however many clusters it has.
     st: Scanner = .{},
     /// The offset the next code point to feed the scanner starts at.
     cursor: usize = 0,
     /// Whether the first code point has been fed.
     seeded: bool = false,
 
+    /// The offset the next cluster starts at, or null once the string is
+    /// exhausted. The first cluster is not reported: it starts at 0 and
+    /// every caller already knows it.
+    ///
+    /// **`error.InvalidUtf8` is the only error reachable**, and a bad start
+    /// byte and a truncated tail both name it. **An error ends the walk and
+    /// the iterator is not resumable**: the seeding block has already set
+    /// `seeded`, and `cursor` still stands on the byte that failed, so every
+    /// later call reads the same byte and returns the same error. A caller
+    /// that wants to go on builds a fresh iterator and starts again.
     pub fn next(self: *GraphemeBoundaryIter) !?usize {
         if (!self.seeded) {
             // The first code point opens the first cluster and closes none. It
@@ -134,7 +150,9 @@ pub const GraphemeBoundaryIter = struct {
     }
 };
 
-/// The boundary walk over `s`.
+/// The boundary walk over `s`. **The iterator borrows `s`**: the buffer must
+/// stay alive and unmodified until the walk ends, and every offset `next`
+/// answers is an offset into it.
 pub fn graphemeBoundaries(s: []const u8) GraphemeBoundaryIter {
     return .{ .s = s };
 }
@@ -152,7 +170,12 @@ pub fn nextGraphemeBoundary(s: []const u8, byte_index: usize) !usize {
 }
 
 /// The byte offset of the last grapheme cluster boundary at or before
-/// `byte_index`.
+/// `byte_index`, or `s.len` once the walk reaches the end. An index past the
+/// end answers as the end itself does.
+///
+/// A code point that runs past the end of `s` — a truncated tail, which a
+/// text object can end on — is `error.InvalidUtf8`, checked before the code
+/// point is sliced out of the string.
 pub fn prevGraphemeBoundary(s: []const u8, byte_index: usize) !usize {
     if (byte_index == 0) return 0;
     var best: usize = 0;
@@ -160,6 +183,11 @@ pub fn prevGraphemeBoundary(s: []const u8, byte_index: usize) !usize {
     var i: usize = 0;
     while (i < byte_index and i < s.len) {
         const len = std.unicode.utf8ByteSequenceLength(s[i]) catch return error.InvalidUtf8;
+        // The walk decodes a whole code point, so the sequence has to fit
+        // inside `s` before it is sliced out of it. `GraphemeBoundaryIter`
+        // draws the same line at `i + len > self.s.len`: a truncated tail is
+        // an error, never a slice past the end of the buffer.
+        if (i + len > s.len) return error.InvalidUtf8;
         const cp = std.unicode.utf8Decode(s[i .. i + len]) catch return error.InvalidUtf8;
         if (opensCluster(&st, cp) and i < byte_index) best = i;
         i += len;
@@ -615,4 +643,32 @@ test "invalid utf8 is rejected" {
     try std.testing.expectError(error.InvalidUtf8, countUtf16CodeUnits(&[_]u8{0xff}));
     try std.testing.expectError(error.InvalidUtf8, countGraphemes(&[_]u8{0x80}));
     try std.testing.expectError(error.InvalidUtf8, nextGraphemeBoundary(&[_]u8{ 0xe2, 0x28 }, 1));
+}
+
+test "a code point cut off by the end of the string is refused" {
+    // **The last code point declares more bytes than the buffer holds.** A
+    // text object can end on a truncated sequence, so every entry point that
+    // decodes a code point has to check that the sequence fits before it
+    // slices it out. `prevGraphemeBoundary` walked past the end here: the
+    // loop tested only `i < s.len`, so `s[1..4]` was taken out of a three
+    // byte slice.
+    const truncated = "a\xe2\x82"; // "a" and two of the three bytes of "€".
+    try std.testing.expectError(error.InvalidUtf8, prevGraphemeBoundary(truncated, truncated.len));
+    try std.testing.expectError(error.InvalidUtf8, nextGraphemeBoundary(truncated, 1));
+    try std.testing.expectError(error.InvalidUtf8, graphemeOffset(truncated, 2));
+    // A four-byte sequence missing its last byte is the same refusal.
+    const quad = "\xf0\x9f\x91";
+    try std.testing.expectError(error.InvalidUtf8, graphemeOffset(quad, 1));
+    // **The iterator is at the same place**, whichever end of the string the
+    // truncation is at: the seeding code point is truncated here.
+    var walk = graphemeBoundaries(quad);
+    try std.testing.expectError(error.InvalidUtf8, walk.next());
+    // A bad start byte is refused by name on the same paths.
+    try std.testing.expectError(error.InvalidUtf8, prevGraphemeBoundary("a\xff", 2));
+    try std.testing.expectError(error.InvalidUtf8, graphemeOffset("a\x80", 2));
+    // **A whole code point is still answered, not refused**: the check is on
+    // the sequence that runs off the end, not on every multi-byte cluster.
+    // "a€b" is three clusters, so its boundaries are 0, 1 and 4.
+    try std.testing.expectEqual(@as(usize, 1), try prevGraphemeBoundary("a€b", 2));
+    try std.testing.expectEqual(@as(usize, 4), try prevGraphemeBoundary("a€b", 5));
 }

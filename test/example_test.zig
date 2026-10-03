@@ -26,6 +26,14 @@ const testing = std.testing;
 /// loaded document, and each copy a list read hands back.
 const gpa = testing.allocator;
 
+/// The borrowed capability every document constructor below is handed.
+///
+/// **Explicit, because `Document` keeps it.** The op set draws actors through
+/// this value for as long as the document lives, so a constructor cannot
+/// reach for an ambient global and no document can outlive its provider. Here
+/// that value is `std.testing.io`; an executable passes its own `init.io`.
+const io = std.testing.io;
+
 const Allocator = std.mem.Allocator;
 
 const Document = am.doc.Document;
@@ -125,7 +133,7 @@ test "the address book: the crate-root example, run as a consumer runs it" {
     // ([`autocommit.rs:92-94`](../github-automerge-automerge/rust/automerge/src/autocommit.rs),
     // [`doc.zig:328-331`](../src/doc.zig)). Every mutating call below opens a
     // transaction and commits it, so this session holds none.
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, io, .auto);
     defer doc.deinit();
     // **A named actor**, because a random one would make a failure
     // unreproducible. Upstream draws one at random
@@ -243,7 +251,7 @@ test "the address book: the crate-root example, run as a consumer runs it" {
     // indexed document and a UTF-8 indexed one have identical bytes
     // ([`doc.zig:2767-2775`](../src/doc.zig)), so the answer is the same
     // [`Document.init`] call at the top of this test.
-    var reloaded = try Document.load(gpa, data, am.doc.defaultTextEncoding(), .auto);
+    var reloaded = try Document.load(gpa, io, data, am.doc.defaultTextEncoding(), .auto);
     defer reloaded.deinit();
 
     // **The whole document, through the same public reads.** A save that lost a
@@ -731,7 +739,7 @@ fn compareShape(
 /// duplicate of the unclocked one, and the comparison would prove that the
 /// `heads` parameter was ignored.
 fn rangesFixture(list: Allocator) !struct { doc: Document, past: []ChangeHash } {
-    var doc = try Document.init(list, .auto);
+    var doc = try Document.init(list, io, .auto);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = "0123456789abcdef" });
     _ = try am.transaction.put(&doc, am.root, .{ .key = "a" }, .{ .int = 1 });

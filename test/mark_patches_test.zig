@@ -84,6 +84,14 @@ const testing = std.testing;
 /// **The leak arbiter for the whole file.** One allocator, named once.
 const gpa = testing.allocator;
 
+/// The borrowed capability every document constructor below is handed.
+///
+/// **Explicit, because `Document` keeps it.** The op set draws actors through
+/// this value for as long as the document lives, so a constructor cannot
+/// reach for an ambient global and no document can outlive its provider. Here
+/// that value is `std.testing.io`; an executable passes its own `init.io`.
+const io = std.testing.io;
+
 const Document = am.doc.Document;
 const ExId = am.ExId;
 const ScalarValue = am.ScalarValue;
@@ -107,7 +115,7 @@ const actor: am.ActorId = .{ .bytes = "markpatches00" };
 //    [`test_mark_patches.rs`:8-41](../github-automerge-automerge/rust/automerge/tests/test_mark_patches.rs)
 
 test "mark_patches_at_end_of_text" {
-    var doc1 = try Document.init(gpa, .auto);
+    var doc1 = try Document.init(gpa, io, .auto);
     defer doc1.deinit();
     doc1.setActorId(actor);
 
@@ -118,7 +126,7 @@ test "mark_patches_at_end_of_text" {
 
     const saved = try doc1.save(gpa);
     defer gpa.free(saved);
-    var doc2 = try Document.load(gpa, saved, doc1.textEncoding(), .auto);
+    var doc2 = try Document.load(gpa, io, saved, doc1.textEncoding(), .auto);
     defer doc2.deinit();
 
     // `Mark::new("bold".to_string(), true, 5, 6)` with `ExpandMark::After`
@@ -181,7 +189,7 @@ test "mark_patches_at_end_of_text" {
 // ── 2. The hydrate clause ─────────────────────────────────────────────────────
 
 test "a mark patch hydrates: the replay reproduces the document and the mirror outlives a mutation" {
-    var doc1 = try Document.init(gpa, .auto);
+    var doc1 = try Document.init(gpa, io, .auto);
     defer doc1.deinit();
     doc1.setActorId(actor);
 
@@ -198,7 +206,7 @@ test "a mark patch hydrates: the replay reproduces the document and the mirror o
     const saved = try doc1.save(gpa);
     defer gpa.free(saved);
     const enc = doc1.textEncoding();
-    var doc2 = try Document.load(gpa, saved, enc, .auto);
+    var doc2 = try Document.load(gpa, io, saved, enc, .auto);
     defer doc2.deinit();
 
     // **The mirror as it stood before the mark**, which is what the stream is

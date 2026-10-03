@@ -123,6 +123,9 @@ pub fn withoutActor(self: ObjInfo, idx: ActorIdx) ?ObjInfo {
 /// without one, so a document whose root is asked about needs no op to have
 /// made it.
 pub const ObjIndex = struct {
+    /// The allocator every map this index owns belongs to, kept so
+    /// [`ObjIndex.deinit`] and [`ObjIndex.reserve`] can be called with
+    /// nothing. Upstream's index holds none and takes one per call.
     gpa: Allocator,
     /// The objects, by the id of the op that made each
     /// (`index.rs:78`). Upstream's is a bare `HashMap<OpId, ObjInfo>` newtype;
@@ -135,6 +138,13 @@ pub const ObjIndex = struct {
         return .{ .gpa = gpa };
     }
 
+    /// Frees the map and poisons the receiver, so a second call is a
+    /// use-after-free rather than a double free.
+    ///
+    /// The entries are `OpId` and `ObjInfo`, both values, so the map's
+    /// buckets are everything this owns. The allocator is the one
+    /// [`ObjIndex.init`] was given and the map carries it, which is why this
+    /// takes none.
     pub fn deinit(self: *ObjIndex) void {
         self.map.deinit(self.gpa);
         self.* = undefined;
@@ -169,6 +179,32 @@ pub const ObjIndex = struct {
     /// `op_set2/op_set/index.rs:97-99`).
     pub fn insert(self: *ObjIndex, id: OpId, info: ObjInfo) Allocator.Error!void {
         try self.map.put(self.gpa, id, info);
+    }
+
+    /// Room for `additional` more entries, so the [`insert`]s that follow
+    /// cannot fail.
+    ///
+    /// [`OpSet.splice`](op_set.zig) reserves through this **before** it writes
+    /// the rows, which is what makes the object table impossible to leave
+    /// behind: a refusal in the middle of adding the entries would leave the
+    /// rows stored and the table short of them, and `batch.walkObjSpan`
+    /// answers `error.Invariant` for any object the table has never heard of
+    /// (`batch.zig:2043-2045`). `ensureUnusedCapacity` is what `insert` calls
+    /// for a key the map does not hold, so a reservation for at least that
+    /// many keys makes every one of them a write with no allocation in it.
+    ///
+    /// Reserving more than the caller will use costs memory and nothing else.
+    /// Reserving fewer leaves the caller exactly where it was, with `insert`
+    /// still able to fail.
+    ///
+    /// **A request a `u32` cannot hold is refused, not truncated.**
+    /// The hash map counts in `u32`,
+    /// and a caller asking for more entries than a hash map can ever hold has
+    /// made a mistake rather than a request — so it is answered as one the
+    /// allocator cannot satisfy, which is what this signature can report.
+    pub fn reserve(self: *ObjIndex, gpa: Allocator, additional: usize) Allocator.Error!void {
+        const n = std.math.cast(u32, additional) orelse return error.OutOfMemory;
+        return self.map.ensureUnusedCapacity(gpa, n);
     }
 
     /// Forgets what `id` made (`ObjIndex::remove`,
@@ -258,6 +294,8 @@ pub const MarkOrder = union(enum) {
 /// as one is recorded (`index.rs:39-41`), so a document with several bad
 /// marks reports the first in row order.
 pub const MarkOrderValidator = struct {
+    /// The allocator the map of open begins belongs to, kept so
+    /// [`MarkOrderValidator.deinit`] can be called with nothing.
     gpa: Allocator,
     /// Every mark begin seen so far, and the object it began in
     /// (`index.rs:24`).
@@ -271,6 +309,13 @@ pub const MarkOrderValidator = struct {
         return .{ .gpa = gpa };
     }
 
+    /// Frees the map of open mark begins and poisons the receiver, so a second
+    /// call is a use-after-free rather than a double free.
+    ///
+    /// **The recorded failure moves with the validator** — [`takeError`] hands
+    /// it over and clears the field — so a `deinit` after a `takeError` frees
+    /// only the map, and a `deinit` before one throws the finding away. Take it
+    /// first; that is what [`checkMarkOrder`] does.
     pub fn deinit(self: *MarkOrderValidator) void {
         self.begins.deinit(self.gpa);
         self.* = undefined;
@@ -393,6 +438,13 @@ pub const Indexes = struct {
     /// Every object the walked rows made (`index.rs:156`).
     obj_info: ObjIndex,
 
+    /// Frees the five columns, the object table and the mark-order validator,
+    /// then poisons the receiver.
+    ///
+    /// A rebuild that is still owned — one [`Rebuilt`] has not been installed
+    /// into an op set — is freed with this, and an op set that has installed
+    /// one has taken ownership of every field, so **exactly one of
+    /// [`Rebuilt.deinit`] and this runs over a given rebuild.**
     pub fn deinit(self: *Indexes) void {
         self.text.deinit();
         self.top.deinit();
@@ -435,7 +487,10 @@ pub const Indexes = struct {
 /// One `(incs index, row index)` pair: where a counter's successor will land
 /// in the increment index, and which row it shadows (`index.rs:10`).
 const SuccRef = struct {
+    /// Where this edge's increment lands in `incs`, reserved when the edge was
+    /// recorded.
     succ_idx: usize,
+    /// The row this edge shadows, which is where the increment is applied.
     op_idx: usize,
 };
 
@@ -457,6 +512,8 @@ const SuccRef = struct {
 /// `processSucc` reserves it before the op that fills it is known
 /// (`index.rs:217`).
 pub const IndexBuilder = struct {
+    /// The allocator every list and map this builder accumulates belongs to,
+    /// kept so [`IndexBuilder.deinit`] can be called with nothing.
     gpa: Allocator,
     /// Which rows a counter points at, and where each edge's increment will go
     /// (`index.rs:10`). Entries are taken out again as the op that fills them
@@ -687,7 +744,7 @@ pub const IndexBuilder = struct {
         // fills the mark cache as well as the rows.
         var mark = try MarkIndexColumn.init(gpa);
         errdefer mark.deinit();
-        try mark.extend(gpa, 0, b.marks.items);
+        try mark.extend(0, b.marks.items);
 
         // Moved out before the teardown below, which gives the accumulation
         // back; after it, only these two survive.
@@ -717,6 +774,13 @@ pub const Rebuilt = struct {
     /// To be passed to [`checkMarkOrder`] (`storage/document.rs:355`).
     mark_order: MarkOrderValidator,
 
+    /// Frees the five columns, the object table and the validator, then poisons
+    /// the receiver.
+    ///
+    /// **Only for a rebuild that was never installed.** [`OpSet.rebuildIndex`](op_set.zig)
+    /// moves `indexes` and `mark_order` into the op set and frees the `Rebuilt`
+    /// shell itself, so a caller that calls this after that has double-freed
+    /// both halves.
     pub fn deinit(self: *Rebuilt) void {
         self.indexes.deinit();
         self.mark_order.deinit();

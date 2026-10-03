@@ -859,6 +859,292 @@ static void test_AMsyncStateEqual_and_their(void** state) {
     assert_memory_equal(common.src, head.src, head.count);
 }
 
+/* -------------------------------------------------------------------------
+ * What a null handle answers, what a null pointer is worth, and who owns
+ * what. These are the contracts `include/automerge.h` states and the
+ * vendored suite never reaches, because upstream's own tests never pass the
+ * arguments in the first place.
+ * ------------------------------------------------------------------------- */
+
+/* The reference hard-codes these error strings and a C caller is allowed to
+ * match on them (`src/result.rs:466`, `src/sync/message.rs:17`,
+ * `src/sync/state.rs:13`). The span is **not** NUL-terminated
+ * (`src/result.rs:544`), so the length is compared rather than the string. */
+static void assert_error_message(AMresult* result, char const* expected) {
+    assert_non_null(result);
+    assert_int_equal(AMresultStatus(result), AM_STATUS_ERROR);
+    AMbyteSpan const message = AMresultError(result);
+    assert_int_equal(message.count, strlen(expected));
+    assert_memory_equal(message.src, expected, strlen(expected));
+}
+
+static void test_enum_FromString_null_destination(void** state) {
+    (void)state;
+    /* A `NULL` out-parameter is `false`, and not a dereference
+     * (`src/c/result.zig`). The generated body writes `*dest` as its first
+     * act inside the matching branch
+     * (`cmake/enum-string-functions-gen.cmake:71-74`), so a name that *does*
+     * match is the case that would trap — which is why these pass names that
+     * match rather than names that do not. Upstream's own generated header
+     * declares `AMxxx *dest` with nothing a caller could act on. */
+    assert_false(AMobjTypeFromString(NULL, "AM_OBJ_TYPE_MAP"));
+    assert_false(AMmarkExpandFromString(NULL, "AM_MARK_EXPAND_BOTH"));
+    assert_false(AMidxTypeFromString(NULL, "AM_IDX_TYPE_POS"));
+    assert_false(AMvalTypeFromString(NULL, "AM_VAL_TYPE_CURSOR"));
+    assert_false(AMstatusFromString(NULL, "AM_STATUS_ERROR"));
+
+    /* The other two refusals, so the arm is pinned as a set: a `NULL` source
+     * and an unknown name both leave a pre-set destination exactly as it was
+     * (`test/enum_string_tests.c:38-40`). */
+    AMobjType tag = AM_OBJ_TYPE_DEFAULT;
+    assert_false(AMobjTypeFromString(&tag, NULL));
+    assert_int_equal(tag, AM_OBJ_TYPE_DEFAULT);
+    assert_false(AMobjTypeFromString(&tag, "AM_OBJ_TYPE_MA"));
+    assert_int_equal(tag, AM_OBJ_TYPE_DEFAULT);
+    assert_true(AMobjTypeFromString(&tag, "AM_OBJ_TYPE_MAP"));
+    assert_int_equal(tag, AM_OBJ_TYPE_MAP);
+}
+
+static void test_AMbytes_null_normalises_count(void** state) {
+    (void)state;
+    /* The precondition is on `src`, not on `count`. A null pointer
+     * normalises the whole span to `{NULL, 0}` (`src/byte_span.rs:179`), so
+     * this is a call a C caller can make rather than one it must guard. */
+    AMbyteSpan const none = AMbytes(NULL, SIZE_MAX);
+    assert_null(none.src);
+    assert_int_equal(none.count, 0);
+
+    /* A zero count over a real pointer is a *different* span: an empty view
+     * over real memory, not the null one, and the two must not be confused. */
+    uint8_t const text[] = {'a', 'b', 'c'};
+    AMbyteSpan const empty = AMbytes(text, 0);
+    assert_ptr_equal(empty.src, text);
+    assert_int_equal(empty.count, 0);
+}
+
+static void test_AMresultCat_leaves_items_alive(void** state) {
+    BaseState* base_state = *state;
+    AMstack** stack_ptr = &base_state->stack;
+
+    AMresult* const left = AMitemFromStr(AMstr("a"));
+    AMresult* const right = AMitemFromStr(AMstr("b"));
+
+    /* Take a handle into `left` *before* concatenating. `AMresultCat` is
+     * declared `(const AMresult *dest, const AMresult *src)` and takes no
+     * `AMitems` at all, and its own note says it leaves both inputs alive
+     * (`include/automerge.h`, `src/result.rs:504-525`), so the only thing
+     * that can invalidate this pointer is `AMresultFree`. */
+    AMitem* const borrowed = AMresultItem(left);
+    assert_non_null(borrowed);
+
+    AMresult* const joined = AMresultCat(left, right);
+    assert_int_equal(AMresultStatus(joined), AM_STATUS_OK);
+    assert_int_equal(AMresultSize(joined), 2);
+
+    /* Still live, still the same cell, still readable. */
+    assert_int_equal(AMresultStatus(left), AM_STATUS_OK);
+    assert_int_equal(AMresultSize(left), 1);
+    assert_ptr_equal(AMresultItem(left), borrowed);
+    AMbyteSpan text;
+    assert_true(AMitemToStr(borrowed, &text));
+    assert_int_equal(text.count, 1);
+    assert_int_equal(text.src[0], 'a');
+
+    /* The concatenation is a *different* array of items, because `cat`
+     * clones the reference counts rather than moving them
+     * (`src/result.rs:507-511`). Freeing one does not touch the other. */
+    assert_ptr_not_equal(AMresultItem(joined), borrowed);
+    AMresultFree(joined);
+    assert_int_equal(AMresultSize(left), 1);
+    assert_true(AMitemToStr(AMresultItem(left), &text));
+    assert_int_equal(text.src[0], 'a');
+
+    AMstackItem(stack_ptr, left, cmocka_cb, AMexpect(AM_VAL_TYPE_STR));
+    AMstackItem(stack_ptr, right, cmocka_cb, AMexpect(AM_VAL_TYPE_STR));
+}
+
+static void test_AMresultFrom_empty_and_negative(void** state) {
+    (void)state;
+    /* One `NULL` answers two different situations, and `count` is the only
+     * way a caller can tell them apart (`include/automerge.h`). Upstream's
+     * `result` starts as `NULL` and the loop never runs
+     * (`src/utils/result.c:6`, `:29-32`), so the empty call is one of them;
+     * a negative count is the other, because upstream's loop
+     * `for (int i = 0; i != count; ++i)` (`result.c:10`) would run until the
+     * index wraps and read that many garbage pointers. */
+    assert_null(AMresultFrom(0));
+    assert_null(AMresultFrom(-1));
+
+    /* One real argument: the result is the caller's, and the argument is
+     * consumed — freed — whether or not the call succeeded
+     * (`src/utils/result.c:12-25`, `include/automerge-c/utils/result.h:22-24`). */
+    AMresult* const single = AMresultFrom(1, AMitemFromStr(AMstr("a")));
+    assert_int_equal(AMresultStatus(single), AM_STATUS_OK);
+    assert_int_equal(AMresultSize(single), 1);
+    AMresultFree(single);
+
+    /* The other `NULL`, from an argument that was not OK — and freed on the
+     * way out like every other argument. */
+    assert_null(AMresultFrom(1, AMload((uint8_t const*)"not a document", 13)));
+}
+
+static void test_AMactorIdStr_is_stable_and_total(void** state) {
+    (void)state;
+    char const actor_hex[] = "0123456789abcdef0123456789abcdef";
+    AMresult* const result = AMactorIdFromStr(AMstr(actor_hex));
+    assert_int_equal(AMresultStatus(result), AM_STATUS_OK);
+    AMactorId const* actor_id;
+    assert_true(AMitemToActorId(AMresultItem(result), &actor_id));
+
+    /* The hex is staged when the handle is built (`src/c/doc.zig`), so two
+     * calls answer the same pointer with the same bytes. A hex computed on
+     * first use would have to swallow an allocation failure, and the only
+     * thing an `AMbyteSpan` can say about that is that it is empty — which
+     * is indistinguishable from a legitimately empty span. */
+    AMbyteSpan const first = AMactorIdStr(actor_id);
+    AMbyteSpan const second = AMactorIdStr(actor_id);
+    assert_ptr_equal(first.src, second.src);
+    assert_int_equal(first.count, strlen(actor_hex));
+    assert_memory_equal(first.src, actor_hex, strlen(actor_hex));
+
+    /* A null handle is the zero span, and it is the only way this function
+     * answers with one. */
+    AMbyteSpan const none = AMactorIdStr(NULL);
+    assert_null(none.src);
+    assert_int_equal(none.count, 0);
+
+    /* The round trip the hex exists for, which under an allocation failure
+     * would have read as invalid input rather than as a failure. */
+    AMresult* const round_trip = AMactorIdFromStr(first);
+    assert_int_equal(AMresultStatus(round_trip), AM_STATUS_OK);
+    AMactorId const* parsed;
+    assert_true(AMitemToActorId(AMresultItem(round_trip), &parsed));
+    AMbyteSpan const again = AMactorIdStr(parsed);
+    assert_int_equal(again.count, first.count);
+    assert_memory_equal(again.src, first.src, first.count);
+
+    AMresultFree(round_trip);
+    AMresultFree(result);
+}
+
+static void test_null_handle_answers(void** state) {
+    BaseState* base_state = *state;
+    AMstack** stack_ptr = &base_state->stack;
+
+    /* `AMchange`: the sentinels are upstream's own answers and are not
+     * distinguishable from real values (`src/change.rs:241`, `:261`,
+     * `:279`, `:298`, `:316`, `:335`), so a caller forwarding an optional
+     * change has to check the handle first. */
+    assert_int_equal(AMchangeMaxOp(NULL), UINT64_MAX);
+    assert_int_equal(AMchangeSeq(NULL), UINT64_MAX);
+    assert_int_equal(AMchangeStartOp(NULL), UINT64_MAX);
+    assert_int_equal(AMchangeTime(NULL), INT64_MAX);
+    assert_int_equal(AMchangeSize(NULL), 0);
+    assert_true(AMchangeIsEmpty(NULL));
+    AMbyteSpan const no_footer = AMchangeExtraBytes(NULL);
+    assert_null(no_footer.src);
+    assert_int_equal(no_footer.count, 0);
+    AMbyteSpan const no_message = AMchangeMessage(NULL);
+    assert_null(no_message.src);
+    assert_int_equal(no_message.count, 0);
+
+    /* Sync readers: a null handle is an empty *success*, because upstream's
+     * `None => Default::default()` arm turns an empty slice into an empty
+     * result (`src/sync/have.rs:37-40`, `src/sync/message.rs:98`, `:118`,
+     * `:139`). */
+    AMresult* const empty_have = AMsyncHaveLastSync(NULL);
+    assert_int_equal(AMresultStatus(empty_have), AM_STATUS_OK);
+    assert_int_equal(AMresultSize(empty_have), 0);
+    AMstackItem(stack_ptr, empty_have, cmocka_cb, AMexpect(AM_VAL_TYPE_CHANGE_HASH));
+
+    AMresult* const empty_needs = AMsyncMessageNeeds(NULL);
+    assert_int_equal(AMresultStatus(empty_needs), AM_STATUS_OK);
+    assert_int_equal(AMresultSize(empty_needs), 0);
+    AMstackItem(stack_ptr, empty_needs, cmocka_cb, AMexpect(AM_VAL_TYPE_CHANGE_HASH));
+
+    /* The two encoders are the other kind: an error result carrying the
+     * reference's hard-coded message (`src/sync/message.rs:12-19`,
+     * `src/sync/state.rs:8-15`). */
+    AMresult* const refused_message = AMsyncMessageEncode(NULL);
+    assert_error_message(refused_message, "Invalid `AMsyncMessage*`");
+    AMresultFree(refused_message);
+
+    AMresult* const refused_state = AMsyncStateEncode(NULL);
+    assert_error_message(refused_state, "Invalid `AMsyncState*`");
+    AMresultFree(refused_state);
+
+    /* Two null states are not equal — the one place in the ABI where a null
+     * is a distinct answer rather than an absence
+     * (`src/sync/state.rs:105`, `:118`). */
+    assert_false(AMsyncStateEqual(NULL, NULL));
+
+    /* A null out-parameter is an error result and not undefined behaviour
+     * (`src/c/sync.zig`): upstream writes through it unconditionally
+     * (`src/sync/state.rs:186-201`). */
+    AMsyncState* sync_state;
+    assert_true(AMitemToSyncState(AMstackItem(stack_ptr, AMsyncStateInit(), cmocka_cb, AMexpect(AM_VAL_TYPE_SYNC_STATE)),
+                                  &sync_state));
+    AMresult* const refused_out = AMsyncStateTheirHaves(sync_state, NULL);
+    assert_error_message(refused_out, "Invalid `bool*`");
+    AMresultFree(refused_out);
+    AMresult* const refused_out_needs = AMsyncStateTheirNeeds(sync_state, NULL);
+    assert_error_message(refused_out_needs, "Invalid `bool*`");
+    AMresultFree(refused_out_needs);
+
+    /* `AMmarkCreate`: a null value is an error result, not the segfault
+     * upstream's unchecked dereference at `src/doc/mark.rs:250` would be.
+     * A wrapper that guards the pointer before the call is right to. */
+    AMdoc* const doc = make_doc(stack_ptr, "aaaa");
+    AMobjId const* const obj_id = AMitemObjId(AMstackItem(stack_ptr,
+                                                          AMmapPutObject(doc, AM_ROOT, AMstr("text"), AM_OBJ_TYPE_TEXT),
+                                                          cmocka_cb, AMexpect(AM_VAL_TYPE_OBJ_TYPE)));
+    AMstackItem(stack_ptr, AMspliceText(doc, obj_id, 0, 0, AMstr("hello world")), cmocka_cb,
+                AMexpect(AM_VAL_TYPE_VOID));
+    AMresult* const refused_mark = AMmarkCreate(doc, obj_id, 0, 5, AM_MARK_EXPAND_BOTH, AMstr("bold"), NULL);
+    assert_error_message(refused_mark, "Invalid `AMitem*`");
+    AMresultFree(refused_mark);
+}
+
+static void test_utility_layer_ownership(void** state) {
+    BaseState* base_state = *state;
+    AMstack** stack_ptr = &base_state->stack;
+
+    /* `AMstrdup` returns a `malloc` allocation, not a borrow into a result,
+     * and `free()` is the release the header promises
+     * (`include/automerge-c/utils/string.h:24-25`). `AMstr()` would stop at
+     * the NUL, so the span is built by hand to reach the substitution. */
+    uint8_t const raw[] = {'a', 0, 'b'};
+    char* const copy = AMstrdup(AMbytes(raw, sizeof raw), NULL);
+    assert_non_null(copy);
+    assert_string_equal(copy, "a\\0b");
+    free(copy);
+    /* A null source is a null answer, not an empty string. */
+    assert_null(AMstrdup(AMbytes(NULL, 0), NULL));
+
+    /* `AMstackFree` releases every result on the stack and nulls the caller's
+     * pointer, and a result taken back off belongs to the caller again. */
+    AMstack* stack = NULL;
+    AMresult* const kept = AMitemFromStr(AMstr("kept"));
+    AMresult* const dropped = AMitemFromStr(AMstr("dropped"));
+    AMstackResult(&stack, kept, cmocka_cb, AMexpect(AM_VAL_TYPE_STR));
+    AMstackResult(&stack, dropped, cmocka_cb, AMexpect(AM_VAL_TYPE_STR));
+    assert_int_equal(AMstackSize(stack), 2);
+    AMresult* const popped = AMstackPop(&stack, NULL);
+    assert_ptr_equal(popped, dropped);
+    assert_int_equal(AMstackSize(stack), 1);
+    AMstackFree(&stack);
+    assert_null(stack);
+    /* `dropped` was popped, so the stack never freed it and it is still the
+     * caller's to release. */
+    assert_int_equal(AMresultStatus(dropped), AM_STATUS_OK);
+    AMstackItem(stack_ptr, dropped, cmocka_cb, AMexpect(AM_VAL_TYPE_STR));
+
+    /* A null stack frees what it is handed rather than leaking it
+     * (`src/utils/stack.c:50-51`). */
+    AMresult* const orphan = AMitemFromStr(AMstr("orphan"));
+    assert_null(AMstackResult(NULL, orphan, cmocka_cb, AMexpect(AM_VAL_TYPE_STR)));
+}
+
 int run_abi_coverage_tests(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_AMchange_scalars, setup_base, teardown_base),
@@ -878,6 +1164,13 @@ int run_abi_coverage_tests(void) {
         cmocka_unit_test_setup_teardown(test_AMstackSize, setup_base, teardown_base),
         cmocka_unit_test_setup_teardown(test_AMsyncMessage_encode_decode, setup_base, teardown_base),
         cmocka_unit_test_setup_teardown(test_AMsyncStateEqual_and_their, setup_base, teardown_base),
+        cmocka_unit_test(test_enum_FromString_null_destination),
+        cmocka_unit_test(test_AMbytes_null_normalises_count),
+        cmocka_unit_test(test_AMactorIdStr_is_stable_and_total),
+        cmocka_unit_test_setup_teardown(test_AMresultCat_leaves_items_alive, setup_base, teardown_base),
+        cmocka_unit_test(test_AMresultFrom_empty_and_negative),
+        cmocka_unit_test_setup_teardown(test_null_handle_answers, setup_base, teardown_base),
+        cmocka_unit_test_setup_teardown(test_utility_layer_ownership, setup_base, teardown_base),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

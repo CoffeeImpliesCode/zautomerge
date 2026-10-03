@@ -80,28 +80,9 @@
 //! ([`inner.rs:157-170`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)),
 //! and `export` resolves **this transaction's** `deps`
 //! ([`inner.rs:197-207`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)).
-//! This port's [`Document.commit`](doc.zig) is handed the operations and
-//! re-derives the change metadata from a fresh
-//! [`Document.transactionArgs`](doc.zig) call, and that call is scoped by
-//! `Document.isolation` rather than by the transaction
-//! ([`doc.zig:3419-3477`](doc.zig)). For an *unscoped* transaction the two
-//! agree — the graph has not moved, so `start_op`, `seq`, the actor and the
-//! dependency set are the same numbers — and [`commitWith`] is what makes them
-//! agree for a *scoped* one, by putting the transaction's own scope in the
-//! document for the duration of the commit.
-//!
-//! **The difference is not hypothetical, and it is a failure, not a nuance.**
-//! A scoped transaction opened with [`Transaction.openAt`](transact.zig) writes
-//! its operations under a concurrency actor
-//! ([`automerge.rs:1259-1281`](../../github-automerge-automerge/rust/automerge/src/automerge.rs),
-//! [`doc.zig:2596-2617`](doc.zig)); committing it through the engine alone
-//! builds a change that claims operations belonging to a *different* actor, and
-//! the document refuses it with a message naming that change's own sequence
-//! number. The test
-//! `test "a scoped transaction's own commit path, and the wrong door is an
-//! error"` shows the refusal and then the fix. The root fix belongs in
-//! [`Document.commit`](doc.zig), which this file may not edit, so
-//! [`commitWith`] is a workaround and is marked as one.
+//! `Document.commit` uses the transaction's original actor, sequence, start
+//! counter and dependencies. `commitWith` temporarily installs its read scope
+//! for patch generation; it does not re-derive change metadata.
 //!
 //! # Ownership
 //!
@@ -237,13 +218,8 @@ pub const CommitOptions = struct {
 /// A committed transaction's result
 /// ([`Success<O>`](../../github-automerge-automerge/rust/automerge/src/transaction/result.rs):6-12).
 ///
-/// **There is no `patch_log` field, because there is no patch log to carry.**
-/// Upstream's hands back the log the transaction filled
-/// ([`result.rs:11`](../../github-automerge-automerge/rust/automerge/src/transaction/result.rs));
-/// a [`PatchLog`](patches.zig) in this port is a value the caller owns and
-/// passes in, and [`doc.zig`](doc.zig) has no patch-log field at all — its
-/// merge sink is `batchmod.NullLog`, upstream's `PatchLog::inactive`
-/// ([`doc.zig:82`](doc.zig)).
+/// The document retains its patch log; this result owns only `result`.
+/// Disposal of `result` follows `O`'s contract.
 pub fn Success(comptime O: type) type {
     return struct {
         /// Whatever the closure returned.
@@ -255,20 +231,25 @@ pub fn Success(comptime O: type) type {
     };
 }
 
-/// A rolled-back transaction's result
-/// ([`Failure<E>`](../../github-automerge-automerge/rust/automerge/src/transaction/result.rs):15-21).
-///
-/// **Not generic.** Upstream's is, because its `E` is the closure's error set;
-/// every method a closure can reach returns `AutomergeError`
-/// ([`automerge.rs:586-591`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-/// so here it is [`TransactionError`] and there is nothing left to choose.
-pub const Failure = struct {
-    /// The error the closure returned.
-    err: TransactionError,
-    /// How many operations the rollback cancelled
-    /// ([`result.rs:19-20`](../../github-automerge-automerge/rust/automerge/src/transaction/result.rs)).
-    cancelled: usize,
-};
+/// Body or commit refusal, with rollback progress and recovery ownership.
+/// `err` always names the primary refusal; `rollback_error` never replaces it.
+/// If rollback fails, this value owns `transaction`. Retry its rollback and
+/// dispose it exactly once before disposing or mutating the borrowed document.
+/// `result` is the body's owned result when only commit failed, otherwise null.
+pub fn Failure(comptime O: type) type {
+    return struct {
+        /// Primary body or commit error.
+        err: TransactionError,
+        /// Operations successfully undone, including partial rollback progress.
+        cancelled: usize,
+        /// Secondary rollback refusal, or null after complete rollback.
+        rollback_error: ?TransactionError = null,
+        /// Recovery owner after rollback refusal; null on complete rollback.
+        transaction: ?Transaction = null,
+        /// Body result retained after a refused commit; dispose as required by O.
+        result: ?O = null,
+    };
+}
 
 /// What [`enclose`] answers: upstream's
 /// `Result<O, E> = Result<Success<O>, Failure<E>>`
@@ -279,8 +260,8 @@ pub fn Outcome(comptime O: type) type {
     return union(enum) {
         /// The closure returned; the transaction committed.
         success: Success(O),
-        /// The closure raised; the transaction rolled back.
-        failure: Failure,
+        /// Body or commit refused; inspect rollback progress and recovery owner.
+        failure: Failure(O),
     };
 }
 
@@ -601,49 +582,27 @@ pub fn commitWith(tx: *Transaction, options: CommitOptions) TransactionError!?Ch
     return tx.commit(options.message, options.time);
 }
 
-/// Gives back everything this transaction has done and closes it, and is
-/// **idempotent** — upstream's `Drop`
-/// **The distinction from [`rollback`](transact.zig) is idempotence, and it is
-/// the whole point.** A `rollback` on a closed transaction is
-/// `error.InvalidOp` ([`transact.zig:1156`](transact.zig)), because applying
-/// it twice is a bug. A `Drop` is not a second application: it is what happens
-/// when nobody said anything, so it has to be safe on a transaction that was
-/// already committed and on one that was already rolled back. Both are no-ops
-/// here.
-///
-/// This is how a caller replaces the automatic rollback Zig does not have:
-/// `defer tx.deinit()` does **not** roll back
-/// ([`transact.zig:349-353`](transact.zig)), so a scope that can fail defers
-/// `tx.abort()` **before** it defers `tx.deinit()` — `defer` runs last-in
-/// first-out, so the order of the two lines is the whole of the difference.
+/// Idempotent rollback: closed transactions are unchanged.
+/// On refusal, retry before disposal. Unlike Rust's `Drop`, disposal does not
+/// imply rollback (`manual_transaction.rs:135-145`). Dispose after abort:
+/// `defer tx.deinit();` then an explicit fallible `abort(&tx)` before return.
 pub fn abort(tx: *Transaction) TransactionError!void {
     if (tx.closed) return;
     _ = try tx.rollback();
 }
 
-/// Runs `body` in a transaction on `doc`, commits when it returns, and rolls
-/// back when it raises
-/// ([`Automerge::transact`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):586-591,
-/// over [`transact_with_impl`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):603-629).
+/// Runs `body` synchronously on the calling thread. The context and document
+/// remain borrowed through return. `body` may use the supplied transaction;
+/// it must not reenter the document through another write entry point or retain
+/// the transaction pointer. A manual-mode document is required.
 ///
-/// **This is the closure form, and it is the whole of what upstream's
-/// transaction out of a closure, so it returns a `Success` or a `Failure` and
-/// the caller reads the hash out of the first.
-///
-/// `body` is a **plain function and a context**, not a Zig closure: a closure
-/// captures by value, and [`encloseWith`]'s options function runs while the
-/// transaction is still open, so a capturing body would hand a context whose
-/// lifetime the caller cannot see. The caller owns `ctx` and must keep it
-/// alive across the call.
-///
-/// The transaction is closed and freed before this returns, so the document is
-/// never left holding one — which is what upstream gets by moving the inner
-/// into `commit` or `rollback`
-/// ([`manual_transaction.rs:68`](../../github-automerge-automerge/rust/automerge/src/transaction/manual_transaction.rs)).
-///
-/// **`error.InvalidOp` for a document in [`Mode.auto`](doc.zig)**, through
-/// [`Transaction.open`](transact.zig), which is the one place a caller can
-/// reach the wrong flavour from this module.
+/// Success commits. Body or commit refusal returns `Outcome.failure` without
+/// losing the primary error. Complete rollback disposes the transaction;
+/// rollback refusal transfers it to the failure result for caller recovery.
+/// Opening the transaction can itself return an error without invoking `body`.
+/// Pending native automatic recovery is refused with `error.InvalidOp` before
+/// `body` runs; finish it through `Document.recoverAuto` first.
+/// Upstream closure contract: `automerge.rs:603-629`.
 pub fn enclose(
     comptime O: type,
     gpa: Allocator,
@@ -654,14 +613,10 @@ pub fn enclose(
     return encloseWith(O, gpa, doc, ctx, body, null);
 }
 
-/// As [`enclose`], and the commit options are derived from what the closure
-/// returned ([`Automerge::transact_with`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):594-601).
-///
-/// Upstream's `C: FnOnce(&O) -> CommitOptions` runs on the *result*, which is
-/// why the result is a type parameter at all. A closure that returns `void`
-/// and wants a fixed message uses [`enclose`] with the message in its context;
-/// a closure that returns a value and wants the message derived from it uses
-/// this.
+/// `enclose`, with options derived synchronously after body success and before
+/// commit, on the calling thread. Null selects `CommitOptions.none`.
+/// The callback borrows `ctx` and `result` only during the call; it must not
+/// mutate/reenter the document. Message bytes must remain live through commit.
 pub fn encloseWith(
     comptime O: type,
     gpa: Allocator,
@@ -671,14 +626,35 @@ pub fn encloseWith(
     options: ?*const fn (@TypeOf(ctx), O) CommitOptions,
 ) TransactionError!Outcome(O) {
     var tx = try Transaction.open(gpa, doc);
-    defer tx.deinit();
-    const result = body(ctx, &tx) catch |failure| {
-        // `automerge.rs:624-627` — the failure arm rolls the transaction back
-        // and reports how many operations that cancelled.
-        return .{ .failure = .{ .err = failure, .cancelled = try tx.rollback() } };
+    var transferred = false;
+    defer if (!transferred) tx.deinit();
+    const result = body(ctx, &tx) catch |primary| {
+        const cancelled = tx.rollback() catch |secondary| {
+            transferred = true;
+            return .{ .failure = .{
+                .err = primary,
+                .cancelled = tx.cancelled,
+                .rollback_error = secondary,
+                .transaction = tx,
+            } };
+        };
+        return .{ .failure = .{ .err = primary, .cancelled = cancelled } };
     };
     const opts = if (options) |derive| derive(ctx, result) else CommitOptions.none;
-    return .{ .success = .{ .result = result, .hash = try commitWith(&tx, opts) } };
+    const hash = commitWith(&tx, opts) catch |primary| {
+        const cancelled = tx.rollback() catch |secondary| {
+            transferred = true;
+            return .{ .failure = .{
+                .err = primary,
+                .cancelled = tx.cancelled,
+                .rollback_error = secondary,
+                .transaction = tx,
+                .result = result,
+            } };
+        };
+        return .{ .failure = .{ .err = primary, .cancelled = cancelled, .result = result } };
+    };
+    return .{ .success = .{ .result = result, .hash = hash } };
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -686,7 +662,7 @@ pub fn encloseWith(
 /// A document in [`Mode.manual`] with a fixed actor, which is the only flavour
 /// [`Transaction.open`](transact.zig) accepts.
 fn manual(gpa: Allocator) !Document {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, std.testing.io, .manual);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = "0123456789abcdef" });
     return doc;
@@ -886,7 +862,7 @@ test "the committed change survives a save and a load with the same bytes" {
     // thing a commit can be held to that does not need the reference.
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var reloaded = try Document.load(gpa, saved, doc.textEncoding(), .manual);
+    var reloaded = try Document.load(gpa, std.testing.io, saved, doc.textEncoding(), .manual);
     defer reloaded.deinit();
 
     try reloaded.ops.debugCmp(&doc.ops);
@@ -1607,7 +1583,7 @@ fn hydratedMap(gpa: Allocator) !*hydmod.Map {
 
 test "the wrong door is an error: a manual document is the only one a transaction opens on" {
     const gpa = testing.allocator;
-    var auto = try Document.init(gpa, .auto);
+    var auto = try Document.init(gpa, std.testing.io, .auto);
     defer auto.deinit();
     auto.setActorId(.{ .bytes = "0123456789abcdef" });
 
@@ -1730,13 +1706,10 @@ test "the wrong door is an error: a manual document is the only one a transactio
 //    written to it. The engine's `initRootFromHydrate` (`transact.zig:1405`)
 //    carries upstream's test for it (`transact.zig:3208`).
 //
-// 6. **`Success` has no `patch_log` and `Failure` is not generic.** Upstream's
-//    `Success<O>` carries the log the transaction filled (`result.rs:11`) and
-//    its `Failure<E>` is generic over the closure's error set (`result.rs:16`).
-//    This port's `Document` holds no patch log at all — its merge sink is
-//    `batchmod.NullLog`, upstream's `PatchLog::inactive` (`doc.zig:82`) — and
-//    every method a closure can reach returns `TransactionError`, so there is
-//    no `E` to choose.
+// 6. `Success` contains the body result and change hash; the document retains
+//    its patch log. `Failure(O)` preserves the primary error, a successful
+//    body's result after commit refusal, and an owning recovery transaction
+//    if rollback refuses.
 //
 // 7. **`CommitOptions.message` is borrowed, not owned.** Upstream holds an
 //    `Option<String>` (`commit.rs:5`); the port's rule is that a borrow is valid
@@ -1830,3 +1803,41 @@ test "the wrong door is an error: a manual document is the only one a transactio
 //     answer, which is a different question with a real number. The two
 //     numbers drifted apart by exactly the drained `pending` because one of
 //     them was read in a state where it did not mean anything.
+
+test "enclose preserves primary error and transfers failed rollback ownership" {
+    const Context = struct {
+        failing: *testing.FailingAllocator,
+        body_fails: bool,
+
+        fn body(ctx: *@This(), tx: *Transaction) TransactionError!usize {
+            _ = try tx.put(.root, .{ .key = "one" }, .{ .int = 1 });
+            _ = try tx.put(.root, .{ .key = "two" }, .{ .int = 2 });
+            ctx.failing.fail_index = ctx.failing.alloc_index;
+            if (ctx.body_fails) return error.InvalidValueType;
+            return 77;
+        }
+    };
+    for ([_]bool{ true, false }) |body_fails| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var doc = try Document.init(gpa, testing.io, .manual);
+        defer doc.deinit();
+        var ctx = Context{ .failing = &failing, .body_fails = body_fails };
+        var outcome = try enclose(usize, gpa, &doc, &ctx, Context.body);
+        failing.fail_index = std.math.maxInt(usize);
+        switch (outcome) {
+            .success => return error.ExpectedFailure,
+            .failure => |*failure| {
+                try testing.expectEqual(if (body_fails) error.InvalidValueType else error.OutOfMemory, failure.err);
+                try testing.expectEqual(@as(?TransactionError, error.OutOfMemory), failure.rollback_error);
+                try testing.expectEqual(if (body_fails) @as(?usize, null) else @as(?usize, 77), failure.result);
+                const tx = &failure.transaction.?;
+                defer tx.deinit();
+                try testing.expectEqual(@as(usize, 2), try tx.rollback());
+                try testing.expectEqual(@as(usize, 0), doc.graph.len());
+                try testing.expect((try @import("read.zig").get(&doc, .root, .{ .key = "one" })) == null);
+                try testing.expect((try @import("read.zig").get(&doc, .root, .{ .key = "two" })) == null);
+            },
+        }
+    }
+}

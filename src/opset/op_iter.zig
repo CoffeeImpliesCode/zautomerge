@@ -264,39 +264,85 @@ pub const ActionValue = struct {
 };
 
 /// The two halves of each row's own id (`OpIdIter`, `op_iter.rs:267-271`).
+///
+/// Two column cursors held in step, and the whole of the cursor kernel every
+/// sub-iterator here carries: `pos`/`maxPos` are the row the cursor stands on
+/// and the closed end of its window, `setMax` closes the window,
+/// `advanceTo`/`advanceBy` consume forward only, `shift` moves the window onto
+/// a range *and* lands the walk on its start, `shiftNext` is `shift` followed
+/// by a read, and `seekTo` reads a row forward of the cursor. Nothing here
+/// moves backwards — that is the kernel's rule, not a per-type one — and
+/// nothing allocates.
 pub const OpIdIter = struct {
     /// `id_actor`, the actor half (`op_iter.rs:269`).
     actor: opcols.ActorColumn.Iterator,
     /// `id_ctr`, the counter half, delta coded (`op_iter.rs:270`).
     ctr: opcols.CounterColumn.Iterator,
 
+    /// The compile-time proof that this type carries the whole `Shiftable`
+    /// kernel (`column.Shiftable`, `hexane/src/iter/tools.rs:19-74`); it is
+    /// what lets a walk be repositioned into a child object without
+    /// allocating. [`assertShiftable`] is what makes the mark mean something.
     pub const shiftable = column.Shiftable(OpIdIter);
 
+    /// A cursor over the two id columns, positioned at row 0 with its window
+    /// open to the end of both columns.
+    ///
+    /// The two cursors must be over the same column of the same column set:
+    /// they are read in lockstep and `pos` is the first one's, so a mismatched
+    /// pair yields a walk whose two halves describe different rows. Every
+    /// caller here builds them from one `Columns` and the check that proves
+    /// the lengths agree is [`checkRowLengths`].
     pub fn init(
         actor: opcols.ActorColumn.Iterator,
         ctr: opcols.CounterColumn.Iterator,
     ) OpIdIter {
         return .{ .actor = actor, .ctr = ctr };
     }
-
+    /// The row this cursor stands on — that is, how many rows have been
+    /// consumed (`Shiftable::pos`, `shift.rs:56-58`). It is the `id_actor`
+    /// cursor's position, and the two are kept equal, so it names the row for
+    /// both halves.
     pub fn pos(self: *const OpIdIter) usize {
         return self.actor.pos();
     }
 
+    /// The row past the last one this cursor may reach (`Shiftable::max_pos`,
+    /// `shift.rs:59-61`): the window's closed end, which `setMax` moves and
+    /// the kernel clamps every advance to. A window that has been closed at or
+    /// past the end of the column is the column's own length.
     pub fn maxPos(self: *const OpIdIter) usize {
         return self.actor.maxPos();
     }
 
+    /// Closes the window at `at` (`Shiftable::set_max`, `shift.rs:62-66`).
+    ///
+    /// Only the far end moves: the cursor stays where it is, and an `at`
+    /// behind the cursor does not rewind it. `at` past the end of the columns
+    /// is clamped to their length. Both cursors move together, because their
+    /// windows are one window.
     pub fn setMax(self: *OpIdIter, at: usize) void {
         self.actor.setMax(at);
         self.ctr.setMax(at);
     }
 
+    /// Consumes rows until the cursor stands on `target`
+    /// (`Shiftable::advance_to`, `shift.rs:67-72`).
+    ///
+    /// `target` at or behind the current [`pos`] is a no-op: the walk only
+    /// ever moves forward, as upstream's `advance_to` does
+    /// (`op_iter.rs:616-623`). A `target` past the window is an
+    /// `error.UnexpectedEnd`, which is the one way the kernel reports a walk
+    /// asked for a row the columns do not have.
     pub fn advanceTo(self: *OpIdIter, target: usize) ParseError!void {
         try self.actor.advanceTo(target);
         try self.ctr.advanceTo(target);
     }
 
+    /// Consumes `amount` more rows, saturating rather than wrapping
+    /// (`Shiftable::advance_by`, `shift.rs:73-76`). The saturation is what
+    /// makes `advanceBy` on a cursor near the end of the column land on its
+    /// last row instead of behind it.
     pub fn advanceBy(self: *OpIdIter, amount: usize) ParseError!void {
         return self.advanceTo(self.actor.pos() +| amount);
     }
@@ -305,17 +351,39 @@ pub const OpIdIter = struct {
     /// walk lands on its start (`Shiftable::shift`, `shift.rs:50-55`), which
     /// upstream's [`Column.Iterator.shift`](../../src/hexane/column.zig) is
     /// `setMax` then `advanceTo` for (`column.rs:542-545`).
+    ///
+    /// **This reads nothing and answers nothing.** It is `setMax(range.end)`
+    /// followed by `advanceTo(range.start)`, so it does move the walk — to the
+    /// *first* row of the range — and the caller reads from there with
+    /// [`shiftNext`] or [`seekTo`]. Both id cursors move together.
     pub fn shift(self: *OpIdIter, range: RowRange) ParseError!void {
         try self.actor.shift(range);
         try self.ctr.shift(range);
     }
 
+    /// Repositions onto `range` and reads the row at its start
+    /// (`Shiftable::shift_next`, `shift.rs:77-86`).
+    ///
+    /// `shift` then a read, so on return the cursor stands on
+    /// `range.start` — not past it — and the next [`maybeTryNext`] answers the
+    /// *following* row. `null` means `range.start` is at or past the end of the
+    /// window, which is the whole of the end-of-walk answer this method has.
+    /// Both halves advance before the answer, so the two cursors stay in step
+    /// even when one of them ends first.
     pub fn shiftNext(self: *OpIdIter, range: RowRange) ParseError!?OpId {
         const a = (try self.actor.shiftNext(range)) orelse return null;
         const c = (try self.ctr.shiftNext(range)) orelse return null;
         return OpId.init(c, a);
     }
 
+    /// Reads row `at` and consumes through it (`Shiftable::seek_to`,
+    /// `shift.rs:87-96`).
+    ///
+    /// Forward only, as every seek in the op set is: an `at` behind the
+    /// cursor answers `null` and leaves the cursor where it is, which is why
+    /// `null` here is "cannot go back" rather than "no such row" — the same
+    /// `null` a walk past the end gives. On a non-null answer the cursor
+    /// stands on `at`, and the two halves have both consumed through it.
     pub fn seekTo(self: *OpIdIter, at: usize) ParseError!?OpId {
         const a = (try self.actor.seekTo(at)) orelse return null;
         const c = (try self.ctr.seekTo(at)) orelse return null;
@@ -346,45 +414,81 @@ pub const OpIdIter = struct {
 };
 
 /// The `insert` column (`InsertIter`, `op_iter.rs:409-412`).
+///
+/// One column cursor, so every kernel method here is a single forward rather
+/// than a lockstep pair — including [`InsertIter.shift`], which is the only
+/// `shift` on this type that cannot fail. Nothing allocates and nothing moves
+/// backwards.
 pub const InsertIter = struct {
     /// `insert`: whether the row inserts rather than overwrites
     /// (`op_set2/columns.rs:28`).
     iter: opcols.BoolPrefixColumn.Iterator,
 
+    /// The compile-time proof that this type carries the whole `Shiftable`
+    /// kernel; [`assertShiftable`] is what makes the mark mean something.
     pub const shiftable = column.Shiftable(InsertIter);
 
+    /// A cursor over the `insert` column, positioned at row 0 with its window
+    /// open to the end of the column.
     pub fn init(iter: opcols.BoolPrefixColumn.Iterator) InsertIter {
         return .{ .iter = iter };
     }
 
+    /// The row this cursor stands on — that is, how many rows have been
+    /// consumed (`Shiftable::pos`, `shift.rs:56-58`).
     pub fn pos(self: *const InsertIter) usize {
         return self.iter.pos();
     }
 
+    /// The row past the last one this cursor may reach (`Shiftable::max_pos`,
+    /// `shift.rs:59-61`): the window's closed end.
     pub fn maxPos(self: *const InsertIter) usize {
         return self.iter.maxPos();
     }
 
+    /// Closes the window at `at` (`Shiftable::set_max`, `shift.rs:62-66`). The
+    /// cursor itself does not move, and an `at` past the end of the column is
+    /// clamped to its length.
     pub fn setMax(self: *InsertIter, at: usize) void {
         self.iter.setMax(at);
     }
 
+    /// Consumes rows until the cursor stands on `target`
+    /// (`Shiftable::advance_to`, `shift.rs:67-72`). Forward only: a `target`
+    /// at or behind the current [`pos`] is a no-op, and one past the window is
+    /// `error.UnexpectedEnd`.
     pub fn advanceTo(self: *InsertIter, target: usize) ParseError!void {
         return self.iter.advanceTo(target);
     }
 
+    /// Consumes `amount` more rows, saturating rather than wrapping
+    /// (`Shiftable::advance_by`, `shift.rs:73-76`).
     pub fn advanceBy(self: *InsertIter, amount: usize) ParseError!void {
         return self.iter.advanceBy(amount);
     }
 
+    /// Moves the walk onto `range`: the window follows the range **and** the
+    /// walk lands on its start (`Shiftable::shift`, `shift.rs:50-55`).
+    ///
+    /// Infallible on this type — `setMax` and `advanceTo` over a run-encoded
+    /// boolean cannot fail — and it reads nothing, so the caller follows it
+    /// with [`shiftNext`] or [`seekTo`].
     pub fn shift(self: *InsertIter, range: RowRange) void {
         self.iter.shift(range);
     }
 
+    /// Repositions onto `range` and reads the row at its start
+    /// (`Shiftable::shift_next`, `shift.rs:77-86`): `shift` then a read, so
+    /// the cursor stands on `range.start` and `null` is a `range.start` at or
+    /// past the end of the window.
     pub fn shiftNext(self: *InsertIter, range: RowRange) ParseError!?bool {
         return self.iter.shiftNext(range);
     }
 
+    /// Reads row `at` and consumes through it (`Shiftable::seek_to`,
+    /// `shift.rs:87-96`). Forward only: an `at` behind the cursor answers
+    /// `null` and leaves it where it is, which is the same `null` a walk past
+    /// the end gives.
     pub fn seekTo(self: *InsertIter, at: usize) ParseError!?bool {
         return self.iter.seekTo(at);
     }
@@ -407,6 +511,12 @@ pub const InsertIter = struct {
 /// so this holds the [`StringTable`] that turns an id back into bytes. The
 /// table is borrowed and must outlive every key the cursor hands out —
 /// the same rule as [`Op`]'s own borrowed key.
+///
+/// Three column cursors held in step plus the borrowed string table, so the
+/// kernel is the [`OpIdIter`] one over three columns rather than two. Every
+/// read is `shiftNext`-shaped: the three halves are read in lockstep and
+/// assembled by [`tryLoadKeyRef`], which is where a row that is neither a map
+/// key nor a sequence anchor is refused.
 pub const KeyIter = struct {
     /// `key_str`: the map key, as an interned id (`op_iter.rs:465`).
     key_str: opcols.UintOptColumn.Iterator,
@@ -417,8 +527,16 @@ pub const KeyIter = struct {
     /// The document's string table, resolving `key_str`.
     strings: StringTable,
 
+    /// The compile-time proof that this type carries the whole `Shiftable`
+    /// kernel; [`assertShiftable`] is what makes the mark mean something.
     pub const shiftable = column.Shiftable(KeyIter);
 
+    /// A cursor over the three key columns, positioned at row 0 with the
+    /// window open to the end of all three.
+    ///
+    /// `strings` is borrowed, not copied, and is the one thing here that is
+    /// not a column cursor: it must be the table of the document these
+    /// columns belong to, and it must outlive every key this hands out.
     pub fn init(
         key_str: opcols.UintOptColumn.Iterator,
         key_actor: opcols.ActorOptColumn.Iterator,
@@ -433,36 +551,65 @@ pub const KeyIter = struct {
         };
     }
 
+    /// The row this cursor stands on — that is, how many rows have been
+    /// consumed (`Shiftable::pos`, `shift.rs:56-58`). It is the `key_str`
+    /// cursor's position, and the three are kept equal.
     pub fn pos(self: *const KeyIter) usize {
         return self.key_str.pos();
     }
 
+    /// The row past the last one this cursor may reach (`Shiftable::max_pos`,
+    /// `shift.rs:59-61`): the window's closed end.
     pub fn maxPos(self: *const KeyIter) usize {
         return self.key_str.maxPos();
     }
 
+    /// Closes all three windows at `at` (`Shiftable::set_max`,
+    /// `shift.rs:62-66`). The cursor does not move and `at` past the end of
+    /// the columns is clamped to their length.
     pub fn setMax(self: *KeyIter, at: usize) void {
         self.key_str.setMax(at);
         self.key_actor.setMax(at);
         self.key_ctr.setMax(at);
     }
 
+    /// Consumes rows until the cursor stands on `target`
+    /// (`Shiftable::advance_to`, `shift.rs:67-72`). Forward only; a `target`
+    /// past the window is `error.UnexpectedEnd`. The three move in the order
+    /// `key_str`, `key_actor`, `key_ctr`, so a failure leaves the last one
+    /// behind rather than the first.
     pub fn advanceTo(self: *KeyIter, target: usize) ParseError!void {
         try self.key_str.advanceTo(target);
         try self.key_actor.advanceTo(target);
         try self.key_ctr.advanceTo(target);
     }
 
+    /// Consumes `amount` more rows, saturating rather than wrapping
+    /// (`Shiftable::advance_by`, `shift.rs:73-76`).
     pub fn advanceBy(self: *KeyIter, amount: usize) ParseError!void {
         return self.advanceTo(self.key_str.pos() +| amount);
     }
 
+    /// Moves the walk onto `range`: the window follows the range **and** the
+    /// walk lands on its start (`Shiftable::shift`, `shift.rs:50-55`).
+    ///
+    /// Reads nothing. All three key cursors move together — the window is one
+    /// window over three columns — and the caller follows with [`shiftNext`]
+    /// or [`seekTo`]. Infallible here for the same reason
+    /// [`InsertIter.shift`] is.
     pub fn shift(self: *KeyIter, range: RowRange) void {
         self.key_str.shift(range);
         self.key_actor.shift(range);
         self.key_ctr.shift(range);
     }
 
+    /// Repositions onto `range`, reads the row at its start, and assembles it
+    /// into one key (`Shiftable::shift_next`, `shift.rs:77-86`).
+    ///
+    /// On return the cursor stands on `range.start`, not past it. `null` is a
+    /// `range.start` at or past the end of the window; an error is a window
+    /// that ran out mid-read or a row the three columns do not make a key out
+    /// of — [`tryLoadKeyRef`] is the authority on the second.
     pub fn shiftNext(self: *KeyIter, range: RowRange) ReadOpError!?KeyRef {
         const str_id = (try self.key_str.shiftNext(range)) orelse return null;
         const actor = (try self.key_actor.shiftNext(range)) orelse return null;
@@ -470,6 +617,13 @@ pub const KeyIter = struct {
         return try self.load(str_id, actor, ctr);
     }
 
+    /// Reads row `at`, consumes through it, and assembles it into one key
+    /// (`Shiftable::seek_to`, `shift.rs:87-96`).
+    ///
+    /// Forward only: an `at` behind the cursor answers `null` and leaves it
+    /// where it is — the same `null` a walk past the end gives. On a
+    /// non-null answer the three key cursors all stand on `at`. The map key
+    /// borrows the string table.
     pub fn seekTo(self: *KeyIter, at: usize) ReadOpError!?KeyRef {
         const str_id = (try self.key_str.seekTo(at)) orelse return null;
         const actor = (try self.key_actor.seekTo(at)) orelse return null;
@@ -511,6 +665,13 @@ pub const KeyIter = struct {
 
 /// The two object columns, read as one object id
 /// (`ObjIdIter`, `op_iter.rs:570-574`).
+///
+/// Two column cursors held in step, with the kernel [`OpIdIter`] has, plus
+/// [`seekToValue`](ObjIdIter.seekToValue) — which is the one method on this
+/// type that is not a step of the walk but a search, and the one that leaves
+/// both cursors on an answer. Every read is assembled by
+/// [`tryLoadObjId`], where "both halves null" and "a counter of zero" are the
+/// two shapes of the root.
 pub const ObjIdIter = struct {
     /// `obj_actor`: the parent object's actor, null at the root
     /// (`op_set2/columns.rs:20`).
@@ -519,8 +680,12 @@ pub const ObjIdIter = struct {
     /// (`op_set2/columns.rs:21`).
     obj_ctr: opcols.UintOptColumn.Iterator,
 
+    /// The compile-time proof that this type carries the whole `Shiftable`
+    /// kernel; [`assertShiftable`] is what makes the mark mean something.
     pub const shiftable = column.Shiftable(ObjIdIter);
 
+    /// A cursor over the two object columns, positioned at row 0 with the
+    /// window open to the end of both.
     pub fn init(
         obj_actor: opcols.ActorOptColumn.Iterator,
         obj_ctr: opcols.UintOptColumn.Iterator,
@@ -528,39 +693,72 @@ pub const ObjIdIter = struct {
         return .{ .obj_actor = obj_actor, .obj_ctr = obj_ctr };
     }
 
+    /// The row this cursor stands on — that is, how many rows have been
+    /// consumed (`Shiftable::pos`, `shift.rs:56-58`). It is the `obj_actor`
+    /// cursor's position, and the two are kept equal.
     pub fn pos(self: *const ObjIdIter) usize {
         return self.obj_actor.pos();
     }
 
+    /// The row past the last one this cursor may reach (`Shiftable::max_pos`,
+    /// `shift.rs:59-61`): the window's closed end.
     pub fn maxPos(self: *const ObjIdIter) usize {
         return self.obj_actor.maxPos();
     }
 
+    /// Closes both windows at `at` (`Shiftable::set_max`, `shift.rs:62-66`).
+    /// The cursor does not move and `at` past the end of the columns is
+    /// clamped to their length.
     pub fn setMax(self: *ObjIdIter, at: usize) void {
         self.obj_actor.setMax(at);
         self.obj_ctr.setMax(at);
     }
 
+    /// Consumes rows until the cursor stands on `target`
+    /// (`Shiftable::advance_to`, `shift.rs:67-72`). Forward only; a `target`
+    /// past the window is `error.UnexpectedEnd`.
     pub fn advanceTo(self: *ObjIdIter, target: usize) ParseError!void {
         try self.obj_actor.advanceTo(target);
         try self.obj_ctr.advanceTo(target);
     }
 
+    /// Consumes `amount` more rows, saturating rather than wrapping
+    /// (`Shiftable::advance_by`, `shift.rs:73-76`).
     pub fn advanceBy(self: *ObjIdIter, amount: usize) ParseError!void {
         return self.advanceTo(self.obj_actor.pos() +| amount);
     }
 
+    /// Moves the walk onto `range`: the window follows the range **and** the
+    /// walk lands on its start (`Shiftable::shift`, `shift.rs:50-55`).
+    ///
+    /// Reads nothing; both object cursors move together, and the caller
+    /// follows with [`shiftNext`] or [`seekTo`]. Infallible for the reason
+    /// [`InsertIter.shift`] is.
     pub fn shift(self: *ObjIdIter, range: RowRange) void {
         self.obj_actor.shift(range);
         self.obj_ctr.shift(range);
     }
 
+    /// Repositions onto `range`, reads the row at its start, and assembles it
+    /// into one object id (`Shiftable::shift_next`, `shift.rs:77-86`).
+    ///
+    /// On return the cursor stands on `range.start`, not past it. `null` is a
+    /// `range.start` at or past the end of the window; an error is a window
+    /// that ran out mid-read or a row the two columns do not make an object id
+    /// out of, which [`tryLoadObjId`] decides.
     pub fn shiftNext(self: *ObjIdIter, range: RowRange) ReadOpError!?ObjId {
         const actor = (try self.obj_actor.shiftNext(range)) orelse return null;
         const ctr = (try self.obj_ctr.shiftNext(range)) orelse return null;
         return try tryLoadObjId(actor, if (ctr) |c| @as(i64, c) else null);
     }
 
+    /// Reads row `at`, consumes through it, and assembles it into one object
+    /// id (`Shiftable::seek_to`, `shift.rs:87-96`).
+    ///
+    /// Forward only: an `at` behind the cursor answers `null` and leaves it
+    /// where it is — the same `null` a walk past the end gives. On a
+    /// non-null answer both object cursors stand on `at`. It does not move
+    /// the window, so it reads whatever the window already allows.
     pub fn seekTo(self: *ObjIdIter, at: usize) ReadOpError!?ObjId {
         const actor = (try self.obj_actor.seekTo(at)) orelse return null;
         const ctr = (try self.obj_ctr.seekTo(at)) orelse return null;
@@ -637,6 +835,12 @@ pub const ObjIdIter = struct {
 
 /// The two mark columns, read as one mark's name and expansion
 /// (`MarkInfoIter`, `op_iter.rs:677-681`).
+///
+/// Two column cursors held in step plus the borrowed string table, with the
+/// kernel [`OpIdIter`] has. The asymmetry worth knowing before reading the
+/// methods: `expand` is read as **false** when the column runs out and the
+/// name is what makes a row a row, so a missing `expand` is never an error —
+/// upstream's rule (`op_iter.rs:704-708`, `:729`), kept here on every read.
 pub const MarkInfoIter = struct {
     /// `mark_name`, an interned id (`op_set2/columns.rs:32`).
     name: opcols.UintOptColumn.Iterator,
@@ -645,8 +849,15 @@ pub const MarkInfoIter = struct {
     /// The document's string table, resolving `mark_name`.
     strings: StringTable,
 
+    /// The compile-time proof that this type carries the whole `Shiftable`
+    /// kernel; [`assertShiftable`] is what makes the mark mean something.
     pub const shiftable = column.Shiftable(MarkInfoIter);
 
+    /// A cursor over the two mark columns, positioned at row 0 with the window
+    /// open to the end of both.
+    ///
+    /// `strings` is borrowed and must be the document's own table: it is
+    /// where every mark name this hands out comes from.
     pub fn init(
         name: opcols.UintOptColumn.Iterator,
         expand: opcols.BoolColumn.Iterator,
@@ -655,24 +866,37 @@ pub const MarkInfoIter = struct {
         return .{ .name = name, .expand = expand, .strings = strings };
     }
 
+    /// The row this cursor stands on — that is, how many rows have been
+    /// consumed (`Shiftable::pos`, `shift.rs:56-58`). It is the `expand`
+    /// cursor's position, and the two are kept equal.
     pub fn pos(self: *const MarkInfoIter) usize {
         return self.expand.pos();
     }
 
+    /// The row past the last one this cursor may reach (`Shiftable::max_pos`,
+    /// `shift.rs:59-61`): the window's closed end.
     pub fn maxPos(self: *const MarkInfoIter) usize {
         return self.expand.maxPos();
     }
 
+    /// Closes both windows at `at` (`Shiftable::set_max`, `shift.rs:62-66`).
+    /// The cursor does not move and `at` past the end of the columns is
+    /// clamped to their length.
     pub fn setMax(self: *MarkInfoIter, at: usize) void {
         self.name.setMax(at);
         self.expand.setMax(at);
     }
 
+    /// Consumes rows until the cursor stands on `target`
+    /// (`Shiftable::advance_to`, `shift.rs:67-72`). Forward only; a `target`
+    /// past the window is `error.UnexpectedEnd`.
     pub fn advanceTo(self: *MarkInfoIter, target: usize) ParseError!void {
         try self.name.advanceTo(target);
         try self.expand.advanceTo(target);
     }
 
+    /// Consumes `amount` more rows, saturating rather than wrapping
+    /// (`Shiftable::advance_by`, `shift.rs:73-76`).
     pub fn advanceBy(self: *MarkInfoIter, amount: usize) ParseError!void {
         return self.advanceTo(self.expand.pos() +| amount);
     }
@@ -680,21 +904,38 @@ pub const MarkInfoIter = struct {
     /// Moves the walk onto `range`: the window follows the range **and** the
     /// walk lands on its start (`Shiftable::shift`, `shift.rs:50-55`; the
     /// kernel's own `shift`, `column.rs:542-545`).
+    ///
+    /// Reads nothing; both mark cursors move together. Fallible here, unlike
+    /// [`InsertIter.shift`], because the `mark_name` column's shift is a
+    /// nullable one.
     pub fn shift(self: *MarkInfoIter, range: RowRange) ParseError!void {
         try self.name.shift(range);
         try self.expand.shift(range);
     }
 
+    /// Repositions onto `range` and reads the row at its start
+    /// (`shift_next`, `op_iter.rs:704-708`).
+    ///
     /// Upstream swallows a missing `expand` as false and only the missing
-    /// name is an error (`shift_next`, `op_iter.rs:704-708`): a row with no
-    /// `expand` column entry is a row that does not expand, and the name
-    /// column is the one that must be there for the row to be a row.
+    /// name is an error: a row with no `expand` column entry is a row that
+    /// does not expand, and the name column is the one that must be there for
+    /// the row to be a row. On return the cursor stands on `range.start`, not
+    /// past it, and `null` is a `range.start` at or past the end of the
+    /// window. The name is borrowed from the string table.
     pub fn shiftNext(self: *MarkInfoIter, range: RowRange) ReadOpError!?MarkInfo {
         const expand = (try self.expand.shiftNext(range)) orelse false;
         const name = (try self.name.shiftNext(range)) orelse return null;
         return .{ .name = if (name) |id| self.strings.resolve(self.strings.ctx, id) else null, .expand = expand };
     }
 
+    /// Reads row `at`, consumes through it, and returns the mark's name and
+    /// expansion (`Shiftable::seek_to`, `shift.rs:87-96`).
+    ///
+    /// Forward only: an `at` behind the cursor answers `null` and leaves it
+    /// where it is, which is the same `null` a walk past the end gives. A
+    /// missing `expand` is false rather than an error, on the terms
+    /// [`shiftNext`](MarkInfoIter.shiftNext) gives; the name is borrowed from
+    /// the string table.
     pub fn seekTo(self: *MarkInfoIter, at: usize) ReadOpError!?MarkInfo {
         const expand = (try self.expand.seekTo(at)) orelse false;
         const name = (try self.name.seekTo(at)) orelse return null;
@@ -728,45 +969,87 @@ pub const MarkInfoIter = struct {
 /// The column holds each action's wire code (`op_set2/columns.rs:29`); the
 /// decoder is [`optypes.actionFromCode`], so an action code outside the
 /// eight is `error.InvalidAction` rather than a row.
+///
+/// One column cursor and the [`InsertIter`] kernel, with one thing the kernel
+/// does not have: the read methods *decode*, so their error set includes
+/// `ParseError`. `error.InvalidAction` therefore means "the column holds a
+/// code that is not one of the eight", which is a corrupt document rather
+/// than a walk off the end.
 pub const ActionIter = struct {
     /// `action`, one wire code per row.
     iter: opcols.ActionColumn.Iterator,
 
+    /// The compile-time proof that this type carries the whole `Shiftable`
+    /// kernel; [`assertShiftable`] is what makes the mark mean something.
     pub const shiftable = column.Shiftable(ActionIter);
 
+    /// A cursor over the action column, positioned at row 0 with its window
+    /// open to the end of the column.
     pub fn init(iter: opcols.ActionColumn.Iterator) ActionIter {
         return .{ .iter = iter };
     }
 
+    /// The row this cursor stands on — that is, how many rows have been
+    /// consumed (`Shiftable::pos`, `shift.rs:56-58`).
     pub fn pos(self: *const ActionIter) usize {
         return self.iter.pos();
     }
 
+    /// The row past the last one this cursor may reach (`Shiftable::max_pos`,
+    /// `shift.rs:59-61`): the window's closed end.
     pub fn maxPos(self: *const ActionIter) usize {
         return self.iter.maxPos();
     }
 
+    /// Closes the window at `at` (`Shiftable::set_max`, `shift.rs:62-66`). The
+    /// cursor does not move and `at` past the end of the column is clamped to
+    /// its length.
     pub fn setMax(self: *ActionIter, at: usize) void {
         self.iter.setMax(at);
     }
 
+    /// Consumes rows until the cursor stands on `target`
+    /// (`Shiftable::advance_to`, `shift.rs:67-72`). Forward only; a `target`
+    /// at or behind the current [`pos`] is a no-op, and one past the window is
+    /// `error.UnexpectedEnd`. It reads nothing, so it cannot raise
+    /// `error.InvalidAction`.
     pub fn advanceTo(self: *ActionIter, target: usize) ParseError!void {
         return self.iter.advanceTo(target);
     }
 
+    /// Consumes `amount` more rows, saturating rather than wrapping
+    /// (`Shiftable::advance_by`, `shift.rs:73-76`).
     pub fn advanceBy(self: *ActionIter, amount: usize) ParseError!void {
         return self.iter.advanceBy(amount);
     }
 
+    /// Moves the walk onto `range`: the window follows the range **and** the
+    /// walk lands on its start (`Shiftable::shift`, `shift.rs:50-55`).
+    ///
+    /// Reads nothing — it does not decode — and so it cannot raise
+    /// `error.InvalidAction`. The caller follows it with [`shiftNext`] or
+    /// [`seekTo`].
     pub fn shift(self: *ActionIter, range: RowRange) void {
         self.iter.shift(range);
     }
 
+    /// Repositions onto `range`, reads the row at its start and decodes its
+    /// code (`Shiftable::shift_next`, `shift.rs:77-86`).
+    ///
+    /// On return the cursor stands on `range.start`, not past it. `null` is a
+    /// `range.start` at or past the end of the window; `error.InvalidAction`
+    /// is a row whose code is not one of the eight.
     pub fn shiftNext(self: *ActionIter, range: RowRange) ParseError!?Action {
         const code = (try self.iter.shiftNext(range)) orelse return null;
         return try optypes.actionFromCode(code);
     }
 
+    /// Reads row `at`, consumes through it, and decodes its code
+    /// (`Shiftable::seek_to`, `shift.rs:87-96`).
+    ///
+    /// Forward only: an `at` behind the cursor answers `null` and leaves it
+    /// where it is, which is the same `null` a walk past the end gives. On a
+    /// non-null answer the cursor stands on `at`.
     pub fn seekTo(self: *ActionIter, at: usize) ParseError!?Action {
         const code = (try self.iter.seekTo(at)) orelse return null;
         return try optypes.actionFromCode(code);
@@ -793,12 +1076,23 @@ pub const ActionIter = struct {
 /// The two cursors are indexed in different spaces — `value_meta` by row,
 /// the raw column by byte — and the metadata word is what joins them: its
 /// length is the row's width in the value arena (`op_set2/meta.rs:40-42`),
-/// and the running sum of the lengths is a row's offset in it. Every
-/// method that moves the row cursor therefore moves the byte cursor to the
-/// row it lands on, and the byte cursor never moves on its own.
+/// and the running sum of the lengths is a row's offset in it.
+///
+/// **Every method that reads a row places the byte cursor on that row**, so a
+/// read is always in step with the row cursor. Two methods are the exception
+/// and are documented as such: [`shift`](ValueIter.shift) moves only the row
+/// cursor, and [`setMax`](ValueIter.setMax) moves only the window — neither
+/// reads, so neither places it. The byte cursor never moves on its own
+/// otherwise; there is no method that advances it without a row read behind
+/// it.
 ///
 /// The values handed out borrow the raw column, so the `RawColumn` must
 /// outlive every [`ScalarValue`] this produces.
+///
+/// **Row space and byte space are different spaces.** [`pos`] and
+/// [`maxPos`](ValueIter.maxPos) are rows; [`landedAt`](ValueIter.landedAt) is
+/// a byte offset; and the two are related only by the prefix sum the metadata
+/// column keeps. Nothing here converts one into the other by arithmetic.
 pub const ValueIter = struct {
     /// `value_meta`, one length-and-type word per row
     /// (`op_set2/columns.rs:30`).
@@ -807,8 +1101,15 @@ pub const ValueIter = struct {
     /// (`op_set2/columns.rs:31`).
     raw: rawcol.RawColumnIter,
 
+    /// The compile-time proof that this type carries the whole `Shiftable`
+    /// kernel; [`assertShiftable`] is what makes the mark mean something.
     pub const shiftable = column.Shiftable(ValueIter);
-
+    /// A cursor over the metadata and raw columns, both at row 0 / byte 0,
+    /// with the metadata window open to the end of the column.
+    ///
+    /// `raw` must be a cursor over the *same* document's value column; the
+    /// byte offset this works in is the metadata column's own running sum, so
+    /// a `raw` from another document would read another document's bytes.
     pub fn init(meta: opcols.MetaColumn.PrefixIter, raw: rawcol.RawColumnIter) ValueIter {
         return .{ .meta = meta, .raw = raw };
     }
@@ -841,21 +1142,42 @@ pub const ValueIter = struct {
         return prefixAt(self.meta.col, at - 1);
     }
 
+    /// The **row** this cursor stands on — that is, how many rows have been
+    /// consumed (`Shiftable::pos`, `shift.rs:56-58`). It is the metadata
+    /// cursor's position, and it is a row, not a byte offset.
     pub fn pos(self: *const ValueIter) usize {
         return self.meta.pos();
     }
 
+    /// The row past the last one this cursor may reach (`Shiftable::max_pos`,
+    /// `shift.rs:59-61`): the window's closed end, in rows. A row behind it
+    /// whose bytes the raw cursor has not been placed on can still be read by
+    /// [`tryNext`](ValueIter.tryNext) — the read places the byte cursor
+    /// itself.
     pub fn maxPos(self: *const ValueIter) usize {
         return self.meta.maxPos();
     }
 
+    /// Closes the metadata window at `at` (`Shiftable::set_max`,
+    /// `shift.rs:62-66`), in rows.
+    ///
+    /// **Only the row window moves.** The byte cursor is left exactly where
+    /// the last read put it, which is sound because every read re-seeks it;
+    /// see the type doc. The cursor does not rewind, and `at` past the end of
+    /// the column is clamped to its length.
     pub fn setMax(self: *ValueIter, at: usize) void {
         self.meta.setMax(at);
     }
 
     /// Moves the row cursor onto `target` and the byte cursor onto that
-    /// row's offset. A target behind the cursor is a no-op, as everywhere
-    /// else in the kernel.
+    /// row's offset (`Shiftable::advance_to`, `shift.rs:67-72`).
+    ///
+    /// Reads nothing and returns no value: the byte placement is bookkeeping
+    /// so that a later read starts from the right place. A target behind the
+    /// cursor is a no-op, as everywhere else in the kernel, and `target` past
+    /// the window is `error.UnexpectedEnd`. The offset comes from
+    /// `prefixAt` — the column's own sum — not from the cursor's, which is
+    /// what [`landedAt`](ValueIter.landedAt) is about.
     pub fn advanceTo(self: *ValueIter, target: usize) ParseError!void {
         const at = self.meta.pos();
         if (target <= at) return;
@@ -863,45 +1185,87 @@ pub const ValueIter = struct {
         try self.raw.seekTo(try prefixAt(self.meta.col, target));
     }
 
+    /// Consumes `amount` more rows, saturating rather than wrapping
+    /// (`Shiftable::advance_by`, `shift.rs:73-76`), placing the byte cursor
+    /// on the row it lands on exactly as [`advanceTo`] does.
     pub fn advanceBy(self: *ValueIter, amount: usize) ParseError!void {
         return self.advanceTo(self.meta.pos() +| amount);
     }
 
+    /// Moves the walk onto `range`: the window follows the range **and** the
+    /// walk lands on its start (`Shiftable::shift`, `shift.rs:50-55`).
+    ///
+    /// **Only `meta` moves; `raw` does not.** This is the one method on this
+    /// type that would otherwise contradict the type doc's promise, and the
+    /// promise is narrower than it looks: what a *read* guarantees is that
+    /// the byte cursor is on the row being read, and this is not a read. A
+    /// caller that calls `shift` and then reads through [`seekTo`] gets a
+    /// correctly placed byte cursor, because [`seekTo`] seeks it; a caller
+    /// that calls `shift` and then calls `raw` itself does not, which is why
+    /// `raw` is not a published accessor.
     pub fn shift(self: *ValueIter, range: RowRange) void {
         self.meta.shift(range);
     }
 
     /// Repositions onto `range` and reads the row at its start
     /// (`shift_next`, `op_iter.rs:888-896`).
+    ///
+    /// `shift` then a read, so the byte cursor is placed on `range.start` and
+    /// the cursor stands there — the next [`tryNext`](ValueIter.tryNext)
+    /// answers the *following* row. `null` is a `range.start` at or past the
+    /// end of the window. The value borrows the raw column.
     pub fn shiftNext(self: *ValueIter, range: RowRange) ReadOpError!?ScalarValue {
         const pv = (try self.meta.shiftNext(range)) orelse return null;
         const meta = ValueMeta.fromRaw(pv.value);
         try self.raw.seekTo(try self.landedAt());
-        return try optypes.fromRaw(meta, try self.raw.take(meta.length()));
+        return try optypes.fromRaw(meta, try self.raw.take(try meta.length()));
     }
 
+    /// Reads row `at` and consumes through it (`Shiftable::seek_to`,
+    /// `shift.rs:87-96`).
+    ///
+    /// Forward only: an `at` behind the cursor answers `null` and leaves it
+    /// where it is, which is the same `null` a walk past the end gives. It is
+    /// built on [`tryNth`] rather than on a seek of the raw cursor, so it
+    /// re-places the byte cursor on the row it reads — which is the point: a
+    /// jump has to re-seek, a step does not.
+    ///
+    /// [`tryNth`] is total, so a row past the end is `error.MissingValue` and
+    /// the `null` here comes from the backwards check alone.
     pub fn seekTo(self: *ValueIter, at: usize) ReadOpError!?ScalarValue {
         if (at < self.meta.pos()) return null;
         return try self.tryNth(at - self.meta.pos());
     }
 
     /// The next row's value (`try_next`, `op_iter.rs:906-915`).
+    ///
+    /// Total: a row this cursor cannot read is `error.MissingValue`, never a
+    /// `null` the caller has to remember to check. It does **not** re-seek the
+    /// byte cursor, because it does not jump — the invariant is that the byte
+    /// cursor stands where the previous read left it, which holds from
+    /// construction (byte 0 is row 0's offset) through any number of steps,
+    /// and any jump goes through [`tryNth`] or [`shiftNext`], which do seek.
+    /// The value borrows the raw column.
     pub fn tryNext(self: *ValueIter) ReadOpError!ScalarValue {
         const pv = (try self.meta.next()) orelse return error.MissingValue;
         const meta = ValueMeta.fromRaw(pv.value);
-        return try optypes.fromRaw(meta, try self.raw.take(meta.length()));
+        return try optypes.fromRaw(meta, try self.raw.take(try meta.length()));
     }
 
     /// The value `n` rows ahead (`try_nth`, `op_iter.rs:917-930`).
     ///
-    /// The metadata cursor jumps and the raw cursor is placed, rather than
-    /// walking both: the same answer, without reading the rows in between.
+    /// The metadata cursor jumps and the raw cursor is re-placed on the row it
+    /// lands on, rather than walking both: the same answer, without reading
+    /// the rows in between. `n == 0` is [`tryNext`]. A value's type and width
+    /// come from the metadata word, so the bytes taken are exactly what it
+    /// declares and a payload the raw column cannot supply is an error rather
+    /// than a short read. The value borrows the raw column.
     pub fn tryNth(self: *ValueIter, n: usize) ReadOpError!ScalarValue {
         if (n == 0) return self.tryNext();
         const pv = (try self.meta.nth(n)) orelse return error.MissingValue;
         const meta = ValueMeta.fromRaw(pv.value);
         try self.raw.seekTo(try self.landedAt());
-        return try optypes.fromRaw(meta, try self.raw.take(meta.length()));
+        return try optypes.fromRaw(meta, try self.raw.take(try meta.length()));
     }
 };
 
@@ -922,6 +1286,14 @@ pub const ValueIter = struct {
 /// A row with more successors than the buffer is `error.TooLarge` rather
 /// than a short read, for the reason [`opmod.loadSuccWindow`] gives: a
 /// truncated read silently drops successors and hides a delete.
+///
+/// **Two spaces here, and the kernel only walks one of them.** [`pos`] and
+/// [`maxPos`](SuccIterIter.maxPos) are rows; [`flat`] is a flattened
+/// successor position. The four cursors are moved together — `advanceTo`,
+/// `shiftNext` and [`tryNth`](SuccIterIter.tryNth) all re-place the three
+/// flattened ones from `succ_count`'s own prefix sum — so the invariant a
+/// caller can rely on is that a cursor returned from any read method has its
+/// three flattened cursors sitting where the span it borrows begins.
 pub const SuccIterIter = struct {
     /// `succ_count`, one count per row (`op_set2/columns.rs:24`).
     count: opcols.CountColumn.PrefixIter,
@@ -939,8 +1311,18 @@ pub const SuccIterIter = struct {
     /// The caller's successor buffer, reused for every row.
     scratch: []SuccEntry,
 
+    /// The compile-time proof that this type carries the whole `Shiftable`
+    /// kernel; [`assertShiftable`] is what makes the mark mean something.
     pub const shiftable = column.Shiftable(SuccIterIter);
-
+    /// A cursor over the count column and the three flattened successor
+    /// columns, positioned at row 0 / flattened `flat`.
+    ///
+    /// `flat` is a caller-supplied starting point in flattened successor
+    /// coordinates — it is what a scoped walk passes when it enters a child
+    /// object partway through the flattened columns — and it must agree with
+    /// where the three cursors actually are, because it is the only record of
+    /// that they are in step. `scratch` is the caller's buffer and must
+    /// outlive the walk and every [`SuccCursors`] it produces.
     pub fn init(
         count: opcols.CountColumn.PrefixIter,
         actor: opcols.ActorColumn.Iterator,
@@ -1004,18 +1386,41 @@ pub const SuccIterIter = struct {
         return SuccCursors.fromSpan(self.scratch[0..want], start);
     }
 
+    /// The **row** this cursor stands on — that is, how many rows have been
+    /// consumed (`Shiftable::pos`, `shift.rs:56-58`). It is the count
+    /// cursor's position, and it is a row rather than the flattened
+    /// successor position [`flat`] carries.
     pub fn pos(self: *const SuccIterIter) usize {
         return self.count.pos();
     }
 
+    /// The row past the last one this cursor may reach (`Shiftable::max_pos`,
+    /// `shift.rs:59-61`): the window's closed end, in rows. The flattened
+    /// columns have no window of their own: they are consumed exactly as far
+    /// as the counts say.
     pub fn maxPos(self: *const SuccIterIter) usize {
         return self.count.maxPos();
     }
 
+    /// Closes the count column's window at `at` (`Shiftable::set_max`,
+    /// `shift.rs:62-66`), in rows.
+    ///
+    /// Only the count cursor moves. The three flattened cursors and [`flat`]
+    /// are left where they are, which is sound because every row read moves
+    /// them from the count column's own prefix sum; see the type doc.
     pub fn setMax(self: *SuccIterIter, at: usize) void {
         self.count.setMax(at);
     }
 
+    /// Moves the count cursor onto `target` and the three flattened cursors
+    /// past every successor of every row before it (`Shiftable::advance_to`,
+    /// `shift.rs:67-72`).
+    ///
+    /// Reads nothing and returns no value: the flattened cursors are placed
+    /// from `succ_count`'s own prefix sum at `target`, which is what makes
+    /// the next read read the right successors. Forward only — a `target` at
+    /// or behind the current row is a no-op, and one past the window is
+    /// `error.UnexpectedEnd`.
     pub fn advanceTo(self: *SuccIterIter, target: usize) ParseError!void {
         const at = self.count.pos();
         if (target <= at) return;
@@ -1023,16 +1428,38 @@ pub const SuccIterIter = struct {
         try self.advanceFlat(try prefixAt(self.count.col, target));
     }
 
+    /// Consumes `amount` more rows, saturating rather than wrapping
+    /// (`Shiftable::advance_by`, `shift.rs:73-76`), placing the flattened
+    /// cursors exactly as [`advanceTo`] does.
     pub fn advanceBy(self: *SuccIterIter, amount: usize) ParseError!void {
         return self.advanceTo(self.count.pos() +| amount);
     }
 
+    /// Moves the walk onto `range`: the window follows the range **and** the
+    /// walk lands on its start (`Shiftable::shift`, `shift.rs:50-55`).
+    ///
+    /// **Only the count cursor moves — not the three flattened cursors, and
+    /// not [`flat`].** This is the one method on this type that would
+    /// otherwise look like it breaks the type doc's invariant, and it does
+    /// not: the invariant is re-established by the next read, and every read
+    /// — [`shiftNext`], [`tryNext`](SuccIterIter.tryNext),
+    /// [`tryNth`](SuccIterIter.tryNth) — places all three from
+    /// `succ_count`'s prefix sum before it reads. A caller that calls `shift`
+    /// and then reads through one of them is correct; a caller that calls
+    /// `shift` and then advances the flattened columns itself is not, which
+    /// is why they are not published.
     pub fn shift(self: *SuccIterIter, range: RowRange) void {
         self.count.shift(range);
     }
 
     /// Repositions onto `range` and reads the successors of the row at its
     /// start (`shift_next`, `op_iter.rs:992-1013`).
+    ///
+    /// On return the three flattened cursors stand at `range.start`'s own
+    /// successor offset and the cursor returned borrows `scratch`. `null` is
+    /// a `range.start` at or past the end of the window; `error.TooLarge` is
+    /// a row with more successors than `scratch` holds, which is a refusal
+    /// rather than a truncated read for the reason the type doc gives.
     pub fn shiftNext(self: *SuccIterIter, range: RowRange) ReadOpError!?SuccCursors {
         const pv = (try self.count.shiftNext(range)) orelse return null;
         const start = try self.landedAt();
@@ -1043,12 +1470,26 @@ pub const SuccIterIter = struct {
         return try self.window(pv.value);
     }
 
+    /// Reads the successors of row `at` and consumes through it
+    /// (`Shiftable::seek_to`, `shift.rs:87-96`).
+    ///
+    /// Forward only: an `at` behind the cursor answers `null` and leaves it
+    /// where it is, which is the same `null` a walk past the end gives. This
+    /// is [`tryNth`](SuccIterIter.tryNth) rather than a seek on the
+    /// flattened cursors, so it re-places them from the count column's sum.
     pub fn seekTo(self: *SuccIterIter, at: usize) ReadOpError!?SuccCursors {
         if (at < self.count.pos()) return null;
         return try self.tryNth(at - self.count.pos());
     }
 
     /// The next row's successors (`try_next`, `op_iter.rs:1029-1049`).
+    ///
+    /// Total: a row this cursor cannot read is `error.MissingValue`, never a
+    /// `null`. It does not re-place the flattened cursors — it steps them,
+    /// which is the same answer at a lower cost, because a step has already
+    /// left them where the next row's successors begin. The returned cursor
+    /// borrows `scratch`, so only the most recent row's successors are
+    /// readable from it.
     pub fn tryNext(self: *SuccIterIter) ReadOpError!SuccCursors {
         const pv = (try self.count.next()) orelse return error.MissingValue; // :1031-1035
         return try self.window(pv.value);
@@ -1056,6 +1497,13 @@ pub const SuccIterIter = struct {
 
     /// The successors of the row `n` rows ahead (`try_nth`,
     /// `op_iter.rs:1051-1081`).
+    ///
+    /// The count cursor jumps and the three flattened cursors are moved past
+    /// the successors of every row before this one, which the count's own
+    /// prefix sum names; `n == 0` is [`tryNext`](SuccIterIter.tryNext). A
+    /// jump backwards is refused rather than attempted: the flattened
+    /// cursors only move forward, so a `n` that would need them to go back is
+    /// a document whose counts and successors disagree.
     pub fn tryNth(self: *SuccIterIter, n: usize) ReadOpError!SuccCursors {
         if (n == 0) return self.tryNext();
         const pv = (try self.count.nth(n)) orelse return error.MissingValue; // :1055-1058
@@ -1073,14 +1521,29 @@ pub const SuccIterIter = struct {
 /// Not one of the eight [`OpIter`] holds: upstream builds it where a
 /// reader wants an action and its value and nothing else — the mark and
 /// successor builders of the change decoder, and the conflict resolver.
+///
+/// It composes rather than re-implements: [`ActionIter`] and [`ValueIter`]
+/// are stored whole, [`pos`] is the action cursor's, and every method here
+/// moves both and reads through them. That is what makes its `shift` the one
+/// that reaches into a type with two spaces — `ValueIter.shift` leaves the
+/// byte cursor where it was — and what makes its reads safe anyway: every
+/// read goes through [`ValueIter.tryNext`] or [`ValueIter.tryNth`], which
+/// place the byte cursor on the row they read.
 pub const ActionValueIter = struct {
     /// The action column.
     action: ActionIter,
     /// The metadata and raw value columns.
     value: ValueIter,
 
+    /// The compile-time proof that this type carries the whole `Shiftable`
+    /// kernel; [`assertShiftable`] is what makes the mark mean something.
     pub const shiftable = column.Shiftable(ActionValueIter);
-
+    /// A cursor over the action column and the value columns, both at row 0
+    /// with their windows open to the end.
+    ///
+    /// `action` and `value` must be over the same document: the pair is read
+    /// as one row, and `ActionValue.pos` is the action cursor's position less
+    /// the row it just consumed.
     pub fn init(action: ActionIter, value: ValueIter) ActionValueIter {
         return .{ .action = action, .value = value };
     }
@@ -1098,28 +1561,52 @@ pub const ActionValueIter = struct {
         return .{ .action = a, .value = v, .pos = self.action.iter.pos() - 1 };
     }
 
+    /// The row this cursor stands on — that is, how many rows have been
+    /// consumed (`Shiftable::pos`, `shift.rs:56-58`). It is the action
+    /// cursor's position; the value cursor is kept in step with it.
     pub fn pos(self: *const ActionValueIter) usize {
         return self.action.pos();
     }
 
+    /// The row past the last one this cursor may reach (`Shiftable::max_pos`,
+    /// `shift.rs:59-61`): the action window's closed end. The value window is
+    /// the same window, kept equal.
     pub fn maxPos(self: *const ActionValueIter) usize {
         return self.action.maxPos();
     }
 
+    /// Closes both windows at `at` (`Shiftable::set_max`, `shift.rs:62-66`),
+    /// in rows. Neither cursor rewinds and `at` past the end of the columns
+    /// is clamped to their length; the value side moves only its row window,
+    /// which [`ValueIter.setMax`] says why is sound.
     pub fn setMax(self: *ActionValueIter, at: usize) void {
         self.action.setMax(at);
         self.value.setMax(at);
     }
 
+    /// Moves the action cursor onto `target` and the value cursor with it
+    /// (`Shiftable::advance_to`, `shift.rs:67-72`).
+    ///
+    /// Reads nothing and returns no value. Forward only, and a failure on the
+    /// action side leaves the value side behind it, which is why the action
+    /// moves first.
     pub fn advanceTo(self: *ActionValueIter, target: usize) ParseError!void {
         try self.action.advanceTo(target);
         try self.value.advanceTo(target);
     }
 
+    /// Consumes `amount` more rows, saturating rather than wrapping
+    /// (`Shiftable::advance_by`, `shift.rs:73-76`).
     pub fn advanceBy(self: *ActionValueIter, amount: usize) ParseError!void {
         return self.advanceTo(self.action.pos() +| amount);
     }
 
+    /// Moves the walk onto `range`: the window follows the range **and** the
+    /// walk lands on its start (`Shiftable::shift`, `shift.rs:50-55`).
+    ///
+    /// Reads nothing. The action window moves and the value *row* window
+    /// moves with it; the value *byte* cursor does not, on the terms
+    /// [`ValueIter.shift`] states, and the next read here places it.
     pub fn shift(self: *ActionValueIter, range: RowRange) void {
         self.action.shift(range);
         self.value.shift(range);
@@ -1127,17 +1614,34 @@ pub const ActionValueIter = struct {
 
     /// Repositions onto `range` and reads the row at its start
     /// (`shift_next`, `op_iter.rs:798-805`).
+    ///
+    /// `ActionValue.pos` is the row just read, which after a `shift` is
+    /// `range.start`. `null` is a `range.start` at or past the end of the
+    /// window; an error is a window that ran out mid-row, a code that is not
+    /// one of the eight, or a value whose bytes the raw column cannot
+    /// supply. The value borrows the raw column.
     pub fn shiftNext(self: *ActionValueIter, range: RowRange) ReadOpError!?ActionValue {
         const a = (try self.action.shiftNext(range)) orelse return null;
         const v = (try self.value.shiftNext(range)) orelse return null;
         return .{ .action = a, .value = v, .pos = self.action.iter.pos() - 1 };
     }
 
+    /// Reads row `at` and consumes through it, returning the action and the
+    /// value (`Shiftable::seek_to`, `shift.rs:87-96`).
+    ///
+    /// Forward only: an `at` behind the cursor answers `null` and leaves it
+    /// where it is, which is the same `null` a walk past the end gives. Past
+    /// the end it is `error.MissingValue` rather than `null`, because both
+    /// `tryNth`s are total — they carry no optional — so this method follows
+    /// [`ValueIter.seekTo`] and gets its `null` from the backwards check
+    /// alone. It is built from `tryNth` on both sides rather than from a raw
+    /// seek, so the value side re-places the byte cursor on the row it reads.
+    /// The value borrows the raw column.
     pub fn seekTo(self: *ActionValueIter, at: usize) ReadOpError!?ActionValue {
         if (at < self.action.pos()) return null;
         const n = at - self.action.pos();
-        const a = (try self.action.tryNth(n)) orelse return null;
-        const v = (try self.value.tryNth(n)) orelse return null;
+        const a = try self.action.tryNth(n);
+        const v = try self.value.tryNth(n);
         return .{ .action = a, .value = v, .pos = self.action.iter.pos() - 1 };
     }
 };
@@ -1851,6 +2355,15 @@ const testing = std.testing;
 /// nothing else, so a test that splices is a statement about the columns
 /// rather than about a view. The same shape `columns.zig` uses for its own
 /// tests.
+///
+/// Every accessor below is a plain field read with the `OpLike` name
+/// [`Columns(O).splice`](columns.zig) looks the row up by. This is a test
+/// fixture and is **not** a second implementation of anything: `visible`,
+/// `top` and `markIndex` are whatever the test put in the row rather than
+/// anything derived, which is the point — a test that splices a row and reads
+/// it back is checking that the columns preserved it, not that the port can
+/// recompute it. `succs` and `incs` are borrowed from the test's table and
+/// must outlive the splice.
 const Row = struct {
     op_id: OpId = .root,
     parent: ?OpId = null,
@@ -1867,70 +2380,94 @@ const Row = struct {
     succs: []const OpId = &.{},
     incs: []const ?i64 = &.{},
 
+    /// The row's own id, as the fixture stores it.
     pub fn id(self: Row) OpId {
         return self.op_id;
     }
 
+    /// The parent object, or null for a root row.
     pub fn obj(self: Row) ?OpId {
         return self.parent;
     }
 
+    /// The action, as the fixture stores it.
     pub fn action(self: Row) Action {
         return self.act;
     }
 
+    /// The map key or sequence anchor the row hangs by.
     pub fn key(self: Row) KeyRef {
         return self.anchor;
     }
 
+    /// Whether the row inserts rather than overwrites.
     pub fn insert(self: Row) bool {
         return self.does_insert;
     }
 
+    /// Whether a mark's expansion passes its end.
     pub fn expand(self: Row) bool {
         return self.does_expand;
     }
 
+    /// Whether the row is visible, as the test said it would be.
     pub fn visible(self: Row) bool {
         return self.is_visible;
     }
 
+    /// Whether the row wins its register, as the test said it would.
     pub fn top(self: Row) bool {
         return self.is_top;
     }
 
+    /// The width the test gave the row. The sequence type and the text
+    /// encoding are ignored: a fixture states its width, it does not compute
+    /// one.
     pub fn width(self: Row, _: types.SequenceType, _: types.TextEncoding) i64 {
         return self.units;
     }
 
+    /// The scalar the row carries.
     pub fn value(self: Row) ScalarValue {
         return self.v;
     }
 
+    /// The metadata word `value` would occupy in the value column.
     pub fn metaValue(self: Row) ValueMeta {
         return optypes.metaOf(self.v);
     }
 
+    /// The mark's name, or null for a row that is not a mark. Borrowed from
+    /// the test's table.
     pub fn markName(self: Row) ?[]const u8 {
         return self.name;
     }
 
+    /// The mark-index word, or null for a row that is not a mark. Stated by
+    /// the test rather than computed, for the reason the type doc gives.
     pub fn markIndex(self: Row) ?i64 {
         return self.mark;
     }
 
+    /// How many successors the row has: `succs.len`.
     pub fn succCount(self: Row) usize {
         return self.succs.len;
     }
 
+    /// The `i`-th successor's id. `i` is the caller's to keep below
+    /// [`succCount`](Row.succCount); this is a fixture, not a parser.
     pub fn succAt(self: Row, i: usize) OpId {
         return self.succs[i];
     }
 
+    /// How many successors carry an increment: `incs.len`.
     pub fn succIncCount(self: Row) usize {
         return self.incs.len;
     }
 
+    /// The `i`-th successor's increment, or null for one that deletes it.
+    /// `i` is the caller's to keep below
+    /// [`succIncCount`](Row.succIncCount).
     pub fn succIncAt(self: Row, i: usize) ?i64 {
         return self.incs[i];
     }
@@ -2334,6 +2871,78 @@ test "a short successor buffer is refused rather than truncated" {
     var all: usize = 0;
     while (try ok.next()) |_| all += 1;
     try testing.expectEqual(rich.len, all);
+}
+
+test "a successor buffer of exactly the widest row reads every row" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, &rich);
+    defer fx.deinit();
+    const cols = &fx.cols;
+    const whole = RowRange{ .start = 0, .end = cols.len() };
+
+    // The width boundary from both sides. `maxSuccCount` is the exact size a
+    // buffer needs and not one entry less: the test above refuses one entry
+    // less, and this pins that the number it hands out is itself enough —
+    // which is the property the type doc leans on when it says the buffer
+    // must hold "at least the widest row's successor count".
+    try testing.expectEqual(@as(usize, 2), try maxSuccCount(Row, cols, whole));
+    var exact: [2]SuccEntry = undefined;
+    var ok = try OpIter(Row).init(cols, fx.strings(), whole, &exact);
+    var rows: usize = 0;
+    while (try ok.next()) |_| rows += 1;
+    try testing.expectEqual(rich.len, rows);
+
+    // And one entry short is still refused, at the same row the wider
+    // buffer walks past: the refusal is about the width, not about being
+    // the last row.
+    var one_short: [1]SuccEntry = undefined;
+    var refused = try OpIter(Row).init(cols, fx.strings(), whole, &one_short);
+    var seen: usize = 0;
+    while (true) {
+        const got = refused.next() catch |e| {
+            try testing.expectEqual(error.TooLarge, e);
+            break;
+        };
+        if (got == null) break;
+        seen += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), seen);
+}
+
+test "a value takes exactly the width its word declares, and one byte more is refused" {
+    const gpa = testing.allocator;
+
+    // `(length << 4) | tag`: the byte length is the word's **high** bits and
+    // the type is the low nibble (`op_set2/meta.rs:19-43`), so the word alone
+    // decides how many bytes the read takes — and `+ 1` does not make it one
+    // byte longer.
+    const word = optypes.metaOf(.{ .str = "ab" });
+
+    var raw = try rawcol.RawColumn.init(gpa);
+    defer raw.deinit();
+    try raw.spliceSlice(0, 0, "ab");
+    try testing.expectEqual(@as(usize, 2), raw.len());
+
+    // Exactly what the arena holds reads, and the row past it is a missing
+    // value rather than an empty string.
+    var meta = try opcols.MetaColumn.init(gpa);
+    defer meta.deinit();
+    try meta.extend(gpa, &.{word.raw});
+    var exact = ValueIter.init(try meta.prefixIter(), raw.iterator());
+    try testing.expectEqualStrings("ab", (try exact.tryNext()).str);
+    try testing.expectError(error.MissingValue, exact.tryNext());
+
+    // One byte more than the arena holds is `error.InvalidValue`, not a short
+    // read: the value is refused rather than silently truncated, which is
+    // what `take` promises and what `try meta.length()` has to hand it. The
+    // word has to be *wider at the same tag* — `+ (1 << 4)` — because
+    // `+ 1` would leave the length at two and hand the same two bytes to
+    // `fromRaw` under the next type up (`meta.rs:23-38`).
+    var wide_meta = try opcols.MetaColumn.init(gpa);
+    defer wide_meta.deinit();
+    try wide_meta.extend(gpa, &.{word.raw + (@as(u64, 1) << 4)});
+    var wide = ValueIter.init(try wide_meta.prefixIter(), raw.iterator());
+    try testing.expectError(error.InvalidValue, wide.tryNext());
 }
 
 test "the successors a walk hands out are the ones loadSuccWindow reads" {

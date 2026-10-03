@@ -94,6 +94,10 @@ pub fn bitsCapacity(num_entries: u32, num_bits_per_entry: u32) usize {
 /// golden-vector tests and by `protocol.zig`. `parse` and `fromHashes` are
 /// the only ways a filter is built, and both keep the invariant
 /// `bits.len() == bitsCapacity(num_entries, num_bits_per_entry)`.
+///
+/// Single-threaded, as every type here is: no lock and no callback, so a
+/// filter shared across threads needs external synchronization, and nothing
+/// reenters.
 pub const BloomFilter = struct {
     /// How many hashes went in. Zero means "no filter at all", which is what
     /// `toBytes` turns into zero bytes and what `containsHash` answers `false`
@@ -106,6 +110,9 @@ pub const BloomFilter = struct {
     /// The bit array, least significant bit of each byte first
     /// (`bloom.rs:98-102`).
     bits: []u8,
+    /// The allocator `bits` was taken from and is released with; it is the
+    /// one `fromHashes` and `parse` allocate through. Borrowed, not owned: it
+    /// must outlive the filter, and `deinit` frees through it.
     gpa: Allocator,
 
     /// The filter that means "nothing", and the one a zero-length bloom
@@ -133,6 +140,13 @@ pub const BloomFilter = struct {
     /// A filter with no entries encodes as *nothing at all*, not as a zero
     /// count: `Have::default()` therefore contributes a zero-length bloom
     /// field (`sync/state.rs:86-89`, `sync.rs:683-685`).
+    ///
+    /// **The caller owns the result** and frees it with `gpa` — the allocator
+    /// given to this call, which need not be the filter's own, because the
+    /// buffer belongs to the caller from the moment it is returned and
+    /// nothing in the filter is released through it. An empty filter returns
+    /// an empty slice, which the allocator accepts for `free`. On an error
+    /// the filter is untouched and nothing is handed over.
     pub fn toBytes(self: BloomFilter, gpa: Allocator) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);

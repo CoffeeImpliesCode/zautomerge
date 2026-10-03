@@ -27,6 +27,26 @@
 //! (`automerge.rs:1754`), and it checks the index *before* touching the tree so
 //! a rejected call leaves the sequence exactly as it was.
 //!
+//! **A removal that cannot allocate is refused the same way.** Rust's global
+//! allocator cannot fail, so upstream has no second failure to answer for: it
+//! rebalances and descends in one breath, with the borrow checker already
+//! satisfied (`sequence_tree.rs:246-361`). This port allocates, so the two
+//! halves are separated — every rebalance reserves what it needs before its
+//! first structural write, and takes the element out before it applies the
+//! rebalance. Either way the descent is the only fallible step and it runs
+//! while every node above it is still untouched, so a refusal leaves the
+//! sequence exactly as it was found: the same elements in the same order, the
+//! same `length`, the same shape, and no subtree orphaned by a merge that was
+//! half applied. [`remove`](SequenceTree) states it on the declaration and
+//! [`checkInvariants`](SequenceTree) lets a caller assert it.
+//!
+//! An insertion that cannot allocate keeps the same elements in the same order
+//! and the same `length`, but it is *not* shape-preserving: a split that has
+//! already been paid for stays, because a node that split and did not take the
+//! element is still a valid tree. Shape is not part of the value — [`eql`](SequenceTree.eql)
+//! does not compare it — so this costs a walk that is slightly better
+//! balanced, never an answer that differs.
+//!
 //! A cursor is deliberately not here. Upstream resolves one through the op
 //! set, which holds the operation ids this tree never sees, so `Cursor` and
 //! `MoveCursor` belong to the op set and its cursor module, not to the
@@ -198,23 +218,45 @@ fn Node(comptime T: type) type {
 
         /// Reserves the room `mergeAssumeCapacity` needs, so that the merge
         /// itself cannot fail. Called before the caller gives up the elements
-        /// it is about to hand over.
+        /// it is about to hand over. The element slot covers the separator
+        /// even in the case where the merge does not carry one across: the
+        /// reservation is made before the caller knows which case it is in,
+        /// and one unused slot costs nothing.
         fn reserveMerge(self: *Self, gpa: Allocator, other: *const Self) Error!void {
             try self.elements.ensureUnusedCapacity(gpa, 1 + other.elements.items.len);
             try self.children.ensureUnusedCapacity(gpa, other.children.items.len);
         }
 
-        /// Absorbs `other` around `middle`: this node's elements, then the
-        /// separator, then the sibling's (`sequence_tree.rs:413-419`). The
+        /// Absorbs `other` after this node's own elements: the separator, when
+        /// there is one, then the sibling's (`sequence_tree.rs:413-419`). The
         /// room is already reserved by `reserveMerge`, and `other`'s two
         /// buffers are freed here because their contents now belong to this
         /// node.
-        fn mergeAssumeCapacity(self: *Self, middle: T, other: *Self) void {
-            self.elements.appendAssumeCapacity(middle);
+        ///
+        /// **`middle` is null where the caller's separator is the element that
+        /// came out and the merged node does not need one in its place** —
+        /// `removeFromMergedPair` says when that is. This node then gains
+        /// `other.length` and no separator, so `other`'s children are exactly
+        /// the ones this node was short of. Upstream merges the separator in
+        /// unconditionally and takes it back out again from the merged child
+        /// (`sequence_tree.rs:260-267`); a port that cannot descend into a
+        /// subtree it has already merged has to say which of the two it is
+        /// doing, because carrying the separator across would put back the
+        /// element that was just removed and count it twice — in the child's
+        /// `length` and in the `length` the merge adds for it.
+        ///
+        /// The result is one element below full, where upstream's would be
+        /// full, because the caller takes the element out of one of the two
+        /// children before merging them — which is what keeps a refused
+        /// descent from leaving this node half merged. Without the separator
+        /// it is two below. So what is asserted here is *not overfull*, not
+        /// *full*.
+        fn mergeAssumeCapacity(self: *Self, middle: ?T, other: *Self) void {
+            if (middle) |separator| self.elements.appendAssumeCapacity(separator);
             self.elements.appendSliceAssumeCapacity(other.elements.items);
             self.children.appendSliceAssumeCapacity(other.children.items);
-            self.length += other.length + 1;
-            std.debug.assert(self.isFull());
+            self.length += other.length + @as(usize, if (middle != null) 1 else 0);
+            std.debug.assert(self.elements.items.len <= 2 * B - 1);
 
             other.elements.deinit(other.gpa);
             other.children.deinit(other.gpa);
@@ -227,8 +269,101 @@ fn Node(comptime T: type) type {
             return self.elements.orderedRemove(index);
         }
 
+        /// Reserves the room a borrow needs: one element and one child, taken
+        /// at the front or the back of the two lists.
+        fn reserveBorrow(self: *Self) Error!void {
+            try self.elements.ensureUnusedCapacity(self.gpa, 1);
+            try self.children.ensureUnusedCapacity(self.gpa, 1);
+        }
+
+        /// Removes the element at `offset` of the three-part sequence
+        /// `left ++ [middle] ++ right`, then merges `right` into `left`
+        /// around `middle`. `element_index` is the separator's index and the
+        /// left child's index at once, and `offset` is the target measured
+        /// from the start of `left`.
+        ///
+        /// **The offset counts elements of the pair, so it is measured against
+        /// the whole of `left` — its `length`, which is its own elements *and*
+        /// the subtrees between them — and not against `left.elements`, which
+        /// is the same number only while `left` is a leaf.** Upstream removes
+        /// from the merged child it has just built (`sequence_tree.rs:265-266`)
+        /// and an index into that child is an index into its whole subtree;
+        /// measuring against the elements alone aims the removal at the wrong
+        /// element whenever `left` has children of its own.
+        ///
+        /// **The element comes out of whichever of the three holds it, before
+        /// the merge, and the merge's room was reserved by the caller while
+        /// both children were still in place.** So the descent is the only
+        /// fallible step and it happens before this node has moved at all: a
+        /// refusal leaves the node exactly as it was, with both children and
+        /// the separator still where they were. Upstream merges first and
+        /// descends into the wider subtree, which is the same answer in one
+        /// breath — and is not expressible in a port whose descent can be
+        /// refused halfway.
+        ///
+        /// **What the merged child gets in place of the separator depends on
+        /// the shape of the two.** Upstream merges the separator in and then
+        /// removes it again from the merged child in a second pass
+        /// (`:261-266`); this port removes first, so the separator is gone by
+        /// the time the merge runs and a replacement has to stand in for it
+        /// wherever the merged node's arity needs one. See the body.
+        ///
+        /// The reservation survives the descent because a removal never grows
+        /// the two lists of the node it is called on: it only shrinks them,
+        /// or borrows into a *descendant*, which reserves its own room.
+        fn removeFromMergedPair(self: *Self, element_index: usize, offset: usize) Error!T {
+            const left = &self.children.items[element_index];
+            const right = &self.children.items[element_index + 1];
+            // The whole of `left`, elements and subtrees alike, because the
+            // offset indexes the sequence the pair spells out and not the
+            // elements `left` holds on its own.
+            const left_len = left.length;
+
+            // The target is whichever of the three holds that offset: an
+            // element of `left` before the separator, the separator itself on
+            // it, and an element of `right` past it. A caller in
+            // `removeElementFromNonLeaf` always wants the separator.
+            const removed: T = if (offset < left_len)
+                try left.remove(offset)
+            else if (offset == left_len)
+                self.elements.items[element_index]
+            else
+                try right.remove(offset - left_len - 1);
+
+            // **A separator between two internal children has to be replaced,
+            // not dropped.** Without one the merged node would hold
+            // `(Le + 1) + (Re + 1)` children for `Le + Re` elements, and arity
+            // wants one more child than elements (`checkShape`). Upstream
+            // keeps the separator in place and removes it from the merged
+            // child in a second pass (`sequence_tree.rs:260-267`), which this
+            // port cannot do — that pass would be a fallible step after the
+            // merge was published — so a replacement comes out of `left`
+            // *before* the publication instead. It is still the last fallible
+            // step, the room it lands in is `left`'s own reservation, and the
+            // caller is handed the old separator all the same.
+            //
+            // A pair of leaves needs no replacement when its separator comes
+            // out. A target inside either child instead leaves the separator
+            // intact, so that value must still be carried into the merge.
+            const replacement: ?T = if (offset == left_len and !left.isLeaf() and !right.isLeaf())
+                try left.remove(left.length - 1)
+            else
+                null;
+
+            const middle = self.elements.orderedRemove(element_index);
+            var successor = self.children.orderedRemove(element_index + 1);
+            left.mergeAssumeCapacity(if (offset == left_len) replacement else middle, &successor);
+            self.length -= 1;
+            return removed;
+        }
+
         /// Removes the element at `index`, which the caller has found to be
         /// this node's own at `element_index` (`sequence_tree.rs:246-268`).
+        ///
+        /// A removal here is failure-atomic: each branch reserves the room it
+        /// needs before it moves anything, and the one fallible step is the
+        /// descent into a child, which happens while this node is still
+        /// whole. See `removeFromMergedPair`.
         fn removeElementFromNonLeaf(self: *Self, index: usize, element_index: usize) Error!T {
             if (self.children.items[element_index].elements.items.len >= B) {
                 // Borrow a replacement from the left neighbour.
@@ -248,28 +383,33 @@ fn Node(comptime T: type) type {
                 return removed;
             } else {
                 // Both neighbours are underfull: pull this node's element and
-                // the right child into the left one, then remove from the
-                // wider subtree.
-                self.length -= 1;
-                const middle = self.elements.orderedRemove(element_index);
-                var successor = self.children.orderedRemove(element_index + 1);
-                const left = &self.children.items[element_index];
-                try left.reserveMerge(self.gpa, &successor);
-                left.mergeAssumeCapacity(middle, &successor);
-
-                const total_index = self.cumulativeIndex(element_index);
-                return self.children.items[element_index].remove(index - total_index);
+                // the right child into the left one, and take the target out
+                // of the pair. The target is this node's own element — `index`
+                // is where the separator sits, the separator sits where `left`
+                // ends, so the offset below is exactly its position in
+                // `left ++ [middle] ++ right` (`sequence_tree.rs:260-267`).
+                try self.children.items[element_index].reserveMerge(
+                    self.gpa,
+                    &self.children.items[element_index + 1],
+                );
+                return self.removeFromMergedPair(element_index, index - self.cumulativeIndex(element_index));
             }
         }
 
-        /// Removes `index` from a child that is underfull, first making that
-        /// child big enough by merging or borrowing from a neighbour
-        /// (`sequence_tree.rs:277-361`).
+        /// Removes `index` from a child, rebalancing that child first when it
+        /// is underfull (`sequence_tree.rs:277-361`).
+        ///
+        /// **Every branch reserves what the rebalance needs, then takes the
+        /// element out, and only then moves anything.** Upstream rebalances
+        /// first and descends into the widened child; this port descends
+        /// first and applies the rebalance to the result, which is the same
+        /// sequence at the end and the only order a refusal survives: the
+        /// descent is the one fallible step, it runs while this node is
+        /// untouched, and the rebalance after it is already paid for. So a
+        /// refusal leaves the node exactly as it was, and a node never has an
+        /// element lifted out from under a half-applied rebalance.
         fn removeFromInternalChild(self: *Self, index: usize, child_slot: usize) Error!T {
-            // The merge below pulls the child into its left neighbour, and
-            // the removal then has to come out of that neighbour
-            // (`sequence_tree.rs:299`).
-            var child_index = child_slot;
+            const child_index = child_slot;
             if (self.children.items[child_index].elements.items.len < B and
                 (child_index == 0 or self.children.items[child_index - 1].elements.items.len < B) and
                 (child_index + 1 == self.children.items.len or
@@ -277,69 +417,74 @@ fn Node(comptime T: type) type {
             {
                 // The child and both neighbours are underfull, so the child is
                 // merged with one of them and this node's element between them
-                // becomes the median of the new node.
-                if (child_index > 0) {
-                    const middle = self.elements.orderedRemove(child_index - 1);
-                    var successor = self.children.orderedRemove(child_index);
-                    child_index -= 1;
-                    const left = &self.children.items[child_index];
-                    try left.reserveMerge(self.gpa, &successor);
-                    left.mergeAssumeCapacity(middle, &successor);
-                } else {
-                    const middle = self.elements.orderedRemove(child_index);
-                    var successor = self.children.orderedRemove(child_index + 1);
-                    const left = &self.children.items[child_index];
-                    try left.reserveMerge(self.gpa, &successor);
-                    left.mergeAssumeCapacity(middle, &successor);
-                }
+                // becomes the median of the new node (`sequence_tree.rs:299`).
+                // Upstream pulls the child into its left neighbour where there
+                // is one, and into its right one otherwise.
+                const element_index = if (child_index > 0) child_index - 1 else 0;
+                try self.children.items[element_index].reserveMerge(
+                    self.gpa,
+                    &self.children.items[element_index + 1],
+                );
+                return self.removeFromMergedPair(element_index, index - self.cumulativeIndex(element_index));
             } else if (self.children.items[child_index].elements.items.len < B) {
                 if (child_index > 0 and self.children.items[child_index - 1].elements.items.len >= B) {
                     // Move the left neighbour's last element up into this node
                     // and the element it replaces down into the child, and its
                     // last child along with them.
+                    const child = &self.children.items[child_index];
+                    try child.reserveBorrow();
+                    const removed = try child.remove(index - self.cumulativeIndex(child_index));
+
                     const last = &self.children.items[child_index - 1];
                     const last_element = last.elements.orderedRemove(last.elements.items.len - 1);
                     last.length -= 1;
                     const parent_element = self.elements.items[child_index - 1];
                     self.elements.items[child_index - 1] = last_element;
-
-                    const child = &self.children.items[child_index];
-                    try child.elements.insert(self.gpa, 0, parent_element);
+                    child.elements.insertAssumeCapacity(0, parent_element);
                     child.length += 1;
-
                     if (last.children.items.len > 0) {
                         const last_child = last.children.orderedRemove(last.children.items.len - 1);
                         last.length -= last_child.length;
-                        try child.children.insert(self.gpa, 0, last_child);
+                        child.children.insertAssumeCapacity(0, last_child);
                         child.length += last_child.length;
                     }
+                    self.length -= 1;
+                    return removed;
                 } else if (child_index + 1 < self.children.items.len and
                     self.children.items[child_index + 1].elements.items.len >= B)
                 {
                     // The mirror image: the right neighbour's first element
                     // comes down, and its first child with it.
+                    const child = &self.children.items[child_index];
+                    try child.reserveBorrow();
+                    const removed = try child.remove(index - self.cumulativeIndex(child_index));
+
                     const right = &self.children.items[child_index + 1];
                     const first_element = right.elements.orderedRemove(0);
                     right.length -= 1;
                     const parent_element = self.elements.items[child_index];
                     self.elements.items[child_index] = first_element;
-
-                    const child = &self.children.items[child_index];
-                    try child.elements.append(self.gpa, parent_element);
+                    child.elements.appendAssumeCapacity(parent_element);
                     child.length += 1;
-
                     if (right.children.items.len > 0) {
                         const first_child = right.children.orderedRemove(0);
                         right.length -= first_child.length;
-                        try child.children.append(self.gpa, first_child);
+                        child.children.appendAssumeCapacity(first_child);
                         child.length += first_child.length;
                     }
+                    self.length -= 1;
+                    return removed;
                 }
             }
 
-            self.length -= 1;
+            // The child is already wide enough, so the removal goes straight
+            // into it and this node only shortens by one — after the descent,
+            // because the descent is the fallible step and this node must not
+            // have moved when that step is refused.
             const total_index = self.cumulativeIndex(child_index);
-            return self.children.items[child_index].remove(index - total_index);
+            const removed = try self.children.items[child_index].remove(index - total_index);
+            self.length -= 1;
+            return removed;
         }
 
         /// Removes the element at `index` in this subtree
@@ -427,11 +572,32 @@ fn Node(comptime T: type) type {
 
 /// A sequence of `T`, indexed by position, with `O(log n)` insertion and
 /// removal (`sequence_tree.rs:8-133`).
+///
+/// **The value is a handle, not the storage.** It owns its nodes, and the only
+/// release is [`deinit`](SequenceTree.deinit); copying the struct copies that
+/// handle, so two copies point at one set of node buffers and deiniting both
+/// frees them twice. Move it, or keep one.
+///
+/// The elements are stored by value and the tree never looks inside them, so
+/// `T` may be anything — but [`eql`](SequenceTree.eql) compares them with
+/// `std.meta.eql`, which is only defined for a comparable type. That is the
+/// one constraint the signature does not express, and it is a constraint only
+/// on the comparison, not on the container.
 pub fn SequenceTree(comptime T: type) type {
     return struct {
         const Self = @This();
 
+        /// The allocator every node of this tree was allocated from, and the
+        /// one [`deinit`](SequenceTree.deinit) frees them into. It is taken
+        /// once, here, and never passed again: a tree that allocated from one
+        /// allocator and freed into another is undefined behaviour, and no
+        /// per-call `gpa` parameter can make that unrepresentable without
+        /// giving up the stored one.
         gpa: Allocator,
+        /// The root node, or null while the sequence is empty. A tree with no
+        /// root is the state `init` returns and the state a removal that
+        /// empties the root returns to; it holds no buffer of its own, so it
+        /// needs no `deinit` beyond the one every tree gets.
         root: ?Node(T) = null,
 
         /// A new, empty sequence.
@@ -439,6 +605,17 @@ pub fn SequenceTree(comptime T: type) type {
             return .{ .gpa = gpa };
         }
 
+        /// Releases every node of the tree, recursively: both of each node's
+        /// lists and, through the root, every node below it. **The allocator
+        /// is not released** — `gpa` is a handle this file does not own — and
+        /// the elements are not freed either, because they were never copied:
+        /// they are the caller's own values, stored by value in the nodes.
+        ///
+        /// The tree is unusable afterwards. `deinit` leaves `root` null, which
+        /// reads as a valid empty tree, so a second call is a harmless no-op
+        /// rather than a double free; but nothing may be read from a value
+        /// whose elements are gone, and a tree that was moved rather than
+        /// deinited must not be deinited twice.
         pub fn deinit(self: *Self) void {
             if (self.root) |*root| root.deinit();
             self.root = null;
@@ -449,6 +626,8 @@ pub fn SequenceTree(comptime T: type) type {
             return if (self.root) |*root| root.length else 0;
         }
 
+        /// True when the sequence holds nothing, which is the state a tree is
+        /// in before its first `push` and after a removal that emptied it.
         pub fn isEmpty(self: *const Self) bool {
             return self.len() == 0;
         }
@@ -522,6 +701,13 @@ pub fn SequenceTree(comptime T: type) type {
         }
 
         /// The element at `index`, or null when the index is past the end.
+        ///
+        /// The pointer borrows a node's own element list, so **it is
+        /// invalidated by the next mutation** — an `insert`, a `push` or a
+        /// `remove` may split, merge or shrink the very list it points into,
+        /// and the read after that is a use-after-free rather than a stale
+        /// value. It is not invalidated by a read, by `iter`, or by
+        /// `checkInvariants`, none of which writes.
         pub fn get(self: *const Self, index: usize) ?*const T {
             const root: *const Node(T) = if (self.root) |*r| r else return null;
             return root.get(index);
@@ -537,6 +723,16 @@ pub fn SequenceTree(comptime T: type) type {
         /// Removes and returns the element at `index`. Returns
         /// `error.InvalidIndex` when the sequence is empty or the index is past
         /// the end (`sequence_tree.rs:109-111`).
+        ///
+        /// **Failure leaves the sequence exactly as it was** — and that covers
+        /// `error.OutOfMemory`, not only the index check. A removal reserves
+        /// every rebalance's room before its first structural write and takes
+        /// the element out before it applies one, so the only fallible step is
+        /// the descent, which runs while every node above it is still whole.
+        /// The residue on a refusal is therefore nothing at all: same elements,
+        /// same order, same `length`, same shape, no orphaned subtree and no
+        /// leaked node. See the module doc for why the order is the other way
+        /// round from upstream's.
         pub fn remove(self: *Self, index: usize) Error!T {
             if (self.root == null or index >= self.len()) return error.InvalidIndex;
             const root = &self.root.?;
@@ -596,17 +792,35 @@ pub fn SequenceTree(comptime T: type) type {
 /// Each step is a tree descent, so walking `n` elements costs `O(n log n)`,
 /// which is upstream's behaviour and the reason a caller that wants a slice
 /// copies it rather than walking the tree.
+///
+/// **The iterator borrows the tree and nothing keeps it alive.** `tree` is a
+/// raw `*const`, so a walk held across a [`deinit`](SequenceTree.deinit)
+/// reads freed memory, and one held across an `insert`, `push` or `remove`
+/// reads whatever the rebalancing left in the nodes — which is not a stale
+/// value but a use-after-free, because those operations move the very
+/// element lists the walk descends into. A caller that wants to mutate while
+/// walking therefore copies out what it needs first
+/// ([`SequenceTree.get`](SequenceTree.get) has the same rule); the cost of
+/// doing so is the `O(n log n)` the walk already charges.
 pub fn Iter(comptime T: type) type {
     return struct {
         const Self = @This();
 
+        /// The tree being walked. A borrow, not an owning handle: nothing
+        /// here keeps it alive, and the pointer is invalidated by the next
+        /// mutation or by `deinit`.
         tree: *const SequenceTree(T),
         /// The next index to read.
         index: usize,
-        /// The end of the walk, exclusive.
+        /// The end of the walk, exclusive. Fixed when the iterator is built,
+        /// so it is not re-read from the tree — which is why a walk is only
+        /// as long as the sequence was when the iterator was made.
         stop: usize,
 
-        /// The next element, or null at the end of the walk.
+        /// The next element, or null at the end of the walk. The returned
+        /// pointer borrows the tree and is invalidated by exactly what this
+        /// iterator is invalidated by; it is **not** invalidated by the next
+        /// call to `next`, which only advances this iterator's own index.
         pub fn next(self: *Self) ?*const T {
             if (self.index >= self.stop) return null;
             const at = self.index;
@@ -657,6 +871,31 @@ fn expectMatches(tree: anytype, model: anytype) !void {
         try testing.expectEqual(items[i], element.*);
     }
     try testing.expectEqual(items.len, i);
+}
+
+/// A node of `width - 1` separators over `width` single-element leaves, the
+/// subtree spelling `base, base + 1, ...` in sequence order, measured and
+/// ready to be wired in as a child.
+fn wiredNode(gpa: Allocator, base: u32, width: usize) !Node(u32) {
+    var node = Node(u32).init(gpa);
+    errdefer node.deinit();
+    var next = base;
+    for (0..width) |i| {
+        {
+            var leaf = Node(u32).init(gpa);
+            errdefer leaf.deinit();
+            try leaf.elements.append(gpa, next);
+            leaf.length = 1;
+            try node.children.append(gpa, leaf);
+        }
+        next += 1;
+        if (i + 1 < width) {
+            try node.elements.append(gpa, next);
+            next += 1;
+        }
+    }
+    node.length = node.measure();
+    return node;
 }
 
 /// A SplitMix64 generator. The property tests need the index stream proptest
@@ -1013,6 +1252,140 @@ test "property: interleaved inserts and removes keep the tree in step" {
             }
             try expectMatches(&tree, model.items);
         }
+    }
+}
+
+// ── Failure-atomicity of a removal ───────────────────────────────────────────
+//
+// A removal rebalances, and it rebalances by allocating, because Rust's
+// global allocator cannot be refused and this port's can. The sweep below
+// pins the promise the module doc makes, and both halves of it are
+// consumer-visible: an element lost to a half-applied merge shows up as a
+// shorter sequence and a different answer from `get`, and a subtree orphaned
+// by one shows up as a leak in the testing allocator.
+//
+// The removal is always from the middle of a tree several levels deep, so it
+// descends to a leaf and comes back up through a borrow or a merge at every
+// level — which is the only shape in which the reserve-then-descent order is
+// observable at all. `expectMatches` after a *successful* removal is there to
+// say the reordering did not change the answer; the same call after a
+// *refused* one is there to say the refusal changed nothing at all.
+fn removeUnderFailure(gpa: Allocator) !void {
+    var tree = SequenceTree(u32).init(gpa);
+    defer tree.deinit();
+
+    var model: std.ArrayList(u32) = .empty;
+    defer model.deinit(gpa);
+
+    for (0..96) |i| {
+        try tree.push(@intCast(i));
+        try model.append(gpa, @intCast(i));
+    }
+    try expectMatches(&tree, model.items);
+
+    while (model.items.len > 0) {
+        const index = model.items.len / 2;
+        const removed = tree.remove(index) catch |e| switch (e) {
+            error.OutOfMemory => {
+                try expectMatches(&tree, model.items);
+                return e;
+            },
+            else => |rest| return rest,
+        };
+        try testing.expectEqual(model.items[index], removed);
+        _ = model.orderedRemove(index);
+        try expectMatches(&tree, model.items);
+    }
+    try testing.expect(tree.isEmpty());
+}
+
+test "a removal refused for want of memory leaves the sequence whole" {
+    try testing.checkAllAllocationFailures(testing.allocator, removeUnderFailure, .{});
+}
+
+test "leaf pair removals preserve the separator only when it survives" {
+    const gpa = testing.allocator;
+    for ([_]usize{ 2 * B, 3 * B }) |count| {
+        for ([_]usize{ 0, B - 1, B }) |at| {
+            var tree = SequenceTree(u32).init(gpa);
+            defer tree.deinit();
+            var model: std.ArrayList(u32) = .empty;
+            defer model.deinit(gpa);
+
+            // Append-built leaves hold B - 1 elements except the last one.
+            // Shorten that leaf so all siblings need a merge, then remove
+            // before, at, or after the first separator. With two leaves the
+            // root collapses; with three it remains above the merged pair.
+            for (0..count) |value| {
+                try tree.push(@intCast(value));
+                try model.append(gpa, @intCast(value));
+                try expectMatches(&tree, model.items);
+            }
+            try testing.expectEqual(model.items[count - 1], try tree.remove(count - 1));
+            _ = model.orderedRemove(count - 1);
+            try expectMatches(&tree, model.items);
+
+            try testing.expectEqual(model.items[at], try tree.remove(at));
+            _ = model.orderedRemove(at);
+            try expectMatches(&tree, model.items);
+        }
+    }
+}
+
+test "a separator between two internal children" {
+    const gpa = testing.allocator;
+
+    // A node is never left with a child under `B` once a removal has
+    // rebalanced it, so two *adjacent* children that are both internal and
+    // both underfull — the one shape where a merged pair cannot close up
+    // around the gap, since the merged node's children would then outnumber
+    // its elements by two (`checkShape`) — only turns up in a subtree of some
+    // hundreds of elements after a long pruning history. The shape is wired
+    // up here instead and the removal itself is the public one, through
+    // `removeElementFromNonLeaf`'s merge branch.
+    //
+    // Every element is distinct, so a removal that kept the separator, took
+    // its value out of the wrong subtree, or shifted the rest along is an
+    // answer the walk cannot mistake for the right one. The widths pair a
+    // left child wide enough to rebalance internally with one so narrow it
+    // cannot, and both are under `B`, which is the pair the rule is about.
+    for ([_][2]usize{ .{ 2, 4 }, .{ 3, 3 }, .{ 4, 2 }, .{ 5, 6 } }) |widths| {
+        var tree = SequenceTree(u32).init(gpa);
+        defer tree.deinit();
+
+        var root = Node(u32).init(gpa);
+        var adopted = false;
+        errdefer if (!adopted) root.deinit();
+        var next: u32 = 0;
+        for (widths, 0..) |width, child_index| {
+            var child = try wiredNode(gpa, next, width);
+            root.children.append(gpa, child) catch |e| {
+                // Not adopted yet, so it is still this scope's to free.
+                child.deinit();
+                return e;
+            };
+            next += @intCast(2 * width - 1);
+            if (child_index == 0) {
+                try root.elements.append(gpa, next);
+                next += 1;
+            }
+        }
+        root.length = root.measure();
+        adopted = true;
+        tree.root = root;
+
+        var model: std.ArrayList(u32) = .empty;
+        defer model.deinit(gpa);
+        for (0..next) |value| try model.append(gpa, @intCast(value));
+        try expectMatches(&tree, model.items);
+
+        // The separator is the one value the two children step over: the
+        // whole tree spells `0..<next`, so every other element is somewhere
+        // around it and has to be exactly where it was afterwards.
+        const at = 2 * widths[0] - 1;
+        try testing.expectEqual(model.items[at], try tree.remove(at));
+        _ = model.orderedRemove(at);
+        try expectMatches(&tree, model.items);
     }
 }
 

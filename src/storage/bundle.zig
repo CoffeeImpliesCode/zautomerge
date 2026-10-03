@@ -245,6 +245,12 @@ pub const change_specs = struct {
 /// `actor` and `deps` are in *document* index space, not bundle index space:
 /// `Builder` rewrites every actor through an [`ActorMapper`] as the columns
 /// are written (`bundle/builder.rs:21-44`).
+///
+/// Copying this is copying a value with no allocation and no borrow in it: the
+/// slices it holds (`message`, `deps`, `extra`) are borrowed from the caller and
+/// the copy shares them, so it must not outlive them. Nothing here is mutated
+/// by the writer, so a copy may be read from another thread while the original
+/// lives.
 pub const BundleMetadata = struct {
     /// The change's hash. Used only to resolve dependency indices; it is not
     /// stored in the bundle, because the bundle reconstructs changes rather
@@ -255,6 +261,13 @@ pub const BundleMetadata = struct {
     seq: u64,
     /// The largest op counter the change's last op carries.
     max_op: u64,
+    /// The change's commit time, in **seconds since the Unix epoch** — the same
+    /// `i64` a change chunk header carries as `time`
+    /// ([`src/change.zig`](../../change.zig)) and the same value the change
+    /// graph's timestamp column holds, which is where the writer takes it from.
+    /// The writer stores it verbatim as a delta cell and the reader reads it back
+    /// verbatim, with no unit conversion at either end, so a caller that means
+    /// milliseconds writes a different column and a different bundle.
     timestamp: i64,
     /// The commit message, or null when the change has none.
     message: ?[]const u8,
@@ -303,6 +316,18 @@ pub const BundleMetadata = struct {
 /// The mapping is built in one pass at the end, from the set of actors some
 /// column mentioned, in ascending document-index order. Nothing may use the
 /// mapping before `buildMapping` has run.
+///
+/// **The allocator is both stored and passed.** `init` keeps what it was given
+/// and every later allocation goes through that kept copy — `buildMapping`'s
+/// replacement for `used` included — while `deinit` frees with the allocator its
+/// own parameter names. **The two must be the same value**, which nothing here
+/// can check: freeing through a different allocator is a silent heap violation
+/// rather than a compile error. The actor table is borrowed, not owned.
+///
+/// **Copying this copies an owner.** The three arrays belong to the mapper, so
+/// exactly one copy may be torn down. It has no interior mutability once
+/// `buildMapping` has run, so the value may be read from another thread then,
+/// but not while `processActor`, `processOp` or `buildMapping` is running.
 pub const ActorMapper = struct {
     /// One flag per document actor: has anything mentioned it.
     seen: []bool,
@@ -316,7 +341,8 @@ pub const ActorMapper = struct {
     actors: []const ActorId,
     gpa: Allocator,
 
-    /// A mapper over the document actor table `actors`.
+    /// A mapper over the document actor table `actors`. `deinit` must be given
+    /// this same `gpa`; see the type comment.
     pub fn init(gpa: Allocator, actors: []const ActorId) Allocator.Error!ActorMapper {
         const seen = try gpa.alloc(bool, actors.len);
         errdefer gpa.free(seen);
@@ -342,6 +368,11 @@ pub const ActorMapper = struct {
 
     /// Releases the mapper's three allocations. The actor table belongs to the
     /// caller.
+    ///
+    /// **`gpa` must be the allocator `init` was given**, because that is the
+    /// one every allocation here went through; see the type comment. After this
+    /// the struct is poisoned, not emptied, so one call per value and one call
+    /// per copy.
     pub fn deinit(self: *ActorMapper, gpa: Allocator) void {
         gpa.free(self.seen);
         gpa.free(self.mapping);
@@ -436,6 +467,10 @@ pub const ActorMapper = struct {
 /// absent; an element id writes the actor and counter columns and leaves the
 /// string absent (`bundle/builder.rs:360-364`). There is no flag column, and
 /// which columns carry a value is the whole encoding.
+///
+/// Copying this is copying a value with no allocation in it; the `map` arm
+/// borrows the caller's bytes and the copy shares them. Either may be read from
+/// another thread.
 pub const KeyRef = union(enum) {
     /// A property name, borrowed from the caller.
     map: []const u8,
@@ -539,6 +574,22 @@ pub const KeyRef = union(enum) {
 /// builds one of those per row and hands it over, and `Builder` replaces
 /// `pred` with the predecessor list it collected from the successor map before
 /// any of it reaches a column.
+///
+/// **Where this value comes from decides who owns what it points at**, and it is
+/// this type in both directions:
+///
+/// * Handed to [`Builder.processOp`] by a caller, it is the caller's own: `key`,
+///   `value`, `mark_name` and `pred` are whatever that caller had. Nothing here
+///   borrows the builder.
+/// * Returned by [`OpIter.next`], every slice in it is a borrow:
+///   [`BundleOp.pred`] is the iterator's own `scratch` list, valid **until the
+///   next call to `next`**, which clears and refills it and may reallocate it;
+///   `key`'s `map` string, `mark_name`, and a `value` that is `str` or `bytes`
+///   point into the bundle's column data and last as long as the bundle does.
+///   A row held across a second `next` call reads stale or reallocated bytes.
+///
+/// Copying this is copying those borrows, so the copy is not a second owner and
+/// neither may outlive what they point at.
 pub const BundleOp = struct {
     /// The operation's own id.
     id: OpId,
@@ -558,8 +609,14 @@ pub const BundleOp = struct {
     expand: bool,
     /// The name of the mark this operation sets, or null.
     mark_name: ?[]const u8,
-    /// The operation's predecessors. Filled in by `Builder.processOp` from the
-    /// successor map, so a value the caller supplies here is discarded.
+    /// The operation's predecessors. On the way in, `Builder.processOp` replaces
+    /// whatever the caller supplies with the list it collected from the
+    /// successor map, so a caller's value here is discarded.
+    ///
+    /// On the way out — as a row from [`OpIter.next`] — this is **borrowed from
+    /// the iterator's own scratch list and is valid only until the next call to
+    /// `next`**, which clears and refills that list. A row kept across a second
+    /// `next` reads stale or reallocated data.
     pred: []const OpId,
 
     /// A `delete` of `id` on `obj` at `key`, the operation
@@ -1174,6 +1231,18 @@ const LastOp = struct {
 /// change's position in canonical `(actor, seq)` order
 /// (`bundle/builder.rs:75-78`), which is what the caller needs in order to
 /// reconstruct the changes afterwards.
+///
+/// **The allocator is both stored and passed, and the two must be the same
+/// value.** `init` keeps what it was given, and `processOp`, `processSucc` and
+/// `flushDeletes` allocate through that kept copy; `finish` takes its own
+/// allocator for the bundle it hands back; `deinit` frees with the one its
+/// parameter names. Nothing here can check the three agree, and freeing
+/// through a different allocator is a silent heap violation rather than a
+/// compile error.
+///
+/// **`finish` is one-shot.** See [`Builder.finish`].
+///
+/// **Copying this copies an owner**, so exactly one copy may be torn down.
 pub const Builder = struct {
     gpa: Allocator,
     mapper: ActorMapper,
@@ -1186,9 +1255,13 @@ pub const Builder = struct {
     /// The predecessors of each op the writer has not yet reached, collected
     /// from the successor edges the op set walked past.
     preds: PredMap,
+    /// Whether [`Builder.finish`] has run. A builder is written once and
+    /// finished once; see that method for why the second call is refused.
+    finished: bool = false,
 
     /// A builder over `changes`, the document actor table `actors`, and
-    /// `gpa` (`bundle/builder.rs:52-96`).
+    /// `gpa` (`bundle/builder.rs:52-96`). `finish` and `deinit` must be given
+    /// this same `gpa`; see the type comment.
     pub fn init(
         gpa: Allocator,
         changes: []BundleMetadata,
@@ -1231,11 +1304,17 @@ pub const Builder = struct {
             .builders = builders,
             .last = null,
             .preds = .empty,
+            .finished = false,
         };
     }
 
     /// Releases everything the builder allocated. The changes slice and the
     /// actor table belong to the caller.
+    ///
+    /// **`gpa` must be the allocator `init` was given and the one `finish` was
+    /// given**, because that is where everything here was allocated; see the
+    /// type comment. After this the struct is poisoned, not emptied, so one
+    /// call per value and one call per copy.
     pub fn deinit(self: *Builder, gpa: Allocator) void {
         self.mapper.deinit(gpa);
         self.change_writer.deinit(gpa);
@@ -1360,7 +1439,24 @@ pub const Builder = struct {
     /// The finished bundle: the uncompressed form the writer iterates over,
     /// and the per-column DEFLATE form that is the on-disk one
     /// (`bundle/builder.rs:143-229`).
+    ///
+    /// **`gpa` must be the allocator `init` was given**, because the bundle
+    /// this hands back is built through it and [`Builder.deinit`] will free
+    /// through it; see the type comment.
+    ///
+    /// **One call per builder, whatever the outcome.** `remapActorCells`
+    /// rewrites `obj_actor`, `key_actor`, `id_actor` and `pred_actor` *in
+    /// place*, through `mapper.remap` (`bundle/builder.rs:21-44`), and the
+    /// change writer does the same to its actor column. Those cells hold
+    /// bundle indices once this has run, and feeding them through `remap` a
+    /// second time reads them as document indices, so a second call would
+    /// silently produce a bundle whose every actor index is wrong rather than
+    /// fail. The flag is set before the first mutation, so a `finish` that
+    /// fails part way through is as finished as one that succeeds: a second
+    /// call is `error.Invariant`.
     pub fn finish(self: *Builder, gpa: Allocator) WriteError!Bundle {
+        if (self.finished) return error.Invariant;
+        self.finished = true;
         try self.flushDeletes();
         try self.mapper.buildMapping(null);
 
@@ -1461,10 +1557,33 @@ pub const Builder = struct {
 /// always verified: `parse_following_header` builds the structure
 /// (`bundle/storage.rs:151-273`) and `verify` walks every change row and every
 /// op row (`bundle/storage.rs:275-295`).
+///
+/// **Which buffer each borrow points into.** There are two, and they are not
+/// the same one:
+///
+/// * The **column sets** index `body`. `body` is the rebuilt chunk when a
+///   column was deflated and the caller's own chunk otherwise, and either way
+///   it is the bytes the columns were re-pointed at, so it must outlive the
+///   bundle. The keep-alive obligation here is [`parse`]'s and
+///   [`parseFramedChunk`]'s, and on the deflate path the bundle holds `body`
+///   itself.
+/// * **The prefix arrays** `deps` and `actors` borrow the chunk the bundle was
+///   read from, which is `disk` when a column was deflated and `body`
+///   otherwise — that is, [`Bundle.bytes`] — because `readPrefix` runs at the
+///   top of [`parseFramedChunk`], before the DEFLATE pass, and each actor id's
+///   bytes are borrowed out of the frame being walked. **Retaining `body`
+///   alone is not enough on the deflate path**, and the chunk that must outlive
+///   the bundle there is the caller's input, not anything the bundle owns.
+///
+/// **Copying this copies an owner.** A copy holds the same two chunks, the
+/// same prefix arrays, the same column lists and the same counters, so exactly
+/// one copy may be torn down. Nothing here is mutated after the parse returns,
+/// so the value may be read from another thread while it lives.
 pub const Bundle = struct {
     /// The whole chunk, header included, in its uncompressed form. The column
-    /// ranges below are offsets into this, and every borrowed slice points
-    /// into it, so it must outlive the bundle.
+    /// ranges below are offsets into this and the column sets index it, so it
+    /// must outlive the bundle — but the prefix arrays `deps` and `actors` do
+    /// not borrow it on the deflate path; see the type comment.
     body: []const u8,
     /// Whether `body` is this bundle's to free.
     owns_body: bool,
@@ -1475,8 +1594,13 @@ pub const Bundle = struct {
     /// Whether `disk` is this bundle's to free.
     owns_disk: bool,
     /// The chunk prefix: dependency hashes the bundle names but does not hold.
+    /// **Borrowed from `disk` when a column was deflated and from `body`
+    /// otherwise**, which is [`Bundle.bytes`]; see the type comment.
     deps: []ChangeHash,
     /// The chunk prefix: the actor ids the bundle's actor columns index into.
+    /// **Borrowed from `disk` when a column was deflated and from `body`
+    /// otherwise**, which is [`Bundle.bytes`]; each actor's bytes are a slice
+    /// of the chunk, not a copy. See the type comment.
     actors: []ActorId,
     /// The change metadata columns, with ranges relative to `changes_data`.
     changes_cols: RawColumns,
@@ -1511,11 +1635,15 @@ pub const Bundle = struct {
     disk_header_len: usize,
 
     /// The dependencies the bundle names but does not hold, in prefix order.
+    /// Borrowed from [`Bundle.bytes`] and owned by nobody: see the type
+    /// comment for why that is `disk` and not `body` on the deflate path.
     pub fn depsList(self: *const Bundle) []const ChangeHash {
         return self.deps;
     }
 
     /// The actor ids the bundle's actor columns index into, in prefix order.
+    /// Borrowed from [`Bundle.bytes`] — `disk` on the deflate path — and owned
+    /// by nobody: each `ActorId` is a slice of that chunk.
     pub fn actorList(self: *const Bundle) []const ActorId {
         return self.actors;
     }
@@ -1569,7 +1697,14 @@ pub const Bundle = struct {
     }
 
     /// Releases the bundle's allocations. The bytes `body` and `disk` point at
-    /// are freed too when the bundle owns them.
+    /// are freed too when the bundle owns them; the chunk it was parsed from is
+    /// borrowed and never freed, whichever of the two the prefix arrays borrow
+    /// it through.
+    ///
+    /// After this the struct is poisoned, not emptied: `self.*` is set to
+    /// undefined, so reading any field afterwards is a use of undefined memory.
+    /// One call per value, and — because a copy is a second owner — one call per
+    /// copy.
     pub fn deinit(self: *Bundle, gpa: Allocator) void {
         if (self.owns_body) gpa.free(self.body);
         if (self.owns_disk and self.disk != null) gpa.free(self.disk.?);
@@ -1750,10 +1885,14 @@ fn framed(gpa: Allocator, body: []const u8) Allocator.Error!Frame {
 /// `error.InvalidChunkType`, the same refusal `change_chunk.zig` makes for a
 /// `document` or `bundle` chunk it cannot read.
 ///
-/// The returned bundle borrows `bytes` unless a column was deflated, in which
-/// case it holds a rebuilt uncompressed copy and `bytes` becomes the on-disk
-/// form. `deinit` releases whatever it allocated; `bytes` itself is never
-/// freed.
+/// **The keep-alive obligation is `bytes` itself, not the bundle's own body.**
+/// With nothing deflated the columns index `bytes` and the prefix arrays borrow
+/// it, and the bundle holds no chunk of its own. With a column deflated the
+/// bundle holds a rebuilt uncompressed copy in `body`, the prefix arrays still
+/// borrow `bytes` — `readPrefix` runs before the DEFLATE pass — and `bytes`
+/// becomes `disk`. `deinit` releases whatever it allocated; the chunk it was
+/// read from is never freed, and it must stay alive for as long as the bundle
+/// is used. See the [`Bundle`] type comment for which borrow points where.
 ///
 /// A bundle with nothing compressed is read in place: the column sets index
 /// straight into `bytes`, which is upstream's zero-copy fast path
@@ -1845,11 +1984,10 @@ pub fn parseFramedChunk(c: chunk.Chunk, gpa: Allocator) ParseError!Bundle {
     // does: `parse_following_header` hands back an empty remaining input
     // whatever the cursor position was (`bundle/storage.rs:193-195`,
     // `:257-258`).
-    const id_ctr = try extractIdCtr(gpa, out.changes_cols, out.ops_cols);
-    gpa.free(out.id_ctr);
-    out.id_ctr = id_ctr;
-
     if (out.changes_cols.allUncompressed() and out.ops_cols.allUncompressed()) {
+        const id_ctr = try extractIdCtr(gpa, out.changes_cols, out.ops_cols);
+        gpa.free(out.id_ctr);
+        out.id_ctr = id_ctr;
         try verify(gpa, &out);
         return out;
     }
@@ -1901,8 +2039,20 @@ pub fn parseFramedChunk(c: chunk.Chunk, gpa: Allocator) ParseError!Bundle {
     // assembled in, so the sets are re-pointed at the bytes the bundle keeps.
     out.changes_cols.data = out.body[changes_start..changes_end];
     out.ops_cols.data = out.body[ops_start..ops_end];
-    // `id_ctr` was computed from the deflated column sets, which is the same
-    // arithmetic over the same bytes, so it stays valid for the rebuilt ones.
+
+    // The counters are built from the *rebuilt* sets, not from the ones that
+    // came off the wire. `extractIdCtr` decodes the `ID_CTR_INVERSE` column as
+    // a delta stream and walks the change metadata with `ChangeIter`, and
+    // `ColumnSpec.encoding` masks bit 3 alone (`column_spec.zig:147`,
+    // `:202-204`), so a DEFLATE-marked delta column matches just the same and
+    // `col.bytes(ops.data)` would hand a raw DEFLATE stream to
+    // `delta.Delta(?i64).decodeAll`. Building them here, from the inflated
+    // bytes, is what upstream does (`bundle/storage.rs:242-255`): the pass runs
+    // first and the counters are computed from the same columns
+    // `OpIter` and `ChangeIter` then read.
+    const id_ctr = try extractIdCtr(gpa, out.changes_cols, out.ops_cols);
+    gpa.free(out.id_ctr);
+    out.id_ctr = id_ctr;
     try verify(gpa, &out);
     return out;
 }
@@ -1991,6 +2141,16 @@ fn readColumnBlock(in: *Input, gpa: Allocator) ParseError!ColumnBlock {
     const descs = sink.descs orelse &.{};
     defer gpa.free(sink.descs orelse &.{});
 
+    // Order over the descriptors as they were read, before `RawColumns.init`
+    // drops the zero-length ones (`column_spec.zig:432-437`). Upstream parses
+    // each block with `RawColumns::parse` (`bundle/storage.rs:173`, `:179`),
+    // which keeps every descriptor the block listed and runs
+    // `are_normal_sorted` over that whole set (`raw_column.rs:232-253`,
+    // `:289-297`), so a block whose first column is empty still has to be
+    // ascending from there. This is where the check belongs — before the data
+    // block is located, as upstream puts it.
+    try descsInNormalOrder(descs);
+
     // The data block is exactly the sum of the declared lengths, so a sum past
     // what is left means a column's length runs past the block. Checked before
     // `take`, so a hostile length costs a comparison and not a read.
@@ -2003,6 +2163,24 @@ fn readColumnBlock(in: *Input, gpa: Allocator) ParseError!ColumnBlock {
         .cols = try RawColumns.init(gpa, descs, data),
         .data = .init(start, start + data.len),
     };
+}
+
+/// The block's descriptors, in ascending normalized order, or
+/// `error.InvalidColumnSpec`.
+///
+/// The whole set takes part, zero-length descriptors included, because upstream
+/// compares the columns the metadata block listed rather than the columns that
+/// survived construction (`raw_column.rs:232-253`, `:289-297`). A repeat is not
+/// a decrease and so passes here; `RawColumns.validate` reports one, as
+/// `error.DuplicateColumn`, once the empty columns are gone.
+fn descsInNormalOrder(descs: []const ColumnDesc) ParseError!void {
+    var previous: ?ColumnSpec = null;
+    for (descs) |desc| {
+        if (previous) |prev| {
+            if (desc.spec.compare(prev) == .lt) return error.InvalidColumnSpec;
+        }
+        previous = desc.spec;
+    }
 }
 
 /// The `readCountThen` destination for a column metadata block. A descriptor is
@@ -2194,6 +2372,11 @@ fn changeOrder(gpa: Allocator, changes: RawColumns) ParseError![]ChangeOrder {
 /// into the column. `deps` are indices too — below `changes.len` for a change
 /// the bundle holds, and `changes.len + k` for the `k`th hash in
 /// [`Bundle.depsList`] (`bundle/builder.rs:277-303`).
+///
+/// Copying this is copying a row's borrows, not a second owner: `message` and
+/// `extra` point into the bundle's column data and `deps` into the iterator's
+/// scratch list, so a copy must not outlive either. Nothing here is mutated, so
+/// a copy may be read from another thread while the iterator lives.
 pub const BundleChange = struct {
     actor: ActorIdx,
     /// Always null. Upstream carries the field and never fills it
@@ -2202,6 +2385,11 @@ pub const BundleChange = struct {
     seq: u64,
     start_op: u64,
     max_op: u64,
+    /// The change's commit time, in **seconds since the Unix epoch**, exactly
+    /// as [`BundleMetadata.timestamp`] carries it and exactly as this column
+    /// stores it: one delta cell per change, decoded as-is, with no unit
+    /// conversion. A bundle written in milliseconds carries a different column
+    /// and different bytes, and nothing at this surface converts it.
     timestamp: i64,
     message: ?[]const u8,
     /// The dependency indices, borrowed from the iterator and valid until the
@@ -2220,6 +2408,13 @@ pub const BundleChange = struct {
 /// allocation before the column is read; here the vector grows one entry at a
 /// time, so a count larger than the dependency column holds stops at the first
 /// read past its end.
+///
+/// **The row this hands back borrows from the iterator and from the bundle.**
+/// [`BundleChange.deps`] is the iterator's own scratch list and lasts until the
+/// next [`ChangeIter.next`] call, which clears and refills it; `message` and
+/// `extra` are slices of the bundle's column data. **Copying an iterator copies
+/// an owner**: two copies share one scratch list and one set of decoders, so
+/// exactly one copy may be torn down and only one may be advanced at a time.
 pub const ChangeIter = struct {
     actor: encoding.Decoder,
     seq: encoding.Decoder,
@@ -2282,7 +2477,15 @@ pub const ChangeIter = struct {
         return self;
     }
 
-    /// Releases the dependency scratch. The column bytes belong to the bundle.
+    /// Releases the dependency scratch, which the iterator owns. The column
+    /// bytes belong to the bundle. After this the iterator's scratch list is
+    /// gone, so a row held across this call no longer has a live `deps`.
+    ///
+    /// Unlike the bundle writers' teardowns this does **not** poison the struct:
+    /// it releases the one allocation, and the decoders are left holding slices
+    /// of the caller's column bytes. Calling it twice frees nothing the second
+    /// time; calling `next` afterwards is undefined, because the scratch list it
+    /// appends to is gone.
     pub fn deinit(self: *ChangeIter) void {
         self.scratch.deinit(self.gpa);
     }
@@ -2338,6 +2541,17 @@ pub const ChangeIter = struct {
 /// of `ParseError::InvalidOpColumn` (`bundle/builder.rs:907`). The id counter
 /// column in either encoding is accepted and ignored here, because the storage
 /// layer has already turned it into `id_ctr` (`bundle/builder.rs:889-891`).
+///
+/// **The row this hands back borrows from the iterator and from the bundle.**
+/// [`BundleOp.pred`] is the iterator's own scratch list and lasts until the
+/// next [`OpIter.next`] call, which clears and refills it; `key`'s `map` string,
+/// `mark_name`, and a `value` that is `str` or `bytes` point into the bundle's
+/// column data. A row held across a second `next` reads stale or reallocated
+/// bytes.
+///
+/// **Copying an iterator copies an owner**: two copies share one scratch list
+/// and one set of decoders, so exactly one copy may be torn down and only one
+/// may be advanced at a time.
 pub const OpIter = struct {
     obj_actor: encoding.Decoder,
     obj_ctr: encoding.Decoder,
@@ -2445,7 +2659,15 @@ pub const OpIter = struct {
         return self;
     }
 
-    /// Releases the predecessor scratch. The column bytes belong to the bundle.
+    /// Releases the predecessor scratch, which the iterator owns. The column
+    /// bytes belong to the bundle. After this the iterator's scratch list is
+    /// gone, so a row held across this call no longer has a live `pred`.
+    ///
+    /// Unlike the bundle writers' teardowns this does **not** poison the struct:
+    /// it releases the one allocation, and the decoders are left holding slices
+    /// of the caller's column bytes. Calling it twice frees nothing the second
+    /// time; calling `next` afterwards is undefined, because the scratch list it
+    /// appends to is gone.
     pub fn deinit(self: *OpIter) void {
         self.scratch.deinit(self.gpa);
     }
@@ -3259,8 +3481,10 @@ test "malformed bundles are rejected, one class at a time" {
 /// nothing at all (`std/mem/Allocator.zig:447`), so a first call that failed
 /// would show nothing however wrong it was. Once a mapping exists `used` is a
 /// real allocation, and the next call has to swap it for another without ever
-/// leaving it freed. That state is reachable: `Builder.finish` is `pub` and
-/// takes the builder by pointer, and each call runs `buildMapping` again.
+/// leaving it freed. That state is reachable because `buildMapping` is `pub`
+/// and takes the mapper by pointer, so a caller may map, map again and then
+/// read the result; [`Builder.finish`], which used to be a second route to it,
+/// is one-shot now.
 ///
 /// The sweep fails remaps as well as allocations, because
 /// `ArrayList.toOwnedSlice` only allocates when the in-place shrink is refused
@@ -3337,4 +3561,199 @@ test "a bundle survives every allocation failure" {
         &reference_rich,
     };
     try testing.checkAllAllocationFailures(gpa, parseThenDeinit, .{&fixtures});
+}
+
+test "a deflated bundle reconstructs its counters from the inflated columns" {
+    const gpa = testing.allocator;
+    // The DEFLATE pass is not limited to the value payload: `deflateBlock`
+    // deflates every column of at least `deflate_min_size` bytes
+    // (`raw_column.rs:62-75`). What decides a column's size is the number of
+    // *runs* its codec emits rather than the number of rows it holds, and the
+    // four change-block columns the counter reconstruction reads are three
+    // delta streams and an actor column. One actor writing one op per change
+    // makes every one of those deltas `+1`, so the three are a single repeat
+    // run of a few bytes however many rows there are, and the actor column a
+    // single repeat run too. Three hundred changes of that shape — the fixture
+    // this one replaces — puts none of them near the threshold, so the bundle
+    // comes out with nothing deflated at all: a bundle the reader never routes
+    // through the inflate pass, which is the whole thing this test is about.
+    //
+    // Two interleaved actors are what make them grow. Every third op below
+    // belongs to the second actor, and every op is its own change, so change
+    // `j` is the `c`th op of its actor and `seq`, `start_op` and `max_op` are
+    // all that one counter. The three counter columns then carry `+1, -(t+1),
+    // t+2` per group of three rows — no two consecutive deltas equal, so one
+    // literal run rather than a run of repeats — and the actor column becomes
+    // four hundred alternating runs. The op block's `ID_CTR_INVERSE` is actor
+    // 0's four hundred document positions at gaps of one and two, again with
+    // no equal neighbours, then actor 1's two hundred at a constant three.
+    // All five columns are well past 256 bytes, so all five reach the wire as
+    // DEFLATE streams.
+    //
+    // That is what makes the counters worth reconstructing from the inflated
+    // bytes: `extractIdCtr` decodes `ID_CTR_INVERSE` as a delta stream and
+    // walks the change metadata with `ChangeIter`, and `ColumnSpec.encoding`
+    // masks bit 3 alone (`column_spec.zig:147`, `:202-204`), so a
+    // DEFLATE-marked column matches just the same and `col.bytes(...)` hands
+    // the raw stream to the decoder. Upstream computes the counters after the
+    // pass (`bundle/storage.rs:242-255`), and this is what pins that.
+    const count = 600;
+    const second_actor = [_]u8{
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
+    };
+    const actors = [_]ActorId{ .{ .bytes = &reference_actor }, .{ .bytes = &second_actor } };
+    // Each op's counter in document order: what the writer's own `id_ctr`
+    // holds, what the reader reconstructs, and what the change row for that
+    // op carries as its sequence number.
+    var counters: [count]u64 = undefined;
+    var next: [2]u64 = .{ 1, 1 };
+    var metas: [count]BundleMetadata = undefined;
+    for (&metas, 0..) |*m, i| {
+        const slot: usize = if (i % 3 == 2) 1 else 0;
+        const ctr = next[slot];
+        next[slot] = ctr + 1;
+        counters[i] = ctr;
+        const n: u64 = i + 1;
+        const low: u16 = @intCast(n);
+        m.* = .{
+            .hash = ChangeHash.fromChecksum(.{ @truncate(low), @truncate(low >> 8), 0x33, 0x44 }),
+            .actor = @intCast(slot),
+            .seq = ctr,
+            .max_op = ctr,
+            .timestamp = 0,
+            .message = null,
+            .deps = &.{},
+            .extra = "",
+            .start_op = ctr,
+            .builder = i,
+        };
+    }
+    var builder = try Builder.init(gpa, &metas, &actors);
+    defer builder.deinit(gpa);
+    for (counters, 0..) |ctr, i| {
+        try builder.processOp(.{
+            .id = OpId.init(@intCast(ctr), @as(ActorIdx, if (i % 3 == 2) 1 else 0)),
+            .obj = .root,
+            .key = .{ .map = "k" },
+            .action = .set,
+            .value = .null_value,
+            .insert = false,
+            .expand = false,
+            .mark_name = null,
+            .pred = &.{},
+        });
+    }
+    var written = try builder.finish(gpa);
+    defer written.deinit(gpa);
+
+    const on_disk = try gpa.dupe(u8, written.bytes());
+    defer gpa.free(on_disk);
+    var back = try parse(gpa, on_disk);
+    defer back.deinit(gpa);
+    try testing.expect(back.checksumValid());
+
+    // The two renderings are the same bundle written twice, and the DEFLATE
+    // bit is part of a descriptor, so a column that was deflated cannot leave
+    // them equal. Comparing the bytes says the writer's pass ran without
+    // pinning by how much it saved, which is nothing the format promises: a
+    // column over the threshold may still come back longer than it went in.
+    try testing.expect(!std.mem.eql(u8, written.bytes(), written.body));
+    // And the reader took the copy-and-inflate path to match, which is the
+    // property the counters depend on: `disk` is set only when some column
+    // carried the DEFLATE bit, and the columns are then read out of the
+    // rebuilt chunk `body` points at rather than the caller's own bytes.
+    try testing.expect(back.disk != null);
+
+    // Every change row and every op row survives, and the counters are the
+    // ones the writer computed.
+    var changes = try ChangeIter.init(back.changes_cols, gpa);
+    defer changes.deinit();
+    var seen: usize = 0;
+    while (try changes.next()) |_| seen += 1;
+    try testing.expectEqual(count, seen);
+
+    var ops = try OpIter.init(back.ops_cols, back.id_ctr, gpa);
+    defer ops.deinit();
+    seen = 0;
+    while (try ops.next()) |_| seen += 1;
+    try testing.expectEqual(count, seen);
+    try testing.expectEqualSlices(i64, written.id_ctr, back.id_ctr);
+
+    // And the change rows carry the metadata the writer gave them, which is
+    // the half that comes out of the inflated columns. The bundle actor index
+    // is the document one: both actors are used, so the mapper hands them out
+    // in document order (`bundle/builder.rs:148`).
+    var rows = try ChangeIter.init(back.changes_cols, gpa);
+    defer rows.deinit();
+    var row_index: usize = 0;
+    while (try rows.next()) |row| : (row_index += 1) {
+        try testing.expectEqual(@as(ActorIdx, if (row_index % 3 == 2) 1 else 0), row.actor);
+        try testing.expectEqual(counters[row_index], row.seq);
+        try testing.expectEqual(counters[row_index], row.start_op);
+        try testing.expectEqual(counters[row_index], row.max_op);
+    }
+    try testing.expectEqual(@as(usize, count), row_index);
+}
+
+test "a builder finishes once, and a second finish is refused" {
+    const gpa = testing.allocator;
+    // `remapActorCells` rewrites the op writer's four actor cell arrays in
+    // place, through `mapper.remap` (`bundle/builder.rs:21-44`), and the change
+    // writer does the same to its actor column. Those cells hold *bundle*
+    // indices once `finish` has run, so feeding them through `remap` again
+    // reads them as document indices and yields a bundle whose every actor
+    // index is wrong — silently, because nothing downstream can tell. The flag
+    // makes it `error.Invariant` instead.
+    var metas = [_]BundleMetadata{.{
+        .hash = ChangeHash.fromChecksum(.{ 0x11, 0x22, 0x33, 0x44 }),
+        .actor = 0,
+        .seq = 1,
+        .max_op = 1,
+        .timestamp = 0,
+        .message = null,
+        .deps = &.{},
+        .extra = "",
+        .start_op = 1,
+        .builder = 0,
+    }};
+    const actors = [_]ActorId{.{ .bytes = &reference_actor }};
+    var builder = try Builder.init(gpa, &metas, &actors);
+    defer builder.deinit(gpa);
+    try builder.processOp(.{
+        .id = OpId.init(1, 0),
+        .obj = .root,
+        .key = .{ .map = "k" },
+        .action = .set,
+        .value = .null_value,
+        .insert = false,
+        .expand = false,
+        .mark_name = null,
+        .pred = &.{},
+    });
+    var written = try builder.finish(gpa);
+    defer written.deinit(gpa);
+
+    try testing.expectError(error.Invariant, builder.finish(gpa));
+
+    // The first bundle is untouched by the refusal, and a builder that has
+    // never been finished still finishes — the flag is per builder, not a
+    // global.
+    try testing.expect(written.checksumValid());
+    var fresh = try Builder.init(gpa, &metas, &actors);
+    defer fresh.deinit(gpa);
+    try fresh.processOp(.{
+        .id = OpId.init(1, 0),
+        .obj = .root,
+        .key = .{ .map = "k" },
+        .action = .set,
+        .value = .null_value,
+        .insert = false,
+        .expand = false,
+        .mark_name = null,
+        .pred = &.{},
+    });
+    var second = try fresh.finish(gpa);
+    defer second.deinit(gpa);
+    try testing.expectEqualSlices(u8, written.bytes(), second.bytes());
 }

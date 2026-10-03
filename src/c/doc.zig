@@ -26,17 +26,56 @@
 //!
 //! # What "the whole crate" cost, and the three places the port cannot follow
 //!
-//! ## 1. The `RefCell` caches are `@constConst`-ed pointers
+//! ## 1. The `RefCell` caches are `@constCast`-ed pointers
 //!
 //! The reference caches computed spellings in `RefCell` so that a
 //! `*const AMactorId` can fill them: `hex_str` (`src/actor_id.rs:18`),
 //! `bytes`/`fmt_str` (`src/cursor.rs:30-31`), `c_actor_id` (`src/obj.rs:19`),
 //! `change_hash` (`src/change.rs:23`). This port does the same with
 //! `@constCast` on a `const`-parameter pointer, and the module docs on
-//! [`AMactorId.toStr`], [`AMcursor.toBytes`], [`AMobjId.actorHandle`] and
-//! [`AMchangeFooter`] each say so. **This is the only unsound-looking thing
+//! [`AMcursor.toBytes`], [`AMcursor.toStr`], [`AMchange.extraBytes`] and
+//! [`AMchange.size`] each say so. **This is the only unsound-looking thing
 //! here and it is sound**: the memory is inside the handle the C caller
 //! already holds, and the cache is idempotent.
+//!
+//! [`AMactorId.toStr`] is the exception that proves the rule is a choice
+//! rather than a habit. Its upstream counterpart fills a `RefCell` lazily,
+//! but this port stages the hex when the handle is built
+//! ([`newActorId`]), because `AMactorIdStr` has no error channel and a lazily
+//! built cache could report an allocation failure only as an empty string.
+//!
+//! ### What the casts oblige a caller to do
+//!
+//! **A handle, a result, an `AMitems`, an `AMstack` and an `AMbyteSpan` may
+//! be reached from only one thread at a time.** Nothing in this ABI takes a
+//! lock, the caches above are plain fields rather than atomics, and
+//! [`AMitem.retain`]/[`AMitem.deinit`] count a shared item in a plain `usize`
+//! exactly as `Rc::strong_count` does upstream (`src/item.rs:1672`) — upstream
+//! can rely on `AMitem` being `!Sync` to keep that safe, and a C ABI has no way
+//! to say so.
+//!
+//! ### The rule a C caller actually has, which is stronger
+//!
+//! **Calls from different threads must use one caller-owned global
+//! serialization boundary, even across distinct handles; they must not
+//! overlap.** The casts above are only half of it. The other half is [`c_io`]:
+//! this file binds one process-wide single-threaded `std.Io` provider at the
+//! seam, so `AMcreate`, `AMclone`, `AMfork`, `AMload`, `AMloadIncremental`,
+//! `AMchangeLoadDocument` and `AMactorIdInit` all reach shared runtime state.
+//! Two threads building different documents still require that same boundary.
+//! A thread-safe `malloc` is not a thread-safe library.
+//!
+//! Hold the caller's lock through each outer call and its callbacks. An
+//! `AMstackCallback` invoked by `AMstackResult`, `AMstackItem` or `AMstackItems`
+//! may synchronously inspect the stack and result, including advancing a local
+//! borrowed `AMitems` cursor or copying diagnostics with `AMstrdup`, on the
+//! invoking thread under that already-held lock; nested inspection must not
+//! reacquire or release it. Diagnostic copies are independently owned and need
+//! `free`. Keep the stack and result live without popping, freeing, replacing
+//! or relinking them.
+//! This does not permit general mutation, other reentrancy or cross-thread
+//! entry. `include/automerge.h`'s `\section threads` and `AMstackCallback`
+//! contract state the full rule and callback lifetimes.
 //!
 //! ## 2. `AMobjIdIndex` has no port answer
 //!
@@ -198,7 +237,11 @@ pub const AMunknownValue = result.AMunknownValue;
 /// below goes to the layer that *does* take a clock — which is the layer
 /// `read.zig` itself calls. See the module doc.
 pub const DocItem = struct {
+    /// The value, borrowed from the document that produced it. Rust:
+    /// `read.DocItem` (`read.zig:276-289`).
     value: optypes.ValueRef,
+    /// The object the value was read from, in the port's shape: a union of
+    /// `root` and `OpId{counter, actor_index}` (`types.zig:245-247`).
     id: ExId,
 };
 
@@ -248,6 +291,45 @@ const ScalarValue = valmod.ScalarValue;
 pub fn cTextEncoding() types.TextEncoding {
     return .utf8_code_unit;
 }
+
+/// The C bridge's `std.Io`, and the only one any export in this ABI uses.
+///
+/// **This is the whole of the bridge's ambient state, and it is deliberately
+/// a single-threaded provider.** [`Document.init`](../../doc.zig),
+/// [`Document.initWithEncoding`](../../doc.zig), [`Document.load`](../../doc.zig)
+/// and [`ActorId.random`](../../types.zig) all take a `std.Io`, and the C ABI
+/// has nowhere to put one: no `AMcreate` parameter, no `AMdoc` field a caller
+/// can reach, and a fixed set of entry points. So the bridge binds one here,
+/// at the seam, exactly as [`result.CAbi.c_allocator`](result.zig) binds the
+/// allocator for the same reason. Everything above it is an explicit
+/// parameter; nothing above it guesses.
+///
+/// `std.Io.Threaded.global_single_threaded` is the library's own documented
+/// choice for exactly this situation (`std/Io/Threaded.zig:1695-1704`: "In
+/// general, the application is responsible for choosing the `Io`
+/// implementation and library code should accept an `Io` parameter rather than
+/// accessing this declaration"), and it is the only one that can serve a C
+/// consumer who has no runtime of their own to offer. Its own doc says "**This
+/// instance does not support concurrency or cancelation**" (`:1703`), which
+/// is the sentence the C-facing threading rule is built from: see the module
+/// doc's thread-confinement section.
+///
+/// **Consequence for a C caller: calls from different threads must share one
+/// global serialization boundary**, including calls that touch nothing but
+/// `malloc`. Separate documents, actors and sync states do not license overlap,
+/// because the provider is process-wide and single-threaded. Hold the caller's
+/// lock through the outer call and its callbacks. Synchronous stack/result
+/// inspection by an invoked `AMstackCallback`, including local cursor iteration
+/// or copying diagnostics with `AMstrdup`, on that same thread uses the
+/// already-held lock and must not reacquire or release it. Diagnostic copies
+/// are independently owned and need `free`. Keep the stack and result live
+/// and preserve their ownership and links; this
+/// exception permits no general mutation, other reentrancy or cross-thread
+/// entry. See `include/automerge.h`'s `\section threads` and callback contract.
+///
+/// Tests in this file use [`std.testing.io`] instead, which is a test-local
+/// provider and does not depend on this binding existing.
+pub const c_io: std.Io = std.Io.Threaded.global_single_threaded.io();
 
 // ---------------------------------------------------------------------------
 // The handles. Every one of them is forward-declared in include/automerge.h,
@@ -369,14 +451,32 @@ pub const AMdoc = struct {
     // that the close is not something a caller can forget at one site and not
     // another. Everything else goes through `d.doc`, and closes by hand.
 
+    /// The encoding the document indexes text in. Rust: `AutoCommit::text_encoding`
+    /// (`src/doc.rs:279-282`).
+    ///
+    /// A property of the document's rows rather than of a transaction, so this
+    /// does **not** close: a read between two writes must not become a commit
+    /// point just because something asked what encoding is in force.
     pub fn textEncoding(self: *const AMdoc) types.TextEncoding {
         return self.doc.textEncoding();
     }
 
+    /// The document's own actor id, by value. Rust: `doc.get_actor().clone()`
+    /// (`src/doc.rs:302-304`).
+    ///
+    /// **The returned `ActorId` borrows the document's arena** and is
+    /// invalidated by the next mutation or by freeing the result the document
+    /// came from. Every C entry point that reports one copies it first
+    /// ([`actorValue`]), so this method's own borrow never reaches C.
     pub fn getActorId(self: *const AMdoc) ActorId {
         return self.doc.getActorId();
     }
 
+    /// Sets the document's actor id for the changes it makes next. Rust:
+    /// `doc.set_actor(id.clone())` (`src/doc.rs:373-377`).
+    ///
+    /// **`id` borrows the caller's bytes**, which the document copies into its
+    /// own arena; the caller keeps ownership of whatever it passed.
     pub fn setActorId(self: *AMdoc, id: ActorId) void {
         self.doc.setActorId(id);
     }
@@ -389,6 +489,13 @@ pub const AMdoc = struct {
         return self.doc.objectType(id);
     }
 
+    /// The allocator this document was built with.
+    ///
+    /// Every buffer the document and any transaction opened against it owns
+    /// belongs to it, which is why [`AMdoc.open`] takes no allocator argument
+    /// and why a document built on anything but `c_alloc` could not be freed
+    /// by the C ABI. A C caller has no use for this: the C surface binds
+    /// `c_allocator` at the boundary and there is no `AMdocAllocator`.
     pub fn allocator(self: *const AMdoc) Allocator {
         return self.doc.allocator();
     }
@@ -400,52 +507,115 @@ pub const AMdoc = struct {
         return self.doc.getHeads(gpa);
     }
 
+    /// The document's complete save bytes. Rust: `doc.save()` (`src/doc.rs:91-98`).
+    ///
+    /// Closes the transaction first, so this is a commit point, and the
+    /// returned slice is **the caller's**: free it with the allocator it was
+    /// passed. It does not borrow the document.
     pub fn save(self: *AMdoc, gpa: Allocator) ![]u8 {
         try self.close();
         return self.doc.save(gpa);
     }
 
+    /// The bytes of the changes this document has that `have` does not name.
+    /// Rust: `doc.save_incremental(have)` (`src/doc.rs:113-127`).
+    ///
+    /// Closes the transaction first. The returned slice is the caller's and
+    /// must be freed with the allocator it was passed.
     pub fn saveIncremental(self: *AMdoc, gpa: Allocator) ![]u8 {
         try self.close();
         return self.doc.saveIncremental(gpa);
     }
 
+    /// Applies an incremental save to the document and answers how many
+    /// bytes it consumed. Rust: `doc.load_incremental(data)`
+    /// (`src/doc.rs:140-152`).
+    ///
+    /// Closes the transaction first, so this is a commit point. `bytes` is
+    /// read and not retained; a short or undecodable input is an error, never
+    /// a partial application.
     pub fn loadIncremental(self: *AMdoc, gpa: Allocator, bytes: []const u8) !usize {
         try self.close();
         return self.doc.loadIncremental(gpa, bytes);
     }
 
+    /// Integrates already-parsed changes and answers how many were applied.
+    /// Rust: `doc.apply_changes(changes)` (`src/doc.rs:171-183`).
+    ///
+    /// Closes the transaction first. `incoming` is borrowed for the call only;
+    /// the changes themselves are stored by value, and the caller keeps
+    /// ownership of the slice.
     pub fn applyChanges(self: *AMdoc, gpa: Allocator, incoming: []const changemod.Change) !usize {
         try self.close();
         return self.doc.applyChanges(gpa, incoming);
     }
 
+    /// The document's changes that `have` does not name, in dependency order.
+    /// Rust: `doc.get_changes(have)` (`src/doc.rs:196-208`).
+    ///
+    /// Closes the transaction first. The returned `Changes` owns its change
+    /// bodies and must be released with `deinit(gpa)` and the same allocator —
+    /// it is not an `AMresult`, and no C entry point hands one out directly.
     pub fn getChanges(self: *AMdoc, gpa: Allocator, have: []const ChangeHash) !docmod.Changes {
         try self.close();
         return self.doc.getChanges(gpa, have);
     }
 
+    /// The changes `other` has that this document does not. Rust:
+    /// `doc.get_changes_added(&other.0)` (`src/doc.rs:220-236`).
+    ///
+    /// Closes **both** documents first: upstream's `AutoCommit::get_changes_added`
+    /// borrows `&mut self` twice, so a held transaction on either side has to
+    /// be resolved before the comparison can see the same rows a C caller
+    /// sees. `other` is not consumed. The returned `Changes` belongs to the
+    /// caller.
     pub fn getChangesAdded(self: *AMdoc, gpa: Allocator, other: *AMdoc) !docmod.Changes {
         try self.close();
         try other.close();
         return self.doc.getChangesAdded(gpa, &other.doc);
     }
 
+    /// The hashes in `heads` that this document does not have. Rust:
+    /// `doc.get_missing_deps(heads)` (`src/doc.rs:249-266`).
+    ///
+    /// Closes the transaction first. The returned slice is the caller's and
+    /// must be freed with the allocator it was passed.
     pub fn getMissingDeps(self: *AMdoc, gpa: Allocator, heads: []const ChangeHash) ![]ChangeHash {
         try self.close();
         return self.doc.getMissingDeps(gpa, heads);
     }
 
+    /// The change this document holds with `hash`, or null. Rust:
+    /// `doc.get_change_by_hash(&hash)` (`src/doc.rs:278-292`).
+    ///
+    /// Closes the transaction first. **The returned `Built` owns the change's
+    /// columns**, which is why every C entry point that wants one goes through
+    /// [`ownedChangeValue`] and copies the framed bytes rather than handing
+    /// the borrow out: a C caller holding it across a mutation would be
+    /// holding a pointer into storage the document is free to reallocate.
     pub fn getChangeByHash(self: *AMdoc, gpa: Allocator, hash: ChangeHash) !?docmod.Built {
         try self.close();
         return self.doc.getChangeByHash(gpa, hash);
     }
 
+    /// The last change this document authored, or null. Rust:
+    /// `doc.get_last_local_change()` (`src/doc.rs:305-320`).
+    ///
+    /// Closes the transaction first, so a change written but not yet committed
+    /// is the answer. The returned `Built` belongs to the caller, on the same
+    /// terms as [`getChangeByHash`]'s.
     pub fn getLastLocalChange(self: *AMdoc, gpa: Allocator) !?docmod.Built {
         try self.close();
         return self.doc.getLastLocalChange(gpa);
     }
 
+    /// Merges `other` into this document and answers the heads of the result.
+    /// Rust: `doc.merge(&mut other.0)` (`src/doc.rs:369-381`).
+    ///
+    /// Closes **both** documents first, for the same reason as
+    /// [`getChangesAdded`]. `other` is not consumed and stays usable. The
+    /// returned slice is the caller's and must be freed with the allocator it
+    /// was passed.
     pub fn merge(self: *AMdoc, gpa: Allocator, other: *AMdoc) ![]ChangeHash {
         try self.close();
         try other.close();
@@ -477,6 +647,13 @@ pub const AMdoc = struct {
         return .{ .doc = try self.doc.forkAt(gpa, heads, .auto) };
     }
 
+    /// Rewinds the document to `heads`, dropping every change after them.
+    /// Rust: `doc.isolate(heads)` (`src/doc.rs:390-403`).
+    ///
+    /// Closes the transaction first, because an isolation point is a commit
+    /// point. This **destroys history**: anything the document held that
+    /// `heads` does not name is gone, including the caller's own uncommitted
+    /// writes.
     pub fn isolate(self: *AMdoc, gpa: Allocator, heads: []const ChangeHash) !void {
         try self.close();
         return self.doc.isolate(gpa, heads);
@@ -495,6 +672,12 @@ pub const AMdoc = struct {
         return self.doc.integrate();
     }
 
+    /// The document's counters. Rust: `doc.stats()` (`src/doc.rs:412-428`).
+    ///
+    /// Closes the transaction first, so the counts include the pending writes.
+    /// The returned `Stats` is a value that owns nothing; its borrowed slices
+    /// are views of the document's own storage and are invalidated by the next
+    /// mutation.
     pub fn stats(self: *AMdoc) !docmod.Stats {
         try self.close();
         return self.doc.stats();
@@ -512,44 +695,63 @@ pub const AMdoc = struct {
 pub const AMactorId = struct {
     /// The borrowed actor id. Rust: `body: *const am::ActorId` (`:18`).
     body: *const ActorId,
-    /// The allocator, for [`hex`]. Rust reaches the same thing through the
-    /// global `Box` (`:19`, `src/result.rs:95`).
+    /// The allocator that built every allocation this handle owns — the actor
+    /// cell, the copy of the bytes inside it, and [`hex`]. Rust reaches the
+    /// same thing through the global `Box` (`:19`, `src/result.rs:95`).
     gpa: Allocator,
-    /// `hex_str: RefCell<Option<Box<str>>>` (Rust: `src/actor_id.rs:19`).
-    /// Filled on the first [`toStr`] and freed with the cell.
-    hex: ?[]u8 = null,
+    /// The lowercase hexadecimal spelling, `hex_str: RefCell<Option<Box<str>>>`
+    /// in the reference (`src/actor_id.rs:19`).
+    ///
+    /// **Staged when the handle is built, never on first use.** Upstream fills
+    /// it lazily through a `RefCell` because `AMactorIdStr` takes
+    /// `*const AMactorId` (`src/actor_id.rs:177`), and this port's
+    /// `AMactorIdStr` has no error channel to report an allocation failure
+    /// through. Filling it at construction moves the only fallible step into
+    /// [`AMobjId.of`] and [`actorValue`], which are already fallible, so the
+    /// accessor is a field read that cannot be wrong. See [`AMactorId.toStr`].
+    hex: []u8,
 
+    /// Releases [`hex`] and poisons the cell.
+    ///
+    /// **This is the destructor of the inline handle, not of a handle from
+    /// [`newActorHandle`].** The copied bytes and the [`ActorId`] cell they
+    /// live in are borrowed, not owned, and a call to this frees one allocation
+    /// and leaves the other two: [`destroyActorHandle`] is the function that
+    /// frees all three, and [`AMobjId.deinit`] routes to it. A span already
+    /// taken from [`toStr`] or [`toBytes`] dies with either.
+    ///
+    /// Calling it twice on one cell is a double free, and calling it after the
+    /// owning result has been freed is a use-after-free; neither is a
+    /// recoverable condition.
     pub fn deinit(self: *AMactorId) void {
-        if (self.hex) |h| self.gpa.free(h);
+        self.gpa.free(self.hex);
         self.* = undefined;
     }
 
     /// The value as bytes. Rust: `actor_id.as_ref().into()`
     /// (`src/actor_id.rs:73`).
+    ///
+    /// A borrow of the borrowed actor, so it lives exactly as long as the cell
+    /// behind [`body`].
     pub fn toBytes(self: *const AMactorId) []const u8 {
         return self.body.bytes;
     }
 
-    /// The value as a lowercase hexadecimal UTF-8 view, computed once.
-    /// Rust: `AMactorId::to_str` (`src/actor_id.rs:32-42`), reached from
-    /// `AMactorIdStr` at `:180`.
+    /// The value as a lowercase hexadecimal UTF-8 view. Rust: `AMactorId::to_str`
+    /// (`src/actor_id.rs:32-42`), reached from `AMactorIdStr`.
     ///
-    /// Takes a mutable pointer through `@constCast` because the C prototype is
-    /// `const AMactorId *` (`src/actor_id.rs:177`) and the reference fills the
-    /// cache through a `RefCell` for the same reason. The cached bytes live
-    /// inside this handle, so a C caller that keeps the span keeps the handle
-    /// alive and the cache is built at most once.
+    /// **This allocates nothing and cannot fail.** The hex is built by
+    /// [`newActorHandle`] and [`actorValue`] and stored in [`hex`], so there
+    /// is no `@constCast` here, no lazy cache to race on, and no way for a
+    /// caller to receive a short answer under memory pressure. That is the
+    /// whole reason the field is not optional.
     pub fn toStr(self: *const AMactorId) []const u8 {
-        const cell: *AMactorId = @constCast(self);
-        if (cell.hex) |h| return h;
-        const out = cell.gpa.alloc(u8, cell.body.bytes.len * 2) catch return "";
-        err.hexInto(cell.body.bytes, out);
-        cell.hex = out;
-        return out;
+        return self.hex;
     }
 
     /// `#[derive(Eq, PartialEq)]` (Rust: `src/actor_id.rs:17`) compares the
-    /// borrowed `ActorId`, which compares the bytes.
+    /// borrowed `ActorId`, which compares the bytes. Two handles for the same
+    /// actor therefore compare equal however each was built.
     pub fn eql(a: AMactorId, b: AMactorId) bool {
         return ActorId.eql(a.body.*, b.body.*);
     }
@@ -562,6 +764,8 @@ pub const AMactorId = struct {
 /// value with a `deinit`, so the borrow is a **pointer to an owned change**:
 /// whoever built it (`Value.change`, [`changeItem`]) owns it and frees it here.
 pub const AMchange = struct {
+    /// The allocator that built the change body, the framed bytes and the
+    /// caches, and that frees all four in [`deinit`].
     gpa: Allocator,
     /// The borrowed change. Rust: `body: *mut am::Change`
     /// (`src/change.rs:19`).
@@ -590,6 +794,18 @@ pub const AMchange = struct {
     /// [`changechunk.ChangeChunk.opCount`](../storage/change_chunk.zig).
     op_count: ?usize = null,
 
+    /// Releases the borrowed change body, the framed bytes it was read from,
+    /// and the two on-demand caches, then poisons the cell.
+    ///
+    /// **Everything a span from this handle can reach dies here.** The hash
+    /// and message spans borrow the change body; the raw bytes borrow
+    /// [`raw`]; the footer from [`extraBytes`] and the deflated body from
+    /// [`compress`] are caches this frees. A caller that frees the owning
+    /// `AMresult` and then reads any of them has a use-after-free, and there
+    /// is no handle count to make that safe.
+    ///
+    /// There is no `AMchangeFree`: a C caller frees the result the change came
+    /// from, and this runs inside that free.
     pub fn deinit(self: *AMchange) void {
         self.change.deinit(self.gpa);
         self.gpa.destroy(self.change);
@@ -690,6 +906,11 @@ pub const AMchange = struct {
 
     /// `AMchangeExtraBytes`: the author footer. Rust: `change.as_ref().extra_bytes()`
     /// (`src/change.rs:128-131`).
+    /// **The footer is cached on first use, through a `@constCast`**, because
+    /// the C prototype takes `const AMchange *` (`src/change.rs:134`) and the
+    /// reference fills a `RefCell` for the same reason. Two threads reaching
+    /// one change through one result therefore race on that write; see the
+    /// module doc's thread-confinement section.
     pub fn extraBytes(self: *const AMchange) []const u8 {
         const cell: *AMchange = @constCast(self);
         if (cell.footer) |f| return f;
@@ -733,12 +954,21 @@ pub const AMchange = struct {
 pub const AMcursor = struct {
     /// The cursor. Rust: `body: am::Cursor` (`src/cursor.rs:26`).
     body: Cursor,
+    /// The allocator that built the cursor and that owns both caches.
     gpa: Allocator,
     /// `bytes: RefCell<Option<Vec<u8>>>` (Rust: `src/cursor.rs:28`).
     bytes: ?[]u8 = null,
     /// `fmt_str: RefCell<Option<Box<str>>>` (Rust: `src/cursor.rs:29`).
     fmt_str: ?[]u8 = null,
 
+    /// Releases the two serialised caches and poisons the cell.
+    ///
+    /// **A span from [`toBytes`] or [`toStr`] dies with the cell**, which is
+    /// the whole reason the caches are owned here rather than borrowed from
+    /// somewhere else: the reference keeps them in `RefCell`es beside the
+    /// cursor for the same reason (`src/cursor.rs:28-29`), and a C caller
+    /// holding `AMcursorBytes` across the owning result's free has a
+    /// use-after-free. There is no `AMcursorFree`; the result does it.
     pub fn deinit(self: *AMcursor) void {
         if (self.bytes) |b| self.gpa.free(b);
         if (self.fmt_str) |s| self.gpa.free(s);
@@ -747,6 +977,11 @@ pub const AMcursor = struct {
 
     /// `AMcursorBytes`. Rust: `AMcursor::to_bytes` (`src/cursor.rs:35-42`),
     /// reached from `AMcursorBytes` at `:77`.
+    /// **The bytes are cached on first use, through a `@constCast`**, because
+    /// the C prototype takes `const AMcursor *` (`src/cursor.rs:78`) and the
+    /// reference fills a `RefCell` for the same reason (`src/cursor.rs:28`).
+    /// Two threads reaching one cursor through one result therefore race on
+    /// that write; see the module doc's thread-confinement section.
     pub fn toBytes(self: *const AMcursor) []const u8 {
         const cell: *AMcursor = @constCast(self);
         if (cell.bytes) |b| return b;
@@ -757,6 +992,10 @@ pub const AMcursor = struct {
 
     /// `AMcursorStr`. Rust: `AMcursor::to_str` (`src/cursor.rs:44-49`),
     /// reached from `AMcursorStr` at `:161`.
+    /// **The string is cached on first use, through a `@constCast`**, for the
+    /// same reason as [`toBytes`]. Two threads reaching one cursor through one
+    /// result therefore race on that write; see the module doc's
+    /// thread-confinement section.
     pub fn toStr(self: *const AMcursor) []const u8 {
         const cell: *AMcursor = @constCast(self);
         if (cell.fmt_str) |s| return s;
@@ -783,6 +1022,8 @@ pub const AMcursor = struct {
 /// bytes, and the actor's table index. See [`AMobjIdIndex`] for why the last
 /// one is the actor index.
 pub const AMobjId = struct {
+    /// The allocator that owns the actor cell this handle carries, and that
+    /// frees it in [`deinit`].
     gpa: Allocator,
     /// `am::ObjId::Id`'s counter. Rust: `src/obj.rs:32`.
     counter: u64,
@@ -823,6 +1064,14 @@ pub const AMobjId = struct {
         return .{ .gpa = gpa, .counter = counter, .index = index, .root = false, .c_actor_id = handle };
     }
 
+    /// Releases the actor cell this handle owns, if it has one, and poisons
+    /// the cell.
+    ///
+    /// **Every handle derived from this one dies here**: the `AMactorId` that
+    /// [`actorHandle`] returns, and with it every hex or byte span taken from
+    /// it. A C caller holding an `AMobjId` — which is the item's own storage,
+    /// not a separate allocation — must stop reading it once the result that
+    /// owned it is freed. There is no `AMobjIdFree`.
     pub fn deinit(self: *AMobjId) void {
         // Every `AMobjId` that carries an actor cell goes through here, which
         // is every read that reports a row's id — `AMobjItems`, `AMmapGet`,
@@ -867,7 +1116,11 @@ pub const AMobjId = struct {
 /// produced the mark — exactly the reference's lifetime, and the reason the
 /// header says a mark's name is a view and its value is a fresh result.
 pub const AMmark = struct {
+    /// The first index the mark covers. Rust: `src/doc/mark.rs:148`
+    /// (`AMmarkStart`).
     start: usize,
+    /// One past the last index the mark covers. Rust: `src/doc/mark.rs:167`
+    /// (`AMmarkEnd`), which answers `SIZE_MAX` when the mark has none.
     end: usize,
     /// Borrowed from the document. Rust: `Mark::name` (`marks.rs:235-237`).
     name: []const u8,
@@ -882,13 +1135,23 @@ pub const AMmark = struct {
 /// the key an `AMitem` reports through `AMitemKey` has to be readable after
 /// the document it came from is gone.
 pub const AMindex = struct {
+    /// The allocator that owns the copied key.
     gpa: Allocator,
+    /// Which variant this is. `AM_IDX_TYPE_DEFAULT` is the answer for an item
+    /// that carries no index (`src/item.rs:817-824`), and neither [`ofKey`]
+    /// nor [`ofPos`] builds one.
     tag: AMidxType,
     /// The key's bytes, when `tag` is [`AMidxType.AM_IDX_TYPE_KEY`].
     key: ?[]u8 = null,
     /// The position, when `tag` is [`AMidxType.AM_IDX_TYPE_POS`].
     pos: usize = 0,
 
+    /// A key index over a **copy** of `key`. Rust: `AMindex::Key(SmolStr)`
+    /// (`src/index.rs:8-12`).
+    ///
+    /// The copy is what lets the key outlive the document row it names: the
+    /// reference's `SmolStr` owns its bytes for the same reason. Fails only
+    /// on allocation, and the caller frees the result with [`deinit`].
     pub fn ofKey(gpa: Allocator, key: []const u8) !AMindex {
         return .{
             .gpa = gpa,
@@ -897,10 +1160,19 @@ pub const AMindex = struct {
         };
     }
 
+    /// A position index. Rust: `AMindex::Pos(usize)` (`src/index.rs:8-12`).
+    ///
+    /// Allocates nothing, so this cannot fail and the returned index owns
+    /// nothing either; [`deinit`] is still the symmetric teardown.
     pub fn ofPos(gpa: Allocator, pos: usize) AMindex {
         return .{ .gpa = gpa, .tag = .AM_IDX_TYPE_POS, .pos = pos };
     }
 
+    /// Releases the copied key, if there is one, and poisons the cell.
+    ///
+    /// **A span from [`keySlice`] dies here.** An index is stored inside its
+    /// owning [`Item`], so this runs as part of `AMresultFree`; there is no
+    /// `AMindexFree` and a C caller holds no separate pointer to one.
     pub fn deinit(self: *AMindex) void {
         if (self.key) |k| self.gpa.free(k);
         self.* = undefined;
@@ -919,6 +1191,10 @@ pub const AMindex = struct {
         return if (self.tag == .AM_IDX_TYPE_POS) self.pos else null;
     }
 
+    /// `#[derive(Eq, PartialEq)]` (Rust: `src/index.rs:13`) over the two
+    /// variants: two keys compare by bytes, two positions by number, and a key
+    /// never equals a position. `AM_IDX_TYPE_DEFAULT` has no spelling here
+    /// because [`ofKey`] and [`ofPos`] are the only two that build one.
     pub fn eql(a: AMindex, b: AMindex) bool {
         if (a.tag != b.tag) return false;
         return switch (a.tag) {
@@ -1097,6 +1373,12 @@ pub const Item = struct {
     /// `value: Option<Value>` (Rust: `:522`).
     value: ?Value = null,
 
+    /// Releases the index, the object id and the value, then poisons the cell.
+    ///
+    /// **This is where everything an item hands out is freed**, which is the
+    /// ABI's single-destructor rule: `AMresultFree` reaches this through
+    /// [`AMitem.deinit`] and there is no other path to it. A span or handle
+    /// taken from any of the three fields is invalidated here.
     pub fn deinit(self: *Item, gpa: Allocator) void {
         if (self.index) |*i| i.deinit();
         if (self.obj_id) |*o| o.deinit();
@@ -1145,6 +1427,9 @@ const RcItem = struct {
 /// rule work: [`deinit`] is the `Drop` of the `Rc` and [`abi.AMresultFree`] is
 /// the only export that reaches it.
 pub const AMitem = struct {
+    /// The `Rc`'s heap cell: a reference count and the item itself. Rust:
+    /// `AMitem(Rc<Item>)` (`src/item.rs:1023-1024`). **Never null for an item
+    /// a caller can reach**, and the only thing [`deinit`] tears down.
     rc: *RcItem,
 
     /// `Rc::new`. Fails only on allocation.
@@ -1466,21 +1751,59 @@ fn newActorCell(alloc: Allocator, bytes: []const u8) !*ActorId {
 /// An owned [`AMactorId`] cell over a copy of `bytes`, for a handle to borrow.
 ///
 /// **`AMactorId` and `ActorId` are not layout-compatible.** The first is
-/// `{ body: *const ActorId, gpa: Allocator, hex: ?[]u8 }` and the second is
+/// `{ body: *const ActorId, gpa: Allocator, hex: []u8 }` and the second is
 /// `{ bytes: []const u8 }`, so a bare `@ptrCast` from one to the other yields
 /// a handle whose `body` is the actor's *slice* and whose `gpa` is whatever
-/// followed it in memory. Two allocations, and the wrapper is built here.
+/// followed it in memory. Three allocations, and the wrapper is built here.
 ///
-/// **The caller owns all three allocations** — the copied bytes, the
-/// [`ActorId`] cell they were copied into, and this handle — and frees them
-/// with [`destroyActorHandle`], which is the only function that does.
-/// [`AMactorId.deinit`] is not it and leaves all three behind.
+/// **The caller owns all four** — the copied bytes, the [`ActorId`] cell they
+/// were copied into, the hex string, and this handle — and frees them with
+/// [`destroyActorHandle`], which is the only function that does.
+/// [`AMactorId.deinit`] is not it and leaves the first three behind.
 fn newActorHandle(alloc: Allocator, bytes: []const u8) !*AMactorId {
-    const cell = try newActorCell(alloc, bytes);
-    errdefer alloc.destroy(cell);
+    // `var`, not `const`: the failure path below hands `id` to
+    // `AMactorId.deinit`, which takes a mutable pointer and poisons the cell.
+    var id = try newActorId(alloc, bytes);
+    // **Both halves are named before `deinit` runs.** `deinit` frees the hex
+    // alone, so the two borrowed allocations have to be reached through the
+    // handle this function owns; reading `id.body` afterwards would be a read
+    // of a poisoned cell.
+    const cell = id.body;
+    errdefer {
+        id.deinit();
+        alloc.free(cell.bytes);
+        alloc.destroy(cell);
+    }
     const handle = try alloc.create(AMactorId);
-    handle.* = .{ .body = cell, .gpa = alloc };
+    handle.* = id;
     return handle;
+}
+
+/// The one construction of an [`AMactorId`], so the hex is staged once.
+///
+/// **This is where the lazy cache became an eager one.** `AMactorIdStr` takes
+/// `*const AMactorId` and answers `AMbyteSpan`, which has no error channel, so
+/// a hex computed on first use could only report an allocation failure as an
+/// empty string — 64 bytes short of the answer, and indistinguishable from a
+/// legitimately empty span. Both callers of this function are already
+/// fallible ([`AMobjId.of`] and [`actorValue`]), so the failure is reported
+/// where a failure can still be reported.
+///
+/// Nothing is assigned into the result until both allocations have succeeded,
+/// so each `errdefer` owns exactly the buffer it made.
+fn newActorId(alloc: Allocator, bytes: []const u8) Allocator.Error!AMactorId {
+    const cell = try newActorCell(alloc, bytes);
+    // `newActorCell` returns a cell that owns its copy of the bytes, and both
+    // halves belong to whoever holds the cell — so the failure path frees
+    // both, in that order, before the hex is even asked for.
+    errdefer {
+        alloc.free(cell.bytes);
+        alloc.destroy(cell);
+    }
+    const hex = try alloc.alloc(u8, cell.bytes.len * 2);
+    errdefer alloc.free(hex);
+    err.hexInto(cell.bytes, hex);
+    return .{ .body = cell, .gpa = alloc, .hex = hex };
 }
 
 /// Frees a handle [`newActorHandle`] handed out, with the body it borrows.
@@ -1519,9 +1842,12 @@ fn destroyActorHandle(handle: *AMactorId) void {
 /// `impl From<am::ActorId> for Value` (Rust: `src/item.rs:141-145`) moves an
 /// owned `ActorId` in, and `AMgetActorId` passes `doc.get_actor().clone()`
 /// (`src/doc.rs:302-304`), so the item owns a copy of the document's bytes.
+///
+/// This is the second of the two callers of [`newActorId`], and it is fallible
+/// for the same reason and with the same guarantee: the hex is staged before
+/// the [`Value`] exists, so `AMactorIdStr` on the item is a field read.
 fn actorValue(alloc: Allocator, actor: ActorId) !Value {
-    const cell = try newActorCell(alloc, actor.bytes);
-    return .{ .actor_id = .{ .body = cell, .gpa = alloc } };
+    return .{ .actor_id = try newActorId(alloc, actor.bytes) };
 }
 
 /// `Vec::<am::ChangeHash>::try_from(heads)` (Rust: `src/items.rs:214-231`).
@@ -1959,12 +2285,16 @@ pub export fn AMactorIdCmp(
 
 /// `AMactorIdInit`. Rust: `src/actor_id.rs:118-120`.
 ///
-/// Sixteen bytes from `ActorId::random()` (`types.rs:63-68`). The port's
-/// `ActorId.random` is a `DefaultPrng` stepped by a process-wide counter, and
-/// its own doc says why: an actor id has to be unique within a document and
-/// never has to be unguessable (`types.zig:100-116`).
+/// Sixteen bytes from `ActorId::random()` (`types.rs:63-68`), which this port
+/// fills from [`c_io`]'s secure random source (`types.zig:147-155`:
+/// `io.randomSecure` into a 16-byte owned result) and refuses on
+/// `error.EntropyUnavailable` rather than substituting a weaker source.
+///
+/// **This is the one export in the ABI that draws randomness**, and it is
+/// therefore the one whose failure is worth naming: the answer is an error
+/// result, never a repeated or a predictable actor id.
 pub export fn AMactorIdInit() ?*AMresult {
-    const bytes = ActorId.random(c_alloc) catch |e| return failWith(c_alloc, e);
+    const bytes = ActorId.random(c_alloc, c_io) catch |e| return failWith(c_alloc, e);
     defer c_alloc.free(bytes.bytes);
     const value = actorValue(c_alloc, bytes) catch |e| return failWith(c_alloc, e);
     return boxOne(c_alloc, value) catch |e| failWith(c_alloc, e);
@@ -2014,10 +2344,15 @@ fn boxErrorNamed(alloc: Allocator, message: []const u8) ?*AMresult {
 
 /// `AMactorIdStr`. Rust: `src/actor_id.rs:188-193`.
 ///
-/// **A null handle is the zero span** (`:191`). The returned span borrows a
-/// hex string cached inside the handle, which is what the reference's
-/// `hex_str: RefCell<Option<Box<str>>>` (`src/actor_id.rs:19`) is for; see
-/// [`AMactorId.toStr`].
+/// **A null handle is the zero span** (`:191`). Otherwise the span is exactly
+/// twice the actor id's length in bytes, lower-case hexadecimal, and it is
+/// never short: the hex is staged when the handle is built, so this accessor
+/// has no allocation and no failure to swallow. See [`AMactorId.toStr`].
+///
+/// **The span borrows the handle**, and the handle is owned by the result the
+/// C caller reached it through, so it lives until that result is freed with
+/// `AMresultFree()` — or until the `AMobjId` it hangs off, which dies with the
+/// same result. Two calls answer the same pointer, because there is one copy.
 pub export fn AMactorIdStr(actor_id: ?*const AMactorId) AMbyteSpan {
     const a = actor_id orelse return .empty;
     return AMbyteSpan.of(a.toStr());
@@ -2156,6 +2491,7 @@ pub export fn AMchangeLoadDocument(src: ?[*]const u8, count: usize) ?*AMresult {
     const s = src orelse return boxErrorNamed(c_alloc, "Invalid uint8_t*");
     var doc = docmod.Document.load(
         c_alloc,
+        c_io,
         s[0..count],
         cTextEncoding(),
         .auto,
@@ -2910,7 +3246,7 @@ pub export fn AMclone(doc: ?*const AMdoc) ?*AMresult {
 /// (`:80`), and that is `ops: OpSet::new(TextEncoding::platform_default())`
 /// ([`automerge.rs:272`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
 pub export fn AMcreate(actor_id: ?*const AMactorId) ?*AMresult {
-    var d: AMdoc = .{ .doc = docmod.Document.initWithEncoding(c_alloc, cTextEncoding(), .auto) catch |e|
+    var d: AMdoc = .{ .doc = docmod.Document.initWithEncoding(c_alloc, c_io, cTextEncoding(), .auto) catch |e|
         return failWith(c_alloc, e) };
     errdefer d.deinit();
     if (actor_id) |a| {
@@ -3302,6 +3638,7 @@ pub export fn AMload(src: ?[*]const u8, count: usize) ?*AMresult {
     const s = src orelse return boxErrorNamed(c_alloc, "Invalid uint8_t*");
     const loaded = docmod.Document.load(
         c_alloc,
+        c_io,
         s[0..count],
         cTextEncoding(),
         .auto,
@@ -4751,7 +5088,7 @@ test "a handle taken out of an item points into the item's own allocation" {
     // dead frame and every mutating entry point faulted on the next call.
     const r = try docResult(
         testing.allocator,
-        AMdoc{ .doc = try docmod.Document.init(testing.allocator, .auto) },
+        AMdoc{ .doc = try docmod.Document.init(testing.allocator, std.testing.io, .auto) },
     );
     defer dropResult(testing.allocator, r);
     const item = AMresult.item(r) orelse return error.Unexpected;
@@ -4774,7 +5111,7 @@ test "AMmapGet answers one indexed item, and a VOID one when the register is emp
     // test that needs both surfaces takes the document through the handle and
     // reaches the library through `amdoc.doc`. There is no `AMdocFree`
     // (`:251-254`) — a result item owns one, and this one is on the stack.
-    var amdoc = AMdoc{ .doc = try docmod.Document.init(testing.allocator, .auto) };
+    var amdoc = AMdoc{ .doc = try docmod.Document.init(testing.allocator, std.testing.io, .auto) };
     defer amdoc.deinit();
     const doc = &amdoc.doc;
     _ = try transact.put(doc, .root, .{ .key = "k" }, .{ .str = "v" });
@@ -4852,7 +5189,7 @@ test "AMsplice reads the scalars out of the items it was handed" {
 }
 
 test "the read surface answers for a document that has been written" {
-    var amdoc = AMdoc{ .doc = try docmod.Document.init(testing.allocator, .auto) };
+    var amdoc = AMdoc{ .doc = try docmod.Document.init(testing.allocator, std.testing.io, .auto) };
     defer amdoc.deinit();
     const doc = &amdoc.doc;
     // The root is a **map**, so the two sub-objects go in by key; an index on
@@ -4925,7 +5262,7 @@ test "a held transaction and its document share one allocator" {
     // place that used to pass `c_alloc` instead, and the teardown below is
     // what it cost: a `free` of a pointer the allocator had not handed out,
     // and a process that died inside `__free`.
-    var amdoc = AMdoc{ .doc = try docmod.Document.init(testing.allocator, .auto) };
+    var amdoc = AMdoc{ .doc = try docmod.Document.init(testing.allocator, std.testing.io, .auto) };
     defer amdoc.deinit();
 
     // **The document is deliberately not on `c_alloc`**, or the equality below
@@ -4968,6 +5305,7 @@ test "a C text index names the character a default-configured reference build na
     // read are still the ones a C caller frees with `AMresultFree`.
     var amdoc = AMdoc{ .doc = try docmod.Document.initWithEncoding(
         testing.allocator,
+        std.testing.io,
         cTextEncoding(),
         .auto,
     ) };
@@ -5088,7 +5426,7 @@ test "a change's author is the document's actor, at that actor's own byte length
     // item (`impl From<am::ActorId> for Value`, `src/item.rs:141-145`), so the
     // span a C caller reads is a copy of `Change.actor` and whatever length
     // that is.
-    var doc = try docmod.Document.init(testing.allocator, .auto);
+    var doc = try docmod.Document.init(testing.allocator, std.testing.io, .auto);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = &actor16 });
     _ = try transact.put(&doc, .root, .{ .key = "a" }, .{ .str = "b" });
@@ -5127,7 +5465,7 @@ test "the hex a handle caches comes back with the handle, exactly once" {
 
 test "AMgetCursorPosition names a foreign cursor InvalidCursor, and AMgetCursor keeps InvalidIndex" {
     const gpa = testing.allocator;
-    var amdoc = AMdoc{ .doc = try docmod.Document.init(gpa, .auto) };
+    var amdoc = AMdoc{ .doc = try docmod.Document.init(gpa, std.testing.io, .auto) };
     defer amdoc.deinit();
     const doc = &amdoc.doc;
 
@@ -5225,7 +5563,7 @@ test "a cursor minted before an edit resolves at its own heads while a transacti
     // the arbiter, and the C ABI's own allocator is still what the reference's
     // cmocka suite uses at runtime.
     const gpa = testing.allocator;
-    var amdoc = AMdoc{ .doc = try docmod.Document.initWithEncoding(gpa, cTextEncoding(), .auto) };
+    var amdoc = AMdoc{ .doc = try docmod.Document.initWithEncoding(gpa, std.testing.io, cTextEncoding(), .auto) };
     defer amdoc.deinit();
     amdoc.setActorId(.{ .bytes = "0123456789abcdef" });
     const doc = &amdoc.doc;

@@ -113,11 +113,15 @@ pub const Encoding = enum(u8) {
     value = 7,
 
     /// The encoding with the tag `t`, or `error.InvalidEncoding` when `t` is
-    /// not one of the eight defined tags.
+    /// not one of the eight defined tags. Nothing is consumed and nothing is
+    /// allocated; `t` is a value, so a caller reading it off the wire keeps
+    /// the cursor where it was.
     ///
     /// This reads a bare tag byte. A caller holding a whole specification
-    /// reads its tag with `ColumnSpec.encoding`, which masks the bit out and
-    /// cannot fail.
+    /// reads its tag with [`ColumnSpec.encoding`], which masks the bit out and
+    /// cannot fail. A bare tag wider than three bits is refused here rather
+    /// than masked, so `fromTag(8)` is `error.InvalidEncoding` while
+    /// `ColumnSpec.fromRaw(8).encoding()` is `.group`.
     pub fn fromTag(t: u8) ParseError!Encoding {
         return switch (t) {
             0 => .group,
@@ -136,10 +140,23 @@ pub const Encoding = enum(u8) {
 /// A packed column specification: an id, an encoding, and a DEFLATE flag.
 ///
 /// `raw` is the 32-bit value as it stands before the `uLEB128` encoding
-/// applied on the wire. Build one with `make`, or with `fromRaw` for a value
-/// that was just read off the wire.
+/// applied on the wire. Build one with [`ColumnSpec.make`] for a value the
+/// caller checked, or with [`ColumnSpec.fromRaw`] for one just read off the
+/// wire.
+///
+/// The struct is two fields by value, so it is freely copyable and owns
+/// nothing: a copy is the same column, not a second owner of anything. The
+/// id an unchecked build can hold is bounded by construction — `raw` is 32
+/// bits and the id is its top 28 — so [`ColumnSpec.id`] cannot exceed
+/// [`ColumnSpec.max_id`] for any `raw` at all, including one read from a
+/// hostile document. Only [`ColumnSpec.make`] takes an id as a separate
+/// argument, and that is where the precondition lives.
 pub const ColumnSpec = struct {
-    /// The packed bitfield, exactly as it appears before `uLEB128` encoding.
+    /// The packed bitfield, exactly as it appears before `uLEB128` encoding:
+    /// bits 31..4 the column id, bit 3 the DEFLATE flag, bits 2..0 the
+    /// encoding. Every accessor below reads it rather than the fields, so
+    /// two specs are the same column when [`ColumnSpec.normalize`] gives them
+    /// the same `raw`.
     raw: u32,
 
     /// Bits 0..2: the column encoding. Three bits, per
@@ -167,11 +184,26 @@ pub const ColumnSpec = struct {
     /// A specification for the column `col_id` with encoding `enc`, flagged
     /// compressed when `compressed` is true.
     ///
-    /// `col_id` must fit the 28 id bits; a caller that has not yet checked its
-    /// input must go through `fromRaw` and let `validate` report the problem,
-    /// because this function cannot fail. The parameter is not named `id`
-    /// because Zig rejects a parameter that shadows the `id` declaration in
-    /// this struct, and the call site is unaffected.
+    /// `col_id` must fit the 28 id bits, that is, be at most [`max_id`]. This
+    /// is a caller precondition, not something the function checks for you:
+    /// `std.debug.assert` is compiled out in `ReleaseFast` and `ReleaseSmall`,
+    /// and `col_id << 4` there is an unsigned shift that discards the high
+    /// bits. An unchecked build therefore does not report an over-range id at
+    /// all — it silently packs a **different** column, one whose id is
+    /// `col_id & max_id`, so the column is looked up under a name the caller
+    /// never wrote.
+    ///
+    /// A caller holding an id that came off the wire cannot use
+    /// [`ColumnSpec.fromRaw`] to be safe instead, because it cannot be unsafe:
+    /// `ColumnSpec.id` is `raw >> 4`, so the largest id any `u32` can carry is
+    /// exactly [`max_id`] and no value read off the wire is ever out of range.
+    /// The check belongs at the point the id is produced — before the cast to
+    /// `u32` where the wire value is wider, and before this call where it is
+    /// not.
+    ///
+    /// The parameter is not named `id` because Zig rejects a parameter that
+    /// shadows the `id` declaration in this struct, and the call site is
+    /// unaffected.
     pub fn make(col_id: u32, enc: Encoding, compressed: bool) ColumnSpec {
         std.debug.assert(col_id <= max_id);
         var raw: u32 = (col_id << 4) | @as(u32, @intFromEnum(enc));
@@ -240,11 +272,15 @@ pub const ColumnSpec = struct {
     }
 
     /// The same column, marked compressed (`column_specification.rs:76-78`).
+    /// The id came out of an existing spec, so it is in range and
+    /// [`ColumnSpec.make`]'s precondition holds.
     pub fn deflated(self: ColumnSpec) ColumnSpec {
         return make(self.id(), self.encoding(), true);
     }
 
     /// The same column, marked uncompressed (`column_specification.rs:80-82`).
+    /// The id came out of an existing spec, so it is in range and
+    /// [`ColumnSpec.make`]'s precondition holds.
     pub fn inflated(self: ColumnSpec) ColumnSpec {
         return make(self.id(), self.encoding(), false);
     }
@@ -255,10 +291,20 @@ pub const ColumnSpec = struct {
 /// The range is relative to the start of the data block, not to the start of
 /// the chunk: the first column of a set starts at 0
 /// (`raw_column.rs:24-26`).
+///
+/// Two fields by value, so a range is freely copyable and owns nothing: it
+/// names bytes in a buffer somebody else holds, and outlives neither a
+/// mutation of that buffer nor the set that indexed it. A range read off the
+/// wire can be nonsense — `end` below `start`, or past the block — and every
+/// accessor here treats that as empty or out of bounds rather than
+/// trapping, so a caller may build one from input and check it afterwards
+/// with [`ColumnRange.fitsIn`] or [`ColumnRange.slice`].
 pub const ColumnRange = struct {
     /// The first byte of the column within the data block.
     start: usize,
-    /// One past the last byte of the column within the data block.
+    /// One past the last byte of the column within the data block. Nothing
+    /// requires `end >= start`: a range with `end` below `start` is empty,
+    /// which is how an unvalidated caller-supplied pair is treated.
     end: usize,
 
     /// The range `[start, end)`.
@@ -273,7 +319,8 @@ pub const ColumnRange = struct {
 
     /// The number of bytes the range covers. A range whose end is not past
     /// its start is empty, which is how a caller-supplied pair is treated
-    /// before it has been validated.
+    /// before it has been validated. Never wraps, because the subtraction
+    /// only runs when the end is larger.
     pub fn len(self: ColumnRange) usize {
         return if (self.end <= self.start) 0 else self.end - self.start;
     }
@@ -285,19 +332,24 @@ pub const ColumnRange = struct {
     }
 
     /// Whether the range is a well-formed `[start, end)` inside a data block
-    /// of `total` bytes: `start <= end <= total`.
+    /// of `total` bytes: `start <= end <= total`. This is the check
+    /// [`RawColumns.validate`] makes per column.
     pub fn fitsIn(self: ColumnRange, total: usize) bool {
         return self.start <= self.end and self.end <= total;
     }
 
     /// The bytes of `data` this range covers, or `error.ColumnOutOfBounds`
-    /// when the range does not fit. Never panics on a range from input.
+    /// when the range does not fit. Never panics on a range from input,
+    /// because the bounds are checked before the slice is taken. The result
+    /// borrows `data`, so it is valid exactly as long as that buffer is.
     pub fn slice(self: ColumnRange, data: []const u8) ParseError![]const u8 {
         if (!self.fitsIn(data.len)) return error.ColumnOutOfBounds;
         return data[self.start..self.end];
     }
 
-    /// Whether two ranges cover the same bytes.
+    /// Whether two ranges cover the same bytes. Unlike [`ColumnSpec.eql`],
+    /// this compares the raw offsets, so a deflated column and its inflated
+    /// twin are the same range either way — the DEFLATE bit is not in here.
     pub fn eql(a: ColumnRange, b: ColumnRange) bool {
         return a.start == b.start and a.end == b.end;
     }
@@ -310,10 +362,19 @@ pub const ColumnRange = struct {
 /// typestate parameter that tracks whether a column is known to be
 /// uncompressed; here the DEFLATE flag lives in the spec, and it is up to the
 /// caller to inflate a compressed column before reading it.
+///
+/// Two fields by value, so a column is freely copyable and owns nothing. It
+/// names bytes in a data block somebody else holds: the bytes themselves come
+/// from [`RawColumn.bytes`] against that block, and a copy does not outlive
+/// it.
 pub const RawColumn = struct {
-    /// What the column is and how its bytes are encoded.
+    /// What the column is and how its bytes are encoded. The spec carries the
+    /// DEFLATE flag, so a compressed column is identified here rather than
+    /// by a separate flag on the column.
     spec: ColumnSpec,
-    /// Where the column's bytes are, within the data block.
+    /// Where the column's bytes are, within the data block. Offsets, not
+    /// bytes: nothing is held until a caller asks for them with
+    /// [`RawColumn.bytes`].
     range: ColumnRange,
 
     /// The column `spec`, whose bytes are `range` of the data block.
@@ -321,12 +382,15 @@ pub const RawColumn = struct {
         return .{ .spec = spec, .range = range };
     }
 
-    /// The column `spec` only if it carries bytes.
+    /// The column `spec` only if it carries bytes, and null when it does
+    /// not.
     ///
     /// A column with an empty range is not part of a set at all: upstream
     /// drops it in `try_new` (`raw_column.rs:40-50`) and in both
     /// `FromIterator` implementations (`:183`, `:187-205`), so an absent
-    /// column costs no bytes and appears nowhere in the metadata.
+    /// column costs no bytes and appears nowhere in the metadata. A `null`
+    /// here is not an error: it means the caller asked for a column that
+    /// carries nothing.
     pub fn tryInit(spec: ColumnSpec, range: ColumnRange) ?RawColumn {
         if (range.isEmpty()) return null;
         return init(spec, range);
@@ -353,7 +417,9 @@ pub const RawColumn = struct {
     }
 
     /// The column's bytes, or `error.ColumnOutOfBounds` when its range does
-    /// not fit `data`.
+    /// not fit `data`. The result borrows `data`, and for a compressed column
+    /// it is still the raw DEFLATE stream — inflating it is the caller's
+    /// step, and `decompressRaw` in `chunk.zig` is what this crate uses.
     pub fn bytes(self: RawColumn, data: []const u8) ParseError![]const u8 {
         return self.range.slice(data);
     }
@@ -365,6 +431,12 @@ pub const RawColumn = struct {
 /// This is the `(ColumnSpec, usize)` pair the format stores for each column
 /// and that upstream's `FromIterator` consumes
 /// (`raw_column.rs:187-205`).
+///
+/// A descriptor is a value, not a view: it names a length and a spec and
+/// holds no bytes, so a caller may build a list of them and hand it to
+/// [`RawColumns.init`] without anything to keep alive. `len` is exactly the
+/// kind of number that came off the wire, and [`RawColumns.init`] sums them
+/// with a saturating add for that reason.
 pub const ColumnDesc = struct {
     /// What the column is and how its bytes are encoded.
     spec: ColumnSpec,
@@ -373,6 +445,8 @@ pub const ColumnDesc = struct {
     len: usize,
 
     /// The metadata entry for column `spec` whose data is `len` bytes long.
+    /// `len` is not checked here; it is bounded by
+    /// [`RawColumns.validate`] and by the data block it is measured against.
     pub fn init(spec: ColumnSpec, len: usize) ColumnDesc {
         return .{ .spec = spec, .len = len };
     }
@@ -400,12 +474,27 @@ pub const ColumnDesc = struct {
 /// is several columns with the same id and different encodings — the
 /// predecessor group is a `group`, an `actor` and a `delta` column, all with
 /// id 7. What may not repeat is the pair of id and encoding.
+///
+/// The caller owns `columns` and releases it with
+/// [`RawColumns.deinit`], exactly once; `data` is borrowed and stays with
+/// whoever allocated it. The set is a plain struct, so a copy duplicates the
+/// `columns` pointer: deinitializing both copies frees the same bytes twice.
+/// Copy a `RawColumns` only to hand it around, never to give two owners of
+/// the list, and deinitialize exactly one of them.
 pub const RawColumns = struct {
     /// The columns, in ascending order by normalized spec, none of them
     /// empty. `columns[i].range.start` is the cumulative offset of the
     /// column into `data`.
+    ///
+    /// This slice is owned by the `RawColumns` and freed by
+    /// [`RawColumns.deinit`]; a caller must not free it separately or append
+    /// to it. The [`RawColumn`]s inside hold specs and ranges by value, so
+    /// the list owns no pointers into anything else.
     columns: []RawColumn,
-    /// The block the ranges index into. Borrowed, never copied.
+    /// The block the ranges index into. Borrowed, never copied, and not
+    /// released by [`RawColumns.deinit`]: the buffer outlives the set, and
+    /// every byte a caller reads through [`RawColumns.bytesFor`] points into
+    /// it.
     data: []const u8,
 
     /// The metadata entries `descs` describe as the columns of the data block
@@ -419,9 +508,16 @@ pub const RawColumns = struct {
     /// contributes no bytes, as in `FromIterator`
     /// (`raw_column.rs:183`, `:187-205`).
     ///
+    /// The caller owns the returned set and releases it with
+    /// [`RawColumns.deinit`] exactly once. The only error is
+    /// `error.OutOfMemory`, from the list; nothing in `descs` can be refused
+    /// here, because a length off the wire is only summed here and judged by
+    /// `validate`. On that error the list is freed and nothing is returned.
+    ///
     /// The set is not validated here: order, uniqueness, and the bounds of
     /// the ranges are `validate`'s job, and a caller that has just built a
     /// set from a document chunk should call it before reading anything.
+    /// Nothing is copied out of `data`, and `descs` is only read.
     pub fn init(gpa: Allocator, descs: []const ColumnDesc, data: []const u8) ParseError!RawColumns {
         var list: std.ArrayList(RawColumn) = .empty;
         errdefer list.deinit(gpa);
@@ -438,6 +534,13 @@ pub const RawColumns = struct {
     }
 
     /// Releases the column list. The data block belongs to the caller.
+    ///
+    /// Called once. The receiver is by value and `columns` is a plain pointer,
+    /// so a copied `RawColumns` reaches the same allocation through
+    /// [`RawColumns.deinit`] twice and frees it twice. After it runs, this
+    /// value and every copy of it are spent: `len`, `iterator`, `find` and
+    /// `bytesFor` all read through the freed slice, and `data` is left as it
+    /// was — still borrowed, still the caller's to release.
     pub fn deinit(self: RawColumns, gpa: Allocator) void {
         gpa.free(self.columns);
     }
@@ -456,6 +559,11 @@ pub const RawColumns = struct {
     /// The total number of bytes the columns occupy. Upstream's
     /// `total_column_len` (`raw_column.rs:267-270`), which is the length of
     /// the data block this set is expected to index.
+    ///
+    /// The sum saturates, so a set built from hostile lengths can report a
+    /// total larger than `data.len` rather than wrapping into a small one.
+    /// [`RawColumns.totalLen`] is a measurement, not a bound: whether the
+    /// columns really fit is [`RawColumns.validate`]'s answer.
     pub fn totalLen(self: RawColumns) usize {
         var total: usize = 0;
         for (self.columns) |col| total = total +| col.len();
@@ -474,9 +582,14 @@ pub const RawColumns = struct {
 
     /// The first column with the given id, or null when the set holds none.
     ///
-    /// A binary search over the ids, which is sound because `validate`
-    /// requires them to be in ascending order. A set that has not been
-    /// validated may answer arbitrarily, but never traps.
+    /// A binary search over the ids, which is sound because
+    /// [`RawColumns.validate`] requires them to be in ascending order. A set
+    /// that has not been validated may answer arbitrarily, but never traps.
+    ///
+    /// **The pointer borrows the set's own `columns` slice**, so it is
+    /// invalid the moment [`RawColumns.deinit`] runs, and it is not stable
+    /// across a reallocation of that list — which no method here performs,
+    /// so within one set's lifetime the pointer stays put.
     pub fn find(self: RawColumns, id: u32) ?*const RawColumn {
         var lo: usize = 0;
         var hi: usize = self.columns.len;
@@ -497,6 +610,10 @@ pub const RawColumns = struct {
     /// and the other way round, because the comparison is on the normalized
     /// forms — upstream's `RawColumns::bytes` lookup
     /// (`raw_column.rs:275-282`).
+    ///
+    /// The same lifetime rules as [`RawColumns.find`]: the pointer borrows
+    /// `columns`, so [`RawColumns.deinit`] invalidates it. A lookup on an
+    /// unvalidated set may answer arbitrarily, but never traps.
     pub fn findSpec(self: RawColumns, spec: ColumnSpec) ?*const RawColumn {
         var lo: usize = 0;
         var hi: usize = self.columns.len;
@@ -515,22 +632,38 @@ pub const RawColumns = struct {
     /// The bytes of the column with the given specification, `null` when the
     /// set holds no such column, and `error.ColumnOutOfBounds` when the
     /// column's range does not fit the data block.
+    ///
+    /// The two empty answers are different questions: `null` is "this set has
+    /// no such column", which is not a defect in the document, while
+    /// `error.ColumnOutOfBounds` is a declared range the block cannot
+    /// honour. The returned bytes borrow `data` — not `columns` — so they
+    /// stay valid after [`RawColumns.deinit`] for as long as the caller
+    /// keeps the data block.
     pub fn bytesFor(self: RawColumns, spec: ColumnSpec) ParseError!?[]const u8 {
         const col = self.findSpec(spec) orelse return null;
         return try col.bytes(self.data);
     }
 
-    /// Every column, in the order the metadata block listed them.
+    /// Every column, in the order the metadata block listed them. The
+    /// iterator borrows `columns`, so it is spent by
+    /// [`RawColumns.deinit`] like the pointer [`RawColumns.find`] returns.
     pub fn iterator(self: RawColumns) Iterator {
         return .{ .columns = self.columns, .index = 0 };
     }
 
     /// Walks the columns of a set in metadata order.
+    ///
+    /// A cursor by value over a borrowed slice: it owns nothing and has no
+    /// `deinit`. What it hands out are `*const RawColumn` pointers into the
+    /// set's own list, valid until [`RawColumns.deinit`]. An iterator left
+    /// unfinished simply drops on the floor; there is nothing to release.
     pub const Iterator = struct {
         columns: []const RawColumn,
         index: usize,
 
-        /// The next column, or null once the set is exhausted.
+        /// The next column, or null once the set is exhausted. Calling it
+        /// again after a null keeps returning null, and the pointer it
+        /// returns borrows the set's `columns` slice.
         pub fn next(self: *Iterator) ?*const RawColumn {
             if (self.index >= self.columns.len) return null;
             defer self.index += 1;
@@ -566,6 +699,17 @@ pub const RawColumns = struct {
     /// responsible for the gaps. The layer above this one does check
     /// contiguity, for the logical columns rather than the raw ones
     /// (`columns.rs:322-350`).
+    ///
+    /// What `validate` deliberately cannot report is an out-of-range column
+    /// id: an id is `raw >> 4`, so a spec read off the wire is in range by
+    /// construction and no `u32` can name a column beyond
+    /// [`ColumnSpec.max_id`]. The check that matters is at the point an id
+    /// becomes a `u32` — [`ColumnSpec.make`]'s precondition — and a caller
+    /// that skipped it in a release build has already lost the id, not a
+    /// validation this function could recover.
+    ///
+    /// `declared` is only read, and on any error the set is unchanged: this
+    /// validates, it does not repair or reorder.
     pub fn validate(self: RawColumns, declared: ?[]const ColumnSpec) ParseError!void {
         if (self.columns.len > self.data.len) return error.Overflow;
         var previous: ?ColumnSpec = null;

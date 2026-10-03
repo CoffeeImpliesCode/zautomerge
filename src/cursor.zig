@@ -337,10 +337,14 @@ pub const CursorPosition = union(enum) {
 /// same two refusals: an actor the document does not hold, and a counter that
 /// fits no row.
 ///
-/// `actor` is **borrowed**. An actor a document handed out points into the
-/// document's actor table ([types.zig](types.zig) on `ActorId`) and an actor
-/// [`fromBytes`] or [`fromStr`] decoded points into the caller's buffer, which
-/// must outlive the cursor.
+/// **`actor` is borrowed, and the three sources own it differently.** An
+/// actor a document handed out points into the document's actor table
+/// ([types.zig](types.zig) on `ActorId`) and must outlive the cursor; an actor
+/// [`fromBytes`] or [`parse0`] decoded is a subslice of the caller's own buffer,
+/// which must outlive the cursor and stay unmodified; an actor [`fromStr`]
+/// decoded is **fresh memory the caller allocated**, and the caller frees
+/// exactly `gpa.free(c.op.actor.bytes)` when the cursor is done with. This type
+/// has no `deinit`, because it cannot know which of the three it holds.
 pub const OpCursor = struct {
     /// The counter of the element's operation (`ctr`, `cursor.rs:34`).
     ///
@@ -350,6 +354,10 @@ pub const OpCursor = struct {
     /// not here.
     ctr: u64,
     /// The actor that made the element, as bytes (`actor`, `cursor.rs:35`).
+    ///
+    /// **Borrowed — see the type comment** for the three owners and what each
+    /// one owes. `actor.bytes` is the only borrowed field here; `ctr`,
+    /// `move_cursor` and `offset` are values.
     actor: ActorId,
     /// Which way this cursor moves if its element is removed (`move_cursor`,
     /// `cursor.rs:36`).
@@ -407,6 +415,13 @@ pub const OpCursor = struct {
 /// (`cursor.rs:17-18`). It can be persisted with [`toBytes`] and read back
 /// with [`fromBytes`], or written as a string with [`toStr`] and read back
 /// with [`fromStr`] (`cursor.rs:15`, `:119`, `:182`).
+///
+/// **A `.start` or `.end` cursor owns nothing. A `.op` cursor borrows its
+/// [`OpCursor.actor`], and which owner it is depends on where the value came
+/// from:** the document's actor table through [`getCursor`], the caller's own
+/// buffer through [`fromBytes`] and [`parse0`], or memory the caller allocated
+/// through [`fromStr`]. There is no `Cursor.deinit`; read [`OpCursor`] for the
+/// rule, and each constructor for the one it is responsible for.
 pub const Cursor = union(enum) {
     /// Always dereferences to position `0` (`cursor.rs:22`).
     start,
@@ -478,6 +493,14 @@ pub fn toBytes(gpa: Allocator, self: Cursor) ![]u8 {
 /// never asks whether the input is spent, so a cursor read out of a larger
 /// buffer is the same cursor. A refusal here is therefore about a byte that
 /// could not be a cursor, never about a byte that followed one.
+///
+/// **The returned cursor borrows `bytes`, and nothing else here allocates.** An
+/// op cursor's [`OpCursor.actor`] is a **subslice of the argument**, so the
+/// buffer must stay alive and unmodified for as long as the cursor is used.
+/// There is no `deinit` and no matching free, and a `.start` or `.end` result
+/// borrows nothing. This is the opposite of [`fromStr`], which decodes the
+/// actor into fresh memory the caller frees with `gpa`; [`parse0`] borrows the
+/// same way. See [`OpCursor`] for the third source, a document's actor table.
 pub fn fromBytes(bytes: []const u8) ParseError!Cursor {
     // `parse::take1` (`cursor.rs:225-226`).
     const version = take1(bytes) orelse return error.UnexpectedEnd;
@@ -532,6 +555,9 @@ pub fn fromBytes(bytes: []const u8) ParseError!Cursor {
 /// **`After` and no start/end**, because `After` was the version-0 default
 /// and there was no notion of a start or end cursor then
 /// (`cursor.rs:281-287`).
+///
+/// **The result borrows `rest`** in the same way [`fromBytes`] borrows its
+/// argument: the actor's bytes are a subslice, and there is nothing to free.
 pub fn parse0(rest: []const u8) ParseError!Cursor {
     // `parse::leb128_u64` (`cursor.rs:274-275`).
     const len = try takeLeb(rest);
@@ -558,11 +584,13 @@ pub fn parse0(rest: []const u8) ParseError!Cursor {
 /// counter is `u64` decimal (`cursor.rs:108`) and the actor is lowercase or
 /// uppercase hex ([types.rs:88-96](https://github.com/automerge/automerge/blob/ddbff535407e4d28cd2a82eaf6c6add08caa3bdd/rust/automerge/src/types.rs#L88-L96)).
 ///
-/// `gpa` is first because the actor's bytes are **decoded into fresh
-/// memory**: the result owns them and the caller frees the cursor's bytes
-/// with `gpa`. No other error than [`ParseError`] is possible, and no byte
-/// string panics. Upstream has two inputs that trap here and this has
-/// neither:
+/// `gpa` is first because the actor's bytes are **decoded into fresh memory**,
+/// which is the one case where a cursor owns what it points at: an op cursor
+/// the caller frees with exactly `gpa.free(c.op.actor.bytes)` once it is done,
+/// and a `.start` or `.end` cursor owns nothing and must not be freed. This is
+/// the opposite of [`fromBytes`], which borrows its argument. No error but
+/// [`ParseError`] is possible, and no byte string panics. Upstream has two
+/// inputs that trap here and this has neither:
 ///
 /// * `""` reaches `&s[0..1]` (`cursor.rs:102`) and panics on the empty
 ///   slice — upstream's `s.len() == 1` arm does not catch it;
@@ -593,11 +621,11 @@ pub fn fromStr(gpa: Allocator, s: []const u8) ParseError!Cursor {
 
     // `s[(n + 1)..].try_into()` (`cursor.rs:109`) — hex, and an empty actor
     // is legal because `hex::decode("")` is. [`err.hexFrom`] is this crate's
-    // hex decoder ([error.zig](error.zig)); its `error.InvalidPath` is the
+    // hex decoder ([error.zig](error.zig)); its `error.InvalidHex` is the
     // "not hex, or an odd length" answer and becomes the same single refusal
     // every other shape in this function gets.
     const bytes = err.hexFrom(gpa, body[sign + 1 ..]) catch |e| switch (e) {
-        error.InvalidPath => return error.InvalidValue,
+        error.InvalidHex => return error.InvalidValue,
         else => |rest| return rest,
     };
 
@@ -655,6 +683,11 @@ pub fn toStr(gpa: Allocator, self: Cursor) ![]u8 {
 /// The offset the cursor records is the requested index less the element's
 /// own start, which is zero for a list and is the distance into a text element
 /// otherwise; see "The offset" in the module doc.
+///
+/// **The result borrows `set`.** `gpa` is released with the [`OpsFound`] this
+/// call frees, and the actor's bytes are the document's own — the op set's
+/// actor table — so the cursor is good for as long as `set` answers for that
+/// document. See [`OpCursor`] for the other two owners.
 pub fn getCursor(
     gpa: Allocator,
     set: anytype,
@@ -2693,7 +2726,7 @@ const AtPosition = ?marksmod.MarkSet.Entry;
 
 test "a cursor comes back to the position it was taken at, and the mark there is the one the span walk read" {
     const gpa = testing.allocator;
-    var d = try cdoc.Document.init(gpa, .auto);
+    var d = try cdoc.Document.init(gpa, std.testing.io, .auto);
     defer d.deinit();
     d.setActorId(.{ .bytes = "0123456789abcdef" });
 

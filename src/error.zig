@@ -13,7 +13,15 @@
 
 const std = @import("std");
 
-/// The document API surface, mirroring `AutomergeError`.
+/// The document API surface, mirroring `AutomergeError`, plus the two tags a
+/// `std.Io` capability hands back through a call this set declares
+/// ([`Io.RandomSecureError`](../../lib/std/Io.zig)).
+///
+/// `error.Canceled` and `error.EntropyUnavailable` are not upstream variants.
+/// They are reachable because a native entry point that draws entropy takes a
+/// `std.Io`, and that capability may refuse; [`ActorId.random`](types.zig) is
+/// the one that does today. Every other entry point in the set comes from the
+/// document, so a caller that never draws entropy never has to handle them.
 pub const Error = error{
     /// The change graph is inconsistent: a change's dependencies are missing.
     ChangeGraph,
@@ -27,7 +35,10 @@ pub const Error = error{
     DuplicateActorId,
     /// A generic failure with no more specific variant.
     Fail,
-    /// The actor id is not valid hex, or has the wrong length.
+    /// An actor id is not valid hex. The length is never the reason: an
+    /// automerge actor id is any byte string, including an empty one, and
+    /// upstream's `ActorId::try_from(&str)` refuses only a non-hex string
+    /// ([`types.rs:88-96`](../../github-automerge-automerge/rust/automerge/src/types.rs)).
     InvalidActorId,
     /// An actor index refers to a row outside the actor table.
     InvalidActorIndex,
@@ -85,6 +96,12 @@ pub const Error = error{
     InvalidMarkName,
     /// The allocator ran out of memory.
     OutOfMemory,
+    /// The caller cancelled the operation through its `std.Io` before it
+    /// finished. Nothing was written.
+    Canceled,
+    /// The `std.Io` in use could not supply cryptographically secure entropy
+    /// and does not fall back to a weaker source, so no id was drawn.
+    EntropyUnavailable,
 };
 
 /// Everything reachable from parsing untrusted bytes.
@@ -150,6 +167,9 @@ pub const ParseError = error{
     InvalidUtf8,
     /// A path, key, or index inside the value is invalid.
     InvalidPath,
+    /// A hex string has an odd number of digits or a digit that is not a hex
+    /// digit. This is the one refusal [`hexFrom`](error.zig) has.
+    InvalidHex,
     /// A value type is recognised but not supported here.
     Unsupported,
     /// The allocator ran out of memory.
@@ -182,8 +202,9 @@ pub const InternalError = error{
 /// that catch rather than discriminate.
 pub const AnyError = Error || ParseError || InternalError;
 
-/// Renders a byte slice as lowercase hex into a caller-supplied buffer of at
-/// least `2 * bytes.len` length.
+/// Renders `bytes` as lowercase hex into `out`, which must have room for
+/// `2 * bytes.len` bytes. Writes nothing to the heap and cannot fail; a short
+/// `out` is a caller precondition that is not checked.
 pub fn hexInto(bytes: []const u8, out: []u8) void {
     const digits = "0123456789abcdef";
     var i: usize = 0;
@@ -194,13 +215,18 @@ pub fn hexInto(bytes: []const u8, out: []u8) void {
     }
 }
 
-/// Decodes lowercase or uppercase hex into `out`. Returns the number of bytes
-/// written, or `error.InvalidCharacter` on a non-hex digit or an odd length.
-pub fn hexFrom(gpa: std.mem.Allocator, input: []const u8) (ParseError || std.mem.Allocator.Error)![]u8 {
-    if (input.len % 2 != 0) return error.InvalidPath;
+/// Decodes lowercase or uppercase hex into a fresh allocation from `gpa`.
+///
+/// The caller owns the result and releases it with that same allocator. The
+/// empty string decodes to an empty slice, which is a legal actor id.
+///
+/// Returns `error.InvalidHex` for a digit that is not a hex digit and for an
+/// odd number of digits. Neither refusal hands the caller an allocation.
+pub fn hexFrom(gpa: std.mem.Allocator, input: []const u8) (error{InvalidHex} || std.mem.Allocator.Error)![]u8 {
+    if (input.len % 2 != 0) return error.InvalidHex;
     const out = try gpa.alloc(u8, input.len / 2);
     errdefer gpa.free(out);
-    _ = std.fmt.hexToBytes(out, input) catch return error.InvalidPath;
+    _ = std.fmt.hexToBytes(out, input) catch return error.InvalidHex;
     return out;
 }
 
@@ -215,6 +241,6 @@ test "hex round trip" {
     defer gpa.free(decoded);
     try std.testing.expectEqualSlices(u8, &bytes, decoded);
 
-    try std.testing.expectError(error.InvalidPath, hexFrom(gpa, "0"));
-    try std.testing.expectError(error.InvalidPath, hexFrom(gpa, "zz"));
+    try std.testing.expectError(error.InvalidHex, hexFrom(gpa, "0"));
+    try std.testing.expectError(error.InvalidHex, hexFrom(gpa, "zz"));
 }

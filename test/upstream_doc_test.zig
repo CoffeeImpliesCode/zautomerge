@@ -45,6 +45,14 @@ const testing = std.testing;
 
 /// **The leak arbiter for the whole file.** One allocator, named once.
 const gpa = testing.allocator;
+
+/// The borrowed capability every document constructor below is handed.
+///
+/// **Explicit, because `Document` keeps it.** The op set draws actors through
+/// this value for as long as the document lives, so a constructor cannot
+/// reach for an ambient global and no document can outlive its provider. Here
+/// that value is `std.testing.io`; an executable passes its own `init.io`.
+const io = std.testing.io;
 const Allocator = std.mem.Allocator;
 
 const Document = am.doc.Document;
@@ -103,7 +111,7 @@ fn mintActor() ActorId {
 /// A new document in the autocommit flavour ([`AutoCommit::new`](../src/doc.zig),
 /// [`autocommit.rs`:92-94](../github-automerge-automerge/rust/automerge/src/autocommit.rs)).
 fn newDoc() !Document {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, io, .auto);
     errdefer doc.deinit();
     doc.setActorId(mintActor());
     return doc;
@@ -112,7 +120,7 @@ fn newDoc() !Document {
 /// The same, with the actor the caller names
 /// ([`automerge_test::new_doc_with_actor`](../github-automerge-automerge/rust/automerge-test/src/lib.rs):17-21).
 fn newDocWithActor(actor: ActorId) !Document {
-    var doc = try Document.init(gpa, .auto);
+    var doc = try Document.init(gpa, io, .auto);
     errdefer doc.deinit();
     doc.setActorId(actor);
     return doc;
@@ -709,14 +717,14 @@ fn patchesFrom(doc: *Document, ctx: anytype) !Patches {
 /// [`Document.fork`](../src/doc.zig) through [`Document.forkAt`](../src/doc.zig)
 /// at the document's own heads, which is the same document with a fresh actor.
 ///
-/// **`Document.fork` leaks and this is why.** It stores
-/// `ActorId.random(gpa)` — sixteen bytes taken from `gpa` — in `actor.unused`
-/// ([`doc.zig`](../src/doc.zig):3827-3830) and `Document.deinit` frees no actor
-/// bytes, because a caller may have handed `setActorId` a string literal.
-/// `Document.forkAt` does the same work correctly (`:3883-3891`): it copies the
-/// minted bytes into the fork's own arena and frees the temporary. **Forking at
-/// the current heads is what `fork` means**, so the ported tests go through the
-/// one that frees what it takes.
+/// **A named actor, and not [`Document.fork`]'s random one.** `fork` mints
+/// through the source's retained `io` ([`doc.zig`](../src/doc.zig)), so its
+/// actor differs on every run and so does every change hash derived from it.
+/// Forking at the current heads is what `fork` means, and [`forkDoc`] forks
+/// there, so the ported tests get the same document under a nameable actor.
+/// **And this is determinism, not a leak**: `fork` allocates the actor from
+/// the **fork's own** arena, which [`Document.deinit`] frees with everything
+/// else, so a fork it did not free is not the reason for this door.
 fn forkDoc(src: *Document) !Document {
     return forkDocMode(src, .auto);
 }
@@ -934,7 +942,7 @@ test "fork_at with an increment over a conflicted counter survives save and load
     defer before.deinit();
     const bytes = try fork.saveWithOptions(gpa, .{ .deflate = false });
     defer gpa.free(bytes);
-    var loaded = try Document.load(gpa, bytes, fork.textEncoding(), .auto);
+    var loaded = try Document.load(gpa, io, bytes, fork.textEncoding(), .auto);
     defer loaded.deinit();
     var after = try hydrateNow(&loaded);
     defer after.deinit();
@@ -945,7 +953,7 @@ test "fork_at with an increment over a conflicted counter survives save and load
 //    [`test.rs`:248-285](../github-automerge-automerge/rust/automerge/tests/test.rs)
 
 test "transaction patches replace a multi-character string in text" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = "\x00" });
     {
@@ -1100,7 +1108,7 @@ test "diff preserves a conflict after the winning value is deleted" {
 //     [`test.rs`:395-418](../github-automerge-automerge/rust/automerge/tests/test.rs)
 
 test "an incremental put_seq in text applies to a hydrated value" {
-    var doc = try Document.initWithEncoding(gpa, .grapheme_cluster, .auto);
+    var doc = try Document.initWithEncoding(gpa, io, .grapheme_cluster, .auto);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = "\x00" });
     const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
@@ -1157,6 +1165,61 @@ test "a reverse diff of replaced lists applies to a hydrated value" {
     defer expected.deinit();
     var patches = try doc.diff(gpa, current_heads, historical_heads);
     defer patches.deinit();
+
+    // **Upstream's own comment is the contract this pins**
+    // (`test.rs`:451-453`): "A reverse diff must not emit a deletion against
+    // the empty replacement list in the hydrated value." The walk does record
+    // one — the `1` went into `old_second` after `historical_heads`, so going
+    // backwards it has to come out — and [`ExposeQueue`] is what keeps it out
+    // of the stream: `putMap` on `"second"` carries `expose`, and the queue
+    // answers that object with its whole content **at `historical_heads`**
+    // (`patches.zig`:2151-2211), which is empty, and skips the object's own
+    // events (`patches.zig`:2079-2082`). So what reaches the mirror is two
+    // `put_map` patches naming the two lists the historical state holds.
+    //
+    // **Read at the present and the same walk answers with a third patch**,
+    // the `insert` of the `1` that is still sitting in the hidden old list,
+    // which no value at `historical_heads` holds. That is the defect the
+    // assertion below catches, and it is why the patch layer needs the
+    // diff's `after` heads and not just its `after` clock
+    // ([`Document.diffClocks`](../src/doc.zig)).
+    const got = patches.slice();
+    try testing.expectEqual(@as(usize, 2), got.len);
+    // **The two keys as a set, not as a sequence.** Which register is emitted
+    // first is the event sort's business — the events of one object keep the
+    // order they were logged in and both of these are the root's
+    // (`patch_log.rs`:515-516`) — and nothing about the contract here depends
+    // on it. What it does depend on is that **both** keys are named exactly
+    // once and that each names a **list**, which is what the historical state
+    // holds at them: `"second"` was a text at the current heads.
+    for ([_][]const u8{ "first", "second" }) |want| {
+        var seen: usize = 0;
+        for (got) |p| switch (p.action) {
+            .put_map => |a| {
+                if (!std.mem.eql(u8, a.key, want)) continue;
+                seen += 1;
+                // **The historical state holds a list at both keys** and
+                // `"second"` was a text at the current ones, so the patch has
+                // to carry the historical type or the mirror keeps the text.
+                switch (a.value) {
+                    .object => |o| try testing.expectEqual(ObjType.list, o),
+                    .scalar => {
+                        std.debug.print("\n{s} is put as a scalar, want a list\n", .{want});
+                        return error.UnexpectedPatchAction;
+                    },
+                }
+            },
+            else => {
+                std.debug.print("\na patch is {s}, want a put_map\n", .{@tagName(p.action)});
+                return error.UnexpectedPatchAction;
+            },
+        };
+        if (seen != 1) {
+            std.debug.print("\n{s} is named by {d} patches, want exactly 1\n", .{ want, seen });
+            return error.UnexpectedPatchAction;
+        }
+    }
+
     try applyPatches(&actual, .unicode_code_point, patches.slice());
     try testing.expect(actual.eql(&expected));
 }
@@ -1346,7 +1409,7 @@ test "rollback after a save and load of a deep hydrated root map" {
 
     const bytes = try doc.save(gpa);
     defer gpa.free(bytes);
-    var loaded = try Document.load(gpa, bytes, .unicode_code_point, .manual);
+    var loaded = try Document.load(gpa, io, bytes, .unicode_code_point, .manual);
     defer loaded.deinit();
     var before = try hydrateNow(&loaded);
     defer before.deinit();
@@ -1365,7 +1428,7 @@ test "rollback after a save and load of a deep hydrated root map" {
 //     [`test.rs`:634-658](../github-automerge-automerge/rust/automerge/tests/test.rs)
 
 test "fork_at preserves the text encoding" {
-    var doc = try Document.initWithEncoding(gpa, .grapheme_cluster, .auto);
+    var doc = try Document.initWithEncoding(gpa, io, .grapheme_cluster, .auto);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = "\x00" });
     _ = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
@@ -1381,7 +1444,7 @@ test "fork_at preserves the text encoding" {
     defer before.deinit();
     const bytes = try forked.saveWithOptions(gpa, .{ .deflate = false });
     defer gpa.free(bytes);
-    var loaded = try Document.load(gpa, bytes, .grapheme_cluster, .auto);
+    var loaded = try Document.load(gpa, io, bytes, .grapheme_cluster, .auto);
     defer loaded.deinit();
     var after = try hydrateNow(&loaded);
     defer after.deinit();
@@ -1392,12 +1455,12 @@ test "fork_at preserves the text encoding" {
 //     [`test.rs`:660-684](../github-automerge-automerge/rust/automerge/tests/test.rs)
 
 test "load_incremental into an empty document preserves the UTF-8 text encoding" {
-    var source = try Document.initWithEncoding(gpa, .utf8_code_unit, .auto);
+    var source = try Document.initWithEncoding(gpa, io, .utf8_code_unit, .auto);
     defer source.deinit();
     source.setActorId(.{ .bytes = "\x01" });
     _ = try am.transaction.putObject(&source, root, .{ .key = "text" }, .text);
 
-    var receiver = try Document.initWithEncoding(gpa, .utf8_code_unit, .auto);
+    var receiver = try Document.initWithEncoding(gpa, io, .utf8_code_unit, .auto);
     defer receiver.deinit();
     receiver.setActorId(.{ .bytes = "\x00" });
     const bytes = try source.save(gpa);
@@ -1409,7 +1472,7 @@ test "load_incremental into an empty document preserves the UTF-8 text encoding"
     defer before.deinit();
     const again = try receiver.save(gpa);
     defer gpa.free(again);
-    var loaded = try Document.load(gpa, again, .utf8_code_unit, .auto);
+    var loaded = try Document.load(gpa, io, again, .utf8_code_unit, .auto);
     defer loaded.deinit();
     var after = try hydrateNow(&loaded);
     defer after.deinit();
@@ -2275,7 +2338,7 @@ test "save and restore an empty document" {
     defer doc.deinit();
     const bytes = try doc.save(gpa);
     defer gpa.free(bytes);
-    var loaded = try Document.load(gpa, bytes, .unicode_code_point, .auto);
+    var loaded = try Document.load(gpa, io, bytes, .unicode_code_point, .auto);
     defer loaded.deinit();
     try expectDoc(&loaded, .{ .map = &.{} });
 }
@@ -2305,7 +2368,7 @@ test "save and restore a complex document" {
     }
     const bytes = try doc1.save(gpa);
     defer gpa.free(bytes);
-    var reloaded = try Document.load(gpa, bytes, .unicode_code_point, .auto);
+    var reloaded = try Document.load(gpa, io, bytes, .unicode_code_point, .auto);
     defer reloaded.deinit();
     try expectDoc(&reloaded, .{ .map = &.{
         .{ .key = "todos", .values = &.{.{ .list = &.{&.{.{ .map = &.{
@@ -2347,7 +2410,7 @@ test "repeated out of order changes" {
 //     [`test.rs`:1661-1706](../github-automerge-automerge/rust/automerge/tests/test.rs)
 
 test "save and restore a complex transactional document" {
-    var doc1 = try Document.init(gpa, .manual);
+    var doc1 = try Document.init(gpa, io, .manual);
     defer doc1.deinit();
     doc1.setActorId(mintActor());
     const first_todo = blk: {
@@ -2361,7 +2424,7 @@ test "save and restore a complex transactional document" {
         break :blk todo;
     };
 
-    var doc2 = try Document.init(gpa, .manual);
+    var doc2 = try Document.init(gpa, io, .manual);
     defer doc2.deinit();
     doc2.setActorId(mintActor());
     {
@@ -2386,7 +2449,7 @@ test "save and restore a complex transactional document" {
     }
     const bytes = try doc1.save(gpa);
     defer gpa.free(bytes);
-    var reloaded = try Document.load(gpa, bytes, .unicode_code_point, .auto);
+    var reloaded = try Document.load(gpa, io, bytes, .unicode_code_point, .auto);
     defer reloaded.deinit();
     try expectDoc(&reloaded, .{ .map = &.{
         .{ .key = "todos", .values = &.{.{ .list = &.{&.{.{ .map = &.{
@@ -2519,7 +2582,7 @@ test "save, load and save again materialise the same document" {
     defer gpa.free(heads_before);
     const first_save = try doc1.save(gpa);
     defer gpa.free(first_save);
-    var reloaded = try Document.load(gpa, first_save, doc1.textEncoding(), .auto);
+    var reloaded = try Document.load(gpa, io, first_save, doc1.textEncoding(), .auto);
     defer reloaded.deinit();
     const second_save = try reloaded.save(gpa);
     defer gpa.free(second_save);
@@ -2664,10 +2727,10 @@ test "list counter and delete" {
 
     const first = try doc1.save(gpa);
     defer gpa.free(first);
-    var doc2 = try Document.load(gpa, first, .unicode_code_point, .auto);
+    var doc2 = try Document.load(gpa, io, first, .unicode_code_point, .auto);
     defer doc2.deinit();
     doc2.setActorId(actors[1]);
-    var doc3 = try Document.load(gpa, first, .unicode_code_point, .auto);
+    var doc3 = try Document.load(gpa, io, first, .unicode_code_point, .auto);
     defer doc3.deinit();
     doc3.setActorId(actors[2]);
 
@@ -2703,7 +2766,7 @@ test "list counter and delete" {
     try testing.expectEqual(@as(usize, 2), try am.read.length(&doc1, list));
     const saved1 = try doc1.save(gpa);
     defer gpa.free(saved1);
-    var doc4 = try Document.load(gpa, saved1, .unicode_code_point, .auto);
+    var doc4 = try Document.load(gpa, io, saved1, .unicode_code_point, .auto);
     defer doc4.deinit();
     try testing.expectEqual(@as(usize, 2), try am.read.length(&doc4, list));
 
@@ -2711,7 +2774,7 @@ test "list counter and delete" {
     try testing.expectEqual(@as(usize, 1), try am.read.length(&doc1, list));
     const saved2 = try doc1.save(gpa);
     defer gpa.free(saved2);
-    var doc5 = try Document.load(gpa, saved2, .unicode_code_point, .auto);
+    var doc5 = try Document.load(gpa, io, saved2, .unicode_code_point, .auto);
     defer doc5.deinit();
     try testing.expectEqual(@as(usize, 1), try am.read.length(&doc5, list));
 }
@@ -2814,10 +2877,10 @@ test "a local increment in a map" {
     _ = try am.transaction.put(&doc1, root, .{ .key = "hello" }, .{ .str = "world" });
     const bytes = try doc1.save(gpa);
     defer gpa.free(bytes);
-    var doc2 = try Document.load(gpa, bytes, .unicode_code_point, .auto);
+    var doc2 = try Document.load(gpa, io, bytes, .unicode_code_point, .auto);
     defer doc2.deinit();
     doc2.setActorId(actors[1]);
-    var doc3 = try Document.load(gpa, bytes, .unicode_code_point, .auto);
+    var doc3 = try Document.load(gpa, io, bytes, .unicode_code_point, .auto);
     defer doc3.deinit();
     doc3.setActorId(actors[2]);
 
@@ -2839,7 +2902,7 @@ test "a local increment in a map" {
     } });
     const saved = try doc1.save(gpa);
     defer gpa.free(saved);
-    var doc4 = try Document.load(gpa, saved, .unicode_code_point, .auto);
+    var doc4 = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
     defer doc4.deinit();
     const again = try doc4.save(gpa);
     defer gpa.free(again);
@@ -2862,7 +2925,7 @@ test "merging text conflicts, then saving and loading" {
 
     const bytes = try doc1.save(gpa);
     defer gpa.free(bytes);
-    var doc2 = try Document.load(gpa, bytes, .unicode_code_point, .auto);
+    var doc2 = try Document.load(gpa, io, bytes, .unicode_code_point, .auto);
     defer doc2.deinit();
     doc2.setActorId(actors[1]);
 
@@ -2889,7 +2952,7 @@ test "merging text conflicts, then saving and loading" {
     try expectDoc(&doc2, want);
     const saved = try doc2.save(gpa);
     defer gpa.free(saved);
-    var doc3 = try Document.load(gpa, saved, .unicode_code_point, .auto);
+    var doc3 = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
     defer doc3.deinit();
     try expectDoc(&doc3, want);
 }
@@ -2904,7 +2967,7 @@ test "merging text conflicts, then saving and loading" {
 
 test "a change that only deletes" {
     const actor: ActorId = .{ .bytes = "\x7f" };
-    var doc1 = try Document.init(gpa, .manual);
+    var doc1 = try Document.init(gpa, io, .manual);
     defer doc1.deinit();
     doc1.setActorId(actor);
     const list = blk: {
@@ -2917,7 +2980,7 @@ test "a change that only deletes" {
     };
     const first = try doc1.save(gpa);
     defer gpa.free(first);
-    var doc2 = try Document.load(gpa, first, .unicode_code_point, .manual);
+    var doc2 = try Document.load(gpa, io, first, .unicode_code_point, .manual);
     defer doc2.deinit();
     doc2.setActorId(actor);
     {
@@ -2928,7 +2991,7 @@ test "a change that only deletes" {
     }
     const second = try doc2.save(gpa);
     defer gpa.free(second);
-    var doc3 = try Document.load(gpa, second, .unicode_code_point, .manual);
+    var doc3 = try Document.load(gpa, io, second, .unicode_code_point, .manual);
     defer doc3.deinit();
     doc3.setActorId(actor);
     {
@@ -2939,7 +3002,7 @@ test "a change that only deletes" {
     }
     const third = try doc3.save(gpa);
     defer gpa.free(third);
-    var doc4 = try Document.load(gpa, third, .unicode_code_point, .manual);
+    var doc4 = try Document.load(gpa, io, third, .unicode_code_point, .manual);
     defer doc4.deinit();
     doc4.setActorId(actor);
 
@@ -2953,7 +3016,7 @@ test "a change that only deletes" {
 //     [`test.rs`:2002-2028](../github-automerge-automerge/rust/automerge/tests/test.rs)
 
 test "save and reload a create-object change" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
     // A change containing an object and no other operations.
@@ -2966,7 +3029,7 @@ test "save and reload a create-object change" {
     };
     const first = try doc.save(gpa);
     defer gpa.free(first);
-    var doc2 = try Document.load(gpa, first, .unicode_code_point, .manual);
+    var doc2 = try Document.load(gpa, io, first, .unicode_code_point, .manual);
     defer doc2.deinit();
     {
         var tx = try Tx.open(gpa, &doc2);
@@ -2979,7 +3042,7 @@ test "save and reload a create-object change" {
     } });
     const second = try doc2.save(gpa);
     defer gpa.free(second);
-    var doc3 = try Document.load(gpa, second, .unicode_code_point, .auto);
+    var doc3 = try Document.load(gpa, io, second, .unicode_code_point, .auto);
     defer doc3.deinit();
 }
 
@@ -3026,7 +3089,7 @@ test "compressed document columns" {
     const compressed = try doc.save(gpa);
     defer gpa.free(compressed);
     try testing.expect(compressed.len < uncompressed.len);
-    var loaded = try Document.load(gpa, compressed, .unicode_code_point, .auto);
+    var loaded = try Document.load(gpa, io, compressed, .unicode_code_point, .auto);
     defer loaded.deinit();
     try expectDoc(&loaded, .{ .map = &.{
         .{ .key = "list", .values = &.{.{ .list = expected.items }} },
@@ -3091,7 +3154,7 @@ test "load_incremental with a corrupted tail" {
     @memcpy(bytes[0..clean.len], clean);
     @memcpy(bytes[clean.len..], &[_]u8{ 1, 2, 3, 4 });
 
-    var loaded = try Document.init(gpa, .auto);
+    var loaded = try Document.init(gpa, io, .auto);
     defer loaded.deinit();
     // Upstream asserts `assert_eq!(loaded_len, 1)` ([`test.rs`:2127](../github-automerge-automerge/rust/automerge/tests/test.rs)),
     // and the port's answer is the same number for the same reason: the empty
@@ -3125,7 +3188,7 @@ test "load a document with deleted objects" {
     }
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var loaded = try Document.load(gpa, saved, .unicode_code_point, .auto);
+    var loaded = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
     defer loaded.deinit();
     try expectDoc(&loaded, .{ .map = &.{} });
 }
@@ -3150,7 +3213,7 @@ test "insert after many deletes" {
 //     [`test.rs`:2162-2181](../github-automerge-automerge/rust/automerge/tests/test.rs)
 
 test "a simple bad save and load" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
     {
@@ -3172,7 +3235,7 @@ test "a simple bad save and load" {
     }
     const bytes = try doc.save(gpa);
     defer gpa.free(bytes);
-    var loaded = try Document.load(gpa, bytes, .unicode_code_point, .auto);
+    var loaded = try Document.load(gpa, io, bytes, .unicode_code_point, .auto);
     defer loaded.deinit();
 }
 
@@ -3216,7 +3279,7 @@ test "operations on the wrong object types" {
 //     [`test.rs`](../github-automerge-automerge/rust/automerge/tests/test.rs):2249-2253
 
 test "a negative 64-bit value" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
     var tx = try Tx.open(gpa, &doc);
@@ -3229,7 +3292,7 @@ test "a negative 64-bit value" {
 //     [`test.rs`:2271-2306](../github-automerge-automerge/rust/automerge/tests/test.rs)
 
 test "a bad change on an op-tree node boundary" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
     {
@@ -3255,7 +3318,7 @@ test "a bad change on an op-tree node boundary" {
     }
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var doc2 = try Document.load(gpa, saved, .unicode_code_point, .manual);
+    var doc2 = try Document.load(gpa, io, saved, .unicode_code_point, .manual);
     defer doc2.deinit();
     {
         var tx = try Tx.open(gpa, &doc);
@@ -3278,7 +3341,7 @@ test "a bad change on an op-tree node boundary" {
     _ = try doc2.applyChanges(gpa, view);
     const saved2 = try doc2.save(gpa);
     defer gpa.free(saved2);
-    var doc3 = try Document.load(gpa, saved2, .unicode_code_point, .auto);
+    var doc3 = try Document.load(gpa, io, saved2, .unicode_code_point, .auto);
     defer doc3.deinit();
 }
 
@@ -3286,7 +3349,7 @@ test "a bad change on an op-tree node boundary" {
 //     [`test.rs`:2308-2335](../github-automerge-automerge/rust/automerge/tests/test.rs)
 
 test "regression: nth miscount" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
     {
@@ -3321,7 +3384,7 @@ test "regression: nth miscount" {
 // literal it is, because the ported file has no reason to carry the alias.
 
 test "regression: nth miscount, smaller" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
     {
@@ -3350,7 +3413,7 @@ test "regression: nth miscount, smaller" {
 //     [`test.rs`](../github-automerge-automerge/rust/automerge/tests/test.rs):2476-2504
 
 test "marks" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
     var tx = try Tx.open(gpa, &doc);
@@ -3378,7 +3441,7 @@ test "marks" {
 //     [`test.rs`](../github-automerge-automerge/rust/automerge/tests/test.rs):2506-2546
 
 test "a transaction can be opened at historical heads" {
-    var doc1 = try Document.init(gpa, .manual);
+    var doc1 = try Document.init(gpa, io, .manual);
     defer doc1.deinit();
     doc1.setActorId(mintActor());
     const txt = blk: {
@@ -3555,7 +3618,7 @@ test "a document can be isolated and integrated" {
 //     [`test.rs`](../github-automerge-automerge/rust/automerge/tests/test.rs):2618-2635
 
 test "inserting text near deleted marks" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
     var tx = try Tx.open(gpa, &doc);
@@ -3604,7 +3667,7 @@ test "inserting text near deleted marks" {
 //     [`test.rs`](../github-automerge-automerge/rust/automerge/tests/test.rs):2637-2659
 
 test "load_incremental with a partial load" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
     {
@@ -3629,7 +3692,7 @@ test "load_incremental with a partial load" {
     defer framed.deinit(gpa);
     for (view) |change| try am.storage.chunk.writeChunk(&framed, gpa, .change, change.bytes);
 
-    var doc2 = try Document.init(gpa, .manual);
+    var doc2 = try Document.init(gpa, io, .manual);
     defer doc2.deinit();
     _ = try doc2.loadIncremental(gpa, framed.items);
 }
@@ -3638,7 +3701,7 @@ test "load_incremental with a partial load" {
 //     [`test.rs`](../github-automerge-automerge/rust/automerge/tests/test.rs):2661-2679
 
 test "get_changes metadata" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
     {
@@ -3666,7 +3729,7 @@ test "get_changes metadata" {
 //     [`test.rs`](../github-automerge-automerge/rust/automerge/tests/test.rs):2681-2713
 
 test "get marks at historical heads" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
     const text_id = blk: {
@@ -3759,7 +3822,7 @@ test "get marks at historical heads" {
 //     [`test.rs`](../github-automerge-automerge/rust/automerge/tests/test.rs):2746-2772
 
 test "rollback with no ops" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
     {
@@ -3807,7 +3870,7 @@ test "rollback with several actors" {
     // those five writes are five committed changes and no rollback reaches them,
     // so the sequence is written against the **manual** door, which is upstream's
     // `Transaction::rollback` reached through `AutoCommit::transaction()`.
-    var doc1 = try Document.init(gpa, .manual);
+    var doc1 = try Document.init(gpa, io, .manual);
     defer doc1.deinit();
     doc1.setActorId(.{ .bytes = "aaaaaa" });
     const text = blk: {
@@ -3861,7 +3924,7 @@ test "rollback with several actors" {
 //     [`test.rs`](../github-automerge-automerge/rust/automerge/tests/test.rs):2803-2832
 
 test "save with ops which reference actors only via delete" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
     {
@@ -3895,7 +3958,7 @@ test "save with ops which reference actors only via delete" {
     // must encode every actor the successors name.
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var loaded = try Document.load(gpa, saved, .unicode_code_point, .auto);
+    var loaded = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
     defer loaded.deinit();
     // Upstream stops at `Automerge::load(&saved).unwrap()` and says in a
     // comment that this "will panic if we failed to encode the referenced
@@ -3917,7 +3980,7 @@ test "save with ops which reference actors only via delete" {
 //     [`test.rs`](../github-automerge-automerge/rust/automerge/tests/test.rs):2834-2852
 
 test "save with empty commits" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
     {
@@ -3935,7 +3998,7 @@ test "save with empty commits" {
     }
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var loaded = try Document.load(gpa, saved, .unicode_code_point, .auto);
+    var loaded = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
     defer loaded.deinit();
 }
 
@@ -3943,7 +4006,7 @@ test "save with empty commits" {
 //     [`test.rs`](../github-automerge-automerge/rust/automerge/tests/test.rs):2854-2895
 
 test "large patches in lists are correct" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
     const heads_before = try headsOf(&doc);
@@ -4112,7 +4175,7 @@ test "missing actors when documents are forked" {
     // `save()` bytes are not required to be identical across implementations.
     const s2 = try doc2.save(gpa);
     defer gpa.free(s2);
-    var reloaded = try Document.load(gpa, s2, .unicode_code_point, .auto);
+    var reloaded = try Document.load(gpa, io, s2, .unicode_code_point, .auto);
     defer reloaded.deinit();
     try reloaded.debugCmp(&doc2);
     try testing.expectEqual(s1.len > 0, s2.len > 0);
@@ -4430,7 +4493,7 @@ test "a merge after putting a value equal to the initial value" {
     defer patches.deinit();
     const saved = try left.save(gpa);
     defer gpa.free(saved);
-    var reloaded = try Document.load(gpa, saved, .unicode_code_point, .auto);
+    var reloaded = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
     defer reloaded.deinit();
     try testing.expectEqual(@as(i64, 0), (try scalarAt(&reloaded, root, .{ .key = "a" })).int);
 }
@@ -4968,7 +5031,7 @@ test "transaction patches insert a hidden scalar into UTF-8 text" {
     // that used to be on this line was therefore a transcription that **could
     // not have passed against the reference either** — it made the call below
     // impossible.
-    var doc = try Document.initWithEncoding(gpa, .utf8_code_unit, .auto);
+    var doc = try Document.initWithEncoding(gpa, io, .utf8_code_unit, .auto);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = "fe004faf" });
     var emoji = try am.hydrate.Value.text(gpa, .utf8_code_unit, "\u{1F469}\u{1F3FF}\u{200D}\u{1F692}");
@@ -5000,7 +5063,7 @@ test "transaction patches insert a hidden scalar into UTF-8 text" {
 //      [`test.rs`](../github-automerge-automerge/rust/automerge/tests/test.rs):4316-4335
 
 test "transaction patches split a block at a normalized UTF-8 index" {
-    var source = try Document.initWithEncoding(gpa, .utf8_code_unit, .auto);
+    var source = try Document.initWithEncoding(gpa, io, .utf8_code_unit, .auto);
     defer source.deinit();
     const text = try am.transaction.putObject(&source, root, .{ .key = "text" }, .text);
     try am.transaction.spliceText(&source, text, 0, 0, "\u{1F469}\u{1F3FF}\u{200D}\u{1F692}");
@@ -5027,7 +5090,7 @@ test "transaction patches split a block at a normalized UTF-8 index" {
 //      [`test.rs`](../github-automerge-automerge/rust/automerge/tests/test.rs):4337-4360
 
 test "transaction patches mark at normalized UTF-8 indexes" {
-    var source = try Document.initWithEncoding(gpa, .utf8_code_unit, .auto);
+    var source = try Document.initWithEncoding(gpa, io, .utf8_code_unit, .auto);
     defer source.deinit();
     const text = try am.transaction.putObject(&source, root, .{ .key = "text" }, .text);
     try am.transaction.spliceText(&source, text, 0, 0, "\u{1F469}\u{1F3FF}\u{200D}\u{1F692}");
@@ -5053,38 +5116,52 @@ test "transaction patches mark at normalized UTF-8 indexes" {
 //      [`test.rs`](../github-automerge-automerge/rust/automerge/tests/test.rs):4407-4450
 
 test "patches expose a surviving conflict after deleting the other branch" {
-    var target = try newDocWithActor(.{ .bytes = "7f0000000000008027" });
-    defer target.deinit();
-    var value = try am.hydrate.Value.text(gpa, .unicode_code_point, "a");
-    defer value.deinit();
-    const object = try am.transaction.batchCreateValue(&target, root, .{ .key = "value" }, value, false);
+    // Upstream's fork actor is random (`test.rs:4423`). Cover both id orders
+    // deterministically: deleting the greater winner exposes the survivor;
+    // deleting the lesser conflict leaves the already-rendered survivor.
+    const encodings = [_]TextEncoding{ .unicode_code_point, .utf8_code_unit, .utf16_code_unit, .grapheme_cluster };
+    const left_actors = [_]ActorId{ .{ .bytes = "7e" }, .{ .bytes = "ff" } };
+    for (encodings) |encoding| {
+        for (left_actors) |left_actor| {
+            var target = try Document.initWithEncoding(gpa, io, encoding, .auto);
+            defer target.deinit();
+            target.setActorId(.{ .bytes = "7f0000000000008027" });
+            var value = try am.hydrate.Value.text(gpa, encoding, "a");
+            defer value.deinit();
+            const object = try am.transaction.batchCreateValue(&target, root, .{ .key = "value" }, value, false);
 
-    var left = try forkDoc(&target);
-    defer left.deinit();
-    _ = try am.transaction.put(&left, object, .{ .index = 0 }, .{ .str = "\u{1F98A}\u{1F43B}" });
+            var left = try forkDoc(&target);
+            defer left.deinit();
+            left.setActorId(left_actor);
+            _ = try am.transaction.put(&left, object, .{ .index = 0 }, .{ .str = "\u{1F98A}\u{1F43B}" });
 
-    var right = try forkDoc(&target);
-    defer right.deinit();
-    right.setActorId(.{ .bytes = "fe004faf" });
-    _ = try am.transaction.put(&right, object, .{ .index = 0 }, .{ .bytes = &[_]u8{0} ** 32 });
-    {
-        const heads = try target.merge(gpa, &left);
-        gpa.free(heads);
+            var right = try forkDoc(&target);
+            defer right.deinit();
+            right.setActorId(.{ .bytes = "fe004faf" });
+            _ = try am.transaction.put(&right, object, .{ .index = 0 }, .{ .bytes = &[_]u8{0} ** 32 });
+            {
+                const heads = try target.merge(gpa, &left);
+                gpa.free(heads);
+            }
+            {
+                const heads = try target.merge(gpa, &right);
+                gpa.free(heads);
+            }
+            _ = try am.transaction.delete(&right, object, .{ .index = 0 });
+
+            var actual = try hydrateNow(&target);
+            defer actual.deinit();
+            var patches = try patchesFrom(&target, MergeInto{ .other = &right });
+            defer patches.deinit();
+            var expected = try hydrateNow(&target);
+            defer expected.deinit();
+            const surviving_text = try am.read.text(&target, object, gpa);
+            defer gpa.free(surviving_text);
+            try testing.expectEqualStrings("\u{1F98A}\u{1F43B}", surviving_text);
+            try applyPatches(&actual, encoding, patches.slice());
+            try testing.expect(actual.eql(&expected));
+        }
     }
-    {
-        const heads = try target.merge(gpa, &right);
-        gpa.free(heads);
-    }
-    _ = try am.transaction.delete(&right, object, .{ .index = 0 });
-
-    var actual = try hydrateNow(&target);
-    defer actual.deinit();
-    var patches = try patchesFrom(&target, MergeInto{ .other = &right });
-    defer patches.deinit();
-    var expected = try hydrateNow(&target);
-    defer expected.deinit();
-    try applyPatches(&actual, .unicode_code_point, patches.slice());
-    try testing.expect(actual.eql(&expected));
 }
 
 // ── 121. big_list
@@ -5093,7 +5170,7 @@ test "patches expose a surviving conflict after deleting the other branch" {
 // Upstream's `const B: usize = 16` (`test.rs`:11) is the literal it is.
 
 test "a big list" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
     const list_id = blk: {
@@ -5130,7 +5207,7 @@ test "a big list" {
 //      [`test.rs`](../github-automerge-automerge/rust/automerge/tests/test.rs):2363-2435
 
 test "regression: an insert's operation ids" {
-    var doc = try Document.init(gpa, .manual);
+    var doc = try Document.init(gpa, io, .manual);
     defer doc.deinit();
     doc.setActorId(mintActor());
     const list_id = blk: {
@@ -5175,7 +5252,7 @@ test "regression: an insert's operation ids" {
     // first change was committed — is visible from this file.
     var all = try doc.getChanges(gpa, &.{});
     defer all.deinit(gpa);
-    var fresh = try Document.init(gpa, .manual);
+    var fresh = try Document.init(gpa, io, .manual);
     defer fresh.deinit();
     fresh.patch_log.deinit();
     fresh.patch_log = .active(gpa);
@@ -5249,7 +5326,7 @@ test "a failed merge with a duplicate sequence number does not corrupt save and 
     defer before.deinit();
     const saved = try left.save(gpa);
     defer gpa.free(saved);
-    var loaded = try Document.load(gpa, saved, .unicode_code_point, .auto);
+    var loaded = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
     defer loaded.deinit();
     var after = try hydrateNow(&loaded);
     defer after.deinit();
@@ -5343,7 +5420,7 @@ test "a queued orphan need does not block an unrelated sync response" {
     try testing.expectEqual(@as(usize, 1), still_missing.len);
     try testing.expect(still_missing[0].eql(missing));
 
-    var right = try Document.load(gpa, base, .unicode_code_point, .auto);
+    var right = try Document.load(gpa, io, base, .unicode_code_point, .auto);
     defer right.deinit();
     right.setActorId(.{ .bytes = "\x02" });
     _ = try am.transaction.put(&right, root, .{ .key = "right" }, .{ .uint = 3 });
@@ -5442,17 +5519,16 @@ test "a queued orphan need does not block an unrelated sync response" {
 // is the whole of that deviation: the assertion is about the patch content for
 // one known change, and `doc.diff` is what the port can answer it with.
 //
-// ## A fork goes through `forkAt`
+// ## A fork goes through `forkAt`, under a named actor
 //
 // **Upstream's `doc.fork()` is `Document.forkAt(gpa, heads, .auto)` in the
-// port, and that is not cosmetic: `Document.fork` leaks.**
-// [`Document.fork`](../src/doc.zig):3827-3830 stores
-// `ActorId.random(gpa)` — sixteen bytes taken from `gpa` — in `actor.unused`,
-// and `Document.deinit` frees no actor bytes because a caller may have handed
-// `setActorId` a string literal. `Document.forkAt` does the same work correctly
-// (`:3883-3891`): it copies the minted bytes into the fork's own arena and
-// frees the temporary. Forking at the current heads is what `fork` means, so
-// every forked document below is forked the way that frees what it takes.
+// port, and that is determinism rather than a leak.**
+// [`Document.fork`](../src/doc.zig) mints its actor through the source's
+// retained `io`, so the actor — and every change hash derived from it —
+// differs on every run. `fork` allocates that actor from the **fork's own**
+// arena, which [`Document.deinit`](../src/doc.zig) frees, so nothing is leaked
+// either way. Forking at the current heads is what `fork` means, so every
+// forked document below is the same document under an actor this file names.
 //
 // ## A rollback is only expressible through the manual door
 //

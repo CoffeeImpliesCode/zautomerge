@@ -62,6 +62,16 @@
 //! (`change.zig`), so a change whose actor array belongs to somebody else must
 //! not be pushed.
 //!
+//! The other direction is the same fact read from a caller's side:
+//! [`ChangeBatch.at`](ChangeBatch.at), [`ChangeQueue.get`](ChangeQueue.get)
+//! and both `slice` methods hand out **aliases** of a container-owned change,
+//! not fresh owners. `Change` is one struct with one allocation behind it, so
+//! a by-value return reads like a transfer at the call site and is not one —
+//! each of those declarations says so, and freeing what one of them returns
+//! is a double free against the container's own `deinit`. `push` is the
+//! mirror image and says the opposite, because it is the one method that
+//! really does take ownership.
+//!
 //! As everywhere else in this port, the allocator is a parameter and never the
 //! page allocator. The queue keeps the one it was built with, for the `deinit`
 //! that frees its own memory; every allocating method takes it as an argument
@@ -229,11 +239,29 @@ pub const ChangeBatch = struct {
     }
 
     /// The change at `index`, in dependency order.
+    ///
+    /// **The returned `Change` is an alias of the one the batch owns, not a
+    /// copy and not a new owner.** It borrows the batch's `other_actors`
+    /// allocation and its `bytes`, and [`deinit`](ChangeBatch.deinit) frees
+    /// both when the batch is released, so the copy must not be deinited:
+    /// doing so frees the actor array the batch still holds and the batch's
+    /// own `deinit` frees it again. A caller that wants to keep the change
+    /// past the batch copies it — `ChangeMetadata.intoOwned` for the fields
+    /// the graph keeps, or a `parseChange` of its own bytes for the rest.
+    ///
+    /// Out of bounds is a panic, as it is for every index into a
+    /// `std.ArrayList`; `len` is the bound.
     pub fn at(self: *const ChangeBatch, index: usize) Change {
         return self.changes.items[index];
     }
 
-    /// The changes, in dependency order. Valid until the batch is deinited.
+    /// The changes, in dependency order.
+    ///
+    /// **Every element aliases the batch's storage**, by the same rule
+    /// [`at`](ChangeBatch.at) states: valid until the batch is deinited or
+    /// mutated, and nothing reached through the slice may be deinited. The
+    /// slice is a borrow for exactly the reason `at` returns by value — it
+    /// cannot reach `Change.deinit` at all.
     pub fn slice(self: *const ChangeBatch) []const Change {
         return self.changes.items;
     }
@@ -307,12 +335,29 @@ pub const ChangeQueue = struct {
     }
 
     /// The waiting changes, in arrival order (`iter`, `change_queue.rs:64`).
-    /// Valid until the next change is pushed or removed.
+    ///
+    /// **Two invalidations, not one.** A push or a removal renumbers or
+    /// extends the list, and the sort compacts it in place and shrinks it, so
+    /// the slice is valid only until the next call to
+    /// [`push`](ChangeQueue.push),
+    /// [`removeActorBranchFrom`](ChangeQueue.removeActorBranchFrom) or
+    /// [`popTopoSortedReady`](ChangeQueue.popTopoSortedReady) — the three that
+    /// move elements. Nothing reached through the slice may be deinited; the
+    /// queue owns every change and frees it in
+    /// [`clear`](ChangeQueue.clear) or [`deinit`](ChangeQueue.deinit).
     pub fn slice(self: *const ChangeQueue) []const Change {
         return self.changes.items;
     }
 
     /// The queued change with this hash, or null.
+    ///
+    /// **The returned `Change` is an alias of the one the queue owns**, by the
+    /// same rule [`ChangeBatch.at`](ChangeBatch.at) states: it borrows the
+    /// queue's `other_actors` allocation, so it must not be deinited, and it
+    /// is only good until the next call that moves a change. A caller that
+    /// needs to keep one — to hand it to a queue that will own it — has to
+    /// parse it again or copy its metadata rather than take this value and
+    /// free it, which would corrupt a queue that is about to be sorted.
     pub fn get(self: *const ChangeQueue, hash: ChangeHash) ?Change {
         const at = self.index_by_hash.get(hash) orelse return null;
         return self.changes.items[at];
@@ -618,8 +663,14 @@ pub const ChangeQueue = struct {
         // a single change moves. That is what makes the queue unchanged when
         // the sort fails: every failure above this point, and the one inside
         // it, happens while the queue still holds all of its changes.
+        //
+        // Only the batch needs room. The queue's own list never grows here:
+        // what stays is compacted over the slots it already occupies and then
+        // shrunk, so it neither needs a reservation nor gets a benefit from
+        // one — it used to be given one, which cost a reallocation and put an
+        // `error.OutOfMemory` on the hot path of a sort that is documented to
+        // leave the queue untouched.
         try batch.changes.ensureTotalCapacity(gpa, head);
-        try self.changes.ensureUnusedCapacity(gpa, n - head);
         if (head != 0) {
             var next_at: usize = 0;
             for (self.changes.items, 0..) |change, at| {

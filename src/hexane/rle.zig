@@ -66,6 +66,31 @@
 //! written — while a one-element *repeat* is not, because rule 1 applies.
 //! Given a value sequence the canonical encoding is unique, so `write` here
 //! and the upstream state machine produce byte-identical slabs.
+//!
+//! # Import route and the shortest sequence that works
+//!
+//! `@import("hexane/rle.zig")`, or `zautomerge.hexane.rle` through the root
+//! module. Zig 0.16.0. What a column imports from here is the three factories
+//! [`Rle`], [`RleOption`] and [`RleUtf8`], plus the three value-payload
+//! helpers [`payloadRead`], [`payloadAppend`] and [`payloadEql`] and the
+//! [`maxSlabLen`] bound.
+//!
+//! ```zig
+//! const Codec = rle.Rle(u64);
+//! var out: std.ArrayList(u8) = .empty;
+//! try Codec.append(&out, gpa, &.{ 1, 2, 2, 2 });    // canonical bytes
+//! const rows = try Codec.decodeAll(out.items, gpa); // one allocation
+//! defer gpa.free(rows);
+//! ```
+//!
+//! # What it deliberately does not do
+//!
+//! It owns nothing and copies no byte payload out of the slab it reads. Every
+//! value a byte column hands back is a window on the caller's bytes — which
+//! is what makes a whole-column decode cost one allocation, and which means a
+//! caller that keeps a value past the slab's lifetime has to copy it. It does
+//! not expose the segmenter either: a slab's runs are a wire detail, and the
+//! codec's `canonical` is the whole of the shape a caller can ask about.
 
 const std = @import("std");
 const err = @import("../error.zig");
@@ -100,12 +125,16 @@ fn isPayload(comptime T: type) bool {
 /// Rejects any `T` that is not a payload, with one message for both
 /// factories so the two cannot drift into accepting different types.
 fn checkPayload(comptime T: type) void {
-    if (!isPayload(T) or T == [:0]const u8) @compileError(
+    if (comptime !isPayload(T) or T == [:0]const u8) @compileError(
         "an RLE value must be an integer type or []const u8",
     );
 }
 
 /// One value payload read from `bytes` at `pos`, and the bytes it occupies.
+///
+/// `T` is one of the two payload types [`Rle`] and [`RleOption`] take: an
+/// integer type, or `[]const u8` and not `[:0]const u8`. Anything else is a
+/// compile error, from the same check both factories run.
 ///
 /// An integer payload is LEB128, signed or unsigned by `T`'s own signedness
 /// (`lib.rs:566-637`). A byte payload is an unsigned LEB128 length followed
@@ -117,8 +146,10 @@ fn checkPayload(comptime T: type) void {
 /// **A byte payload borrows `bytes`.** It is a window on the encoded slab,
 /// not a copy, exactly as upstream's `try_unpack` returns `&'a [u8]`
 /// (`lib.rs:756-764`); a caller that keeps it past the slab's own lifetime
-/// has to copy it.
+/// has to copy it. The same is true of every value [`decodeAll`] hands out and
+/// of every one `Decoder.next` returns.
 pub fn payloadRead(comptime T: type, bytes: []const u8, pos: usize) ParseError!struct { value: T, len: usize } {
+    checkPayload(T);
     if (comptime T == []const u8) {
         const hdr = try leb128.readUnsigned(bytes[pos..]);
         const n = std.math.cast(usize, hdr.value) orelse return error.Overflow;
@@ -138,8 +169,14 @@ pub fn payloadRead(comptime T: type, bytes: []const u8, pos: usize) ParseError!s
     return .{ .value = narrow, .len = v.len };
 }
 
-/// Appends one value payload to `out`.
+/// Appends one value payload to `out`, which is allocated from `gpa` and
+/// stays the caller's.
+///
+/// `T` is one of the two payload types [`Rle`] and [`RleOption`] take: an
+/// integer type, or `[]const u8` and not `[:0]const u8`. Anything else is a
+/// compile error, from the same check both factories run.
 pub fn payloadAppend(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime T: type, value: T) std.mem.Allocator.Error!void {
+    checkPayload(T);
     if (comptime T == []const u8) {
         try leb128.appendUnsigned(out, gpa, value.len);
         try out.appendSlice(gpa, value);
@@ -151,12 +188,17 @@ pub fn payloadAppend(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime T
 
 /// Whether two value payloads are **the same value**.
 ///
+/// `T` is one of the two payload types [`Rle`] and [`RleOption`] take: an
+/// integer type, or `[]const u8` and not `[:0]const u8`. Anything else is a
+/// compile error, from the same check both factories run.
+///
 /// An integer compares by its own `==`. A byte payload compares by content,
 /// which is upstream's `ColumnValueRef::eq` for `Vec<u8>` (`lib.rs:739-741`)
 /// and `String` (`lib.rs:688-690`) — and *not* Zig's `==` on a slice, which
 /// compares the pointer and the length. Every run boundary and every
 /// canonicality rule in this file goes through here rather than through `==`.
 pub fn payloadEql(comptime T: type, a: T, b: T) bool {
+    checkPayload(T);
     if (comptime T == []const u8) return std.mem.eql(u8, a, b);
     return a == b;
 }
@@ -214,6 +256,13 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool, comptime Utf8: bool) ty
         /// `maxSlabLen` is `error.TooLarge`. Malformed bytes are whatever the
         /// LEB128 reader says they are (`error.UnexpectedEnd`,
         /// `error.InvalidLeb128`).
+        ///
+        /// **A byte payload borrows `bytes`.** For `Rle([]const u8)`,
+        /// `RleOption([]const u8)` and both [`RleUtf8`] forms the elements of
+        /// the returned slice are windows on `bytes` and not copies: this
+        /// allocates the header slice and nothing else, so a caller that frees
+        /// or overwrites `bytes` and keeps the rows reads freed memory. An
+        /// integer column's rows are values and carry no such obligation.
         pub fn decodeAll(bytes: []const u8, gpa: std.mem.Allocator) ParseError![]Element {
             const n = try countValues(bytes);
             const out = try gpa.alloc(Element, n);
@@ -325,12 +374,24 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool, comptime Utf8: bool) ty
         /// forward-decodable.
         pub const Decoder = struct {
             /// The slab being walked.
+            ///
+            /// **The decoder borrows it.** The `bytes` given to [`init`] must
+            /// stay alive and unmodified for as long as the decoder is used,
+            /// and the slab's owner must outlive the decoder. For
+            /// `Rle([]const u8)`, `RleOption([]const u8)` and both
+            /// [`RleUtf8`] forms the values `next` returns are windows into
+            /// this slab rather than copies — [`payloadRead`] is where that
+            /// happens, and it is upstream's `try_unpack` borrowing `&'a
+            /// [u8]` (`lib.rs:756-764`). A caller that keeps one past the
+            /// slab's lifetime has to copy it.
             data: []const u8,
             /// Byte offset of the next run header, or of the next literal value
             /// while a literal run is being served.
             pos: usize,
             /// Values still owed by the run in `run`.
             remaining: u64,
+            /// The run being served, and the shape of the bytes `pos` reads.
+            /// Its variants are private; `next` is the only way to advance it.
             run: Run,
 
             const Run = union(enum) {

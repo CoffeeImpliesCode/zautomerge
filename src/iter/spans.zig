@@ -84,6 +84,16 @@
 //! the same copy [`opset/batch.zig`](../opset/batch.zig) makes per patch event,
 //! and it is why nothing here needs a lifetime parameter.
 //!
+//! **And the run's buffer goes with the span, so a span outlives the reader
+//! that made it.** [`SpanState.flush`] hands the whole [`NextText`] over
+//! rather than copying out of it, and [`SpansDiff.next`] hands out a mark set
+//! [`batch.MarkDiff.exportSet`] allocated afresh. **A span this reader has
+//! already handed out therefore shares no storage with the fold**, which is
+//! what makes "a reader may be moved at any time" and "a span may be held" the
+//! same sentence: every `deinit` below releases only what the reader still
+//! holds, so freeing the reader never touches a span a caller already has, in
+//! either order.
+//!
 //! **The two folds are copied separately and flattened once.** A patch's mark
 //! payload is one set, and [`batch.MarkDiff.exportSet`] is where the two folds
 //! become one — `Pop::Before` rewrites a name the merge side lacks to a `Null`
@@ -390,7 +400,13 @@ pub fn SpanDiff(comptime O: type) type {
         /// The span itself (`spans.rs:18`).
         span: SpanInternal(O),
 
-        /// Gives back the span's own bytes and its marks.
+        /// Gives back the span's own bytes and its marks, **and the span is
+        /// dead once this returns**: the call ends in `self.* = undefined`, so
+        /// a second one reads undefined memory rather than reaching an
+        /// allocator that could diagnose the double free — `Debug` and
+        /// `ReleaseSafe` are the builds that would have said something. A block
+        /// arm owns no bytes and frees none; the op set its
+        /// [`maprange.ExIdPromise`](map_range.zig) names is borrowed.
         pub fn deinit(self: *Self, gpa: Allocator) void {
             self.span.deinit(gpa);
             self.* = undefined;
@@ -450,7 +466,11 @@ pub fn SpanInternal(comptime O: type) type {
             expose: bool,
         },
 
-        /// Gives back the run's bytes and its marks, if this span holds any.
+        /// Gives back the run's bytes and its marks, if this span holds any,
+        /// **and leaves the value unusable**: `self.* = undefined` is the last
+        /// line, so a second call reads undefined memory rather than reaching
+        /// an allocator. A `.obj` arm owns nothing and frees nothing — its id
+        /// is a number and its op set is the document's.
         pub fn deinit(self: *Self, gpa: Allocator) void {
             switch (self.*) {
                 .text => |*t| {
@@ -503,6 +523,13 @@ pub const Span = union(enum) {
 
     /// Gives back every byte this span owns: the text, and the mark set's own
     /// array. The mark names are the document's and stay.
+    ///
+    /// **And the span is dead once this returns**: the call ends in
+    /// `self.* = undefined`, so a second one reads undefined memory rather
+    /// than reaching an allocator that could diagnose the double free. A
+    /// `.block` arm owns nothing and frees nothing. **The document is
+    /// untouched** — the mark names stay valid in it, so releasing one span
+    /// shortens nobody else's life.
     pub fn deinit(self: *Span, gpa: Allocator) void {
         switch (self.*) {
             .text => |*t| {
@@ -1224,7 +1251,12 @@ pub fn SpansDiff(comptime O: type) type {
             };
         }
 
-        /// Gives back both mark folds and the buffered run.
+        /// Gives back both mark folds and the buffered run, **and leaves the
+        /// reader unusable**: `self.* = undefined` is the last line, so a second
+        /// call reads undefined memory rather than reaching an allocator that
+        /// could diagnose the double free. **A [`SpanDiff`] this reader has
+        /// already handed out is the caller's** and is not touched here — see
+        /// the module doc on why it shares no storage with the fold.
         pub fn deinit(self: *Self) void {
             self.marks.deinit();
             self.state.deinit();
@@ -1457,7 +1489,11 @@ pub fn SpansInternal(comptime O: type) type {
             };
         }
 
-        /// Gives back everything the reader made.
+        /// Gives back everything the reader made, **and leaves the reader
+        /// unusable**: `self.* = undefined` is the last line, so a second call
+        /// reads undefined memory rather than reaching an allocator. A
+        /// [`SpanInternal`] already handed out is the caller's, freed with
+        /// [`SpanInternal.deinit`] and the allocator this was built with.
         pub fn deinit(self: *Self) void {
             self.iter.deinit();
             self.* = undefined;
@@ -1511,8 +1547,12 @@ pub fn Spans(comptime O: type) type {
             };
         }
 
-        /// Gives back the reader's own folds and buffer. **The spans it has
-        /// already handed out are the caller's** and are not touched here.
+        /// Gives back the reader's own folds and buffer, **and leaves the
+        /// reader unusable**: `self.* = undefined` is the last line, so a second
+        /// call reads undefined memory rather than reaching an allocator.
+        /// **The spans it has already handed out are the caller's** and are not
+        /// touched here, **in either order** — they are detached copies, so a
+        /// span may be read after this call.
         pub fn deinit(self: *Self) void {
             self.internal.deinit();
             self.* = undefined;
@@ -2631,6 +2671,52 @@ test "a spans reader allocates nothing to construct and frees everything it made
     // **Back to the baseline.** A missed `Span.deinit`, an unreleased fold or a
     // buffered run that outlived its reader all land here.
     try testing.expectEqual(before, live);
+}
+
+test "a span outlives the reader that produced it, and freeing the reader does not touch it" {
+    // **`FailingAllocator` as a pure byte counter**, as the test above uses it.
+    // The document is built with `testing.allocator` and not with `gpa`, so
+    // every byte counted below belongs to the reader or to a span it handed
+    // out, and none of it belongs to the fixture.
+    var counter: testing.FailingAllocator = .init(testing.allocator, .{});
+    const gpa = counter.allocator();
+
+    const text = made(1, 0);
+    // **The marked fixture, not the plain one**: a plain run carries no mark
+    // set, so a span that kept a *borrowed* fold rather than a copied one would
+    // still read "ab" here and this test would pass with the defect it is for.
+    // The mark set is the half that proves the copy.
+    const doc = try Fixture.build(testing.allocator, &.{actor_a}, &.{
+        row(opId(1, 0), .root, .{ .map = "t" }, false, .make_text, .null_value, false, null, &.{}),
+        markBegin(opId(5, 0), text, head(), "bold", .{ .bool_value = true }),
+        row(opId(2, 0), text, anchored(opId(5, 0)), true, .set, .{ .str = "ab" }, false, null, &.{}),
+        markEnd(opId(6, 0), text, anchored(opId(2, 0))),
+        row(opId(3, 0), text, anchored(opId(6, 0)), true, .set, .{ .str = "cd" }, false, null, &.{}),
+    });
+    defer doc.destroy();
+    const rows = try doc.set.scopeToObj(text);
+
+    var reader = try Spans(opmod.Op).init(gpa, &doc.set, rows, null, encoding);
+    // **Constructing a reader allocates nothing**, so this is the line the
+    // span's own bytes are measured against.
+    try testing.expectEqual(@as(usize, 0), counter.allocated_bytes - counter.freed_bytes);
+
+    const held = (try reader.next()) orelse return error.TestExpectedItem;
+    reader.deinit();
+
+    // **The reader is gone and the span still reads.** Its run buffer was
+    // handed over rather than borrowed and its mark set was exported afresh, so
+    // nothing it names belongs to the fold this call just released — and
+    // `testing.allocator` is what would say so if it did.
+    try testing.expectEqualStrings("ab", try textOf(held));
+    try expectMarks(held, &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
+
+    // **And the span still owns what it was handed**, which is the other half
+    // of the same sentence: the count goes back to where constructing the
+    // reader found it, and only because the caller gave the bytes back.
+    var owned = held;
+    owned.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), counter.allocated_bytes - counter.freed_bytes);
 }
 
 test "a mark that crosses an op-tree page is neither split nor carried past its end, at every page boundary" {

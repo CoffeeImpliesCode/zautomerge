@@ -14,9 +14,16 @@
 //!
 //! * **Forward only.** There is no seek and no reset. A reader either
 //!   advances the cursor or returns an error, and a reader that returns an
-//!   error does not advance it, so a failed parse can never be mistaken for
-//!   a successful one and a caller that recovers is still positioned at the
-//!   value it failed on.
+//!   error leaves the cursor on the value it failed on, so a failed parse can
+//!   never be mistaken for a successful one and a caller that recovers is
+//!   still positioned at the value it failed on.
+//!
+//!   [`Input.readCountThen`] is the one reader this rule does not cover, and
+//!   it cannot: it has to read a count before it can judge it. A refused
+//!   count has already consumed its length prefix, and an error the callback
+//!   returns propagates with the cursor wherever that callback left it. A
+//!   caller that must go back to the count itself records `pos` before the
+//!   call; there is no rewind.
 //! * **Borrowed results.** Every slice a reader returns points into the
 //!   caller's own buffer. Nothing here allocates and no reader takes an
 //!   allocator.
@@ -26,9 +33,14 @@
 //!   *declared* length larger than the input could possibly hold returns
 //!   `error.LengthExceedsInput`, before the length is used to size or index
 //!   anything.
-//! * **Counts are checked before they are believed.** `readCountThen` is the
-//!   only way to read an element count, and it proves the count against
-//!   `remaining()` before the callback that may allocate ever sees it.
+//! * **A count is proved against the input before anything is sized from
+//!   it.** [`Input.readCountThen`] applies that proof itself: it refuses a
+//!   count larger than `remaining() / min_item_size` before the callback
+//!   that may allocate ever sees it. Reading a count with
+//!   [`Input.takeUleb`] instead is the caller's responsibility, because
+//!   `takeUleb` reads a LEB128 field of any width and applies no bound to
+//!   one. Neither route is enforced by the type system; a caller that sizes
+//!   an allocation from an unbounded count is the defect, not the reader.
 //!
 //! ## Endianness
 //!
@@ -50,6 +62,11 @@ const ParseError = err.ParseError;
 /// advances the cursor or fails; a failed parse never leaves the cursor in a
 /// state that could be mistaken for a successful read.
 ///
+/// The cursor borrows; it does not own. It holds a slice and an offset, so
+/// copying one is free and safe — the copies are independent cursors over the
+/// same bytes, and neither has to be released. The buffer it borrows must
+/// outlive every slice, cursor and offset taken from it.
+///
 /// Upstream's `Input<'a>` is `{bytes, position, original}` (`parse.rs:114-118`)
 /// and is a plain copy rather than a mutable handle, because every combinator
 /// threads the shrunk window through its return value. A hand-written Zig
@@ -62,17 +79,31 @@ const ParseError = err.ParseError;
 pub const Input = struct {
     /// The whole buffer this cursor walks. Nothing is ever copied out of it.
     bytes: []const u8,
-    /// How far into `bytes` the cursor has read. Always in `[0, bytes.len]`;
-    /// every method preserves that, so `bytes[pos..]` is always valid.
+    /// How far into `bytes` the cursor has read. Every method preserves
+    /// `pos <= bytes.len`, so `bytes[pos..]` is always valid.
+    ///
+    /// The field is reachable, so the invariant is the caller's to keep as
+    /// well as the methods'. [`Input.rest`] slices with it and
+    /// [`Input.remaining`] subtracts with it, neither checked: a value past
+    /// `bytes.len` panics in a checked build and is undefined behaviour in
+    /// `ReleaseFast`. Move it with the checked reader methods rather than
+    /// assigning it directly.
     pos: usize,
 
     /// A cursor positioned at the start of `bytes`.
+    ///
+    /// The buffer is borrowed, not copied: `bytes` is stored as given and the
+    /// caller keeps it, so mutating it while a cursor is live is the caller's
+    /// to avoid.
     pub fn init(bytes: []const u8) Input {
         return .{ .bytes = bytes, .pos = 0 };
     }
 
     /// The bytes not yet consumed. Upstream `unconsumed_bytes`
-    /// (`parse.rs:306-308`).
+    /// (`parse.rs:306-308`). Borrows `bytes`, so it is invalidated by nothing
+    /// here: the cursor has no lifetime of its own and does not own the
+    /// buffer, so a slice from `rest` stays valid exactly as long as the
+    /// caller's buffer does.
     pub fn rest(self: Input) []const u8 {
         return self.bytes[self.pos..];
     }
@@ -84,14 +115,17 @@ pub const Input = struct {
     }
 
     /// The number of bytes not yet consumed, which is `rest().len`. This is
-    /// the number every count read from a file is checked against.
+    /// the number every count read from a file is checked against: a
+    /// `readCountThen` divides it by the section's minimum element size, and
+    /// `take` refuses an `n` above it.
     pub fn remaining(self: Input) usize {
         return self.bytes.len - self.pos;
     }
 
     /// Consumes `n` bytes and returns them borrowed from the input. Upstream
-    /// `take_n` (`parse.rs:179-191`). A short input is `error.UnexpectedEnd`,
-    /// never a silently short slice.
+    /// `take_n` (`parse.rs:179-191`). The only error is
+    /// `error.UnexpectedEnd`, for an `n` the input cannot cover, and it
+    /// leaves the cursor where it stood — never a silently short slice.
     pub fn take(self: *Input, n: usize) ParseError![]const u8 {
         if (n > self.remaining()) return error.UnexpectedEnd;
         const out = self.bytes[self.pos .. self.pos + n];
@@ -99,7 +133,8 @@ pub const Input = struct {
         return out;
     }
 
-    /// One raw byte. Upstream `take_1` (`parse.rs:165-177`).
+    /// One raw byte. Upstream `take_1` (`parse.rs:165-177`). The only error is
+    /// `error.UnexpectedEnd`, and it consumes nothing.
     pub fn takeByte(self: *Input) ParseError!u8 {
         const out = try self.take(1);
         return out[0];
@@ -111,6 +146,18 @@ pub const Input = struct {
     /// strict reader: an overlong encoding, a tenth byte carrying more than
     /// the one bit that is left, and a truncated tail are all errors here
     /// rather than silently accepted values.
+    ///
+    /// The refusals are `error.UnexpectedEnd` for a truncated tail,
+    /// `error.InvalidLeb128` for an overlong encoding, and `error.Overflow`
+    /// for a tenth byte wider than the one bit that is left. All three leave
+    /// the cursor where it stood, because the length of the encoding is only
+    /// known once the value has been read.
+    ///
+    /// This reads any LEB128 field the format uses, a count as readily as a
+    /// length or a sequence number, and it applies **no bound of its own to a
+    /// count**. A caller that sizes an allocation from the value it returns
+    /// proves the value against `remaining()` first — which is what
+    /// [`Input.readCountThen`] does on the caller's behalf.
     pub fn takeUleb(self: *Input) ParseError!u64 {
         const r = try leb128.readUnsigned(self.rest());
         self.pos += r.len;
@@ -118,7 +165,9 @@ pub const Input = struct {
     }
 
     /// A signed LEB128 value, under the same strict rules
-    /// (`parse/leb128.rs:42-76`).
+    /// (`parse/leb128.rs:42-76`): `error.UnexpectedEnd`,
+    /// `error.InvalidLeb128` or `error.Overflow`, each leaving the cursor
+    /// where it stood.
     pub fn takeLeb(self: *Input) ParseError!i64 {
         const r = try leb128.readSigned(self.rest());
         self.pos += r.len;
@@ -129,7 +178,8 @@ pub const Input = struct {
     /// array of a `T`. Pass an integer type and read the value back with
     /// `std.mem.readInt(T, &bytes, .big)`, or pass an array type to take that
     /// many bytes by their width — a change hash is `@sizeOf([32]u8)`, a
-    /// chunk checksum is `@sizeOf([4]u8)`.
+    /// chunk checksum is `@sizeOf([4]u8)`. The only error is
+    /// `error.UnexpectedEnd`, for a short input, and it consumes nothing.
     pub fn takeArray(self: *Input, comptime T: type) ParseError![@sizeOf(T)]u8 {
         const n = @sizeOf(T);
         const bytes = try self.take(n);
@@ -138,13 +188,15 @@ pub const Input = struct {
         return out;
     }
 
-    /// A big-endian `u32`: four bytes, most significant first.
+    /// A big-endian `u32`: four bytes, most significant first. The only error
+    /// is `error.UnexpectedEnd`.
     pub fn takeU32(self: *Input) ParseError!u32 {
         const bytes = try self.takeArray(u32);
         return std.mem.readInt(u32, &bytes, .big);
     }
 
-    /// A big-endian `u64`: eight bytes, most significant first.
+    /// A big-endian `u64`: eight bytes, most significant first. The only error
+    /// is `error.UnexpectedEnd`.
     pub fn takeU64(self: *Input) ParseError!u64 {
         const bytes = try self.takeArray(u64);
         return std.mem.readInt(u64, &bytes, .big);
@@ -156,6 +208,11 @@ pub const Input = struct {
     /// it. That is how a chunk body, one column's data, or one section of a
     /// document is isolated before it is parsed. The sub-cursor's `pos` starts
     /// at zero, so an offset recorded inside it is relative to the region.
+    ///
+    /// The only error is `error.UnexpectedEnd`, for an `n` the input cannot
+    /// cover; a failed `sub` leaves the parent untouched. The sub-cursor
+    /// borrows the parent's bytes, so it outlives neither the buffer nor a
+    /// mutation of it, and it owns nothing of its own.
     pub fn sub(self: *Input, n: usize) ParseError!Input {
         return Input.init(try self.take(n));
     }
@@ -163,9 +220,12 @@ pub const Input = struct {
     /// Advances by `n` without checking, saturating at the end of the buffer.
     /// Upstream's `skip` clamps the same way (`parse.rs:239-247`): a skip past
     /// the end yields an empty cursor, and the next reader returns
-    /// `error.UnexpectedEnd` instead of trapping. Use it only to step over a
-    /// region whose length an earlier reader already validated, such as the
-    /// opaque tail of a change chunk; never to seek.
+    /// `error.UnexpectedEnd` instead of trapping. It never fails, so it
+    /// cannot be the reader that reports truncation.
+    ///
+    /// Use it only to step over a region whose length an earlier reader
+    /// already validated, such as the opaque tail of a change chunk; never to
+    /// seek. The cursor ends at `min(pos + n, bytes.len)`.
     pub fn skip(self: *Input, n: usize) void {
         const end = self.pos +| n;
         self.pos = @min(end, self.bytes.len);
@@ -177,6 +237,13 @@ pub const Input = struct {
     /// shape, and the document format writes an actor, a change message, a
     /// map key, and a value's byte payload exactly this way
     /// (`decodable_impls.rs:162-175`).
+    ///
+    /// The refusals are `error.UnexpectedEnd`,
+    /// `error.InvalidLeb128` and `error.Overflow` from the prefix, and
+    /// `error.LengthExceedsInput` for a declared length the bytes behind it
+    /// cannot hold. All four leave the cursor where it stood: the prefix is
+    /// measured without committing, so a caller that recovers is still
+    /// positioned at the string.
     pub fn readStrBytes(self: *Input) ParseError![]const u8 {
         const w = try self.strWindow();
         const bytes = self.rest()[w.head..][0..w.len];
@@ -190,6 +257,9 @@ pub const Input = struct {
     /// to allocate nothing. The cursor does not move when the bytes are not
     /// UTF-8, so a caller that recovers from the error is still positioned at
     /// the string rather than in the middle of it.
+    ///
+    /// The refusals are those of [`Input.readStrBytes`] plus
+    /// `error.InvalidUtf8`, and all five leave the cursor where it stood.
     pub fn readStr(self: *Input) ParseError![]const u8 {
         const w = try self.strWindow();
         const bytes = self.rest()[w.head..][0..w.len];
@@ -221,6 +291,34 @@ pub const Input = struct {
     /// causes. It carries the caller's own state — a destination collection,
     /// an allocator, an out-parameter for the number of elements actually
     /// parsed — through `ctx`, because a function pointer cannot capture.
+    ///
+    /// Four things about the callback are fixed here, and a caller needs all
+    /// four:
+    ///
+    /// * **`f` is a `comptime` parameter.** It must be named at the call
+    ///   site; a function value held in a variable is not a `comptime` value
+    ///   and cannot be passed. A sink that has to be chosen at run time is
+    ///   dispatched by the caller, not here.
+    /// * **`ctx` is passed by value and its type is whatever the caller
+    ///   passed**, because `@TypeOf(ctx)` names it in the signature. A sink
+    ///   that mutates therefore holds a pointer, and that is what every
+    ///   in-tree sink does.
+    /// * **`f` runs on the cursor the count came from, with the prefix
+    ///   already consumed.** A `ctx` that holds `*Input` — which is how
+    ///   `change.zig`, `storage/change_chunk.zig`, `storage/bundle.zig`,
+    ///   `storage/document_chunk.zig` and `sync/message.zig` all call this —
+    ///   advances that same cursor, so `f` consumes the counted section
+    ///   itself and the caller resumes where `f` stopped. `f` may also call
+    ///   `readCountThen` again on that cursor for a nested count: the bound
+    ///   is proved against whatever is left at the inner call, and both
+    ///   calls leave the cursor after their own prefix on failure.
+    /// * **What survives an error.** `error.UnexpectedEnd` from the prefix
+    ///   leaves the cursor where it stood. `error.LengthExceedsInput` leaves
+    ///   it just past the prefix it refused, because the count must be read
+    ///   before it can be judged. An error `f` itself returns propagates
+    ///   unchanged, with the cursor wherever `f` left it. In no case is the
+    ///   cursor restored, and a caller that recovers has to work from where
+    ///   it is or re-parse the whole buffer from a fresh cursor.
     pub fn readCountThen(
         self: *Input,
         ctx: anytype,
@@ -276,6 +374,43 @@ const Sink = struct {
 fn recordCount(n: *usize, count: usize) ParseError!void {
     n.* = count;
 }
+
+/// A `readCountThen` destination that holds the cursor itself, which is the
+/// shape every in-tree sink has: it reads the counted section off the same
+/// `Input` the count was read from.
+const CursorSink = struct {
+    in: *Input,
+    /// How many bytes the callback consumed, so a test can see the cursor it
+    /// left behind rather than inferring it.
+    read: usize = 0,
+
+    /// One byte per element, taken from the caller's own cursor.
+    fn collect(self: *CursorSink, count: usize) ParseError!void {
+        for (0..count) |_| {
+            _ = try self.in.takeByte();
+            self.read += 1;
+        }
+    }
+
+    /// The same, but refusing after the first byte, to pin what survives an
+    /// error the callback itself returns.
+    fn collectThenFail(self: *CursorSink, count: usize) ParseError!void {
+        try self.collect(count);
+        return error.UnexpectedEnd;
+    }
+
+    /// A callback that reads a *second* counted section off the same cursor,
+    /// which is the reentry case: the inner count is proved against whatever
+    /// is left after the outer one.
+    fn collectNested(self: *CursorSink, count: usize) ParseError!void {
+        for (0..count) |_| {
+            var n: usize = 0;
+            try self.in.readCountThen(&n, 1, recordCount);
+            self.read += n;
+            _ = try self.in.take(n);
+        }
+    }
+};
 
 // Reader wrappers that discard their result, so readers of different return
 // types can sit in one table.
@@ -504,6 +639,89 @@ test "the count bound is exactly the input" {
         wide.readCountThen(&sink, 32, Sink.collect),
     );
     try std.testing.expect(!sink.ran);
+}
+
+test "the callback runs on the caller's cursor, and the caller resumes where it stopped" {
+    // A count of two, one byte per element, then a byte that belongs to the
+    // caller rather than to the section.
+    const buf = [_]u8{ 0x02, 0xaa, 0xbb, 0xcc };
+    var in: Input = .init(&buf);
+
+    var sink: CursorSink = .{ .in = &in };
+    try in.readCountThen(&sink, 1, CursorSink.collect);
+
+    // **The callback moved the very cursor the count was read from.** Its two
+    // elements are gone from it, so the caller continues at the third byte
+    // rather than at the payload.
+    try std.testing.expectEqual(@as(usize, 2), sink.read);
+    try std.testing.expectEqual(@as(usize, 1), in.remaining());
+    try std.testing.expectEqual(@as(u8, 0xcc), try in.takeByte());
+    try std.testing.expect(in.isEmpty());
+}
+
+test "a refused count consumes its prefix, and an error from the callback does not rewind it" {
+    const buf = [_]u8{ 0x01, 0xaa, 0xbb };
+    var in: Input = .init(&buf);
+
+    var sink: CursorSink = .{ .in = &in };
+    try std.testing.expectError(
+        error.UnexpectedEnd,
+        in.readCountThen(&sink, 1, CursorSink.collectThenFail),
+    );
+    // The error came out of `f`, and `f` had already read its element: the
+    // prefix and the element are both consumed, and nothing is put back. A
+    // caller that recovers starts at the second element, not at the count.
+    try std.testing.expectEqual(@as(usize, 1), sink.read);
+    try std.testing.expectEqual(@as(usize, 1), in.remaining());
+    try std.testing.expectEqual(@as(u8, 0xbb), try in.takeByte());
+
+    // A count refused for being too large consumed its prefix and nothing
+    // else, because the callback never ran at all.
+    var refused: Input = .init(&[_]u8{ 0x03, 0x00, 0x00, 0x00, 0x00 });
+    var untouched: CursorSink = .{ .in = &refused };
+    try std.testing.expectError(
+        error.LengthExceedsInput,
+        refused.readCountThen(&untouched, 2, CursorSink.collect),
+    );
+    try std.testing.expectEqual(@as(usize, 0), untouched.read);
+    try std.testing.expectEqual(@as(usize, 4), refused.remaining());
+
+    // A prefix that cannot even be read is the other case: the count is
+    // refused before it exists, so the cursor does not move at all.
+    var truncated: Input = .init(&[_]u8{0x80});
+    try std.testing.expectError(
+        error.UnexpectedEnd,
+        truncated.readCountThen(&untouched, 1, CursorSink.collect),
+    );
+    try std.testing.expectEqual(@as(usize, 0), truncated.pos);
+}
+
+test "a callback may read a nested count off the same cursor" {
+    // Three groups, each a count and then the bytes that count names: 1, 2
+    // and 1. The outer count is proved against the seven bytes behind it at
+    // two per group, which is exactly three, and each inner count is proved
+    // against what the outer one left.
+    const buf = [_]u8{ 0x03, 0x01, 0xaa, 0x02, 0xbb, 0xcc, 0x01, 0xdd };
+    var in: Input = .init(&buf);
+
+    var sink: CursorSink = .{ .in = &in };
+    try in.readCountThen(&sink, 2, CursorSink.collectNested);
+
+    // Four elements across three groups, and the cursor sits at the end: the
+    // nested reads consumed exactly what their counts named.
+    try std.testing.expectEqual(@as(usize, 4), sink.read);
+    try std.testing.expect(in.isEmpty());
+
+    // The same bytes under an outer minimum too wide for three groups is
+    // refused before the callback runs, so the inner reads never happen.
+    var wide: Input = .init(&buf);
+    var wide_sink: CursorSink = .{ .in = &wide };
+    try std.testing.expectError(
+        error.LengthExceedsInput,
+        wide.readCountThen(&wide_sink, 3, CursorSink.collectNested),
+    );
+    try std.testing.expectEqual(@as(usize, 0), wide_sink.read);
+    try std.testing.expectEqual(@as(usize, 7), wide.remaining());
 }
 
 test "sub isolates a region and advances the parent" {
