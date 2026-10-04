@@ -117,6 +117,38 @@ CROSS_BUILD_JOBS=1
 CROSS_TIMEOUT=900
 CROSS_BUILD_TIMEOUT=3600
 
+# WHAT A PER-TARGET LOG NOW SHOWS, AND WHERE THE WHOLE RECORD IS
+# `zig build test` runs every root through `test/verification_runner.zig`,
+# which speaks the build runner's own protocol unchanged — the counts in
+# `Build Summary: N/M tests passed` are the same ones this matrix has always
+# read — and additionally appends one line per case to a record file under
+# **this target's own** cache directory: `n/total <ns> pass|skip|fail <name>`
+# when a case finishes, and `n/total begin - <name>` before it starts. Three
+# things follow for reading a row below.
+#
+#   * A root that finishes prints its own summary into the log: how many of
+#     its cases ran, the total seconds, the ten slowest cases by name, and
+#     the last five lines of the record. A forty-minute native root is
+#     therefore attributable from the run that already happened, instead of
+#     from a re-run with a filter — which is the narrowing this matrix does
+#     not do.
+#   * A root that is killed is still readable. `--test-timeout 900s` is a
+#     **per-case** budget, so a case that outruns it is named in the build
+#     runner's error together with how long it had been running, and the last
+#     line of that root's record file names the same case. The outer
+#     CROSS_BUILD_TIMEOUT is a whole-phase deadline and kills the build
+#     itself, so nothing is printed after it; the record file on disk is what
+#     is left, and its last line is the case in flight.
+#   * cross-test gives every target a fresh `--cache-dir`, so one target's
+#     records are never another target's, and `tail -f` on the record of a
+#     root that is still going is the live view of it.
+#
+# None of that makes a timeout a pass. It is still a budget finding to read
+# and not to reclassify: nothing here is raised to turn one green, and
+# nothing is narrowed to make one fit. What the record buys is the ability to
+# say which of the two a red row is — a case that got slower, or a target
+# that emulates it more slowly than the host runs it.
+
 # A target with no runner is compile coverage, not a pass, and not a failure
 # either. x86_64-windows has no wine64 in this environment, so cross-test
 # records it build_only/runtime_unavailable and says so in its summary;

@@ -117,6 +117,31 @@ pub const root: ExId = .root;                      // src/root.zig
 | `Patch`, `PatchAction` | `Patch`, `PatchAction` | `src/patches.zig` `Patch`, `PatchAction` | |
 | `Stats` | `Stats` | `src/doc.zig` `Stats` | three counters; upstream's struct also carries the crate and `rustc` versions, which are facts about the build |
 
+## Hexane packing
+
+The low-level codec modules are root-reachable as `zautomerge.hexane`.
+Their default factories remain `rle.Rle(T)`, `rle.RleOption(T)`,
+`rle.RleUtf8(Nullable)`, `bool_codec.Bool`, and `delta.Delta(T)`.
+They use `rle.Leb128`, which names `src/leb128.zig` without a forwarding copy.
+
+Explicit packing seams are `rle.RleWith(P, T, Nullable, Utf8)`,
+`bool_codec.BoolWith(P)`, `delta.DeltaWith(P, T)`,
+`rle.payloadReadWith(P, T, bytes, pos)`, and
+`rle.payloadAppendWith(P, gpa, out, T, value)`. `P` is a comptime type.
+It must match the required signed/unsigned read, write, append, size, and
+maximum-size declarations in `src/leb128.zig`. Reads must consume a positive,
+in-bounds byte count and use the same `ParseError` contract.
+The same packing must encode headers, counts, lengths, and value payloads.
+
+`slab.rewrite_lit_header` now requires `P` as its first argument:
+`rewrite_lit_header(P, gpa, buf, header_pos, total)`.
+Default-wire callers pass `rle.Leb128`; alternate-wire callers pass their codec's
+packing. There is no old-signature alias.
+
+These seams do not select a different Automerge document format.
+Only LEB128 ships for document storage. The private BeLen provider is test-only;
+the five upstream alternate-packing cases use it to exercise the entire path.
+
 ## Read
 
 The `ReadDoc` surface is in `src/read.zig`. Calls take `*const Document`, but

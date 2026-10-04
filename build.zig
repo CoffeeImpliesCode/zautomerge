@@ -79,19 +79,16 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "build_options", .module = slow_options.createModule() }},
         }),
     });
-    const run_slow_lib_tests = b.addRunArtifact(slow_lib_tests);
-
     const slow_path_step = b.step(
         "slow-path",
         "Run the unit tests with -Dslow-path forced on",
     );
-    slow_path_step.dependOn(&run_slow_lib_tests.step);
+    timedTest(b, slow_lib_tests, "library-slow-path", null, &.{slow_path_step});
 
     const lib_tests = b.addTest(.{ .root_module = mod });
-    const run_lib_tests = b.addRunArtifact(lib_tests);
 
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_lib_tests.step);
+    timedTest(b, lib_tests, "library", null, &.{test_step});
 
     // The fixture corpus lives in test/fixtures and the test reads it through
     // a path relative to the build root, which is the process working
@@ -103,9 +100,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    const run_fixtures_tests = b.addRunArtifact(fixtures_tests);
-    run_fixtures_tests.setCwd(b.path("."));
-    test_step.dependOn(&run_fixtures_tests.step);
+    timedTest(b, fixtures_tests, "fixtures", b.path("."), &.{test_step});
 
     // The crate-root address-book example, run the way a consumer runs it: a
     // module of its own that imports `zautomerge` by name, so nothing below
@@ -130,8 +125,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    const run_example_tests = b.addRunArtifact(example_tests);
-    test_step.dependOn(&run_example_tests.step);
+    timedTest(b, example_tests, "example", null, &.{test_step});
 
     // `rust/automerge/tests/test.rs` — the document's own 140-case suite —
     // ported case for case into `test/upstream_doc_test.zig`, and run the way
@@ -150,8 +144,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    const run_upstream_doc_tests = b.addRunArtifact(upstream_doc_tests);
-    test_step.dependOn(&run_upstream_doc_tests.step);
+    timedTest(b, upstream_doc_tests, "upstream-doc", null, &.{test_step});
 
     // `rust/automerge/tests/test_mark_patches.rs` — a file holding **exactly
     // one** `#[test]` — ported case for case into `test/mark_patches_test.zig`.
@@ -176,8 +169,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    const run_mark_patches_tests = b.addRunArtifact(mark_patches_tests);
-    test_step.dependOn(&run_mark_patches_tests.step);
+    timedTest(b, mark_patches_tests, "mark-patches", null, &.{test_step});
 
     // `rust/hexane/src/tests.rs`, ported case for case where the port's public
     // API reaches the case, into `src/hexane/hexane_test.zig`. **Its own step
@@ -204,8 +196,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    const run_hexane_tests = b.addRunArtifact(hexane_tests);
-    test_step.dependOn(&run_hexane_tests.step);
+    timedTest(b, hexane_tests, "hexane", null, &.{test_step});
 
     // The C ABI's Zig tests need libc and a root under src/ so imports stay
     // inside the module. The library test root deliberately links no libc.
@@ -221,11 +212,8 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = &.{ "c.doc.", "c.sync." },
     });
-    const run_c_abi_tests = b.addRunArtifact(c_abi_tests);
-    run_c_abi_tests.setCwd(b.path("."));
-    test_step.dependOn(&run_c_abi_tests.step);
     const c_abi_step = b.step("c-abi-test", "Run the C ABI's own Zig test sections");
-    c_abi_step.dependOn(&run_c_abi_tests.step);
+    timedTest(b, c_abi_tests, "c-abi", b.path("."), &.{ test_step, c_abi_step });
 
     // `test/upstream_doc_more.zig` is the **remainder** of the same upstream
     // file: the 23 of `tests/test.rs`'s 140 `#[test]` cases that
@@ -252,9 +240,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    const run_upstream_doc_more_tests = b.addRunArtifact(upstream_doc_more_tests);
-    run_upstream_doc_more_tests.setCwd(b.path("."));
-    test_step.dependOn(&run_upstream_doc_more_tests.step);
+    timedTest(b, upstream_doc_more_tests, "upstream-doc-more", b.path("."), &.{test_step});
 
     // `test/upstream_text_more.zig` is the **remainder** of the upstream text
     // suites: the three `#[test]` cases in `rust/automerge/tests/text.rs` and
@@ -279,8 +265,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    const run_upstream_text_more_tests = b.addRunArtifact(upstream_text_more_tests);
-    test_step.dependOn(&run_upstream_text_more_tests.step);
+    timedTest(b, upstream_text_more_tests, "upstream-text-more", null, &.{test_step});
     // `test/upstream_batch_insert.zig` is `$AUTOMERGE_REF/rust/automerge/tests/
     // batch_insert.rs` — all 46 of its `#[test]` cases, ported case for case
     // and in upstream's order, and nothing else. It is the **whole** of a file
@@ -308,8 +293,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    const run_upstream_batch_insert_tests = b.addRunArtifact(upstream_batch_insert_tests);
-    test_step.dependOn(&run_upstream_batch_insert_tests.step);
+    timedTest(b, upstream_batch_insert_tests, "upstream-batch-insert", null, &.{test_step});
 
     // `test/upstream_save_load_orphans.zig` is `$AUTOMERGE_REF/rust/automerge/
     // tests/test_save_load_orphans.rs` — all 3 of its `#[test]` cases, ported
@@ -340,8 +324,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    const run_upstream_save_load_orphans_tests = b.addRunArtifact(upstream_save_load_orphans_tests);
-    test_step.dependOn(&run_upstream_save_load_orphans_tests.step);
+    timedTest(b, upstream_save_load_orphans_tests, "upstream-save-load-orphans", null, &.{test_step});
 
     // `test/upstream_block_tests.zig` is `$AUTOMERGE_REF/rust/automerge/tests/
     // block_tests.rs` — **all nineteen of its `#[test]` cases**, ported case
@@ -376,8 +359,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    const run_upstream_block_tests = b.addRunArtifact(upstream_block_tests);
-    test_step.dependOn(&run_upstream_block_tests.step);
+    timedTest(b, upstream_block_tests, "upstream-block", null, &.{test_step});
 
     // `test/upstream_convert_string.zig` is
     // `$AUTOMERGE_REF/rust/automerge/tests/convert_string_to_text.rs` — **all
@@ -415,8 +397,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    const run_upstream_convert_string_tests = b.addRunArtifact(upstream_convert_string_tests);
-    test_step.dependOn(&run_upstream_convert_string_tests.step);
+    timedTest(b, upstream_convert_string_tests, "upstream-convert-string", null, &.{test_step});
 
     // `test/upstream_rich_text_fuzz.zig` is `$AUTOMERGE_REF/rust/automerge/
     // tests/rich_text_fuzz_crash.rs` — **8 of its 9** `#[test]` cases, ported
@@ -454,8 +435,38 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    const run_upstream_rich_text_fuzz_tests = b.addRunArtifact(upstream_rich_text_fuzz_tests);
-    test_step.dependOn(&run_upstream_rich_text_fuzz_tests.step);
+    timedTest(b, upstream_rich_text_fuzz_tests, "upstream-rich-text-fuzz", null, &.{test_step});
+
+    // `test/save_interop_test.zig` is the **permanent** half of the save
+    // interoperability gate: it reads `test/golden/save-interop.jsonl` — the
+    // records `tools/oracle`'s `save-interop` subcommand recorded from the
+    // reference automerge — rebuilds each of the six shared scripts itself,
+    // and checks its heads, its change hashes and raw change bodies, and its
+    // hydrated document against the reference's answer for the same script,
+    // plus the **normalized default-save body** the reference would have
+    // written for that script.
+    //
+    // **A working directory *is* set**, unlike most of the steps above:
+    // this file reads `test/golden/save-interop.jsonl`, and that file is the
+    // only copy of the reference's answers to those six scripts.
+    //
+    // **No Cargo and no reference checkout**, which is the whole difference
+    // between this step and `conformance` below. `save-interop.jsonl` is a
+    // committed file like any other fixture, so `zig build` and
+    // `zig build test` need neither the oracle nor the sibling `automerge`
+    // checkout. What makes it a gate rather than a pinned answer is what it
+    // is pinned **to**: `zig build conformance` regenerates that file from
+    // the reference and fails the moment it differs, so a vector cannot drift
+    // away from the reference behind this test's back.
+    const save_interop_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/save_interop_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zautomerge", .module = mod }},
+        }),
+    });
+    timedTest(b, save_interop_tests, "save-interop", b.path("."), &.{test_step});
 
     // `zig build ctest` builds the upstream C conformance suite — the cmocka
     // suite from `rust/automerge-c/test/`, copied verbatim into
@@ -724,7 +735,201 @@ pub fn build(b: *std.Build) void {
     } else {
         conformance_step.dependOn(&addPassthrough(b, link_oracle, args).step);
     }
+
+    // `zig build save-interop` is the **live** half of the same gate, and it
+    // is a step rather than a test because the reference has to answer
+    // between the two halves. Nothing in it is committed: the port builds each
+    // of the six shared scripts and prints its saves, `tools/oracle`'s
+    // `verify-save-interop` loads each of them with the reference automerge,
+    // compares what it loaded against the reference's own build of the same
+    // script, and prints a re-save of what it loaded, and the port checks
+    // **that**. The reverse direction is therefore proved against live bytes
+    // and needs no golden file of its own, which is also the only honest way
+    // to check it: a compressed save is not a byte-for-byte commitment, so a
+    // pinned copy of one would be a fixture that only ever proves it is still
+    // itself.
+    //
+    // **Three processes, ordered by the file that carries the data.** Each
+    // stage takes the previous one's output as a `std.Build.LazyPath` —
+    // `captureStdOut` (`Run.zig:675`) from the two that print records,
+    // `setStdIn` for the one that reads them, `addFileArg` for the last — and
+    // each of those calls adds the producing step to the consumer's
+    // dependencies (`Run.zig:530`, `Run.zig:354`, `Build.zig:2469-2472`), so
+    // the order is a property of the graph rather than a hand-written
+    // `dependOn` that a later edit can drop. No output file is spelled out and
+    // no stdout is parsed here: the oracle reads stdin because that is what
+    // `cargo run` hands the binary it spawns.
+    //
+    // **No `expectExitCode` and no `stdio` assignment on the two runs whose
+    // diagnostics matter**, and that is the load-bearing choice here.
+    // `expectExitCode` is only reachable on a run in the checked stdio mode
+    // (`addCheck` panics on every other mode, `Run.zig:641-652`), and the
+    // checked mode pipes stderr and keeps it — a failure in the checked mode
+    // reports the exit code and nothing else (`Run.zig:1433-1496`). What these
+    // two runs need is the opposite: their own streams inherited, so a failed
+    // oracle or a failed verification prints what it thinks went wrong next
+    // to the line saying it failed. A non-zero exit still fails the step,
+    // through the term handling every non-checked mode uses
+    // (`Run.zig:1509`, `Step.zig:726-729`).
+    //
+    // Like `conformance`, this step needs cargo and the reference checkout, so
+    // it is unreachable from the default step and from `zig build test`.
+    const save_interop_bin = b.addExecutable(.{
+        .name = "zautomerge-save-interop",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/save_interop.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zautomerge", .module = mod }},
+        }),
+    });
+
+    // 1. The port's own six saves, as NDJSON on stdout. **No argument** is the
+    //    dump mode; `dump` is an accepted synonym and is not spelled here
+    //    because the no-argument form is the one the executable's contract
+    //    fixes. No `setCwd`, because the executable reads no path: a step that
+    //    sets a working directory it does not need breaks the moment the file
+    //    moves.
+    const dump_saves = b.addRunArtifact(save_interop_bin);
+    dump_saves.setName("dump the port's six saves");
+    // `trim_whitespace` stays at its `.none` default on purpose. The records
+    // are newline-delimited JSON and the trailing newline is part of what the
+    // oracle is about to be handed; trimming the file would make the gate
+    // check a save that nothing else ever produced.
+    const save_requests = dump_saves.captureStdOut(.{ .basename = "save-requests.jsonl" });
+
+    // 2. The reference's answer to those saves. **`has_side_effects` is set
+    //    here**, and it is what makes this run inherit its stderr: with the
+    //    default stdio, a run that has side effects gets `.inherit` on both
+    //    streams, and one that does not gets a pipe the build reads only to
+    //    report a failure (`Run.zig:1560-1571`). It also forces the run on
+    //    every invocation, which matters because the oracle's own sources are
+    //    not a declared build input: without it a cached capture of an older
+    //    oracle would be the answer the port is checked against, and the gate
+    //    would be checking itself (`Run.zig:707-714`, `Run.zig:926`).
+    const verify_with_reference = b.addSystemCommand(&.{"cargo"});
+    verify_with_reference.addArgs(&.{ "run", "--quiet", "--manifest-path" });
+    verify_with_reference.addFileArg(b.path("tools/oracle/Cargo.toml"));
+    verify_with_reference.addArgs(&.{ "--", "verify-save-interop" });
+    verify_with_reference.setCwd(b.path("."));
+    // The requests go in on stdin, which is how the oracle's other
+    // stdin-driven subcommands (`feed`, `loadhex`) are fed, and this is the
+    // edge that orders stage 1 before stage 2. `setStdIn` is not the same as
+    // inheriting: a run with piped stdin asserts it is not in the `.inherit`
+    // stdio mode (`Run.zig:1551-1553`).
+    verify_with_reference.setStdIn(.{ .lazy_path = save_requests });
+    verify_with_reference.has_side_effects = true;
+    verify_with_reference.step.dependOn(&link_oracle.step);
+    verify_with_reference.setName("run automerge oracle verify-save-interop");
+    const reference_responses = verify_with_reference.captureStdOut(.{
+        .basename = "reference-responses.jsonl",
+    });
+
+    // 3. The port checks what the reference made of its saves: the same six
+    //    scenarios rebuilt on this side, the reference's re-save loaded and
+    //    compared, and the response file's own hash, head and change-bytes
+    //    claims checked rather than trusted. Its `has_side_effects` is the
+    //    same argument as stage 2's, and its input is a reference answer
+    //    produced a moment earlier, so it is live by construction; that is
+    //    also what puts the checked-case count it reports on stderr in front
+    //    of the operator while the step runs, rather than in a cache file
+    //    nobody reads.
+    const verify_reference_saves = b.addRunArtifact(save_interop_bin);
+    verify_reference_saves.addArgs(&.{"verify"});
+    verify_reference_saves.addFileArg(reference_responses);
+    verify_reference_saves.has_side_effects = true;
+    verify_reference_saves.setName("verify the reference's cross-loaded saves");
+
+    const save_interop_step = b.step(
+        "save-interop",
+        "Check the port's saves against the automerge reference, in both directions",
+    );
+    save_interop_step.dependOn(&verify_reference_saves.step);
 }
+
+/// Run one test root under `test/verification_runner.zig` and put that root's
+/// case record in front of whoever asked for the root.
+///
+/// The runner is the compiler's own `std.zig.Server` protocol with one thing
+/// added: a file naming every case with the nanoseconds it spent, appended
+/// and flushed per case. That is what makes a root which takes forty
+/// minutes answer for itself — while it runs, from the file's last line, and
+/// afterwards from the summary `report` prints. **Nothing about which cases
+/// run changes**: the runner serves the same `builtin.test_functions` table
+/// the compiler built, with the same flags, so the build runner's counts,
+/// its per-case `--test-timeout` attribution, its leak and `std.log` counts
+/// and its `Build Summary: N/M tests passed` line are the ones this project
+/// has always read.
+///
+/// Four decisions in here, three of them about not losing the evidence:
+///
+/// - The runner is attached to the compile step here rather than passed to
+///   each of the sixteen `b.addTest` call sites, because
+///   `std.Build.addRunArtifact` reads `test_runner` to choose between the
+///   server protocol and an exit code (`Build.zig`:986-1000). A runner
+///   attached after that call would leave a `Run` step waiting for a
+///   protocol this process never speaks.
+/// - The record is declared with `addWriteFiles`, so the file and its
+///   directory exist before the runner truncates them, and so `report` reads
+///   a real file rather than a path that may be absent — a missing declared
+///   input is a build error, and a cross row whose test binary never ran is
+///   exactly that case. `run` takes the same `LazyPath` the report does, so
+///   the build system renders one path for both, and the `dependOn` below
+///   orders `WriteFile` → root → report, which is what stops a `WriteFile`
+///   cache miss from truncating a finished record between the two.
+/// - `report` is a step **per root** rather than one step for the whole
+///   `test` step, so a root that fails still leaves every other root's
+///   timings in the log.
+/// - It narrows nothing. No filter, no seed, no reduced timeout and no
+///   skipped root appears anywhere below; the runner runs every entry of the
+///   table it is given, and `report` exits 0 whatever it finds, because a
+///   reporting step must never be able to turn a passing run red.
+fn timedTest(
+    b: *std.Build,
+    test_artifact: *std.Build.Step.Compile,
+    label: []const u8,
+    cwd: ?std.Build.LazyPath,
+    steps: []const *std.Build.Step,
+) void {
+    test_artifact.test_runner = .{ .path = b.path("test/verification_runner.zig"), .mode = .server };
+
+    const run = b.addRunArtifact(test_artifact);
+    const record = b.addWriteFiles().add(b.fmt("zautomerge-test-timings-{s}.tsv", .{label}), "");
+    run.addPrefixedFileArg("--zautomerge-progress=", record);
+
+    const report = b.addSystemCommand(&.{"sh"});
+    report.addArgs(&.{ "-c", timing_report_script, "sh" });
+    report.addFileArg(record);
+    if (cwd) |dir| {
+        // The same working directory `run` gets, because that is what makes
+        // the one path the build system rendered resolve to one file in both
+        // processes rather than to two files in two directories.
+        run.setCwd(dir);
+        report.setCwd(dir);
+    }
+    report.expectExitCode(0);
+    report.setName(b.fmt("print {s} case timings", .{label}));
+    report.step.dependOn(&run.step);
+
+    for (steps) |step| step.dependOn(&report.step);
+}
+
+/// What `timedTest` runs once a root has finished: that root's totals, its
+/// slowest cases and the last few cases it reached. `grep` and `tail` keep
+/// the log readable when the root was 1730 cases long, and the `exit 0` is
+/// what makes a missing record a note rather than a failed step.
+const timing_report_script =
+    \\f="$1"
+    \\if [ ! -f "$f" ]; then
+    \\  echo "zautomerge-test-timings: no case record at $f (this root never ran)"
+    \\  exit 0
+    \\fi
+    \\echo "zautomerge-test-timings: $f"
+    \\grep '^#' "$f"
+    \\echo "zautomerge-test-timings: last cases in the record"
+    \\tail -n 5 "$f"
+    \\exit 0
+;
 
 /// Run one oracle subcommand and either check its vector against the
 /// committed copy or record it, per `-Dconformance-record`. `record_dir` is
@@ -836,19 +1041,40 @@ const golden_dir = "test/golden";
 /// | `converge-parallel` | read at run time by `src/sync/protocol.zig`                             |
 /// | `codec`             | read at run time by `src/hexane/codec_golden.zig`                      |
 /// | `clock`             | nothing yet: checked, and read by no test                              |
+/// | `save-interop`       | read at run time by `test/save_interop_test.zig`, and the six scripts `zig build save-interop` replays against the live oracle |
+/// | `hexane-regression` | read at run time by `src/hexane/raw.zig`'s `cross_slab_fuzz_regression`, which replays upstream's seed-799 op list step by step against the port's own run-budget column |
 ///
 /// `doc`, `change` and `diff` are recorded as the provenance of literals in
 /// `src/`, which is why re-recording them changes no test on its own: the
 /// check is what says the literals still agree with the reference.
 ///
+/// `save-interop` is the one vector with a **live** second consumer, and the
+/// two directions are deliberately different. This file is the committed half:
+/// it is a record of what the reference answers for the six shared scripts,
+/// and `zig build conformance` is what says the record is still true. The
+/// **reverse** direction — the port's saves loaded by the reference and the
+/// reference's re-save loaded by the port — is checked by `zig build
+/// save-interop` against `tools/oracle` running now, and reads no committed
+/// file at all. That is not a gap in the vector table; a compressed save is
+/// not a byte-for-byte commitment, so what the reverse direction has to agree
+/// on is the normalized body, the materialized state and the hashes, and
+/// those are checked live rather than pinned to bytes a DEFLATE encoder
+/// chose.
+///
 /// Every subcommand **not** in this list owns no vector under `test/golden/`
 /// and prints to stdout, so it is reachable by name and left alone. **That is
 /// the rule and not an enumeration**: the oracle grows a subcommand
 /// (`updocprobe` was the last) and a list of names goes stale on the next one,
-/// which is how this sentence came to name four of the ten it should have.
-/// The ten are `fixtures`, `marks`, `updocprobe`, `feed`, `loadinc`, `third`,
-/// `text`, `isolateprobe`, `sample` and `loadhex`
-/// (`tools/oracle/src/main.rs`:193-213).
+/// which is how this sentence came to name four of the eleven it should have.
+/// The eleven are `fixtures`, `marks`, `updocprobe`, `feed`, `loadinc`, `third`,
+/// `text`, `isolateprobe`, `sample`, `loadhex` and `verify-save-interop`
+/// (`tools/oracle/src/main.rs`:193-213). **`verify-save-interop` is the
+/// subcommand that most wants a vector and must not have one**: it reads the
+/// port's saves on stdin and answers with its own, so what it writes depends on
+/// the thing under test rather than on the reference alone, and a committed
+/// copy of that answer would be a fixture only the port it was recorded from
+/// could pass. `zig build save-interop` runs it live and hands its answer
+/// straight back to the port instead.
 const golden_vectors = [_][]const u8{
     "doc",
     "change",
@@ -858,4 +1084,6 @@ const golden_vectors = [_][]const u8{
     "converge-parallel",
     "codec",
     "clock",
+    "save-interop",
+    "hexane-regression",
 };

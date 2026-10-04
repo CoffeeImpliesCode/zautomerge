@@ -2,11 +2,78 @@
 
 The plan of record is [plan.md](plan.md); this is the state of it.
 
-## Current API-design repair evidence
+## P2/P5 repair evidence (2026-10-04)
 
-**Source baseline:** working-copy revision `4450924c`, based on committed parent
-`f8aace30c150ac99f97efbe36a1c731430996ec2`. The repairs are uncommitted edits against that baseline.
-The package hash below identifies the frozen native/C source snapshot used by the consumers.
+Scope: Zig 0.16.0, x86-64 Linux, reference commit
+`ddbff535407e4d28cd2a82eaf6c6add08caa3bdd`. Each row certifies only its named
+source path and execution.
+
+| Check | Observed result |
+| --- | --- |
+| Final integrated Debug command | 69/69 steps succeeded; 3722/3723 Zig tests passed, one default-run skip, no failures. Includes `test slow-path ctest conformance save-interop`. |
+| Default native test roots, Debug | 1992 passed, one skipped. The library root passed 1729 with one skip; all 118 upstream document cases passed. |
+| Forced slow-path library root, Debug | 1730/1730 passed, including the case skipped in the default run. |
+| Ten golden vectors and live save interop | Every golden file matched the reference; the live verifier reported 6/6 cases verified. |
+| Unfiltered hexane integration module, Debug | All 8 cases passed, including both exhaustive splice sweeps and the 100,000-operation slab-merge invariant case. |
+| Real boolean column CLI | All 187 deletion prefixes, lengths 14 through 200, produced exact canonical bytes and loaded rows. Before the repair, the 18-row prefix encoded the wrong rows; the 200-row exhaustive case refused an interior zero count. |
+| Final shipped-header and generic diagnostic probes | 9/9 verified: one positive compile and eight intended diagnostic refusals. |
+| Fetched native and C consumers, Debug | 8/8 build steps succeeded; both executables ran against the final URL-and-hash package. |
+| Fetched native and C consumers, ReleaseFast | 8/8 build steps succeeded; explicit runtime checks remained active. |
+| Final hexane source ledger | All 272 covered declaration anchors resolve; 14 occurrences have explicit exclusion reasons. This is source-review evidence, not runtime proof. |
+
+**Final native/C package snapshot:**
+`zautomerge-0.0.0-FlN8sHVpkgD8pe8q5n02h8J7rKw9D_J7N-YJneM1JmV9`.
+The consumer manifest used an HTTP URL and this hash, not a path dependency.
+The local package server was stopped after both consumer modes passed.
+
+**Boolean seam defect:** a standalone merged count decodes from false parity,
+even when it belongs to a true run in the column. `Column.encode` now retains
+the preceding tail value when equal boolean runs merge
+(`rust/hexane/src/bool.rs:855-857`). The existing exhaustive case failed before
+the repair and passed afterward.
+
+## Verification recovery evidence (2026-10-04)
+
+This section records what a timed-out and then cancelled verification run
+actually measured, and what was changed in response. It supersedes nothing
+above: the P2/P5 rows describe the source those checks ran against, and this
+section adds the test runner, the profiling they enabled, and the limits that
+are still open.
+
+| Check | Observed result |
+| --- | --- |
+| Cancelled `zig-gate` cross section | `x86_64-linux` finished at 1992 tests passed; `aarch64-linux` hit `per_build_timeout` (3600 s); `powerpc64-linux` was cancelled in flight. Cancelled work is not a pass. |
+| The aarch64 timeout, named | `upstream_doc_test.test.rollback after a save and load of a deep hydrated root map` — 117 of 118 passed, that case alone timed out after 15m 0.82 s against `--test-timeout 900s`. |
+| The same case natively, Debug | 52.96 s of that root's 100.3 s total. Per-step, `updateObject` over the 2,712-node hydrated root is 47.0 s; `hydrate` twice is 2.4 s each; save, load and rollback together are under 0.3 s. |
+| Why that is not a slow path but a slow host | 47.0 s of Debug at one core is roughly 850 s under `qemu-aarch64` user-mode emulation, which is what the 900 s per-case budget measures. The budget is not raised to fit it and the case is not cut down. |
+| Custom test runner, `zig build c-abi-test` | 6/6 steps, 21/21 cases, and the printed record footer and slowest-case table match the run. |
+| Custom test runner, upstream document root | 118/118 cases; the three cases over the 10 s stderr threshold were named with their durations, and the footer ranked all ten slowest. |
+| Custom test runner, `x86_64-windows` | The `c-abi` root compiles to `test.exe`; the run step then refuses to spawn a foreign binary, which is the state the cross profile already expects for that row. |
+| `zig fmt --check .` | Exit 0 after the runner was formatted. |
+| `zig-pkg/` fetch cache | Three extracted copies of the served package were untracked and deleted, and `.gitignore` now names the directory. It is a `zig fetch` cache, not source. |
+| `zig build test`, Debug, all fifteen roots | The fifteen case-record footers read after that run summed to **1992 pass and 1 skip across 1993 cases, 0 fail** — the same 1993 the gate has always run. The library root reported 1729 pass + 1 skip of 1730 in 1579 s; the upstream document root 118/118 in 146 s. A later duplicate run of the same step, cancelled at its own deadline, re-entered the library root and truncated that root's record file, so only the other fourteen footers are still on disk. |
+| `zig build slow-path ctest conformance save-interop` | **40/40 steps succeeded.** The forced slow-path library root passed **1730/1730** in 1287 s, including the case the default run skips; the C ABI suite ran; all ten golden vectors matched the reference (`doc`, `change`, `sync`, `diff`, `converge`, `converge-parallel`, `codec`, `clock`, `hexane-regression`, `save-interop`); the live save verifier reported 6/6. The slow-path root's own record names its slowest case, `hexane.column.test.fuzz_column_save_load_after_mutations`, at 43.4 s. |
+
+**The changes that measurement justified, and the one it did not.**
+`Column.reanchorAfter` now reads the row's wire value out of the run sequence
+the walk already holds instead of calling `wireRange` to rebuild it, removing
+one allocation and one full slab walk per prefix/delta splice. `zig test`
+against `hexane.column.test.fuzz_indexed_delta_column` — 200 trials × 400
+splices, the heaviest `reanchorAfter` caller — passes at 163.60 s. A
+candidate that gave single-row `Columns.splice` stack buffers was measured,
+showed no effect on the 47.0 s (`updateObject` stayed at 48.6 s), and was
+reverted rather than kept on a hunch.
+
+**What is still open.** No release-mode (`ReleaseSafe` or `ReleaseFast`) run
+of the library root has completed on this source, and the four-target cross
+matrix has not been re-run since the runner landed. Both are named as gaps
+here rather than counted as passes.
+
+## API-design checkpoint evidence (2026-10-04)
+
+The API-design repair was checkpointed as `5b4b36e4`, without a push.
+The measurements in this section describe that source snapshot, before the P2
+and P5 changes below. The package hash identifies its frozen native/C sources.
 The read-only reference is Automerge 0.12.0 at
 `ddbff535407e4d28cd2a82eaf6c6add08caa3bdd`.
 The compiler is Zig 0.16.0 on x86-64 Linux.
@@ -242,32 +309,23 @@ The port declares **1541 test blocks** in total (1316 under `src/`, 225 under
 on**; the number is here because deleting it would lose the shape of the tree
 and no current figure was available to replace it.
 
-**The one large gap left in the port is `hexane/src/tests.rs` — and that is
-P2's gate.** **181 of the 284 distinct upstream names are present and 103 are
-missing**, measured 2026-10-01. It was **1** that morning, **72** an hour later
-and **160** at the previous revision of this line; it is dated, not final, and
-it has moved four times in one session.
+**Hexane case inventory, 2026-10-04:** [hexane-cases.json](hexane-cases.json)
+records all **286 `#[test]` occurrences**, across **284 distinct names**.
+**272 are covered, 14 are excluded, and none is partial or missing.**
+The two duplicated names identify separate `BeLen` and `Bijou64` occurrences;
+the ledger keeps their module-qualified IDs rather than merging them.
 
-**The instrument, named first, because a coverage number without one is not a
-measurement: exact upstream `fn`-name presence with an 8-line `#[test]`
-window.** For each `#[test]` in `hexane/src/tests.rs`, the next
-`fn <name>(` within eight lines is that case's name, and a name occurring
-anywhere in this tree counts as present. **It reproduces upstream exactly** —
-**286** `#[test]` functions and **284** distinct names — so the denominator is
-upstream's and not a regex's opinion of it. The two duplicated names are
-`splice_and_nullable` and `u64_column_roundtrip_and_wire_divergence`, each
-declared twice under a second codec parameter (`BeLen` and `Bijou64`), so a
-tally of functions overstates the denominator by two.
+Coverage rests on each declaration's operations, values, and refusals, not name
+presence. There are 266 same-named declarations and six named substitutes.
+All 272 current source anchors resolve. Each record stores the pinned reference
+input/assertion lines and the Zig assertion digest; 42 mappings also have a
+recorded body read. These are source-review claims, not test-run results.
 
-**What it is not.** This is name presence, and this file has already retracted
-a ranking built on name presence over the integration files, because the port
-renames every ported case into English. `hexane/src/tests.rs` has no prefix
-convention for the port to follow, so name presence is the only measure
-available — and it is a **floor, not a proof**: it says a case exists, not that
-it asserts upstream's expectations.
-
-`src/hexane/` declares 198 test blocks of its own, so the codecs and the btree
-are tested — just not by upstream's cases.
+The exclusions are explicit: nine `bijou64` feature cases, three ignored
+`deep_fuzz` cases, one ignored benchmark without assertions, and one Rust-only
+`Copy` trait check. The five ungated alternate-packing cases use a private
+test-only `BeLen` codec. The default wire remains LEB128. The seed-799 regression
+replays the reference's recorded rows and bytes after all ten splices.
 
 **There is no unaccounted test block.** This section used to report a residue
 of two — `grep -rhoE '^\s*test "' src/` counting more than the runner held, less
@@ -325,13 +383,19 @@ excluding `manifest.zig`). `test/fixtures/manifest.zig` records **5** entries
 generated from the oracle; `doc.jsonl` records `"bytes":446` for the
 interoperability exemplar, which is the document chunk reproduced byte for byte.
 
-`test/golden/` holds **eight** vectors, and every one of them is regenerated
+`test/golden/` holds **ten** vectors, and every one of them is regenerated
 into the build cache and `cmp`-ed against the committed copy on every
 `zig build conformance` (`addGoldenVector` in `build.zig`), so a vector cannot drift from the
-reference without the build failing on the file that drifted. Record counts,
-measured 2026-10-01: `codec.jsonl` **1989**, `clock.jsonl` **110**,
-`converge-parallel.jsonl` **20**, `converge.jsonl` **19**, `sync.jsonl` **18**,
-`diff.jsonl` **6**, `change.jsonl` **2**, `doc.jsonl` **1**.
+reference without the build failing on the file that drifted. All ten vectors
+matched in the 2026-10-04 conformance run, with 22/22 build steps successful.
+Record counts measured in the same tree: `codec.jsonl` **1989**, `clock.jsonl`
+**110**, `converge-parallel.jsonl` **20**, `converge.jsonl` **19**,
+`sync.jsonl` **18**, `diff.jsonl` **6**, `change.jsonl` **2**, `doc.jsonl` **1**,
+`save-interop.jsonl` **6** (one scripted document per case, `map`, `list`,
+`text`, `marks`, `conflicts`, `merge`), `hexane-regression.jsonl` **1** (the
+reference's own seed-799 round, 19 initial rows and ten splices).
+**Total: 2172 records.** The codec file contains 1966 encoder cases, 22 B-tree
+results, and one generator record; all 1989 records are byte-compared.
 
 **The two `sync.jsonl` records that carry no `sent` field are not a defect, and
 this file recorded them as an unexplained residue. They are `kind:
@@ -357,10 +421,10 @@ the file exists.
 | --- | --- | --- |
 | P0 conformance harness | done | 18 corpus files, a manifest of what loading each must do, and a Rust oracle that drives the reference. The manifest/corpus agreement test passes (6/6). |
 | P1 foundation | done | `error.zig`, `types.zig`, `value.zig`, `clock.zig`, `leb128.zig`, `unicode.zig`. |
-| P2 hexane | **done; gate partly met — and now the weakest gate in the plan** | The four slab codecs, the B=64 btree, the slab, the generic column, the byte arena (`hexane/raw.zig`), the Fenwick weight index (`hexane/index.zig`), the forward-only edit cursor (`hexane/edit.zig`) and the column read surface; 198 test blocks in `src/hexane/`. The gate has three clauses. "Every codec round-trips bytes for random inputs against the Rust encoder" **is** met — `test/golden/codec.jsonl` is 1989 records regenerated from the reference and `cmp`-ed on every `zig build conformance`. "The upstream invariant checker, ported as a `-Dslow-path` test" **is** met as of 2026-10-01: `-Dslow-path` is a build option in `build.zig`, carried into the library module as `build_options.check_slow_paths` and read by `SlabBTree.assertSound` (`src/hexane/btree.zig`) and by `OpSet.seekOpsByIndex`'s fast/slow cross-check (`src/opset/op_set.zig`), and `zig build slow-path` runs the unit tests in a build where it cannot be off. The checker is tested ungated (`btree.zig:2487` accepts a sound tree, `:2500` rejects ten corruptions) and the gate is tested from both sides (`btree.zig:2634`: a corrupted tree is `error.InvariantViolation` with the option and silent without it). What the option buys is upstream's deep fuzz at upstream's scale (`btree.zig:2847`), skipped without it; it costs **2.46 s → 4.72 s** on the 30-test `src/hexane/btree.zig` suite (2026-10-01, Debug, this machine). The third clause, the 286-case `hexane/src/tests.rs` suite "ported case-for-case", is **not** met: **181 of the 284 distinct upstream names are present and 103 are missing**, measured 2026-10-01 by exact upstream-`fn`-name presence with an 8-line `#[test]` window — the instrument, and what that instrument is not, is under *Test state*. **This is the largest remaining gap in the port and it makes P2 the weakest gate.** |
+| P2 hexane | **done; gate met 2026-10-04** | The final Debug gate passed all test roots and the forced slow-path root: 3722 passed, one default skip, no failures. The source ledger accounts for all 286 upstream occurrences: 272 covered, 14 reasoned exclusions, no missing occurrence. All five private BeLen cases run; the seed-799 vector replays Rust's actual 19-row, ten-splice fixture. All 1989 codec records match the reference; 1966 are native encoder byte cases. The existing exhaustive boolean test caught and now protects the merged-true-tail repair. See [plan.md](plan.md#p2--hexane) and [hexane-cases.json](hexane-cases.json). |
 | P3 columnar and format | done | `parse.zig`, `chunk.zig`, `column_spec.zig`, `columnar/encoding.zig`, `columnar/columns.zig`, `storage/change_chunk.zig`, `storage/document_chunk.zig`. The document chunk reproduces the oracle's 446-byte `save()` output byte for byte. |
 | P4 change graph and encoding | done | `change.zig`, `author.zig`, `change_graph.zig`, `change_queue.zig`, `storage/change_chunk.zig`. |
-| P5 op set and merge | **done; one gate clause open** | `opset/ids.zig`, `types.zig`, `op.zig` (the row and `Op.step`, the row-order invariant as four machine-checkable rules, each with a rejection test), `columns.zig`, `mark_index.zig`, `op_iter.zig`, `index.zig`, `visible.zig`, `top_op.zig`, `op_query.zig`, `marks.zig`, `found_op.zig`, `insert.zig`, `parents.zig`, `op_set.zig` and `batch.zig`. Both invariant checkers are demonstrated failing. The merge is checked against itself one change at a time by `debugCmp`, over a map, a list and text. **Both named upstream files are ported**: `tests/test.rs` 140/140 and `tests/batch_insert.rs` 46/46 (`test/upstream_batch_insert.zig`, wired at `the `upstream_batch_insert_tests` step`, 47/47 passing, 45 replay sites). What remains is the gate's second clause — a shared document's `save()` bytes matching modulo the DEFLATE stream is **not separately asserted anywhere**; `save()` equivalence is checked by loading, per `plan.md` §1. |
+| P5 op set and merge | **done; gate met 2026-10-04** | The two named upstream files are ported: `tests/test.rs` 140/140 and `tests/batch_insert.rs` 46/46. The eight native save tests pass. The strengthened `zig build save-interop` passed 7/7 steps and verified six deterministic scripts: map, list, text, marks, conflicts, merge. Zig saves load in Rust; Rust re-saves load in Zig. Zig compares both the re-save and the independently built Rust save from `reference_hex`, byte for byte after column inflation. This caught and fixed the change-extra metadata tag (`0x56`: Null `0` instead of Bytes `7`). Actor/head order, column IDs/order/data, and the head-index suffix remain in the comparison. Values, heads, hashes, change metadata, and raw change bytes also match. The list case requires actual on-wire DEFLATE on both sides. |
 | P6 document API | **done; signatures changed this revision** | `doc.zig` (the document, actor table, change graph, op set, `load`/`save`/`commit`/`merge`/`applyChanges`/`fork`/`forkAt`/`clone`/`isolate`, the diff surface, the bundle and fragment surface), `read.zig` (the whole `ReadDoc` surface — the unsuffixed readers, the eleven `_at` readers, `iter`/`iterAt`, the three cursor readers and `getCursorPositionFor`), `transact.zig` (the `Transactable` bodies and the manual `Transaction`), `transaction.zig` (`CommitOptions`, `Success`/`Failure`/`Outcome`, `enclose`/`encloseWith`, the accessors). **This row said "`read.zig` (twenty methods)"; that count was a snapshot and is not maintained** — the list of names is in `API.md` §Read, which is the thing to read. The crate-root address-book example **compiled and passed** (3/3, measured 2026-10-01) — the "`src/c/sync.zig` does not compile" claim this row used to carry is false. **Every constructor on this surface now takes a borrowed `std.Io`**, which is a signature change across the whole row and the reason every count in *Test state* is dated rather than current. |
 | P7 iteration | **done; gate clause re-measured 2026-10-01 and met bar two named cases** | `sequence_tree.zig` and all six of upstream's iterators: `iter/tools.zig` (`Unshift`, `PeekShift`, `SkipIter`, `Diff`, `DiffKernel`, `Shiftable`), `iter/map_range.zig`, `iter/list_range.zig`, `iter/spans.zig`, `iter/keys.zig`, `iter/values.zig`, `iter/doc.zig` (`ObjIdIter`, `DiffIter`) and `iter/slice.zig`. The claim that "one of the ported text tests fails" is **false**: the library suite is **1469 passed, 1 skipped, 0 failed**. **This row said the gate's other clause was not met, on a name-presence count of 8 for `tests/text.rs` and 10 for `tests/text_encoding.rs`, and that count was wrong** — it is the same instrument this file has already retracted once, and the port renames every ported case into English. Verified case by case against both upstream files: **all 21 `text.rs` cases and all 15 `text_encoding.rs` cases are in the tree**, and the instrument that settles it is that case-by-case comparison rather than any name match. **34 of the 36 run under all four `TextEncoding`s**, so the gate's "the 15 tests each run under 4 encodings" holds for 34, and the two exceptions are named: `empty_marks_before_block_marker_dont_repeat_text` (`text.rs:321-348`) and the `marks_are_okay` proptest driver (`text.rs:658-710`). **Both build their model in ASCII-plus-`'\n'`, and a block marker is three units wide under `utf8_code_unit`** — upstream measures every non-`Set(Str)` action as `text_encoding.width("\u{fffc}")` (`op_set2/op_set.rs:443-447`) — so a `'\n'`-wide model does not describe that document. `src/read.zig:7971-7981` is the port's own record of the same two. |
 | P8 sync | **done, measured 2026-10-01** | `sync/bloom.zig`, `sync/message.zig`, `sync/state.zig`, `sync/protocol.zig` and `sync/v1.zig`: the message codec, the peer state, the document-side state machine and the frozen v1 path. The gate's third clause names "the five round-trip tests from `sync/v1_compat_test/`"; upstream has **three** (`src/sync/v1_compat_test/mod.rs:473`, `:496`, `:519` — `bloom.rs` and `state.rs` declare none), and the directory is **907** lines as the plan says. The port's `src/sync/v1.zig` carries 9 tests, covering both directions and a v1-only peer. |
@@ -920,18 +984,13 @@ the *write* path — not only the read-back — are named in the tree and pass
 - `src/doc.zig:6500` — every change in the reference's own 446-byte document
   comes back with the reference's hashes.
 
-**What is still open in this slice** is not a failing test, and this sentence
-used to say it was. It said `tests/batch_insert.rs` "is not ported at all" and
-that P7/P9's ported-upstream clauses are partly met; **the first is false** —
-the file is ported 46 of 46 in `test/upstream_batch_insert.zig`, which the
-coverage table under *Test state* already recorded — and the P7 clause is
-re-measured and met bar two named cases. What is open is the gate arithmetic
-under *What is done and verified*: the `hexane/src/tests.rs` suite, and the
-fragment API behind the bundle row. And `can_transaction_at`
-(`test.rs:2507-2546`) — which this file previously called "left failing", and
-which `API.md` §Known gaps item 1 also called a hole — is now transcribed with
-upstream's own expected values at every line and **passes**
-(`test/upstream_doc_test.zig:3126`).
+**Corrections to earlier claims:** `tests/batch_insert.rs` is ported 46 of 46
+in `test/upstream_batch_insert.zig`. The fragment API exists; its document and
+graph entry points are listed in the bundle row above. The hexane case
+accounting is now explicit in [hexane-cases.json](hexane-cases.json): 272 covered
+occurrences and 14 reasoned exclusions, with no missing occurrence.
+`can_transaction_at` (`test.rs:2507-2546`) is transcribed with upstream's
+expected values and passes (`test/upstream_doc_test.zig:3126`).
 
 **Three walls this session turned out to be one wrong assertion each**, and in
 all three the instrument was the reference rather than a re-reading of the port:
@@ -955,9 +1014,9 @@ upstream's `tests/batch_insert.rs` holds **46** `#[test]` functions, and
 for each of the 46 — one per upstream case — plus one port-only test, and the
 string `batch_insert` occurs in `src/hexane/hexane_test.zig`, `src/read.zig`,
 `test/upstream_block_tests.zig`, `test/upstream_batch_insert.zig` and
-`test/upstream_save_load_orphans.zig`. The one gate clause still open on P5 is
-its second, the `save()`-modulo-DEFLATE comparison, which is a missing
-assertion rather than a missing file.
+`test/upstream_save_load_orphans.zig`. P5's save-format clause is now closed:
+`zig build save-interop` passed 7/7 steps and verified all six cases in both
+directions, including byte equality after column inflation.
 
 ### 2. The `_at` historical variants
 
@@ -991,21 +1050,19 @@ hand a walk back — and a walk copies the `Clock` by value and borrows only its
 `slots`, so the clock has to outlive the call. It shares the document's one
 existing cache rather than adding a second.
 
-### 3. The gate arithmetic that does not add up
+### 3. Case accounting
 
-`plan.md`'s gates and `test/` disagree about what "ported case-for-case" means,
-and the number this entry rested on cannot settle it. **"123 of the 293 upstream
-integration cases have no name in the port" is a name-presence count**, which is
-the instrument this file retracted once already — the port renames every ported
-case into English, so it under-counts by a factor of three. Measured by the
-`test "<upstream file>: <English name>"` convention instead, the table under
-*Test state* records all ten upstream integration files ported, every case.
-**One measurable gap is left and it is the hexane suite: 181 of 284 distinct
-upstream names present, 103 missing** (instrument named under *Test state*).
-Either the gates are the contract and the hexane work is outstanding, or the
-gates name the wrong files. **Decide which, in writing, before the next
-round** — a gate that cannot be met is worth more than a gate that is quietly
-redefined.
+**Closed 2026-10-04.** Name-presence counts did not establish coverage.
+[hexane-cases.json](hexane-cases.json) accounts for all 286 upstream test
+occurrences, representing 284 distinct names: 272 covered and 14 excluded.
+The covered entries map to 266 same-named declarations and six named
+substitutes. All 272 declaration anchors resolve in the final source.
+
+The exclusions are nine optional Bijou64 cases, three ignored deep-fuzz
+cases, one ignored benchmark without assertions, and one Rust-only `Copy`
+trait check. The last case runs in Rust's default build but has no Zig
+behaviour to port. Source review is not runtime proof; the P2 verdict in
+[plan.md](plan.md#p2--hexane) records the separate execution gate.
 
 
 #### `tests/rich_text_fuzz_crash.rs` — the other half of the totality gate

@@ -88,6 +88,23 @@ upstream behaviour *executed*, extend the oracle crate.
 - `zig build test` runs the unit tests.
 - `zig build conformance` checks every vector in `test/golden/` against the
   reference oracle, and `-Dconformance-record` rewrites them from it.
+- `zig build save-interop` is the live half of the save-format gate: the port
+  prints its own saves for six shared scripts, the reference loads and
+  re-saves each one, and also returns an independently built Rust save. The
+  port compares both normalized bodies. It reads no committed file and needs
+  the oracle and reference checkout, so it is a step rather than a test.
+- Every test root runs through `test/verification_runner.zig`. It speaks the
+  build runner's own `std.zig.Server` protocol message for message, so the
+  counts in `Build Summary: N/M tests passed` and the per-case
+  `--test-timeout` attribution are unchanged, and it adds one record line per
+  case under the build's local cache: `n/total begin - <name>` before the case
+  and `n/total <ns> pass|skip|fail <name>` after it, closed by a `#`-prefixed
+  footer with the totals and the ten slowest cases. `zig build` prints that
+  footer per root. The reason is the library root: 1730 cases and about forty
+  minutes of Debug at one core, where a run making progress and a run wedged
+  in one case were otherwise the same observation for three quarters of an
+  hour. The record is best-effort — if it cannot be opened, the cases still
+  run, and a killed run's last line is the case it died in.
 - `zig fmt --check .` checks formatting. `gate` runs the house gate.
 - `jj st` shows working-copy status. Use `jj`, not raw Git, for mutations.
 

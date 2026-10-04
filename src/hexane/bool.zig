@@ -30,11 +30,22 @@
 //! (the zero-count rules) belong to the column loader, which is the only
 //! place upstream runs them, on whole columns rather than on slabs.
 //!
+//!
+//! # Packing
+//!
+//! Those counts are written through a **packing**: [`BoolWith`] takes one as a
+//! `comptime` parameter and [`Bool`] is it on the default wire, which is
+//! `rle.Leb128` — the `../leb128.zig` module under a name. There is exactly one
+//! packing this port ships; the second exists so `column.zig`'s `alt_codec`
+//! cases can drive the parameter through every path. Because a boolean slab is
+//! *nothing but* counts, this module is where a packing that reached the
+//! payloads but not the counts would be caught first.
+//!
 //! # Import route and the shortest sequence that works
 //!
-//! `@import("hexane/bool.zig")`, or `zautomerge.hexane.bool` through the root
+//! `@import("hexane/bool.zig")`, or `zautomerge.hexane.bool_codec` through the root
 //! module. Zig 0.16.0. What a column imports from here is [`Bool`] and its
-//! [`Bool.Decoder`].
+//! [`Bool.Decoder`] — and [`BoolWith`] for a codec on another wire.
 //!
 //! ```zig
 //! var out: std.ArrayList(u8) = .empty;
@@ -50,7 +61,7 @@
 //! it — [`Bool.Decoder`] hands back `bool` values, never windows.
 
 const std = @import("std");
-const leb128 = @import("../leb128.zig");
+const rle = @import("rle.zig");
 const err = @import("../error.zig");
 
 const ParseError = err.ParseError;
@@ -95,111 +106,120 @@ const RunIter = struct {
     }
 };
 
-/// The boolean slab codec. Same shape as the run-length codecs: size a
-/// buffer, write into it, append to a list, or decode a whole slab.
-pub const Bool = struct {
-    /// The number of bytes `write` will emit for `values`.
-    pub fn encodedSize(values: []const bool) usize {
-        var total: usize = 0;
-        var runs = RunIter.init(values);
-        while (runs.next()) |run| total += leb128.unsignedSize(run.count);
-        return total;
-    }
-
-    /// Writes `values` into `out`, which must hold `encodedSize` bytes.
-    pub fn write(out: []u8, values: []const bool) void {
-        var pos: usize = 0;
-        var runs = RunIter.init(values);
-        while (runs.next()) |run| {
-            pos += leb128.writeUnsigned(out[pos..], run.count);
-        }
-    }
-
-    /// Appends the encoding of `values` to `list`.
-    pub fn append(list: *std.ArrayList(u8), gpa: std.mem.Allocator, values: []const bool) !void {
-        var runs = RunIter.init(values);
-        while (runs.next()) |run| try leb128.appendUnsigned(list, gpa, run.count);
-    }
-
-    /// Decodes every value in a slab. The caller owns the returned slice.
-    pub fn decodeAll(bytes: []const u8, gpa: std.mem.Allocator) ParseError![]bool {
-        // Two passes: the first sums the run counts so the exact allocation
-        // is made once, and it rejects a slab whose total does not fit a
-        // `usize` before any memory is touched.
-        const total = try countValues(bytes);
-        const out = try gpa.alloc(bool, total);
-        errdefer gpa.free(out);
-        var pos: usize = 0;
-        var written: usize = 0;
-        var value = false;
-        while (pos < bytes.len) {
-            const run = try leb128.readUnsigned(bytes[pos..]);
-            pos += run.len;
-            const count = std.math.cast(usize, run.value) orelse return error.Overflow;
-            const end = std.math.add(usize, written, count) catch return error.Overflow;
-            // `countValues` summed exactly these counts, so `end` is at most
-            // `total`; the check keeps the slice below in bounds whatever
-            // the input claims.
-            if (end > total) return error.Overflow;
-            @memset(out[written..end], value);
-            written = end;
-            value = !value;
-        }
-        return out;
-    }
-
-    /// A cursor over a slab that yields values one at a time.
-    ///
-    /// Each run yields its value repeatedly; crossing into the next run
-    /// reads one LEB128 count. The document walk pulls booleans one at a
-    /// time, so this never materialises the whole slab.
-    pub const Decoder = struct {
-        /// The slab being walked, borrowed: it must stay alive and unmodified
-        /// for as long as this decoder is used, and its owner must outlive the
-        /// decoder. Nothing a boolean column hands back points into it — the
-        /// wire form carries no value bytes — so this is the only borrow a
-        /// caller has to honour.
-        bytes: []const u8,
-        /// The offset of the next unread run count.
-        pos: usize,
-        /// Items left in the current run.
-        remaining: usize,
-        /// The current run's value. Starts as `true` so that the first
-        /// flip yields the `false` the wire format opens with
-        /// (upstream `bool.rs:490-502`).
-        value: bool,
-
-        /// A cursor standing at the start of `bytes`, which it borrows; see
-        /// the `bytes` field.
-        pub fn init(bytes: []const u8) ParseError!Decoder {
-            return .{ .bytes = bytes, .pos = 0, .remaining = 0, .value = true };
+/// The boolean slab codec under an explicit packing. The count is the only
+/// thing this format stores, so this is the narrowest place the packing shows:
+/// a run count packed one way and the opening pad packed another is not a
+/// second boolean wire, it is an unreadable one.
+pub fn BoolWith(comptime P: type) type {
+    return struct {
+        /// The number of bytes `write` will emit for `values`.
+        pub fn encodedSize(values: []const bool) usize {
+            var total: usize = 0;
+            var runs = RunIter.init(values);
+            while (runs.next()) |run| total += P.unsignedSize(@as(u64, @intCast(run.count)));
+            return total;
         }
 
-        /// The next value, null at the end of the slab. A malformed run
-        /// count part-way through the slab is reported here, not swallowed.
-        pub fn next(self: *Decoder) ParseError!?bool {
-            while (true) {
-                if (self.remaining > 0) {
-                    self.remaining -= 1;
-                    return self.value;
-                }
-                if (self.pos >= self.bytes.len) return null;
-                const run = try leb128.readUnsigned(self.bytes[self.pos..]);
-                self.pos += run.len;
-                self.value = !self.value;
-                self.remaining = std.math.cast(usize, run.value) orelse return error.Overflow;
+        /// Writes `values` into `out`, which must hold `encodedSize` bytes.
+        pub fn write(out: []u8, values: []const bool) void {
+            var pos: usize = 0;
+            var runs = RunIter.init(values);
+            while (runs.next()) |run| {
+                pos += P.writeUnsigned(out[pos..], @as(u64, @intCast(run.count)));
             }
         }
+
+        /// Appends the encoding of `values` to `list`.
+        pub fn append(list: *std.ArrayList(u8), gpa: std.mem.Allocator, values: []const bool) !void {
+            var runs = RunIter.init(values);
+            while (runs.next()) |run| try P.appendUnsigned(list, gpa, @as(u64, @intCast(run.count)));
+        }
+
+        /// Decodes every value in a slab. The caller owns the returned slice.
+        pub fn decodeAll(bytes: []const u8, gpa: std.mem.Allocator) ParseError![]bool {
+            // Two passes: the first sums the run counts so the exact allocation
+            // is made once, and it rejects a slab whose total does not fit a
+            // `usize` before any memory is touched.
+            const total = try countValues(P, bytes);
+            const out = try gpa.alloc(bool, total);
+            errdefer gpa.free(out);
+            var pos: usize = 0;
+            var written: usize = 0;
+            var value = false;
+            while (pos < bytes.len) {
+                const run = try P.readUnsigned(bytes[pos..]);
+                pos += run.len;
+                const count = std.math.cast(usize, run.value) orelse return error.Overflow;
+                const end = std.math.add(usize, written, count) catch return error.Overflow;
+                // `countValues` summed exactly these counts, so `end` is at most
+                // `total`; the check keeps the slice below in bounds whatever
+                // the input claims.
+                if (end > total) return error.Overflow;
+                @memset(out[written..end], value);
+                written = end;
+                value = !value;
+            }
+            return out;
+        }
+
+        /// A cursor over a slab that yields values one at a time.
+        ///
+        /// Each run yields its value repeatedly; crossing into the next run
+        /// reads one LEB128 count. The document walk pulls booleans one at a
+        /// time, so this never materialises the whole slab.
+        pub const Decoder = struct {
+            /// The slab being walked, borrowed: it must stay alive and unmodified
+            /// for as long as this decoder is used, and its owner must outlive the
+            /// decoder. Nothing a boolean column hands back points into it — the
+            /// wire form carries no value bytes — so this is the only borrow a
+            /// caller has to honour.
+            bytes: []const u8,
+            /// The offset of the next unread run count.
+            pos: usize,
+            /// Items left in the current run.
+            remaining: usize,
+            /// The current run's value. Starts as `true` so that the first
+            /// flip yields the `false` the wire format opens with
+            /// (upstream `bool.rs:490-502`).
+            value: bool,
+
+            /// A cursor standing at the start of `bytes`, which it borrows; see
+            /// the `bytes` field.
+            pub fn init(bytes: []const u8) ParseError!Decoder {
+                return .{ .bytes = bytes, .pos = 0, .remaining = 0, .value = true };
+            }
+
+            /// The next value, null at the end of the slab. A malformed run
+            /// count part-way through the slab is reported here, not swallowed.
+            pub fn next(self: *Decoder) ParseError!?bool {
+                while (true) {
+                    if (self.remaining > 0) {
+                        self.remaining -= 1;
+                        return self.value;
+                    }
+                    if (self.pos >= self.bytes.len) return null;
+                    const run = try P.readUnsigned(self.bytes[self.pos..]);
+                    self.pos += run.len;
+                    self.value = !self.value;
+                    self.remaining = std.math.cast(usize, run.value) orelse return error.Overflow;
+                }
+            }
+        };
     };
-};
+}
+
+/// The boolean slab codec on the default wire. Upstream's `Codec` is a type
+/// parameter with `Leb128` as its default everywhere (`codec.rs:228-246`), and
+/// this is that default made explicit at the one place it is chosen.
+pub const Bool = BoolWith(rle.Leb128);
 
 /// The total number of values in `bytes`, or an error if the run counts do
 /// not sum to something a `usize` can hold.
-fn countValues(bytes: []const u8) ParseError!usize {
+fn countValues(comptime P: type, bytes: []const u8) ParseError!usize {
     var total: usize = 0;
     var pos: usize = 0;
     while (pos < bytes.len) {
-        const run = try leb128.readUnsigned(bytes[pos..]);
+        const run = try P.readUnsigned(bytes[pos..]);
         pos += run.len;
         const count = std.math.cast(usize, run.value) orelse return error.Overflow;
         total = std.math.add(usize, total, count) catch return error.Overflow;
@@ -442,7 +462,7 @@ test "run counts that overflow the total are rejected" {
     const two_to_63 = [_]u8{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01 };
     const slab = two_to_63 ++ two_to_63;
     try std.testing.expectError(error.Overflow, Bool.decodeAll(&slab, gpa));
-    try std.testing.expectError(error.Overflow, countValues(&slab));
+    try std.testing.expectError(error.Overflow, countValues(rle.Leb128, &slab));
 }
 
 // ── Upstream `hexane/src/tests.rs`, the frozen byte fixtures ──────────────────
@@ -546,15 +566,24 @@ test "the boolean codec encodes the reference's bytes for every golden case" {
 //   values: `[2, 3, 1]`. Both upstream arms are here, including the one that
 //   exists because a column starting true carries the zero-count false pad.
 //
-// * **Two upstream boolean cases are blocked and neither is a transcription
-//   problem.** `fuzz_bool_splice_exhaustive` splices a `Column<bool>` across a
-//   slab boundary and compares against a `Vec`;
-//   `bool_encoder_into_column_direct_matches_load` builds one under a
-//   four-segment budget and demands `save()` be byte-identical to a one-shot
-//   encode. Both need the column's slab list and its seam pass, which is
-//   `column.zig` — **`Bool` encodes and decodes one slab, and `Slab.splice`
-//   rewrites only inside a single one, so the multi-slab seam these cases
-//   exist to catch cannot be built here.**
+// * **Neither of the two upstream boolean cases is blocked, and both need the
+//   column's slab list, which is `column.zig`'s.**
+//   `bool_encoder_into_column_direct_matches_load` is declared there: a
+//   `Column(bool, Bool)` built through `Encoder` at a budget of four over four
+//   hundred rows must `save()` the bytes a plain column's `save()` writes
+//   (`column.zig:14952-14992`). **That is the multi-slab seam this file cannot
+//   build** — `Bool` encodes and decodes one slab, and `Slab.splice` rewrites
+//   only inside a single one. `fuzz_bool_splice_exhaustive` splices a
+//   `Column<bool>` against a `Vec` model, and the port drives exactly that
+//   comparison over a many-slab boolean column in `random splices agree with a
+//   plain array`, `a seed sweep holds the merge policy over many slab layouts`
+//   and `a column of many slabs keeps its index, its budget and its values`
+//   (`column.zig:7946`, `:7935`, `:7858`). **What is not upstream's is the
+//   sweep's shape**: upstream walks nine `(del, ins)` pairs at *every* position
+//   of a 200-row column built at an eight-segment budget (`tests.rs:2853-2907`),
+//   where the port draws the position, the delete and the insert from pinned
+//   seeds and runs the column at the default budget. Which case carries which
+//   status is `docs/hexane-cases.json`'s.
 //
 // * **The zero-count pad is a property of the *first run*, not of the first
 //   value.** That is why `[true, true, false]` is `[0, 2, 1]` and not

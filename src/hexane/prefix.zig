@@ -597,12 +597,22 @@ test "prefix_iter_ranges_totals" {
     // prefix column holding `1..=20`, each row reports
     // `(value, running total)` = `(3,6)`, `(4,10)`, `(11,66)`, `(12,78)`.
     //
-    // **`Shiftable::ranges` has no counterpart in the port** — no file under
-    // `src/hexane` defines a `ranges` combinator, and `column.zig` implements
-    // only the four `Shiftable` defaults (`setMax`, `advanceTo`, `shift`,
-    // `seekTo`). So the two windows are two stretches of **one** decoder,
-    // stepped past in between, which is what the adapter yields. **What is
-    // therefore not covered is the adapter's own chaining.**
+    // **The adapter over a prefix cursor exists, and is driven elsewhere.**
+    // `Shiftable::ranges` (`shift.rs:87-126`) is `column.zig`'s `Ranges(I)`
+    // (`column.zig:7289`), over any cursor with `pos`, `setMax` and `shift`,
+    // and `PrefixIter.ranges` (`column.zig:3289`) is its instance for this
+    // codec's cursor — the earlier claim here that no file under `src/hexane`
+    // defines a `ranges` combinator was false, and so was the conclusion drawn
+    // from it. **`column.zig` drives it over these same two windows**
+    // (`prefix_iter_runs_splices`, `column.zig:16097-16117`), because a
+    // `Ranges` adapter needs the `Column` cursor that a codec-level decoder
+    // does not have.
+    //
+    // **What is left here, and is this case's own content, is the decoder and
+    // the sum it carries.** The two windows are two stretches of **one**
+    // decoder, stepped past in between, so the second is entered from the row
+    // behind it and the running sum across the gap is the one the first window
+    // left.
     //
     // The arithmetic upstream states is `(i+1)(i+2)/2` at row `i`, which is
     // the sum of `1..=i+1`; it is written out here per row rather than

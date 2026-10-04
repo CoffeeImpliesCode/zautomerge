@@ -145,32 +145,47 @@ fn addI64(a: i64, b: i64) ParseError!i64 {
 /// Where a slab is written. `out` is null while the slab is only being
 /// measured, which is how `encodedSize` and `write` share one code path
 /// and can never disagree about how many bytes a slab takes.
-const Sink = struct {
-    out: ?[]u8,
-    /// Bytes written, or counted.
-    n: usize = 0,
+fn Sink(comptime P: type) type {
+    return struct {
+        const Self = @This();
 
-    fn byte(self: *Sink, b: u8) void {
-        if (self.out) |o| o[self.n] = b;
-        self.n += 1;
-    }
+        out: ?[]u8,
+        /// Bytes written, or counted.
+        n: usize = 0,
 
-    fn signed(self: *Sink, v: i64) void {
-        var buf: [leb128.max_signed_size]u8 = undefined;
-        for (buf[0..leb128.writeSigned(&buf, v)]) |b| self.byte(b);
-    }
+        fn byte(self: *Self, b: u8) void {
+            if (self.out) |o| o[self.n] = b;
+            self.n += 1;
+        }
 
-    fn unsigned(self: *Sink, v: u64) void {
-        var buf: [leb128.max_unsigned_size]u8 = undefined;
-        for (buf[0..leb128.writeUnsigned(&buf, v)]) |b| self.byte(b);
-    }
-};
+        fn signed(self: *Self, v: i64) void {
+            var buf: [P.max_signed_size]u8 = undefined;
+            for (buf[0..P.writeSigned(&buf, v)]) |b| self.byte(b);
+        }
+
+        fn unsigned(self: *Self, v: u64) void {
+            var buf: [P.max_unsigned_size]u8 = undefined;
+            for (buf[0..P.writeUnsigned(&buf, v)]) |b| self.byte(b);
+        }
+    };
+}
 
 // ── Delta ────────────────────────────────────────────────────────────────────
 
 /// The delta codec for a column of `T`. `T` is `u32`, `u64`, `i32`,
 /// `i64`, or an optional of one; anything else is a compile error.
 pub fn Delta(comptime T: type) type {
+    return DeltaWith(rle.Leb128, T);
+}
+
+/// The delta codec under an explicit packing. This module is the one place
+/// the port keeps its *own* writer rather than handing the values to `rle`: the
+/// delta transform has no materialised value slice to encode, so the segment
+/// splitter at the bottom of the file writes through a [`Sink`](Sink) of its
+/// own. That sink writes the run headers and the null-run counts, so it is
+/// where a packing that reached the payload but not the headers would be
+/// caught here and nowhere else.
+pub fn DeltaWith(comptime P: type, comptime T: type) type {
     return struct {
         /// The column's value type.
         pub const Value = T;
@@ -190,7 +205,7 @@ pub fn Delta(comptime T: type) type {
         /// nullable (`delta/mod.rs:19-26`), so this is the nullable
         /// codec either way and a null run in a non-nullable column is
         /// `realize`'s to refuse.
-        const WireDecoder = rle.RleOption(i64).Decoder;
+        const WireDecoder = rle.RleWith(P, i64, true, false).Decoder;
 
         /// A column value as a realized `i64`, or null for a null row.
         /// A value outside the domain is `error.Overflow`.
@@ -311,7 +326,7 @@ pub fn Delta(comptime T: type) type {
             // Two passes: the first counts the rows so the allocation is
             // made once, and it reads the same headers the second does,
             // so a malformed slab is rejected before any memory moves.
-            const total = try countRows(bytes);
+            const total = try countRows(P, bytes);
             const out = try gpa.alloc(T, total);
             errdefer gpa.free(out);
             var dec = try Decoder.init(bytes);
@@ -743,7 +758,7 @@ pub fn Delta(comptime T: type) type {
 
         /// Cuts the rest of `probe`'s stream into segments and writes
         /// them to `sink`.
-        fn emitAll(probe: *Probe, sink: *Sink) ParseError!void {
+        fn emitAll(probe: *Probe, sink: *Sink(P)) ParseError!void {
             while (true) {
                 const outer = (try probe.peekAt(0)) orelse return;
                 const head: Stored = outer;
@@ -798,7 +813,7 @@ pub fn Delta(comptime T: type) type {
 
         /// The number of bytes the slab cut from `source` takes.
         fn slabSize(source: Source) ParseError!usize {
-            var sink = Sink{ .out = null };
+            var sink: Sink(P) = .{ .out = null };
             var probe = Probe{ .source = source };
             try emitAll(&probe, &sink);
             return sink.n;
@@ -807,7 +822,7 @@ pub fn Delta(comptime T: type) type {
         /// Writes the slab cut from `source` into `out`, returning the
         /// number of bytes written.
         fn writeSlab(out: []u8, source: Source) ParseError!usize {
-            var sink = Sink{ .out = out };
+            var sink: Sink(P) = .{ .out = out };
             var probe = Probe{ .source = source };
             try emitAll(&probe, &sink);
             return sink.n;
@@ -823,8 +838,8 @@ pub const DeltaOption = Delta(?u32);
 
 /// The number of rows in `bytes`, walked with the RLE cursor so a decode
 /// makes its allocation exactly once.
-fn countRows(bytes: []const u8) ParseError!usize {
-    var dec = try rle.RleOption(i64).Decoder.init(bytes);
+fn countRows(comptime P: type, bytes: []const u8) ParseError!usize {
+    var dec = try rle.RleWith(P, i64, true, false).Decoder.init(bytes);
     var total: usize = 0;
     while (true) {
         _ = (try dec.next()) orelse return total;
@@ -1394,7 +1409,7 @@ test "delta_column_load_with_roundtrip" {
     try E.append(&list, gpa, &values);
 
     // The bytes really are self-describing: the count is in them.
-    try testing.expectEqual(@as(usize, values.len), try countRows(list.items));
+    try testing.expectEqual(@as(usize, values.len), try countRows(rle.Leb128, list.items));
 
     const loaded = try E.decodeAll(list.items, gpa);
     defer gpa.free(loaded);
@@ -1544,8 +1559,13 @@ test "the delta codec encodes the reference's bytes for every golden case" {
 //   values would only re-derive the sum `decodeAll` had already done, so the
 //   assertions go through `toDeltas` — the stored form — instead.
 //
-// * **`delta_column_load_with_nullable_empty_fill` is blocked, not folded in.**
-//   It asks for five absent rows out of *empty* bytes, which needs
-//   `LoadOpts::with_length` and `with_fill`; those are `Column.LoadOpts`
-//   (`column.zig:2814-2846`) and `delta.zig` is a codec with no load options,
-//   so there is nowhere outside `column.zig` to ask for a length or a fill.
+// * **`delta_column_load_with_nullable_empty_fill` is transcribed in
+//   `column.zig`, and it could not live here.** Five absent rows out of *empty*
+//   bytes needs a length and a fill, and those are `LoadOpts::with_length` and
+//   `with_fill` — `Column.LoadOpts` (`column.zig:4451-4502`), never a codec's:
+//   this file encodes and decodes slabs and has nowhere to ask for either. A
+//   delta column also fills by a **third** rule, a run of equal values being
+//   one literal run followed by one repeat run of zero differences
+//   (`column.zig:2069-2103`), so the fill belongs to the column and not to the
+//   codec. The case is declared there over `Column(?u32, DeltaOption)`, with
+//   the non-null fill beside it (`column.zig:13847-13866`).

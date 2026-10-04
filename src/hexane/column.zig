@@ -22,6 +22,22 @@
 //! * the **weight** — what the index stores per slab, which is the
 //!   `WeightFn` seam of `column.rs:81-137`.
 //!
+//! # The packing
+//!
+//! Every varint a slab is made of — a run header, a null-run count, a value
+//! payload, a byte payload's length, a boolean run count — goes through a
+//! **packing**, a `comptime` parameter that defaults to `rle.Leb128`. That is
+//! upstream's `Codec` type parameter (`codec.rs:110-211`), and it is a
+//! separate parameter from `E`: `E` says what the wire *means*, the packing
+//! says how the bytes *spell* it. Every codec below publishes `pub const Pack`
+//! so `slab.zig` takes the same one from the codec rather than being told,
+//! and [`packOf`] answers LEB128 for a codec that predates the parameter.
+//!
+//! One packing ships. The second exists for the five `alt_codec` cases in this
+//! file's test section, whose whole subject is whether the parameter reached
+//! *every* path — a seam that reached the payloads and left the headers on
+//! LEB128 does not produce a second wire format, it produces a corrupt one.
+//!
 //! # The weight seam
 //!
 //! Three weights, one shape (`A.Aggregate.{identity, merge, itemCount,
@@ -64,6 +80,7 @@ const rle = @import("rle.zig");
 const bool_codec = @import("bool.zig");
 const btree = @import("btree.zig");
 const slabmod = @import("slab.zig");
+const delta_codec = @import("delta.zig");
 
 const Slab = slabmod.Slab;
 const ParseError = err.ParseError;
@@ -299,6 +316,17 @@ fn compareValue(comptime T: type, a: T, b: T) std.math.Order {
     return .eq;
 }
 
+/// The packing a codec's wire uses, taken from the codec itself so the
+/// literal-header rewrite and the header read beside it cannot disagree with
+/// it — and LEB128 for a codec that predates the parameter and publishes no
+/// `Pack`, which is what `opset/columns.zig`'s two hand-written codecs do.
+/// Those are the default wire by construction, so the fallback is a fact about
+/// them rather than a guess. `slab.zig` has the same helper for the same
+/// reason.
+fn packOf(comptime E: type) type {
+    return if (@hasDecl(E, "Pack")) E.Pack else rle.Leb128;
+}
+
 /// The first row in `slab` at which the running sum reaches `target`,
 /// counted from the slab's own start — `find_prefix_in_slab`
 /// (`prefix.rs:111-150`).
@@ -436,12 +464,20 @@ fn fillWire(comptime Wire: type, out: []Wire, v: Wire) void {
 /// `PackError::InvalidUtf8`). It changes nothing about the *encoding* —
 /// the length prefix is the same — so a text column's bytes are a byte
 /// column's bytes.
-fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool) type {
+fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool, comptime P: type) type {
     return struct {
         const Self = @This();
 
         /// What one slab entry decodes to.
         pub const Wire = if (Nullable) ?Payload else Payload;
+
+        /// The packing this codec's wire uses, published so `slab.zig` derives
+        /// the *same* one from the codec rather than naming a second. A
+        /// literal run's count header is written by a function that has no
+        /// codec argument, and on any packing but the default its width is not
+        /// the one LEB128 would have chosen — so a wrong answer here is a
+        /// corrupt slab, not a slower one.
+        pub const Pack = P;
 
         /// Whether this codec's literal runs carry the signed count header
         /// `slabmod.rewrite_lit_header` writes, so two of them that meet can
@@ -455,11 +491,9 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
         /// The text form is the same codec as the byte form plus the UTF-8
         /// check, so the two agree on every byte they both accept.
         pub const RleCodec = if (Utf8)
-            rle.RleUtf8(Nullable)
-        else if (Nullable)
-            rle.RleOption(Payload)
+            rle.RleWith(P, []const u8, Nullable, true)
         else
-            rle.Rle(Payload);
+            rle.RleWith(P, Payload, Nullable, false);
 
         /// A reader over a slab's wire entries. A text column's reader
         /// refuses invalid UTF-8 on the way past it, which is where
@@ -480,10 +514,10 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
         /// null when the run carries no value. One walk of a literal run;
         /// O(1) for a repeat or null run.
         fn lastOfRun(bytes: []const u8, seg: slabmod.Segment(Wire)) ParseError!?struct { value: Payload, len: usize } {
-            const hdr = try leb128.readSigned(bytes[seg.byte_start..]);
+            const hdr = try P.readSigned(bytes[seg.byte_start..]);
             if (hdr.value == 0) return null;
             if (hdr.value > 0) {
-                const v = try payloadRead(Payload, bytes, seg.byte_start + hdr.len);
+                const v = try payloadRead(P, Payload, bytes, seg.byte_start + hdr.len);
                 return .{ .value = v.value, .len = v.len };
             }
             const count = std.math.cast(usize, -hdr.value) orelse return error.Overflow;
@@ -491,7 +525,7 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
             var last: Payload = undefined;
             var last_len: usize = 0;
             for (0..count) |_| {
-                const v = try payloadRead(Payload, bytes, pos);
+                const v = try payloadRead(P, Payload, bytes, pos);
                 last = v.value;
                 last_len = v.len;
                 pos += v.len;
@@ -505,9 +539,9 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
         /// lets a merge seam drop `b`'s first value without decoding the rest
         /// of the run (`rle/splice.rs:1104-1107`).
         fn firstOfRun(bytes: []const u8, seg: slabmod.Segment(Wire)) ParseError!?struct { value: Payload, len: usize } {
-            const hdr = try leb128.readSigned(bytes[seg.byte_start..]);
+            const hdr = try P.readSigned(bytes[seg.byte_start..]);
             if (hdr.value == 0) return null;
-            const v = try payloadRead(Payload, bytes, seg.byte_start + hdr.len);
+            const v = try payloadRead(P, Payload, bytes, seg.byte_start + hdr.len);
             return .{ .value = v.value, .len = v.len };
         }
 
@@ -518,30 +552,30 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
             var pos: usize = 0;
             var item: usize = 0;
             while (pos < bytes.len) {
-                const hdr = try leb128.readSigned(bytes[pos..]);
+                const hdr = try P.readSigned(bytes[pos..]);
                 const payload = pos + hdr.len;
                 var count: usize = undefined;
                 var value: Wire = undefined;
                 var end: usize = undefined;
                 if (hdr.value > 0) {
-                    const v = try payloadRead(Payload, bytes, payload);
+                    const v = try payloadRead(P, Payload, bytes, payload);
                     count = std.math.cast(usize, hdr.value) orelse return error.Overflow;
                     value = v.value;
                     end = payload + v.len;
                 } else if (hdr.value == 0) {
                     if (comptime !Nullable) return error.UnexpectedNull;
-                    const n = try leb128.readUnsigned(bytes[payload..]);
+                    const n = try P.readUnsigned(bytes[payload..]);
                     count = std.math.cast(usize, n.value) orelse return error.Overflow;
                     value = try nullWire();
                     end = payload + n.len;
                 } else {
                     count = std.math.cast(usize, -hdr.value) orelse return error.Overflow;
                     var p = payload;
-                    const first = try payloadRead(Payload, bytes, p);
+                    const first = try payloadRead(P, Payload, bytes, p);
                     value = first.value;
                     p += first.len;
                     var k: usize = 1;
-                    while (k < count) : (k += 1) p += (try payloadRead(Payload, bytes, p)).len;
+                    while (k < count) : (k += 1) p += (try payloadRead(P, Payload, bytes, p)).len;
                     end = p;
                 }
                 try out.append(gpa, .{
@@ -599,11 +633,11 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
 
         /// Items `lo .. lo + n` of the literal run `seg`, read off the wire.
         fn readLiteralRun(bytes: []const u8, seg: slabmod.Segment(Wire), lo: usize, n: usize, out: []Wire) ParseError!void {
-            const hdr = try leb128.readSigned(bytes[seg.byte_start..]);
+            const hdr = try P.readSigned(bytes[seg.byte_start..]);
             var pos = seg.byte_start + hdr.len;
             var i: usize = 0;
             while (i < lo + n) : (i += 1) {
-                const v = try payloadRead(Payload, bytes, pos);
+                const v = try payloadRead(P, Payload, bytes, pos);
                 if (i >= lo) out[i - lo] = v.value;
                 pos += v.len;
             }
@@ -635,21 +669,21 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
             var pos: usize = 0;
             var item: usize = 0;
             while (pos < bytes.len) {
-                const hdr = try leb128.readSigned(bytes[pos..]);
+                const hdr = try P.readSigned(bytes[pos..]);
                 const payload = pos + hdr.len;
                 var count: usize = undefined;
                 var value: Wire = undefined;
                 var end: usize = undefined;
                 var kind: slabmod.RunKind = undefined;
                 if (hdr.value > 0) {
-                    const v = try payloadRead(Payload, bytes, payload);
+                    const v = try payloadRead(P, Payload, bytes, payload);
                     count = std.math.cast(usize, hdr.value) orelse return error.Overflow;
                     value = v.value;
                     end = payload + v.len;
                     kind = .repeat;
                 } else if (hdr.value == 0) {
                     if (comptime !Nullable) return error.UnexpectedNull;
-                    const n = try leb128.readUnsigned(bytes[payload..]);
+                    const n = try P.readUnsigned(bytes[payload..]);
                     count = std.math.cast(usize, n.value) orelse return error.Overflow;
                     value = try nullWire();
                     end = payload + n.len;
@@ -657,11 +691,11 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
                 } else {
                     count = std.math.cast(usize, -hdr.value) orelse return error.Overflow;
                     var p = payload;
-                    const first = try payloadRead(Payload, bytes, p);
+                    const first = try payloadRead(P, Payload, bytes, p);
                     value = first.value;
                     p += first.len;
                     var k: usize = 1;
-                    while (k < count) : (k += 1) p += (try payloadRead(Payload, bytes, p)).len;
+                    while (k < count) : (k += 1) p += (try payloadRead(P, Payload, bytes, p)).len;
                     end = p;
                     kind = .literal;
                 }
@@ -719,14 +753,14 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
         /// measures the whole run sequence to reach the same answer.
         pub fn firstRunValue(bytes: []const u8) ParseError!?Wire {
             if (bytes.len == 0) return null;
-            const hdr = try leb128.readSigned(bytes);
+            const hdr = try P.readSigned(bytes);
             const payload = hdr.len;
-            if (hdr.value > 0) return (try payloadRead(Payload, bytes, payload)).value;
+            if (hdr.value > 0) return (try payloadRead(P, Payload, bytes, payload)).value;
             if (hdr.value == 0) {
                 if (comptime !Nullable) return error.UnexpectedNull;
                 return try nullWire();
             }
-            return (try payloadRead(Payload, bytes, payload)).value;
+            return (try payloadRead(P, Payload, bytes, payload)).value;
         }
 
         /// The canonical encoding of `wires`. `opens_with_true` is the value
@@ -741,7 +775,7 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
         /// only one grouping to produce.
         pub fn wireEncode(gpa: std.mem.Allocator, wires: []const Wire, opens_with_true: bool) ParseError![]u8 {
             _ = opens_with_true;
-            var w = RunWriter(Payload, Nullable).init(gpa);
+            var w = RunWriter(Payload, Nullable, P).init(gpa);
             defer w.deinit();
             try w.extend(wires);
             try w.finish();
@@ -762,20 +796,20 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
             if (comptime Nullable) {
                 if (value) |v| {
                     if (len == 1) {
-                        try leb128.appendSigned(&out, gpa, -1);
-                        try appendValue(gpa, &out, Payload, v);
+                        try P.appendSigned(&out, gpa, -1);
+                        try appendValue(P, gpa, &out, Payload, v);
                     } else {
-                        try appendRepeat(gpa, &out, Payload, len, v);
+                        try appendRepeat(P, gpa, &out, Payload, len, v);
                     }
                 } else {
-                    try appendNullRun(gpa, &out, len);
+                    try appendNullRun(P, gpa, &out, len);
                 }
             } else {
                 if (len == 1) {
-                    try leb128.appendSigned(&out, gpa, -1);
-                    try appendValue(gpa, &out, Payload, value);
+                    try P.appendSigned(&out, gpa, -1);
+                    try appendValue(P, gpa, &out, Payload, value);
                 } else {
-                    try appendRepeat(gpa, &out, Payload, len, value);
+                    try appendRepeat(P, gpa, &out, Payload, len, value);
                 }
             }
             return out.toOwnedSlice(gpa);
@@ -995,11 +1029,11 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
                 if (self.lit_left != 0) return self.nextLiteral();
                 if (self.pos >= self.bytes.len) return null;
 
-                const hdr = try leb128.readSigned(self.bytes[self.pos..]);
+                const hdr = try P.readSigned(self.bytes[self.pos..]);
                 const payload = self.pos + hdr.len;
                 if (hdr.value > 0) {
                     if (hdr.value < 2) return error.InvalidValue; // rule 1
-                    const v = try payloadRead(Payload, self.bytes, payload);
+                    const v = try payloadRead(P, Payload, self.bytes, payload);
                     const end = payload + v.len;
                     const value: Wire = v.value;
                     try self.checkBoundary(value); // rules 6 and 8
@@ -1019,7 +1053,7 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
                 }
                 if (hdr.value == 0) {
                     if (comptime !Nullable) return error.UnexpectedNull; // rule 9
-                    const n = try leb128.readUnsigned(self.bytes[payload..]);
+                    const n = try P.readUnsigned(self.bytes[payload..]);
                     if (n.value == 0) return error.InvalidValue; // rule 2
                     if (self.prev) |p| {
                         if (std.meta.activeTag(p) == .null_run) return error.InvalidValue; // rule 5
@@ -1047,10 +1081,10 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
                 // The literal run's payloads are walked once to find where
                 // it ends; the values themselves are read again, one per
                 // step, so a caller that wants each of them gets each.
-                const first = try payloadRead(Payload, self.bytes, payload);
+                const first = try payloadRead(P, Payload, self.bytes, payload);
                 var p = payload + first.len;
                 var k: usize = 1;
-                while (k < count) : (k += 1) p += (try payloadRead(Payload, self.bytes, p)).len;
+                while (k < count) : (k += 1) p += (try payloadRead(P, Payload, self.bytes, p)).len;
                 self.pos = p;
                 self.lit_end = p;
                 self.lit_pos = payload;
@@ -1060,7 +1094,7 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
 
             /// The next item of the literal run being served.
             fn nextLiteral(self: *LoadCursor) ParseError!?Step {
-                const v = try payloadRead(Payload, self.bytes, self.lit_pos);
+                const v = try payloadRead(P, Payload, self.bytes, self.lit_pos);
                 self.lit_pos += v.len;
                 self.lit_left -= 1;
                 // A literal run is served one item per step, so the row
@@ -1114,7 +1148,7 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
 /// many values went in, and — once a run budget is set — how to roll the
 /// finished runs into slabs. The canonical bytes are the writer's, so the
 /// streaming encoder and the whole-column one cannot drift apart.
-fn RleEncoder(comptime Payload: type, comptime Nullable: bool) type {
+fn RleEncoder(comptime Payload: type, comptime Nullable: bool, comptime P: type) type {
     return struct {
         const Self = @This();
 
@@ -1128,7 +1162,7 @@ fn RleEncoder(comptime Payload: type, comptime Nullable: bool) type {
         /// The run writer that owns the encode buffer. Everything this
         /// encoder allocates goes through it, and everything it hands back
         /// comes out of it, so the canonical bytes are one implementation's.
-        writer: RunWriter(Payload, Nullable),
+        writer: RunWriter(Payload, Nullable, P),
         /// Values appended so far. It counts every value the encoder has been
         /// given, across every buffer `take` has handed over — which is what
         /// lets a caller roll a slab and keep counting.
@@ -1137,7 +1171,7 @@ fn RleEncoder(comptime Payload: type, comptime Nullable: bool) type {
         /// An encoder holding nothing, over one contiguous buffer. The
         /// allocator is the caller's and is not released; `deinit` is.
         pub fn init(gpa: std.mem.Allocator) Self {
-            return .{ .writer = RunWriter(Payload, Nullable).init(gpa), .total = 0 };
+            return .{ .writer = RunWriter(Payload, Nullable, P).init(gpa), .total = 0 };
         }
 
         /// Frees the encode buffer. The allocator itself is the caller's, and
@@ -1199,7 +1233,7 @@ fn RleEncoder(comptime Payload: type, comptime Nullable: bool) type {
 /// only has to count how long each value lasts — which is what makes this
 /// the shortest of the three: no payload is stored and no header but the
 /// count is written.
-fn BoolEncoder(comptime V: type) type {
+fn BoolEncoder(comptime V: type, comptime P: type) type {
     return struct {
         const Self = @This();
 
@@ -1214,9 +1248,9 @@ fn BoolEncoder(comptime V: type) type {
         /// allocator, and a buffer already handed over by `take` was not
         /// freed by it.
         gpa: std.mem.Allocator,
-        /// The bytes written so far. A run is one LEB128 count and nothing
-        /// else; the value is the run's position in the sequence, which is
-        /// why no payload is stored (`bool.rs:609-800`).
+        /// The bytes written so far. A run is one count and nothing else; the
+        /// value is the run's position in the sequence, which is why no
+        /// payload is stored (`bool.rs:609-800`).
         out: std.ArrayList(u8),
         /// The value the run in progress carries, and how far it has grown.
         pending: ?V,
@@ -1319,8 +1353,8 @@ fn BoolEncoder(comptime V: type) type {
             // A run sequence read from its own start opens on a `false`
             // run, so a column whose first value is `true` spends a run on
             // the pad that lets it (`bool.rs:988-1002`).
-            if (v and self.segments == 0) try leb128.appendUnsigned(&self.out, self.gpa, 0);
-            try leb128.appendUnsigned(&self.out, self.gpa, self.count);
+            if (v and self.segments == 0) try P.appendUnsigned(&self.out, self.gpa, 0);
+            try P.appendUnsigned(&self.out, self.gpa, @as(u64, @intCast(self.count)));
             self.segments += 1;
             self.pending = null;
             self.count = 0;
@@ -1333,23 +1367,23 @@ fn BoolEncoder(comptime V: type) type {
 /// and a byte payload as an unsigned LEB128 length followed by that many
 /// raw bytes (`lib.rs:566-595` for the integers, `lib.rs:696-770` for
 /// `String` and `Vec<u8>`).
-fn payloadRead(comptime Payload: type, bytes: []const u8, pos: usize) ParseError!struct { value: Payload, len: usize } {
-    const read = try rle.payloadRead(Payload, bytes, pos);
+fn payloadRead(comptime P: type, comptime Payload: type, bytes: []const u8, pos: usize) ParseError!struct { value: Payload, len: usize } {
+    const read = try rle.payloadReadWith(P, Payload, bytes, pos);
     return .{ .value = read.value, .len = read.len };
 }
 
-fn appendValue(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime Payload: type, v: Payload) !void {
-    try rle.payloadAppend(gpa, out, Payload, v);
+fn appendValue(comptime P: type, gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime Payload: type, v: Payload) !void {
+    try rle.payloadAppendWith(P, gpa, out, Payload, v);
 }
 
-fn appendRepeat(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime Payload: type, count: usize, v: Payload) !void {
-    try leb128.appendSigned(out, gpa, @as(i64, @intCast(count)));
-    try appendValue(gpa, out, Payload, v);
+fn appendRepeat(comptime P: type, gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime Payload: type, count: usize, v: Payload) !void {
+    try P.appendSigned(out, gpa, @as(i64, @intCast(count)));
+    try appendValue(P, gpa, out, Payload, v);
 }
 
-fn appendNullRun(gpa: std.mem.Allocator, out: *std.ArrayList(u8), count: usize) !void {
-    try leb128.appendSigned(out, gpa, 0);
-    try leb128.appendUnsigned(out, gpa, count);
+fn appendNullRun(comptime P: type, gpa: std.mem.Allocator, out: *std.ArrayList(u8), count: usize) !void {
+    try P.appendSigned(out, gpa, 0);
+    try P.appendUnsigned(out, gpa, @as(u64, @intCast(count)));
 }
 
 /// The canonical run-length encoder, one value at a time
@@ -1368,7 +1402,7 @@ fn appendNullRun(gpa: std.mem.Allocator, out: *std.ArrayList(u8), count: usize) 
 /// appending one value at a time never holds more than those three runs,
 /// which is what makes this a streaming encoder rather than a whole-column
 /// re-encode.
-fn RunWriter(comptime Payload: type, comptime Nullable: bool) type {
+fn RunWriter(comptime Payload: type, comptime Nullable: bool, comptime P: type) type {
     return struct {
         const Self = @This();
 
@@ -1524,16 +1558,16 @@ fn RunWriter(comptime Payload: type, comptime Nullable: bool) type {
 
         fn flushLiteral(self: *Self) !void {
             if (self.lit.items.len == 0) return;
-            try leb128.appendSigned(&self.out, self.gpa, -@as(i64, @intCast(self.lit.items.len)));
-            for (self.lit.items) |v| try rle.payloadAppend(self.gpa, &self.out, Payload, v);
+            try P.appendSigned(&self.out, self.gpa, -@as(i64, @intCast(self.lit.items.len)));
+            for (self.lit.items) |v| try rle.payloadAppendWith(P, self.gpa, &self.out, Payload, v);
             self.lit.clearRetainingCapacity();
             self.segments += 1;
         }
 
         fn flushRepeat(self: *Self) !void {
             const v = self.rep_value orelse return;
-            try leb128.appendSigned(&self.out, self.gpa, @as(i64, @intCast(self.rep_count)));
-            try rle.payloadAppend(self.gpa, &self.out, Payload, v);
+            try P.appendSigned(&self.out, self.gpa, @as(i64, @intCast(self.rep_count)));
+            try rle.payloadAppendWith(P, self.gpa, &self.out, Payload, v);
             self.rep_value = null;
             self.rep_count = 0;
             self.segments += 1;
@@ -1541,8 +1575,8 @@ fn RunWriter(comptime Payload: type, comptime Nullable: bool) type {
 
         fn flushNull(self: *Self) !void {
             if (self.null_count == 0) return;
-            try leb128.appendSigned(&self.out, self.gpa, 0);
-            try leb128.appendUnsigned(&self.out, self.gpa, self.null_count);
+            try P.appendSigned(&self.out, self.gpa, 0);
+            try P.appendUnsigned(&self.out, self.gpa, @as(u64, @intCast(self.null_count)));
             self.null_count = 0;
             self.segments += 1;
         }
@@ -1571,15 +1605,21 @@ fn eqlWire(comptime Payload: type, comptime Nullable: bool, a: rleElement(Payloa
 /// and both nullabilities. `Payload` is what a value packs as, `Nullable`
 /// says whether a null run is part of the format (`lib.rs:406-437`), and
 /// `Utf8` is the byte payload's validation rule (`lib.rs:700-709`).
-fn RleBase(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool) type {
+fn RleBase(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool, comptime P: type) type {
     return struct {
-        const Base = WireRle(Payload, Nullable, Utf8);
+        const Base = WireRle(Payload, Nullable, Utf8, P);
 
         /// The column value type, and the wire form too: a run-length column
         /// stores the values themselves, so there is no difference and no
         /// length to measure.
         pub const Value = rleElement(Payload, Nullable);
         pub const Wire = Base.Wire;
+        /// The packing this codec's wire uses. Every codec in this file
+        /// publishes one, so `slab.zig` takes it from the codec rather than
+        /// being told — the literal-header rewrite has no codec argument of
+        /// its own, and on any packing but the default its width is not the
+        /// one LEB128 would have chosen.
+        pub const Pack = P;
         pub const has_lit_header = Base.has_lit_header;
         pub const runAtOrAfter = Base.runAtOrAfter;
         pub const firstRunValue = Base.firstRunValue;
@@ -1607,7 +1647,7 @@ fn RleBase(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool)
         pub const LoadCursor = Base.LoadCursor;
         /// The streaming encoder over this column's values
         /// (`ColumnEncoding::Encoder`, `encoding.rs:126-129`).
-        pub const StreamEncoder = RleEncoder(Payload, Nullable);
+        pub const StreamEncoder = RleEncoder(Payload, Nullable, P);
 
         pub const segmentsOf = Base.segmentsOf;
         pub const wireRange = Base.wireRange;
@@ -1719,14 +1759,14 @@ fn rlePayloadOk(comptime T: type, comptime who: []const u8) void {
 /// or a byte string, which packs as a length and its bytes.
 pub fn Rle(comptime T: type) type {
     rlePayloadOk(T, "Rle");
-    return RleBase(T, false, false);
+    return RleBase(T, false, false, rle.Leb128);
 }
 
 /// The run-length codec for a nullable column of `T`: an absent value rides
 /// in the run header and never in a payload (`lib.rs:406-437`).
 pub fn RleOption(comptime T: type) type {
     rlePayloadOk(T, "RleOption");
-    return RleBase(T, true, false);
+    return RleBase(T, true, false, rle.Leb128);
 }
 
 /// The run-length codec for a column of text: the byte codec's wire, with
@@ -1736,7 +1776,7 @@ pub fn RleOption(comptime T: type) type {
 /// [`Rle`] and [`RleOption`]; an absent value is still carried by the run
 /// header and is never a UTF-8 question.
 pub fn RleUtf8(comptime Nullable: bool) type {
-    return RleBase([]const u8, Nullable, true);
+    return RleBase([]const u8, Nullable, true, rle.Leb128);
 }
 
 /// The prefix codec: an ordinary RLE column of row lengths, with an index
@@ -1744,10 +1784,21 @@ pub fn RleUtf8(comptime Nullable: bool) type {
 /// away. `T` is an integer or an optional of one; an absent length
 /// contributes nothing to the sum (`prefix.rs:287-312`).
 pub fn Prefix(comptime T: type) type {
+    return PrefixBase(rle.Leb128, T);
+}
+
+/// The prefix codec under an explicit packing: an ordinary run-length column
+/// of row lengths, with an index that also carries their sum. A prefix column
+/// has its own weight and its own queries, so the packing has to reach the
+/// weight route and not only the runs — which is what the `prefix_column` case
+/// in this file's test section is for.
+fn PrefixBase(comptime P: type, comptime T: type) type {
     const Payload = payloadOf(T);
     const Nullable = isNullable(T);
-    const Base = WireRle(Payload, Nullable, false);
+    const Base = WireRle(Payload, Nullable, false, P);
     return struct {
+        /// The packing this codec's wire uses.
+        pub const Pack = P;
         /// The column value type: a row's own length. The wire form is the
         /// same number, so the two are the same type.
         pub const Value = T;
@@ -1777,7 +1828,7 @@ pub fn Prefix(comptime T: type) type {
         pub const LoadCursor = Base.LoadCursor;
         /// The streaming encoder over this column's values
         /// (`ColumnEncoding::Encoder`, `encoding.rs:126-129`).
-        pub const StreamEncoder = RleEncoder(Payload, Nullable);
+        pub const StreamEncoder = RleEncoder(Payload, Nullable, P);
 
         pub const segmentsOf = Base.segmentsOf;
         pub const wireRange = Base.wireRange;
@@ -1883,11 +1934,20 @@ pub fn Prefix(comptime T: type) type {
 /// sequence and read as one: the decoder's running value carries across the
 /// slab boundaries on its own.
 pub fn Delta(comptime T: type) type {
-    const Base = WireRle(i64, true, false);
+    return DeltaBase(rle.Leb128, T);
+}
+
+/// The delta codec under an explicit packing. A delta column's wire is a
+/// nullable run-length column of `i64` differences, so the packing reaches it
+/// through [`WireRle`] and not through anything of its own.
+fn DeltaBase(comptime P: type, comptime T: type) type {
+    const Base = WireRle(i64, true, false, P);
     const Payload = payloadOf(T);
     const Nullable = isNullable(T);
 
     return struct {
+        /// The packing this codec's wire uses.
+        pub const Pack = P;
         /// The column value type, and what a run's difference is measured
         /// against. The wire form is a difference rather than the value, so
         /// the two are not the same type.
@@ -1928,10 +1988,10 @@ pub fn Delta(comptime T: type) type {
         /// column's wire entry is a *signed difference* from the value in
         /// front of the row, and an absent row rides in the run header as
         /// a null — which is `Base`'s own nullable run-length codec, so the
-        /// encoder is `RleEncoder(i64, true)` and not one over `Payload`.
+        /// encoder is `RleEncoder(i64, true, P)` and not one over `Payload`.
         /// A `u64` payload packs unsigned and has no way to write an
         /// absent row at all.
-        pub const StreamEncoder = RleEncoder(i64, true);
+        pub const StreamEncoder = RleEncoder(i64, true, P);
 
         pub const segmentsOf = Base.segmentsOf;
         pub const wireRange = Base.wireRange;
@@ -2121,451 +2181,462 @@ pub const DeltaOption = Delta(?u32);
 /// (`bool.rs:13-25`). A count is a position, so a slab cut at a run
 /// boundary has to be told which value its first run now carries — the
 /// `opens_with_true` argument every codec's encoder takes.
-pub const Bool = struct {
-    /// The column value type: a boolean is its own wire value.
-    pub const Value = bool;
-    /// The wire value type, which for a boolean column is the value itself.
-    pub const Wire = bool;
-    /// A boolean run is a length in the byte stream and its value is the
-    /// run's position in the sequence, so there is no header behind it at
-    /// all (`bool.rs:13-25`) — not even for a one-item run.
-    pub const has_lit_header = false;
-    /// The per-slab weight, and so the index type this column builds.
-    /// `tracks_prefix` false means the column keeps no per-slab bases.
-    pub const Weight = LenWeight;
-    /// Whether this column keeps the per-slab weight prefixes. False: a
-    /// boolean column stores the values themselves.
-    pub const tracks_prefix = false;
-    /// Whether the stored value is a row's own *length*, so the column
-    /// answers the prefix-sum questions (`prefix.rs:44-108`). A boolean
-    /// column is *not* one, even though a run of `true`s is a run of
-    /// ones: upstream spells that `PrefixValue for bool`
-    /// (`prefix.rs:316`) and keeps the count in the slab's own sums.
-    pub const is_prefix_column = false;
-    /// Whether the stored value is a difference from the row in front
-    /// (`delta/mod.rs:19-26`).
-    pub const is_delta = false;
-    pub const WireDecoder = bool_codec.Bool.Decoder;
+pub const Bool = BoolCodec(rle.Leb128);
 
-    /// Every run of a boolean slab. The first count is the number of
-    /// `false`s, so a slab that starts on `true` opens with a count of zero
-    /// — a run with no items, and the only such run the format has
-    /// (`bool.rs:988-1002`).
-    pub fn segmentsOf(gpa: std.mem.Allocator, bytes: []const u8) ParseError![]slabmod.Segment(Bool.Wire) {
-        var out: std.ArrayList(slabmod.Segment(Bool.Wire)) = .empty;
-        errdefer out.deinit(gpa);
-        var pos: usize = 0;
-        var item: usize = 0;
-        var value: bool = false;
-        var first = true;
-        while (pos < bytes.len) {
-            const c = try leb128.readUnsigned(bytes[pos..]);
-            const count = std.math.cast(usize, c.value) orelse return error.Overflow;
-            try out.append(gpa, .{
-                .byte_start = pos,
-                .byte_end = pos + c.len,
-                .item_start = item,
-                .item_end = item + count,
-                .first_value = if (count == 0) null else value,
-                .opens_with_true = value,
-                .kind = if (count == 0) .pad else if (count == 1) .literal else .repeat,
-            });
-            item = std.math.add(usize, item, count) catch return error.Overflow;
-            pos += c.len;
-            // Only the very first run may hold no items, and it does not
-            // flip the parity: it is the pad that lets a slab open on
-            // `true` (`bool.rs:988-1002`). Every other run alternates,
-            // including one that happens to be empty.
-            if (!first or !value) value = !value;
-            first = false;
+/// The boolean column codec under an explicit packing. A boolean slab is
+/// nothing but run counts, so this is where a packing that reached the
+/// payloads but not the counts would show: the counts are the whole wire.
+fn BoolCodec(comptime P: type) type {
+    return struct {
+        const Self = @This();
+
+        /// The packing this codec's wire uses.
+        pub const Pack = P;
+        /// The column value type: a boolean is its own wire value.
+        pub const Value = bool;
+        /// The wire value type, which for a boolean column is the value itself.
+        pub const Wire = bool;
+        /// A boolean run is a length in the byte stream and its value is the
+        /// run's position in the sequence, so there is no header behind it at
+        /// all (`bool.rs:13-25`) — not even for a one-item run.
+        pub const has_lit_header = false;
+        /// The per-slab weight, and so the index type this column builds.
+        /// `tracks_prefix` false means the column keeps no per-slab bases.
+        pub const Weight = LenWeight;
+        /// Whether this column keeps the per-slab weight prefixes. False: a
+        /// boolean column stores the values themselves.
+        pub const tracks_prefix = false;
+        /// Whether the stored value is a row's own *length*, so the column
+        /// answers the prefix-sum questions (`prefix.rs:44-108`). A boolean
+        /// column is *not* one, even though a run of `true`s is a run of
+        /// ones: upstream spells that `PrefixValue for bool`
+        /// (`prefix.rs:316`) and keeps the count in the slab's own sums.
+        pub const is_prefix_column = false;
+        /// Whether the stored value is a difference from the row in front
+        /// (`delta/mod.rs:19-26`).
+        pub const is_delta = false;
+        pub const WireDecoder = bool_codec.BoolWith(P).Decoder;
+
+        /// Every run of a boolean slab. The first count is the number of
+        /// `false`s, so a slab that starts on `true` opens with a count of zero
+        /// — a run with no items, and the only such run the format has
+        /// (`bool.rs:988-1002`).
+        pub fn segmentsOf(gpa: std.mem.Allocator, bytes: []const u8) ParseError![]slabmod.Segment(Wire) {
+            var out: std.ArrayList(slabmod.Segment(Wire)) = .empty;
+            errdefer out.deinit(gpa);
+            var pos: usize = 0;
+            var item: usize = 0;
+            var value: bool = false;
+            var first = true;
+            while (pos < bytes.len) {
+                const c = try P.readUnsigned(bytes[pos..]);
+                const count = std.math.cast(usize, c.value) orelse return error.Overflow;
+                try out.append(gpa, .{
+                    .byte_start = pos,
+                    .byte_end = pos + c.len,
+                    .item_start = item,
+                    .item_end = item + count,
+                    .first_value = if (count == 0) null else value,
+                    .opens_with_true = value,
+                    .kind = if (count == 0) .pad else if (count == 1) .literal else .repeat,
+                });
+                item = std.math.add(usize, item, count) catch return error.Overflow;
+                pos += c.len;
+                // Only the very first run may hold no items, and it does not
+                // flip the parity: it is the pad that lets a slab open on
+                // `true` (`bool.rs:988-1002`). Every other run alternates,
+                // including one that happens to be empty.
+                if (!first or !value) value = !value;
+                first = false;
+            }
+            return out.toOwnedSlice(gpa);
         }
-        return out.toOwnedSlice(gpa);
-    }
 
-    /// The wire values for rows `from..to` of `bytes`, as a fresh
-    /// caller-owned slice. Decodes the whole slab and copies the window out
-    /// of it, so `from > to` or `to` past the end is `error.InvalidValue`.
-    pub fn wireRange(gpa: std.mem.Allocator, bytes: []const u8, from: usize, to: usize) ParseError![]Wire {
-        const all = try wireAll(gpa, Bool, bytes);
-        defer gpa.free(all);
-        if (to > all.len or from > to) return error.InvalidValue;
-        return gpa.dupe(Wire, all[from..to]);
-    }
-
-    /// The canonical encoding of `wires`, as a run sequence read from a
-    /// position whose first run carries `true` when `opens_with_true` is
-    /// set and `false` otherwise.
-    ///
-    /// A run's value is its position, and a run sequence read from its own
-    /// start opens on a `false` run, so a region that has to open on
-    /// `true` at an even position is written with the zero-count `false`
-    /// run in front of it — the pad a boolean slab that starts on `true`
-    /// opens with (`bool.rs:988-1002`). At an odd position the first run
-    /// is a `true` run already, so the same values go out unpadded. That
-    /// is the whole of the argument the encoder takes: where the region
-    /// lands in the sequence it is written into.
-    pub fn wireEncode(gpa: std.mem.Allocator, wires: []const Wire, opens_with_true: bool) ParseError![]u8 {
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(gpa);
-        if (wires.len != 0 and wires[0] and !opens_with_true) {
-            try leb128.appendUnsigned(&out, gpa, 0);
+        /// The wire values for rows `from..to` of `bytes`, as a fresh
+        /// caller-owned slice. Decodes the whole slab and copies the window out
+        /// of it, so `from > to` or `to` past the end is `error.InvalidValue`.
+        pub fn wireRange(gpa: std.mem.Allocator, bytes: []const u8, from: usize, to: usize) ParseError![]Wire {
+            const all = try wireAll(gpa, Self, bytes);
+            defer gpa.free(all);
+            if (to > all.len or from > to) return error.InvalidValue;
+            return gpa.dupe(Wire, all[from..to]);
         }
-        var i: usize = 0;
-        while (i < wires.len) {
-            var n: usize = i + 1;
-            while (n < wires.len and wires[n] == wires[i]) n += 1;
-            try leb128.appendUnsigned(&out, gpa, n - i);
-            i = n;
+
+        /// The canonical encoding of `wires`, as a run sequence read from a
+        /// position whose first run carries `true` when `opens_with_true` is
+        /// set and `false` otherwise.
+        ///
+        /// A run's value is its position, and a run sequence read from its own
+        /// start opens on a `false` run, so a region that has to open on
+        /// `true` at an even position is written with the zero-count `false`
+        /// run in front of it — the pad a boolean slab that starts on `true`
+        /// opens with (`bool.rs:988-1002`). At an odd position the first run
+        /// is a `true` run already, so the same values go out unpadded. That
+        /// is the whole of the argument the encoder takes: where the region
+        /// lands in the sequence it is written into.
+        pub fn wireEncode(gpa: std.mem.Allocator, wires: []const Wire, opens_with_true: bool) ParseError![]u8 {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(gpa);
+            if (wires.len != 0 and wires[0] and !opens_with_true) {
+                try P.appendUnsigned(&out, gpa, 0);
+            }
+            var i: usize = 0;
+            while (i < wires.len) {
+                var n: usize = i + 1;
+                while (n < wires.len and wires[n] == wires[i]) n += 1;
+                try P.appendUnsigned(&out, gpa, @as(u64, @intCast(n - i)));
+                i = n;
+            }
+            return out.toOwnedSlice(gpa);
         }
-        return out.toOwnedSlice(gpa);
-    }
 
-    /// One run of `len` copies of `value`, in O(1), placed the way
-    /// `wireEncode` places a region that opens on `value`.
-    pub fn wireFill(gpa: std.mem.Allocator, len: usize, value: Wire, opens_with_true: bool) ParseError![]u8 {
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(gpa);
-        if (len == 0) return out.toOwnedSlice(gpa);
-        if (value and !opens_with_true) try leb128.appendUnsigned(&out, gpa, 0);
-        try leb128.appendUnsigned(&out, gpa, len);
-        return out.toOwnedSlice(gpa);
-    }
+        /// One run of `len` copies of `value`, in O(1), placed the way
+        /// `wireEncode` places a region that opens on `value`.
+        pub fn wireFill(gpa: std.mem.Allocator, len: usize, value: Wire, opens_with_true: bool) ParseError![]u8 {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(gpa);
+            if (len == 0) return out.toOwnedSlice(gpa);
+            if (value and !opens_with_true) try P.appendUnsigned(&out, gpa, 0);
+            try P.appendUnsigned(&out, gpa, @as(u64, @intCast(len)));
+            return out.toOwnedSlice(gpa);
+        }
 
-    /// The bytes of a slab holding `len` copies of `value`
-    /// (`Column::fill`, `column.rs:1227-1245`). A boolean value is a run
-    /// count and nothing else, so this is one run and O(1).
-    pub fn fillBytes(gpa: std.mem.Allocator, len: usize, value: Value) ParseError![]u8 {
-        return Bool.wireFill(gpa, len, value, false);
-    }
+        /// The bytes of a slab holding `len` copies of `value`
+        /// (`Column::fill`, `column.rs:1227-1245`). A boolean value is a run
+        /// count and nothing else, so this is one run and O(1).
+        pub fn fillBytes(gpa: std.mem.Allocator, len: usize, value: Value) ParseError![]u8 {
+            return Self.wireFill(gpa, len, value, false);
+        }
 
-    /// The runs `bytes[from..to]` describes, as a slab of its own: the
-    /// bytes, plus the pad when the first of those runs is a `true` run,
-    /// because a slab's own run sequence opens on a `false` run
-    /// (`bool.rs:988-1002`).
-    pub fn wireSlice(
-        gpa: std.mem.Allocator,
-        bytes: []const u8,
-        from: usize,
-        to: usize,
-        opens_with_true: bool,
-    ) ParseError![]u8 {
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(gpa);
-        if (opens_with_true) try leb128.appendUnsigned(&out, gpa, 0);
-        try out.appendSlice(gpa, bytes[from..to]);
-        return out.toOwnedSlice(gpa);
-    }
+        /// The runs `bytes[from..to]` describes, as a slab of its own: the
+        /// bytes, plus the pad when the first of those runs is a `true` run,
+        /// because a slab's own run sequence opens on a `false` run
+        /// (`bool.rs:988-1002`).
+        pub fn wireSlice(
+            gpa: std.mem.Allocator,
+            bytes: []const u8,
+            from: usize,
+            to: usize,
+            opens_with_true: bool,
+        ) ParseError![]u8 {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(gpa);
+            if (opens_with_true) try P.appendUnsigned(&out, gpa, 0);
+            try out.appendSlice(gpa, bytes[from..to]);
+            return out.toOwnedSlice(gpa);
+        }
 
-    /// Every run of a boolean slab carries one value, so its last value is
-    /// its first.
-    pub fn lastValueOfRun(bytes: []const u8, seg: slabmod.Segment(Bool.Wire)) ParseError!?Wire {
-        _ = bytes;
-        return seg.first_value;
-    }
+        /// Every run of a boolean slab carries one value, so its last value is
+        /// its first.
+        pub fn lastValueOfRun(bytes: []const u8, seg: slabmod.Segment(Wire)) ParseError!?Wire {
+            _ = bytes;
+            return seg.first_value;
+        }
 
-    /// The streaming encoder over this column's values
-    /// (`ColumnEncoding::Encoder`, `encoding.rs:126-129`).
-    pub const StreamEncoder = BoolEncoder(bool);
+        /// The streaming encoder over this column's values
+        /// (`ColumnEncoding::Encoder`, `encoding.rs:126-129`).
+        pub const StreamEncoder = BoolEncoder(bool, P);
 
-    /// A boolean run stores no value, so there is no literal tail to record.
-    pub fn litTail(bytes: []const u8, seg: slabmod.Segment(Bool.Wire)) ParseError!u32 {
-        _ = bytes;
-        _ = seg;
-        return 0;
-    }
+        /// A boolean run stores no value, so there is no literal tail to record.
+        pub fn litTail(bytes: []const u8, seg: slabmod.Segment(Wire)) ParseError!u32 {
+            _ = bytes;
+            _ = seg;
+            return 0;
+        }
 
-    /// A boolean run stores a length, not values, so the first value of the
-    /// run has no width. The mirror of `litTail`, which is zero for the same
-    /// reason.
-    pub fn litHead(bytes: []const u8, seg: slabmod.Segment(Bool.Wire)) ParseError!u32 {
-        _ = bytes;
-        _ = seg;
-        return 0;
-    }
+        /// A boolean run stores a length, not values, so the first value of the
+        /// run has no width. The mirror of `litTail`, which is zero for the same
+        /// reason.
+        pub fn litHead(bytes: []const u8, seg: slabmod.Segment(Wire)) ParseError!u32 {
+            _ = bytes;
+            _ = seg;
+            return 0;
+        }
 
-    /// The value the `k`-th item of the run `seg` carries. A boolean
-    /// literal run is a run of one item (`bool.rs:13-25`: the value is the
-    /// run's position, not a stored one), so the run's own value is the
-    /// only one it has.
-    pub fn literalValueAt(bytes: []const u8, seg: slabmod.Segment(Bool.Wire), k: usize) ParseError!Bool.Wire {
-        _ = bytes;
-        _ = k;
-        return seg.first_value.?;
-    }
+        /// The value the `k`-th item of the run `seg` carries. A boolean
+        /// literal run is a run of one item (`bool.rs:13-25`: the value is the
+        /// run's position, not a stored one), so the run's own value is the
+        /// only one it has.
+        pub fn literalValueAt(bytes: []const u8, seg: slabmod.Segment(Wire), k: usize) ParseError!Wire {
+            _ = bytes;
+            _ = k;
+            return seg.first_value.?;
+        }
 
-    /// The items the run cut out of a longer run sequence carries.
-    ///
-    /// A boolean run carries no payload: its value is its position in the
-    /// run sequence, so `to - from` copies of `value` **is** the run's
-    /// items — and a fragment cut out of a longer sequence cannot say so
-    /// for itself, because read on its own it opens on the `false` run a
-    /// slab's own bytes open on and every item behind it is the other
-    /// boolean than it is (`bool.zig:13-25`, `bool.rs:988-1002`).
-    pub fn wireRunItems(
-        gpa: std.mem.Allocator,
-        bytes: []const u8,
-        from: usize,
-        to: usize,
-        value: Bool.Wire,
-    ) ParseError![]Bool.Wire {
-        _ = bytes;
-        if (to < from) return error.InvalidValue;
-        const out = try gpa.alloc(Bool.Wire, to - from);
-        errdefer gpa.free(out);
-        fillWire(Bool.Wire, out, value);
-        return out;
-    }
+        /// The items the run cut out of a longer run sequence carries.
+        ///
+        /// A boolean run carries no payload: its value is its position in the
+        /// run sequence, so `to - from` copies of `value` **is** the run's
+        /// items — and a fragment cut out of a longer sequence cannot say so
+        /// for itself, because read on its own it opens on the `false` run a
+        /// slab's own bytes open on and every item behind it is the other
+        /// boolean than it is (`bool.zig:13-25`, `bool.rs:988-1002`).
+        pub fn wireRunItems(
+            gpa: std.mem.Allocator,
+            bytes: []const u8,
+            from: usize,
+            to: usize,
+            value: Wire,
+        ) ParseError![]Wire {
+            _ = bytes;
+            if (to < from) return error.InvalidValue;
+            const out = try gpa.alloc(Wire, to - from);
+            errdefer gpa.free(out);
+            fillWire(Wire, out, value);
+            return out;
+        }
 
-    /// Where a run cursor stands inside a boolean slab's run sequence:
-    /// the run it is in, and the item inside that run. See
-    /// `WireRle.RunAt`; a boolean run's value is its position, so the
-    /// second half is what a literal run of one item would not tell us.
-    pub const RunAt = struct {
-        /// The run the cursor is in. Never the opening pad, which holds
-        /// no items.
-        seg: slabmod.Segment(Bool.Wire),
-        /// The item the cursor stands on, inside `seg`.
-        at: usize,
-    };
+        /// Where a run cursor stands inside a boolean slab's run sequence:
+        /// the run it is in, and the item inside that run. See
+        /// `WireRle.RunAt`; a boolean run's value is its position, so the
+        /// second half is what a literal run of one item would not tell us.
+        pub const RunAt = struct {
+            /// The run the cursor is in. Never the opening pad, which holds
+            /// no items.
+            seg: slabmod.Segment(Wire),
+            /// The item the cursor stands on, inside `seg`.
+            at: usize,
+        };
 
-    /// The run holding item `at`, or the first one behind it, or null
-    /// once the slab has none left. Allocation-free, so a run iterator
-    /// over a boolean column is a value (`bool.rs:756-772`, upstream's
-    /// count walk).
-    ///
-    /// The leading pad holds no items and so is stepped over rather than
-    /// answered (`bool.rs:988-1002`).
-    pub fn runAtOrAfter(bytes: []const u8, at: usize) ParseError!?RunAt {
-        var pos: usize = 0;
-        var item: usize = 0;
-        var value: bool = false;
-        var first = true;
-        while (pos < bytes.len) {
-            const c = try leb128.readUnsigned(bytes[pos..]);
-            const count = std.math.cast(usize, c.value) orelse return error.Overflow;
-            const stop = std.math.add(usize, item, count) catch return error.Overflow;
-            if (stop > at) {
+        /// The run holding item `at`, or the first one behind it, or null
+        /// once the slab has none left. Allocation-free, so a run iterator
+        /// over a boolean column is a value (`bool.rs:756-772`, upstream's
+        /// count walk).
+        ///
+        /// The leading pad holds no items and so is stepped over rather than
+        /// answered (`bool.rs:988-1002`).
+        pub fn runAtOrAfter(bytes: []const u8, at: usize) ParseError!?RunAt {
+            var pos: usize = 0;
+            var item: usize = 0;
+            var value: bool = false;
+            var first = true;
+            while (pos < bytes.len) {
+                const c = try P.readUnsigned(bytes[pos..]);
+                const count = std.math.cast(usize, c.value) orelse return error.Overflow;
+                const stop = std.math.add(usize, item, count) catch return error.Overflow;
+                if (stop > at) {
+                    return .{
+                        .seg = .{
+                            .byte_start = pos,
+                            .byte_end = pos + c.len,
+                            .item_start = item,
+                            .item_end = stop,
+                            .first_value = value,
+                            .opens_with_true = value,
+                            .kind = if (count == 1) .literal else .repeat,
+                        },
+                        .at = at,
+                    };
+                }
+                item = stop;
+                pos += c.len;
+                // Only the very first run may hold no items, and it does not
+                // flip the parity (`bool.rs:988-1002`); the same rule
+                // `segmentsOf` follows.
+                if (!first or !value) value = !value;
+                first = false;
+            }
+            return null;
+        }
+
+        /// The value the first item of `bytes` carries, or null for an empty
+        /// slab. Allocation-free.
+        pub fn firstRunValue(bytes: []const u8) ParseError!?Wire {
+            var pos: usize = 0;
+            var value: bool = false;
+            var first = true;
+            while (pos < bytes.len) {
+                const c = try P.readUnsigned(bytes[pos..]);
+                if (c.value != 0) return value;
+                pos += c.len;
+                if (!first or !value) value = !value;
+                first = false;
+            }
+            return null;
+        }
+
+        /// Whether two adjacent runs would carry the same value, so canonical
+        /// form has to merge them.
+        pub fn sameValue(a: ?Wire, b: ?Wire) bool {
+            if (a == null or b == null) return false;
+            return a.? == b.?;
+        }
+
+        /// No kinds of runs stand next to each other uneasily: a boolean run
+        /// of one item is a run like any other, and two adjacent runs always
+        /// carry different values because a run's value is its position in
+        /// the sequence (`bool.rs:13-25`, `bool.rs:776-783`).
+        pub fn mustMergeKinds(left_kind: slabmod.RunKind, right_kind: slabmod.RunKind) bool {
+            _ = left_kind;
+            _ = right_kind;
+            return false;
+        }
+
+        /// A boolean run sequence is canonical when only the first run may hold
+        /// no items: an interior or trailing zero count would mean two
+        /// neighbouring runs carry the same value and should have been one
+        /// (`bool.rs:776-783`).
+        pub fn canonicalSlab(bytes: []const u8) ParseError!void {
+            var pos: usize = 0;
+            var run: usize = 0;
+            while (pos < bytes.len) {
+                const c = try P.readUnsigned(bytes[pos..]);
+                pos += c.len;
+                // A zero count anywhere but the opening pad means two
+                // neighbouring runs carry the same value and should have been
+                // one, and a trailing one means the slab holds nothing at all
+                // (`bool.rs:784-824`).
+                if (c.value == 0 and (run > 0 or pos >= bytes.len)) return error.InvalidValue;
+                run += 1;
+            }
+        }
+
+        /// The slab's weight: its item count, which is all a boolean column's
+        /// index needs (`column.rs:115-137`).
+        pub fn weightOf(gpa: std.mem.Allocator, slab: *const Slab) ParseError!Weight {
+            _ = gpa;
+            return .{ .len = slab.len };
+        }
+
+        /// One step of the incremental walk over a boolean slab's bytes. A
+        /// boolean run's items all carry its one value, so a run is one step
+        /// with its whole count (`encoding.rs:148-170`).
+        pub const Step = struct {
+            /// How many items the run carries.
+            count: usize,
+            /// The value they carry, or null for the opening pad, which carries
+            /// none.
+            value: ?Wire,
+            /// Which kind of run the step came from.
+            kind: slabmod.RunKind,
+            /// Always true: a boolean run is served in one step.
+            last_of_run: bool,
+            /// One past the run's last byte.
+            run_end: usize,
+            /// Whether the run *after* this one carries `true`, which is what a
+            /// slab cut here needs its opening pad for (`bool.rs:988-1002`).
+            after_opens_with_true: bool,
+        };
+
+        /// The incremental walk over a boolean slab's bytes that a streaming
+        /// load drives (`BoolLoadIter`, `bool.rs:751`, `:988-1090`).
+        ///
+        /// It validates canonical form as it goes, rule for rule the same rule
+        /// [`canonicalSlab`] applies: only the opening run may hold no items,
+        /// and a run sequence whose first run is a pad alternates from there on
+        /// without the pad flipping anything (`bool.rs:784-824`).
+        pub const LoadCursor = struct {
+            /// The slab being walked, read-only. It is the caller's and must
+            /// stay alive and unmodified for as long as the cursor is used;
+            /// nothing the cursor returns points into it.
+            bytes: []const u8,
+            /// The byte offset of the next run header.
+            pos: usize,
+            /// Items served so far.
+            item: usize,
+            /// The value the next run carries. A run's value is its position in
+            /// the sequence, so this is the parity, not a stored byte.
+            value: bool,
+            /// Whether the next run is still the opening one.
+            first: bool,
+
+            /// A cursor standing at the start of `bytes`. The bytes are only
+            /// read, and must stay alive and unmodified for as long as the
+            /// cursor is used.
+            pub fn init(bytes: []const u8) LoadCursor {
+                return .{ .bytes = bytes, .pos = 0, .item = 0, .value = false, .first = true };
+            }
+
+            /// Items served so far, which is also the row the next run starts at.
+            pub fn items(self: *const LoadCursor) usize {
+                return self.item;
+            }
+
+            /// The byte offset one past the run last served.
+            pub fn bytePos(self: *const LoadCursor) usize {
+                return self.pos;
+            }
+
+            /// The next run, or null at the end of the input. A run is served
+            /// whole, so every step has `last_of_run` set and a value that is
+            /// null only for the opening pad. Malformed bytes are
+            /// `error.InvalidValue` — a zero-count run anywhere but the opening
+            /// pad, or a trailing one — and `error.Overflow` where a count
+            /// will not fit a `usize`.
+            pub fn next(self: *LoadCursor) ParseError!?Step {
+                if (self.pos >= self.bytes.len) return null;
+                const c = try P.readUnsigned(self.bytes[self.pos..]);
+                const end = self.pos + c.len;
+                // A zero count anywhere but the opening pad means two
+                // neighbouring runs carry the same value and should have been
+                // one, and a trailing one means the slab holds nothing at all.
+                if (c.value == 0 and (!self.first or end >= self.bytes.len)) return error.InvalidValue;
+                const count = std.math.cast(usize, c.value) orelse return error.Overflow;
+                const value = self.value;
+                self.pos = end;
+                self.item = std.math.add(usize, self.item, count) catch return error.Overflow;
+                // Only the opening pad stands still; every other run alternates.
+                const after_value = if (!self.first or !value) !value else value;
+                self.first = false;
                 return .{
-                    .seg = .{
-                        .byte_start = pos,
-                        .byte_end = pos + c.len,
-                        .item_start = item,
-                        .item_end = stop,
-                        .first_value = value,
-                        .opens_with_true = value,
-                        .kind = if (count == 1) .literal else .repeat,
-                    },
-                    .at = at,
+                    .count = count,
+                    .value = if (count == 0) null else value,
+                    .kind = if (count == 0) .pad else if (count == 1) .literal else .repeat,
+                    .last_of_run = true,
+                    .run_end = end,
+                    .after_opens_with_true = after_value,
                 };
             }
-            item = stop;
-            pos += c.len;
-            // Only the very first run may hold no items, and it does not
-            // flip the parity (`bool.rs:988-1002`); the same rule
-            // `segmentsOf` follows.
-            if (!first or !value) value = !value;
-            first = false;
-        }
-        return null;
-    }
+        };
 
-    /// The value the first item of `bytes` carries, or null for an empty
-    /// slab. Allocation-free.
-    pub fn firstRunValue(bytes: []const u8) ParseError!?Bool.Wire {
-        var pos: usize = 0;
-        var value: bool = false;
-        var first = true;
-        while (pos < bytes.len) {
-            const c = try leb128.readUnsigned(bytes[pos..]);
-            if (c.value != 0) return value;
-            pos += c.len;
-            if (!first or !value) value = !value;
-            first = false;
-        }
-        return null;
-    }
-
-    /// Whether two adjacent runs would carry the same value, so canonical
-    /// form has to merge them.
-    pub fn sameValue(a: ?Wire, b: ?Wire) bool {
-        if (a == null or b == null) return false;
-        return a.? == b.?;
-    }
-
-    /// No kinds of runs stand next to each other uneasily: a boolean run
-    /// of one item is a run like any other, and two adjacent runs always
-    /// carry different values because a run's value is its position in
-    /// the sequence (`bool.rs:13-25`, `bool.rs:776-783`).
-    pub fn mustMergeKinds(left_kind: slabmod.RunKind, right_kind: slabmod.RunKind) bool {
-        _ = left_kind;
-        _ = right_kind;
-        return false;
-    }
-
-    /// A boolean run sequence is canonical when only the first run may hold
-    /// no items: an interior or trailing zero count would mean two
-    /// neighbouring runs carry the same value and should have been one
-    /// (`bool.rs:776-783`).
-    pub fn canonicalSlab(bytes: []const u8) ParseError!void {
-        var pos: usize = 0;
-        var run: usize = 0;
-        while (pos < bytes.len) {
-            const c = try leb128.readUnsigned(bytes[pos..]);
-            pos += c.len;
-            // A zero count anywhere but the opening pad means two
-            // neighbouring runs carry the same value and should have been
-            // one, and a trailing one means the slab holds nothing at all
-            // (`bool.rs:784-824`).
-            if (c.value == 0 and (run > 0 or pos >= bytes.len)) return error.InvalidValue;
-            run += 1;
-        }
-    }
-
-    /// The slab's weight: its item count, which is all a boolean column's
-    /// index needs (`column.rs:115-137`).
-    pub fn weightOf(gpa: std.mem.Allocator, slab: *const Slab) ParseError!Weight {
-        _ = gpa;
-        return .{ .len = slab.len };
-    }
-
-    /// One step of the incremental walk over a boolean slab's bytes. A
-    /// boolean run's items all carry its one value, so a run is one step
-    /// with its whole count (`encoding.rs:148-170`).
-    pub const Step = struct {
-        /// How many items the run carries.
-        count: usize,
-        /// The value they carry, or null for the opening pad, which carries
-        /// none.
-        value: ?Wire,
-        /// Which kind of run the step came from.
-        kind: slabmod.RunKind,
-        /// Always true: a boolean run is served in one step.
-        last_of_run: bool,
-        /// One past the run's last byte.
-        run_end: usize,
-        /// Whether the run *after* this one carries `true`, which is what a
-        /// slab cut here needs its opening pad for (`bool.rs:988-1002`).
-        after_opens_with_true: bool,
-    };
-
-    /// The incremental walk over a boolean slab's bytes that a streaming
-    /// load drives (`BoolLoadIter`, `bool.rs:751`, `:988-1090`).
-    ///
-    /// It validates canonical form as it goes, rule for rule the same rule
-    /// [`canonicalSlab`] applies: only the opening run may hold no items,
-    /// and a run sequence whose first run is a pad alternates from there on
-    /// without the pad flipping anything (`bool.rs:784-824`).
-    pub const LoadCursor = struct {
-        /// The slab being walked, read-only. It is the caller's and must
-        /// stay alive and unmodified for as long as the cursor is used;
-        /// nothing the cursor returns points into it.
-        bytes: []const u8,
-        /// The byte offset of the next run header.
-        pos: usize,
-        /// Items served so far.
-        item: usize,
-        /// The value the next run carries. A run's value is its position in
-        /// the sequence, so this is the parity, not a stored byte.
-        value: bool,
-        /// Whether the next run is still the opening one.
-        first: bool,
-
-        /// A cursor standing at the start of `bytes`. The bytes are only
-        /// read, and must stay alive and unmodified for as long as the
-        /// cursor is used.
-        pub fn init(bytes: []const u8) LoadCursor {
-            return .{ .bytes = bytes, .pos = 0, .item = 0, .value = false, .first = true };
+        /// How far a slab's weight advances a prefix sum: zero, because a
+        /// boolean column is not a prefix column and its weight carries no
+        /// running value.
+        pub fn weightIncrement(w: Weight) i64 {
+            _ = w;
+            return 0;
         }
 
-        /// Items served so far, which is also the row the next run starts at.
-        pub fn items(self: *const LoadCursor) usize {
-            return self.item;
+        /// The column value one wire entry stands for. A boolean column stores
+        /// the value itself, so `running` is untouched and the returned value
+        /// is the wire entry.
+        pub fn valueOfWire(w: Wire, running: *i64) ParseError!Value {
+            _ = running;
+            return w;
         }
 
-        /// The byte offset one past the run last served.
-        pub fn bytePos(self: *const LoadCursor) usize {
-            return self.pos;
+        /// Folds a wire value into a running sum, without realizing it.
+        pub fn accumulate(w: Wire, running: *i64) ParseError!void {
+            running.* = try addChecked(running.*, @as(i64, @intCast(w)));
         }
 
-        /// The next run, or null at the end of the input. A run is served
-        /// whole, so every step has `last_of_run` set and a value that is
-        /// null only for the opening pad. Malformed bytes are
-        /// `error.InvalidValue` — a zero-count run anywhere but the opening
-        /// pad, or a trailing one — and `error.Overflow` where a count
-        /// will not fit a `usize`.
-        pub fn next(self: *LoadCursor) ParseError!?Step {
-            if (self.pos >= self.bytes.len) return null;
-            const c = try leb128.readUnsigned(self.bytes[self.pos..]);
-            const end = self.pos + c.len;
-            // A zero count anywhere but the opening pad means two
-            // neighbouring runs carry the same value and should have been
-            // one, and a trailing one means the slab holds nothing at all.
-            if (c.value == 0 and (!self.first or end >= self.bytes.len)) return error.InvalidValue;
-            const count = std.math.cast(usize, c.value) orelse return error.Overflow;
-            const value = self.value;
-            self.pos = end;
-            self.item = std.math.add(usize, self.item, count) catch return error.Overflow;
-            // Only the opening pad stands still; every other run alternates.
-            const after_value = if (!self.first or !value) !value else value;
-            self.first = false;
-            return .{
-                .count = count,
-                .value = if (count == 0) null else value,
-                .kind = if (count == 0) .pad else if (count == 1) .literal else .repeat,
-                .last_of_run = true,
-                .run_end = end,
-                .after_opens_with_true = after_value,
-            };
+        /// The wire entries an insert takes, and the running value behind them.
+        /// A boolean column's value is its position in the sequence, so the
+        /// wire entries are the values unchanged; the returned slice is the
+        /// caller's to release with `gpa`.
+        pub fn wireOfInsert(gpa: std.mem.Allocator, running: i64, values: []const Value) ParseError!Inserted(Wire) {
+            const out = try gpa.dupe(Wire, values);
+            return .{ .wires = out, .running = running };
+        }
+
+        /// The wire entry one value takes, and the running value it leaves
+        /// behind. A boolean column's value is its position in the sequence, so
+        /// the wire *is* the value and nothing moves.
+        pub fn wireOfOne(running: i64, v: Value) ParseError!struct { wire: Wire, running: i64 } {
+            return .{ .wire = v, .running = running };
+        }
+
+        /// Nothing to re-anchor: a boolean column stores the value itself, so
+        /// no wire entry is measured against a running value. Always null, and
+        /// the column's re-anchor step reads that as "no row to fix".
+        pub fn reanchor(wire: Wire, before: i64, after: i64) ParseError!?Wire {
+            _ = wire;
+            _ = before;
+            _ = after;
+            return null;
         }
     };
-
-    /// How far a slab's weight advances a prefix sum: zero, because a
-    /// boolean column is not a prefix column and its weight carries no
-    /// running value.
-    pub fn weightIncrement(w: Weight) i64 {
-        _ = w;
-        return 0;
-    }
-
-    /// The column value one wire entry stands for. A boolean column stores
-    /// the value itself, so `running` is untouched and the returned value
-    /// is the wire entry.
-    pub fn valueOfWire(w: Wire, running: *i64) ParseError!Value {
-        _ = running;
-        return w;
-    }
-
-    /// Folds a wire value into a running sum, without realizing it.
-    pub fn accumulate(w: Wire, running: *i64) ParseError!void {
-        running.* = try addChecked(running.*, @as(i64, @intCast(w)));
-    }
-
-    /// The wire entries an insert takes, and the running value behind them.
-    /// A boolean column's value is its position in the sequence, so the
-    /// wire entries are the values unchanged; the returned slice is the
-    /// caller's to release with `gpa`.
-    pub fn wireOfInsert(gpa: std.mem.Allocator, running: i64, values: []const Value) ParseError!Inserted(Wire) {
-        const out = try gpa.dupe(Wire, values);
-        return .{ .wires = out, .running = running };
-    }
-
-    /// The wire entry one value takes, and the running value it leaves
-    /// behind. A boolean column's value is its position in the sequence, so
-    /// the wire *is* the value and nothing moves.
-    pub fn wireOfOne(running: i64, v: Value) ParseError!struct { wire: Wire, running: i64 } {
-        return .{ .wire = v, .running = running };
-    }
-
-    /// Nothing to re-anchor: a boolean column stores the value itself, so
-    /// no wire entry is measured against a running value. Always null, and
-    /// the column's re-anchor step reads that as "no row to fix".
-    pub fn reanchor(wire: Wire, before: i64, after: i64) ParseError!?Wire {
-        _ = wire;
-        _ = before;
-        _ = after;
-        return null;
-    }
-};
+}
 
 // ── The column ────────────────────────────────────────────────────────────
 
@@ -4276,11 +4347,11 @@ pub fn Column(comptime T: type, comptime E: type) type {
                         !E.sameValue(last_value, b_first.first_value);
                     if (lit_seam) {
                         const head = out.items.len - last_bytes;
-                        const hdr = try leb128.readSigned(s.data[b_first.byte_start..]);
+                        const hdr = try packOf(E).readSigned(s.data[b_first.byte_start..]);
                         if (hdr.len > b_first.byte_end - b_first.byte_start) return error.InvalidValue;
                         try out.appendSlice(gpa, s.data[b_first.byte_start + hdr.len .. b_first.byte_end]);
                         seam_items = last_items + b_first.itemCount();
-                        _ = try slabmod.rewrite_lit_header(gpa, &out, head, seam_items);
+                        _ = try slabmod.rewrite_lit_header(packOf(E), gpa, &out, head, seam_items);
                         seam_runs = 1;
                         seam_value = try E.lastValueOfRun(s.data, b_first);
                         seam_lit_tail = try E.litTail(s.data, b_first);
@@ -4339,7 +4410,14 @@ pub fn Column(comptime T: type, comptime E: type) type {
                         if (merged_segs.len == 0) return error.InvalidValue;
                         const mid_last = merged_segs[merged_segs.len - 1];
                         seam_runs = merged_segs.len;
-                        seam_value = try E.lastValueOfRun(merged, mid_last);
+                        // Bool counts do not store their value: this fragment
+                        // parses from false, not from the seam's parity
+                        // (rust/hexane/src/bool.rs:855-857). Equal bool runs
+                        // keep the preceding tail's value when merged.
+                        seam_value = if (comptime E.Wire == bool)
+                            last_value
+                        else
+                            try E.lastValueOfRun(merged, mid_last);
                         seam_lit_tail = try E.litTail(merged, mid_last);
                         seam_kind = mid_last.kind;
                         seam_items = mid_last.itemCount();
@@ -5700,13 +5778,39 @@ pub fn Column(comptime T: type, comptime E: type) type {
                     // run, and a run the walk reached by stepping over absent
                     // rows starts wherever it starts.
                     const at = self.tree.itemsBeforeSlab(si) + row;
-                    const d = try E.wireRange(gpa, s.data, row, row + 1);
-                    defer gpa.free(d);
-                    const fix = (try E.reanchor(d[0], try self.runningAt(at), after)) orelse return null;
+                    // **Out of the run sequence this walk already holds.**
+                    // `E.wireRange(gpa, s.data, row, row + 1)` answers the
+                    // same question with the same value and reaches it by
+                    // building the sequence a second time — one allocation
+                    // and a walk of every byte in front of the row — and
+                    // then allocating a one-element slice to carry a wire
+                    // that is returned by value anyway. The two branches
+                    // below are that function's own for a one-item range:
+                    // the run's own value for a repeat run
+                    // (`WireRle.wireRange`'s `.repeat` arm) and
+                    // `literalValueAt` for a literal one (its `.literal`
+                    // arm, which is `readLiteralRun` at `lo == k`).
+                    const seg = segs[k];
+                    const d: E.Wire = switch (seg.kind) {
+                        .repeat => seg.first_value.?,
+                        .literal => try E.literalValueAt(s.data, seg, row - seg.item_start),
+                        // Named rather than folded into the literal arm so
+                        // that a change to the walk above lands here: an
+                        // absent run was stepped over and `runAt` answers a
+                        // run with items, so neither can stand on this line.
+                        // `wireRange` refuses a run with no items the same
+                        // way.
+                        .absent, .pad => return error.InvalidValue,
+                    };
+                    // `runningAt` takes the column `const`, so this is the
+                    // same running value the call inside the expression
+                    // below would have asked for.
+                    const before = try self.runningAt(at);
+                    const fix = (try E.reanchor(d, before, after)) orelse return null;
                     // `sameValue` on two values that both carry one is the
                     // test "are these the same", which is what says the row
                     // is already anchored.
-                    if (E.sameValue(d[0], fix)) return null;
+                    if (E.sameValue(d, fix)) return null;
                     return .{ .at = at, .skip = skip, .wire = fix };
                 }
                 si += 1;
@@ -6000,11 +6104,23 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 try self.reindex();
                 return;
             }
+            // **A rebuilt range can be empty, and empty at the tail.** A cut
+            // that removed every slab from `lo` on and put nothing back
+            // leaves no slab at `lo`: there is nothing to split and no run
+            // budget to enforce, so both are vacuous. `count` is the number
+            // of pieces placed, so `lo == slabs.len` is exactly the case
+            // where the range came out empty at the end of the column, and
+            // that is the whole of the condition — a boundary of the range,
+            // not a special input. The two stages after the split are *not*
+            // vacuous: the index still has to drop the slabs the cut
+            // removed, so only the split is skipped.
+            const rebuilt = lo < self.slabs.items.len;
             // Room for the split and for the bases that follow it, taken
             // while the column still holds every value it had. `Slab.segments`
             // is the run count `splitToBudget` cuts on, so this is the exact
             // number of pieces that can come out of it, not an estimate.
-            try self.reserveSlabs(self.slabs.items.len + self.slabs.items[lo].segments / self.budget);
+            const head_spill = if (rebuilt) self.slabs.items[lo].segments / self.budget else 0;
+            try self.reserveSlabs(self.slabs.items.len + head_spill);
             // `spilled` has exactly one owner at every point and no guard
             // outlives it. The previous shape armed an `errdefer` that closed
             // over `spilled`, called `spilled.deinit` on the success path, and
@@ -6015,9 +6131,15 @@ pub fn Column(comptime T: type, comptime E: type) type {
             // protection fault the apply-route allocation sweep hit. The
             // items transfer to `self.slabs` on success; the list buffer is
             // released once, here, and the two fallible calls after it hold no
-            // reference to `spilled` at all.
-            try self.takeOwnership(lo);
-            var spilled = try slabmod.splitToBudget(self.gpa, E, &self.slabs.items[lo], self.budget);
+            // reference to `spilled` at all. Starting from `.empty` rather
+            // than from the call's own result keeps that true on the refusal
+            // path too: an empty list owns nothing, so releasing it is a
+            // no-op instead of a read of an uninitialised value.
+            var spilled: std.ArrayList(Slab) = .empty;
+            if (rebuilt) {
+                try self.takeOwnership(lo);
+                spilled = try slabmod.splitToBudget(self.gpa, E, &self.slabs.items[lo], self.budget);
+            }
             const spill = spilled.items.len;
             if (spill != 0) {
                 // Non-fallible: the room was taken above, so the pieces are
@@ -6147,20 +6269,31 @@ pub fn Column(comptime T: type, comptime E: type) type {
             return .{ .start = start, .end = end };
         }
 
-        /// Replace the index's slabs `[start, end)` with the weights of the
-        /// column's slabs `[start, slabCount())`.
+        /// Replace the index's leaves from `start` on with the weights of the
+        /// column's slabs from `start` on.
         ///
         /// The index is only correct from the first slab a splice touched:
         /// everything before it kept both its bytes and its weight, and the
         /// merge policy only reaches outwards from the range.
+        ///
+        /// **A tail that was removed outright puts `start` one past the last
+        /// slab while the tree still names the slabs that are gone.** The
+        /// walk then starts at the end of the list and its whole job is the
+        /// truncation `Tree.splice` performs with an empty replacement — so
+        /// the walk starts at `@min(start, slabs.len)` rather than at
+        /// `start`, and there is no early return for "nothing to do". The
+        /// no-op case is already a no-op one level down: `Tree.splice` returns
+        /// when its range is empty and its replacement is too
+        /// (`btree.zig:404`), which is what an index that already agrees with
+        /// the slab list hits here.
         fn reindexFrom(self: *Self, start: usize) ParseError!void {
-            if (start >= self.slabs.items.len) return;
+            const from = @min(start, self.slabs.items.len);
             var weights: std.ArrayList(Weight) = .empty;
             defer weights.deinit(self.gpa);
-            for (self.slabs.items[start..]) |*s| {
+            for (self.slabs.items[from..]) |*s| {
                 try weights.append(self.gpa, try E.weightOf(self.gpa, s));
             }
-            self.tree.splice(start, self.tree.len(), weights.items) catch |e| switch (e) {
+            self.tree.splice(from, self.tree.len(), weights.items) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidIndex => return error.InvalidValue,
             };
@@ -9985,8 +10118,24 @@ fn manySlabColumn(gpa: std.mem.Allocator, runs: usize, per: usize) !Column(u64, 
 
 // ── `load_*` ────────────────────────────────────────────────────────────────
 
-//  Alternating booleans past the run budget: the slab cut inside a boolean
-//  column must not lose or reorder a run (`tests.rs:1663`).
+//  A boolean column's values survive an encode and a load
+//  (`tests.rs:1663`): the length, then every row against both sides.
+//
+//  **The comment upstream writes for this case is not what its fixture does,
+//  and neither is this one.** Upstream names the regression it is for —
+//  "alternating booleans exceeding max_segments caused incorrect values
+//  after a slab cut in `bool_encode_all_slabs`" (`tests.rs:1665-1666`) — and
+//  builds with `Column::<bool>::from_values`, i.e. at the default budget.
+//  Eighteen booleans are seventeen runs, and seventeen runs fit inside the
+//  default sixty-four-run budget with room to spare, so upstream's own
+//  column is one slab and the regression it names is unreached there too.
+//  Seventeen runs, one slab, and a round trip: that is the whole claim here.
+//
+//  The property is not uncovered elsewhere on that account.
+//  `bool_encoder_into_column_direct_matches_load` encodes four hundred
+//  booleans at a **four-run** budget, checks the column really cut, and holds
+//  its bytes against the plain column's save — which is the cut the parity
+//  argument needs, reached.
 test "load_bool_alternating_slab_boundary" {
     const gpa = testing.allocator;
     const values = [_]bool{
@@ -10518,43 +10667,110 @@ test "load_empty_and_fill_and_length" {
 }
 
 //  Every non-canonical run structure is a load error (`tests.rs:5084`).
+//
+//  **Both entry points, all seven fixtures.** Upstream asserts each fixture
+//  twice: once through the draining `load_with` and once by pulling the run
+//  stream (`RleEncoding::load_iter`) until it errors. This port has two
+//  independent implementations of rules 6, 7 and 8 — `Rle.canonical` for
+//  the draining loader, `LoadCursor.checkBoundary` for the streaming one —
+//  so the second assertion reaches a *different function* here rather than
+//  the first one twice. The expected error is named per fixture instead of
+//  `is_err()`, because the seventh is a null run in a column that cannot
+//  hold one, which is rule 9 and not a canonicality rule at all.
 test "load_rejects_non_canonical_input" {
     const gpa = testing.allocator;
     const C = Column(u64, Rle(u64));
     const O = Column(?u64, RleOption(u64));
-    const cases = [_][]const u8{
-        // repeat with count 1
-        &.{ 0x01, 0x05 },
-        // adjacent equal repeats
-        &.{ 0x02, 0x05, 0x02, 0x05 },
-        // repeat then equal literal
-        &.{ 0x02, 0x05, 0x7f, 0x05 },
-        // adjacent literal runs
-        &.{ 0x7f, 0x05, 0x7f, 0x05 },
-        // literal with consecutive equal values
-        &.{ 0x7e, 0x05, 0x05 },
-        // literal then equal repeat
-        &.{ 0x7f, 0x05, 0x02, 0x05 },
+    const Fixture = struct {
+        note: []const u8,
+        bytes: []const u8,
+        want: anyerror,
     };
-    for (cases) |bytes| {
-        try testing.expectError(error.InvalidValue, C.load(gpa, bytes));
-        // The run stream refuses the same bytes: the check is at the wire
-        // level, beneath the slab machinery.
-        try testing.expectError(error.InvalidValue, rle.Rle(u64).canonical(bytes));
+    const cases = [_]Fixture{
+        // repeat with count 1 — rule 1
+        .{ .note = "repeat with count 1", .bytes = &.{ 0x01, 0x05 }, .want = error.InvalidValue },
+        // adjacent equal repeats — rule 8
+        .{ .note = "adjacent equal repeats", .bytes = &.{ 0x02, 0x05, 0x02, 0x05 }, .want = error.InvalidValue },
+        // repeat then equal literal — rule 8
+        .{ .note = "repeat then equal literal", .bytes = &.{ 0x02, 0x05, 0x7f, 0x05 }, .want = error.InvalidValue },
+        // adjacent literal runs — rule 4
+        .{ .note = "adjacent literal runs", .bytes = &.{ 0x7f, 0x05, 0x7f, 0x05 }, .want = error.InvalidValue },
+        // literal with consecutive equal values — rule 7
+        .{ .note = "literal with consecutive equal values", .bytes = &.{ 0x7e, 0x05, 0x05 }, .want = error.InvalidValue },
+        // literal then equal repeat — rule 8
+        .{ .note = "literal then equal repeat", .bytes = &.{ 0x7f, 0x05, 0x02, 0x05 }, .want = error.InvalidValue },
+        // count-0 null run, in a column that cannot hold one — rule 9
+        .{ .note = "count-0 null run", .bytes = &.{ 0x00, 0x00 }, .want = error.UnexpectedNull },
+    };
+    for (cases) |c| {
+        // The draining loader: `load` reaches `E.canonicalSlab` and nothing
+        // else.
+        if (C.load(gpa, c.bytes)) |loaded| {
+            // The capture is a `const` binding and `deinit` wants `*Self`,
+            // so ownership moves into a mutable local first.
+            var ok = loaded;
+            ok.deinit();
+            std.debug.print("the draining loader accepted {s}: {x}\n", .{ c.note, c.bytes });
+            return error.TestUnexpectedResult;
+        } else |e| {
+            if (e != c.want) {
+                std.debug.print("{s}: the draining loader said {s}, not {s}\n", .{
+                    c.note, @errorName(e), @errorName(c.want),
+                });
+                return error.TestUnexpectedResult;
+            }
+        }
+
+        // The run stream, drained until it refuses or ends — which is the
+        // path whose boundary and within-literal rules `Rle.canonical` does
+        // not share.
+        //
+        // **The refusal is caught and matched, not propagated.** A `try` in
+        // the drain loop turns the very behaviour the fixture is here for
+        // into a failure of the test, so the loop records the first error the
+        // stream hands back and the fixture's own `want` is asserted against
+        // it below — the same shape as the draining loader above, and the
+        // same thing upstream asserts (`tests.rs:5084-5110`).
+        var iter = try C.loadIter(gpa, c.bytes, C.LoadOpts.new());
+        defer iter.deinit();
+        var refusal: ?anyerror = null;
+        while (refusal == null) {
+            const next_run = iter.tryNextRun() catch |e| {
+                refusal = e;
+                break;
+            };
+            if (next_run == null) break;
+        }
+        if (refusal) |e| {
+            if (e != c.want) {
+                std.debug.print("{s}: the run stream said {s}, not {s}\n", .{
+                    c.note, @errorName(e), @errorName(c.want),
+                });
+                return error.TestUnexpectedResult;
+            }
+        } else {
+            std.debug.print("the run stream accepted {s}: {x}\n", .{ c.note, c.bytes });
+            return error.TestUnexpectedResult;
+        }
     }
-    // adjacent null runs
+    // adjacent null runs (rule 5)
     try testing.expectError(error.InvalidValue, O.load(gpa, &.{ 0x00, 0x01, 0x00, 0x01 }));
-    // count-0 null run
+    // count-0 null run in a column that can hold one (rule 2)
     try testing.expectError(error.InvalidValue, O.load(gpa, &.{ 0x00, 0x00 }));
 }
 
-//  A null run in a non-nullable column and a truncated payload are both
-//  refused (`tests.rs:5125`). Upstream's third case is a string column
-//  holding invalid UTF-8; the port has no byte-string codec.
+//  A null run in a non-nullable column, a truncated payload, and invalid
+//  UTF-8 in a text column are all refused (`tests.rs:5125-5133`).
+//
+//  The third arm is upstream's own byte string: repeat count 2, a one-byte
+//  length, then `0xff`. That is the same wire a *byte* column accepts and a
+//  text column refuses — the whole difference between the two codecs — which
+//  `a_text_column_refuses_bytes_that_are_not_text` pins from the other side.
 test "load_rejects_bad_contents" {
     const gpa = testing.allocator;
     try testing.expectError(error.UnexpectedNull, Column(u64, Rle(u64)).load(gpa, &.{ 0x00, 0x01 }));
     try testing.expectError(error.UnexpectedEnd, Column(u64, Rle(u64)).load(gpa, &.{0x02}));
+    try testing.expectError(error.InvalidUtf8, StrCol.load(gpa, &.{ 0x02, 0x01, 0xff }));
 }
 
 //  A prefix column's weights are accumulated as the runs stream past the
@@ -11258,12 +11474,14 @@ test "splice_lone_plus_lit_insert_same_as_lone" {
 }
 
 //  A nullable column whose payload is wider than a byte, spliced and then
-//  saved and loaded (`tests.rs:314-324`).
+//  saved and loaded (`tests.rs:314-324`) — the LEB128 half.
 //
-//  Upstream writes the case four times, twice per codec: Leb128 (`BeLen`) and
-//  `Bijou64`. Only the Leb128 case is ported — `Bijou64` is the second
-//  unsigned codec that nothing selects (`docs/plan.md` §2).
-test "splice_and_nullable" {
+//  Upstream writes a `splice_and_nullable` of its own inside `mod alt_codec`
+//  (`tests.rs:5510-5521`), over the same values under its test-local `BeLen`,
+//  and a second inside `#[cfg(feature = "bijou64")] mod bijou64_codec`
+//  (`tests.rs:5663`), which this port does not carry. The cross-codec one is
+//  declared under its own name further down; this one is the default wire.
+test "splice_and_nullable_leb128" {
     const gpa = testing.allocator;
     var col = try Column(?u64, RleOption(u64)).init(gpa);
     defer col.deinit();
@@ -11381,16 +11599,31 @@ test "save_to_unless_bool_after_insert" {
     try testing.expect(bytes.len > 0);
 }
 
-//  Four columns saved into one buffer, each range equal to its own save and
-//  the concatenation equal to the four saves laid end to end
-//  (`tests.rs:325-379`).
-//
-//  The port has no `save_to(&mut buf) -> Range`: `encode` allocates and the
-//  caller frees, so the buffer here is the concatenation the test builds, and
-//  the ranges are the offsets it computed. Upstream's fourth column is a
-//  `String`; the port has no byte-string codec.
 test "save_to_multi_column_concatenation" {
+    // Four columns saved into one buffer, each range equal to its own save,
+    // the ranges contiguous and covering, and each range loading back to the
+    // values it was saved from (`tests.rs:2967-3046`).
+    //
+    // The port has no `save_to(&mut buf) -> Range`: `encode` allocates and
+    // the caller frees, so the buffer here is the concatenation the test
+    // builds and the ranges are the offsets it computed. That makes
+    // upstream's `assert_eq!(buf, expected)` (`:3020-3025`) the construction
+    // rather than a check, and leaves the four range-vs-`save` compares and
+    // the four contiguity reads as what pins the bookkeeping.
+    //
+    // **All four columns are here.** Upstream's
+    // fourth is a `String` column cycling `alpha`/`beta`/`gamma`/`delta`
+    // (`:2993-2998`); the port's text codec is `StrCol`, the same one
+    // `string_basic` and `a_text_column_refuses_bytes_that_are_not_text` use,
+    // so "the port has no byte-string codec" was never a reason to leave it
+    // out. Every column is built at a **sixteen-run budget** (`:2977`, `:2989`,
+    // `:2992`, `:2997`) rather than the default sixty-four. Three of the four
+    // then really cut — a thousand rows over a hundred values, five hundred
+    // booleans and a thousand distinct strings are many runs at sixteen — and
+    // the fourth, `Option<u64>` over `[0, 5)`, is about six runs and stays one
+    // slab here exactly as it does upstream.
     const gpa = testing.allocator;
+    const budget: usize = 16;
     var prng: std.Random.DefaultPrng = .init(0x5A4E_0001);
     const rand = prng.random();
     const n = 1000;
@@ -11406,16 +11639,27 @@ test "save_to_multi_column_concatenation" {
     const bool_vals = try gpa.alloc(bool, n);
     defer gpa.free(bool_vals);
     for (bool_vals) |*v| v.* = rand.boolean();
+    // `["alpha", "beta", "gamma", "delta"][i % 4]` — `tests.rs:2993-2998`.
+    // Every row differs from the one in front of it, so this is a thousand
+    // literal runs rather than four, and sixteen runs per slab is a cut on
+    // every slab boundary that matters.
+    const tags = [_][]const u8{ "alpha", "beta", "gamma", "delta" };
+    const str_vals = try gpa.alloc([]const u8, n);
+    defer gpa.free(str_vals);
+    for (str_vals, 0..) |*v, i| v.* = tags[i % tags.len];
 
-    var c_u64 = try Column(u64, Rle(u64)).init(gpa);
+    var c_u64 = try Column(u64, Rle(u64)).initWithBudget(gpa, budget);
     defer c_u64.deinit();
     try c_u64.extend(gpa, u64_vals);
-    var c_opt = try Column(?u64, RleOption(u64)).init(gpa);
+    var c_opt = try Column(?u64, RleOption(u64)).initWithBudget(gpa, budget);
     defer c_opt.deinit();
     try c_opt.extend(gpa, opt_vals);
-    var c_bool = try Column(bool, Bool).init(gpa);
+    var c_bool = try Column(bool, Bool).initWithBudget(gpa, budget);
     defer c_bool.deinit();
     try c_bool.extend(gpa, bool_vals);
+    var c_str = try StrCol.initWithBudget(gpa, budget);
+    defer c_str.deinit();
+    try c_str.extend(gpa, str_vals);
 
     const s_u64 = try c_u64.encode(gpa);
     defer gpa.free(s_u64);
@@ -11423,6 +11667,8 @@ test "save_to_multi_column_concatenation" {
     defer gpa.free(s_opt);
     const s_bool = try c_bool.encode(gpa);
     defer gpa.free(s_bool);
+    const s_str = try c_str.encode(gpa);
+    defer gpa.free(s_str);
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
@@ -11432,15 +11678,19 @@ test "save_to_multi_column_concatenation" {
     try buf.appendSlice(gpa, s_opt);
     const r_bool: RowRange = .{ .start = buf.items.len, .end = buf.items.len + s_bool.len };
     try buf.appendSlice(gpa, s_bool);
+    const r_str: RowRange = .{ .start = buf.items.len, .end = buf.items.len + s_str.len };
+    try buf.appendSlice(gpa, s_str);
 
     try testing.expectEqualSlices(u8, s_u64, buf.items[r_u64.start..r_u64.end]);
     try testing.expectEqualSlices(u8, s_opt, buf.items[r_opt.start..r_opt.end]);
     try testing.expectEqualSlices(u8, s_bool, buf.items[r_bool.start..r_bool.end]);
+    try testing.expectEqualSlices(u8, s_str, buf.items[r_str.start..r_str.end]);
     // Ranges are contiguous and cover the buffer.
     try testing.expectEqual(@as(usize, 0), r_u64.start);
     try testing.expectEqual(r_u64.end, r_opt.start);
     try testing.expectEqual(r_opt.end, r_bool.start);
-    try testing.expectEqual(buf.items.len, r_bool.end);
+    try testing.expectEqual(r_bool.end, r_str.start);
+    try testing.expectEqual(buf.items.len, r_str.end);
 
     {
         var back = try Column(u64, Rle(u64)).load(gpa, buf.items[r_u64.start..r_u64.end]);
@@ -11462,6 +11712,13 @@ test "save_to_multi_column_concatenation" {
         const got = try back.toSlice(gpa);
         defer gpa.free(got);
         try testing.expectEqualSlices(bool, bool_vals, got);
+    }
+    {
+        var back = try StrCol.load(gpa, buf.items[r_str.start..r_str.end]);
+        defer back.deinit();
+        // By content, not by header: a loaded column owns its own bytes, so
+        // the model and the column never share a pointer.
+        try expectBytesValues(StrCol, &back, str_vals, textEql);
     }
 }
 
@@ -11720,11 +11977,18 @@ test "scope_to_value_multi_slab_span" {
 }
 
 //  The middle run located across every prefix / run / suffix shape
-//  (`tests.rs:3622-3641`).
+//  (`tests.rs:3785-3808`).
 //
-//  Upstream's outer axis is `max_segments`; this sweep keeps the run lengths
-//  — the shapes that decide where a run starts and ends — and reaches several
-//  slabs under the default budget instead of by tuning one.
+//  **Upstream's outer `max_segments` axis — `4, 8, 16, 32`, for 256
+//  combinations — is not swept here, and nothing is lost by leaving it.** The
+//  data is three value groups (`[0×p][1×r][2×s]`, `tests.rs:3793-3796`), so
+//  the column is at most three runs whatever the lengths, and every budget
+//  either sweep uses — upstream's four smallest, and the sixty-four here — is
+//  larger than three. All 256 of upstream's combinations are one slab there
+//  and all 64 of these are one slab here: the axis is vacuous on both sides.
+//
+//  What the run lengths *do* decide is where the middle run starts and ends,
+//  and that is what is asserted.
 test "scope_to_value_fuzz_multi_slab" {
     const gpa = testing.allocator;
     for ([_]usize{ 0, 1, 2, 5 }) |prefix_len| {
@@ -12244,10 +12508,8 @@ test "remove_middle" {
     try assertCol(u64, Rle(u64), &col, &.{ 1, 3 });
 }
 
-//  A nullable and a boolean column, each inserted one row at a time
-//  (`tests.rs:166`, `:173`, `:180`, `:187`). Upstream's fourth case is a
-//  string column; the port has no byte-string codec.
 test "nullable_basic" {
+    // Nullable insertion preserves row order (`tests.rs:192-199`).
     const gpa = testing.allocator;
     var col = try Column(?u64, RleOption(u64)).init(gpa);
     defer col.deinit();
@@ -12299,21 +12561,43 @@ test "slab_splitting" {
     try assertCol(u64, Rle(u64), &col, vals);
 }
 
-//  Twenty rows in, fifteen removed from the front (`tests.rs:202`). The
+//  Twenty rows in, fifteen removed from the front (`tests.rs:254-268`). The
 //  removes are what the merge policy runs on, so the layout is checked after
-//  every one of them.
+//  every one of them — and the column has to be split for any of that to
+//  mean anything.
+//
+//  **The split is built, not hoped for.** Upstream inserts the twenty
+//  *distinct* values `0..=19` against a four-run budget and gets five slabs;
+//  twenty distinct values are ONE literal run in this port
+//  (`slab.zig:111-114`, `pinned_run_count`), so the same twenty rows are ten
+//  runs of two. At a four-run budget that is more than one slab, and the
+//  assertions below check both ends of the drain rather than trusting the
+//  arithmetic.
 test "slab_merging_after_removes" {
     const gpa = testing.allocator;
-    var col = try manySlabColumn(gpa, 5, 4);
+    const Col = Column(u64, Rle(u64));
+    var col = try Col.initWithBudget(gpa, 4);
     defer col.deinit();
     var model: std.ArrayList(u64) = .empty;
     defer model.deinit(gpa);
-    for (0..5) |r| for (0..4) |_| try model.append(gpa, @intCast(r));
+    for (0..20) |i| try model.append(gpa, @intCast(i / 2));
+    try col.extend(gpa, model.items);
+    try testing.expect(col.slabCount() > 1);
+    const slabs_built: usize = col.slabCount();
+
     var k: usize = 0;
     while (k < 15) : (k += 1) {
-        try removeAt(Column(u64, Rle(u64)), gpa, &col, 0);
+        try removeAt(Col, gpa, &col, 0);
         _ = model.orderedRemove(0);
         try expectModel(u64, Rle(u64), &col, model.items);
+    }
+    // Fewer slabs than it started with: the merges the case is named for
+    // really ran.
+    if (col.slabCount() >= slabs_built) {
+        std.debug.print("draining 15 rows left {d} slab(s) of the {d} built\n", .{
+            col.slabCount(), slabs_built,
+        });
+        return error.TestUnexpectedResult;
     }
     try assertCol(u64, Rle(u64), &col, model.items);
 }
@@ -13124,6 +13408,41 @@ test "seek_to_value_basic" {
     }
 }
 
+//  A value the column does not hold, asked of `seekToValue` on a
+//  **non-nullable** column (`tests.rs:3684-3693`). Every other seek case here
+//  asks for a value the column holds, or is a nullable column — where an
+//  absent target is `null` and therefore present. So the insertion-point rule
+//  for a **missing** value was asserted on `scopeToValue` and on a nullable
+//  seek, and not on the case it is hardest for: a walk that reads runs and
+//  finds none of them equal to the target has to stop at the row the target
+//  would have gone in at, not at the end of the last run it read.
+//
+//  Three targets in ascending order on **one** cursor, so each answer is the
+//  model's from where the cursor stands. A found target would move the cursor
+//  forward; a missing one leaves it on the insertion point, which is what
+//  makes the second and third answers non-trivial.
+test "seek_to_value_missing" {
+    const gpa = testing.allocator;
+    const Col = Column(u64, Rle(u64));
+    const data = [_]u64{ 0, 0, 0, 2, 2, 2, 4, 4, 4 };
+    var col = try Col.fromValues(gpa, &data, default_max_segments);
+    defer col.deinit();
+    const whole = RowRange{ .start = 0, .end = col.len() };
+
+    var it = try col.iterator();
+    for ([_]u64{ 1, 3, 5 }) |target| {
+        try expectScope(seekModel(&data, target, it.pos(), whole), try it.seekToValue(target, whole));
+    }
+
+    // A fresh cursor gives the same answers here, because the ascending order
+    // means the cursor never stands past the next target's insertion point.
+    // Asserted because it is the weaker statement and the two must not drift.
+    for ([_]u64{ 1, 3, 5 }) |target| {
+        var fresh = try col.iterator();
+        try expectScope(scopeInModel(&data, target, whole), try fresh.seekToValue(target, whole));
+    }
+}
+
 //  The same answers asked for one value after another on **one** cursor,
 //  which is what the op set does walking a map's rows in order
 //  (`tests.rs:3695-3712`). Each answer is the model's **from where the cursor
@@ -13253,58 +13572,489 @@ test "seek_to_value_nullable" {
     }
 }
 
-/// `?u64` in the order the column's own comparison rule puts them
-/// (`column.zig:239-243`): absent before every value, values unsigned.
-fn lessNullable(_: void, a: ?u64, b: ?u64) bool {
+/// `?U` in the order the column's own comparison rule puts them
+/// (`column.zig:287-295`): absent before every value, values unsigned. The
+/// payload is a parameter because upstream's nullable fuzz is over
+/// `Option<u32>` (`tests.rs:3959`) where the other nullable cases here are
+/// over `?u64`, and the rule does not depend on the width.
+fn nullableLess(comptime U: type, a: ?U, b: ?U) bool {
     if (a == null) return b != null;
     if (b == null) return false;
     return a.? < b.?;
 }
 
-fn scopeInNullableModel(model: []const ?u64, target: ?u64, range: RowRange) RowRange {
+/// [`nullableLess`] over `u64`, for `std.mem.sort`.
+fn lessNullable(_: void, a: ?u64, b: ?u64) bool {
+    return nullableLess(u64, a, b);
+}
+
+/// The rows `target` occupies in a **sorted** nullable model, by linear
+/// scan: the same rule and the same insertion-point answer as
+/// [`scopeInModel`](scopeInModel), over `?U`.
+fn scopeInNullableModelOf(comptime U: type, model: []const ?U, target: ?U, range: RowRange) RowRange {
     const window = clampRange(range, model.len);
     var start = window.start;
     var end = window.start;
-    while (start < window.end and lessNullable({}, model[start], target)) : (start += 1) {}
-    while (end < window.end and !lessNullable({}, target, model[end])) : (end += 1) {}
+    while (start < window.end and nullableLess(U, model[start], target)) : (start += 1) {}
+    while (end < window.end and !nullableLess(U, target, model[end])) : (end += 1) {}
     return .{ .start = start, .end = end };
+}
+
+fn scopeInNullableModel(model: []const ?u64, target: ?u64, range: RowRange) RowRange {
+    return scopeInNullableModelOf(u64, model, target, range);
+}
+
+/// [`seekModel`](seekModel) over a nullable model: the answer is from **the
+/// cursor**, not from the window's start, and over `?U`.
+fn seekInNullableModelOf(
+    comptime U: type,
+    model: []const ?U,
+    target: ?U,
+    at: usize,
+    range: RowRange,
+) RowRange {
+    const end = @min(range.end, model.len);
+    const from = @min(@max(at, @min(range.start, model.len)), end);
+    const rel = scopeInNullableModelOf(U, model[from..end], target, .{ .start = 0, .end = end - from });
+    return .{ .start = from + rel.start, .end = from + rel.end };
+}
+
+/// `a <= b` in the column's own order ([`compareValue`](compareValue)), so a
+/// model is sorted by exactly the rule the column's run walk uses — which is
+/// what makes the two answers comparable at all, and for `?U` is "absent
+/// first".
+fn lessByColumn(comptime T: type) fn (context: void, a: T, b: T) bool {
+    // A comptime factory rather than a plain function: `std.mem.sort` takes
+    // a function *value*, and `T` has to be bound before one can exist.
+    return struct {
+        fn less(_: void, a: T, b: T) bool {
+            return compareValue(T, a, b) == .lt;
+        }
+    }.less;
+}
+
+/// The first row of `items` that is **past** `v`: `partition_point(|x| x <= v)`,
+/// the insertion point upstream's two fuzzes take for a value being inserted
+/// into a sorted column (`tests.rs:3854`, `:3983`).
+fn upperBound(comptime T: type, items: []const T, v: T) usize {
+    var i: usize = 0;
+    while (i < items.len and compareValue(T, items[i], v) != .gt) : (i += 1) {}
+    return i;
+}
+
+/// A sorted column of `values` on the run budget `budget`, built the way
+/// upstream's two fuzzes build theirs (`tests.rs:3833-3858`, `:3974-3986`):
+/// **one value at a time, each at its sorted position, in a shuffled order**.
+///
+/// **What the shuffle buys, exactly.** The position is `upperBound` — the row
+/// after the last row equal to the value — which is upstream's
+/// `partition_point(|v| v <= val)` (`tests.rs:3854`) and means a value never
+/// splits a run of equal values: an insert either extends the run of that
+/// value or opens a new run at a boundary. The column is therefore sorted,
+/// and its run count is the number of maximal equal groups it holds, at every
+/// step.
+///
+/// So the shuffle is not a way to reach a wilder final layout, and this does
+/// not claim to be one. What it buys over one `extend` of a sorted list is
+/// that the **insert** path runs — `splice` at an arbitrary position in a
+/// column that already holds rows — rather than one bulk write at the end,
+/// and that the column is grown through many different prefixes of its own
+/// value set, each of which is a different slab layout on the way there.
+/// Upstream states the same intent at `tests.rs:3842-3843` ("randomizing
+/// insertion order within equal-value groups to create varied slab
+/// layouts"); the layouts it gets differ, and the ones here differ too, but
+/// not by the same margin — see the run-count note on the case below.
+///
+/// `values` is sorted in place and becomes the model; it is the caller's to
+/// free, and the column is the caller's to `deinit`. `rng` is left where the
+/// shuffle left it, so a caller drawing several columns from one stream gets
+/// upstream's stream order.
+fn shuffledSortedColumn(
+    comptime T: type,
+    comptime E: type,
+    gpa: std.mem.Allocator,
+    values: []T,
+    budget: usize,
+    rng: *u64,
+) !struct { col: Column(T, E), model: []T } {
+    std.mem.sort(T, values, {}, lessByColumn(T));
+
+    // The insertion order: every row, shuffled (`tests.rs:3844-3848`).
+    const order = try gpa.alloc(usize, values.len);
+    defer gpa.free(order);
+    for (order, 0..) |*slot, i| slot.* = i;
+    var i: usize = order.len;
+    while (i > 1) : (i -= 1) {
+        const j = xorshift(rng) % i;
+        std.mem.swap(usize, &order[i - 1], &order[j]);
+    }
+
+    var col = try Column(T, E).initWithBudget(gpa, budget);
+    errdefer col.deinit();
+    // The rows already in the column, so a value's sorted position is found
+    // against what is there rather than against the whole model.
+    var current: std.ArrayList(T) = .empty;
+    defer current.deinit(gpa);
+    for (order) |orig| {
+        const v = values[orig];
+        const pos = upperBound(T, current.items, v);
+        try current.insert(gpa, pos, v);
+        try insertAt(Column(T, E), gpa, &col, pos, v);
+    }
+    return .{ .col = col, .model = values };
+}
+
+test "fuzz_scope_and_seek_to_value" {
+    // Upstream's `fuzz_scope_and_seek_to_value` (`tests.rs:3809-3940`): 500
+    // randomized sorted columns, and both routes to a value's rows — a fresh
+    // cursor's `scopeToValue` and a walking cursor's `seekToValue` — against a
+    // linear scan of the same rows.
+    //
+    // **Every axis upstream sweeps is swept here.** The run budget cycles
+    // `4, 8, 16, 64` with the trial (`tests.rs:3823-3828`), the row count is
+    // `50 + rng % 200` and the alphabet `2 + rng % 8` (`:3830-3831`), and each
+    // value in `0..=num_distinct` is asked for four ways: over the whole column,
+    // over a prefix window, as a **sequential** seek on one cursor (the way the
+    // op set walks a map's rows, `:3894-3906`), as a **skipping** seek that
+    // steps over every other value and so re-descends for one behind the cursor
+    // (`:3908-3919`), and over a middle window with a fresh cursor each time
+    // (`:3921-3938`). `num_distinct` itself is one past the largest value drawn,
+    // so the sweep also asks for a value the column does not hold at all — the
+    // empty range at the row it would have been inserted at.
+    //
+    // The answers come from `scopeInModel` and `seekModel`, the same linear
+    // models the surrounding cases use. For the seeks those are the
+    // cursor-relative answers; over a sorted column with ascending targets the
+    // cursor never stands past the next target's first row, so they are also the
+    // whole-range answers upstream's `partition_point` computes — the two agree
+    // on every target here, and the cursor-relative one is the stricter of the
+    // two because it is the one `seekToValue` actually implements.
+    //
+    // **The multi-slab reach is counted, not assumed.** Upstream's budget
+    // counts *segments*, and a literal run is worth its number of values there,
+    // so a 250-row column over nine values spans dozens of slabs at a budget of
+    // four; this counts a literal run as one (`slab.zig:111-114`), so the same
+    // rows are far fewer runs. `multi_slab` counts the trials whose column
+    // really spans more than one slab, and the assertion at the end is that the
+    // sweep reaches the shape at all — the arms that binary-search the slabs
+    // behind a run (`sortedScanToValue`, `column.zig:7073-7118`) are only
+    // reachable from a column that has more than one.
+    const gpa = testing.allocator;
+    var rng: u64 = 777;
+
+    // Trials whose column really spans more than one slab, asserted at the
+    // end. See the header.
+    var multi_slab: usize = 0;
+
+    var trial: usize = 0;
+    while (trial < 500) : (trial += 1) {
+        const budget: usize = switch (trial % 4) {
+            0 => 4,
+            1 => 8,
+            2 => 16,
+            else => 64,
+        };
+        const n: usize = 50 + @as(usize, @intCast(xorshift(&rng) % 200));
+        const distinct: u64 = 2 + xorshift(&rng) % 8;
+
+        const values = try gpa.alloc(u64, n);
+        defer gpa.free(values);
+        for (values) |*v| v.* = xorshift(&rng) % distinct;
+
+        var built = try shuffledSortedColumn(u64, Rle(u64), gpa, values, budget, &rng);
+        defer built.col.deinit();
+        const model = built.model;
+        // The column is the sorted rows whatever order they went in
+        // (`tests.rs:3860-3865`).
+        try expectModel(u64, Rle(u64), &built.col, model);
+
+        const whole = RowRange{ .start = 0, .end = built.col.len() };
+
+        // A window that starts and ends on the same row, asked of both routes.
+        // Nothing in it can hold the target, so both answer the empty range
+        // at that row — and the cursor is left standing on it.
+        const empty_at = n / 3;
+        const empty = RowRange{ .start = empty_at, .end = empty_at };
+        {
+            var t: u64 = 0;
+            while (t <= distinct) : (t += 1) {
+                try expectScope(
+                    scopeInModel(model, t, empty),
+                    try built.col.scopeToValue(t, empty),
+                );
+                var empty_it = try built.col.iterator();
+                try expectScope(
+                    seekModel(model, t, empty_it.pos(), empty),
+                    try empty_it.seekToValue(t, empty),
+                );
+                try testing.expectEqual(@as(usize, empty_at), empty_it.pos());
+            }
+        }
+
+        var target: u64 = 0;
+        while (target <= distinct) : (target += 1) {
+            // The whole column, from a fresh cursor.
+            try expectScope(
+                scopeInModel(model, target, whole),
+                try built.col.scopeToValue(target, whole),
+            );
+            // A prefix window: the answer is found *inside* it, so a target
+            // whose rows are all behind the window answers empty
+            // (`tests.rs:3880-3891`).
+            if (n > 10) {
+                const mid = n / 2;
+                const head = RowRange{ .start = 0, .end = mid };
+                try expectScope(
+                    scopeInModel(model, target, head),
+                    try built.col.scopeToValue(target, head),
+                );
+            }
+        }
+
+        // Sequential seeks on one cursor, values in ascending order.
+        var seq = try built.col.iterator();
+        target = 0;
+        while (target <= distinct) : (target += 1) {
+            try expectScope(
+                seekModel(model, target, seq.pos(), whole),
+                try seq.seekToValue(target, whole),
+            );
+        }
+        try testing.expect(seq.pos() <= built.col.len());
+
+        // Skipping seeks: every other value, so each one jumps a run.
+        var skip = try built.col.iterator();
+        target = 0;
+        while (target <= distinct) : (target += 2) {
+            try expectScope(
+                seekModel(model, target, skip.pos(), whole),
+                try skip.seekToValue(target, whole),
+            );
+        }
+        try testing.expect(skip.pos() <= built.col.len());
+
+        // A middle window, each target on a **fresh** cursor — the arm a
+        // walking cursor cannot reach (`tests.rs:3921-3938`).
+        if (n > 20) {
+            const lo = n / 4;
+            const hi = 3 * n / 4;
+            const window = RowRange{ .start = lo, .end = hi };
+            target = 0;
+            while (target <= distinct) : (target += 1) {
+                var fresh = try built.col.iterator();
+                try expectScope(
+                    seekModel(model, target, fresh.pos(), window),
+                    try fresh.seekToValue(target, window),
+                );
+            }
+        }
+
+        // A column of this shape at this budget really does span slabs, so
+        // the descent arms above were reached and not skipped over.
+        multi_slab += @intFromBool(built.col.slabCount() > 1);
+    }
+
+    // The shape the descent arms need, reached rather than hoped for.
+    try testing.expect(multi_slab > 0);
+}
+
+test "fuzz_scope_to_value_nullable" {
+    // Upstream's `fuzz_scope_to_value_nullable` (`tests.rs:3942-4020`): 200
+    // randomized sorted `?u32` columns — one value in five absent — and both
+    // routes to a value's rows against a linear scan of the same rows.
+    //
+    // The axes are upstream's: the run budget cycles `4, 8, 64`
+    // (`tests.rs:3954-3958`), the row count is `30 + rng % 150` and the alphabet
+    // `2 + rng % 5` (`:3960-3961`), and one draw in five is `null`
+    // (`:3965-3971`) — so absent rows sort **first**, which is what makes `null`
+    // a target with a run of its own at the front rather than in the middle.
+    // `null` is asked for first and every value in `0..=num_distinct` after it
+    // (`:3992-3995`), and `num_distinct` is one past the largest value drawn, so
+    // the sweep asks for a value the column does not hold as well as for one it
+    // does.
+    //
+    // The sequential seek (`tests.rs:4007-4018`) is on **one** cursor over that
+    // whole target list, so every answer after the first is the cursor-relative
+    // one (`seekInNullableModelOf`), not the fresh-cursor one — the difference
+    // a nullable column makes wider, because a run of absent rows at the front
+    // is long enough for the cursor to be standing well inside it.
+    const gpa = testing.allocator;
+    var rng: u64 = 42424242;
+
+    var trial: usize = 0;
+    while (trial < 200) : (trial += 1) {
+        const budget: usize = switch (trial % 3) {
+            0 => 4,
+            1 => 8,
+            else => 64,
+        };
+        const n: usize = 30 + @as(usize, @intCast(xorshift(&rng) % 150));
+        const distinct: u32 = 2 + @as(u32, @intCast(xorshift(&rng) % 5));
+
+        const values = try gpa.alloc(?u32, n);
+        defer gpa.free(values);
+        for (values) |*slot| {
+            const r = xorshift(&rng);
+            // `None` in one draw of five, the value `r % distinct` otherwise
+            // (`tests.rs:3965-3971`).
+            const drawn: u32 = @intCast(r % @as(u64, distinct));
+            slot.* = if (r % 5 == 0) null else drawn;
+        }
+
+        var built = try shuffledSortedColumn(?u32, RleOption(u32), gpa, values, budget, &rng);
+        defer built.col.deinit();
+        const model = built.model;
+        try expectModel(?u32, RleOption(u32), &built.col, model);
+
+        const whole = RowRange{ .start = 0, .end = built.col.len() };
+
+        // `null` first, then every value in `0..=num_distinct`
+        // (`tests.rs:3992-3995`).
+        var targets: [8]?u32 = undefined;
+        targets[0] = null;
+        var t: u32 = 0;
+        var count: usize = 1;
+        while (t <= distinct) : (t += 1) {
+            targets[count] = t;
+            count += 1;
+        }
+
+        for (targets[0..count]) |target| {
+            try expectScope(
+                scopeInNullableModelOf(u32, model, target, whole),
+                try built.col.scopeToValue(target, whole),
+            );
+        }
+
+        // An empty window in front of the run of absent rows: `null` is the
+        // one target that could have been there, and the answer is still the
+        // empty range at the window's own row.
+        const empty = RowRange{ .start = 0, .end = 0 };
+        try expectScope(
+            scopeInNullableModelOf(u32, model, null, empty),
+            try built.col.scopeToValue(null, empty),
+        );
+        {
+            var fresh = try built.col.iterator();
+            try expectScope(
+                seekInNullableModelOf(u32, model, null, fresh.pos(), empty),
+                try fresh.seekToValue(null, empty),
+            );
+            try testing.expectEqual(@as(usize, 0), fresh.pos());
+        }
+
+        // The same list, in order, on one cursor (`tests.rs:4007-4018`).
+        var it = try built.col.iterator();
+        for (targets[0..count]) |target| {
+            try expectScope(
+                seekInNullableModelOf(u32, model, target, it.pos(), whole),
+                try it.seekToValue(target, whole),
+            );
+        }
+        try testing.expect(it.pos() <= built.col.len());
+    }
+}
+
+//  `tests.rs:5332-5355`: `scope_to_value_basic`'s shape, delta-encoded. Every
+//  answer upstream states is here, **including the empty ones** — a value the
+//  column does not hold answers the empty range at the row it would have been
+//  inserted at, and that rule is the one the run walk has to realize, since a
+//  delta column's runs are runs of *differences* and a value with no row is
+//  a value no run's first entry matches. Both ends of the data are asked for
+//  as well, where the insertion point is the end of the column.
+test "delta_scope_to_value_basic" {
+    const gpa = testing.allocator;
+    const DCol = Column(u64, Delta(u64));
+    const data = [_]u64{
+        2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4,
+        4, 4, 5, 5, 5, 5, 6, 6, 6, 8, 9, 9,
+    };
+    var col = try DCol.fromValues(gpa, &data, default_max_segments);
+    defer col.deinit();
+    try assertCol(u64, Delta(u64), &col, &data);
+
+    // A middle value, over a window that contains all of it, over windows
+    // that cut it from both ends, over a window before it, over one inside
+    // it that holds no row of it, and over the window behind it.
+    try expectScope(.{ .start = 7, .end = 15 }, try col.scopeToValue(4, .{ .start = 0, .end = col.len() }));
+    try expectScope(.{ .start = 7, .end = 11 }, try col.scopeToValue(4, .{ .start = 0, .end = 11 }));
+    try expectScope(.{ .start = 7, .end = 8 }, try col.scopeToValue(4, .{ .start = 0, .end = 8 }));
+    try expectScope(.{ .start = 1, .end = 1 }, try col.scopeToValue(4, .{ .start = 0, .end = 1 }));
+    try expectScope(.{ .start = 8, .end = 9 }, try col.scopeToValue(4, .{ .start = 8, .end = 9 }));
+    try expectScope(.{ .start = 9, .end = 15 }, try col.scopeToValue(4, .{ .start = 9, .end = col.len() }));
+    try expectScope(.{ .start = 14, .end = 15 }, try col.scopeToValue(4, .{ .start = 14, .end = 16 }));
+
+    // The ends of the alphabet, present.
+    try expectScope(.{ .start = 0, .end = 3 }, try col.scopeToValue(2, .{ .start = 0, .end = col.len() }));
+    try expectScope(.{ .start = 22, .end = 23 }, try col.scopeToValue(8, .{ .start = 0, .end = col.len() }));
+    try expectScope(.{ .start = 23, .end = 25 }, try col.scopeToValue(9, .{ .start = 0, .end = col.len() }));
+
+    // **The three answers that are empty ranges**: a value between two values
+    // the column does hold (`7` → `22..22`), and one below every value and
+    // one above every value (`1` → `0..0`, `10` → `25..25`).
+    try expectScope(.{ .start = 22, .end = 22 }, try col.scopeToValue(7, .{ .start = 0, .end = col.len() }));
+    try expectScope(.{ .start = 0, .end = 0 }, try col.scopeToValue(1, .{ .start = 0, .end = col.len() }));
+    try expectScope(.{ .start = 25, .end = 25 }, try col.scopeToValue(10, .{ .start = 0, .end = col.len() }));
 }
 
 //  A delta column's answer is a plain column's answer. The delta column's
 //  run walk realizes values (`nextRunByValue`, `delta/mod.rs:19-26`) where the
 //  RLE column's is the wire's, so the two routes to the answer are different
 //  code for the same claim (`tests.rs:3739-3806`).
+//
+//  **Upstream's scale, not a shorter sweep of the same shape**
+//  (`tests.rs:5381-5405`): 20 trials of 2000 rows drawn from `0..300` and
+//  sorted, and **200** target/window pairs per trial with the target drawn
+//  from `0..310` — an alphabet ten past the largest value drawn, so a good
+//  share of the asks are for values the column does not hold. The windows are
+//  drawn independently and ordered, so an empty window is a draw like any
+//  other and is asked as often as a full one.
 test "delta_scope_to_value_matches_plain_column" {
     const gpa = testing.allocator;
-    const n: usize = 3000;
+    const n: usize = 2000;
     const model = try gpa.alloc(u64, n);
     defer gpa.free(model);
     var prng: std.Random.DefaultPrng = .init(0x3141_5);
     const rand = prng.random();
-    for (model) |*v| v.* = rand.intRangeAtMost(u64, 0, 60);
-    std.mem.sort(u64, model, {}, std.sort.asc(u64));
 
-    var plain = try Column(u64, Rle(u64)).init(gpa);
-    defer plain.deinit();
-    try plain.extend(gpa, model);
-    var delta = try Column(u64, Delta(u64)).init(gpa);
-    defer delta.deinit();
-    try delta.extend(gpa, model);
-    if (delta.slabCount() < 2) return error.TestUnexpectedResult;
+    for (0..20) |trial| {
+        for (model) |*v| v.* = rand.intRangeLessThan(u64, 0, 300);
+        std.mem.sort(u64, model, {}, std.sort.asc(u64));
 
-    var target: u64 = 0;
-    while (target <= 62) : (target += 1) {
-        var a = rand.intRangeAtMost(usize, 0, n);
-        var b = rand.intRangeAtMost(usize, 0, n);
-        if (a > b) std.mem.swap(usize, &a, &b);
-        const window = RowRange{ .start = a, .end = b };
-        const want = try plain.scopeToValue(target, window);
-        if (want.start != want.end) {
+        var plain = try Column(u64, Rle(u64)).init(gpa);
+        defer plain.deinit();
+        try plain.extend(gpa, model);
+        var delta = try Column(u64, Delta(u64)).init(gpa);
+        defer delta.deinit();
+        try delta.extend(gpa, model);
+        // Upstream asserts the shape before it asks anything of the delta
+        // column (`tests.rs:5392`): the tree descent is the thing under test
+        // and a single-slab column has no descent to disagree about.
+        if (delta.slabCount() < 2) {
+            std.debug.print("trial {d}: {d} rows of delta hold {d} slab(s)\n", .{
+                trial, model.len, delta.slabCount(),
+            });
+            return error.TestUnexpectedResult;
+        }
+
+        for (0..200) |_| {
+            const target = rand.intRangeLessThan(u64, 0, 310);
+            var a = rand.intRangeAtMost(usize, 0, n);
+            var b = rand.intRangeAtMost(usize, 0, n);
+            if (a > b) std.mem.swap(usize, &a, &b);
+            const window = RowRange{ .start = a, .end = b };
+            // **Every** answer, the empty ones included. This case used to
+            // compare only the non-empty answers and report a match without
+            // asking; an empty answer is the one a delta column's run walk is
+            // most likely to get wrong — a value no run holds still has to
+            // land on its insertion point — and `delta_scope_to_value_basic`
+            // is the fixed-shape statement of that rule.
+            const want = try plain.scopeToValue(target, window);
             const got = try delta.scopeToValue(target, window);
             if (got.start != want.start or got.end != want.end) {
                 std.debug.print(
-                    "target {d} window {d}..{d}: delta {d}..{d}, plain {d}..{d}\n",
-                    .{ target, a, b, got.start, got.end, want.start, want.end },
+                    "trial {d} target {d} window {d}..{d}: delta {d}..{d}, plain {d}..{d}\n",
+                    .{ trial, target, a, b, got.start, got.end, want.start, want.end },
                 );
                 return error.TestUnexpectedResult;
             }
@@ -13560,6 +14310,54 @@ test "nth_within_repeat_run" {
     try expectNth(u64, Rle(u64), &col, model, &.{ 0, 1, 5000, 9999, 10_000 });
 }
 
+test "nth_from_iter_range" {
+    // Upstream's `nth_from_iter_range` (`tests.rs:2133-2143`): a window over
+    // most of a ten-thousand-row column, and three window-relative probes on
+    // it. **Each probe gets its own window**, because upstream builds a fresh
+    // `iter_range` for each of its three asserts and a window `nth` counts
+    // from where its own cursor stands.
+    //
+    // **The last-row skip is what this case is for.** Over a window of eight
+    // thousand rows, `nth(7999)` lands exactly on the window's final row and
+    // `nth(8000)` is the same question answered no — the two upstream asserts
+    // differ by one row and nothing else in this file lands a skip on a
+    // window's last row exactly. The first probe lands inside the slab the
+    // cursor already stands in, and the two others re-descend through the
+    // index, so both arms are on one fixture.
+    const gpa = testing.allocator;
+    const rows: usize = 10_000;
+    const model = try gpa.alloc(u64, rows);
+    defer gpa.free(model);
+    for (model, 0..) |*v, i| v.* = @intCast(i / 100);
+    var col = try Column(u64, Rle(u64)).init(gpa);
+    defer col.deinit();
+    try col.extend(gpa, model);
+
+    const window = RowRange{ .start = 2_000, .end = rows };
+    const window_len = window.end - window.start;
+    // Upstream's three offsets, the last two written off the window's own
+    // length rather than as literals.
+    for ([_]usize{ 500, window_len - 1, window_len }) |n| {
+        var it = try col.iterRange(window);
+        const at = window.start + n;
+        const got = try it.nth(n);
+        if (at >= rows) {
+            try testing.expect(got == null);
+            continue;
+        }
+        if (got == null or got.? != model[at]) {
+            std.debug.print(
+                "iter_range({d}..{d}).nth({d}): got {any}, the model says {any}\n",
+                .{ window.start, window.end, n, got, model[at] },
+            );
+            return error.TestUnexpectedResult;
+        }
+        // The cursor is left on the row it landed on, in column coordinates —
+        // the same reading `expectNth` takes for its own windows.
+        try testing.expectEqual(at + 1, it.pos());
+    }
+}
+
 //  `nth` twice on one cursor answers the two rows the two skips name, so a
 //  caller walking with `nth` sees every row exactly once (`tests.rs:2213-2223`).
 test "nth_sequential_calls" {
@@ -13654,9 +14452,24 @@ fn bumpByOne(_: void, v: u64) u64 {
     return v + 1;
 }
 
-/// Upstream's `fuzz_column_remap` mapping (`tests.rs:3626`).
+/// Upstream's `fuzz_column_remap` mapping (`tests.rs:4491`):
+/// `v.wrapping_mul(3).wrapping_add(7) % 100`, spelled `(v *% 3 +% 7) % 100`
+/// below — Zig has no `wrapping_mul`, and `*%`/`+%` are its wrapping forms.
+///
+/// **What `% 100` does, and what it does not.** The case draws its values
+/// from `0..50` (`tests.rs:4486`), where `3v + 7` runs from 7 to 154
+/// without repeating — so the remainder is what brings the image back under
+/// a hundred and makes the map non-monotone over the column's own alphabet:
+/// a run that grew can land beside a run that shrank, which is the ordering
+/// a run-at-a-time rebuild has to get right. It merges nothing. `3v + 7` is
+/// injective on `0..50`, so equal images are always equal inputs, and the
+/// only repeats a remap leaves behind are repeats the column already had.
+///
+/// The model in `fuzz_column_remap` applies this same expression to a plain
+/// array, so the column and the model cannot drift apart by agreeing on the
+/// wrong thing.
 fn timesThreePlusSeven(_: void, v: u64) u64 {
-    return v * 3 + 7;
+    return (v *% 3 +% 7) % 100;
 }
 
 /// The runs of `col`, as `(count, value)` pairs.
@@ -13762,23 +14575,44 @@ test "remapped_leaves_the_source_column_whole" {
     try expectSound(u64, Rle(u64), &col);
 }
 
-//  `remap` after arbitrary mutation, against the same mapping applied to a
-//  plain array (`tests.rs:3617-3636`). A remap over a column built in one
-//  splice never sees the layout an edited column has, and the walk is the
-//  part that reads it.
 test "fuzz_column_remap" {
+    // `remap` after arbitrary mutation, against the same mapping applied to a
+    // plain array (`tests.rs:4471-4504`). A remap over a column built in one
+    // splice never sees the layout an edited column has, and the walk is the
+    // part that reads it.
+    //
+    // **Every axis is upstream's**: seed `66666` driving the same `xorshift`
+    // for both draws (`tests.rs:4473`, `:4484`, `:4486`), a hundred trials of
+    // a hundred inserts, the value drawn from `[0, 50)` and the insert
+    // position from `0..=len` — and `0` when the column is empty, as
+    // upstream special-cases (`:4481-4483`).
+    //
+    // The map is `timesThreePlusSeven`, `v.wrapping_mul(3).wrapping_add(7) %
+    // 100`. The remainder is what makes it non-monotone over the drawn
+    // domain — `3v + 7` there runs from 7 to 154, so without it the image
+    // would leave the column's own alphabet — and non-monotone is the point:
+    // a run that grew can land beside a run that shrank. It merges nothing:
+    // `3v + 7` is injective on `0..50`, so the only equal images are of
+    // inputs that were already equal, and the only repeats a remap leaves are
+    // repeats the column already had.
+    //
+    // Both statements are upstream's own: the rows against the mapped mirror
+    // (`tests.rs:4494`), then save, load, save and byte equality
+    // (`tests.rs:4496-4502`) — which is what `expectRoundTrip` is.
     const gpa = testing.allocator;
-    var prng: std.Random.DefaultPrng = .init(0x2E2E);
-    const rand = prng.random();
-    for (0..20) |trial| {
-        var col = try Column(u64, Rle(u64)).init(gpa);
+    const Col = Column(u64, Rle(u64));
+    var rng: u64 = 66666;
+
+    for (0..100) |trial| {
+        var col = try Col.init(gpa);
         defer col.deinit();
         var model: std.ArrayList(u64) = .empty;
         defer model.deinit(gpa);
         for (0..100) |_| {
-            const len = model.items.len;
-            const at = if (len == 0) 0 else rand.intRangeAtMost(usize, 0, len);
-            const v = rand.intRangeAtMost(u64, 0, 50);
+            // `0..=len` off the same stream — `tests.rs:4480-4485`.
+            const len = col.len();
+            const at: usize = if (len == 0) 0 else @as(usize, @intCast(xorshift(&rng))) % (len + 1);
+            const v = xorshift(&rng) % 50;
             try col.splice(gpa, at, 0, &.{v});
             try model.insert(gpa, at, v);
         }
@@ -13786,7 +14620,7 @@ test "fuzz_column_remap" {
 
         var want: std.ArrayList(u64) = .empty;
         defer want.deinit(gpa);
-        for (model.items) |v| try want.append(gpa, v * 3 + 7);
+        for (model.items) |v| try want.append(gpa, (v *% 3 +% 7) % 100);
 
         try col.remap(gpa, {}, timesThreePlusSeven);
         try expectSound(u64, Rle(u64), &col);
@@ -13797,6 +14631,157 @@ test "fuzz_column_remap" {
         try expectModel(u64, Rle(u64), &col, want.items);
         try expectRoundTrip(u64, Rle(u64), &col, want.items);
     }
+}
+
+//  A nullable column edited at random — inserts and **removes** — and then
+//  saved, loaded and compared (`tests.rs:4506-4544`).
+//
+//  This is the only fuzz here that removes as well as inserts, and that is
+//  the point of it: a remove rewrites the run it lands in and re-merges the
+//  slabs around it, so it can leave a layout no insert-only walk produces, and
+//  the save/load round trip is where that layout has to come back out as the
+//  same bytes. Upstream draws a remove on one op in three and an absent
+//  value on one insert in five, with both ends of the column reachable: the
+//  insert position is drawn over `0..=len` and the remove over `0..len`.
+//
+//  **Upstream's 200 trials of 200 operations** (`tests.rs:4510-4513`). The
+//  two statements upstream makes at the end — the reloaded column holds the
+//  same values, and the reloaded column saves to the same bytes — are both
+//  here: `expectRoundTrip` is the second and `expectModel` the first, and it
+//  checks them by index, by order and through a full walk.
+test "fuzz_column_save_load_after_mutations" {
+    const gpa = testing.allocator;
+    const Col = Column(?u64, RleOption(u64));
+    var rng: u64 = 77777;
+
+    // How many of each thing actually happened, so the sweep cannot pass by
+    // mutating nothing, by never taking the remove arm, or by never writing
+    // an absent row.
+    var removes: usize = 0;
+    var nulls: usize = 0;
+
+    for (0..200) |_| {
+        var col = try Col.init(gpa);
+        defer col.deinit();
+        var model: std.ArrayList(?u64) = .empty;
+        defer model.deinit(gpa);
+
+        for (0..200) |_| {
+            const len = model.items.len;
+            if (len == 0 or xorshift(&rng) % 3 != 0) {
+                // `0..=len`, so the position past the last row is a draw.
+                const at = if (len == 0) 0 else xorshift(&rng) % (len + 1);
+                const v: ?u64 = if (xorshift(&rng) % 5 == 0)
+                    null
+                else
+                    xorshift(&rng) % 100;
+                try insertAt(Col, gpa, &col, at, v);
+                if (v == null) nulls += 1;
+                try model.insert(gpa, at, v);
+            } else {
+                // `0..len`, and `len` is not zero on this arm.
+                const at = xorshift(&rng) % len;
+                try removeAt(Col, gpa, &col, at);
+                _ = model.orderedRemove(at);
+                removes += 1;
+            }
+        }
+
+        try expectModel(?u64, RleOption(u64), &col, model.items);
+        try expectRoundTrip(?u64, RleOption(u64), &col, model.items);
+    }
+
+    // Upstream's own draw, at upstream's scale: the remove arm fires and
+    // absent rows are written.
+    //
+    // **No slab-count premise.** A third counter used to stand here, asserting
+    // that the sweep's columns span more than one slab, and it asserted
+    // something this port does not promise rather than something upstream
+    // checks: upstream ends this sweep on two statements about the reloaded
+    // values and the reloaded bytes (`tests.rs:4510-4513`), both of which are
+    // above, and asserts no slab count at all. On this port's own layout the
+    // counter was also always zero, and not because of the generator: the
+    // default budget is 64 *wire runs*, `min_seg` is a quarter of it, and
+    // `settle`'s merge walk folds any pair with an undersized side back
+    // together (`column.rs:1782-1797`), so a column grown one value at a time
+    // collapses rather than accumulating slabs. Reaching a multi-slab layout
+    // here needs a budget below the one a default column has — which is a
+    // different test with its own premise, not a correction to this sweep's.
+    try testing.expect(removes > 0);
+    try testing.expect(nulls > 0);
+}
+
+//  A cut that starts on a slab boundary, reaches past the last row, and
+//  inserts nothing leaves no slab where the cut stood — the rebuilt range is
+//  empty and it sits at the end of the column. `settle` has no slab to split
+//  there, and used to index one anyway, in the `self.slabs.items[lo].segments`
+//  that bounds the room it reserves for the split, which aborted the process
+//  on the very first shape that reaches it. The index had the same gap one
+//  step later: `reindexFrom` returned early on `start >= slabs.len`, so the
+//  tree kept naming the slabs the cut had removed.
+//
+//  **The case is the smallest one that takes that route.** The column is
+//  loaded at a budget of three runs rather than grown at the default, because
+//  a default column merges its way back to a single slab — the reason the
+//  sweep above carries no slab-count premise — so a *grown* column cannot
+//  reach the shape at all and a grown premise would have been the same
+//  incidental assertion in a new place. Loading cuts and does not merge back,
+//  so ten repeat runs land in ten slabs and the cut below removes two of them.
+test "a_tail_cut_that_empties_its_range_leaves_the_index_consistent" {
+    const gpa = testing.allocator;
+    const C = Column(u64, Rle(u64));
+
+    var model: std.ArrayList(u64) = .empty;
+    defer model.deinit(gpa);
+    // Twenty rows as ten pairs: ten repeat runs, which is more than a budget
+    // of three holds and fewer than the default sixty-four does, so the two
+    // layouts differ for a reason the case states rather than by accident.
+    for (0..10) |r| {
+        try model.append(gpa, @intCast(r + 1));
+        try model.append(gpa, @intCast(r + 1));
+    }
+    var built = try C.fromValues(gpa, model.items, default_max_segments);
+    defer built.deinit();
+    const bytes = try built.encode(gpa);
+    defer gpa.free(bytes);
+
+    var col = try C.loadWithBudget(gpa, bytes, 3);
+    defer col.deinit();
+
+    const before = col.slabCount();
+    try expectSound(u64, Rle(u64), &col);
+    try expectModel(u64, Rle(u64), &col, model.items);
+    // Two slabs behind the cut is the premise, and it is checked rather than
+    // assumed: with one slab the case would take `spliceOneSlab` and prove
+    // nothing about an empty rebuilt range.
+    if (before < 3) {
+        std.debug.print("the tail cut needs three slabs, the load made {d}\n", .{before});
+        return error.TestUnexpectedResult;
+    }
+
+    // The row the third-from-last slab begins at. Cutting from there to the
+    // end drops that slab and the last one, keeps the ones in front of it,
+    // and rebuilds nothing: no head in front of the cut, no inserted rows,
+    // and no tail behind it.
+    var start: usize = 0;
+    for (col.slabs.items[0 .. before - 2]) |s| start += s.len;
+    const kept = model.items[0..start];
+
+    try col.splice(gpa, start, model.items.len - start, &.{});
+
+    try testing.expectEqual(kept.len, col.len());
+    try testing.expect(col.slabCount() < before);
+    try expectSound(u64, Rle(u64), &col);
+    try expectModel(u64, Rle(u64), &col, kept);
+    // The bytes the column now saves have to load back into the same column,
+    // which is what a stale index makes impossible: the second load answers
+    // from a tree that still counted two slabs the column no longer has.
+    const again = try col.encode(gpa);
+    defer gpa.free(again);
+    var back = try C.loadWithBudget(gpa, again, 3);
+    defer back.deinit();
+    try expectSound(u64, Rle(u64), &back);
+    try expectModel(u64, Rle(u64), &back, kept);
 }
 
 //  `remove_n` is a bounds-checked delete: it drains like `Vec::drain`, a
@@ -14094,16 +15079,54 @@ fn deltaRangeRows(
     }
 }
 
+/// Upstream's `find_first` (`tests.rs:4454-4462`): the first row carrying
+/// `target`, or null when no row does. The delta column's index has no
+/// separate first-row query, and this is what its **absence** means
+/// concretely — the answer is the first row of the first slab a
+/// `findByValue` walk reports, because a delta column's runs are runs of
+/// equal *differences* and a run is visited by realizing its rows, so the
+/// walk is already in row order.
+fn deltaFindFirst(col: *const Column(u64, Delta(u64)), target: u64) !?usize {
+    var find = try col.findByValue(@intCast(target));
+    defer find.deinit();
+    while (find.next()) |hit| {
+        const slab = col.slabAt(hit.slab) orelse return error.InvalidValue;
+        var it = try col.iterRange(.{
+            .start = hit.items_before,
+            .end = hit.items_before + slab.len,
+        });
+        var i: usize = 0;
+        while (try it.next()) |v| {
+            if (v == target) return hit.items_before + i;
+            i += 1;
+        }
+    }
+    return null;
+}
+
 //  A delta column edited at random, then searched for every value and every
-//  value range, against the same search done by hand (`tests.rs:4407-4455`).
-//  `find_first` is upstream's third query and this port has no counterpart;
-//  the first row a `find_by_value` walk reports **is** that answer, so it is
-//  the same walk rather than a second one.
+//  value range, against the same search done by hand (`tests.rs:4408-4469`).
+//  **Upstream's trial count: 200** (`tests.rs:4412`), where this case ran 8.
+//  The op count stays at 400 rather than upstream's 200 because this port
+//  needs a wider build to reach more than one slab at all — the note on the
+//  insert loop below names the device, and it is this port's, not upstream's.
+//
+//  All three of upstream's queries are asked, and the column's own rows are
+//  held against the model before any of them (`tests.rs:4428`). The queries
+//  pin index answers, and a row that moved inside its `[lo, lo+130)` window
+//  while staying off every `findByValue` target would satisfy all three.
+//
+//  `find_first` has no index query of its own in this port, and
+//  [`deltaFindFirst`] is what stands in for it: the first row of the first
+//  slab a `findByValue` walk reports, which is the answer because that walk
+//  is already in row order. Upstream asks it for the column's own first
+//  value, so a miss here is a real difference and not an absent-value
+//  artefact.
 test "fuzz_indexed_delta_column" {
     const gpa = testing.allocator;
     var prng: std.Random.DefaultPrng = .init(0x0DE1A);
     const rand = prng.random();
-    for (0..8) |trial| {
+    for (0..200) |trial| {
         var col = try Column(u64, Delta(u64)).init(gpa);
         defer col.deinit();
         var model: std.ArrayList(u64) = .empty;
@@ -14134,7 +15157,28 @@ test "fuzz_indexed_delta_column" {
             });
             return error.TestUnexpectedResult;
         }
-        try expectSound(u64, Delta(u64), &col);
+
+        // Upstream's own row check (`tests.rs:4428`, `col.to_vec() == mirror`)
+        // is the one the index queries cannot stand in for, so it comes
+        // first and says *which* row is wrong rather than leaving it to the
+        // query that trips over it.
+        const rows = try col.toSlice(gpa);
+        defer gpa.free(rows);
+        if (model.items.len != rows.len) {
+            std.debug.print("trial {d}: the column has {d} rows, the model has {d}\n", .{
+                trial, rows.len, model.items.len,
+            });
+            return error.TestUnexpectedResult;
+        }
+        for (model.items, rows, 0..) |want, have, k| {
+            if (want != have) {
+                std.debug.print("trial {d}: row {d} is {d}, the model has {d}\n", .{
+                    trial, k, have, want,
+                });
+                return error.TestUnexpectedResult;
+            }
+        }
+        try expectModel(u64, Delta(u64), &col, model.items);
 
         var target: u64 = 0;
         while (target < 500) : (target += 97) {
@@ -14181,6 +15225,28 @@ test "fuzz_indexed_delta_column" {
             if (!std.mem.eql(usize, want.items, got.items)) {
                 std.debug.print("trial {d}: find_by_range({d}..{d}) found {d} rows of {d}\n", .{
                     trial, lo, hi, got.items.len, want.items.len,
+                });
+                return error.TestUnexpectedResult;
+            }
+        }
+
+        // `find_first` for the column's own first value — the query this
+        // case did not ask at all before (`tests.rs:4454-4462`). The model
+        // position is never null here: the value came from the column, so
+        // the column holds at least one row of it.
+        if (model.items.len != 0) {
+            const first_val = model.items[0];
+            var want_first: ?usize = null;
+            for (model.items, 0..) |v, k| {
+                if (v == first_val) {
+                    want_first = k;
+                    break;
+                }
+            }
+            const got_first = try deltaFindFirst(&col, first_val);
+            if (got_first == null or got_first.? != want_first.?) {
+                std.debug.print("trial {d}: find_first({d}) found {?d}, want {?d}\n", .{
+                    trial, first_val, got_first, want_first,
                 });
                 return error.TestUnexpectedResult;
             }
@@ -14310,11 +15376,14 @@ test "splice_over_mixed_width_payloads" {
 // one codec's bytes read under another either refuse or answer different
 // values, and it needed this port's runtime codec parameter to say at all:
 // upstream's `Column<T>` has none — this file says so three times, where it
-// excludes upstream's own codec comparison for exactly that reason
-// (`string_and_bool_columns`, `string_bool_delta_prefix_columns`,
-// `prefix_column`: the other codec is upstream's test-local `BeLen`,
-// `tests.rs:5420-5431`, and this port "has exactly one integer packing and
-// no codec parameter"). The header's own citation does not rescue it: the
+// excludes upstream's own codec comparison for exactly that reason (upstream's
+// `string_and_bool_columns` and `prefix_column`, both still declared under
+// those names here, and `string_bool_delta_prefix_columns`, which is
+// `bijou64`-gated upstream and is declared here as
+// `one_fixture_through_the_text_boolean_delta_and_prefix_codecs`). In all
+// three the other codec is upstream's test-local `BeLen`, `tests.rs:5420-5431`,
+// and this port "has exactly one integer packing and no codec parameter".
+// The header's own citation does not rescue it: the
 // lines it named, `tests.rs:5478-5495`, are the union of the three
 // **prefix-column load** cases directly above it
 // (`prefix_column_load_with_empty_and_fill`, `:5474-5479`;
@@ -14786,17 +15855,12 @@ fn oneMore(i: usize) u64 {
     return @as(u64, @intCast(i + 1));
 }
 
-/// `(i / 5) % 5`: five copies of each value, a column of short repeat runs
-/// and **many of them**, for one cut over and over.
-///
-/// `i % 5` was here and is not what the case wanted: every row of it
-/// differs from the row in front of it, so it canonically groups into one
-/// literal run — a single slab however small the run budget is — and a
-/// column that is one slab has no cut for a partial load to cut at. The
-/// run budget bounds runs, not rows, so a generator has to make runs
-/// (`encoder_into_column_direct_matches_load` says the same about its own).
-fn modFive(i: usize) u64 {
-    return @as(u64, @intCast((i / 5) % 5));
+/// `i * 37 % 1000` (`tests.rs:5492`), for the column whose values are all
+/// distinct and all under a kilobyte, so that a length prefix and a LEB128
+/// group differ on every single one of them rather than on the run headers
+/// alone.
+fn thirtySeven(i: usize) u64 {
+    return @as(u64, @intCast(i * 37 % 1000));
 }
 
 /// Runs of eight, for the range-chain case's 60 rows.
@@ -14983,6 +16047,17 @@ test "bool_encoder_into_column_direct_matches_load" {
     try enc.extend(vals);
     var col = try enc.intoColumn();
     defer col.deinit();
+
+    // The cut is the case's premise, so it is checked rather than assumed —
+    // `tests.rs:4629` makes the same check, and the three sibling encoder
+    // cases in this file each make it too. One slab means the parity argument
+    // the comment above describes was never exercised.
+    if (col.slabCount() <= 1) {
+        std.debug.print("the boolean encoder rolled {d} slab(s) for {d} values at a budget of four\n", .{
+            col.slabCount(), vals.len,
+        });
+        return error.TestUnexpectedResult;
+    }
     const got = try col.toSlice(gpa);
     defer gpa.free(got);
     try testing.expectEqualSlices(bool, vals, got);
@@ -15051,10 +16126,19 @@ test "a nullable column's absent runs do not break its repeat runs" {
     }
 }
 
-test "save_load_save_is_identity" {
-    // `tests.rs`. Save, load, save: the second save is the first save's
-    // bytes. A load cuts its slabs at half the budget, so this also holds
-    // that the cut is invisible in the wire form.
+test "re_encoding_after_a_load_returns_the_same_bytes" {
+    // Save, load, save: the second save is the first save's bytes. A load cuts
+    // its slabs at half the budget, so this also holds that the cut is
+    // invisible in the wire form.
+    //
+    // **Named for what it does, not for upstream's name.** Upstream's
+    // `save_load_save_is_identity` (`tests.rs:5703`) exists only inside
+    // `#[cfg(feature = "bijou64")] mod bijou64_codec` (`tests.rs:5551-5552`),
+    // where it compares a `bijou64` column's bytes with the default's. There
+    // is no such column here, so keeping the upstream name on a LEB-only case
+    // would let a per-case ledger record a feature-gated case as covered.
+    // The substance — encode, load, re-encode, byte equality — is upstream's
+    // and is what the five shapes below exercise.
     const gpa = testing.allocator;
     const shapes = [_][]const u64{
         &.{},
@@ -15077,16 +16161,15 @@ test "save_load_save_is_identity" {
     }
 }
 
-test "string_and_bool_columns" {
-    // `tests.rs`. Upstream's second half is `assert_ne!` between two
-    // *codecs* over the same values — `Column<String, BeLen>` against the
-    // default — and `BeLen` is upstream's own test-local varint
-    // (`tests.rs:5420-5431`); `bijou64`, the other one, is dead feature
-    // code (`AGENTS.md:50-52`). This port has exactly one integer packing
-    // and no codec parameter, so that half has no counterpart to compare.
-    // What is left — the string and boolean columns round-tripping through
-    // their own bytes — is real and is what is held here, on the byte
-    // payload and on the boolean codec.
+test "string_and_bool_columns_leb128" {
+    // The LEB128 half of a case upstream writes twice. `alt_codec::
+    // string_and_bool_columns` (`tests.rs:5523-5536`) builds the same text and
+    // boolean columns over its test-local `BeLen` and is declared under that
+    // name further down; the third occurrence (`tests.rs:5676`) is inside
+    // `#[cfg(feature = "bijou64")] mod bijou64_codec` (`tests.rs:5551-5552`),
+    // which is dead feature code (`AGENTS.md:50-52`). What is held here is the
+    // default wire: the byte payload's length prefix and the boolean codec's
+    // run counts, each round-tripped through its own bytes.
     const gpa = testing.allocator;
     const strings = [_][]const u8{ "alpha", "alpha", "beta", "gamma" };
     var scol = try StrCol.fromValues(gpa, &strings, default_max_segments);
@@ -15100,14 +16183,19 @@ test "string_and_bool_columns" {
     try assertCol(bool, Bool, &bcol, &bools);
 }
 
-test "string_bool_delta_prefix_columns" {
-    // `tests.rs`. The same four shapes with the other codec parameter, so
-    // the same exclusion as `string_and_bool_columns`: the `assert_ne!`
-    // between two codecs needs `BeLen`. The four columns themselves are
-    // real, and this is where a byte column, a boolean column, a delta
-    // column and a prefix column are each built, saved and loaded in one
-    // place — which is also the only place the byte payload meets the
-    // integer codecs they share a spine with.
+test "one_fixture_through_the_text_boolean_delta_and_prefix_codecs" {
+    // The four codec shapes over one fixture: a text column, a boolean column,
+    // a delta column and a prefix column, each built, saved and loaded in one
+    // place — which is also the only place the byte payload meets the integer
+    // codecs they share a spine with.
+    //
+    // **Named for what it does, not for upstream's name.** Upstream's
+    // `string_bool_delta_prefix_columns` (`tests.rs:5676`) is declared only
+    // inside `#[cfg(feature = "bijou64")] mod bijou64_codec`
+    // (`tests.rs:5551-5552`), where its subject is the `bijou64` wire. The
+    // four columns here are LEB128 columns over the same values; carrying the
+    // upstream name would let a per-case ledger mark a feature-gated case
+    // covered by a case that never builds a gated column.
     const gpa = testing.allocator;
     const strings = [_][]const u8{ "alpha", "alpha", "beta", "gamma" };
     var scol = try StrCol.fromValues(gpa, &strings, default_max_segments);
@@ -15134,11 +16222,11 @@ test "string_bool_delta_prefix_columns" {
     try assertCol(u64, Prefix(u64), &pcol, values);
 }
 
-test "prefix_column" {
-    // `tests.rs`. The values, and the prefix sums they answer with. The
-    // `assert_ne!` against the other codec's bytes is excluded for the
-    // reason `string_and_bool_columns` gives: the other codec is
-    // upstream's test-local `BeLen`.
+test "prefix_column_leb128" {
+    // The default wire. Upstream's `prefix_column` (`tests.rs:5474-5488`) is
+    // declared inside `mod alt_codec` over its test-local `BeLen`, and what
+    // separates it from this one is its `assert_ne!` between the two codecs'
+    // bytes for the same values. That case is below, under its own name.
     const gpa = testing.allocator;
     const values = try manyU64(gpa, 99, oneMore);
     defer gpa.free(values);
@@ -15156,10 +16244,11 @@ test "prefix_column" {
     try testing.expectEqual(@as(usize, 4950), @as(usize, @intCast(total)));
 }
 
-test "delta_column" {
-    // `tests.rs`. The values and the save/load round trip. The
-    // `assert_ne!` between two codecs' bytes is excluded for the reason
-    // `string_and_bool_columns` gives.
+test "delta_column_leb128" {
+    // The default wire. Upstream's `delta_column` (`tests.rs:5538-5547`) is the
+    // same case over its test-local `BeLen`, and what separates it from this
+    // one is its `assert_ne!` between the two codecs' bytes. That case is
+    // below, under its own name.
     const gpa = testing.allocator;
     const values = try manyU64(gpa, 200, triple);
     defer gpa.free(values);
@@ -15175,6 +16264,283 @@ test "delta_column" {
     // The wire is the *nullable* signed run-length format — a difference,
     // or an absent row in the run header — which is `RleOption`, not `Rle`.
     try RleOption(i64).canonicalSlab(bytes);
+}
+
+// ── The alternate codec (`tests.rs:5412-5548`) ─────────────────────────────
+//
+//  End-to-end proof that the codec parameter reaches every path: a toy
+//  length-prefixed big-endian varint, wire-incompatible with LEB128, driven
+//  through column build / splice / save / load / bool / delta / string
+//  (`tests.rs:5408-5411`).
+//
+// BeLen and this file's packing-aware column factories are private. The
+// rle, boolean and delta packing helpers are public cross-module seams.
+// Documents, changes and sync messages still use LEB128.
+
+/// Upstream's test-local `BeLen` (`tests.rs:5420-5470`): one length byte
+/// `0..8`, then that many big-endian bytes of the value, minimal, so zero is
+/// `[0x00]` and `maxInt(u64)` takes nine bytes in all. Signed through a
+/// zigzag.
+///
+/// Deliberately nothing like LEB128, which is the whole point: a path that
+/// packs its values but leaves its run headers on LEB128 does not write
+/// *different* bytes, it writes bytes that do not decode back — which is what
+/// `u64_column_roundtrip_and_wire_divergence` and its cross-codec load are
+/// here to notice.
+const BeLen = struct {
+    pub const max_signed_size: usize = 9;
+    pub const max_unsigned_size: usize = 9;
+
+    pub fn unsignedSize(value: u64) usize {
+        return 1 + byteLen(value);
+    }
+
+    pub fn signedSize(value: i64) usize {
+        return unsignedSize(zigzag(value));
+    }
+
+    pub fn writeUnsigned(out: []u8, value: u64) usize {
+        const len = byteLen(value);
+        std.debug.assert(out.len >= len + 1);
+        out[0] = @intCast(len);
+        var i: usize = 1;
+        var k: usize = len;
+        while (k > 0) {
+            k -= 1;
+            out[i] = @truncate(value >> @intCast(k * 8));
+            i += 1;
+        }
+        return i;
+    }
+
+    pub fn writeSigned(out: []u8, value: i64) usize {
+        return writeUnsigned(out, zigzag(value));
+    }
+
+    /// Rejects an empty input, a length above eight and a truncated value, and
+    /// reads **no** minimality rule: upstream's reader accepts `[0x02,0x00,0x05]`
+    /// as 5 (`tests.rs:5443-5452`), so this does too. It always advances, it
+    /// never allocates, and it never panics.
+    pub fn readUnsigned(in: []const u8) ParseError!struct { value: u64, len: usize } {
+        if (in.len == 0) return error.UnexpectedEnd;
+        const len: usize = in[0];
+        if (len > 8) return error.InvalidValue;
+        if (in.len < 1 + len) return error.UnexpectedEnd;
+        var v: u64 = 0;
+        for (in[1..][0..len]) |b| v = (v << 8) | b;
+        return .{ .value = v, .len = 1 + len };
+    }
+
+    pub fn readSigned(in: []const u8) ParseError!struct { value: i64, len: usize } {
+        const r = try readUnsigned(in);
+        return .{ .value = unzigzag(r.value), .len = r.len };
+    }
+
+    pub fn appendUnsigned(list: *std.ArrayList(u8), gpa: std.mem.Allocator, value: u64) !void {
+        var buf: [max_unsigned_size]u8 = undefined;
+        try list.appendSlice(gpa, buf[0..writeUnsigned(&buf, value)]);
+    }
+
+    pub fn appendSigned(list: *std.ArrayList(u8), gpa: std.mem.Allocator, value: i64) !void {
+        return appendUnsigned(list, gpa, zigzag(value));
+    }
+
+    /// `(8 - leading_zeros() / 8).min(8)`, the upstream width
+    /// (`tests.rs:5432`). The `min` is vacuous — `@clz` never exceeds 64 — and
+    /// the count is a `@clz`, not a loop.
+    fn byteLen(n: u64) usize {
+        return 8 - @as(usize, @clz(n)) / 8;
+    }
+
+    fn zigzag(n: i64) u64 {
+        const u: u64 = @bitCast(n);
+        return (u << 1) ^ (0 -% (u >> 63));
+    }
+
+    fn unzigzag(z: u64) i64 {
+        const half: i64 = @intCast(z >> 1);
+        return half ^ -(@as(i64, @intCast(z & 1)));
+    }
+};
+
+test "prefix_column" {
+    // `alt_codec::prefix_column` (`tests.rs:5474-5488`): values and byte
+    // divergence from LEB128. The prefix codec also carries indexed weights.
+    const gpa = testing.allocator;
+    const Alt = Column(u64, PrefixBase(BeLen, u64));
+    const LEB = Column(u64, Prefix(u64));
+    const values = try manyU64(gpa, 99, oneMore);
+    defer gpa.free(values);
+
+    var col = try Alt.fromValues(gpa, values, default_max_segments);
+    defer col.deinit();
+    try assertCol(u64, PrefixBase(BeLen, u64), &col, values);
+    var total: i64 = 0;
+    for (values, 0..) |v, i| {
+        try testing.expectEqual(total, try col.getPrefix(i));
+        total += @intCast(v);
+    }
+    try testing.expectEqual(total, try col.getPrefix(values.len));
+    try testing.expectEqual(@as(usize, 4950), @as(usize, @intCast(total)));
+
+    const alt_bytes = try col.encode(gpa);
+    defer gpa.free(alt_bytes);
+    var leb = try LEB.fromValues(gpa, values, default_max_segments);
+    defer leb.deinit();
+    const leb_bytes = try leb.encode(gpa);
+    defer gpa.free(leb_bytes);
+    try testing.expect(!std.mem.eql(u8, alt_bytes, leb_bytes));
+}
+
+test "u64_column_roundtrip_and_wire_divergence" {
+    // `tests.rs:5490-5508`: values, byte divergence, same-codec reload, and
+    // a cross-codec load that either fails or produces different values.
+    const gpa = testing.allocator;
+    const Alt = RleBase(u64, false, false, BeLen);
+    const values = try manyU64(gpa, 500, thirtySeven);
+    defer gpa.free(values);
+
+    var alt = try Column(u64, Alt).fromValues(gpa, values, default_max_segments);
+    defer alt.deinit();
+    const got = try alt.toSlice(gpa);
+    defer gpa.free(got);
+    try testing.expectEqualSlices(u64, values, got);
+
+    const alt_bytes = try alt.encode(gpa);
+    defer gpa.free(alt_bytes);
+    var leb = try Column(u64, Rle(u64)).fromValues(gpa, values, default_max_segments);
+    defer leb.deinit();
+    const leb_bytes = try leb.encode(gpa);
+    defer gpa.free(leb_bytes);
+    try testing.expect(!std.mem.eql(u8, alt_bytes, leb_bytes));
+
+    var back = try Column(u64, Alt).load(gpa, alt_bytes);
+    defer back.deinit();
+    try assertCol(u64, Alt, &back, values);
+
+    // The cross-codec load. `BeLen`'s length byte is LEB128 *payload*, so the
+    // walk desynchronises one byte per run and runs off the end — but either
+    // arm upstream allows is written here, because which one fires is a
+    // property of the bytes rather than the point of the case
+    // (`tests.rs:5505-5508`).
+    if (Column(u64, Rle(u64)).load(gpa, alt_bytes)) |wrong| {
+        var w = wrong;
+        defer w.deinit();
+        const rows = try w.toSlice(gpa);
+        defer gpa.free(rows);
+        try testing.expect(!std.mem.eql(u64, values, rows));
+    } else |_| {}
+}
+
+test "splice_and_nullable" {
+    // `alt_codec::splice_and_nullable` (`tests.rs:5510-5521`).
+    const gpa = testing.allocator;
+    const Alt = RleBase(u64, true, false, BeLen);
+    var col = try Column(?u64, Alt).init(gpa);
+    defer col.deinit();
+    try col.splice(gpa, 0, 0, &.{ 1, null, null, 300, 300 });
+    try col.splice(gpa, 2, 1, &.{70000});
+    try assertCol(?u64, Alt, &col, &.{ 1, null, 70000, 300, 300 });
+    const saved = try col.encode(gpa);
+    defer gpa.free(saved);
+    var loaded = try Column(?u64, Alt).load(gpa, saved);
+    defer loaded.deinit();
+    const got = try loaded.toSlice(gpa);
+    defer gpa.free(got);
+    try testing.expectEqualSlices(?u64, &.{ 1, null, 70000, 300, 300 }, got);
+
+    // Exercise the packed literal-header rewrite in Column.encode
+    // (`column.rs:1360-1376`, `rle/splice.rs:1093-1110`, `codec.rs:207-219`).
+    // Seven distinct values form ONE literal run. Build two valid slabs
+    // explicitly so their literal/literal boundary must be joined on save.
+    const Plain = RleBase(u64, false, false, BeLen);
+    const spread = [_]u64{ 0, 1, 2, 3, 4, 5, 6 };
+    var cut = try Column(u64, Plain).initWithBudget(gpa, 3);
+    defer cut.deinit();
+    for ([_][]const u64{ spread[0..3], spread[3..] }) |part| {
+        const piece = try Plain.wireEncode(gpa, part, false);
+        errdefer gpa.free(piece);
+        const m = try slabmod.measure(gpa, Plain, piece);
+        try cut.slabs.append(gpa, .{
+            .data = piece,
+            .len = m.len,
+            .segments = m.segments,
+            .tail = m.tail,
+        });
+        cut.total_len += m.len;
+    }
+    try cut.reindex();
+    try cut.rebuildAggs();
+    try testing.expectEqual(@as(usize, 2), cut.slabCount());
+    try expectSound(u64, Plain, &cut);
+    const joined = try cut.encode(gpa);
+    defer gpa.free(joined);
+    var rejoined = try Column(u64, Plain).loadWithBudget(gpa, joined, 3);
+    defer rejoined.deinit();
+    try assertCol(u64, Plain, &rejoined, &spread);
+}
+
+test "string_and_bool_columns" {
+    // `tests.rs:5523-5536`: same-codec string and boolean reloads. Packing
+    // applies to string lengths and boolean run counts, not just payloads.
+    const gpa = testing.allocator;
+    const Str = Column([]const u8, RleBase([]const u8, false, true, BeLen));
+    const Flags = Column(bool, BoolCodec(BeLen));
+
+    const strings = [_][]const u8{ "alpha", "alpha", "beta", "gamma" };
+    var scol = try Str.fromValues(gpa, &strings, default_max_segments);
+    defer scol.deinit();
+    try expectBytesRoundTrip(Str, &scol, &strings, textEql);
+
+    const bools = [_]bool{ true, true, false, true, false, false, false, true };
+    var bcol = try Flags.fromValues(gpa, &bools, default_max_segments);
+    defer bcol.deinit();
+    try assertCol(bool, BoolCodec(BeLen), &bcol, &bools);
+}
+
+test "delta_column" {
+    // `tests.rs:5538-5547`: values, byte divergence, same-codec reload.
+    // Also exercise the delta module's own packed writer.
+    const gpa = testing.allocator;
+    const Alt = DeltaBase(BeLen, u64);
+    const values = try manyU64(gpa, 200, triple);
+    defer gpa.free(values);
+
+    var col = try Column(u64, Alt).fromValues(gpa, values, default_max_segments);
+    defer col.deinit();
+    try assertCol(u64, Alt, &col, values);
+
+    var leb = try Column(u64, Delta(u64)).fromValues(gpa, values, default_max_segments);
+    defer leb.deinit();
+    const leb_bytes = try leb.encode(gpa);
+    defer gpa.free(leb_bytes);
+    const bytes = try col.encode(gpa);
+    defer gpa.free(bytes);
+    try testing.expect(!std.mem.eql(u8, bytes, leb_bytes));
+    // A delta column's wire is differences, so its bytes are not its values.
+    try RleBase(i64, true, false, BeLen).canonicalSlab(bytes);
+
+    var back = try Column(u64, Alt).load(gpa, bytes);
+    defer back.deinit();
+    try assertCol(u64, Alt, &back, values);
+
+    // **The delta module's own writer.** Decoding the column's bytes would
+    // never reach `Sink.signed`/`Sink.unsigned` — a reader and a writer are
+    // different code — so the module writes the same values itself, through
+    // its own `encodedSize`, `write` and `append`, and all three have to land
+    // on the column's bytes exactly. This is the only place the packed `Sink`
+    // is exercised at all.
+    const DW = delta_codec.DeltaWith(BeLen, u64);
+    const n = DW.encodedSize(values);
+    try testing.expectEqual(bytes.len, n);
+    const mine = try gpa.alloc(u8, n);
+    defer gpa.free(mine);
+    DW.write(mine, values);
+    try testing.expectEqualSlices(u8, bytes, mine);
+    var appended: std.ArrayList(u8) = .empty;
+    defer appended.deinit(gpa);
+    try DW.append(&appended, gpa, values);
+    try testing.expectEqualSlices(u8, bytes, appended.items);
 }
 
 test "load_iter_partial_consume_then_error" {
@@ -15224,9 +16590,18 @@ test "load_accumulates_prefix_weights_partial_consume" {
     // weights the index is built from are the ones measured as the slabs
     // were cut — not a second walk of the data. The proof is the prefix
     // sums, which come out of those weights.
+    //
+    // **The values are upstream's generator, not a tidy shape**: seed
+    // `0xACC0`, two thousand draws, each `xorshift(&mut seed) % 5`
+    // (`tests.rs:5200-5201`), and a four-run budget (`tests.rs:5205`).
+    // A regular shape — five copies of each value, say — puts every cut of a
+    // four-run budget on a run boundary, so no slab ever ends mid-run and the
+    // partial-run accounting this case exists to check is never measured.
     const gpa = testing.allocator;
-    const vals = try manyU64(gpa, 2000, modFive);
+    const vals = try gpa.alloc(u64, 2_000);
     defer gpa.free(vals);
+    var seed: u64 = 0xACC0;
+    for (vals) |*v| v.* = xorshift(&seed) % 5;
     const PCol = Column(u64, Prefix(u64));
     var original = try PCol.fromValues(gpa, vals, default_max_segments);
     defer original.deinit();
@@ -15234,7 +16609,14 @@ test "load_accumulates_prefix_weights_partial_consume" {
     defer gpa.free(saved);
 
     var iter = try PCol.loadIter(gpa, saved, PCol.LoadOpts.new().withMaxSegments(4));
-    for (0..25) |_| _ = try iter.tryNextRun();
+    // Twenty-five real runs, upstream's count: the consumer's partial consume
+    // is the subject, and it is not a partial consume if the stream ran out.
+    for (0..25) |k| {
+        if (try iter.tryNextRun()) |_| {} else {
+            std.debug.print("the stream ended at run {d}, before the 25 it owes\n", .{k});
+            return error.TestUnexpectedResult;
+        }
+    }
     var col = try iter.finalize();
     defer col.deinit();
 
@@ -15874,15 +17256,17 @@ test "copy_ranges_heuristic" {
     // *source's* slabs, which were built under the source's budget, so that
     // last one cannot take them.
     //
-    // **Which of the two paths answers is a cost decision and is not
-    // observable** ([`Column.CopyStrategy`] says so, and so does upstream's
-    // own `copy_ranges`: "the choice is unobservable — both paths yield
-    // identical values and `save()` bytes"). So the decision is not pinned
-    // here; the *rows* are, and they are held against a model built from
-    // the destination's and the source's own arrays rather than from
-    // anything the copy produced. The three boundary reads upstream makes
-    // on the motivating case are subsumed: this model is every row, of
-    // which those three are the ends and the first copied row.
+    // **The decision is pinned, not only the rows.** Upstream asserts
+    // `Invert` for the bulk copy, `Direct` for the scattered pair and
+    // `Direct` again for the eight-run destination (`tests.rs:1430`,
+    // `:1433-1436`, `:1440-1443`), and each is read here off a pristine
+    // destination — the same budget and the same rows — before the copy
+    // runs, because `copySplices` decides about the source it consumes.
+    // Upstream's own `copy_ranges` comment calls the choice unobservable
+    // because both paths yield identical values, so the rows are still held
+    // against a model built from the destination's and the source's own
+    // arrays and not from anything the copy produced: the check says the
+    // decision is the right one *and* that it does not change the answer.
     const gpa = testing.allocator;
     const Col = Column(u64, Rle(u64));
     const src_vals = try manyU64(gpa, 100_000, thirds);
@@ -15894,22 +17278,26 @@ test "copy_ranges_heuristic" {
         what: []const u8,
         budget: usize,
         ranges: []const RowRange,
+        want: Col.CopyStrategy,
     };
     const cases = [_]Case{
         .{
             .what = "nearly all of a big source into a tiny destination",
             .budget = default_max_segments,
             .ranges = &[_]RowRange{.{ .start = 0, .end = 100_000 }},
+            .want = .invert,
         },
         .{
-            .what = "two scattered ranges out of the same source",
+            .what = "two scattered ranges out of the source",
             .budget = default_max_segments,
             .ranges = &[_]RowRange{ .{ .start = 50, .end = 60 }, .{ .start = 1000, .end = 1010 } },
+            .want = .direct,
         },
         .{
             .what = "the same bulk copy into a destination on another run budget",
             .budget = 8,
             .ranges = &[_]RowRange{.{ .start = 0, .end = 100_000 }},
+            .want = .direct,
         },
     };
 
@@ -15931,6 +17319,21 @@ test "copy_ranges_heuristic" {
 
         var dest = try Col.fromValues(gpa, &dest_vals, c.budget);
         defer dest.deinit();
+
+        // The same three reads upstream makes, taken before the copy so the
+        // destination is still the two rows it was built from and the source
+        // is a column of its own rather than the one `copySplices` eats.
+        var probe = try Col.fromValues(gpa, src_vals, default_max_segments);
+        defer probe.deinit();
+        const decided = try dest.copyStrategy(&probe, norm, splices.len);
+        if (decided != c.want) {
+            std.debug.print(
+                "copy of {s}: the decision is {s}, upstream says {s}\n",
+                .{ c.what, @tagName(decided), @tagName(c.want) },
+            );
+            return error.TestUnexpectedResult;
+        }
+
         try dest.copySplices(gpa, try Col.fromValues(gpa, src_vals, default_max_segments), splices);
 
         const got = try dest.toSlice(gpa);
@@ -15944,6 +17347,44 @@ test "copy_ranges_heuristic" {
         }
         try validateRleColumn(Rle(u64), &dest);
     }
+}
+
+test "copy_ranges_rejects_overlap at the row level" {
+    // `copy_ranges_rejects_overlap` (`tests.rs:1479-1499`), the row-level
+    // half. Upstream drives the two overlapping splices through
+    // `copy_ranges` and its `should_panic(expected = "ascending")` catches
+    // the `assert!` inside `normalize_splices` (`column.rs:751-754`).
+    //
+    // **The port cannot reach that assert through `copySplices`**, which
+    // documents that its splices must already be normalized and never
+    // validates them, so the row-level refusal is only observable at the
+    // normalizer itself: `error.InvalidValue` for a `sp.range.start` behind
+    // the last range's end (`column.zig:5215`). `raw.zig`'s
+    // `copy_ranges_rejects_overlap` proves the byte-coordinate analogue
+    // leaves the destination untouched, which a refusal that *returns*
+    // cannot also say, so the two are not substitutes.
+    const gpa = testing.allocator;
+    const Col = Column(u64, Rle(u64));
+    const overlapping = [_]Col.Splice{
+        .{ .pos = 0, .delete = 0, .range = .{ .start = 10, .end = 30 } },
+        .{ .pos = 0, .delete = 0, .range = .{ .start = 20, .end = 40 } },
+    };
+    try testing.expectError(error.InvalidValue, Col.normalizeSplices(gpa, &overlapping, 100, 0));
+
+    // The same two splices with the second starting where the first ends,
+    // so the refusal above is the overlap and not the shape. Touching
+    // neighbours normalize into one splice.
+    const ascending = [_]Col.Splice{
+        .{ .pos = 0, .delete = 0, .range = .{ .start = 10, .end = 30 } },
+        .{ .pos = 0, .delete = 0, .range = .{ .start = 30, .end = 40 } },
+    };
+    const norm = try Col.normalizeSplices(gpa, &ascending, 100, 0);
+    defer gpa.free(norm);
+    try testing.expectEqual(@as(usize, 1), norm.len);
+    try testing.expectEqual(
+        Col.Splice{ .pos = 0, .delete = 0, .range = .{ .start = 10, .end = 40 } },
+        norm[0],
+    );
 }
 
 test "copy_ranges_into_empty_column" {

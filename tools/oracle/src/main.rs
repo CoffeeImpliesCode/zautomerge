@@ -79,6 +79,21 @@
 //!   replays it, so what it is for is the *reference's* answers on a path no other subcommand
 //!   reaches.
 //!
+//! * `save-interop` — the six scripted documents the port and the reference have to agree on,
+//!   written through manual transactions with named commit messages: the default compressed
+//!   `save()`, the heads, every change with its raw bytes, and the materialised document.
+//! * `verify-save-interop` — the other direction. It reads the **port's** saves back and checks
+//!   each one against a document this side builds independently, then prints this side's re-save
+//!   of what it loaded. See `save_interop.rs` for why that is not an echo.
+//! * `hexane-regression` — one upstream regression, recorded rather than
+//!   re-derived: upstream replays seed 799 out of its own `cross_slab_fuzz`
+//!   (`hexane/src/tests.rs:2711-2743`), and a port that draws from a different
+//!   generator cannot produce that op list at all. This runs it on the
+//!   reference's own `SmallRng`, against the reference's own `Column<u64>`,
+//!   and prints the initial rows, the slab budget and — after **every** splice
+//!   — the rows the reference holds and the canonical bytes `save()` gives for
+//!   them. See `hexane_regression.rs`.
+//!
 //! The hex is always lowercase and unprefixed.
 
 use std::error::Error;
@@ -96,6 +111,8 @@ use serde_json::{Map, Value as Json, json};
 mod codec;
 mod third;
 mod richfuzz;
+mod save_interop;
+mod hexane_regression;
 
 /// The actor which writes the scripted document and the left sync peer.
 const ACTOR_A: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
@@ -186,6 +203,20 @@ usage: zautomerge-oracle <command> [output-file]
              document, its heads, and the bytes it re-saves. It is how the reference is asked
              what it makes of save() bytes another implementation produced.
 
+  save-interop
+             build the six interoperability scenarios and print, for each, the default
+             compressed save() bytes, the heads, every change with its raw bytes and the
+             materialised document
+  verify-save-interop
+             read the port's own saves as {\"kind\":\"port-save\",\"scenario\":...,\"hex\":...} records
+             on stdin, check each against a document built here independently, and print this
+             side's re-save of what it loaded
+
+  hexane-regression
+             replay upstream's seed 799 out of `cross_slab_fuzz`
+             (hexane/src/tests.rs:2711-2743) on the reference's own `SmallRng`, and print the
+             reference column's rows and its canonical `save()` bytes after every splice
+
 The output file defaults to stdout, and `-` also means stdout. Output is
 newline delimited JSON.
 ";
@@ -242,6 +273,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         "isolateprobe" => isolate_probe(&mut out),
         "sample" => sample_command(&mut out),
         "loadhex" => loadhex_command(&mut out, &mut io::stdin().lock()),
+        "save-interop" => save_interop::save_interop_command(&mut out),
+        "verify-save-interop" => {
+            save_interop::verify_save_interop_command(&mut out, &mut io::stdin().lock())
+        }
+        "hexane-regression" => hexane_regression::hexane_regression_command(&mut out),
         other => Err(usage_error(format!("unknown command `{other}`"))),
     }
 }
@@ -307,8 +343,9 @@ fn doc_command(out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
     right.put(ROOT, "only_right", 42i64)?;
     right.commit_with(commit_options("right"));
 
-    // Pulling `right` in writes a merge change by `left` depending on both
-    // heads, so the saved document has two actors and concurrent history.
+    // Pulling `right` in **applies** its change and writes no change of `left`'s own
+    // (`merge` is `get_changes_added` plus `apply_changes`, `automerge.rs:1115-1131`), so the
+    // saved document has two actors and a forked history with both commits still heads.
     left.merge(&mut right)?;
 
     let bytes = left.save();
@@ -1599,6 +1636,9 @@ fn parallel_sync_record(round: usize, from: &str, to: &str, sent: Option<&[u8]>)
 }
 
 /// One materialised value, as JSON: `{"type": …, …}`.
+/// Generic over the document, so a [`automerge::Automerge`] driven by manual transactions renders
+/// through this same tree as an [`AutoCommit`]. Everything below is a [`ReadDoc`] read, and the
+/// two document types hold the same document.
 ///
 /// **The type is always spelled out**, so a consumer that renders `"13"` and one
 /// that renders `13` are distinguishable, and a counter that came out as an
@@ -1609,7 +1649,7 @@ fn parallel_sync_record(round: usize, from: &str, to: &str, sent: Option<&[u8]>)
 /// holds no floats and says so, and a counter is an `i64` in every reading of
 /// it, so the string is exactly as checkable and cannot be reformatted on the
 /// way through.
-fn render_value(doc: &AutoCommit, value: &Value<'_>, id: &ObjId) -> Result<Json, Box<dyn Error>> {
+fn render_value<R: ReadDoc>(doc: &R, value: &Value<'_>, id: &ObjId) -> Result<Json, Box<dyn Error>> {
     Ok(match value {
         Value::Object(ObjType::Text) => json!({
             "type": "text",
@@ -1629,7 +1669,7 @@ fn render_value(doc: &AutoCommit, value: &Value<'_>, id: &ObjId) -> Result<Json,
 /// observable of the document, so sorting makes the golden readable and the
 /// comparison meaningful; element order in a list *is* the document, so it is
 /// emitted in index order and the index is printed beside every element.
-fn children(doc: &AutoCommit, id: &ObjId) -> Result<Vec<Json>, Box<dyn Error>> {
+fn children<R: ReadDoc>(doc: &R, id: &ObjId) -> Result<Vec<Json>, Box<dyn Error>> {
     let mut out: Vec<Json> = Vec::new();
     if doc.object_type(id)? == ObjType::List {
         for index in 0..doc.length(id) {
@@ -1653,7 +1693,7 @@ fn children(doc: &AutoCommit, id: &ObjId) -> Result<Vec<Json>, Box<dyn Error>> {
 ///
 /// **The sorting is [`mark_nodes`]'**, and the reason for it is the one written
 /// there.
-fn render_marks(doc: &AutoCommit, id: &ObjId) -> Result<Vec<Json>, Box<dyn Error>> {
+fn render_marks<R: ReadDoc>(doc: &R, id: &ObjId) -> Result<Vec<Json>, Box<dyn Error>> {
     Ok(mark_nodes(&doc.marks(id)?))
 }
 

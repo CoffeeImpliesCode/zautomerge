@@ -3747,5 +3747,125 @@ test "fuzz_prefix_column_bool" {
                 }
             }
         }
+
+        // Preserve the per-trial save/load/save assertion too
+        // (`rust/hexane/src/tests.rs:4401-4405`).
+        const saved = try col.encode(gpa);
+        defer gpa.free(saved);
+        var loaded = try BoolPrefixColumn.load(gpa, saved);
+        defer loaded.deinit();
+        const resaved = try loaded.encode(gpa);
+        defer gpa.free(resaved);
+        try testing.expectEqualSlices(u8, saved, resaved);
+    }
+}
+
+test "next_run_never_yields_adjacent_equal_runs_at_default_config" {
+    // **`tests.rs:4959-4989`** — the second arm of the upstream case, and the
+    // one that needs a codec of *this* file's.
+    //
+    // Three hundred alternating booleans in a `PrefixColumn<bool>` are **three
+    // hundred runs** against the default 64-run budget, so the column splits on
+    // its own with no budget tuned to make it (`tests.rs:4963-4966`), and one
+    // value is then deleted at — or just before — the first slab boundary, so
+    // the edit leaves `false | false` across it (`tests.rs:4967-4970`).
+    //
+    // **The contract is that the run walk coalesces whatever the layout is**:
+    // no two consecutive runs may carry equal values, and the walk covers all
+    // 299 rows that are left. The first arm of the same upstream case — an
+    // `Option<String>` column over the same edit — is transcribed in
+    // `hexane/column.zig` under this same name, and **the boolean prefix column
+    // could not go with it**: its weight is the count of `true` rows in front of
+    // a slab (`columns.rs:28`, `prefix.rs:316-325`), which is the op set's
+    // `insert` column and is [`BoolPrefixCodec`] above.
+    //
+    // **The prefix sums are checked as well, because on this codec the run's
+    // value and the column's weight are two different questions.** A walk that
+    // coalesced across the seam and dropped the seam's weight would answer the
+    // values right and every `get_prefix` wrong, and a run walk on its own
+    // would not see it.
+    const gpa = testing.allocator;
+    var vals: [300]bool = undefined;
+    for (&vals, 0..) |*v, i| v.* = i % 2 == 0;
+
+    var col = try BoolPrefixColumn.init(gpa);
+    defer col.deinit();
+    // Upstream's `PrefixColumn::new()` then one `splice(0, 0, vals)`, so the
+    // three hundred values arrive as one edit rather than as three hundred.
+    try col.splice(gpa, 0, 0, &vals);
+    // The premise: without a cut there is no boundary to coalesce across, and
+    // the walk below would pass for the wrong reason (`tests.rs:4966`).
+    if (col.slabCount() <= 1) {
+        std.debug.print("{d} alternating booleans at the default budget are {d} slab(s)\n", .{ vals.len, col.slabCount() });
+        return error.TestUnexpectedResult;
+    }
+    const boundary = col.slabAt(0).?.len;
+
+    // Upstream deletes the `true` at the boundary if there is one and the row
+    // just before it otherwise (`tests.rs:4968-4970`) — either way the row that
+    // goes is a `true`, and the two `false`s it leaves are the run the walk has
+    // to coalesce.
+    const at_boundary = if ((try col.get(boundary))) |v| v else false;
+    const del = if (at_boundary) boundary else boundary - 1;
+    try col.splice(gpa, del, 1, &.{});
+    // The edit must not have folded the column back into one slab
+    // (`tests.rs:4971-4974`).
+    if (col.slabCount() <= 1) {
+        std.debug.print("the delete at {d} folded the column back into {d} slab(s)\n", .{ del, col.slabCount() });
+        return error.TestUnexpectedResult;
+    }
+
+    // The model, built from the drawn values rather than fed in: the same three
+    // hundred with row `del` gone.
+    var want: [299]bool = undefined;
+    var k: usize = 0;
+    for (vals, 0..) |v, i| {
+        if (i == del) continue;
+        want[k] = v;
+        k += 1;
+    }
+
+    // **The walk.** `PrefixIter.nextRun` is upstream's `next_run` over the
+    // prefix cursor (`prefix.rs:935-947`), and its run value is the
+    // `PrefixedValue` the string column's walk does not have.
+    var it = try col.prefixIter();
+    var prev: ?bool = null;
+    var total: usize = 0;
+    while (try it.nextRun()) |r| {
+        const v = r.value.value;
+        if (prev) |p| {
+            if (p == v) {
+                std.debug.print("rows {d} and {d} are one run of {}\n", .{ total, total + r.count, v });
+                return error.TestUnexpectedResult;
+            }
+        }
+        prev = v;
+        total += r.count;
+    }
+    try testing.expectEqual(@as(usize, 299), total);
+
+    // **The rows, against the model**, so the walk is not the only witness.
+    var trues: usize = 0;
+    for (want, 0..) |v, i| {
+        if (((try col.get(i)) orelse return error.TestUnexpectedResult) != v) {
+            std.debug.print("row {d} is not the model's\n", .{i});
+            return error.TestExpectedEqual;
+        }
+        trues += @intFromBool(v);
+    }
+    try testing.expect((try col.get(want.len)) == null);
+
+    // **And the prefix sums**, this codec's own question: the column's own
+    // total, and the same total arrived at through the cursor the run walk
+    // used — so a seam that coalesced and lost its weight cannot pass.
+    try testing.expectEqual(@as(i64, @intCast(trues)), try col.getPrefix(want.len));
+    try testing.expectEqual(@as(i64, @intCast(trues)), it.total());
+    if (try col.checkInvariants()) |v| {
+        if (v.detail_len != 0) {
+            std.debug.print("{s} ({s}, at {d})\n", .{ v.what, v.detail(), v.at });
+        } else {
+            std.debug.print("{s} (at {d})\n", .{ v.what, v.at });
+        }
+        return error.TestUnexpectedResult;
     }
 }

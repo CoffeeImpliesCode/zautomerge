@@ -1814,23 +1814,281 @@ test "cross_slab_replace" {
 }
 
 test "cross_slab_fuzz" {
-    // **`tests.rs:2745-2786`.** A thousand rounds, ten splices each, over an
-    // arena of at most twenty-four rows with a per-round budget.
+    // **`tests.rs:2745-2784`.** A thousand seeds and ten splices each, over a
+    // **run-length column** — upstream's `Column<u64>`, built by
+    // `from_values_with_max_segments` with a budget drawn per seed
+    // (`:2752-2753`), over `5..=24` values drawn from `0..=4` (`:2750-2751`).
+    //
+    // **The budget counts runs, and that is the whole reason the case exists.**
+    // Three to eight runs against a value stream that repeats one of five
+    // numbers cuts *inside* the run sequence, so the runs either side of a cut
+    // carry the same value, and every splice has to merge across that seam and
+    // re-encode the column canonically. A byte budget over four-byte rows cuts
+    // on a row boundary, has no run to merge and nothing to re-encode — so the
+    // arena sweep in this file is a **different case under its own name**
+    // ([`byte_arena_cross_slab_fuzz`] below), not a substitute for this one.
     //
     // **The seeds are pinned, not drawn.** Upstream uses `SmallRng`; the port
     // uses `std.Random.DefaultPrng` over the same `0..1000` seed range, which
-    // is the convention `hexane_test.zig:241-247` records — a proptest
-    // failure is reproducible from its regressions file and a random one is
-    // not. **The seed is not upstream's op list**, only upstream's seed
-    // *range*: `SmallRng` and `DefaultPrng` are different generators, so no
-    // seed here reproduces an upstream round.
-    const gpa = testing.allocator;
-    for (0..1000) |seed| try crossSlabRound(gpa, seed);
+    // is the convention `hexane_test.zig` records — a proptest failure is
+    // reproducible from its regressions file and a random one is not. **The
+    // seed is not upstream's op list**, only upstream's seed *range*, and the
+    // reason is not that these are two different generators: on a 64-bit
+    // target both are Xoshiro256++ (`rngs/small.rs:15`, `Random.zig:13`). They
+    // part **before** the first draw — rand_core expands a `u64` seed with
+    // PCG32 (`seedable_rng.rs:109-121`), Zig expands one with SplitMix64
+    // (`Random/Xoshiro256.zig:57-65`) — and each reduces a bounded draw its own
+    // way. What the port substitutes here is the *sample*, not the property:
+    // this sweep is upstream's op sequence over a thousand seeds of our own.
+    // Seed 799 itself is [`cross_slab_fuzz_regression`] below, recorded.
+    for (0..1000) |seed| try rleCrossSlabRound(testing.allocator, seed, "cross_slab_fuzz");
 }
 
-/// One round of [`cross_slab_fuzz`], compared against a `Vec` model **after
-/// every single operation** rather than only at the end.
-fn crossSlabRound(gpa: std.mem.Allocator, seed: u64) !void {
+test "cross_slab_fuzz_regression" {
+    // **`tests.rs:2711-2743`.** Upstream replays seed 799 out of the sweep
+    // above, so a divergence there is reproduced on its own. **This is that
+    // replay**, not a round of our own wearing upstream's number: the op list
+    // is read from `test/golden/hexane-regression.jsonl`, which `tools/oracle`'s
+    // `hexane-regression` subcommand records by drawing upstream's own
+    // requests against upstream's own `SmallRng` and asking the reference's
+    // `Column<u64>` what it made of each one. Nothing here is re-drawn locally
+    // and nothing is typed in by hand.
+    //
+    // **Why a recorded trace rather than a local draw.** On a 64-bit target
+    // `SmallRng` *is* `Xoshiro256PlusPlus` (rand `rngs/small.rs:15`) and
+    // `std.Random.DefaultPrng` *is* `Xoshiro256` (`Random.zig:13`) — the same
+    // generator, not two of them. They part **before** the first draw: rand_core
+    // expands a `u64` seed with PCG32 (`seedable_rng.rs:109-121`) where Zig
+    // expands one with SplitMix64 (`Random/Xoshiro256.zig:57-65`), and each then
+    // reduces a bounded draw its own way. So no seed in one reproduces an op
+    // list in the other, and seed 799 had to be *recorded* rather than
+    // re-drawn. See [`cross_slab_fuzz`] for what the sweep keeps instead.
+    //
+    // **What is checked, after every step and not once at the end**: the
+    // column's rows against a plain `Vec` model, the column's rows against the
+    // reference's own `expected`, and the column's canonical bytes against the
+    // reference's own `hex`. The last is the wire claim — the very
+    // `Column::save()` bytes the reference wrote for that state — and it is
+    // the one a model check cannot stand in for.
+    //
+    // **A missing vector fails this test.** There is no path through it that
+    // passes without replaying the trace.
+    const gpa = testing.allocator;
+    const trace = try readRegressionTrace(gpa);
+    defer gpa.free(trace);
+
+    var lines = std.mem.splitScalar(u8, trace, '\n');
+    const line = std.mem.trim(u8, lines.next() orelse "", " \t\r");
+    var parsed = try std.json.parseFromSlice(RegressionRecord, gpa, line, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    const rec = parsed.value;
+    try testing.expectEqualStrings("hexane-regression", rec.kind);
+    try testing.expectEqual(@as(u64, 799), rec.seed);
+
+    const colmod = @import("column.zig");
+    const RleU64 = colmod.Column(u64, colmod.Rle(u64));
+    var col = try RleU64.fromValues(gpa, rec.values, rec.budget);
+    defer col.deinit();
+    var mirror: std.ArrayList(u64) = .empty;
+    defer mirror.deinit(gpa);
+    try mirror.appendSlice(gpa, rec.values);
+
+    for (rec.steps, 0..) |step, k| {
+        try col.splice(gpa, step.index, step.delete, step.insert);
+        try mirror.replaceRange(gpa, step.index, step.delete, step.insert);
+
+        const got = try col.toSlice(gpa);
+        defer gpa.free(got);
+        if (!std.mem.eql(u64, got, step.expected)) {
+            std.debug.print("cross_slab_fuzz_regression step {d}: splice({d}, {d}, {d} value(s)) left the column holding {d} row(s); the reference recorded {d}\n", .{
+                k, step.index, step.delete, step.insert.len, got.len, step.expected.len,
+            });
+            return error.TestExpectedEqual;
+        }
+        try testing.expectEqualSlices(u64, mirror.items, got);
+
+        const encoded = try col.encode(gpa);
+        defer gpa.free(encoded);
+        const want = try hexDecode(gpa, step.hex);
+        defer gpa.free(want);
+        if (!std.mem.eql(u8, encoded, want)) {
+            std.debug.print("cross_slab_fuzz_regression step {d}: the column encodes to {d} byte(s), the reference recorded {d}\n", .{
+                k, encoded.len, want.len,
+            });
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+/// `test/golden/hexane-regression.jsonl`, relative to the process working
+/// directory. **Probed rather than assumed**, for the reason
+/// [`codec_golden`] gives its own corpus: a unit test binary inherits the
+/// directory it was started in, which is the package root under
+/// `zig build test` and this file's own directory under a direct `zig test`.
+const regression_paths = [_][]const u8{
+    "test/golden/hexane-regression.jsonl",
+    "../test/golden/hexane-regression.jsonl",
+    "../../test/golden/hexane-regression.jsonl",
+};
+
+/// The trace's own size limit. One record, at most ten steps, and a step's
+/// bytes are a slab's worth of runs — this is generous by orders of magnitude.
+/// A limit rather than a bare read is what keeps a wrong path from reading a
+/// directory tree.
+const regression_limit: usize = 1 << 20;
+
+/// One line of `test/golden/hexane-regression.jsonl`, as
+/// `tools/oracle`'s `hexane-regression` subcommand records it.
+///
+/// **Every field has a default and unknown fields are ignored**, because the
+/// oracle is free to grow a field: a new one must not stop this file from
+/// reading the vector, and a missing one must not stop a record from being
+/// read at all. The same rule `codec_golden.Record` is written under.
+const RegressionRecord = struct {
+    /// Always `hexane-regression`, and checked rather than assumed.
+    kind: []const u8 = "",
+    /// Always 799, and checked rather than assumed.
+    seed: u64 = 0,
+    /// The initial rows, the reference's own draws at `tests.rs:2717`.
+    values: []const u64 = &.{},
+    /// `max_segments` in **runs**, the reference's draw at `tests.rs:2718`.
+    budget: usize = 0,
+    /// One entry per splice that ran, in order. **The count is whatever
+    /// ran**: upstream's loop breaks on an empty column (`:2724-2726`), so a
+    /// short list is the record, not a truncated one.
+    steps: []const Step = &.{},
+
+    const Step = struct {
+        /// Where the splice landed. A step's own number is its position in
+        /// `steps`, not a field.
+        index: usize = 0,
+        /// Rows removed, counted from `index`.
+        delete: usize = 0,
+        /// Rows inserted at `index`, after the delete. Zero to three of them.
+        insert: []const u64 = &.{},
+        /// The reference column's rows **after** this step, `col.to_vec()`.
+        expected: []const u64 = &.{},
+        /// `col.save()` — the reference's canonical encoding of that same
+        /// state, the bytes both implementations must agree on.
+        hex: []const u8 = "",
+    };
+};
+
+/// Reads the recorded trace, or returns `error.GoldenVectorsNotFound` naming
+/// every path that was tried.
+fn readRegressionTrace(gpa: std.mem.Allocator) ![]u8 {
+    for (regression_paths) |path| {
+        return std.Io.Dir.cwd().readFileAlloc(testing.io, path, gpa, .limited(regression_limit)) catch |e| switch (e) {
+            error.FileNotFound, error.NotDir => continue,
+            else => return e,
+        };
+    }
+    std.debug.print("hexane-regression.jsonl not found; tried", .{});
+    for (regression_paths) |path| std.debug.print(" {s}", .{path});
+    std.debug.print("\n", .{});
+    return error.GoldenVectorsNotFound;
+}
+
+/// The bytes `hex` spells, for comparing against what the column encodes to.
+/// Lowercase and unprefixed, which is what the oracle writes
+/// (`tools/oracle/src/main.rs`, `hex_encode`), and this crate's own
+/// [`hexFrom`] decodes exactly that.
+fn hexDecode(gpa: std.mem.Allocator, hex: []const u8) ![]u8 {
+    return err.hexFrom(gpa, hex);
+}
+
+/// One round of [`cross_slab_fuzz`]: the run-budget column, compared against a
+/// `Vec` model **after every single operation** rather than only at the end,
+/// and against its own structural invariants.
+///
+/// **Every draw is upstream's draw, in upstream's order and over upstream's
+/// ranges** (`:2750-2753`): the row count first, then one value a row, then the
+/// budget — only the generator and the bounded reduction are ours, which is
+/// what [`cross_slab_fuzz`] says at length. `name` is the calling case's own
+/// name so a failure names the sweep it came from.
+fn rleCrossSlabRound(gpa: std.mem.Allocator, seed: u64, name: []const u8) !void {
+    const colmod = @import("column.zig");
+    const RleU64 = colmod.Column(u64, colmod.Rle(u64));
+    var prng: std.Random.DefaultPrng = .init(seed);
+    const random = prng.random();
+
+    const n = random.intRangeAtMost(usize, 0, 19) + 5;
+    var values: [24]u64 = undefined;
+    for (values[0..n]) |*v| v.* = random.intRangeAtMost(u64, 0, 4);
+    const budget = random.intRangeAtMost(usize, 0, 5) + 3;
+
+    var col = try RleU64.fromValues(gpa, values[0..n], budget);
+    defer col.deinit();
+    var mirror: std.ArrayList(u64) = .empty;
+    defer mirror.deinit(gpa);
+    try mirror.appendSlice(gpa, values[0..n]);
+
+    for (0..10) |op| {
+        const len = col.len();
+        if (len == 0) break;
+        const idx = random.intRangeAtMost(usize, 0, len - 1);
+        const del = random.intRangeAtMost(usize, 0, @min(len - idx, 5));
+        const ins_count = random.intRangeAtMost(usize, 0, 3);
+        var inserted: [3]u64 = undefined;
+        for (inserted[0..ins_count]) |*v| v.* = random.intRangeAtMost(u64, 0, 4);
+
+        try col.splice(gpa, idx, del, inserted[0..ins_count]);
+        try mirror.replaceRange(gpa, idx, del, inserted[0..ins_count]);
+
+        // Upstream's `assert_eq!(col.to_vec(), mirror)` (`:2770`), run after
+        // every operation rather than at the end of the round.
+        const got = try col.toSlice(gpa);
+        defer gpa.free(got);
+        if (got.len != mirror.items.len or !std.mem.eql(u64, got, mirror.items) or col.len() != mirror.items.len) {
+            std.debug.print("{s} seed {d} op {d}: budget {d}, the column holds {d}/{d} value(s), the model {d}\n", .{
+                name, seed, op, budget, got.len, col.len(), mirror.items.len,
+            });
+            return error.TestExpectedEqual;
+        }
+        // And the layout: a run merged across a cut that should not have been,
+        // or a slab left holding more runs than the budget, is the defect this
+        // sweep exists for and it does not change what the column answers with.
+        if (try col.checkInvariants()) |v| {
+            if (v.detail_len != 0) {
+                std.debug.print("{s} seed {d} op {d}: {s} ({s}, at {d})\n", .{ name, seed, op, v.what, v.detail(), v.at });
+            } else {
+                std.debug.print("{s} seed {d} op {d}: {s} (at {d})\n", .{ name, seed, op, v.what, v.at });
+            }
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "byte_arena_cross_slab_fuzz" {
+    // **A byte-budget sweep of the arena, which is a different case from
+    // upstream's and is named as one.** A `RawColumn` has no values, only
+    // bytes: the bytes spliced in are the bytes that come out
+    // (`raw.rs:3-7`), so its budget is a *byte* count and a cut lands on a
+    // **row boundary**. There is no run to merge across a seam and nothing to
+    // re-encode canonically, and upstream's `cross_slab_fuzz` is about
+    // precisely that — it is [`cross_slab_fuzz`] above, under upstream's name.
+    //
+    // **What this one covers that the run-budget column does not**: a splice
+    // in byte coordinates, over at most twenty-four four-byte rows at a budget
+    // of three to eight bytes, so every slab holds one or two rows and the
+    // Fenwick tree over the byte lengths is re-walked on nearly every
+    // operation. The op set's `value` column is this arena
+    // (`op_set2/columns.rs:31`), so the sweep is a consumer's obligation too.
+    //
+    // **The seeds are pinned** over the same `0..1000` range, for the reason
+    // `cross_slab_fuzz` gives.
+    for (0..1000) |seed| try arenaCrossSlabRound(testing.allocator, seed);
+}
+
+/// One round of [`byte_arena_cross_slab_fuzz`], compared against a `Vec` model
+/// **after every single operation** rather than only at the end.
+///
+/// **The coordinates are byte ones**, so the draws are the byte shapes the
+/// arena admits: a position in rows turned into a byte offset, a delete capped
+/// at five rows past it, and up to three four-byte words spliced in.
+fn arenaCrossSlabRound(gpa: std.mem.Allocator, seed: u64) !void {
     var prng: std.Random.DefaultPrng = .init(seed);
     const random = prng.random();
 
@@ -1862,27 +2120,13 @@ fn crossSlabRound(gpa: std.mem.Allocator, seed: u64) !void {
         try mirror.replaceRange(gpa, idx, del, inserted[0..ins_count]);
 
         if (col.len() != mirror.items.len * 4) {
-            std.debug.print("seed {d} op {d}: the arena holds {d} byte(s), the model {d} row(s)\n", .{
+            std.debug.print("byte_arena seed {d} op {d}: the arena holds {d} byte(s), the model {d} row(s)\n", .{
                 seed, op, col.len(), mirror.items.len,
             });
             return error.TestExpectedEqual;
         }
         try expectWords(&col, mirror.items);
     }
-}
-
-test "cross_slab_fuzz_regression" {
-    // **`tests.rs:2711-2743`.** Upstream replays seed 799 out of the sweep
-    // above, so a divergence there is reproduced on its own.
-    //
-    // **What the port can honestly say.** `SmallRng` and
-    // `std.Random.DefaultPrng` are different generators, so seed 799 here is
-    // **not** upstream's seed-799 op list and this is not a replay of it.
-    // What it is: the sweep's per-operation mirror check, pinned to one seed
-    // so a failure names a round rather than a range, and so a report that
-    // says "seed 799" is re-runnable from this line. Upstream's number is
-    // kept because it is the number upstream's failure reports carry.
-    try crossSlabRound(std.testing.allocator, 799);
 }
 
 test "copy_ranges_rejects_overlap" {
@@ -2129,11 +2373,13 @@ test "max_segments_zero_rejected" {
     //
     // **The bound differs and the port is the looser one here.** Upstream
     // requires `max_segments >= 2`; the arena refuses only zero
-    // (`raw.zig:174-175`), because a one-byte slab is a degenerate but
-    // well-formed layout. **So this covers the zero case and not the one
-    // case** — `max_segments_one_rejected` and
-    // `max_segments_one_rejected_at_load` are recorded as blocked on
-    // `column.zig`, where the `>= 2` assert lives.
+    // (`raw.zig:208`), because a one-byte slab is a degenerate but
+    // well-formed layout. **The two floors count different things** — this
+    // one is bytes per slab and upstream's is run segments — so refusing zero
+    // here is not a laxer statement about the same quantity. The refusals of a
+    // one-*segment* budget are `column.zig`'s, under their upstream names:
+    // `max_segments_one_rejected` and `max_segments_one_rejected_at_load`,
+    // over `initWithBudget` and `LoadOpts.withMaxSegments`.
     try testing.expectError(
         error.InvalidValue,
         RawColumn.withMaxSegments(std.testing.allocator, 0),
@@ -2181,36 +2427,63 @@ test "max_segments_two_full_cycle" {
 
 // Zig 0.16.0 / upstream / Rust / port
 //
-// * **The seven `cross_slab_*` cases are this file's cases wearing upstream's
-//   names.** Upstream builds a `Column<u64>` with a four-*segment* budget and
-//   splices across the seams; the drain-across-slabs, the seam choice
-//   (`pickSplit`, `raw.zig:730-737`) and the coalescing that follows are written
-//   once, here, from `raw.rs`, and `column.zig` drives the same shape over run
-//   sequences. **The rows here are 4-byte words, so the weights are bytes and
-//   the budget is a runtime argument** — a `Column<u64>` cut at four segments is
-//   still covered only by `column.zig`'s own transcription.
+// * **Six of the seven `cross_slab_*` cases are this file's cases wearing
+//   upstream's names; the seventh is upstream's own.** Upstream builds a
+//   `Column<u64>` with a small *segment* budget and splices across the seams;
+//   the drain-across-slabs, the seam choice (`pickSplit`, `raw.zig:730-737`)
+//   and the coalescing that follows are written once, here, from `raw.rs`, and
+//   they are the same code paths either kind of column walks. **The rows here
+//   are 4-byte words, so the weights are bytes and the budget is a runtime
+//   argument** — a `Column<u64>` cut at four segments is a *different* cut.
 //
-// * **`cross_slab_fuzz_regression` is not a replay of upstream's seed 799.**
-//   `SmallRng` and `std.Random.DefaultPrng` are different generators, so seed
-//   799 here is the port's own round. It is the sweep's per-operation mirror
-//   check pinned to one seed, so a failure names a round rather than a range.
+//   **`cross_slab_fuzz` and `cross_slab_fuzz_regression` are that exception,
+//   and they are not substitutes any more.** They build a real
+//   `Column(u64, Rle(u64))` at the run budget drawn per seed (`3..=8` runs,
+//   `tests.rs:2752`), because upstream's budget counts **runs**: three runs
+//   against a `0..=4` value stream cuts inside the run sequence, and the whole
+//   case is that the runs either side of a cut carry the same value and have to
+//   merge and re-encode canonically. A byte budget cuts on a row boundary and
+//   has neither. **The arena sweep is kept, under its own name**
+//   (`byte_arena_cross_slab_fuzz`), because a splice in byte coordinates at
+//   one or two rows a slab is this file's own obligation — it is the op set's
+//   `value` column (`op_set2/columns.rs:31`) — and `column.zig` cannot reach
+//   it.
 //
-// * **`max_segments_zero_rejected` covers the zero case and not the one case.**
-//   Upstream's assert is `max_segments >= 2` (`column.rs:1121-1126`); the arena
-//   refuses only zero (`raw.zig:174-175`), because a one-byte slab is degenerate
-//   but well formed. `max_segments_one_rejected` and
-//   `max_segments_one_rejected_at_load` are therefore blocked on `column.zig`,
-//   where the `>= 2` assert lives.
+// * **`cross_slab_fuzz_regression` is a replay, and the trace is recorded.**
+//   Its op list is `test/golden/hexane-regression.jsonl`, which `tools/oracle`'s
+//   `hexane-regression` subcommand draws from upstream's own `SmallRng` and
+//   records step by step — because the port cannot re-draw 799. `SmallRng` and
+//   `std.Random.DefaultPrng` are the **same** generator on a 64-bit target
+//   (Xoshiro256++, `rngs/small.rs:15` and `Random.zig:13`) and part at the
+//   **seed expansion** — PCG32 in `rand_core` (`seedable_rng.rs:109-121`) against
+//   SplitMix64 in Zig (`Random/Xoshiro256.zig:57-65`) — not at the algorithm.
+//   The 1000-seed sweep keeps its own pinned seeds; what it substitutes is the
+//   sample, not the property.
 //
-// * **`fuzz_slab_merge_invariant` is NOT ported here, and the arena is the wrong
-//   place for it.** Upstream asserts a *global* postcondition — no undersized
-//   slab anywhere has a neighbour pair that would still fit
+// * **`max_segments_zero_rejected` covers the zero case; the one case is
+//   `column.zig`'s.** Upstream's assert is `max_segments >= 2`
+//   (`column.rs:1121-1126`); the arena refuses only zero (`raw.zig:208`),
+//   because a one-byte slab is degenerate but well formed. **A byte budget and
+//   a run-segment budget are different quantities**, so the looser floor here is
+//   not a laxer version of the same rule. `max_segments_one_rejected` and
+//   `max_segments_one_rejected_at_load` are declared there, over
+//   `initWithBudget` and `LoadOpts.withMaxSegments`.
+//
+// * **`fuzz_slab_merge_invariant` is not declared in this file, and the arena is
+//   the wrong place for it.** Upstream asserts a *global* postcondition — no
+//   undersized slab anywhere has a neighbour pair that would still fit
 //   (`tests.rs:4022-4054`). `canMerge` states the same rule, but this file
 //   applies it **only to the boundaries around a splice**
-//   (`stageSpliceSlice`), deliberately never globally, so a port would have
-//   to weaken the case into a per-boundary predicate. **A weaker assertion
-//   wearing the same name would inflate the coverage count and prove less** — it
-//   is recorded as blocked instead.
+//   (`stageSpliceSlice`), deliberately never globally, so a port here would
+//   have to weaken the case into a per-boundary predicate, and a weaker
+//   assertion wearing the same name would prove less. The postcondition is
+//   asserted where the quantity in it exists: `column.zig`'s
+//   `mergeableNeighbours` is upstream's predicate — `min_seg = budget / 4`, and
+//   `prev + cur <= budget` — walked over every adjacent pair
+//   (`column.zig:6302-6312`), and `expectSound` runs it after every splice in
+//   the boolean, integer, nullable, delta and prefix codecs. **What differs is
+//   the sweep behind it**, which is short of upstream's 200 trials of 500
+//   operations, and a reported `error` stands in for its `panic!`.
 //
 // * **`try_merge_range_*` were recorded here as blocked, and were ported in
 //   `column.zig` on 2026-10-02.** The original note was right about this file
@@ -2229,174 +2502,21 @@ test "max_segments_two_full_cycle" {
 //   (`raw.zig:788`, `:396-397`), and the test additionally holds that the
 //   destination is untouched — the half a `should_panic` cannot check.
 //
-// ## The upstream `hexane/src/tests.rs` cases with no `^test "NAME"` here
+// ## Where per-case occurrence status lives
 //
-// **The instrument, named first, because a coverage number without one is not
-// a measurement.** Upstream's denominator: every `fn NAME` in
-// `rust/hexane/src/tests.rs` carrying `#[test]` within the eight preceding
-// lines — **286 functions, 284 distinct names**, because `splice_and_nullable`
-// and `u64_column_roundtrip_and_wire_divergence` are each declared twice, once
-// per codec parameter. A name counts as present when some `test "NAME"`
-// declaration anywhere in `src/` spells it.
+// **This file keeps no tally of upstream cases, and that is deliberate.** It
+// did, and the number went stale every time another file gained a case: a
+// name-presence list is a second instrument, it drifts, and the port renames
+// ported cases into English, so it under-counts what is actually asserted.
+// Per-case status, module-qualified ids, exclusion kinds, and the mapping from
+// an upstream case to a Zig declaration are owned by
+// `docs/hexane-cases.json`, pinned to the reference commit; the denominator is
+// published once, in `docs/STATUS.md`.
 //
-// **This record was 103 on 2026-10-01, 79 on the first day of this pass, and
-// is 28 now.** A figure carried forward is a measurement of a tree that no
-// longer exists, so the number and the list below are one edit.
-//
-// **What the 79 became.** Every group that said *the thing is missing* now
-// says *the thing is here*, because the thing was missing from the
-// implementation rather than from the tests:
-//
-// * **A (19) — closed.** `rle.Rle`/`rle.RleOption` take `[]const u8` and
-//   `rle.RleUtf8` validates it, and `column.zig`'s wire layer routes every
-//   payload read, write, comparison and run merge through them
-//   (`column.zig`'s `payloadRead`, `appendValue`, `eqlWire`,
-//   `WireRle.sameValue`, `RunWriter`). `Column([]const u8, RleUtf8(false))`,
-//   `Column(?[]const u8, RleUtf8(true))` and their byte-codec counterparts are
-//   real columns, and the 19 cases are declared under their upstream names
-//   across `column.zig` (`string_basic` … `scope_to_value_strings`; the five
-//   codec-level ones — `golden_format_rle_str`, `golden_format_rle_opt_str`,
-//   `golden_format_rle_bytes`, `load_invalid_utf8_in_string_is_error`,
-//   `load_invalid_utf8_in_nullable_string_is_error` — are declared in
-//   `rle.zig`, over the same codec the columns use).
-// * **B (15) — 9 closed, 6 remain** (the second integer codec; below).
-// * **C (3) — closed.** `Column.LoadIter` is a real streaming load:
-//   `tryNextRun` validates the input run by run as it is pulled, cuts a slab
-//   every half-budget runs and measures that slab's weight as it lands, and
-//   `finalize` drains and validates whatever the consumer did not pull. The
-//   three cases are `load_iter_partial_consume_then_error`,
-//   `load_accumulates_prefix_weights_partial_consume` and
-//   `load_roundtrip_proptest_streaming`.
-// * **E (2) — closed.** `Column.initWithBudget`, `Column.loadWithBudget` and
-//   `LoadOpts.withMaxSegments` make the run budget a runtime value, and a
-//   budget below two is `error.InvalidValue` — the refusal, where upstream
-//   asserts. `max_segments_one_rejected`,
-//   `max_segments_one_rejected_at_load`.
-// * **F (3) — closed.** `column.Ranges` is the range adapter
-//   (`shift.rs:102-126`), with `Iterator.ranges`, `Runs.ranges` and
-//   `PrefixIter.ranges`; `Column.spliceRuns` is the run-aware splice
-//   (`column.rs:1563-1569`). `ranges_chains_windows`,
-//   `ranges_touching_equals_union`, `prefix_iter_runs_splices`.
-// * **G (7) — 6 closed, 1 remains** (`copy_ranges_bench`, `#[ignore]`d
-//   upstream). `Column.copyStrategy`, `copyRangesWith`, `copySplices`,
-//   `copySplicesWith`, `retainRanges`, `swapContents`, `normalizeRanges` and
-//   `normalizeSplices` are all real, and the six cases are
-//   `copy_ranges_heuristic`, `copy_ranges_into_empty_column`,
-//   `copy_ranges_prefix_column`, `copy_ranges_strategies_agree`,
-//   `copy_ranges_strategies_agree_nullable`,
-//   `copy_ranges_multi_point_strategies_agree`.
-// * **I (1) — closed.** `Column.IterState` and `Iterator.suspend` /
-//   `tryResume` exist, and a splice bumps the column's mutation counter.
-//   `splice_invalidates_a_suspended_iter`.
-// * **J (2) — closed**, both arms, now that a string column and a boolean
-//   column are real value kinds: `merge_slab_string_literal_boundary` and
-//   `splice_runs_str_and_bool`. The integer versions they were folded into
-//   are still there.
-// * **L (4) — restored under their upstream names.** The reason they were
-//   renamed is gone: the string and prefix columns they say exist now do.
-//   `next_run_merges_across_slabs_strings_and_prefix`,
-//   `next_run_never_yields_adjacent_equal_runs_at_default_config`,
-//   `string_splice_at_literal_repeat_boundary`,
-//   `string_splice_variable_length_values`. The behaviour-named blocks that
-//   carried them (`next_run_merges_across_slabs`,
-//   `prefix_next_run_merges_across_slabs`, `splice_over_mixed_width_payloads`)
-//   are **kept** — they pin the integer column, which the restored names do
-//   not.
-// * **K — one of its 19 is now closed.** `fuzz_prefix_column_bool` needs a
-//   `Column(bool, Prefix(…))`, which the column layer's integer-valued
-//   codecs cannot instantiate; it is declared against the op set's real
-//   boolean prefix codec in `opset/columns.zig`, which is where that codec
-//   lives. The other 18 are below.
-//
-// **What this list is and is not.** It is a list of upstream *names* with no
-// declaration. A name whose behaviour a ported test already carries is not a
-// gap, and those are named below rather than duplicated: a second copy
-// wearing upstream's name would inflate the count and prove the same thing.
-//
-// * **B — 6 cases. A second integer codec.** The port has exactly one
-//   integer packing, LEB128, and no codec parameter to add a second. Every
-//   one of these six is an `assert_ne!` between two codecs' bytes, or a
-//   case written directly against the other codec's primitives:
-//   `bijou64` is dead feature code (`AGENTS.md:50-52`) and the other operand
-//   is upstream's own test-local `BeLen` (`tests.rs:5420-5431`), neither of
-//   which is a surface this port has or should have. `save-load-save
-//   identity` — the portable half of the same family — is now declared under
-//   its upstream name (`save_load_save_is_identity`), and
-//   `truncated_input_errors`'s portable half, "every strict prefix of a
-//   multi-byte encoding is a decode error", is `src/leb128.zig:734`.
-//   ```
-//   codec_roundtrip_boundaries module_aliases_pick_the_codec
-//   tier8_overflow_rejected truncated_input_errors
-//   u64_column_roundtrip_and_wire_divergence wire_format_matches_spec
-//   ```
-//
-// * **D — 1 case. A `#[derive(Copy)]`, not a behaviour.** `load_with_opts_is_copy`
-//   asserts a derive on `LoadOpts` (`tests.rs`), which in Zig is
-//   unconditional struct assignment; there is nothing for a test to observe.
-//   ```
-//   load_with_opts_is_copy
-//   ```
-//
-// * **G — 1 case. A benchmark.** `copy_ranges_bench` is `#[ignore]`d
-//   upstream and times two strategies against each other rather than
-//   asserting anything. **Its arguments are asserted** — by
-//   `copy_ranges_strategies_agree`, which runs both strategies over the same
-//   shapes and holds them to the same bytes — and the decision the benchmark
-//   was written to tune is pinned by `copy_ranges_heuristic`.
-//   ```
-//   copy_ranges_bench
-//   ```
-//
-// * **H — 3 cases. `deep_fuzz`, which is dead feature code**
-//   (`AGENTS.md:50-52`), and each of the three is
-//   `#[cfg_attr(not(feature = "deep_fuzz"), ignore)]` upstream, so they do
-//   not run in the reference either.
-//   ```
-//   fuzz_delta_column fuzz_delta_column_nullable fuzz_prefix_column
-//   ```
-//
-// * **K — 17 cases a named port test already carries.** These are named
-//   rather than duplicated.
-//   ```
-//   delta_scope_to_value_basic empty_born_iter_extends_with_next
-//   empty_born_iter_extends_with_shift empty_born_iter_multi_slab_nth
-//   fuzz_bool_splice_exhaustive fuzz_column_save_load_after_mutations
-//   fuzz_option_u64_splice_exhaustive fuzz_scope_and_seek_to_value
-//   fuzz_scope_to_value_nullable fuzz_sequential_splice_uint
-//   fuzz_slab_merge_invariant fuzz_splice_ops nth_from_iter_range
-//   remap_multi_slab remap_u64_basic remove_n_out_of_bounds_panics
-//   seek_to_value_missing
-//   ```
-//   Where each is carried: `delta_scope_to_value_basic` by
-//   `delta_scope_to_value_matches_plain_column`; the three
-//   `empty_born_iter_*` by `an empty, an inverted and a past-the-end range
-//   are all a position` (`column.zig`, which holds the empty-born `next`,
-//   `shift` and far-`nth` arms); the three random-splice cases
-//   (`fuzz_bool_splice_exhaustive`, `fuzz_option_u64_splice_exhaustive`,
-//   `fuzz_splice_ops`, `fuzz_sequential_splice_uint`) by `random splices
-//   agree with a plain array` and `splice_matches_a_model`, the latter over
-//   four fixed seeds;
-//   `fuzz_column_save_load_after_mutations` by `expectRoundTrip` after 300
-//   splices; `fuzz_scope_and_seek_to_value` and
-//   `fuzz_scope_to_value_nullable` by `scope_to_value_fuzz_vs_linear`,
-//   `scope_to_value_multi_slab_span`, `scope_to_value_fuzz_multi_slab` and
-//   the `seek_to_value_*` family;
-//   `fuzz_slab_merge_invariant` by `expectSound`, which runs
-//   `mergeableNeighbours` — upstream's own predicate, `min_seg =
-//   DEFAULT_MAX_SEG / 4` and `sa + sb <= DEFAULT_MAX_SEG`
-//   (`tests.rs:4022-4054`) — after **every** splice and splice in the
-//   boolean, integer, nullable, delta, prefix and byte-payload codecs;
-//   `nth_from_iter_range` by the window-relative arm of `expectNth` and the
-//   `nth_across_runs` / `nth_across_slabs` family;
-//   `remap_multi_slab` and `remap_u64_basic` by `a remap of a many-slab
-//   column keeps every row` and `remap_runs_preserved`;
-//   `remove_n_out_of_bounds_panics` by `an out of bounds splice is a
-//   refusal, not a trap` and `exerciseBounds`, which hold that `removeN`
-//   past the end is `error.InvalidValue` and that the column is unchanged —
-//   **stronger** than a panic that never returns; `seek_to_value_missing` by
-//   `seek_to_value_basic`'s absent-target arm and `seek_to_value_with_range`.
-//
-// 28 in total: six that need a second integer codec, one that is a Rust
-// derive, one that is an ignored benchmark, three that are dead gated
-// feature code, and seventeen whose behaviour a named port test already
-// carries.
+// What stays here is the half a tally cannot carry: **where a blocked case
+// would be unblocked**, and why this file is the wrong home for it. Three
+// facts do that work, and none of them is a name — the arena's budget is bytes
+// per slab where `column.zig`'s is run segments, `canMerge` is a predicate to
+// ask at a splice boundary rather than a postcondition to assert globally, and
+// a codec file has no `Column` to hand a load option to. The bullets above
+// name each remaining case and the surface that owns it.

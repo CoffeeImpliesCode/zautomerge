@@ -19,4 +19,16 @@ automerge = { path = "vendor/automerge" }
 # `hexane`, so this costs no new compilation, and it is a path dependency on
 # the same read-only checkout `vendor/automerge` resolves to.
 hexane = { path = "vendor/hexane" }
+# `rand`, pinned with `=` to the one version this lock already resolves, for
+# `hexane-regression`: upstream's seed-799 regression draws its op list from
+# `SmallRng` (`hexane/src/tests.rs:2711-2743`), and that op list is only
+# upstream's if it comes from the same generator over the same stream, so a
+# caret here would be a range the golden vector silently depends on. `hexane`'s
+# own dev-dependency is `rand = "^0.10"`, and the lock already carries 0.10.3
+# for `automerge` and `hexane`, so naming it here costs no new package, no
+# recompiled crate and no feature the lock did not already resolve. There is no
+# `small_rng` feature to ask for: 0.10.3 exports `SmallRng` unconditionally
+# (`rngs/mod.rs:106`), and the default features are exactly what upstream's own
+# test binary was compiled with, so defaults are what is asked for.
+rand = "=0.10.3"
 serde_json = "1"

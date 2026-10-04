@@ -100,7 +100,18 @@ const std = @import("std");
 const err = @import("../error.zig");
 const leb128 = @import("../leb128.zig");
 
+const rle = @import("rle.zig");
 const ParseError = err.ParseError;
+
+/// The packing a codec's wire uses, taken from the codec itself so the
+/// literal-header rewrite and the two header reads beside it cannot disagree
+/// with it — and LEB128 for a codec that predates the parameter and publishes
+/// no `Pack`, which is what `opset/columns.zig`'s two hand-written codecs do.
+/// Those are the default wire by construction, so the fallback is a fact about
+/// them and not a guess.
+fn packOf(comptime E: type) type {
+    return if (@hasDecl(E, "Pack")) E.Pack else rle.Leb128;
+}
 
 /// The default number of runs one slab may hold (`column.rs:21`).
 ///
@@ -693,25 +704,31 @@ pub fn splice(
 /// a `total` of zero is upstream's answer for a run with no values left,
 /// and the header goes while the bytes behind it stay.
 ///
-/// The run header is a signed LEB128 in every codec that has one, so this
-/// does not go through the codec: the boolean codec is the one without,
-/// and it has no literal run to call it on (`litRunHeaders`).
+/// The header is written in the codec's own packing, which is what this
+/// function's `P` names: upstream puts it on the `Codec` trait
+/// (`codec.rs:207-219`) for exactly the reason a caller here cannot hard-code
+/// it — a literal run's header is the one header whose *width* the merge seam
+/// has to know in advance, and on any packing but the default the width is not
+/// the one LEB128 would have chosen. Every caller inside this module has the
+/// codec in hand and passes `E.Pack`; `column.zig`'s encode seam does the same.
+/// The boolean codec has no literal run to call it on at all (`litRunHeaders`).
 pub fn rewrite_lit_header(
+    comptime P: type,
     gpa: std.mem.Allocator,
     buf: *std.ArrayList(u8),
     header_pos: usize,
     total: usize,
 ) ParseError!i64 {
     if (header_pos > buf.items.len) return error.InvalidValue;
-    const old = try leb128.readSigned(buf.items[header_pos..]);
+    const old = try P.readSigned(buf.items[header_pos..]);
     if (old.len > buf.items.len - header_pos) return error.InvalidValue;
     if (total > std.math.maxInt(i64)) return error.TooLarge;
     const before: usize = buf.items.len;
     if (total == 0) {
         try buf.replaceRange(gpa, header_pos, old.len, &.{});
     } else {
-        var hdr: [leb128.max_signed_size]u8 = undefined;
-        const n = leb128.writeSigned(&hdr, -@as(i64, @intCast(total)));
+        var hdr: [P.max_signed_size]u8 = undefined;
+        const n = P.writeSigned(&hdr, -@as(i64, @intCast(total)));
         try buf.replaceRange(gpa, header_pos, old.len, hdr[0..n]);
     }
     // The two lengths differ by at most the two header widths, so the
@@ -757,14 +774,20 @@ fn litSeam(
     const n = a_last.itemCount();
     const m = b_first.itemCount();
     const meet = try E.lastValueOfRun(a.data, a_last);
+
+    // **The packing, taken once.** Every header width below is this seam's
+    // own `P`, so the header it measures and the header it rewrites are the
+    // same width by construction rather than by two independent lookups that
+    // have to agree.
+    const P = packOf(E);
     if (!E.sameValue(meet, b_first.first_value)) {
         // One run: `a`'s header, then every value of both runs.
         const pos = out.items.len;
         try out.appendSlice(gpa, a.data[a_last.byte_start..a_last.byte_end]);
-        const hdr = try leb128.readSigned(b.data[b_first.byte_start..]);
+        const hdr = try P.readSigned(b.data[b_first.byte_start..]);
         if (hdr.len > b_first.byte_end - b_first.byte_start) return error.InvalidValue;
         try out.appendSlice(gpa, b.data[b_first.byte_start + hdr.len .. b_first.byte_end]);
-        _ = try rewrite_lit_header(gpa, out, pos, n + m);
+        _ = try rewrite_lit_header(P, gpa, out, pos, n + m);
         return;
     }
 
@@ -779,7 +802,7 @@ fn litSeam(
         if (last >= a_last.byte_end - a_last.byte_start) return error.InvalidValue;
         const pos = out.items.len;
         try out.appendSlice(gpa, a.data[a_last.byte_start .. a_last.byte_end - last]);
-        _ = try rewrite_lit_header(gpa, out, pos, n - 1);
+        _ = try rewrite_lit_header(P, gpa, out, pos, n - 1);
     }
     // The parity of the run the pair lands on. Only the boolean codec reads
     // it, and the boolean codec has no header to rewrite, so it never
@@ -797,7 +820,7 @@ fn litSeam(
         // `rewrite_lit_header` over what is left (`rle/splice.rs:1104-1107`);
         // the width of the value that goes is what `litHead` records, the
         // mirror of the `litTail` the `a` side reads.
-        const hdr = try leb128.readSigned(b.data[b_first.byte_start..]);
+        const hdr = try P.readSigned(b.data[b_first.byte_start..]);
         const head: usize = try E.litHead(b.data, b_first);
         const body = std.math.add(usize, b_first.byte_start + hdr.len, head) catch
             return error.TooLarge;
@@ -806,7 +829,7 @@ fn litSeam(
         // rewrite in place; the values behind it are appended after.
         const pos = out.items.len;
         try out.appendSlice(gpa, b.data[b_first.byte_start .. b_first.byte_start + hdr.len]);
-        _ = try rewrite_lit_header(gpa, out, pos, m - 1);
+        _ = try rewrite_lit_header(P, gpa, out, pos, m - 1);
         try out.appendSlice(gpa, b.data[body..b_first.byte_end]);
     }
 }
@@ -1407,7 +1430,7 @@ test "rewrite_lit_header rewrites a count header in place" {
     // why every upstream call site pairs it with a splice
     // (`rle/splice.rs:1104-1107`). So the payload comes back whole and only
     // the header shrank.
-    try testing.expectEqual(@as(i64, -1), try rewrite_lit_header(gpa, &buf, 0, 64));
+    try testing.expectEqual(@as(i64, -1), try rewrite_lit_header(rle.Leb128, gpa, &buf, 0, 64));
     const narrow = try leb128.readSigned(buf.items);
     try testing.expectEqual(@as(i64, -64), narrow.value);
     try testing.expectEqual(@as(usize, 1), narrow.len);
@@ -1415,11 +1438,11 @@ test "rewrite_lit_header rewrites a count header in place" {
 
     // One value more is a wider header, the other way round, and the same
     // bytes come back.
-    try testing.expectEqual(@as(i64, 1), try rewrite_lit_header(gpa, &buf, 0, 65));
+    try testing.expectEqual(@as(i64, 1), try rewrite_lit_header(rle.Leb128, gpa, &buf, 0, 65));
     try testing.expectEqualSlices(u8, bytes, buf.items);
 
     // A run with no values left loses its header and keeps its bytes.
-    try testing.expectEqual(@as(i64, -2), try rewrite_lit_header(gpa, &buf, 0, 0));
+    try testing.expectEqual(@as(i64, -2), try rewrite_lit_header(rle.Leb128, gpa, &buf, 0, 0));
     try testing.expectEqualSlices(u8, payload, buf.items);
 }
 
@@ -1930,28 +1953,6 @@ test "split_repeat2_adjacent_literal_regression" {
     }
 }
 
-test "splice_runs_from_another_columns_iter" {
-    // **`tests.rs:1148-1157`.** Items `1..5` of `[7,7,7,8,9,9]` spliced into
-    // `[1,2,3]` at 1.
-    //
-    // **`splice_runs` is `splice_inner` over `(value, count)` pairs**
-    // (`column.rs:1563`), so a run splice is a value splice at the slab level
-    // and this file's `splice` *is* the operation — there is no second
-    // implementation to compare against. The boundary the case is really
-    // about is the clip: the window opens one item into a three-item repeat,
-    // so it splices `7 × 2` and not `7 × 3`.
-    const colmod = @import("column.zig");
-    const E = colmod.Rle(u64);
-    const gpa = testing.allocator;
-    var dst = try slabOf(E, gpa, &.{ 1, 2, 3 });
-    defer dst.deinit(gpa);
-
-    const window = [_]u64{ 7, 7, 8, 9 };
-    try splice(gpa, E, &dst, 1, 0, &window, null);
-    try expectSlabSound(E, &dst);
-    try expectValues(E, &dst, &.{ 1, 7, 7, 8, 9, 2, 3 });
-}
-
 test "splice_runs_matches_per_item_splice" {
     // **`tests.rs:1159-1181`.** For four `(at, del)` pairs, splicing a window
     // in one call holds the same values as splicing them one at a time.
@@ -1997,47 +1998,6 @@ test "splice_runs_matches_per_item_splice" {
         defer gpa.free(incremental);
         try expectValues(E, &bulk, incremental);
     }
-}
-
-test "splice_runs_with_ranges" {
-    // **`tests.rs:1257-1271`.** Three disjoint windows of a sixty-value
-    // column spliced between `100` and `200`.
-    //
-    // **`Shiftable::ranges` has no counterpart in the port** — no file under
-    // `src/hexane` defines a `ranges` combinator, and `column.zig` implements
-    // only the four `Shiftable` defaults. So the windows are concatenated
-    // here, which is what the adapter yields: three stretches of one sequence,
-    // in order, with nothing between them. **What is therefore not covered is
-    // the adapter's own chaining** — how it carries the remainder of one
-    // window past the next.
-    const colmod = @import("column.zig");
-    const E = colmod.Rle(u64);
-    const gpa = testing.allocator;
-
-    var values: [60]u64 = undefined;
-    for (&values, 0..) |*v, i| v.* = @intCast(i / 7);
-    var src = try slabOf(E, gpa, &values);
-    defer src.deinit(gpa);
-    const rows = try E.wireRange(gpa, src.data, 0, src.len);
-    defer gpa.free(rows);
-
-    var window: std.ArrayList(u64) = .empty;
-    defer window.deinit(gpa);
-    try window.appendSlice(gpa, rows[2..5]);
-    try window.appendSlice(gpa, rows[10..15]);
-    try window.appendSlice(gpa, rows[31..50]);
-
-    var dst = try slabOf(E, gpa, &.{ 100, 200 });
-    defer dst.deinit(gpa);
-    try splice(gpa, E, &dst, 1, 0, window.items, null);
-    try expectSlabSound(E, &dst);
-
-    var want: std.ArrayList(u64) = .empty;
-    defer want.deinit(gpa);
-    try want.append(gpa, 100);
-    try want.appendSlice(gpa, window.items);
-    try want.append(gpa, 200);
-    try expectValues(E, &dst, want.items);
 }
 
 test "bool_into_slab_tail_multibyte_leb" {
@@ -2707,11 +2667,21 @@ test "a slab answers for the RLE and boolean families and for nothing else" {
 //   item per step runs off the end at `(at, del) = (4, 0)`, where there is
 //   nothing to delete.
 //
-// * **`splice_runs_with_ranges` concatenates its windows by hand.**
-//   `Shiftable::ranges` (`shift.rs:87`, `:107`) has no counterpart in this
-//   crate — no file under `src/hexane` defines a `ranges` combinator — so the
-//   three windows are spelled out in order, which is what the adapter yields.
-//   **The adapter's own chaining is not covered.**
+// * **`splice_runs_with_ranges` and `splice_runs_from_another_columns_iter`
+//   were deleted from this file, not weakened in it.** Both asserted the
+//   *answer* rather than the derivation: one concatenated three windows by
+//   hand, the other wrote out the four values a clipped window holds. **Both
+//   names are held elsewhere and by the adapter that has to carry the case** —
+//   `hexane_test.zig` builds a real `Column`, walks `iter().runs().ranges([…])`
+//   and `iterRange(1..5).runs()`, and splices what those cursors collected into
+//   `Column.spliceRuns`. `Shiftable::ranges` (`shift.rs:87`, `:107`) is
+//   `column.zig`'s `Ranges(I)`, over any cursor with `pos`, `setMax` and
+//   `shift` (`column.zig:7289`), and it was driven at the time those cases
+//   were here — the claim that no file under `src/hexane` defines a `ranges`
+//   combinator was false. **A slab holds no `iterRange`, no `runs()` and no
+//   `ranges`**, so a case about an adapter chain is a case about `Column`, and
+//   keeping a by-hand version here would have been a second, weaker
+//   declaration of the same upstream name.
 //
 // * **`bool_into_slab_tail_multibyte_leb` is a two-derivation case and both
 //   derivations are this file's.** Upstream contrasts
@@ -2722,17 +2692,18 @@ test "a slab answers for the RLE and boolean families and for nothing else" {
 //   later splice cut in the wrong place, which is why the case compares them
 //   and not just the values.
 //
-// * **`merge_slab_string_literal_boundary` is not ported, and it is blocked on
-//   a missing codec rather than on `column.zig`.** Its two slabs are
-//   `["x","y","hello"]` and `["hello","hello","world"]`, which need upstream's
-//   `ColumnValueRef for String` — a length-prefixed, utf8-checked payload
-//   (`lib.rs:694-731`). `Rle`/`RleOption` `@compileError` on any non-integer
-//   value type (`rle.zig:636-652`), so **no `E` in the tree satisfies
-//   `merge`'s contract for strings.** The other three `merge_slab_*` cases port
-//   because their values are integers.
+// * **`merge_slab_string_literal_boundary` is transcribed in `column.zig`, and
+//   the codec it wanted exists.** Its two slabs are `["x","y","hello"]` and
+//   `["hello","hello","world"]`, and the payload they need is the
+//   length-prefixed byte string upstream's `ColumnValueRef for String` packs
+//   (`lib.rs:694-731`): `RleUtf8` over `[]const u8`, which adds the UTF-8 check
+//   and is an accepted payload for `checkPayload` (`rle.zig:127-131`). **It is
+//   instantiated as `E` for `merge` there**, over the `slab.merge` this file
+//   exports, so the literal-against-literal seam runs for a byte payload and not
+//   only for an integer. The other three `merge_slab_*` cases stay here because
+//   their values are integers, and this file is where the merge is.
 //
-// * **The full blocked ledger, with the reason for each of the 103 upstream
-//   cases not ported in this crate's hexane files, is in
-//   [`raw.zig`](raw.zig)'s `Zig 0.16.0 / upstream / Rust / port` block.** It is
-//   there rather than duplicated here because most of those cases are about
-//   the arena, and a ledger that appears twice is a ledger that can drift.
+// * **Per-case occurrence status, module-qualified ids and exclusion kinds are
+//   owned by `docs/hexane-cases.json`**, and not by a second list here. A
+//   ledger that appears in two files is a ledger that can drift, and the one
+//   this block replaced counted names rather than declarations.

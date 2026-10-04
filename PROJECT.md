@@ -188,10 +188,10 @@ The full port of the `automerge` and `hexane` crates, phase by phase, is in
 | --- | --- | --- |
 | P0 | scaffold, fixtures, Rust oracle for differential testing | `zig build test`, `zig build conformance` |
 | P1 | types, values, errors, clocks, LEB128, SHA-256, DEFLATE | property tests against the oracle |
-| P2 | `hexane`: slabs, columns, RLE, bool, delta, prefix, the btree, the edit cursor | codec round trips, btree invariants |
+| P2 | `hexane`: slabs, columns, RLE, bool, delta, prefix, the btree, the edit cursor | codec round trips, btree invariants, and 272 covered upstream occurrences with 14 reasoned exclusions in [docs/hexane-cases.json](docs/hexane-cases.json) |
 | P3 | columnar encoding, chunk framing, document and change chunks | all 17 corpus fixtures load with the recorded outcome, all 8 fuzz crashers return `ParseError` |
 | P4 | change graph, change encoding | change hashes byte-identical to the reference |
-| P5 | the op set, merge, batch apply | `tests/test.rs` **140/140** and `tests/batch_insert.rs` **46/46** ported; the gate's `save()`-modulo-DEFLATE clause is not asserted |
+| P5 | the op set, merge, batch apply | `tests/test.rs` **140/140** and `tests/batch_insert.rs` **46/46** ported; `zig build save-interop` verifies six shared scripts in both directions, including byte-identical document bodies after column inflation |
 | P6 | the document and transaction API | every `ReadDoc` and `Transactable` method tested, and every constructor call site supplies a live `std.Io` — a test with `std.testing.io`, an executable with its own, the C bridge with its process-wide provider |
 | P7 | iterators and historical reads | `text.rs` **21/21** and `text_encoding.rs` **15/15** ported, verified case by case; **34 of the 36 run under all four `TextEncoding`s**, the two exceptions named and reasoned in `docs/STATUS.md`. **The `8/21` and `10/15` this row carried until 2026-10-01 were wrong in both halves** — the cases were already in the tree. |
 | P8 | sync, including v1 compatibility | convergence, cross-implementation sync both ways |
@@ -206,8 +206,10 @@ The full port of the `automerge` and `hexane` crates, phase by phase, is in
 - Change hashes match the reference byte for byte, because a change hash is
   SHA-256 over the encoded change.
 - `save()` output is **not** byte-identical: DEFLATE is not reproducible across
-  implementations, and equivalence is checked by loading and comparing the
-  materialized document instead.
+  implementations. Equivalence is checked by loading and comparing the
+  materialized document. Six shared save scenarios also compare document bodies
+  byte for byte after column inflation, retaining actor/head order, column
+  IDs/order/data, and the head-index suffix.
 
 
 **Licensing.** The root `LICENSE` is the MIT licence of the Automerge

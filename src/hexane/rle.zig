@@ -67,13 +67,30 @@
 //! Given a value sequence the canonical encoding is unique, so `write` here
 //! and the upstream state machine produce byte-identical slabs.
 //!
+//! # Packing
+//!
+//! Every LEB128 call above is a call on a **packing**: the run headers, the
+//! null-run counts, the value payloads and the byte payload's length prefix all
+//! go through one `comptime P`, which defaults to [`Leb128`] — the
+//! `../leb128.zig` module under a name, not a copy of it. That is what upstream's
+//! `Codec` type parameter is (`codec.rs:110-211`) and it is the whole of the
+//! reason [`RleWith`] exists: the wire format is a parameter of the codec, not a
+//! property of it, and a seam that only reached the payloads would leave the
+//! headers, the counts and the lengths on LEB128 — which is not a second wire
+//! format, it is a corrupt one.
+//!
+//! There is exactly one packing this port ships. The second exists so the five
+//! `alt_codec` cases in `column.zig` can drive the parameter through every path
+//! and catch one that misses it.
+//!
 //! # Import route and the shortest sequence that works
 //!
 //! `@import("hexane/rle.zig")`, or `zautomerge.hexane.rle` through the root
 //! module. Zig 0.16.0. What a column imports from here is the three factories
 //! [`Rle`], [`RleOption`] and [`RleUtf8`], plus the three value-payload
 //! helpers [`payloadRead`], [`payloadAppend`] and [`payloadEql`] and the
-//! [`maxSlabLen`] bound.
+//! [`maxSlabLen`] bound — and, for a codec that is not on the default wire,
+//! [`RleWith`] and the `…With` payload pair beside it.
 //!
 //! ```zig
 //! const Codec = rle.Rle(u64);
@@ -97,6 +114,11 @@ const err = @import("../error.zig");
 const leb128 = @import("../leb128.zig");
 
 const ParseError = err.ParseError;
+
+/// The default integer packing: the [`../leb128.zig`](../leb128.zig) module
+/// under a name, so a `Pack` parameter can be given one without copying its
+/// ten decls into a struct of forwarders.
+pub const Leb128 = @import("../leb128.zig");
 
 /// The most values one slab may decode to.
 ///
@@ -149,9 +171,22 @@ fn checkPayload(comptime T: type) void {
 /// has to copy it. The same is true of every value [`decodeAll`] hands out and
 /// of every one `Decoder.next` returns.
 pub fn payloadRead(comptime T: type, bytes: []const u8, pos: usize) ParseError!struct { value: T, len: usize } {
+    return payloadReadWith(Leb128, T, bytes, pos);
+}
+
+/// [`payloadRead`] over an explicit packing. `P` is the same shape as
+/// `Leb128` — `readUnsigned`, `readSigned` — so a caller that needs a wire
+/// format other than the default names one here; nothing else in this file
+/// changes, because every read in it already goes through this pair.
+pub fn payloadReadWith(
+    comptime P: type,
+    comptime T: type,
+    bytes: []const u8,
+    pos: usize,
+) ParseError!struct { value: T, len: usize } {
     checkPayload(T);
     if (comptime T == []const u8) {
-        const hdr = try leb128.readUnsigned(bytes[pos..]);
+        const hdr = try P.readUnsigned(bytes[pos..]);
         const n = std.math.cast(usize, hdr.value) orelse return error.Overflow;
         const at = pos + hdr.len;
         // `readUnsigned` consumed `hdr.len` bytes out of `bytes`, so `at` is
@@ -160,11 +195,11 @@ pub fn payloadRead(comptime T: type, bytes: []const u8, pos: usize) ParseError!s
         return .{ .value = bytes[at..][0..n], .len = hdr.len + n };
     }
     if (@typeInfo(T).int.signedness == .signed) {
-        const v = try leb128.readSigned(bytes[pos..]);
+        const v = try P.readSigned(bytes[pos..]);
         const narrow = std.math.cast(T, v.value) orelse return error.Overflow;
         return .{ .value = narrow, .len = v.len };
     }
-    const v = try leb128.readUnsigned(bytes[pos..]);
+    const v = try P.readUnsigned(bytes[pos..]);
     const narrow = std.math.cast(T, v.value) orelse return error.Overflow;
     return .{ .value = narrow, .len = v.len };
 }
@@ -176,14 +211,26 @@ pub fn payloadRead(comptime T: type, bytes: []const u8, pos: usize) ParseError!s
 /// integer type, or `[]const u8` and not `[:0]const u8`. Anything else is a
 /// compile error, from the same check both factories run.
 pub fn payloadAppend(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime T: type, value: T) std.mem.Allocator.Error!void {
+    return payloadAppendWith(Leb128, gpa, out, T, value);
+}
+
+/// [`payloadAppend`] over an explicit packing, the writer half of
+/// [`payloadReadWith`].
+pub fn payloadAppendWith(
+    comptime P: type,
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    comptime T: type,
+    value: T,
+) std.mem.Allocator.Error!void {
     checkPayload(T);
     if (comptime T == []const u8) {
-        try leb128.appendUnsigned(out, gpa, value.len);
+        try P.appendUnsigned(out, gpa, @as(u64, @intCast(value.len)));
         try out.appendSlice(gpa, value);
         return;
     }
-    if (@typeInfo(T).int.signedness == .signed) return leb128.appendSigned(out, gpa, value);
-    return leb128.appendUnsigned(out, gpa, value);
+    if (@typeInfo(T).int.signedness == .signed) return P.appendSigned(out, gpa, value);
+    return P.appendUnsigned(out, gpa, @as(u64, @intCast(value)));
 }
 
 /// Whether two value payloads are **the same value**.
@@ -208,7 +255,7 @@ pub fn payloadEql(comptime T: type, a: T, b: T) bool {
 /// is part of the format, and `Utf8` says whether a byte payload has to be
 /// valid UTF-8. For the plain form `Element == T`; for the nullable form
 /// `Element == ?T`.
-fn RleGeneric(comptime T: type, comptime Nullable: bool, comptime Utf8: bool) type {
+fn RleGeneric(comptime T: type, comptime Nullable: bool, comptime Utf8: bool, comptime P: type) type {
     return struct {
         /// One decoded column entry: `T` for the plain form, `?T` for the
         /// nullable one.
@@ -548,24 +595,24 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool, comptime Utf8: bool) ty
 
         /// The number of bytes one value of type `T` occupies.
         fn valueSize(value: T) usize {
-            if (comptime T == []const u8) return leb128.unsignedSize(value.len) + value.len;
+            if (comptime T == []const u8) return P.unsignedSize(@as(u64, @intCast(value.len))) + value.len;
             if (@typeInfo(T).int.signedness == .signed) {
-                return leb128.signedSize(value);
+                return P.signedSize(@as(i64, value));
             }
-            return leb128.unsignedSize(value);
+            return P.unsignedSize(@as(u64, value));
         }
 
         /// Writes one value payload, returning the bytes written.
         fn writeValue(out: []u8, value: T) usize {
             if (comptime T == []const u8) {
-                const n = leb128.writeUnsigned(out, value.len);
+                const n = P.writeUnsigned(out, @as(u64, @intCast(value.len)));
                 @memcpy(out[n..][0..value.len], value);
                 return n + value.len;
             }
             if (@typeInfo(T).int.signedness == .signed) {
-                return leb128.writeSigned(out, value);
+                return P.writeSigned(out, @as(i64, value));
             }
-            return leb128.writeUnsigned(out, value);
+            return P.writeUnsigned(out, @as(u64, value));
         }
 
         /// Reads one value payload. A payload byte can only ever spell a
@@ -582,18 +629,18 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool, comptime Utf8: bool) ty
         /// (`lib.rs:756-764`).
         fn readValue(bytes: []const u8, pos: usize) ParseError!struct { value: T, len: usize } {
             if (comptime T == []const u8) {
-                const pv = try payloadRead(T, bytes, pos);
+                const pv = try payloadReadWith(P, T, bytes, pos);
                 if (comptime Utf8) {
                     if (!std.unicode.utf8ValidateSlice(pv.value)) return error.InvalidUtf8;
                 }
                 return .{ .value = pv.value, .len = pv.len };
             }
             if (@typeInfo(T).int.signedness == .signed) {
-                const v = try leb128.readSigned(bytes[pos..]);
+                const v = try P.readSigned(bytes[pos..]);
                 const narrow = std.math.cast(T, v.value) orelse return error.Overflow;
                 return .{ .value = narrow, .len = v.len };
             }
-            const v = try leb128.readUnsigned(bytes[pos..]);
+            const v = try P.readUnsigned(bytes[pos..]);
             const narrow = std.math.cast(T, v.value) orelse return error.Overflow;
             return .{ .value = narrow, .len = v.len };
         }
@@ -616,7 +663,7 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool, comptime Utf8: bool) ty
 
         /// Reads the run header at `pos`.
         fn readRunHeader(bytes: []const u8, pos: usize) ParseError!RunHeader {
-            const h = try leb128.readSigned(bytes[pos..]);
+            const h = try P.readSigned(bytes[pos..]);
             const payload_at = pos + h.len;
             if (h.value > 0) {
                 return .{
@@ -651,12 +698,12 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool, comptime Utf8: bool) ty
 
         /// Reads the unsigned count that follows a null run's header.
         fn readNullCount(bytes: []const u8, pos: usize) ParseError!struct { count: u64, header_len: usize } {
-            const c = try leb128.readUnsigned(bytes[pos..]);
+            const c = try P.readUnsigned(bytes[pos..]);
             return .{ .count = c.value, .header_len = c.len };
         }
 
         /// `-value` for the negative header of a literal run. Computed with a
-        /// wrapping negate because `leb128.readSigned` can return
+        /// wrapping negate because the signed reader can return
         /// `minInt(i64)`, and a literal count of 2^63 is a claim the wire
         /// allows even though no slab can satisfy it.
         fn literalCount(value: i64) u64 {
@@ -713,7 +760,7 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool, comptime Utf8: bool) ty
                 return switch (s) {
                     .repeat => |r| headerSize(r.count) + valueSize(payload(r.value)),
                     .literal => |l| literalSize(l.start, l.len, values),
-                    .null => |count| headerSize(0) + leb128.unsignedSize(count),
+                    .null => |count| headerSize(0) + P.unsignedSize(@as(u64, @intCast(count))),
                 };
             }
 
@@ -721,20 +768,20 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool, comptime Utf8: bool) ty
             fn writeTo(s: Segment, out: []u8, values: []const Element) usize {
                 return switch (s) {
                     .repeat => |r| blk: {
-                        var n = leb128.writeSigned(out, @as(i64, @intCast(r.count)));
+                        var n = P.writeSigned(out, @as(i64, @intCast(r.count)));
                         n += writeValue(out[n..], payload(r.value));
                         break :blk n;
                     },
                     .literal => |l| blk: {
-                        var n = leb128.writeSigned(out, literalHeader(l.len));
+                        var n = P.writeSigned(out, literalHeader(l.len));
                         for (values[l.start..][0..l.len]) |v| {
                             n += writeValue(out[n..], payload(v));
                         }
                         break :blk n;
                     },
                     .null => |count| blk: {
-                        var n = leb128.writeSigned(out, 0);
-                        n += leb128.writeUnsigned(out[n..], count);
+                        var n = P.writeSigned(out, 0);
+                        n += P.writeUnsigned(out[n..], @as(u64, @intCast(count)));
                         break :blk n;
                     },
                 };
@@ -811,7 +858,7 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool, comptime Utf8: bool) ty
         /// The number of bytes a literal run of `len` values from `start`
         /// takes: one signed header plus one payload per value.
         fn literalSize(start: usize, len: usize, values: []const Element) usize {
-            var n = leb128.signedSize(literalHeader(len));
+            var n = P.signedSize(literalHeader(len));
             for (values[start..][0..len]) |v| n += valueSize(payload(v));
             return n;
         }
@@ -819,7 +866,7 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool, comptime Utf8: bool) ty
         /// `signed_leb128( count )`, the header of a repeat run.
         fn headerSize(count: usize) usize {
             std.debug.assert(count <= std.math.maxInt(i64));
-            return leb128.signedSize(@as(i64, @intCast(count)));
+            return P.signedSize(@as(i64, @intCast(count)));
         }
 
         /// The last value-bearing run of a slab, which the boundary check in
@@ -841,8 +888,18 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool, comptime Utf8: bool) ty
 /// `Rle([]const u8)` accepts any byte, because `Vec<u8>` does. The codec
 /// that refuses a byte string that is not UTF-8 is [`RleUtf8`].
 pub fn Rle(comptime T: type) type {
+    return RleWith(Leb128, T, false, false);
+}
+
+/// The run-length codec over `T` under an explicit packing. This is the one
+/// entry point [`Rle`], [`RleOption`] and [`RleUtf8`] all forward to, and the
+/// reason it takes `Nullable` and `Utf8` rather than having a `With` variant of
+/// its own per factory: one name does the work of three, and a caller in
+/// another module of this crate that needs a wire format other than LEB128
+/// names one here instead of the port growing a second codec family.
+pub fn RleWith(comptime P: type, comptime T: type, comptime Nullable: bool, comptime Utf8: bool) type {
     checkPayload(T);
-    return RleGeneric(T, false, false);
+    return RleGeneric(T, Nullable, Utf8, P);
 }
 
 /// The run-length codec for a nullable column over `T`. An absent value is
@@ -853,8 +910,7 @@ pub fn Rle(comptime T: type) type {
 /// the null run and its `""` as a zero-length payload, and the two decode
 /// back to the two distinct values they came from.
 pub fn RleOption(comptime T: type) type {
-    checkPayload(T);
-    return RleGeneric(T, true, false);
+    return RleWith(Leb128, T, true, false);
 }
 
 /// The run-length codec over `String`, in both the plain and the nullable
@@ -873,7 +929,7 @@ pub fn RleOption(comptime T: type) type {
 /// from `canonical`, and a slab carrying one is never counted, never sized
 /// and never handed out a row for.
 pub fn RleUtf8(comptime Nullable: bool) type {
-    return RleGeneric([]const u8, Nullable, true);
+    return RleWith(Leb128, []const u8, Nullable, true);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

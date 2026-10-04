@@ -7133,16 +7133,16 @@ fn encodeGraphCols(doc: *const Document, gpa: Allocator) LoadError!OwnedColumns 
         dep_actors,
     ));
 
-    // The author footers: one metadata word per change and their bytes. **The
-    // metadata half is written even when every footer is empty** — upstream
-    // leaves that column in on purpose (`change.rs:254-255`).
+    // Change extras are bytes, including an empty footer: metadata tag 7,
+    // not Null (change_graph.rs:537-541; op_set2/meta.rs:95-98). Upstream
+    // retains the metadata column even when all footers are empty (:254-255).
     var words = try gpa.alloc(Cell, count);
     defer gpa.free(words);
     var footers: std.ArrayList(u8) = .empty;
     defer footers.deinit(gpa);
     for (0..count) |i| {
         const extra = doc.nodeInfo(@intCast(i)).extra;
-        words[i] = .{ .uint = @as(u64, @intCast(extra.len)) << 4 };
+        words[i] = .{ .uint = value.ValueMeta.init(.bytes, extra.len).raw };
         try footers.appendSlice(gpa, extra);
     }
     try keepColumn(gpa, &pending, try columnarenc.encodeColumn(
