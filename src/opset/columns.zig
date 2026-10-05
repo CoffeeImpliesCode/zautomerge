@@ -384,14 +384,56 @@ pub const MetaPrefixCodec = struct {
     pub const mustMergeKinds = hexane.Rle(u64).mustMergeKinds;
     pub const canonicalSlab = hexane.Rle(u64).canonicalSlab;
 
+    /// The weight of a slab of metadata words: its row count, and the sum of
+    /// the lengths the words declare (`op_set2/meta.rs:116-124`,
+    /// `MetaPrefixCodec`'s own weight).
+    ///
+    /// **A repeat run is folded in one step, so the walk is `O(runs in the
+    /// slab)` and not `O(rows)`.** `nextRunMax` charges a repeat run its whole
+    /// count in O(1) (`rle.zig:592-599`), and the word in front of the run is
+    /// one length, so `count` rows of it add `length * count` in the single
+    /// multiplication [`accumulateRun`](MetaPrefixCodec.accumulateRun)
+    /// implies. **This is what makes an append cost what it should.** Every
+    /// splice runs this once per slab through `reindexFrom`
+    /// ([column.zig:6739-6750](../hexane/column.zig)) and `rebuildAggs`
+    /// ([:6824-6841](../hexane/column.zig)), from the first slab the cut
+    /// touched — which is the only slab, for a set appended to — and an op set
+    /// of same-length metadata words is one repeat run. **A literal run is
+    /// still folded a value at a time**, because its values are packed back to
+    /// back and its count says nothing about where any one of them starts
+    /// (`rle.zig:600-605`); so a slab of distinct lengths is the case the row
+    /// walk was for, and it is the case this column is in for a text object.
+    ///
+    /// **The refusals are the row walk's, at the same run, and no refusal is
+    /// lost to the fold.** `nextRunMax` reads every run header through
+    /// `enterRun` ([rle.zig:640-668](../hexane/rle.zig)), which reads the
+    /// header and a repeat run's one payload through `readRunHeader` and
+    /// `readValue`, so a truncated or overlong varint, a count that is not
+    /// representable, a run claiming more values than the bytes hold, a count
+    /// past `maxSlabLen` and a null run in a column that has none are all
+    /// raised inside the fold itself, at the run that carries them. The fold
+    /// reads no further than the row walk did: it stops on `slab.len` without
+    /// opening the next header. Exhaustion answers null, which is the fold's
+    /// `error.InvalidValue` and the row walk's (`dec.next() orelse return`).
+    /// The sum refuses where [`accumulateRun`](MetaPrefixCodec.accumulateRun)
+    /// says it does, which is where the row walk's `count` additions refuse.
+    ///
+    /// **There is no second walk.** The decoder is
+    /// `hexane.Rle(u64).WireDecoder` — `RleCodec.Decoder` (`column.zig:702`)
+    /// — and it publishes `nextRunMax` (`rle.zig:589`), so the row-at-a-time
+    /// arm the boolean codec's fold has no use for is not a shape this one
+    /// can take either. The row walk that was here is kept in the test
+    /// section as `metaWeightOfRows`, where the substitution it made is the
+    /// claim being tested.
     pub fn weightOf(gpa: Allocator, slab: *const slabmod.Slab) ParseError!Weight {
         _ = gpa;
         var sum: i64 = 0;
         var dec = try WireDecoder.init(slab.data);
-        var i: usize = 0;
-        while (i < slab.len) : (i += 1) {
-            const w = (try dec.next()) orelse return error.InvalidValue;
-            sum = std.math.add(i64, sum, try lengthOf(w)) catch return error.Overflow;
+        var left = slab.len;
+        while (left != 0) {
+            const run = (try dec.nextRunMax(left)) orelse return error.InvalidValue;
+            left -= run.count;
+            try accumulateRun(run.value, run.count, &sum);
         }
         return .{ .len = slab.len, .prefix = sum };
     }
@@ -406,6 +448,50 @@ pub const MetaPrefixCodec = struct {
         running.* = std.math.add(i64, running.*, try lengthOf(w)) catch return error.Overflow;
     }
 
+    /// `accumulate` over `count` rows of one metadata word: a row's length
+    /// is the word's own, so a run of `count` rows of one word adds
+    /// `length * count` in one step. **Publishing it is what puts this codec
+    /// on the fast arm of `accumulateWire`**
+    /// ([column.zig:297-314](../hexane/column.zig)), which dispatches on
+    /// `@hasDecl(E, "accumulateRun")`. So `Column.runningAt` — and
+    /// `getPrefix`, and the two prefix reads at the head of
+    /// [`Columns.splice`](columns.zig) — stops reading a `value_meta` slab a
+    /// row at a time, the same win [`weightOf`](MetaPrefixCodec.weightOf)
+    /// takes on the write path.
+    ///
+    /// **The refusal is the row walk's, at the same sum, and a refusal leaves
+    /// the sum where it was.** The addition is made in `i128` and refused when
+    /// the *result* leaves `i64`, because a sum already inside `i64` can span
+    /// more than `i64` on its own — a fold that added `length * count` first
+    /// would refuse a span that fits. With `lengthOf` casting an unsigned
+    /// shift it is never negative, so the partial sums inside a run run from
+    /// the value in front of it to the value behind it monotonically: both
+    /// endpoints in range is every one between them, and the arm refuses
+    /// exactly what `count` calls to [`accumulate`](MetaPrefixCodec.accumulate)
+    /// refuse.
+    ///
+    /// **`lengthOf`'s own `error.Overflow` is unreachable from a word**, and it
+    /// is stated where it lives: a `u64` shifted right four is at most
+    /// `2^60 - 1`, and `2^60 - 1 < maxInt(i64)`, so no word reaches it. The
+    /// width of a *sum* of lengths is the thing that does leave `i64`, and that
+    /// is the refusal both folds raise.
+    pub fn accumulateRun(w: Wire, count: usize, running: *i64) ParseError!void {
+        const wide: i128 = @as(i128, running.*) + @as(i128, try lengthOf(w)) * @as(i128, count);
+        if (wide < std.math.minInt(i64) or wide > std.math.maxInt(i64)) return error.Overflow;
+        running.* = @intCast(wide);
+    }
+
+    /// The length half of the word, which is the row's width
+    /// (`op_set2/meta.rs:40-42`).
+    ///
+    /// **The `error.Overflow` is unreachable from a word, and is here because
+    /// the cast is the check rather than an assertion.** A word is a `u64` and
+    /// the shift leaves at most `2^60 - 1`, which is inside `i64` — so
+    /// `cast` answers null for no `u64` at all, and a test that expects this
+    /// refusal would pass for the wrong reason or fail for the right one. The
+    /// width of a *sum* of lengths is the thing that does overflow, and that
+    /// is what [`accumulate`](MetaPrefixCodec.accumulate) and
+    /// [`accumulateRun`](MetaPrefixCodec.accumulateRun) refuse.
     fn lengthOf(w: u64) ParseError!i64 {
         return std.math.cast(i64, w >> 4) orelse error.Overflow;
     }
@@ -1450,6 +1536,54 @@ pub fn Columns(comptime O: type) type {
             // is in hand, for the same reason: the only remaining fallible
             // steps are then the last two, and each one's own failure still
             // leaves every stage unpublished.
+
+            // **Which of the twenty-one carries nothing, and why none of
+            // them is skipped.**
+            //
+            // Three are genuinely empty on a splice whose rows bring no
+            // successors: `succ_actor`, `succ_ctr` and `index.inc`, each
+            // handed `del == 0` and a value list of no length. **They are
+            // still called, and the call is free**: `stageSplice` answers
+            // `del == 0 and values.len == 0` with the no-op stage and returns
+            // before it allocates anything
+            // ([column.zig:4598-4607](../hexane/column.zig)), and its
+            // `publish` leaves the column alone
+            // ([column.zig:4532-4535](../hexane/column.zig)). Hoisting the
+            // condition up here would move no work.
+            //
+            // The other eighteen are the row-indexed columns, and they are
+            // not empty even when every value they are handed is a default.
+            // **The row count is the count of rows**: `cols.len()` *is*
+            // `id_actor.len()`, and `rowLengthMismatch`
+            // ([op_iter.zig:1883](op_iter.zig)) names the first row-indexed
+            // column that disagrees with it, which `OpIter.init` refuses the
+            // set over. A default payload is a value, not the absence of a
+            // row, so a skip there would leave the columns short by one and
+            // shift every row behind the splice.
+            //
+            // **`removeOps` does skip its three
+            // ([`removeOps`](columns.zig) below), and the reasoning does not
+            // transfer.** Upstream guards the removal and not the insertion
+            // (`columns.rs:400-408` against `:457-470`), and the guard is not
+            // free here: `stageSplice` refuses a position past the end of the
+            // column it is handed
+            // ([column.zig:4596](../hexane/column.zig)), so those three calls
+            // are what refuse a `succ_count` whose prefix runs past the
+            // flattened pair — the one disagreement
+            // `succLengthMismatch` names. Skipping them when `succ_total` is
+            // zero would trade that refusal for a saving on a path that
+            // already allocates nothing.
+            //
+            // **What a splice costs here, and what it does not.** The build
+            // phase above is one pass over `rows`, and the two prefix reads
+            // are a binary search for the slab and the runs inside it
+            // ([column.zig:3372-3395](../hexane/column.zig)), so this file
+            // adds **O(rows) once per call, not O(rows) per row**. A caller
+            // that inserts `n` rows in `n` calls pays `n` calls of a cost
+            // that does not itself grow with the document. What each call
+            // hands the column layer is per column, and what the column layer
+            // does with it is its own arithmetic
+            // ([`stageSplice`](../hexane/column.zig)).
             var s_id_actor = try self.id_actor.stageSplice(pos, 0, id_actors);
             defer s_id_actor.deinit();
             var s_id_ctr = try self.id_ctr.stageSplice(pos, 0, id_ctrs);
@@ -2854,6 +2988,207 @@ test "a splice at a non-zero position puts the payloads and the successors where
     const incs = try valuesOf(IncColumn, &cols.index.inc, gpa);
     defer gpa.free(incs);
     try testing.expectEqualSlices(?i64, &.{ -2, 1, null }, incs);
+}
+
+test "a row whose payload is every column's default still lengthens every row column" {
+    const gpa = testing.allocator;
+    var table = Table.init(gpa);
+    defer table.deinit();
+    var cols = try Columns(Row).init(gpa);
+    defer cols.deinit();
+
+    // **A default is a value, not the absence of a row.** Every column that
+    // can hold an absent value holds one here, and the row is still written
+    // into all eighteen row-indexed columns, because `cols.len()` *is*
+    // `id_actor.len()` and a column one row short is a set the walk refuses
+    // ([op_iter.zig:1883](op_iter.zig)). This is the row that would be a
+    // candidate for a per-column skip if a default payload were one.
+    //
+    // `key_str` is the one column it cannot leave at its default: a
+    // `KeyRef` with no counter is a map key ([types.zig:214-226](types.zig)),
+    // and a map key is interned, so the column holds the id `0`.
+    // `is_visible` and `is_top` are off here, and both default to `true` on
+    // the type — a type default is not the column's default. With `is_top`
+    // off the row has no width either (`columns.rs:466-471`).
+    const defaults: [1]Row = .{.{
+        .op_id = .{ .counter = 1, .actor = 0 },
+        .is_visible = false,
+        .is_top = false,
+    }};
+    _ = try cols.splice(gpa, 0, &defaults, .unicode_code_point, table.asTable());
+    try checkLengths(&cols, gpa, 1, 0);
+
+    // **Each of those defaults is read back, so "all-default" is a claim
+    // about the columns and not a label on the fixture.**
+    const obj_actors = try valuesOf(ActorOptColumn, &cols.obj_actor, gpa);
+    defer gpa.free(obj_actors);
+    try testing.expectEqualSlices(?ActorIdx, &.{null}, obj_actors);
+    const obj_ctrs = try valuesOf(UintOptColumn, &cols.obj_ctr, gpa);
+    defer gpa.free(obj_ctrs);
+    try testing.expectEqualSlices(?u32, &.{null}, obj_ctrs);
+    const key_actors = try valuesOf(ActorOptColumn, &cols.key_actor, gpa);
+    defer gpa.free(key_actors);
+    try testing.expectEqualSlices(?ActorIdx, &.{null}, key_actors);
+    const key_ctrs = try valuesOf(OptCounterColumn, &cols.key_ctr, gpa);
+    defer gpa.free(key_ctrs);
+    try testing.expectEqualSlices(?u32, &.{null}, key_ctrs);
+    const key_strs = try valuesOf(UintOptColumn, &cols.key_str, gpa);
+    defer gpa.free(key_strs);
+    try testing.expectEqualSlices(?u32, &.{0}, key_strs);
+    const inserts = try valuesOf(BoolPrefixColumn, &cols.insert, gpa);
+    defer gpa.free(inserts);
+    try testing.expectEqualSlices(bool, &.{false}, inserts);
+    const expands = try valuesOf(BoolColumn, &cols.expand, gpa);
+    defer gpa.free(expands);
+    try testing.expectEqualSlices(bool, &.{false}, expands);
+    const mark_names = try valuesOf(UintOptColumn, &cols.mark_name, gpa);
+    defer gpa.free(mark_names);
+    try testing.expectEqualSlices(?u32, &.{null}, mark_names);
+    const widths = try valuesOf(TextColumn, &cols.index.text, gpa);
+    defer gpa.free(widths);
+    try testing.expectEqualSlices(?u32, &.{null}, widths);
+    const tops = try valuesOf(BoolPrefixColumn, &cols.index.top, gpa);
+    defer gpa.free(tops);
+    try testing.expectEqualSlices(bool, &.{false}, tops);
+    const visibles = try valuesOf(BoolColumn, &cols.index.visible, gpa);
+    defer gpa.free(visibles);
+    try testing.expectEqualSlices(bool, &.{false}, visibles);
+    const marks = try markRows(&cols.index.mark, gpa);
+    defer gpa.free(marks);
+    try testing.expect(marks[0] == null);
+}
+
+test "a single-row splice with no successors leaves the three successor columns as they were" {
+    const gpa = testing.allocator;
+    var table = Table.init(gpa);
+    defer table.deinit();
+    var cols = try Columns(Row).init(gpa);
+    defer cols.deinit();
+
+    // **Two rows, and the second carries two successors**, so the flattened
+    // pair is not empty and a stage that wrote nothing into it is visible.
+    const first: [1]Row = .{rich[0]};
+    const with_succs: [1]Row = .{rich[3]};
+    _ = try cols.splice(gpa, 0, &first, .unicode_code_point, table.asTable());
+    _ = try cols.splice(gpa, 1, &with_succs, .unicode_code_point, table.asTable());
+    try checkLengths(&cols, gpa, 2, 2);
+
+    const actors_before = try cols.succ_actor.encode(gpa);
+    defer gpa.free(actors_before);
+    const ctrs_before = try cols.succ_ctr.encode(gpa);
+    defer gpa.free(ctrs_before);
+    const incs_before = try cols.index.inc.encode(gpa);
+    defer gpa.free(incs_before);
+
+    // **One row, and no successors.** These are the three stages that carry
+    // nothing: each is handed `del == 0` and a value list of no length,
+    // which `stageSplice` answers with the no-op stage before it allocates
+    // ([column.zig:4598-4607](../hexane/column.zig)) and whose `publish`
+    // leaves the column alone ([column.zig:4532-4535](../hexane/column.zig)).
+    // They are still called, and calling them is what the encodings below
+    // measure.
+    const plain: [1]Row = .{.{ .op_id = .{ .counter = 7, .actor = 0 } }};
+    _ = try cols.splice(gpa, 2, &plain, .unicode_code_point, table.asTable());
+
+    // **Nothing moved**, and the row count says the splice was not a no-op
+    // over the set as a whole: three rows, two successors.
+    try checkLengths(&cols, gpa, 3, 2);
+    const actors_after = try cols.succ_actor.encode(gpa);
+    defer gpa.free(actors_after);
+    const ctrs_after = try cols.succ_ctr.encode(gpa);
+    defer gpa.free(ctrs_after);
+    const incs_after = try cols.index.inc.encode(gpa);
+    defer gpa.free(incs_after);
+    try testing.expectEqualSlices(u8, actors_before, actors_after);
+    try testing.expectEqualSlices(u8, ctrs_before, ctrs_after);
+    try testing.expectEqualSlices(u8, incs_before, incs_after);
+}
+
+test "a successor count that runs past the flattened pair is refused, and nothing moves" {
+    const gpa = testing.allocator;
+    var table = Table.init(gpa);
+    defer table.deinit();
+
+    const first: [1]Row = .{.{ .op_id = .{ .counter = 1, .actor = 0 } }};
+    const second: [1]Row = .{.{ .op_id = .{ .counter = 2, .actor = 0 } }};
+
+    // **The control: the same two rows into a set whose own counts agree.**
+    var clean = try Columns(Row).init(gpa);
+    defer clean.deinit();
+    _ = try clean.splice(gpa, 0, &first, .unicode_code_point, table.asTable());
+    _ = try clean.splice(gpa, 1, &second, .unicode_code_point, table.asTable());
+    try checkLengths(&clean, gpa, 2, 0);
+
+    // **And here the counts disagree.** `succ_count` says row 0 has two
+    // successors and the flattened pair has none, which is the one thing
+    // `succLengthMismatch` names
+    // ([op_iter.zig:1920-1937](op_iter.zig)). Nothing that built the set can
+    // produce it, so the set is written directly.
+    var broken = try Columns(Row).init(gpa);
+    defer broken.deinit();
+    _ = try broken.splice(gpa, 0, &first, .unicode_code_point, table.asTable());
+    // **One row in, one row out** — `del == 1`, not `del == 0`. A splice that
+    // deletes nothing *inserts* the `2` in front of the `0` row the splice
+    // above wrote, leaving two count rows (`{2, 0}`) against one op row. That
+    // is a second, unrelated malformation — a row-length mismatch, which
+    // `rowLengthMismatch` names — and `broken.len()` cannot see it, because
+    // that is `id_actor.len()` ([opset/columns.zig:1556](columns.zig)). The
+    // count the case is about is row 0's own, so row 0 is replaced.
+    try broken.succ_count.splice(gpa, 0, 1, &.{2});
+    try testing.expectEqual(@as(usize, 1), broken.len());
+    try testing.expectEqual(@as(usize, 0), broken.subLen());
+
+    // **The refusal is the successor triple's, and rows that bring no
+    // successors are why**: `succ_pos` is 2 and `succ_actor` holds nothing,
+    // so `stageSplice` refuses the position
+    // ([column.zig:4596](../hexane/column.zig)).
+    //
+    // **This is the witness that `removeOps`'s `if (succ_del > 0)` guard was
+    // not copied here.** With that guard this splice would answer `1` and
+    // accept a set no walk can read; upstream guards the removal and not the
+    // insertion (`columns.rs:400-408` against `:457-470`), and the guard is
+    // what makes the removal's asymmetry upstream's rather than the port's.
+    try testing.expectError(
+        error.InvalidValue,
+        broken.splice(gpa, 1, &second, .unicode_code_point, table.asTable()),
+    );
+
+    // **And the refusal moved nothing**, which is the staging's own claim:
+    // the row count, the successor total and the counts themselves are the
+    // ones the set held before the call.
+    try testing.expectEqual(@as(usize, 1), broken.len());
+    try testing.expectEqual(@as(usize, 0), broken.subLen());
+    const counts = try valuesOf(CountColumn, &broken.succ_count, gpa);
+    defer gpa.free(counts);
+    try testing.expectEqualSlices(u32, &.{2}, counts);
+}
+
+test "a splice of nothing, and a splice of only deletes, write no row" {
+    const gpa = testing.allocator;
+    var table = Table.init(gpa);
+    defer table.deinit();
+    var cols = try Columns(Row).init(gpa);
+    defer cols.deinit();
+
+    // **All twenty-one stages run on an empty splice and none of them has
+    // anything to do** — `del == 0` and a value list of no length is the no-op
+    // `stageSplice` was given an answer for
+    // ([column.zig:4598-4607](../hexane/column.zig)). Zero rows, and every
+    // column exactly as long as it was.
+    // `&.{}` is the spelling an empty slice argument takes here
+    // ([op_set.zig:8473](op_set.zig)), where the same call is made.
+    try testing.expectEqual(@as(usize, 0), try cols.splice(gpa, 0, &.{}, .unicode_code_point, table.asTable()));
+    try checkLengths(&cols, gpa, 0, 0);
+
+    // **A delete is not a row** (`columns.rs:423`), so a splice of nothing but
+    // deletes writes nothing either. This is the one that pays the filter and
+    // still has nothing left to stage.
+    const only_deletes: [2]Row = .{
+        .{ .op_id = .{ .counter = 1, .actor = 0 }, .act = .delete },
+        .{ .op_id = .{ .counter = 2, .actor = 0 }, .act = .delete },
+    };
+    try testing.expectEqual(@as(usize, 0), try cols.splice(gpa, 0, &only_deletes, .unicode_code_point, table.asTable()));
+    try checkLengths(&cols, gpa, 0, 0);
 }
 
 test "a splice and the matching removal leave every column byte-identical" {
@@ -4413,6 +4748,536 @@ test "a refused allocation leaves a boolean prefix column's rows and prefix sums
                 error.OutOfMemory => continue,
                 else => return e,
             };
+        }
+    }
+}
+
+test "the metadata weight fold and the row walk it replaced land on the same sum" {
+    // **The pair below is the claim, and both halves are checked**:
+    // `accumulateRun` is the fold `MetaPrefixCodec.weightOf` now takes, and
+    // `accumulate` over rows is the one it replaced. They must answer the
+    // same sum and refuse on the same sum, because the fold runs on the write
+    // path of every splice and the row walk still runs on the read path.
+    //
+    // **A word whose length is two** (`op_set2/meta.rs:40-42`: the word is
+    // `(length << 4) | type`), so a run of `count` rows of it adds
+    // `2 * count` and the refusals below land on round numbers.
+    const word: u64 = (2 << 4) | 1;
+    const M = std.math.maxInt(i64);
+
+    // **Every ordinary count, and the two agree exactly** — including a run of
+    // no rows, which adds nothing, and a run long enough to need the
+    // multiplication the fold is for.
+    for ([_]usize{ 0, 1, 2, 7, 64, 1000 }) |count| {
+        var run: i64 = 0;
+        var rows: i64 = 0;
+        try MetaPrefixCodec.accumulateRun(word, count, &run);
+        var i: usize = 0;
+        while (i < count) : (i += 1) try MetaPrefixCodec.accumulate(word, &rows);
+        try testing.expectEqual(rows, run);
+        try testing.expectEqual(@as(i64, @intCast(2 * count)), run);
+    }
+
+    // **A sum in front of a run can be negative**, which is the `runningAt`
+    // case: `runningAt` folds a slab onto the column's own base
+    // ([column.zig:3483](../hexane/column.zig)), and a base is not always
+    // zero. Both folds start at the smallest `i64` and neither refuses.
+    {
+        var run: i64 = std.math.minInt(i64);
+        var rows: i64 = std.math.minInt(i64);
+        try MetaPrefixCodec.accumulateRun(word, 4096, &run);
+        var i: usize = 0;
+        while (i < 4096) : (i += 1) try MetaPrefixCodec.accumulate(word, &rows);
+        try testing.expectEqual(rows, run);
+    }
+
+    // **The span hazard, reached — and this is the case the one above is not.**
+    // A sum already inside `i64` can span more than `i64` on its own
+    // ([addRunOf](../hexane/column.zig)), so a fold that multiplied first and
+    // added second would refuse where this one must answer. Here the span is
+    // `2 * (1 << 62) = 2^63`, which leaves `i64` on its own, and the result is
+    // `minInt(i64) + 2^63 = 0`, which fits — so the arm answers `0` and
+    // refuses nothing. **The 4096 rows above span 8192 and reach none of
+    // this**; a case that stops short of the hazard and is described as
+    // reaching it is the false sentence in miniature.
+    //
+    // **The row walk is not the witness here, and cannot be.** It is the same
+    // addition `count` times, so it would need `1 << 62` rows to be walked;
+    // `accumulateRun` never materialises the run, which is the whole of what
+    // makes it O(1). So this case pins the arm on its own, and the agreement
+    // with the walk is pinned above, where both are affordable.
+    {
+        var run: i64 = std.math.minInt(i64);
+        try MetaPrefixCodec.accumulateRun(word, @as(usize, 1) << 62, &run);
+        try testing.expectEqual(@as(i64, 0), run);
+    }
+
+    // **And they refuse on the same sum, at the same row.** `M - 2` plus one
+    // row of length two is exactly `M`, and the second row is the refusal —
+    // the run takes it as one step where the walk takes it as the second of
+    // two.
+    {
+        var run: i64 = M - 2;
+        var rows: i64 = M - 2;
+        try MetaPrefixCodec.accumulateRun(word, 1, &run);
+        try MetaPrefixCodec.accumulate(word, &rows);
+        try testing.expectEqual(@as(i64, M), run);
+        try testing.expectEqual(@as(i64, M), rows);
+        try testing.expectError(error.Overflow, MetaPrefixCodec.accumulateRun(word, 1, &run));
+        try testing.expectError(error.Overflow, MetaPrefixCodec.accumulate(word, &rows));
+    }
+
+    // **A refusal leaves the sum where it was**, which is what makes it
+    // usable: `accumulateWire` propagates it with `try`
+    // ([column.zig:298](../hexane/column.zig)), so nothing downstream of a
+    // fold that stops is half folded.
+    {
+        var run: i64 = M - 2;
+        try testing.expectError(error.Overflow, MetaPrefixCodec.accumulateRun(word, 2, &run));
+        try testing.expectEqual(@as(i64, M - 2), run);
+    }
+}
+
+/// `MetaPrefixCodec.weightOf` as it stood before the run-level fold: one row
+/// at a time, with the checked addition per row.
+///
+/// A copy of the code the fold replaced rather than a description of it,
+/// because the claim the tests below make is a substitution — the fold over
+/// runs answers what the fold over rows answered — and only the replaced code
+/// itself witnesses that. `boolWeightOfRows` is the same copy for the boolean
+/// codec, and the reason is the one it gives.
+fn metaWeightOfRows(slab: *const slabmod.Slab) ParseError!MetaPrefixCodec.Weight {
+    var sum: i64 = 0;
+    var dec = try MetaPrefixCodec.WireDecoder.init(slab.data);
+    var i: usize = 0;
+    while (i < slab.len) : (i += 1) {
+        const w = (try dec.next()) orelse return error.InvalidValue;
+        sum = std.math.add(i64, sum, try MetaPrefixCodec.lengthOf(w)) catch return error.Overflow;
+    }
+    return .{ .len = slab.len, .prefix = sum };
+}
+
+/// Both folds on one metadata slab, held to each other: the same weight, or
+/// the same refusal. What they agreed on comes back, so a caller can hold it
+/// to a refusal or an answer of its own.
+fn sameMetaWeight(gpa: Allocator, slab: *const slabmod.Slab) !WalkOutcome {
+    const runs = MetaPrefixCodec.weightOf(gpa, slab);
+    const rows = metaWeightOfRows(slab);
+    const a: WalkOutcome = if (runs) |w| .{ .weight = w, .refused = null } else |e| .{ .weight = .{}, .refused = e };
+    const b: WalkOutcome = if (rows) |w| .{ .weight = w, .refused = null } else |e| .{ .weight = .{}, .refused = e };
+    if (!sameRefusal(a.refused, b.refused) or a.weight.len != b.weight.len or a.weight.prefix != b.weight.prefix) {
+        std.debug.print("over runs {any} | over rows {any}\n", .{ a, b });
+        return error.TestUnexpectedResult;
+    }
+    return a;
+}
+
+/// One word list, held on four counts: the bytes must be cut into `runs` runs,
+/// the fold and the row walk must answer the same weight, and that weight must
+/// be the model's own sum of the declared lengths over `words.len` rows — so a
+/// pair of folds agreeing on a wrong answer cannot pass. The run count is in
+/// the call because a case cannot be taken for a repeat run or a literal run
+/// until the bytes say it is one, and a repeat run is never written with a
+/// count of one (`column.zig:1704-1706`), so a single word is a literal run.
+fn metaWordsHeld(gpa: Allocator, words: []const u64, runs: usize) !void {
+    const bytes = try MetaPrefixCodec.wireEncode(gpa, words, false);
+    defer gpa.free(bytes);
+    var slab = try slabmod.init(gpa, MetaPrefixCodec, bytes);
+    defer slab.deinit(gpa);
+    if (slab.segments != runs) {
+        std.debug.print("{d} rows encoded into {d} run(s), the case says {d}\n", .{ words.len, slab.segments, runs });
+        return error.TestUnexpectedResult;
+    }
+    var model: i64 = 0;
+    for (words) |w| model += @intCast(w >> 4);
+    const outcome = try sameMetaWeight(gpa, &slab);
+    if (outcome.refused != null or outcome.weight.len != words.len or outcome.weight.prefix != model) {
+        std.debug.print("{d} rows in {d} run(s): {any}, and the model says {d} over {d} rows\n", .{ words.len, runs, outcome, model, words.len });
+        return error.TestUnexpectedResult;
+    }
+}
+
+/// One hand-built metadata case, held: both folds must say what the case says
+/// — the refusal, or the sum over `len` rows — and `sameMetaWeight` has
+/// already held them to each other before this runs.
+///
+/// The bytes are copied rather than borrowed because `Slab.data` is owned.
+/// `segments` and `tail` are left empty on purpose: a case is here to drive the
+/// two folds, and measuring the bytes first would refuse a malformed case
+/// before either fold ever saw it. The weight walk reads `data` and `len` and
+/// nothing else (`columns.zig:428-439`).
+fn metaCaseHeld(gpa: Allocator, why: []const u8, bytes: []const u8, len: usize, want: ?ParseError, prefix: i64) !void {
+    const owned = try gpa.dupe(u8, bytes);
+    defer gpa.free(owned);
+    const slab: slabmod.Slab = .{ .data = owned, .len = len, .segments = 0, .tail = .zero };
+    const outcome = try sameMetaWeight(gpa, &slab);
+    if (!sameRefusal(outcome.refused, want)) {
+        std.debug.print("{s}: {any}, and the case says {any}\n", .{ why, outcome, want });
+        return error.TestUnexpectedResult;
+    }
+    if (want == null and (outcome.weight.len != len or outcome.weight.prefix != prefix)) {
+        std.debug.print("{s}: {any}, and the case says {d} over {d} rows\n", .{ why, outcome, prefix, len });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "the metadata weight fold is the row walk's weight, over every run shape a metadata column holds" {
+    // **The claim is a substitution**, and `metaWeightOfRows` is the code it
+    // replaced. Every case is held three ways — the bytes are cut into the runs
+    // the case names, the two folds answer the same weight, and that weight is
+    // the model's own sum of the declared lengths — so a pair of folds that
+    // agree on a wrong answer cannot pass for a pair that agrees.
+    const gpa = testing.allocator;
+    var buf: [400]u64 = undefined;
+
+    // **A word is `(length << 4) | type`** (`op_set2/meta.rs:20-43`), so these
+    // three are a length-9 word, a length-3 word and a word of no length.
+    const a: u64 = (9 << 4) | 1;
+    const b: u64 = (3 << 4) | 2;
+    const nothing: u64 = 3;
+
+    // **One repeat run of one word** — no differences between the rows at all,
+    // and the shape `Slab.fill` builds in O(1) (`slab.zig:242-243`), which is
+    // what a staged op set holds for a column of equal-length metadata words.
+    // Three hundred rows are one varint and one word on the wire, and were
+    // three hundred iterations of the row walk.
+    @memset(buf[0..300], a);
+    try metaWordsHeld(gpa, buf[0..300], 1);
+
+    // **Words of no length**, which add nothing and are not a null run: a
+    // length of zero is the prefix identity in a word rather than in a header,
+    // and a slab of them weighs zero over every row it holds.
+    @memset(buf[0..64], nothing);
+    try metaWordsHeld(gpa, buf[0..64], 1);
+
+    // **One literal run of three hundred distinct words.** `nextRunMax` hands a
+    // literal run back one value at a time (`rle.zig:600-605`), so this is the
+    // case the fold still walks a row at a time, and it must walk it to the
+    // same sum.
+    for (buf[0..300], 0..) |*v, i| v.* = (@as(u64, @intCast(i + 1)) << 4) | 1;
+    try metaWordsHeld(gpa, buf[0..300], 1);
+
+    // **Repeat, literal, repeat, and a run of no length** — four runs, so the
+    // sum has to be carried across every boundary rather than restarted. The
+    // literal run's sixty lengths run 100 to 159, none of which is 9, 3 or 0,
+    // so the four runs stay four runs.
+    {
+        var n: usize = 0;
+        for (0..120) |_| {
+            buf[n] = a;
+            n += 1;
+        }
+        for (0..60) |i| {
+            buf[n] = (@as(u64, @intCast(100 + i)) << 4) | 1;
+            n += 1;
+        }
+        for (0..120) |_| {
+            buf[n] = b;
+            n += 1;
+        }
+        for (0..40) |_| {
+            buf[n] = nothing;
+            n += 1;
+        }
+        try metaWordsHeld(gpa, buf[0..n], 4);
+    }
+
+    // **A decreasing run**: three hundred distinct lengths falling one at a
+    // time, so the running value at the last row is 1 and not the slab's own
+    // start. A prefix sum over a falling sequence is the one shape where the
+    // total is not the count times anything.
+    for (buf[0..300], 0..) |*v, i| v.* = (@as(u64, @intCast(300 - i)) << 4) | 1;
+    try metaWordsHeld(gpa, buf[0..300], 1);
+
+    // **A literal run whose widest word is interior**, so the fold cannot take
+    // the run's first or last value for its extent. The widest word this codec
+    // can hold declares `maxInt(u64) >> 4` and it is the third of five; the
+    // other four differ from it only in the type nibble, so this case is also
+    // the one that says the nibble is not part of the length.
+    {
+        var n: usize = 0;
+        for ([_]u64{ 1, 3, std.math.maxInt(u64), 2, 5 }) |v| {
+            buf[n] = v;
+            n += 1;
+        }
+        try metaWordsHeld(gpa, buf[0..n], 1);
+    }
+
+    // **The declared length under all sixteen types**: sixteen distinct words
+    // of one length, so the run is literal and every one of them has to add
+    // the same five.
+    {
+        var n: usize = 0;
+        for (0..16) |t| {
+            buf[n] = (@as(u64, 5) << 4) | @as(u64, @intCast(t));
+            n += 1;
+        }
+        try metaWordsHeld(gpa, buf[0..n], 1);
+    }
+
+    // **The two ends of the declared-length range on their own**, which the
+    // fold may neither round, widen nor drop: the widest word there is, and
+    // the word of no length. A single word is a literal run of one, so both
+    // are the one run `nextRunMax` hands back a value at a time.
+    buf[0] = std.math.maxInt(u64);
+    try metaWordsHeld(gpa, buf[0..1], 1);
+    buf[0] = 0;
+    try metaWordsHeld(gpa, buf[0..1], 1);
+
+    // **The two bounds that disagree with the bytes.** Both folds bound
+    // themselves by the slab's declared length and not by the bytes, so a
+    // length short of the wire stops both early with the same shortened sum,
+    // and a length past the end is `error.InvalidValue` in both — the third
+    // shape the budget makes the two ends of the walk agree on.
+    @memset(buf[0..10], a);
+    {
+        const bytes = try MetaPrefixCodec.wireEncode(gpa, buf[0..10], false);
+        defer gpa.free(bytes);
+        for ([_]usize{ 0, 4, 10, 11 }) |len| {
+            const slab: slabmod.Slab = .{ .data = bytes, .len = len, .segments = 0, .tail = .zero };
+            const outcome = try sameMetaWeight(gpa, &slab);
+            const want: ?ParseError = if (len > 10) error.InvalidValue else null;
+            // **The row count is widened before the multiply, and it has to
+            // be.** `@min(len, 10)` does not answer `usize`: Zig gives `@min`
+            // the smallest type that holds *both* operands' range, and `10`
+            // fits in `u4`, so the product would be `u4 * 9` — `9` does not
+            // fit `u4`, and the multiply traps on `len == 4` (`4 * 9` is 36
+            // against a maximum of 15) before the cast ever runs. The typed
+            // binding is the same widening `change_graph.zig:1046` spells as
+            // `const from: u32 = @intCast(@min(...))`, and it puts the `usize`
+            // the loop already had back under the product.
+            const rows: usize = @min(len, 10);
+            const sum: i64 = @intCast(rows * 9);
+            if (!sameRefusal(outcome.refused, want)) {
+                std.debug.print("{d} rows owed of ten: {any}, and the case says {any}\n", .{ len, outcome, want });
+                return error.TestUnexpectedResult;
+            }
+            if (want == null and (outcome.weight.len != len or outcome.weight.prefix != sum)) {
+                std.debug.print("{d} rows owed of ten: {any}, and the case says {d}\n", .{ len, outcome, sum });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+test "the metadata weight fold refuses what the row walk refuses, at the same run" {
+    // **Every refusal a metadata slab carries, each named**, so two folds that
+    // agree on `error.InvalidValue` for a case that owed `error.UnexpectedEnd`
+    // cannot pass. Each case goes through `sameMetaWeight` as well, so the two
+    // walks are held to each other and not only to what is written here.
+    //
+    // The bytes are built through the packing rather than written out, because
+    // a run header is a *signed* varint and a payload an unsigned one, and the
+    // literal-run cases below are exactly the ones where a hand-written byte
+    // would be wrong in a way the test could not tell from the refusal it was
+    // reaching for.
+    const gpa = testing.allocator;
+    // A length-9 word, whose unsigned varint is two bytes, so the case that
+    // cuts it short cuts it mid-varint rather than mid-byte.
+    const word_len9: u64 = (9 << 4) | 1;
+
+    // **The two refusals of a run header**, before any payload is read: a
+    // varint cut short, and one that runs past the ten bytes a `i64` needs.
+    {
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(gpa);
+        try bytes.append(gpa, 0x80);
+        try metaCaseHeld(gpa, "a run header cut short", bytes.items, 1, error.UnexpectedEnd, 0);
+    }
+    {
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(gpa);
+        try bytes.append(gpa, 0x80);
+        try bytes.append(gpa, 0x00);
+        try metaCaseHeld(gpa, "a run header running past its own width", bytes.items, 1, error.InvalidLeb128, 0);
+    }
+
+    // **A repeat run's one payload, cut short.** The header says three rows of
+    // one word and the word's varint never finishes. `nextRunMax` reads that
+    // payload inside `enterRun` (`rle.zig:651`) — the very call the row walk's
+    // `next` makes — so the fold cannot spend the run's count without reading
+    // the word that run is made of.
+    {
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(gpa);
+        try leb128.appendSigned(&bytes, gpa, 3);
+        try leb128.appendUnsigned(&bytes, gpa, word_len9);
+        bytes.items.len -= 1;
+        try metaCaseHeld(gpa, "a repeat run's payload cut short", bytes.items, 3, error.UnexpectedEnd, 0);
+    }
+
+    // **A run claiming more values than the bytes hold**, which
+    // `readRunHeader` refuses before the walk starts (`rle.zig:835`).
+    {
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(gpa);
+        try leb128.appendSigned(&bytes, gpa, -5);
+        try leb128.appendUnsigned(&bytes, gpa, 7);
+        try metaCaseHeld(gpa, "a literal run longer than the bytes", bytes.items, 1, error.LengthExceedsInput, 0);
+    }
+
+    // **A literal run's third payload, cut short.** This is the case the fold
+    // is judged on: a literal run's values are packed back to back and its
+    // count says nothing about where any one of them starts, so `nextRunMax`
+    // reads them one at a time (`rle.zig:600-605`) — through the same
+    // `readValue` the row walk reads them through (`rle.zig:493`). A fold that
+    // counted the run instead would walk past this and answer.
+    //
+    // **The third payload is a byte, not a missing one**: every value costs at
+    // least a byte, so a count the bytes cannot back is refused by the header
+    // reader instead (`rle.zig:835`, the case above), and a payload can only
+    // be cut short inside its own varint. This is the byte that says another
+    // byte is coming.
+    {
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(gpa);
+        try leb128.appendSigned(&bytes, gpa, -3);
+        try leb128.appendUnsigned(&bytes, gpa, 5);
+        try leb128.appendUnsigned(&bytes, gpa, 6);
+        try bytes.append(gpa, 0x80);
+        try metaCaseHeld(gpa, "a literal run's third payload cut short", bytes.items, 3, error.UnexpectedEnd, 0);
+    }
+
+    // **A count past `maxSlabLen`**, refused before the payload is even read
+    // (`rle.zig:650`).
+    {
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(gpa);
+        try leb128.appendSigned(&bytes, gpa, @as(i64, (@as(u64, 1) << 32) + 1));
+        try metaCaseHeld(gpa, "a run count past maxSlabLen", bytes.items, 2, error.TooLarge, 0);
+    }
+
+    // **A null run in a column that has none**, which is what the
+    // non-nullable instantiation of this wire — the one `value_meta` is written
+    // under — answers for every null run (`rle.zig:655-656`). It sits behind a
+    // well-formed repeat run so the case also says the refusal is at the run
+    // that carries it and not at the head of the walk.
+    {
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(gpa);
+        try leb128.appendSigned(&bytes, gpa, 2);
+        try leb128.appendUnsigned(&bytes, gpa, word_len9);
+        try leb128.appendSigned(&bytes, gpa, 0);
+        try leb128.appendUnsigned(&bytes, gpa, 3);
+        try metaCaseHeld(gpa, "a null run in a column with none", bytes.items, 5, error.UnexpectedNull, 0);
+        // **And stopping short of it answers**, which is the other half of the
+        // budget: two rows of a length-9 word, and the null run behind them
+        // never opened.
+        try metaCaseHeld(gpa, "two rows in front of the null run", bytes.items, 2, null, 18);
+    }
+
+    // **The `i64` refusal, at a sum a slab can reach.** The widest word
+    // declares `2^60 - 1`, so eight of them are `maxInt(i64) - 7` and answer,
+    // and nine leave `i64` and refuse. The word is not what overflows — no word
+    // can, `lengthOf`'s own refusal being unreachable — the count is, which is
+    // why the pair sits here and not in a case about the word.
+    {
+        var buf: [9]u64 = undefined;
+        @memset(&buf, std.math.maxInt(u64));
+        const eight = try MetaPrefixCodec.wireEncode(gpa, buf[0..8], false);
+        defer gpa.free(eight);
+        const nine = try MetaPrefixCodec.wireEncode(gpa, buf[0..9], false);
+        defer gpa.free(nine);
+        // `2^60 - 1` is the widest length a word can declare.
+        const span: i64 = (@as(i64, 1) << 60) - 1;
+        for ([_]usize{ 8, 9 }) |rows| {
+            const bytes = if (rows == 8) eight else nine;
+            var slab = try slabmod.init(gpa, MetaPrefixCodec, bytes);
+            defer slab.deinit(gpa);
+            const outcome = try sameMetaWeight(gpa, &slab);
+            const want: ?ParseError = if (rows == 8) null else error.Overflow;
+            if (!sameRefusal(outcome.refused, want)) {
+                std.debug.print("{d} rows of the widest word: {any}, and the case says {any}\n", .{ rows, outcome, want });
+                return error.TestUnexpectedResult;
+            }
+            if (want == null and outcome.weight.prefix != @as(i64, @intCast(rows)) * span) {
+                std.debug.print("{d} rows of the widest word: {any}\n", .{ rows, outcome });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+/// `Prefix.weightOf` as it stood before the run-level fold, for the nullable
+/// instantiation: one row at a time, with the checked addition per row and an
+/// absent row adding nothing (`column.zig:2172-2181`). The copy, for the
+/// reason `metaWeightOfRows` gives.
+fn optPrefixWeightOfRows(comptime E: type, slab: *const slabmod.Slab) ParseError!E.Weight {
+    var sum: i64 = 0;
+    var dec = try E.WireDecoder.init(slab.data);
+    var i: usize = 0;
+    while (i < slab.len) : (i += 1) {
+        const w = (try dec.next()) orelse return error.InvalidValue;
+        if (w) |v| sum = std.math.add(i64, sum, std.math.cast(i64, v) orelse return error.Overflow) catch return error.Overflow;
+    }
+    return .{ .len = slab.len, .prefix = sum };
+}
+
+test "the nullable instantiation of the same wire folds the same way, and the non-nullable one refuses its null run" {
+    // **The claim is about the wire and not about this codec's payload type.**
+    // `MetaPrefixCodec` takes the non-nullable instantiation of the run-length
+    // codec — `hexane.Rle(u64)` is `RleWith(Leb128, u64, false, false)`
+    // (`rle.zig:1042-1043`), and a metadata word is never absent — but the
+    // argument that a run-level fold steps over no refusal has to hold on the
+    // nullable arm too, where a null run is a run the fold must *serve* rather
+    // than a run it must refuse.
+    //
+    // **The nullable fold is the crate's own** (`hexane.Prefix`,
+    // `column.zig:2059-2061`), so the run-level walk below is production code,
+    // and the row walk beside it is a copy of the branch it replaced
+    // (`column.zig:2172-2181`).
+    const gpa = testing.allocator;
+    const Opt = hexane.Prefix(?u64);
+
+    // Three rows of length five, a null run of four, and a literal run of two.
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(gpa);
+    try leb128.appendSigned(&bytes, gpa, 3);
+    try leb128.appendUnsigned(&bytes, gpa, 5);
+    try leb128.appendSigned(&bytes, gpa, 0);
+    try leb128.appendUnsigned(&bytes, gpa, 4);
+    try leb128.appendSigned(&bytes, gpa, -2);
+    try leb128.appendUnsigned(&bytes, gpa, 7);
+    try leb128.appendUnsigned(&bytes, gpa, 9);
+    const owned = try gpa.dupe(u8, bytes.items);
+    defer gpa.free(owned);
+    const slab: slabmod.Slab = .{ .data = owned, .len = 9, .segments = 0, .tail = .zero };
+
+    const runs = Opt.weightOf(gpa, &slab);
+    const rows = optPrefixWeightOfRows(Opt, &slab);
+    const a: WalkOutcome = if (runs) |w| .{ .weight = w, .refused = null } else |e| .{ .weight = .{}, .refused = e };
+    const b: WalkOutcome = if (rows) |w| .{ .weight = w, .refused = null } else |e| .{ .weight = .{}, .refused = e };
+    if (!sameRefusal(a.refused, b.refused) or a.weight.len != b.weight.len or a.weight.prefix != b.weight.prefix) {
+        std.debug.print("nullable: over runs {any} | over rows {any}\n", .{ a, b });
+        return error.TestUnexpectedResult;
+    }
+    // Three rows of five, four absent rows adding nothing, and two of 7 and 9.
+    if (a.refused != null or a.weight.len != 9 or a.weight.prefix != 31) {
+        std.debug.print("nullable: {any}, and the model says 31 over nine rows\n", .{a});
+        return error.TestUnexpectedResult;
+    }
+
+    // **The same bytes on the instantiation `value_meta` is written under**,
+    // where the null run is refused at `enterRun` rather than served as the
+    // prefix identity — and both walks refuse it, which is the point: the fold
+    // does not step over the one run kind it cannot fold.
+    {
+        const outcome = try sameMetaWeight(gpa, &slab);
+        if (!sameRefusal(outcome.refused, error.UnexpectedNull)) {
+            std.debug.print("a null run in a column with none: {any}\n", .{outcome});
+            return error.TestUnexpectedResult;
+        }
+    }
+    // **And stopping short of it answers**, which is the other half: the three
+    // rows carry the values 5, 5 and 5 read as metadata *words*, so each of
+    // them declares a length of `5 >> 4 = 0`, and the null run behind them was
+    // never opened by either walk.
+    {
+        const short: slabmod.Slab = .{ .data = owned, .len = 3, .segments = 0, .tail = .zero };
+        const outcome = try sameMetaWeight(gpa, &short);
+        if (outcome.refused != null or outcome.weight.len != 3 or outcome.weight.prefix != 0) {
+            std.debug.print("three rows in front of the null run: {any}\n", .{outcome});
+            return error.TestUnexpectedResult;
         }
     }
 }

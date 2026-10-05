@@ -93,6 +93,43 @@
 //! passes is not a check, and a green suite over one is not evidence. The
 //! test below the checkers' own compares the two answers unconditionally.
 //!
+//! **The lesson was applied a second time, to
+//! [`OpSet.queryInsertAt`]'s own cross-check
+//! (`op_set.rs:584-596`).** That one is *not* upstream's feature gate but a
+//! plain `debug_assert_eq!`, so upstream pays nothing for it — its release
+//! profile leaves `debug_assertions` off
+//! ([`rust/Cargo.toml`:14-16](../../github-automerge-automerge/rust/Cargo.toml))
+//! — and this port ran it in every build. The general answer is a
+//! whole-object walk, so an always-on cross-check is O(rows in the object) on
+//! every list and text insert at a non-zero index: **50 000 ascending inserts
+//! in one transaction measured about 1011 s and ~4.69e12 instructions**, the
+//! fixture of a benchmark whose own subject took 16.1 s. It is behind
+//! [`check_slow_paths`] now, and the same test arrangement covers it: a test
+//! calls [`OpSet.queryInsertAtSlow`] directly and compares both answers in
+//! every build. **The gate decides whether the *write path* pays for the
+//! comparison; it does not decide whether the comparison is made.**
+//!
+//! **The lesson was applied a third time, to
+//! [`OpSet.seekListOpid`]'s cross-check (`op_set.rs:846`), and that one was
+//! paid on every cursor resolve.** Upstream spells it a plain
+//! `debug_assert_eq!` too, so the same argument holds: upstream's release
+//! profile compiles it out and pays nothing. Here the second arm is
+//! [`OpSet.seekListOpidSlow`] — [`OpSet.iterObjAndFind`] plus a
+//! [`Self.Grouped`](op_set.zig) walk over **every** register in the object —
+//! so an always-on comparison is O(rows in the object) on
+//! `Transaction.joinBlock`, on [`OpSet.parentObject`]'s `.seq` arm
+//! (`Parents.next`, and `read.parents`) and on `PatchBuilder.getPath` through
+//! `doc.objectParent`. It is behind [`check_slow_paths`] now, and the same
+//! test arrangement covers it: three tests call
+//! [`OpSet.seekListOpidFast`] and [`OpSet.seekListOpidSlow`] directly and
+//! compare both answers with [`foundOpIdEqual`] in every build. **The gate
+//! decides whether the read and write paths pay for the comparison; it does
+//! not decide whether the comparison is made.**
+//!
+//! **One cross-check is still ungated**, and it is the one that is cheap:
+//! [`OpSet.findOpByIdAndVis`], whose slow arm stops at the end of the row's
+//! own register (`op_set.rs:1131-1132`). See [`check_slow_paths`].
+//!
 //! # What this file does not declare
 //!
 //! Four of upstream's query accessors — `keys`, `spans`, `list_range`,
@@ -2373,9 +2410,33 @@ pub fn OpSet(comptime O: type) type {
         /// has already received in this pass (`:262-268`): because the pass is
         /// backwards, the count is the position from the end, and the new
         /// `succ_count` is the row's old count plus that.
+        ///
+        /// **The buffer's width comes from this pass, not from a walk over the
+        /// column set**, for the reason
+        /// [`OpSet.addSuccWithUndo`] gives and by the same two facts: the mark
+        /// [`OpSet.succ_scratch_width`] already holds is at least
+        /// [`opiter.maxSuccCount`] over everything, and the only rows this
+        /// pass can have widened are the ones it wrote, each of which now
+        /// holds the count [`OpSet.writeSuccColumns`] returned. So the maximum
+        /// after the pass is `max(succ_scratch_width, want)` — the same mark and
+        /// the same buffer length [`OpSet.refitScratch`] would have left, for
+        /// the length of `inserts` instead of the length of the document.
+        ///
+        /// **A caller that cannot name the width must call
+        /// [`OpSet.refitScratch`].** This method can: it is handed every edge it
+        /// is about to publish.
+        ///
+        /// **The refusal still fires where it did.** The widening is the last
+        /// step, after every column write, exactly as the walk was — so a
+        /// resize this cannot pay for still leaves the edges published, the
+        /// mark behind the buffer, and `error.OutOfMemory` on the way out.
         pub fn addSucc(self: *Self, inserts: []const SuccInsert) ParseError!void {
             var succ_inc: usize = 0;
             var last_pos: ?usize = null;
+            // **The widest count this pass publishes**, kept here so the
+            // buffer's high-water mark can be raised without walking
+            // `succ_count` again ([`OpSet.reserveScratchTo`]).
+            var want: usize = 0;
             var i = inserts.len;
             while (i > 0) {
                 i -= 1;
@@ -2386,9 +2447,9 @@ pub fn OpSet(comptime O: type) type {
                     last_pos = item.pos;
                     succ_inc = 1;
                 }
-                try self.writeSuccEdge(item, succ_inc);
+                want = @max(want, @as(usize, try self.writeSuccEdge(item, succ_inc)));
             }
-            try self.refitScratch();
+            try self.reserveScratchTo(want);
         }
 
         /// Adds a successor edge to each of `inserts` and records what undoing
@@ -2639,9 +2700,9 @@ pub fn OpSet(comptime O: type) type {
         /// `succ_count` and the flattened pair the same length.
         ///
         /// **Returns the count it wrote**, which is the row's width after the
-        /// edge and so the whole of what [`OpSet.addSuccWithUndo`] needs to
-        /// keep the successor buffer wide without a pass over the column set
-        /// ([`OpSet.reserveScratchTo`]).
+        /// edge and so the whole of what [`OpSet.addSuccWithUndo`] and
+        /// [`OpSet.addSucc`] need to keep the successor buffer wide without a
+        /// pass over the column set ([`OpSet.reserveScratchTo`]).
         fn writeSuccColumns(self: *Self, item: SuccInsert, succ_inc: usize) ParseError!u32 {
             const new_count = std.math.add(u64, item.len, succ_inc) catch return error.Overflow;
             const count = std.math.cast(u32, new_count) orelse return error.Overflow;
@@ -2671,10 +2732,12 @@ pub fn OpSet(comptime O: type) type {
         /// A delete (`inc == null`) takes the row out of `visible`, out of
         /// the text index and out of `top` — the same three columns
         /// `add_succ_with_undo` records and then writes, in the other order.
-        fn writeSuccEdge(self: *Self, item: SuccInsert, succ_inc: usize) ParseError!void {
-            // The count is [`OpSet.addSucc`]'s business only through
-            // [`OpSet.refitScratch`], which reads the width out of the columns.
-            _ = try self.writeSuccColumns(item, succ_inc);
+        fn writeSuccEdge(self: *Self, item: SuccInsert, succ_inc: usize) ParseError!u32 {
+            // The count is handed back because [`OpSet.addSucc`] takes the
+            // successor buffer's width from this pass rather than from a walk
+            // over the columns ([`OpSet.reserveScratchTo`]), and this is the
+            // number that walk would have found on this row.
+            const count = try self.writeSuccColumns(item, succ_inc);
             if (item.inc == null) {
                 var s_vis = try self.cols.index.visible.stageSplice(item.pos, 1, &.{false});
                 defer s_vis.deinit();
@@ -2686,6 +2749,7 @@ pub fn OpSet(comptime O: type) type {
                 s_text.publish(&self.cols.index.text);
                 s_top.publish(&self.cols.index.top);
             }
+            return count;
         }
 
         /// Widens the successor buffer to the widest row in the op set, and
@@ -2693,21 +2757,24 @@ pub fn OpSet(comptime O: type) type {
         ///
         /// **This is the only step that reads the width out of the columns**,
         /// so every path that can make a row wider either runs it or can name
-        /// the width without it: the load ([`OpSet.fromParts`]) and the three
-        /// that leave the columns to speak for themselves
-        /// ([`OpSet.addSucc`], [`OpSet.undoSucc`], [`OpSet.undoOp`]); the row
-        /// splice ([`OpSet.splice`], against [`OpSet.reserveScratchFor`]); and
-        /// the edge pass ([`OpSet.addSuccWithUndo`], against
-        /// [`OpSet.reserveScratchTo`]). A buffer that is already wide enough is
-        /// left alone, so the common case costs one pass over `succ_count` and
-        /// no allocation.
+        /// the width without it. Two leave the columns to speak for themselves
+        /// — the two undo paths ([`OpSet.undoSucc`], [`OpSet.undoOp`]), where
+        /// an undo can only make a row **narrower** and so can never raise the
+        /// high-water mark, and the load ([`OpSet.fromParts`]), which has no
+        /// rows to read the widths off. The other four name it: the row splice
+        /// ([`OpSet.splice`], against [`OpSet.reserveScratchFor`]) and the two
+        /// edge passes ([`OpSet.addSuccWithUndo`] and [`OpSet.addSucc`], both
+        /// against [`OpSet.reserveScratchTo`]). A buffer that is already wide
+        /// enough is left alone, so the common case costs one pass over
+        /// `succ_count` and no allocation — and for the four that name the
+        /// width, not even that.
         ///
         /// **It reads the width out of the columns, so it can only run after
         /// they are written** — which is why [`OpSet.splice`] does not call it,
-        /// and why [`OpSet.addSuccWithUndo`] does not either: both take the
-        /// width from the rows they are about to write or have just written,
-        /// which is the same number this walk arrives at, for the length of
-        /// the change instead of the length of the document.
+        /// and why neither edge pass does: both take the width from the rows
+        /// they are about to write or have just written, which is the same
+        /// number this walk arrives at, for the length of the change instead of
+        /// the length of the document.
         fn refitScratch(self: *Self) ParseError!void {
             const want = try opiter.maxSuccCount(O, &self.cols, .{
                 .start = 0,
@@ -3839,9 +3906,36 @@ pub fn OpSet(comptime O: type) type {
         ///
         /// The fast path for the present and the slow one for a clock, and
         /// **upstream's `debug_assert_eq!` between them is ported as a real
-        /// check** (`:846`). The two arms agree on every document whose index
-        /// is sound, and the check is what says so; where they do not agree the
-        /// check is the answer. **Both arms read `index.visible` for
+        /// check** (`:846`) — **behind [`check_slow_paths`]**. The two arms
+        /// agree on every document whose index is sound, and the check is what
+        /// says so; where they do not agree, the check is the answer.
+        ///
+        /// **Upstream spells that comparison a `debug_assert_eq!` and not a
+        /// `#[cfg(feature = "slow_path_assertions")]` block**, so what it costs
+        /// upstream is nothing: the release profile sets only `lto` and
+        /// `codegen-units`
+        /// ([`rust/Cargo.toml`:14-16](../../github-automerge-automerge/rust/Cargo.toml)),
+        /// which leaves `debug_assertions` off. Inheriting the spelling without
+        /// the profile costs this port a walk: the second arm here is
+        /// [`OpSet.seekListOpidSlow`], which is [`OpSet.iterObjAndFind`] plus
+        /// a [`Self.Grouped`] walk over **every** register in the object, so the
+        /// comparison is O(rows in the object) on every call, and every caller
+        /// is a hot one — `Transaction.joinBlock` (`transact.zig:1096`),
+        /// [`OpSet.parentObject`]'s `.seq` arm (which is `Parents.next`,
+        /// `parents.zig:336`, and `read.parents`) and
+        /// [`PatchBuilder.getPath`](patches.zig) through `doc.objectParent`
+        /// (`patches.zig:1758`). This is the same argument and the same
+        /// disposition as [`OpSet.queryInsertAt`]'s gate, for the same
+        /// upstream spelling.
+        ///
+        /// **The gate decides whether the write and read paths pay for the
+        /// comparison; it does not decide whether the comparison is made.**
+        /// Three tests call [`OpSet.seekListOpidFast`] and
+        /// [`OpSet.seekListOpidSlow`] directly and compare both answers with
+        /// [`foundOpIdEqual`] — the function this gate calls — so the
+        /// comparison runs in every build.
+        ///
+        /// **Both arms read `index.visible` for
         /// [`FoundOpId.visible`](op_set.zig)** — upstream's read `index.top`
         /// (`op_set.rs:867`) and `index.text` (`:872`) against the walk's
         /// `ops.ops.contains` (`:890`), which are two different questions and
@@ -3856,8 +3950,10 @@ pub fn OpSet(comptime O: type) type {
         ) (ReadOpError || SearchError || InternalError)!?FoundOpId {
             if (c) |cover| return self.seekListOpidSlow(obj, opid, seq_type, cover);
             const fast = try self.seekListOpidFast(obj, opid, seq_type);
-            const slow = try self.seekListOpidSlow(obj, opid, seq_type, null);
-            if (!foundOpIdEqual(fast, slow)) return error.Invariant;
+            if (check_slow_paths) {
+                const slow = try self.seekListOpidSlow(obj, opid, seq_type, null);
+                if (!foundOpIdEqual(fast, slow)) return error.Invariant;
+            }
             return fast;
         }
 
@@ -3876,8 +3972,10 @@ pub fn OpSet(comptime O: type) type {
         /// register. [`OpSet.validateTopIndex`] is the checker for it
         /// (upstream's `assert_eq!(first_top, last_vis)`, `op_set.rs:196-212`),
         /// and [`OpSet.seekListOpid`]'s cross-check is what reports a document
-        /// that breaks it. A register with two winners makes the prefix count
-        /// one element too many, and no descent can repair that: the register's
+        /// that breaks it — **under [`check_slow_paths`]**, and by a test on
+        /// both arms in every build either way.
+        /// **A register with two winners makes the prefix count** one element
+        /// too many, and no descent can repair that: the register's
         /// first row is only findable by walking back over the key column,
         /// which is the walk [`OpSet.seekListOpidSlow`] already does. So the
         /// answer there is the disagreement, not a number.
@@ -3946,7 +4044,7 @@ pub fn OpSet(comptime O: type) type {
         /// contributed no width and the accumulated index is exactly the
         /// index the prefix descent in [`OpSet.seekListOpidFast`] reports.
         /// Returning `null` here instead made the two disagree, and
-        /// [`OpSet.seekListOpid`]'s cross-check answer `error.Invariant` for a
+        /// [`OpSet.seekListOpid`]'s cross-check answered `error.Invariant` for a
         /// document a cursor has to resolve: a cursor on an element that was
         /// deleted, in an object where everything after it was deleted too.
         /// That is the `MoveCursor` case `MoveCursor::After` is defined by
@@ -4166,6 +4264,24 @@ pub fn OpSet(comptime O: type) type {
         /// is a bug rather than a document, and a bug that would otherwise be
         /// visible only as a wrong insertion point in a debug build.
         ///
+        /// **It is behind [`check_slow_paths`], and it was not always.** The
+        /// check is upstream's own `debug_assert_eq!`, and upstream's release
+        /// profile sets only `lto` and `codegen-units`
+        /// ([`rust/Cargo.toml`:14-16](../../github-automerge-automerge/rust/Cargo.toml)),
+        /// which leaves `debug_assertions` off — so upstream pays nothing for
+        /// it. This port ran it in every build, and the general answer is a
+        /// whole-object walk, so an always-on cross-check is O(rows in the
+        /// object) on **every** insert at a non-zero index: 50 000 ascending
+        /// inserts in one transaction cost about 1011 s and ~4.69e12
+        /// instructions, near enough all of it this walk. The gate is the same
+        /// one [`OpSet.seekOpsByIndex`] uses (`:3746`), and
+        /// `zig build slow-path` builds this module with the flag on, so the
+        /// arm is still run by a command rather than by an option nobody
+        /// passes. **A test below the checkers' own calls
+        /// [`OpSet.queryInsertAtSlow`] and compares both answers in every
+        /// build** — the same arrangement as `seekOpsByIndex` (`:9176-9185`),
+        /// and the reason this check was kept rather than deleted.
+        ///
         /// The general walk is [`insertmod.InsertQuery`], and **`resolve` is
         /// called exactly once per query**: it consumes the walk and half-folds
         /// the mark state, and there is no way to un-fold it
@@ -4190,17 +4306,48 @@ pub fn OpSet(comptime O: type) type {
                 else
                     try self.queryInsertAtText(gpa, obj, index);
                 if (fast) |answer| {
-                    // op_set.rs:584-596 — the general answer, computed and
-                    // compared, never returned. **`answer` owns a `MarkSet`**
-                    // (`insert.zig:203-206`), so the disagreement has to give
-                    // it back before the error leaves; otherwise every
-                    // cross-check failure leaks the fast path's mark set and
-                    // `std.testing.allocator` aborts the whole run.
                     var owned = answer;
                     errdefer owned.deinit(gpa);
-                    var slow = try self.queryInsertAtSlow(gpa, obj, index, seq_type, c);
-                    defer slow.deinit(gpa);
-                    if (!queryNthEqual(owned, slow)) return error.Invariant;
+                    // **`queryInsertAtSlow` is the cross-check, and it is behind
+                    // [`check_slow_paths`]** — the same gate
+                    // [`OpSet.seekOpsByIndex`] puts its own cross-check behind
+                    // (`:3746`), for the same reason.
+                    //
+                    // **The justification is upstream's spelling, not
+                    // upstream's feature.** The check itself is upstream's own
+                    // `debug_assert_eq!` at `op_set.rs:584-596` — the same
+                    // `InsertQuery::new(self.iter_obj(obj), ..).resolve(0)`
+                    // walk, compared and thrown away — and **upstream's
+                    // release profile sets only `lto` and `codegen-units`**
+                    // ([`rust/Cargo.toml`:14-16](../../github-automerge-automerge/rust/Cargo.toml)),
+                    // which leaves `debug_assertions` off, so upstream pays
+                    // **zero** for it in a release build. The port ran it in
+                    // every build, always, which is the divergence.
+                    //
+                    // **And the walk is O(rows in the object) per call, so
+                    // always-on is not a rounding error.** It is a whole
+                    // `iterObj` walk on every list and text insert at a
+                    // non-zero index, which turns a transaction of *n* such
+                    // inserts into O(n²): measured, 50 000 inserts at
+                    // ascending positions in one transaction cost about
+                    // 1011 s and roughly 4.69e12 instructions, ~98% of the
+                    // whole process. Two O(rows)-per-insert stages sat on the
+                    // write path; this is the dominant one.
+                    //
+                    // **`errdefer owned.deinit(gpa)` stays outside the gate**
+                    // (`op_set.rs:594-596` is where the answer's own `MarkSet`
+                    // is at stake): `answer` owns a `MarkSet`
+                    // ([insert.zig](insert.zig):203-206), and a disagreement
+                    // has to give it back before the error leaves, or every
+                    // cross-check failure leaks the fast path's mark set and
+                    // `std.testing.allocator` aborts the whole run. With the
+                    // gate on, `defer slow.deinit(gpa)` gives the walk's own
+                    // answer back on both exits.
+                    if (check_slow_paths) {
+                        var slow = try self.queryInsertAtSlow(gpa, obj, index, seq_type, c);
+                        defer slow.deinit(gpa);
+                        if (!queryNthEqual(owned, slow)) return error.Invariant;
+                    }
                     return owned;
                 }
             }
@@ -4213,6 +4360,22 @@ pub fn OpSet(comptime O: type) type {
         /// The walk is [`OpSet.iterObj`] — `scopeToObj` then `iterRange` — and
         /// the `0` is how much of the target the walk has already accounted
         /// for, which for the general path is nothing.
+        ///
+        /// **It is O(rows in the object), and that is what the gate is about.**
+        /// Two callers, and **only one of them is conditional**:
+        ///
+        /// 1. [`OpSet.queryInsertAt`]'s own fallback, at `:4354`, for a clock,
+        ///    index zero, or a fast descent that found nothing. **That one is
+        ///    ungated and must stay that way** — it is not a check, it is the
+        ///    answer. `op_set.rs:600-608` is where upstream computes it for
+        ///    those cases too, unconditionally, and a fast descent finding
+        ///    nothing is upstream's `if let Some(q)` falling through
+        ///    (`:583`, `:597`), not a condition this port may narrow. Gating
+        ///    it would leave those three cases with **no answer at all**.
+        /// 2. The fast/slow cross-check, behind [`check_slow_paths`].
+        ///
+        /// A test calls this directly (`:8269-8295`), which is the default
+        /// build's witness for the second caller.
         fn queryInsertAtSlow(
             self: *Self,
             gpa: Allocator,
@@ -4389,7 +4552,9 @@ pub fn OpSet(comptime O: type) type {
                             // (`insert.zig:530-540`) and the two must not drift:
                             // they are two walks over one rule, and
                             // `queryInsertAt`'s cross-check reports a disagreement
-                            // between them as `error.Invariant`.
+                            // between them as `error.Invariant` — **behind
+                            // [`check_slow_paths`]**, so it is
+                            // `zig build slow-path` that sees it.
                             if (switch (m) {
                                 .start => e,
                                 .end => !e,
@@ -5240,10 +5405,11 @@ pub fn OpSet(comptime O: type) type {
 /// Whether the fast paths cross-check themselves against the slow ones
 /// (upstream's `slow_path_assertions` feature, `plan.md` §2).
 ///
-/// Upstream gates two of the four cross-checks behind the feature
-/// (`op_set.rs:645-649`, `:1088-1089`) and leaves the other two as plain
+/// Upstream gates two of its cross-checks behind the feature
+/// (`op_set.rs:645-649`, `:1088-1089`) and leaves three as plain
 /// `debug_assert_eq!`s (`:584-596`, `:846`, `:1107`). This is the port's
-/// spelling of the gate for the two upstream gated.
+/// spelling of the gate, and **the port applies it to more than the two
+/// upstream gates it**, for the reason the next paragraph gives.
 ///
 /// **The value is `-Dslow-path`, not a literal.** It was `= false` until the
 /// option existed, and a `const` next to the checks it gates is a constant
@@ -5252,16 +5418,53 @@ pub fn OpSet(comptime O: type) type {
 /// a build with no `-Dslow-path` leaves both compiled out, which is
 /// upstream's default feature set.
 ///
-/// **The other two are not behind it.** They are cheap and upstream has them
-/// as `debug_assert_eq!`s, so a mismatch is a bug that would otherwise surface
-/// only in a debug build: [`OpSet.queryInsertAt`](op_set.zig) against the
-/// general walk, and [`OpSet.seekListOpid`](op_set.zig) and
-/// [`OpSet.findOpByIdAndVis`](op_set.zig) between their two paths. All three
-/// report `error.Invariant`.
+/// **One cross-check is NOT behind it, and this paragraph used to give a
+/// reason that was wrong.** [`OpSet.findOpByIdAndVis`](op_set.zig) compares
+/// its two paths on every call and reports `error.Invariant`.
 ///
-/// A test compares the fast and the slow answer for
-/// [`OpSet.seekOpsByIndex`](op_set.zig) directly, so the check is exercised
-/// whether or not this is set.
+/// The text here used to name three ungated cross-checks — this one,
+/// [`OpSet.seekListOpid`](op_set.zig) and [`OpSet.queryInsertAt`](op_set.zig)
+/// — and call all three "cheap", on the grounds that upstream spells them
+/// `debug_assert_eq!`s. **Only this one is cheap, and the reason is the walk,
+/// not the spelling.** A register lookup is a descent and a row-by-id lookup
+/// is one indexed read, but their *slow* arms are not the same cost:
+/// [`OpSet.findOpByIdAndVisSlow`] stops at the first row outside the row's
+/// own register (`op_set.rs:1131-1132`), so it is O(register length) beside
+/// the work it checks.
+///
+/// **`queryInsertAt`'s general answer is not cheap**: it is
+/// `InsertQuery::new(self.iter_obj(obj), ..).resolve(0)`
+/// ([`op_set.rs`:584-596](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)),
+/// **a whole-object walk on every insert at a non-zero index**.
+/// **`seekListOpidSlow` is not cheap either**: [`OpSet.iterObjAndFind`] plus
+/// a [`Self.Grouped`] walk over **every** register in the object, so the
+/// comparison is O(rows in the object) — on `Transaction.joinBlock`
+/// (`transact.zig:1096`), on [`OpSet.parentObject`]'s `.seq` arm and
+/// `read.parents`, and on `PatchBuilder.getPath` through `doc.objectParent`
+/// (`patches.zig:1758`).
+///
+/// Upstream's `debug_assert_eq!`s were free to upstream only because
+/// upstream's release profile leaves `debug_assertions` off
+/// ([`rust/Cargo.toml`:14-16](../../github-automerge-automerge/rust/Cargo.toml));
+/// inheriting the spelling without the profile made `queryInsertAt` O(rows)
+/// here, and 50 000 ascending inserts in one transaction measured about
+/// 1011 s and ~4.69e12 instructions. **Both are behind the flag now**
+/// ([`OpSet.queryInsertAt`](op_set.zig):`:4346-4350`,
+/// [`OpSet.seekListOpid`](op_set.zig):`:3953-3956`) — the same upstream
+/// spelling, the same argument and the same disposition for both.
+/// `findOpByIdAndVis` stays ungated, because it is the cheap one — which is
+/// the claim this paragraph can actually make.
+///
+/// **Every gated comparison has a default-build witness.** Tests call
+/// [`OpSet.seekOpsByIndexSlow`](op_set.zig),
+/// [`OpSet.queryInsertAtSlow`](op_set.zig),
+/// [`OpSet.seekListOpidFast`](op_set.zig) and
+/// [`OpSet.seekListOpidSlow`](op_set.zig) directly and compare both answers
+/// with the same equality functions the gates call
+/// ([`opsFoundEqual`](op_set.zig), [`queryNthEqual`](op_set.zig),
+/// [`foundOpIdEqual`](op_set.zig)), so the comparisons are exercised whether
+/// or not this is set. **The gate decides whether the read and write paths
+/// pay for a comparison; it does not decide whether a comparison is made.**
 pub const check_slow_paths: bool = build_options.check_slow_paths;
 
 /// What a value search can raise. [`btree.TreeError`] is not a subset of
@@ -7904,6 +8107,79 @@ test "addSucc places an edge and takes it away with the same round trip" {
     try sameCheckpoint(built.before, after);
 }
 
+test "addSucc takes its buffer width from the edges it published, not from a walk" {
+    const gpa = testing.allocator;
+    var table = Table.init(gpa);
+    defer table.deinit();
+    var built = try counterSet(gpa, &table);
+    defer built.set.deinit();
+    defer built.before.deinit(gpa);
+
+    // **Both rows arrive with no successors**, so [`OpSet.splice`] reserved
+    // against a zero width and the buffer is empty. This is the same starting
+    // point the [`OpSet.addSuccWithUndo`] witness starts from, and the claim
+    // under test is the same one stated for the other entry point: **the
+    // width is the widest count this pass wrote, and it is the width a walk
+    // over `succ_count` reads back.**
+    try testing.expectEqual(@as(usize, 0), built.set.succ_scratch.items.len);
+    try testing.expectEqual(@as(usize, 0), built.set.succ_scratch_width);
+
+    // **An empty list publishes nothing and reserves nothing.**
+    try built.set.addSucc(&.{});
+    try testing.expectEqual(@as(usize, 0), built.set.succ_scratch_width);
+    try testing.expectEqual(@as(usize, 0), built.set.succ_scratch.items.len);
+    try expectScratchCoversRows(&built.set);
+
+    // **Two edges onto row 0 make the widest row two wide.** The mark and the
+    // buffer land on exactly what the walk over `succ_count` finds, so the
+    // width taken off the edges is the width out of the columns.
+    const two = [_]opmod.SuccInsert{
+        .{ .id = opId(4, 0), .pos = 0, .inc = 7, .len = 0, .sub_pos = 0 },
+        .{ .id = opId(3, 0), .pos = 0, .inc = 7, .len = 0, .sub_pos = 0 },
+    };
+    try built.set.addSucc(&two);
+    try testing.expectEqual(@as(u32, 2), (try built.set.cols.succ_count.get(0)).?);
+    try testing.expectEqual(
+        @as(usize, 2),
+        try opiter.maxSuccCount(TestRow, &built.set.cols, .{ .start = 0, .end = built.set.len() }),
+    );
+    try testing.expectEqual(@as(usize, 2), built.set.succ_scratch_width);
+    try testing.expectEqual(@as(usize, 2), built.set.succ_scratch.items.len);
+    try expectScratchCoversRows(&built.set);
+
+    // **An empty list after a widening leaves the mark where it is** — the
+    // mark is a high-water mark, and a pass which publishes nothing neither
+    // walks nor resizes.
+    try built.set.addSucc(&.{});
+    try testing.expectEqual(@as(usize, 2), built.set.succ_scratch_width);
+    try testing.expectEqual(@as(usize, 2), built.set.succ_scratch.items.len);
+
+    // **And a pass that does widen still widens.** Three more edges onto row 1,
+    // already one wide after the first of them, take it past the mark — and
+    // the buffer follows, because the last edge the pass publishes is the
+    // widest count it wrote.
+    try built.set.addSucc(&.{try edgeOnto(&built.set, 1, opId(5, 0))});
+    try testing.expectEqual(@as(u32, 1), (try built.set.cols.succ_count.get(1)).?);
+    try testing.expectEqual(@as(usize, 2), built.set.succ_scratch_width);
+    try testing.expectEqual(@as(usize, 2), built.set.succ_scratch.items.len);
+    try expectScratchCoversRows(&built.set);
+
+    const three = [_]opmod.SuccInsert{
+        try edgeOnto(&built.set, 1, opId(7, 0)),
+        try edgeOnto(&built.set, 1, opId(6, 0)),
+        try edgeOnto(&built.set, 1, opId(8, 0)),
+    };
+    try built.set.addSucc(&three);
+    try testing.expectEqual(@as(u32, 4), (try built.set.cols.succ_count.get(1)).?);
+    try testing.expectEqual(
+        @as(usize, 4),
+        try opiter.maxSuccCount(TestRow, &built.set.cols, .{ .start = 0, .end = built.set.len() }),
+    );
+    try testing.expectEqual(@as(usize, 4), built.set.succ_scratch_width);
+    try testing.expectEqual(@as(usize, 4), built.set.succ_scratch.items.len);
+    try expectScratchCoversRows(&built.set);
+}
+
 // ── Where a new row goes ───────────────────────────────────────────────────
 
 test "queryInsertAt answers at the front, in the middle and at the end, with and without a clock" {
@@ -7929,10 +8205,19 @@ test "queryInsertAt answers at the front, in the middle and at the end, with and
         try testing.expect(head.eql(q.elemid));
     }
 
-    // **Index 1**, which takes the prefix descent and then cross-checks it
-    // against the general walk (`op_set.rs:584-596`). `queryInsertAt` returns
-    // `error.Invariant` if the two disagree, so reaching the end of this block
-    // *is* the cross-check passing; it is also made explicit below.
+    // **Index 1**, which takes the prefix descent (`queryInsertAtList`) rather
+    // than the general walk (`op_set.rs:576-599`).
+    //
+    // **What this block asserts is the prefix descent's answer, pinned to
+    // literals** — `pos` 6, `index` 1, the element anchored to row 7. It is
+    // not asserting anything through `error.Invariant`, and it did once: the
+    // comment here used to say that reaching the end of the block *was* the
+    // cross-check passing, because [`OpSet.queryInsertAt`] compared the two
+    // answers unconditionally. **That cross-check is now behind
+    // [`check_slow_paths`]** (`:4323-4327`), so the assertion through the
+    // error is gone from this block and what remains is the literal. The
+    // agreement between the two answers is asserted directly, and in every
+    // build, further down in this same test.
     {
         var q = try doc.set.queryInsertAt(gpa, list_obj, 1, .list, null);
         defer q.deinit(gpa);
@@ -7966,20 +8251,56 @@ test "queryInsertAt answers at the front, in the middle and at the end, with and
         }
     }
 
-    // **The fast and the general answer agree**, stated directly rather than
-    // only through the `error.Invariant` [`OpSet.queryInsertAt`] raises.
+    // **The contract, and it is the one the gate used to assert for free: the
+    // fast answer and the general answer are the same answer, on both sequence
+    // types, at every non-zero index the fast path takes.**
+    //
+    // **The fast answer is asked of `queryInsertAtList`/`queryInsertAtText`
+    // directly, not of [`OpSet.queryInsertAt`].** Two reasons, and the second
+    // is the one that matters: `queryInsertAt` answers the general walk
+    // whenever the descent finds nothing (`op_set.rs:583`, `:600-608`), so a
+    // comparison of `queryInsertAt` against `queryInsertAtSlow` would compare
+    // the walk with itself and pass **vacuously** on any index the fast path
+    // does not reach. `expect(fast != null)` is what stops that.
+    //
+    // `queryNthEqual` is the same function the gated arm calls
+    // ([`queryInsertAt`](op_set.zig)), so this is the gate's comparison and not
+    // a copy of it, and it runs in **every** build — the arrangement
+    // `seekOpsByIndex` uses (`op_set.zig:9176-9185`) and the reason the module
+    // doc calls it a lesson rather than a convenience.
     for ([_]usize{ 1, 2 }) |index| {
-        var fast = try doc.set.queryInsertAt(gpa, list_obj, index, .list, null);
-        defer fast.deinit(gpa);
-        var slow = try doc.set.queryInsertAtSlow(gpa, list_obj, index, .list, null);
-        defer slow.deinit(gpa);
-        try testing.expect(queryNthEqual(fast, slow));
+        var list_fast = try doc.set.queryInsertAtList(gpa, list_obj, index);
+        try testing.expect(list_fast != null);
+        defer list_fast.?.deinit(gpa);
+        var list_slow = try doc.set.queryInsertAtSlow(gpa, list_obj, index, .list, null);
+        defer list_slow.deinit(gpa);
+        try testing.expect(queryNthEqual(list_fast.?, list_slow));
+        // And the dispatcher hands back that same answer, whichever arm it
+        // took, so the gate compares the answer the caller actually receives.
+        var dispatched = try doc.set.queryInsertAt(gpa, list_obj, index, .list, null);
+        defer dispatched.deinit(gpa);
+        try testing.expect(queryNthEqual(dispatched, list_slow));
+    }
+    // **The text object is the other fast path** (`queryInsertAtText`), and
+    // index 1 is the mark case the block below is about: it is the one index
+    // where the fast answer and the walk have both been wrong before, so it is
+    // the one that must be compared here.
+    {
+        var text_fast = try doc.set.queryInsertAtText(gpa, text_obj, 1);
+        try testing.expect(text_fast != null);
+        defer text_fast.?.deinit(gpa);
+        var text_slow = try doc.set.queryInsertAtSlow(gpa, text_obj, 1, .text, null);
+        defer text_slow.deinit(gpa);
+        try testing.expect(queryNthEqual(text_fast.?, text_slow));
+        var dispatched = try doc.set.queryInsertAt(gpa, text_obj, 1, .text, null);
+        defer dispatched.deinit(gpa);
+        try testing.expect(queryNthEqual(dispatched, text_slow));
     }
 
-    // **The text object** takes the other fast path, and the same three
-    // positions are the three answers. The text reads "ba" — "b" is row 8 and
-    // "a" is row 11, with the mark's two rows between them contributing no
-    // width.
+    // **The text object**, where index 0 takes the general walk directly and
+    // index 1 takes the text fast path (compared against the walk in the block
+    // above). The text reads "ba" — "b" is row 8 and "a" is row 11, with the
+    // mark's two rows between them contributing no width.
     {
         var q = try doc.set.queryInsertAt(gpa, text_obj, 0, .text, null);
         defer q.deinit(gpa);
@@ -8019,7 +8340,13 @@ test "queryInsertAt answers at the front, in the middle and at the end, with and
     // in one element register and made the end top — a `Some(0)` the scan
     // stopped at, whose `End(10)` had no `Start(10)` to truncate because the
     // begin had been stepped over. The fast path then answered `11` against
-    // the walk's `9` and `queryInsertAt` raised `error.Invariant`.
+    // the walk's `9`, which [`OpSet.queryInsertAt`] reported as
+    // `error.Invariant` **while its cross-check ran unconditionally**. That
+    // cross-check is behind [`check_slow_paths`] now, so it would not fire in a
+    // default build — **and the `9` asserted in the block below is what holds
+    // the line here instead**, alongside the direct fast-versus-walk
+    // comparison above it. The comparison, not the gate, is the witness.
+    //
     // **That spelling is a shape the reference cannot write**: both halves of
     // a mark are inserts (`inner.rs:827-857`), and `insert_mark_end_after`
     // (`:404-430`) splices the end at `begin.pos + 1` keyed to
@@ -10989,13 +11316,17 @@ test "a register that merged into a conflict answers one index and one visibilit
 
     // **The checked entry point, which is what every caller reaches, and the
     // line this whole test is about.** `getCursorPosition` (`cursor.zig:788`),
-    // `getCursor` (`cursor.zig:727`) and `parentObject` (`op_set.zig:2465`) all
-    // go through [`OpSet.seekListOpid`], and all three are `error.Invariant` on
-    // a document a merge produces — which is what the cross-check at
-    // `op_set.zig:3089` reports when one row of a conflicted register is asked
-    // about. `visible = true` is the only answer a caller can act on: the row
-    // is still in the document, `index.visible` says so, and a reader sees it
-    // as a conflict (`automerge.rs:1803`, the `MoveCursor::Before` test).
+    // `getCursor` (`cursor.zig:727`) and `parentObject` (`op_set.zig:3244`) all
+    // go through [`OpSet.seekListOpid`]. They answered `error.Invariant` on a
+    // document a merge produces — which is what the cross-check at
+    // `op_set.zig:3955` reported when one row of a conflicted register was
+    // asked about, **and what it still reports under
+    // [`check_slow_paths`]**. `visible = true` is the only answer a caller can
+    // act on either way: the row is still in the document, `index.visible` says
+    // so, and a reader sees it as a conflict (`automerge.rs:1803`, the
+    // `MoveCursor::Before` test). The assertion below holds in **both** builds,
+    // because the fast arm is the value handed back on either side of the gate
+    // and the direct arm-by-arm comparison further down is the check itself.
     const answered = (try set.seekListOpid(lst, opId(2, 0), .list, null)).?;
     try testing.expectEqual(@as(usize, 0), answered.index);
     try testing.expectEqual(true, answered.visible);
@@ -11065,10 +11396,10 @@ test "the opid seek's fast arm is the one that answers, and only that arm can ma
     // for the losing row and `index.visible` is true, and the fast arm read
     // `index.top`, so it reported a row a reader can see as gone. Both rows of
     // one element have to answer the same thing, and `seekListOpid` answered
-    // neither — it answered `error.Invariant` (`op_set.zig:3089`). That is the
-    // perturbation, and it fails *only* the fast arm: the walk hands the losing
-    // row over as one of the group's visible rows and has always said so
-    // (`found_op.rs:58-63`).
+    // neither — it answered `error.Invariant` (`op_set.zig:3955`, and only
+    // under [`check_slow_paths`] today). That is the perturbation, and it fails
+    // *only* the fast arm: the walk hands the losing row over as one of the
+    // group's visible rows and has always said so (`found_op.rs:58-63`).
     for ([_]OpId{ opId(2, 0), opId(3, 1) }) |id| {
         const fast = (try set.seekListOpidFast(lst, id, .list)).?;
         const slow = (try set.seekListOpidSlow(lst, id, .list, null)).?;
@@ -11091,15 +11422,18 @@ test "the opid seek's fast arm is the one that answers, and only that arm can ma
 
     // **The half of it that "returns `fast`" alone cannot carry, and why it is
     // here.** The checked entry point hands back `fast`
-    // (`op_set.zig:3090`), and when the two arms agree the two candidates are
+    // (`op_set.zig:3957`), and when the two arms agree the two candidates are
     // the same value, so no caller can tell which one it got — the check makes
     // that unobservable by construction. What *is* observable is the check
     // firing, and it can only fire if **both** arms ran and both computed an
-    // answer: `seekListOpid` at `op_set.zig:3087-3089` is the fast descent, the
+    // answer: `seekListOpid` at `op_set.zig:3951-3955` is the fast descent, the
     // walk, and the comparison, and removing either arm leaves nothing to
-    // disagree. The test below pins that on a document where they do disagree.
-    // Together the two say what this one cannot: the descent ran, it ran with
-    // the arithmetic above, and its value is the one handed back.
+    // disagree. The test below pins that on a document where they do disagree,
+    // **directly on the two arms** so the disagreement is asserted in every
+    // build, and through the entry point as well under
+    // [`check_slow_paths`]. Together the two say what this one cannot: the
+    // descent ran, it ran with the arithmetic above, and its value is the one
+    // handed back.
 }
 
 test "a register with two winners is a broken index, and the cross-check still says so" {
@@ -11153,11 +11487,27 @@ test "a register with two winners is a broken index, and the cross-check still s
     try testing.expectEqual(@as(usize, 0), slow.index);
     try testing.expect(!foundOpIdEqual(fast, slow));
 
-    // **So the check still fires, and it fires here.** Upstream's
-    // `debug_assert_eq!` (`op_set.rs:846`) is the same report with a different
-    // disposition; the port raises the error and returns nothing, which is the
-    // difference between naming a fault and shipping one.
-    try testing.expectError(error.Invariant, set.seekListOpid(lst, opId(3, 0), .list, null));
+    // **So the check still fires, and where it fires is the flag's call.**
+    // Upstream's `debug_assert_eq!` (`op_set.rs:846`) is the same report with a
+    // different disposition — it aborts the process and hands back the fast
+    // answer's own value either way — where the port raises the error and
+    // returns nothing, which is the difference between naming a fault and
+    // shipping one. **The port's version of that comparison is behind
+    // [`check_slow_paths`]**, so the routed entry point's disposition is
+    // asserted on the arm it actually has, and neither branch is a skip: with
+    // the flag on it must raise, and with the flag off it must hand back the
+    // fast arm's value — which is the literal `1` asserted above and is the
+    // wrong element index for this document, so the default build is pinned to
+    // the *answer* the gate produces rather than to the absence of a check.
+    // The disagreement itself is asserted unconditionally three lines up.
+    if (check_slow_paths) {
+        try testing.expectError(error.Invariant, set.seekListOpid(lst, opId(3, 0), .list, null));
+    } else {
+        const routed = (try set.seekListOpid(lst, opId(3, 0), .list, null)).?;
+        try testing.expectEqual(fast.index, routed.index);
+        try testing.expectEqual(fast.visible, routed.visible);
+        try testing.expect(!foundOpIdEqual(fast, slow));
+    }
 }
 
 // ── Differences from upstream, in one place ─────────────────────────────────
@@ -11178,6 +11528,6 @@ test "a register with two winners is a broken index, and the cross-check still s
 // | [`OpSet.propRange`] **walks** the key column and counts the rows below the key to answer an absent key's sorted point | `prop_range` is `key_str.scope_to_value(Some(prop), obj_range)`, one descent ([`op_set.rs:1268-1271`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)) | this port's `key_str` holds interned ids ([plan §5.3](../../docs/plan.md)), which are in first-seen order and not key order, so `scopeToValue` needs sorted values and cannot be used. A walk that finds nothing has no descent to fall out of, so the accumulation is written out: one past the last row whose key sorts below the probe, which is what the descent answers ([`column.rs:958-1000`](../../github-automerge-automerge/rust/automerge/src/op_set2/columns.rs), [hexane/src/tests.rs:3464-3476](../../github-automerge-automerge/rust/hexane/src/tests.rs)). Without it the answer was the object's end, which is right **only** for a key above every key the object holds |
 // | `OpSet.mapRange` takes **no clock** | `map_range` takes one and passes it to `MapRange::new` ([`op_set.rs:396-419`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)) | upstream's four arms are row arithmetic over `key_str` and `obj_range` and never mention the clock; the narrowing happens in the walk. The port puts the clock where it goes — on the walk's constructor ([`OpSet.keys`], [`OpSet.listRange`]) — rather than on the bounds, where nothing would read it |
 // | [`OpSet.idToExid`] answers an [`ExId.id`](../types.zig) — the operation alone — for an index the actor table does not have, and an [`ExId.named`](../types.zig) — the operation **plus the actor's bytes** — for every index it does | `OpSet::id_to_exid` reads `self.actors[id.actor()].clone()` and has no arm that does not ([`op_set.rs:1054-1060`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)); the third field of `ExId::Id` is the actor's bytes precisely so an id survives a renumbering ([`exid.rs:15-18`](../../github-automerge-automerge/rust/automerge/src/exid.rs), read back at [`automerge.rs:744-758`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)) | an index out of range is a row the set should not hold ([`OpSet.splice`] rejects it), and there is no actor to record for one. The bare id is the old behaviour and is what a caller with only an index gets; it is **not** the answer for an index the table *does* have, because that answer used to drop the one field that makes an id mean the same thing in two documents. The actor table is sorted, so interning an actor that sorts first — which is what `isolate` does, with a concurrency actor whose magic bytes are `0x13 b2 23 09` ([`types.rs:23`](../../github-automerge-automerge/rust/automerge/src/types.rs)) — renumbers every index at or above it ([`op_set.rs:1400-1405`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)) |
-// | [`OpSet.queryInsertAt`] **computes the general answer and returns `error.Invariant`** when the two disagree, and [`OpSet.queryInsertAtText`] answers `null` — falling through to the general walk — where `elemid_at` finds no element at the corrected position | `query_insert_at` compares the fast answer with `InsertQuery`'s under a `debug_assert_eq!` and returns `Ok(q)` either way ([`op_set.rs:583-598`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)); `elemid_at(..)?` propagates `None` out of `query_insert_at_text`, which is the same fall-through, and unwrapping there instead is a panic | a `debug_assert_eq!` is compiled out of a release build, so a disagreement between two rules that must give one answer is a wrong insertion point only a debug build sees. Computing both is what makes it a **value** — `error.Invariant` reaches the caller and a test can assert it — rather than a message on stderr. **The extra call is not optional**: the fast path's [`QueryNth`] owns a [`MarkSet`](insert.zig), so the disagreement has to hand it back before the error leaves or every failure leaks and `std.testing.allocator` aborts the run |
+// | [`OpSet.queryInsertAt`] **computes the general answer and returns `error.Invariant`** when the two disagree — **behind [`check_slow_paths`]**, where upstream's `debug_assert_eq!` is compiled out rather than gated — and [`OpSet.queryInsertAtText`] answers `null` — falling through to the general walk — where `elemid_at` finds no element at the corrected position | `query_insert_at` compares the fast answer with `InsertQuery`'s under a `debug_assert_eq!` and returns `Ok(q)` either way ([`op_set.rs:583-598`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)); `elemid_at(..)?` propagates `None` out of `query_insert_at_text`, which is the same fall-through, and unwrapping there instead is a panic | **the gate keeps upstream's cost, which is nothing**: the general answer is a whole-object walk, so an always-on comparison is O(rows in the object) on every list and text insert at a non-zero index, and 50 000 ascending inserts in one transaction measured about 1011 s and ~4.69e12 instructions. With the gate on the disagreement is still a **value** — `error.Invariant` reaches the caller and a test can assert it — rather than a message on stderr, and `zig build slow-path` runs the arm; **a default-build test calls [`OpSet.queryInsertAtSlow`] and compares both answers itself** (`:8078-8122`), so the comparison is made in every build and the write path does not pay for it. **The extra call is not optional when it runs**: the fast path's [`QueryNth`] owns a [`MarkSet`](insert.zig), so the disagreement has to hand it back before the error leaves or every failure leaks and `std.testing.allocator` aborts the run |
 // | [`OpSet.seekListOpidFast`] reads **`index.visible[pos]`** for [`FoundOpId.visible`](op_set.zig), and [`OpSet.seekListOpidSlow`] reads it too whenever there is no clock | `seek_list_opid_fast` sets `visible` from the value the index descent landed on — `index.top` at `op_set.rs:867` and `index.text` at `:872` — and `seek_list_opid_slow` sets it from `ops.ops.contains(&op)` over an `iter_obj(obj).no_marks()` walk (`op_set.rs:886`, `:890`) | the two arms answer **two different questions**, and the `debug_assert_eq!` between them (`op_set.rs:846`) fires on documents a merge produces. `index.top` answers "did this row win its register" and `index.visible` answers "is this row still there" ([`OpSet`](op_set.zig)'s own [`TopIndexFault.top_not_visible`](op_set.zig), upstream's `assert!(vis)` at `op_set.rs:202-203` — the two are separate facts there too). A row that is visible and lost its register to a later conflicting write is the ordinary shape of a merged list, and upstream's fast arm called it gone; and because the walk drops mark rows while the descent counts them, upstream's slow arm called a mark gone too. The only consumer asks the question `index.visible` answers — "is this element still there" ([`automerge.rs:1803`](../../github-automerge-automerge/rust/automerge/src/automerge.rs), [`getCursorPosition`](cursor.zig)'s `found.visible` arm at `cursor.zig:796`) — so **both** arms read that column, and a conflict loser or a mark resolves instead of raising `error.Invariant` |
-// | [`OpSet.seekListOpidFast`]'s **index** is upstream's `prefix.delta` unchanged, and a register with two winners still answers `error.Invariant` | so does upstream (`op_set.rs:868`, `:873`), with the same `debug_assert_eq!` | this is a deliberate non-change, and the reason is that the fast path's index is right wherever the index is sound: a register carries exactly one `index.top` ([`IndexBuilder`](index.zig), `index.rs:223-228`), which is what [`OpSet.validateTopIndex`] asserts (`op_set.rs:196-212`), so the count of winners before a row is the count of registers before it. A register with two winners is a document neither `local_list_op` nor a load can write — an overwrite puts a successor edge on every row of the register (`transact.zig:816-818`) — and the port cannot repair it in one descent, because the register's first row is only findable by walking the key column, which is what the slow arm already does. **So the disagreement is the report**, and it is one another checker names: `final_group_mismatch` at `op_set.rs:196-212` says *which* row and *what*, where `error.Invariant` can only say "these two differ" |
+// | [`OpSet.seekListOpidFast`]'s **index** is upstream's `prefix.delta` unchanged, and a register with two winners answers `error.Invariant` — **behind [`check_slow_paths`]**, and `fast` otherwise | so does upstream (`op_set.rs:868`, `:873`), with the same `debug_assert_eq!`, which its release profile compiles out ([`rust/Cargo.toml`:14-16](../../github-automerge-automerge/rust/Cargo.toml)) | this is a deliberate non-change in the *value*, and the gate is the same one [`OpSet.queryInsertAt`] puts its comparison behind: the check itself is upstream's own, and upstream pays nothing for it, while here the second arm is [`OpSet.seekListOpidSlow`] — [`OpSet.iterObjAndFind`] plus a [`Self.Grouped`] walk over every register in the object — so an always-on comparison is O(rows in the object) on `Transaction.joinBlock` and every cursor resolve. The value is right wherever the index is sound, and that is the reason: a register carries exactly one `index.top` ([`IndexBuilder`](index.zig), `index.rs:223-228`), which is what [`OpSet.validateTopIndex`] asserts (`op_set.rs:196-212`), so the count of winners before a row is the count of registers before it. A register with two winners is a document neither `local_list_op` nor a load can write — an overwrite puts a successor edge on every row of the register (`transact.zig:816-818`) — and the port cannot repair it in one descent, because the register's first row is only findable by walking the key column, which is what the slow arm already does. **So the disagreement is the report**, and it is one another checker names: `final_group_mismatch` at `op_set.rs:196-212` says *which* row and *what*, where `error.Invariant` can only say "these two differ" — and a test asserts that disagreement on both arms directly in **every** build, so the gate decides who pays for the comparison and not whether it is made |

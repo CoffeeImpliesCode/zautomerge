@@ -1002,6 +1002,102 @@ fn reportNonCanonical(
     , .{ seed, if (signed) "signed" else "unsigned", hexOf(input, &inbuf), value, hexOf(canonical, &outbuf) });
 }
 
+// ── Composition: many values, one cursor ────────────────────────────────────
+//
+// Every hot decode path reads varints out of one buffer with a cursor and
+// advances by the `len` this module returns: `columnar/encoding.zig:273-276`
+// and `:558`, `hexane/rle.zig`'s run headers, `hexane/slab.zig:1794-1826`,
+// `storage/chunk.zig`'s chunk walk, `cursor.zig:563-568`, and the prefix fold
+// in `opset/columns.zig`. **The width tables above pin that ONE value decodes
+// to itself; they say nothing about a SEQUENCE of reads**, and what such a
+// loop needs is the composition of the two:
+//
+// * the cursor lands on the byte after the value it just read, so nothing is
+//   skipped and nothing is read twice, and
+// * no read consumes nothing, so a loop that trusts a count terminates.
+//   `opset/columns.zig:264-268` leans on the second by name.
+//
+// This is also the cheapest witness there is for the per-varint cost being
+// constant: the loop below runs 1500 reads over one buffer, and the only thing
+// that makes its total work a function of `count` rather than of
+// `count * written` is that every read consumes the bytes it was owed.
+
+test "a stream of varints decodes value by value and lands exactly on its end" {
+    var prng: std.Random.DefaultPrng = .init(random_seed ^ 0x5738_1E55);
+    const rand = prng.random();
+
+    // 1500 values, half unsigned and half signed, **alternating**, so that a
+    // cursor which lost track of which sign the next value had would read a
+    // u64's bytes as an i64 and be wrong rather than coincidentally right.
+    const count = 1500;
+    var stream: [count * max_signed_size]u8 = undefined;
+    var want_unsigned: [count]u64 = undefined;
+    var want_signed: [count]i64 = undefined;
+    var written: usize = 0;
+
+    for (0..count) |i| {
+        const shift: u6 = rand.intRangeAtMost(u6, 0, 63);
+        if (i % 2 == 0) {
+            // The same four shapes the value sweep draws (`random values round
+            // trip at every width`, :863), so the widths in this stream are
+            // the widths that sweep already reaches.
+            const u: u64 = switch (i % 4) {
+                0 => rand.int(u64),
+                1 => rand.int(u64) >> shift,
+                2 => rand.intRangeAtMost(u64, 0, 16383),
+                else => rand.int(u64),
+            };
+            want_unsigned[i] = u;
+            written += writeUnsigned(stream[written..], u);
+        } else {
+            const s: i64 = switch (i % 4) {
+                0 => rand.int(i64),
+                1 => rand.int(i64) >> shift,
+                2 => rand.intRangeAtMost(i64, -8192, 8191),
+                else => rand.int(i64),
+            };
+            want_signed[i] = s;
+            written += writeSigned(stream[written..], s);
+        }
+    }
+
+    // **The stream is a mixture, or the assertions below prove nothing.** A
+    // buffer of one-byte values would let a reader that consumed the wrong
+    // count still land on the end; a buffer of ten-byte values would let a
+    // reader that consumed a fixed ten still land on it. Both bounds say the
+    // widths actually vary, and one of them is the width the wire mostly
+    // carries.
+    try std.testing.expect(written > count);
+    try std.testing.expect(written < count * max_signed_size);
+
+    var pos: usize = 0;
+    var reads: usize = 0;
+    while (pos < written) {
+        if (reads % 2 == 0) {
+            const got = try readUnsigned(stream[pos..]);
+            // **The no-zero-length rule, at every position in the stream and
+            // not only on a fresh buffer.** A `len` of zero would leave the
+            // cursor where it was and this loop would never end.
+            try std.testing.expect(got.len >= 1);
+            try std.testing.expectEqual(want_unsigned[reads], got.value);
+            pos += got.len;
+        } else {
+            const got = try readSigned(stream[pos..]);
+            try std.testing.expect(got.len >= 1);
+            try std.testing.expectEqual(want_signed[reads], got.value);
+            pos += got.len;
+        }
+        reads += 1;
+    }
+
+    // **The composition, as an equation:** what the encoder spent and what the
+    // decoder walked are the same bytes, and the number of reads is the number
+    // of values — so no value was read twice and none was skipped. A read that
+    // returned the right value with the wrong `len` fails one of the two.
+    try std.testing.expectEqual(written, pos);
+    try std.testing.expectEqual(count, reads);
+}
+
 // Zig 0.16.0 / upstream / Rust / port
 //
 // * **`Leb128TooLarge` is reported as `InvalidLeb128`, and that is a port

@@ -1000,6 +1000,61 @@ test "three queued changes waiting on the same queued change are all released" {
     try testing.expect(f.queue.isEmpty());
 }
 
+test "one sort orders a merge of sixty-four heads and emits all of them" {
+    const gpa = testing.allocator;
+    var f: Fixture = Fixture.init(gpa);
+    defer f.deinit();
+
+    // The width every other test here is three at. The queue holds `tips`
+    // changes that all wait for one queued merge, plus one that waits for a
+    // change nobody has, so the walk has a wide waiter list to release, a
+    // blocked change to report and a downstream mark to spread — and every
+    // one of those lists is walked once.
+    const tips = 64;
+    const base = testHash(1);
+    const merge = testHash(2);
+    const gone = testHash(3);
+    const orphan = testHash(4);
+    try f.apply(gpa, try testChange(gpa, base, "a", 1, 1, &.{}));
+
+    const deps = try gpa.alloc(ChangeHash, 2);
+    defer gpa.free(deps);
+    deps[0] = merge;
+    deps[1] = base;
+    // The merge is queued **before** every change that waits for it, so the
+    // sort cannot lean on arrival order: the waiter lists are the only thing
+    // that can release the tips. Its own dependency is `base`, which the
+    // document already has, so it is ready on the first pass and everything
+    // else in this batch waits on it rather than on arrival order.
+    try f.queue.push(gpa, try testChange(gpa, merge, "a", 2, 1, &.{base}));
+    var n: u32 = 0;
+    while (n < tips) : (n += 1) {
+        try f.queue.push(gpa, try testChange(gpa, testHash(0x100 + n), "b", n + 1, 1, deps));
+    }
+    // Waiting for a change nobody has, and one that waits for it in turn.
+    try f.queue.push(gpa, try testChange(gpa, orphan, "c", 1, 1, &.{gone}));
+
+    var batch = try f.queue.popTopoSortedReady(gpa, &f.graph);
+    defer batch.deinit();
+
+    // The merge and every tip, and nothing else.
+    try testing.expectEqual(@as(usize, tips + 1), batch.len());
+    try testing.expectEqual(@as(usize, 1), batch.blocked.items.len);
+    try testing.expect(batch.blocked.items[0].change.eql(orphan));
+    try testing.expectEqual(@as(usize, 1), f.queue.len());
+    try testing.expect(f.queue.contains(orphan));
+
+    // A topological order: `merge` before every tip, which is the only
+    // ordering constraint in this batch.
+    var order: [tips + 1]ChangeHash = undefined;
+    batchHashesInto(batch, &order);
+    try testing.expect(order[0].eql(merge));
+    var at: usize = 1;
+    while (at < order.len) : (at += 1) {
+        try testing.expect(order[at].eql(testHash(@intCast(0x100 + at - 1))));
+    }
+}
+
 test "a change waiting for a change nobody has stays queued and is reported" {
     const gpa = testing.allocator;
     var f: Fixture = Fixture.init(gpa);

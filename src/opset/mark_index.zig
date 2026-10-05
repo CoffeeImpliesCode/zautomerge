@@ -497,13 +497,58 @@ pub const MarkAcc = struct {
 /// allocates and copies on the way; reserved up front the same merge is two
 /// allocations and one pass whichever of the two sets is bigger. A prefix
 /// read is nothing but this merge, so it is where the count is worth taking.
+///
+/// **Two set differences, not a merge — and that is the whole of the
+/// difference from `addAssignRef`.** `out` starts empty, and each of `src`'s
+/// two sets is sorted and free of duplicates (`insertSorted`, which is the
+/// only way an id gets into either), so the merge has nothing to merge
+/// against and lands where it lands in two steps:
+///
+/// * the loop over `src.opens` misses an empty `out.closes` every time, so
+///   every one of its ids is inserted — going in `src`'s own sorted order,
+///   each at the end — and `out.opens` ends as `src.opens`;
+/// * the loop over `src.closes` then takes each of its ids **out** of
+///   `out.opens` where it is there, and otherwise puts it in `out.closes`.
+///
+/// So the answer is `opens \ closes` and `closes \ opens` — the second loop
+/// again — and each is one linear walk of two already-sorted sequences
+/// ([`differenceInto`]). That needs nothing of `src` beyond the two
+/// properties above, so it holds for a `src` whose sets share an id as well
+/// as for one that does not, and the argument does not rest on the
+/// never-in-both invariant [`MarkAcc`] states.
+///
+/// What it buys is the difference between `O(k)` and `O(k*k)`: `addAssignRef`
+/// inserts one id at a time, and an ordered insert into a sorted `ArrayList`
+/// memmoves everything behind the insertion point, so `k` of them move
+/// `0 + 1 + ... + (k-1)` slots — `k*(k-1)/2` of them, which for the `k`
+/// marks open behind a row of a document with 2500 of them is hundreds of
+/// thousands of `OpId`s moved per read, against the `k` a walk moves.
+///
+/// **The refusal is at the same point as it was.** Both `ensureTotalCapacity`
+/// calls come first and are the only two steps that can fail; neither walk
+/// allocates.
 fn copyAcc(gpa: Allocator, src: *const MarkAcc) Allocator.Error!MarkAcc {
     var out = MarkAcc.init(gpa);
     errdefer out.deinit();
     try out.opens.ensureTotalCapacity(gpa, src.opens.items.len);
     try out.closes.ensureTotalCapacity(gpa, src.closes.items.len);
-    try out.addAssignRef(src);
+    differenceInto(&out.opens, src.opens.items, src.closes.items);
+    differenceInto(&out.closes, src.closes.items, src.opens.items);
     return out;
+}
+
+/// Appends `keep \ drop` to `into`, in the order it is already in. `keep` and
+/// `drop` are sorted and hold no duplicates — the invariant every aggregate
+/// keeps ([`MarkAcc`]) — so the answer is the merge of the two sequences and
+/// one pointer over `drop` is the whole of the state. The caller has reserved
+/// the room, so this cannot refuse.
+fn differenceInto(into: *IdSet, keep: []const OpId, drop: []const OpId) void {
+    var d: usize = 0;
+    for (keep) |begin| {
+        while (d < drop.len and drop[d].order(begin) == .lt) d += 1;
+        if (d < drop.len and drop[d].eql(begin)) continue;
+        into.appendAssumeCapacity(begin);
+    }
 }
 
 /// The first index of `items` whose id does not sort before `begin`. The sets are
@@ -1593,18 +1638,32 @@ pub const MarkIndexColumn = struct {
     ///
     /// **What it costs, and what it may have to pay first.** A read is
     /// `O(log S)` to descend, one owned copy of the landing slab's entry —
-    /// `O(k)` set operations for the `k` marks open behind that row, with the
-    /// room reserved up front so that is two allocations rather than one per
-    /// id — and at most one slab's worth of runs folded. What it replaces was
-    /// `O(runs before target)`.
+    /// `O(k)` for the `k` marks open behind that row, two allocations and one
+    /// linear walk ([`copyAcc`]) — and at most one slab's worth of runs
+    /// folded. What it replaces was `O(runs before target)`. The `k` is the
+    /// answer's own size, so `O(k)` per query is what any reader of "which
+    /// marks are open here" costs whatever this column is made of; nothing
+    /// here grows with the length of the column except the `log S` and the
+    /// single slab.
+    ///
+    /// **The fold inside the landing slab is `O(one slab's runs)` set
+    /// operations, and each one is `O(k)`** — [`MarkAcc.applyOne`] inserts into
+    /// a sorted array, which memmoves. That is the run budget (sixty-four),
+    /// not the document, so it is a fixed multiplier on `k` and not a factor
+    /// that grows with the row count. It is the one term of the three that is
+    /// still quadratic in the number of *marks*, and it is left as it is:
+    /// collapsing a slab's worth of deltas into one merge is only worth doing
+    /// if a document ever holds marks open across many slabs at once, which is
+    /// the deep-nesting case rather than this one.
     ///
     /// A read that reaches past the frontier first rebuilds the entries
     /// between it and the slab it wants, which is `O(rows from the frontier
-    /// on)`. The frontier moves when a write invalidates entries and at no
+    /// on)` — and it *writes* to do it ([`repairAggs`], reached through
+    /// [`agg`]). The frontier moves when a write invalidates entries and at no
     /// other time, so a run of writes followed by a run of reads pays that
-    /// fold once for the second, and a run of reads on its own pays nothing.
-    /// The worst case is one write and one read alternating, which is what
-    /// this was before, and never worse than it.
+    /// fold once for the second, and a run of reads on its own pays nothing
+    /// after its first. The worst case is one write and one read alternating,
+    /// which is what this was before, and never worse than it.
     ///
     /// `gpa` allocates **the returned `MarkAcc` only** — its two sets, which
     /// the caller frees with [`MarkAcc.deinit`]. It says nothing about this
@@ -1683,12 +1742,36 @@ pub const MarkIndexColumn = struct {
     /// That is what makes the cost proportional to how much of the column
     /// moved rather than to how much of it there is.
     ///
+    /// **Getting to the frontier is one load.** The running aggregate and the
+    /// row it covers both come out of `entries[next - 1]` — the row because
+    /// that entry recorded it (`start_row`), which is what an entry below the
+    /// frontier is *for*. This walk used to re-add the lengths of every slab
+    /// in front of the frontier to recover that row, which made reaching the
+    /// frontier `O(frontier)` — and the frontier grows with the column, so a
+    /// run of reads at increasing positions paid that walk on every one of
+    /// them, `O(S)` for `S` slabs and `O(S^2)` over the sweep. Reaching it is
+    /// `O(1)` now, and a repair costs `O(rows from the frontier on)`: the
+    /// entries below it are not walked, not summed and not copied.
+    ///
+    /// **This is a write, on the read path.** `total` takes `*const
+    /// MarkIndexColumn` and reaches the state through `agg` ([`agg`]) and gets
+    /// here, which allocates with `self.gpa`, appends to `entries` and moves
+    /// `valid` forward. It cannot be otherwise: the write that invalidated the
+    /// entries is a publish, which cannot fail and so cannot be where an
+    /// allocating fold is paid for ([`agg`] says the same). The read that pays
+    /// it is the first one past the frontier, and every read after it pays
+    /// nothing — so the cost is amortised over the reads a write costs, not
+    /// per query.
+    ///
     /// **A refusal leaves the frontier where it was.** The running aggregate
     /// is given back by the `errdefer`, the entry a failed copy would have
     /// written is left as the empty aggregate the loop appended it as, and
     /// nothing below the frontier is touched — so the next call starts from
     /// the same place and does the same work, and a refusal is never a
     /// half-built prefix.
+    ///
+    /// **`upto` is the landing slab, so one repair reaches every entry a
+    /// single query needs** and the loop below runs its share of them once.
     fn repairAggs(self: *const MarkIndexColumn, upto: usize) ParseError!void {
         const state = self.agg;
         // Everything at or past the frontier describes rows, or a slab layout,
@@ -1716,8 +1799,16 @@ pub const MarkIndexColumn = struct {
         var row: usize = 0;
         var next: usize = valid;
         if (next > 0) {
-            var behind: usize = 0;
-            while (behind + 1 < next) : (behind += 1) row += self.data.slabAt(behind).?.len;
+            // The row comes **out of the array**, not out of a walk over every
+            // slab in front of it. `storeAgg` recorded `start_row` as the row
+            // the slab it wrote starts at, and `next - 1` is below the
+            // frontier, which is exactly the claim that the entries below it
+            // still line up with the slabs the column has — so the sum the walk
+            // was computing is the number already sitting there. A test pins
+            // the equality: `a column of many slabs answers every position`
+            // walks the array and the slab lengths and wants them equal
+            // (`mark_index.zig:3452-3455`).
+            row = state.entries.items[next - 1].start_row;
             acc = try copyAcc(self.gpa, &state.entries.items[next - 1].acc);
         } else {
             // Entry zero aggregates no rows at all, and there is no slab in
@@ -2252,6 +2343,99 @@ fn leftOf(gpa: Allocator, begin: OpId) !MarkAcc {
     errdefer out.deinit();
     try out.opens.append(gpa, begin);
     return out;
+}
+
+test "copyAcc answers what the borrowed merge answers, on both sets and at size" {
+    // `copyAcc` is what every prefix read runs: it is the merge of a slab's own
+    // aggregate into a fresh one, and it is the one step of a read whose cost is
+    // proportional to the answer. It was `addAssignRef` over an empty target and
+    // is now two set differences (`copyAcc`'s doc carries the argument). This is
+    // the witness that the two agree, over the three shapes the merge can see —
+    // nothing, opens alone, opens and closes together — and at a size where the
+    // sorted-insert cascade `addAssignRef` walks is wide enough for a difference
+    // in what it lands to show.
+
+    const gpa = testing.allocator;
+    const n = 400;
+
+    // A stream of deltas over `n` ids: three fifths are opened and stay open,
+    // one fifth is closed and never opened (a dangling close), and one fifth
+    // is opened and closed in turn and so cancels. `closes` is non-empty
+    // throughout, which is the shape the second difference walks and the one
+    // a prefix over a well-formed column never reaches.
+    var both = MarkAcc.init(gpa);
+    defer both.deinit();
+    for (1..n + 1) |c| {
+        const begin = id(@intCast(c % 3), @intCast(c));
+        switch (c % 5) {
+            0 => try both.applyOne(.{ .end = begin }),
+            4 => {
+                try both.applyOne(.{ .start = begin });
+                try both.applyOne(.{ .end = begin });
+            },
+            else => try both.applyOne(.{ .start = begin }),
+        }
+    }
+    try testing.expect(both.opens.items.len != 0);
+    try testing.expect(both.closes.items.len != 0);
+
+    var got = try copyAcc(gpa, &both);
+    defer got.deinit();
+    var want = MarkAcc.init(gpa);
+    defer want.deinit();
+    try want.addAssignRef(&both);
+    try testing.expect(want.eql(got));
+    try expectIds(want.opens.items, got.opens.items);
+    try expectIds(want.closes.items, got.closes.items);
+    // The order is the document's, which is what every exact comparison in
+    // this file rests on, and no id is in both sets.
+    for (got.opens.items, 0..) |v, i| {
+        if (i != 0) try testing.expect(got.opens.items[i - 1].order(v) == .lt);
+        try testing.expect(!containsSorted(got.closes.items, v));
+    }
+
+    // The other two shapes. The empty one is the identity, and the opens-only
+    // one is the whole of what a prefix read over a well-formed column ever
+    // copies ([`MarkAcc`], on why `closes` stays empty there).
+    var nothing = MarkAcc.init(gpa);
+    defer nothing.deinit();
+    var empty = try copyAcc(gpa, &nothing);
+    defer empty.deinit();
+    try testing.expectEqual(@as(usize, 0), empty.opens.items.len);
+    try testing.expectEqual(@as(usize, 0), empty.closes.items.len);
+
+    var opens_only = MarkAcc.init(gpa);
+    defer opens_only.deinit();
+    for (1..n + 1) |c| {
+        try opens_only.applyOne(.{ .start = id(@intCast(c % 3), @intCast(c)) });
+    }
+    var opened = try copyAcc(gpa, &opens_only);
+    defer opened.deinit();
+    var want_opens = MarkAcc.init(gpa);
+    defer want_opens.deinit();
+    try want_opens.addAssignRef(&opens_only);
+    try testing.expect(want_opens.eql(opened));
+    try expectIds(want_opens.opens.items, opened.opens.items);
+
+    // **A `src` whose two sets share an id**, which the copy this replaced
+    // reached by absorbing a close out of the copy's own opens. The argument
+    // the two differences rest on is that each set is sorted and duplicate
+    // free, so this answers the same either way — and saying so is what keeps
+    // the walk honest if an aggregate is ever built another way.
+    var shared = MarkAcc.init(gpa);
+    defer shared.deinit();
+    try shared.opens.append(gpa, id(0, 1));
+    try shared.opens.append(gpa, id(0, 2));
+    try shared.closes.append(gpa, id(0, 2));
+    var got_shared = try copyAcc(gpa, &shared);
+    defer got_shared.deinit();
+    var want_shared = MarkAcc.init(gpa);
+    defer want_shared.deinit();
+    try want_shared.addAssignRef(&shared);
+    try testing.expect(want_shared.eql(got_shared));
+    try testing.expectEqual(@as(usize, 1), got_shared.opens.items.len);
+    try testing.expect(got_shared.opens.items[0].eql(id(0, 1)));
+    try testing.expectEqual(@as(usize, 0), got_shared.closes.items.len);
 }
 
 test "an empty column has no marks anywhere" {
@@ -3422,6 +3606,89 @@ test "a position is answered before any other, on a column nothing has queried y
         try expectActive(gpa, &col, wide[0..wide_len], wide_len - 1);
         try expectActive(gpa, &col, wide[0..wide_len], wide_len / 2);
     }
+}
+
+test "a repair that resumes above the frontier reads its row out of the entry" {
+    // `repairAggs` reading its row out of the entry it resumes from, which is
+    // the whole of what reaching the frontier costs.
+    //
+    // The case above reaches the frontier from zero, because the first ask in
+    // each block is at or near the head of the column. This one puts the frontier
+    // in the middle: a write lowers it to some `f > 0`, and the next ask at the
+    // **deepest** slab then resumes the walk at `valid` rather than at zero — so
+    // the row the fold starts from has to be `entries[valid - 1].start_row`. If
+    // that read were wrong the fold would start in the middle of a slab, and the
+    // entry it wrote would name a row its slab does not start at.
+    //
+    // Every entry is then checked twice: that its `start_row` is the row its
+    // slab starts at, and that its aggregate is the fold over exactly the rows
+    // before that row — the second against the brute-force oracle, so this does
+    // not check the aggregate against itself.
+
+    const gpa = testing.allocator;
+    const n = 8_000;
+    const wide = try gpa.alloc(?MarkIdx, n);
+    defer gpa.free(wide);
+    var placed: std.ArrayList(Placed) = .empty;
+    defer placed.deinit(gpa);
+    try placeMarks(gpa, n, 600, 9, wide, &placed);
+    var wide_len: usize = n;
+    var col = try columnFor(gpa, wide);
+    defer col.deinit();
+    try testing.expect(col.data.slabCount() > 1);
+
+    // Ask the deepest position first, so the whole array is built and the
+    // frontier is the slab count.
+    try expectActive(gpa, &col, wide, n - 1);
+    try testing.expectEqual(col.data.slabCount(), col.agg.valid);
+
+    // A write in the middle of the column lowers the frontier to somewhere
+    // above zero and below the slab count — the case this test is about. The
+    // mark is chosen by **position**, not by placement order, because a write
+    // at row zero or at the tail would put the frontier at either end and
+    // leave nothing between them to resume from.
+    var chosen: ?Placed = null;
+    for (placed.items) |p| {
+        if (p.start > n / 4 and p.start < (3 * n) / 4) {
+            chosen = p;
+            break;
+        }
+    }
+    const mark = chosen orelse placed.items[0];
+    const rows = try findMarkPositions(gpa, &col, mark.id);
+    defer gpa.free(rows);
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try col.undo(rows[1], &[_]?MarkIndexBuilder{.{ .end = mark.id }});
+    try col.undo(rows[0], &[_]?MarkIndexBuilder{.{
+        .start = .{ .id = mark.id, .data = mkMark("m") },
+    }});
+    removeMarkRows(wide, &wide_len, mark.id);
+    try testing.expectEqual(wide_len, col.len());
+    try testing.expect(col.agg.valid > 0);
+    try testing.expect(col.agg.valid < col.data.slabCount());
+
+    // The deepest ask again: this repair starts above the frontier, so it
+    // takes its running row from an entry rather than re-adding slab lengths.
+    try expectActive(gpa, &col, wide[0..wide_len], wide_len - 1);
+    try testing.expectEqual(col.data.slabCount(), col.agg.valid);
+
+    var at: usize = 0;
+    for (col.agg.entries.items, 0..) |entry, i| {
+        // The row the entry folds up to is the row its slab starts at.
+        try testing.expectEqual(at, entry.start_row);
+        // And the aggregate over it is the fold over exactly `0..at`, against
+        // the oracle rather than against another entry.
+        try testing.expectEqual(@as(usize, 0), entry.acc.closes.items.len);
+        if (at != 0) {
+            const want = try oracleMarksAt(gpa, wide[0..wide_len], at - 1);
+            defer gpa.free(want);
+            try expectIds(want, entry.acc.opens.items);
+        } else {
+            try testing.expectEqual(@as(usize, 0), entry.acc.opens.items.len);
+        }
+        at += col.data.slabAt(i).?.len;
+    }
+    try testing.expectEqual(col.len(), at);
 }
 
 test "a refusal part way through building the prefix leaves it answering" {

@@ -3461,7 +3461,7 @@ pub export fn AMgetCursor(
 /// **The port's [`OpSet.seekListOpid`](../opset/op_set.zig) cannot answer `null`
 /// for that same question** — it raises `error.InvalidIndex` when the id's row
 /// lies outside the object's range
-/// ([`op_set.zig:3145`](../opset/op_set.zig)) — so calling the private helper
+/// ([`op_set.zig:4007`](../opset/op_set.zig)) — so calling the private helper
 /// directly reported upstream's refusal **under the op set's name**, and a
 /// caller handed `InvalidCursor` by [`read.getCursorPosition`](../read.zig)
 /// ([`read.zig:1897-1905`](../read.zig)) was handed `InvalidIndex` here.
@@ -5802,7 +5802,7 @@ test "a cursor minted before an edit resolves at its own heads while a transacti
 //   `.ok_or_else(|| AutomergeError::InvalidCursor(cursor.clone()))`
 //   ([`:1778-1781`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
 //   and the port's raises `error.InvalidIndex` instead
-//   ([`op_set.zig:3145`](../opset/op_set.zig)) — so the C surface reported
+//   ([`op_set.zig:4007`](../opset/op_set.zig)) — so the C surface reported
 //   upstream's refusal under the op set's name, **and
 //   [`read.getCursorPosition`](../read.zig) ([`read.zig:1897-1905`](../read.zig))
 //   reported the same cursor under upstream's.** One port, two answers, which

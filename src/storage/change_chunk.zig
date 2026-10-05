@@ -720,6 +720,20 @@ pub fn writeBody(
 ///
 /// The order check is strict (`prev < col`), so it catches a repeat as well as
 /// a descent.
+///
+/// **One copy of the data block, and no staging buffer.** The metadata is
+/// written where it goes and `ops.cols.data` is appended once, so the body is
+/// built in the caller's buffer in a single pass; there is no uncompressed
+/// body assembled first and rebuilt afterwards, which is what
+/// `document_chunk.writeChunk`'s compressing arm used to do before it learned
+/// that its region offsets are a function of the block rather than of a pass
+/// over it. The body cannot be smaller than that copy: the change hash is
+/// `SHA-256` over the whole of it, header and footer included, so the bytes
+/// have to be contiguous and in hand before anything is hashed.
+///
+/// The two passes are over the *descriptors*, not the bytes: one to count the
+/// columns that will be written and one to write them. A set is fourteen
+/// columns at most.
 pub fn writeOpsBlock(
     out: *std.ArrayList(u8),
     gpa: Allocator,
@@ -1755,6 +1769,83 @@ test "a metadata block that decreases across an empty column is refused" {
     });
     try full.appendSlice(gpa, &(data ++ data));
     try testing.expectError(error.InvalidColumnSpec, parseChangeChunk(full.items, gpa));
+}
+
+test "the op data block is appended once, whole, at the offset the metadata says" {
+    const gpa = testing.allocator;
+    // **The one claim about this writer's shape, pinned.** Three regions in
+    // three appends: the metadata block, the data block, the footer. A writer
+    // that staged the data and rebuilt the body would put those bytes twice,
+    // or need a buffer the size of the body to put them in once.
+    //
+    // The data is a rising run of sixteen distinct bytes, so no window of it
+    // repeats: a second copy anywhere in the body is findable, and a
+    // truncated one is not.
+    const data = [_]u8{
+        0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87,
+        0x98, 0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe, 0x0f,
+    };
+    const footer = [_]u8{ 0x01, 0x03, 'a', 'b', 'c' };
+    const descs = [_]ColumnDesc{
+        ColumnDesc.init(ColumnSpec.make(0, .actor, false), 5),
+        ColumnDesc.init(ColumnSpec.make(4, .rle_uint, false), 6),
+        ColumnDesc.init(ColumnSpec.make(4, .string, false), 5),
+    };
+    const cols = try RawColumns.init(gpa, &descs, &data);
+    defer cols.deinit(gpa);
+
+    // The header the body carries in front of the op block, so what is parsed
+    // back at the end is a whole change body and not an op block with a reader
+    // held over it.
+    const head = [_]u8{
+        0x00, // no dependencies
+        0x01, 0xaa, // actor
+        0x01, // seq 1
+        0x01, // start_op 1
+        0x00, // time 0
+        0x00, // no message
+        0x00, // no other actors
+    };
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.appendSlice(gpa, &head);
+    try writeOpsBlock(&body, gpa, OpsBlock.init(cols, &footer));
+
+    // The metadata block, walked: a count and three (specification, length)
+    // pairs, all of them one byte wide, so the block is seven bytes and it
+    // starts where the header ends.
+    var at: usize = head.len;
+    try testing.expectEqual(@as(u8, descs.len), body.items[at]);
+    at += 1;
+    for (descs) |desc| {
+        try testing.expectEqual(desc.spec.raw, @as(u32, body.items[at]));
+        try testing.expectEqual(desc.len, @as(usize, body.items[at + 1]));
+        at += 2;
+    }
+    try testing.expectEqual(head.len + 1 + 2 * descs.len, at);
+
+    // The data block, whole, at exactly that offset — and the footer after it,
+    // with nothing between them.
+    try testing.expectEqualSlices(u8, &data, body.items[at..][0..data.len]);
+    try testing.expectEqualSlices(u8, &footer, body.items[at + data.len ..]);
+    try testing.expectEqual(at + data.len + footer.len, body.items.len);
+
+    // **Once.** Every window of the whole body that matches the data block,
+    // counted.
+    var found: usize = 0;
+    for (body.items, 0..) |_, start| {
+        if (start + data.len > body.items.len) break;
+        if (std.mem.eql(u8, body.items[start..][0..data.len], &data)) found += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), found);
+
+    // And the reader puts the three boundaries in the same three places.
+    var parsed = try parseChangeChunk(body.items, gpa);
+    defer parsed.deinit(gpa);
+    try testing.expectEqual(@as(usize, descs.len), parsed.ops.len());
+    try testing.expectEqualSlices(u8, &data, parsed.opData());
+    try testing.expectEqualSlices(u8, &footer, parsed.footer);
 }
 
 // ── Differences from upstream, in one place ─────────────────────────────────

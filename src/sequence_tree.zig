@@ -1389,6 +1389,152 @@ test "a separator between two internal children" {
     }
 }
 
+// ── The fan-out bound, which is the whole of the O(log n) ────────────────────
+//
+// Every descent in this file costs a linear scan of one node's children:
+// `findChildIndex` (`:128-138`), `cumulativeIndex` (`:142-146`), `get`
+// (`:514-532`), `getMut` (`:534-552`) and the child loop in `remove`
+// (`:496-510`). So an insert or a remove costs *fan-out times depth*, and only
+// the fan-out rule makes that logarithmic. A node splits at `2 * B - 1`
+// elements (`isFull`, `:111-113`) and lifts its middle element into the parent
+// (`splitChild`, `:176-217`), so **nothing in the tree ever holds more than
+// `2 * B` children** — 32, and 31 elements.
+//
+// **Nothing asserted that until now.** `checkShape` (`:559-569`) checks the
+// occupancy rule and the arity rule, so a violation would surface — but only
+// on a tree small enough for the bug to be plausible. The largest tree any
+// test above builds is 256 elements (`:929`), which is two levels deep, and
+// this module's two holders are `hydrate::List` (`hydrate.zig:1271`) and
+// `patches::InsertValues` (`patches.zig:746`), neither of which sizes its
+// lists by anything to do with the tree's depth. The bound is what the
+// insertion cost is being claimed to rest on, and it is claimed for their
+// trees.
+
+/// What a walk of every node measured.
+const Shape = struct {
+    /// How many nodes the tree holds.
+    nodes: usize = 0,
+    /// How many levels lie between the root and the deepest leaf, the root
+    /// counting as one.
+    levels: usize = 0,
+    /// The widest node's child count — the fan-out, which is the number the
+    /// cost argument is about.
+    widest: usize = 0,
+    /// The narrowest internal node **below the root**. Two is the floor: an
+    /// internal node holds at least one element and `checkShape`'s arity rule
+    /// gives it one more child than elements.
+    narrowest_internal: usize = 0,
+};
+
+/// Walk every node, asserting the fan-out rule node by node rather than
+/// stating it once, and recording what it found.
+fn measureShape(comptime T: type, node: *const Node(T), level: usize, out: *Shape) !void {
+    out.nodes += 1;
+    out.levels = @max(out.levels, level);
+    out.widest = @max(out.widest, node.children.items.len);
+    // **The bound, as a value at every node.** A child count above `2 * B` is
+    // the regression this section exists to catch, and it is checked where it
+    // lives rather than inferred from the tree's depth afterwards.
+    try testing.expect(node.elements.items.len <= 2 * B - 1);
+    try testing.expect(node.children.items.len <= 2 * B);
+    // Arity: a leaf has no children, an internal node has exactly one more
+    // child than elements. `2 * B` children follows from `2 * B - 1` elements
+    // through this rule, which is why both are asserted.
+    try testing.expect(node.children.items.len == 0 or
+        node.children.items.len == node.elements.items.len + 1);
+    // The root is excluded: a delete may leave it with anything from one
+    // element to a full node, and it is a node below the root whose occupancy
+    // the depth bound leans on.
+    if (level > 1 and node.children.items.len != 0) {
+        out.narrowest_internal = if (out.narrowest_internal == 0)
+            node.children.items.len
+        else
+            @min(out.narrowest_internal, node.children.items.len);
+    }
+    for (node.children.items) |*child| try measureShape(T, child, level + 1, out);
+}
+
+/// The deepest a tree of `n` elements may be under the fan-out rule, the root
+/// counting as one level.
+///
+/// **It walks `B` upward, which is one level looser than the tightest bound
+/// the rules support, and the slack is deliberate.** The tight form is
+/// `1 + floor(log_B(n / (2 * B)))`, which needs the module doc's claim at
+/// `:19-22` — "a node that ends a delete may hold `B - 1` elements" — to be a
+/// floor rather than an observation. This form uses neither that floor nor the
+/// root's fan-out, so it survives a rebalance that leaves a node one element
+/// lighter than the doc says. It is still three orders of magnitude below the
+/// depth a tree with no fan-out rule reaches: `n` levels for a chain, against
+/// this bound's `log_B(n) + 2`.
+fn maxLevels(n: usize) usize {
+    var span = B;
+    var levels: usize = 2;
+    while (span < n) : (levels += 1) span *= B;
+    return levels;
+}
+
+test "the fan-out bound is what keeps a descent logarithmic" {
+    const gpa = testing.allocator;
+    const n = 20_000;
+
+    var tree = SequenceTree(u32).init(gpa);
+    defer tree.deinit();
+
+    // ── Built by appending ────────────────────────────────────────────────
+    for (0..n) |i| try tree.push(@intCast(i));
+
+    var shape: Shape = .{};
+    try measureShape(u32, &tree.root.?, 1, &shape);
+    try tree.checkInvariants();
+
+    try testing.expectEqual(n, tree.len());
+    try testing.expect(shape.nodes > 1);
+    // The fan-out: the claim this whole section is about.
+    try testing.expect(shape.widest <= 2 * B);
+    try testing.expect(shape.narrowest_internal >= 2);
+    // And the depth that follows from it.
+    try testing.expect(shape.levels <= maxLevels(n));
+    // The two ends and the middle, so a walk that had found nothing at all
+    // cannot be what satisfied the shape assertions above.
+    try testing.expectEqual(@as(u32, 0), tree.get(0).?.*);
+    try testing.expectEqual(@as(u32, @intCast(n / 2)), tree.get(n / 2).?.*);
+    try testing.expectEqual(@as(u32, @intCast(n - 1)), tree.get(n - 1).?.*);
+
+    // ── Pruned ────────────────────────────────────────────────────────────
+    //
+    // **A removal is where the fan-out could widen, and it is the one place the
+    // split rule does not answer.** A merge adds the right neighbour's
+    // children to the left one (`:254-264`), and `mergeAssumeCapacity`
+    // (`:254-259`) asserts only `elements.len <= 2 * B - 1` — the element
+    // rule, from which the child rule follows by arity. So the bound has to be
+    // checked on a pruned tree and not only on a fresh one, or a merge could
+    // widen a node and nothing here would say so.
+    //
+    // Every third index is removed, which interleaves the removes with
+    // rebalances at every level instead of running down one side of the tree,
+    // and `at` advances while the tree is shrinking so the walk stops on the
+    // length rather than on a fixed count.
+    var at: usize = 0;
+    while (at < tree.len()) : (at += 3) _ = try tree.remove(at);
+
+    var pruned: Shape = .{};
+    try measureShape(u32, &tree.root.?, 1, &pruned);
+    try tree.checkInvariants();
+
+    try testing.expect(pruned.widest <= 2 * B);
+    try testing.expect(pruned.narrowest_internal >= 2);
+    try testing.expect(pruned.levels <= maxLevels(tree.len()));
+    // Four survives for every three removed, and index zero is one of the
+    // removed ones — so the first element is 1 and the last is untouched.
+    try testing.expectEqual(n - n / 4, tree.len());
+    var it = tree.iter();
+    try testing.expectEqual(@as(u32, 1), it.next().?.*);
+    try testing.expectEqual(@as(u32, @intCast(n - 1)), tree.get(tree.len() - 1).?.*);
+    var walked: usize = 1;
+    while (it.next()) |_| walked += 1;
+    try testing.expectEqual(tree.len(), walked);
+}
+
 // ── Diff against the reference, for the test assertions and the invariant walk
 // ────────────────────────────────────────────────────────────────────────────
 //

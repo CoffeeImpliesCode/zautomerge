@@ -106,6 +106,35 @@
 //! [`SpanState.runMarks`]. Applied to a single fold it turns that fold's own
 //! marks into tombstones, and every mark boundary then reads as a change.
 //!
+//! # What one row costs
+//!
+//! **The rows are read in lockstep, and stepping is `O(1)` amortised.** The
+//! action and value columns move together through
+//! [`opiter.ActionValueIter`]'s [`tryNext`](../../opset/op_iter.zig), which is a
+//! metadata step plus a raw-column take and **does not re-seek the byte
+//! cursor** ([`ValueIter.tryNext`](../../opset/op_iter.zig)'s own note is that a
+//! step is not a jump). The mark name and op id are read by **distance** rather
+//! than by stepping ([`SpansDiff.nextOpid`](Self.nextOpid),
+//! [`nextMarkName`](Self.nextMarkName)) — but **only on a `mark` or block row**,
+//! so a text with no marks never touches either column, and a text with `P`
+//! mark rows pays `O(P · (log S + slab))` for both of them over the whole read,
+//! not `O(R)` for each of `R` rows. **The clock is never re-seeked**:
+//! [`predates`](map_range.zig) reads [`Clock.contains`](../../src/clock.zig), an
+//! array index, and only on a block row.
+//!
+//! **The mark fold is the one part that was superlinear, and it is now
+//! `O(R + P·M)`.** [`NextText.canExtend`] has to answer "do the folds still
+//! flatten to what this run carries", and the answer upstream gets from an
+//! `Arc` **pointer** test (`spans.rs:301-313`). This port has no `Arc`, so the
+//! answer was a **content walk of both folds** — `O(M)` — and it ran on
+//! **every row**, which is `O(R·M)`. [`SpanState.marks_epoch`] is the
+//! substitute for the pointer: it moves only where the resolved content moved,
+//! so an unchanged epoch proves the folds are as the run copied them and the
+//! walk is skipped. `R` rows and `P` content-changing mark operations now cost
+//! `O(R + P·M)` where they cost `O(R·M)`. **The epoch is a fast path and never
+//! the answer** — a moved epoch falls through to the walk, which is what keeps
+//! a mark that opens and closes with no text between from splitting the run.
+//!
 //! [`SpansDiff`], [`SpansInternal`] and [`Spans`] are generic over the op set's
 //! row type, and so is [`SpanDiff`], because a span's block payload is an
 //! [`maprange.ExIdPromise`]. The fold itself, [`SpanState`], is **not** generic:
@@ -206,7 +235,7 @@ fn markView(before: ?*const MarkSet, after: ?*const MarkSet, diff: Diff) ?MarkDi
 ///
 /// **The copy is the whole of it, and nothing is flattened here.** The fold's
 /// set is already one name per mark, in name order
-/// ([`MarkSet`](../../src/marks.zig)), so [`MarkSet.fromPairs`] reproduces it
+/// ([`MarkSet`](../../src/marks.zig)), so appending its entries reproduces it
 /// exactly — including an unmark tombstone, which a flattening would drop
 /// (`spans.rs:367-372`, `:419`).
 ///
@@ -216,9 +245,33 @@ fn markView(before: ?*const MarkSet, after: ?*const MarkSet, diff: Diff) ?MarkDi
 /// read whatever the set says when the run is finally flushed rather than what
 /// it said when the run started. The names inside are borrowed from the
 /// document and are not freed with the set, which is [`MarkSet`]'s own rule.
+///
+/// # Why this appends and does not go through [`MarkSet.fromPairs`]
+///
+/// **A straight append, and the reason is that the source is already in the
+/// shape the destination wants.** [`MarkSet.put`] finds
+/// [`lowerBound`](../../src/marks.zig) and **inserts at that index**, which is
+/// an `O(M)` shift of every entry behind it — so `fromPairs` over `M` names is
+/// `O(M²)` in the memmoves alone, and it grows the array one insert at a time.
+/// The source here is a [`MarkSet`], so its entries are **sorted by name and
+/// unique**: `lowerBound` on the next name lands on `items.len` and every
+/// insert is an append. `appendSlice` is the same `M` appends with the
+/// capacity reserved once, so it is **`O(M)` time and one allocation** where
+/// `fromPairs` was `O(M²)` time and an amortised-growth array.
+///
+/// **The output is identical, and that is the whole justification.**
+/// `fromPairs`'s own doc says "later pairs replacing earlier ones with the
+/// same name", and a `MarkSet` cannot hold two entries with the same name — so
+/// over a sorted unique source the replacement arm never fires and the two
+/// builders produce byte-identical entry arrays. `refreshMarks` calls this
+/// twice per **changed** mark operation, so the term it removes is
+/// `O(mark operations × names²)` over a document and `O(names)` per call.
 fn copyFold(gpa: Allocator, set: ?*const MarkSet) Error!?MarkSet {
     const s = set orelse return null;
-    return try MarkSet.fromPairs(gpa, s.entries.items);
+    var out = MarkSet.init(gpa);
+    errdefer out.deinit();
+    try out.entries.appendSlice(gpa, s.entries.items);
+    return out;
 }
 
 /// Feeds one mark begin to one or both folds
@@ -582,18 +635,35 @@ const NextText = struct {
     /// borrow of it would read whatever the set says when the run is finally
     /// flushed rather than what it said when the run started.
     marks: ?MarkSet = null,
-    // **No generation, and this field's absence is the fix.** Upstream
-    // compares the run's marks against the fold's **by content**
-    // (`spans.rs:496`, `MarkDiff::eq` at `:299-314`), and a mark that opens
-    // and closes with no text between leaves the content unchanged — so the
-    // run keeps the text it has. A counter cannot say that: it only ever goes
-    // up, so every mark operation split a run even when the set came back to
-    // where it was. See [`NextText.canExtend`].
+    /// The fold's [`marks_epoch`](SpanState.marks_epoch) when this run took
+    /// its marks, and **the only reason `canExtend` is O(1) on the common
+    /// row**.
+    ///
+    /// **A stamp, not a decision.** An equal epoch means the folds have not
+    /// moved since [`runMarks`](SpanState.runMarks) copied them, so the
+    /// flattening this run holds is still what the folds flatten to — which
+    /// makes [`flattenedEql`](spans.zig#L341) true without walking it. A
+    /// differing epoch means only that something *may* have moved, and the
+    /// walk answers as it always did. So this field never decides whether a
+    /// run extends; it only decides whether deciding costs a walk.
+    ///
+    /// **Upstream gets the same short-circuit for free and by a different
+    /// means.** Its run holds an `Arc<MarkSet>` and the fold holds the same
+    /// `Arc`, so `MarkDiff::eq`'s pointer test (`spans.rs:301-313`) answers
+    /// "equal" in one comparison whenever no mark operation has run. The port
+    /// has no `Arc` and the resolved set is mutated in place, so the fold
+    /// *copies* it and there is no pointer to compare — which is why this
+    /// stamp exists, and why the copy is what makes the walk necessary at all.
+    marks_epoch: u64 = 0,
 
     /// An empty run for `diff`, already carrying the marks `state` says a
     /// run of that tag carries ([`NextText::new`], `spans.rs:470-477`).
     fn init(state: *SpanState, diff: Diff) Error!NextText {
-        return .{ .diff = diff, .marks = try state.runMarks(diff) };
+        return .{
+            .diff = diff,
+            .marks = try state.runMarks(diff),
+            .marks_epoch = state.marks_epoch,
+        };
     }
 
     /// Gives back the buffer and the marks.
@@ -622,8 +692,45 @@ const NextText = struct {
     /// still say what they said keeps the text it has — which is upstream's
     /// `marks_are_consolidated_in_the_presence_of_zero_length_spans`
     /// (`tests/text.rs:297-319`).
+    ///
+    /// # The complexity, and the two branches
+    ///
+    /// **O(1) when the epoch matches, O(M) when it does not**, where `M` is
+    /// the number of mark names the folds hold. `flattenedEql` merges both
+    /// folds' entries name by name, so it is `O(M)`; upstream is the same walk
+    /// but reaches it only after a **pointer** test on the two `Arc`s has
+    /// already answered (`spans.rs:301-313`, and the comment at `spans.rs:300`
+    /// says that test was added because the walk "was a big performance
+    /// issue"). This port has no `Arc` to test, so the stamp stands in: equal
+    /// epochs are a proof that the folds have not moved since
+    /// [`marks`](NextText.marks) was copied, which makes the walk's answer
+    /// known without running it.
+    ///
+    /// **The epoch never turns a walk into a wrong answer, only into a
+    /// skipped one.** It is bumped only where the resolved content moved
+    /// ([`SpanState.marks_epoch`]), so `epoch == marks_epoch` implies the two
+    /// flattenings are equal. The converse is not claimed: a differing epoch
+    /// may still flatten equal, and then the walk says so, which is what keeps
+    /// `marks_are_consolidated_in_the_presence_of_zero_length_spans` true —
+    /// `bold` opening and closing bumps the epoch twice, so that case always
+    /// takes the walk and is answered by content as upstream answers it.
+    ///
+    /// **What this buys, over a read.** The walk is per **row** and the epoch
+    /// moves per **mark operation that changed the marks**, so a text of `R`
+    /// rows and `P` mark operations costs `O(R + P·M)` where it cost `O(R·M)`.
+    /// A marked document with many rows and few mark boundaries — the ordinary
+    /// case — goes from quadratic in `R·M` to linear in `R`.
+    ///
+    /// **A `Del` run agrees on both branches, and that is checked rather than
+    /// assumed.** [`markView`] answers `null` for a `del` tag (`spans.rs:317-324`),
+    /// so [`runMarks`](SpanState.runMarks) gave such a run `marks == null`, and
+    /// [`flattenedEql`] with a null view answers `flat == null`
+    /// (`spans.zig:319`) — true against that `null`. So the short-circuit's
+    /// `true` and the walk's `true` are the same answer for a `Del`, and a
+    /// deleted run coalesces exactly as it did.
     fn canExtend(self: *const NextText, state: *const SpanState, diff: Diff) bool {
         if (self.diff != diff) return false;
+        if (self.marks_epoch == state.marks_epoch) return true;
         const view = markView(
             if (state.before) |*b| b else null,
             if (state.after) |*a| a else null,
@@ -660,16 +767,38 @@ const SpanState = struct {
     /// The **merge** fold's resolved marks as of the last mark operation,
     /// **owned** (the `After` half).
     after: ?MarkSet = null,
-    // **Nothing here counts the mark operations, and that is deliberate.**
-    // The question [`NextText.canExtend`] asks is "do the fold's marks still
-    // say what the buffered run's marks say", and the source says the answer
-    // is the *content* of the two (`spans.rs:496`,
-    // [`MarkDiff::eq`](spans.rs):299-314`). A counter was here, and it could
-    // not answer that question: it only goes up, so a mark that opened and
-    // closed with no text between — the case `spans.rs:436-447` is written
-    // about, where the active set passes through
-    // `['bold', 'bold,italic', 'bold']` while the buffered run keeps `bold` —
-    // split the run anyway. `canExtend` walks both sets instead.
+    /// How many times the folds' resolved content has **moved**, as of the
+    /// last mark operation.
+    ///
+    /// **This counts content changes and not mark operations, and that is the
+    /// whole of what makes it usable.** The question
+    /// [`NextText.canExtend`] asks is "do the fold's marks still say what the
+    /// buffered run's marks say", and the source says the answer is the
+    /// *content* of the two (`spans.rs:496`,
+    /// [`MarkDiff::eq`](spans.rs):299-314'). A counter over mark
+    /// *operations* was here and could not answer that question: it only goes
+    /// up, so a mark that opened and closed with no text between — the case
+    /// `spans.rs:436-447` is written about, where the active set passes
+    /// through `['bold', 'bold,italic', 'bold']` while the buffered run keeps
+    /// `bold` — split the run anyway.
+    ///
+    /// **This one is bumped in [`refreshMarks`](Self.refreshMarks) alone**,
+    /// and that is only reached when [`markBeginDiff`] or [`markEndDiff`]
+    /// reported that the *resolved set* changed — which is a statement about
+    /// content, because [`marks.MarkStateMachine.markBegin`] returns whether
+    /// it wrote `resolved` ([`marks.zig:674-695`](../../src/marks.zig)) and
+    /// not whether it was fed an operation. So a shadowed mark, or one whose
+    /// value the one below already has, leaves this alone.
+    ///
+    /// **It is a fast path and never the answer.** An epoch equal to the run's
+    /// proves the folds have not moved since the run captured its marks, which
+    /// makes [`flattenedEql`] *trivially* true — so the walk is skipped. An
+    /// epoch that differs proves nothing either way (the fold may have moved
+    /// and come back), and falls through to the walk unchanged. That is why the
+    /// zero-length-span case still consolidates: `bold` opening and closing
+    /// moves the content twice, so the epoch differs and
+    /// [`flattenedEql`](spans.zig#L341) is what answers, and it answers true.
+    marks_epoch: u64 = 0,
     /// A block marker seen but not yet emitted, because emitting it means
     /// emitting the text in front of it first (`spans.rs:449-453`).
     next_diff: ?PendingBlock = null,
@@ -753,7 +882,29 @@ const SpanState = struct {
     /// a.clone())`, `spans.rs:658`) and flattens once, at export
     /// (`spans.rs:389-400`); the copy below is upstream's `clone`, and the
     /// flattening still happens once per run in [`runMarks`](Self.runMarks).
+    ///
+    /// # What this costs, and what it moves
+    ///
+    /// **Two `copyFold` calls, each `O(M)` in the names the fold holds and one
+    /// allocation** (see [`copyFold`]). So this is `O(M)` per mark operation
+    /// that changed the marks — not per row, and not `O(M²)` any more.
+    ///
+    /// **It moves [`marks_epoch`](Self.marks_epoch), and it is the only writer
+    /// of that field.** That is what makes the epoch mean what
+    /// [`NextText.canExtend`] needs it to mean: every content change passes
+    /// through here, so an epoch that did not move is a proof the folds are
+    /// exactly as the run copied them.
+    ///
+    /// **The bump comes first, and the order is the safety property.** A moved
+    /// epoch sends [`canExtend`](NextText.canExtend) to the walk, which reads
+    /// whatever the folds actually hold — so on every path out of this
+    /// function the answer is at worst the pre-existing one, which always
+    /// walked. Bumping last would be the other way round: a copy that failed
+    /// on `error.OutOfMemory` would leave the epoch unmoved over folds whose
+    /// content *had* moved, and the short-circuit would then publish a stale
+    /// answer. Bumping first cannot: a moved epoch only ever costs a walk.
     fn refreshMarks(self: *SpanState, folds: *const batch.RichTextDiff) Error!void {
+        self.marks_epoch +%= 1;
         if (self.before) |*b| b.deinit();
         if (self.after) |*a| a.deinit();
         self.before = try copyFold(self.gpa, folds.before.current());
@@ -1733,6 +1884,15 @@ const Fixture = struct {
             self.table.deinit();
             return e;
         };
+        // **The table is a second owner and this is its error path.** `destroy`
+        // frees it beside the op set, and an error between the two — a refused
+        // `splice`, a mark order the op set will not accept
+        // ([`OpSet.rebuildIndex`](../../opset/op_set.zig)) — has to free it too,
+        // or a fixture that fails on its rows leaks the key strings and the
+        // mark name `splice` interned before it refused. **Declared before the
+        // op set's own `errdefer` so it runs after it**: the op set borrows the
+        // table, so the borrower goes first.
+        errdefer self.table.deinit();
         errdefer self.set.deinit();
         _ = try self.set.splice(0, rows);
         try self.set.rebuildIndex();
@@ -2841,4 +3001,219 @@ test "an unmark tombstone splits no run and reaches no span" {
     try testing.expectEqualStrings("abc", got.items[0].asStr());
     try expectMarks(got.items[0], &.{});
     try expectNoMark(got.items[0], "bold");
+}
+
+test "a marked text of many rows reads as one span, and its marks are copied per mark operation and not per row" {
+    // **The per-run cost, measured.** Before [`NextText.marks_epoch`], every
+    // row of a marked run asked `canExtend` to walk both folds' entries, so a
+    // text of `R` rows under `M` active mark names cost `O(R·M)` — quadratic in
+    // the product, and `M` grows with the document. With the epoch the walk
+    // happens only on a row that follows a mark operation which **moved** the
+    // resolved content, so the cost is `O(R + P·M)` for `P` such operations.
+    //
+    // **Bytes allocated is the instrument, and it is the right one here**
+    // because the walk allocates nothing — so this does not directly count
+    // walks. What it does pin is the *copy* half, which is the other half of
+    // the claim and the one that is observable: `refreshMarks` copies both
+    // folds once per **changed** mark operation (spans.zig:848-875) and
+    // `runMarks` copies the view once per **run** (spans.zig:857-862), and
+    // neither may scale with the number of rows between them.
+    //
+    // **The rows: `R` characters, one `bold` mark opened before the first and
+    // not closed until after the last**, so every row sits inside the mark and
+    // the whole text is one run. The mark is what makes the test bite: an
+    // unmarked read takes `pushUnmarkedAddStr`'s fast arm (spans.zig:820-853),
+    // which never asks `canExtend` at all, so an unmarked fixture would pass
+    // this whether or not the epoch existed.
+    //
+    // **Ids: the characters take `2 ..= R+1`, the mark's begin is `R+2` and its
+    // end is `R+3`**, and the end's id is the begin's plus one
+    // ([`markEnd`]'s doc). The mark's rows come **before** the text they cover
+    // and its end before the element at its end index, which is the order
+    // [`pageBoundaryRows`] above states for the same reason.
+    const build_gpa = testing.allocator;
+    const R: usize = 300;
+    const text = made(1, 0);
+
+    const build = struct {
+        /// `R` single-code-point inserts under one open `bold` mark, as rows
+        /// over a caller-owned buffer that outlives the op set.
+        fn rows(gpa: Allocator, text_obj: ObjId, n: usize) !std.ArrayList(opmod.Op) {
+            var out: std.ArrayList(opmod.Op) = .empty;
+            errdefer out.deinit(gpa);
+            const begin_id = opId(@intCast(n + 2), 0);
+            const end_id = opId(@intCast(n + 3), 0);
+            var prev: OpId = begin_id;
+            try out.append(gpa, markBegin(begin_id, text_obj, head(), "bold", .{ .bool_value = true }));
+            for (0..n) |i| {
+                const id = opId(@intCast(i + 2), 0);
+                try out.append(gpa, row(
+                    id,
+                    text_obj,
+                    if (i == 0) head() else anchored(prev),
+                    true,
+                    .set,
+                    // Every character is `"a"`, so the rendered text is a run of
+                    // `n` of them and the assertion below can say so exactly.
+                    .{ .str = "a" },
+                    false,
+                    null,
+                    &.{},
+                ));
+                prev = id;
+            }
+            // The end sits after the last character, anchored on it, so no row
+            // is inside the mark's tail.
+            try out.append(gpa, markEnd(end_id, text_obj, anchored(prev)));
+            return out;
+        }
+    };
+
+    var ops = try build.rows(build_gpa, text, R);
+    defer ops.deinit(build_gpa);
+    const doc = try Fixture.build(build_gpa, &.{actor_a}, ops.items);
+    defer doc.destroy();
+
+    // **One span for the whole text, carrying `bold`.** A reader that split the
+    // run per row would answer `R` spans, and a reader that split it at the
+    // mark's own boundaries would answer three. This is the same assertion
+    // shape as the page-boundary test above, for the same reason: a count of
+    // spans is what upstream's `assert_eq!(patches.len(), 1)` is counting.
+    var got = try readAll(&doc.set, text, build_gpa, null);
+    defer freeSpans(&got, build_gpa);
+    if (got.items.len != 1) {
+        std.debug.print("{d} span(s) over {d} rows, want 1\n", .{ got.items.len, R });
+        return error.TestExpectedEqual;
+    }
+    try testing.expectEqual(@as(usize, R), got.items[0].asStr().len);
+    try expectMarks(got.items[0], &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
+
+    // **And the reader's bytes do not grow with the rows.** The fold copies
+    // are `O(M)` per mark operation (`refreshMarks`) and `O(M)` per run
+    // (`runMarks`), there is **one** mark operation and **one** run here, and
+    // the span hands its marks over rather than copying them — so the bytes a
+    // walk of `R` rows spends on marks are the same handful a walk of **one**
+    // row spends. **That is the observable half of the claim**: a reader that
+    // copied the mark set per row would spend `R` times this, and the ratio
+    // between the two measurements is exactly the `R` this test pins.
+    //
+    // Two sizes a factor of eight apart, measured on the **walk only** — the
+    // fixture and the op set are built before the counter is read, so their
+    // bytes are not in either figure.
+    const Walk = struct {
+        fn bytes(gpa: Allocator, text_obj: ObjId, n: usize, counter: *testing.FailingAllocator) !usize {
+            var built = try build.rows(gpa, text_obj, n);
+            defer built.deinit(gpa);
+            const counted = try Fixture.build(gpa, &.{actor_a}, built.items);
+            defer counted.destroy();
+
+            // Warm the op set's own successor buffer, which belongs to the op
+            // set and not to the reader. **The warm-up's spans are freed** — a
+            // reader hands out owned text and marks, and dropping them on the
+            // floor would be a leak the counting allocator's own inner would
+            // report at the end of the test.
+            {
+                var warm = try readAll(&counted.set, text_obj, gpa, null);
+                defer freeSpans(&warm, gpa);
+            }
+
+            const before = counter.allocated_bytes;
+            var spans = try readAll(&counted.set, text_obj, gpa, null);
+            defer freeSpans(&spans, gpa);
+            // The spans are read, not only counted, so a reader that answered
+            // nothing cannot pass by allocating nothing.
+            try testing.expectEqual(@as(usize, 1), spans.items.len);
+            try testing.expectEqual(n, spans.items[0].asStr().len);
+            try expectMarks(spans.items[0], &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
+            return counter.allocated_bytes - before;
+        }
+    };
+
+    var counter: testing.FailingAllocator = .init(testing.allocator, .{});
+    const cgpa = counter.allocator();
+    const one = try Walk.bytes(cgpa, text, 1, &counter);
+    const many = try Walk.bytes(cgpa, text, R, &counter);
+
+    // **The bound is on the growth, and it is per row of text** — a plain
+    // `many <= one * k` would be wrong here and would fail on a correct
+    // reader: the run's **text buffer** is `n` bytes and its capacity doubles,
+    // so a 300-row read legitimately allocates about 512 where a 1-row read
+    // allocates about 8. What must **not** grow per row is the **mark** work.
+    //
+    // **Why `R * 4` separates them.** Legitimate growth is the text: about one
+    // byte per row plus the slack in a doubled capacity, so a few bytes per row.
+    // A reader that copied the mark set per row would add a `MarkSet` — one
+    // allocation, a struct, and a 24-byte `MarkSet.Entry` for `bold` — to
+    // **every** row, which is tens of bytes per row and cannot fit under four.
+    // So the bound is loose on purpose and is a growth ceiling rather than a
+    // byte count, so it does not have to be restated when a struct field grows.
+    try testing.expect(many - one <= R * 4);
+}
+
+test "a mark that opens and closes with no text between still splits no run" {
+    const gpa = testing.allocator;
+    // **The case the epoch's whole design turns on, and it is the one the
+    // prose above names.** `"abc"` with `bold` opened before `"a"`, a second
+    // mark `em` opened and closed **with no text between the two**, and `bold`
+    // closing after `"c"`. The active set passes through
+    // `[bold] → [bold, em] → [bold]` while the buffered run keeps `[bold]`.
+    //
+    // **A counter over mark *operations* fails this**, and one over mark
+    // operations is what the comment [`NextText.marks_epoch`] had to be
+    // rewritten away from: `em` opening and closing moves the content twice, so
+    // the epoch differs from the run's and `canExtend` takes the
+    // `flattenedEql` walk — which compares **content** and answers equal, so the
+    // run keeps its text. This is upstream's
+    // `spans_are_consolidated_in_the_presence_of_zero_length_spans`
+    // (`tests/text.rs:297-319`) with a **non-tombstone** mark, which the
+    // unmark-tombstone test above covers only in its tombstone shape: upstream's
+    // two zero-length marks are `Mark::new("strong", true, 1, 1)` and
+    // `Mark::new("strong", true, 2, 2)` (`tests/text.rs:303-315`), and an empty
+    // mark is exactly that shape — a begin and an end with no row between them.
+    //
+    // **One span of three characters carrying `bold` and not `em`** is the
+    // answer. Three spans is the failure a content-blind comparison gives, and
+    // one span carrying `em` is the failure a fold that forgot to end it
+    // gives — so both marks are asserted, by name, and not by count.
+    //
+    // **The ids below are load-bearing, and they are not free choices.** A mark
+    // end carries no name, and a nameless mark row names the begin at
+    // `id.prev()` ([`Op.markIndex`](../../opset/op.zig), `op.rs:191-202`, the
+    // `MarkIndexBuilder::End(self.id.prev())` arm), so an end closes the begin
+    // whose counter is one below its own. [`OpSet.rebuildIndex`](../../opset/op_set.zig)
+    // runs that word past the validator, which refuses an end whose begin it has
+    // not already seen in row order
+    // ([`MarkOrderValidator.checkEnd`](../../opset/index.zig), `index.rs:52-73`).
+    // So `bold` is `(5, 0)` and `(6, 0)` and `em` is `(7, 0)` and `(8, 0)`:
+    // each end is the counter after its own begin, and `bold`'s end arrives
+    // after every row it covers. This is the shape the overlapping fixture
+    // above writes, where the second mark's pair is `(12, 0)`/`(13, 0)` and the
+    // first's end still closes `(5, 0)` at `(6, 0)`.
+    const text = made(1, 0);
+    const doc = try Fixture.build(gpa, &.{actor_a}, &.{
+        row(opId(1, 0), .root, .{ .map = "t" }, false, .make_text, .null_value, false, null, &.{}),
+        markBegin(opId(5, 0), text, head(), "bold", .{ .bool_value = true }),
+        row(opId(2, 0), text, anchored(opId(5, 0)), true, .set, .{ .str = "a" }, false, null, &.{}),
+        // `em` opens and closes between `"a"` and `"b"`, so no row is inside it.
+        markBegin(opId(7, 0), text, anchored(opId(2, 0)), "em", .{ .bool_value = true }),
+        markEnd(opId(8, 0), text, anchored(opId(7, 0))),
+        row(opId(3, 0), text, anchored(opId(8, 0)), true, .set, .{ .str = "b" }, false, null, &.{}),
+        row(opId(4, 0), text, anchored(opId(3, 0)), true, .set, .{ .str = "c" }, false, null, &.{}),
+        markEnd(opId(6, 0), text, anchored(opId(4, 0))),
+    });
+    defer doc.destroy();
+
+    var got = try readAll(&doc.set, text, gpa, null);
+    defer freeSpans(&got, gpa);
+
+    if (got.items.len != 1) {
+        std.debug.print("{d} span(s), want 1\n", .{got.items.len});
+        for (got.items) |span| std.debug.print("  \"{s}\" marks={d}\n", .{ span.asStr(), marksOf(span).len });
+        return error.TestExpectedEqual;
+    }
+    try testing.expectEqualStrings("abc", got.items[0].asStr());
+    try expectMarks(got.items[0], &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
+    // **`em` must not reach the span at all**, asserted by name so a span
+    // carrying `em` plus something else is still a failure.
+    try expectNoMark(got.items[0], "em");
 }

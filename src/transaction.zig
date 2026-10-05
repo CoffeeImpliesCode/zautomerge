@@ -408,18 +408,31 @@ pub fn heads(gpa: Allocator, tx: *const Transaction) Error![]ChangeHash {
 /// the root object id, an id the document does not hold, and **an operation
 /// this transaction has written and not yet committed** — which is the third
 /// of the three and the one only the manual door reaches.
+///
+/// **This is upstream's own call, and it is a delegation.**
+/// [`Automerge::hash_for_opid`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):1559-1567
+/// is the `ExId::Root` arm and then `self.change_graph.opid_to_hash(opid)`
+/// (`:1563-1564`), and [`ChangeGraph::opid_to_hash`](../../github-automerge-automerge/rust/automerge/src/change_graph.rs):300-318
+/// binary-searches `seq_index[actor]` for the change whose
+/// `[start_op, max_op]` holds the counter. This port's
+/// [`ChangeGraph.opidToHash`](change_graph.zig) **is** that function, already
+/// `pub` and already the port of `change_graph.rs:300-320`, so this is the same
+/// answer the reference gives at the same cost: **`O(log` changes by that
+/// actor)`, not `O(changes in the document)`.**
+///
+/// **It used to walk the node table**, and the reason is worth keeping: this
+/// file was written before `opidToHash` had a `pub` door, so it reimplemented
+/// the interval test over `nodes` — `O(C)` in the whole graph, where `C` is
+/// every change the document has ever seen rather than the ones this actor
+/// wrote. The two agree on every counter because both reduce to "the node whose
+/// `[start_op, max_op]` contains the counter, and there is at most one", which
+/// is why the rewiring changes no answer. The test
+/// `test "hashForOpid answers a many-change document as the graph's own
+/// interval query does, and answers every null upstream lists"` is the witness
+/// that they still agree, over two hundred changes and two alternating actors.
 pub fn hashForOpid(tx: *const Transaction, id: ExId) ?ChangeHash {
     const op = id.opId() orelse return null; // ExId::Root
-    const graph = &tx.doc.graph;
-    var i: usize = 0;
-    while (i < graph.len()) : (i += 1) {
-        const node = graph.nodeAt(@intCast(i)) orelse continue;
-        if (node.actor != op.actor) continue;
-        const counter: u64 = op.counter;
-        if (counter < node.meta.start_op or counter > node.meta.max_op) continue;
-        return node.meta.hash;
-    }
-    return null;
+    return tx.doc.graph.opidToHash(op);
 }
 
 /// This transaction's dependencies as **node indices**, **caller-owned** and
@@ -1471,6 +1484,110 @@ test "hashForOpid names the change that carries an operation, and nothing for a 
     try testing.expect(hashForOpid(&tx, absent) == null);
 }
 
+test "hashForOpid answers a many-change document as the graph's own interval query does, and answers every null upstream lists" {
+    const gpa = testing.allocator;
+    var doc = try manual(gpa);
+    defer doc.deinit();
+
+    const first: ActorId = .{ .bytes = "0123456789abcdef" };
+    const second: ActorId = .{ .bytes = "fedcba9876543210" };
+    var key_buf: [16]u8 = undefined;
+    var last_hash: ChangeHash = undefined;
+    var last_exid: ExId = undefined;
+    for (0..200) |i| {
+        // **Alternate the actor**, so `seq_index` has two lists of a hundred
+        // each rather than one list of two hundred. The counter space is
+        // shared — `start_op = graph.maxOp() + 1` ([`doc.zig:3398`](doc.zig),
+        // upstream's `automerge.rs:567`) — so the two lists interleave, and a
+        // binary search over one of them has to step over counters the other
+        // actor owns. That is the shape where a search and a scan could
+        // disagree, and a single actor could not produce it.
+        doc.setActorId(if (i % 2 == 0) first else second);
+        var tx = try Transaction.open(gpa, &doc);
+        defer tx.deinit();
+        const key = try std.fmt.bufPrint(&key_buf, "k{d}", .{i});
+        const id = (try tx.put(.root, .{ .key = key }, .{ .int = @intCast(i) })).?;
+        last_hash = (try commitWith(&tx, CommitOptions.none)).?;
+        last_exid = doc.ops.idToExid(id);
+    }
+    // **Two actors and two hundred changes**, so the answer for the last
+    // change is two hundred nodes into the table rather than one. The scan this
+    // replaced cost that walk per call, and a fixture of one change would not
+    // tell the two apart: both answers would be the first node.
+    try testing.expectEqual(@as(usize, 200), doc.graph.len());
+    try testing.expectEqual(@as(usize, 2), doc.numActors());
+
+    // A transaction to ask through. `hashForOpid` reads `tx.doc.graph` and
+    // nothing else on the transaction, so an open one is all the call needs.
+    var probe = try Transaction.open(gpa, &doc);
+    defer probe.deinit();
+
+    // **The last change's operation, which is the one the old scan had to walk
+    // the whole table to reach.** The head of the graph is that change, so this
+    // is also the answer a peer asking for the newest operation gets.
+    // `head`, not `heads`: this file has a `heads` function
+    // ([`:398`](transaction.zig)) and a local may not shadow it.
+    const head = probe.baseHeads();
+    try testing.expectEqual(@as(usize, 1), head.len);
+    try testing.expect(hashForOpid(&probe, last_exid).?.eql(last_hash));
+    try testing.expect(hashForOpid(&probe, last_exid).?.eql(head[0]));
+
+    // **Every counter of every actor, against the graph's own interval query.**
+    // This is the equivalence that makes the delegation a rewiring and not a
+    // new answer: `opidToHash` is what `hashForOpid` now calls, and it is what
+    // upstream calls (`change_graph.rs:300-318`). Walking every counter rather
+    // than a sample is deliberate — a search that is off by one agrees with a
+    // scan everywhere except the counter it lands on.
+    var named: usize = 0;
+    for (0..doc.numActors()) |slot| {
+        // `types.ActorIdx` rather than a module alias: nothing outside this
+        // test names the type, and a top-level `const` only tests read is a
+        // name the file's own surface does not have.
+        const actor: types.ActorIdx = @intCast(slot);
+        // `0` is the head sentinel, and `maxOp() + 1` is past the last change.
+        var counter: u64 = 0;
+        while (counter <= doc.graph.maxOp() + 1) : (counter += 1) {
+            const id = ExId.fromParts(counter, actor) orelse continue;
+            const through_door = hashForOpid(&probe, id);
+            const through_graph = doc.graph.opidToHash(id.opId().?);
+            if (through_graph) |hash| {
+                named += 1;
+                try testing.expectEqual(hash, through_door.?);
+            } else {
+                // A counter no change owns belongs to no change: that is the
+                // root's counter zero and the counter past the last change.
+                try testing.expect(through_door == null);
+            }
+        }
+    }
+    // **The comparison is not vacuous.** `named` counts the `(actor, counter)`
+    // pairs some change owns, and every operation in the fixture is owned by
+    // exactly one change of exactly one actor — so it is the fixture's op
+    // count. A door that answered null for everything would fail here rather
+    // than pass having compared nothing.
+    try testing.expectEqual(@as(usize, 200), named);
+
+    // **The three nulls upstream lists**
+    // ([`manual_transaction.rs:41-43`](../../github-automerge-automerge/rust/automerge/src/transaction/manual_transaction.rs)).
+    // The root names no operation.
+    try testing.expect(hashForOpid(&probe, .root) == null);
+    // An id the document does not hold: a real actor slot and a counter above
+    // every change's `max_op`.
+    const last_slot: types.ActorIdx = @intCast(doc.graph.numActors() - 1);
+    const absent = ExId.fromParts(1_000_000, last_slot) orelse return error.BadExId;
+    try testing.expect(hashForOpid(&probe, absent) == null);
+    // And an operation this transaction has written and not yet committed,
+    // which is the third of the three and the one only the manual door
+    // reaches: its counter is above every change the graph holds, so it is
+    // past the last `max_op` whichever way the interval is searched.
+    const pending = (try probe.put(.root, .{ .key = "pending" }, .{ .int = 0 })).?;
+    try testing.expect(hashForOpid(&probe, doc.ops.idToExid(pending)) == null);
+    // **And it names the change once that transaction commits**, which is the
+    // whole of the pending/committed distinction.
+    const committed = (try commitWith(&probe, CommitOptions.none)).?;
+    try testing.expect(hashForOpid(&probe, doc.ops.idToExid(pending)).?.eql(committed));
+}
+
 test "the whole write surface of API.md's ## Write, driven from manual transactions" {
     const gpa = testing.allocator;
     var doc = try manual(gpa);
@@ -1732,11 +1849,17 @@ test "the wrong door is an error: a manual document is the only one a transactio
 //    path: the engine's commit is refused, and commitWith restores the
 //    isolation"` pins both halves so the workaround cannot be dropped silently.
 //
-// 9. **`hashForOpid` walks the graph, where upstream binary-searches it.**
-//    Upstream's `ChangeGraph::opid_to_hash` (`change_graph.rs:300-318`)
-//    binary-searches the actor's own change list, which `change_graph.zig`
-//    keeps private. This file scans the node table, which is `O(nodes)` rather
-//    than `O(log n)` and answers the same question.
+// 9. **`hashForOpid` used to walk the node table; it is upstream's binary
+//    search now.** Upstream's `ChangeGraph::opid_to_hash`
+//    (`change_graph.rs:300-318`) binary-searches `seq_index[actor]`, and
+//    `change_graph.zig` has carried that as the `pub` `opidToHash` since it
+//    was written — the round-3 audit's "no public entry point" was wrong, and
+//    so was the note here that `seq_index` is private. This file scanned
+//    `nodes` instead, which is `O(C)` in the whole graph where upstream is
+//    `O(log` changes by that actor `)`, and answered the same question. It now
+//    delegates (`transaction.zig:433-436`), so **this is no longer a
+//    divergence**; the note stays because the scan is the shape a reader
+//    comparing the two files will still expect to find.
 //
 // 10. **`changeMeta` cannot carry the author footer, so `authorFooter` is
 //    separate.** Upstream folds it in through `extra_bytes`

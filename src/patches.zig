@@ -36,6 +36,56 @@
 //!   — which is what makes a diff of a document that gained an object produce a
 //!   stream a hydrate round trip can apply.
 //!
+//! # What a patch costs, read off the source
+//!
+//! **No gate in `bench/` reaches this file**, so these are source-derived, not
+//! measured, and the numbers that were wrong are named with what fixed them.
+//!
+//! * **Per event, O(1) plus the patch's own payload.** [`PatchBuilder.maybeAppend`]
+//!   reads the tail patch and compares one id — no scan, no map
+//!   (`:2087-2093`). **Per patch's first event, O(depth) path steps**, each a
+//!   binary search over the [`PathMap`] (`:1543-1555`), and
+//!   [`PatchBuilder.updatePathMap`] walks a parent **once per builder**, not
+//!   once per child, because `seen` gates it (`:1758-1759`).
+//! * **Per coalesced mark event, O(runs in the event)**, and it is that by
+//!   appending to the array the patch already names
+//!   ([`PatchBuilder.appendMarks`], `:2001-2007`). **It was O(runs already in
+//!   the patch) per event** — it built a second array and copied the whole run
+//!   list into it every call — so `n` mark events on one patch cost
+//!   `1 + 2 + … + (n-1)` copies. That was the one superlinear term in the
+//!   builder and it is gone; `test "n mark events on one object coalesce into
+//!   one patch holding every run, in order"` is the witness, and it is driven
+//!   through the builder because [`PatchLog.mark`] folds consecutive runs into
+//!   one event as it records them (`:2700-2716`) and so cannot reach the arm
+//!   twice.
+//! * **Per coalesced text splice, O(bytes in the patch so far)**, and that one
+//!   is still true. [`ConcreteTextValue.splice`] allocates a replacement of
+//!   the whole value and copies both sides (`:481-488`), where upstream holds
+//!   a `SequenceTree<u8>` per encoding and splices in place
+//!   ([`text_value.rs`:36`](../../github-automerge-automerge/rust/automerge/src/text_value.rs),
+//!   `:48-51`). **A diff that coalesces many splices onto one text object is
+//!   quadratic in that object's length**, and it is a deliberate port choice,
+//!   not an oversight: this buffer cannot retain half a surrogate pair, which
+//!   a native-unit tree also cannot but handles by splitting (`:497-499`).
+//!   **Left alone and reported, not fixed** — the fix is to port the rope,
+//!   which is a change to a value type three modules read.
+//! * **Once per `makePatches`, O(E log E)** for `E` events, the stable sort at
+//!   [`PatchLog.buildCurrent`]'s `std.sort.block` (`:3128`). Amortised over the
+//!   patches it produces that is the log's own size, not a per-patch cost.
+//!   **It re-sorts on every call** and the events are already sorted after the
+//!   first, so a caller that diffs repeatedly pays it repeatedly; upstream has
+//!   the same shape ([`patch_log.rs`:515-516](https://github.com/automerge/automerge/blob/ddbff535407e4d28cd2a82eaf6c6add08/rust/automerge/src/patches/patch_log.rs)).
+//! * **Per exposed object, O(1) amortised**, plus a walk of that object's own
+//!   content: [`ExposeQueue`] keeps a sorted flat array where upstream has a
+//!   `BTreeSet<ExId>` ([`patch_log.rs`:680](../../github-automerge-automerge/rust/automerge/src/patches/patch_log.rs)),
+//!   so its `insert` is a binary search **plus an O(queue) memmove**
+//!   (`:2220-2231`) and its `remove` an `orderedRemove` (`:2234-2248`). The
+//!   queue holds only the objects one diff exposes, which is bounded by the
+//!   objects that diff created, so the quadratic is in *that* and not in the
+//!   document. **Reported, not fixed**: the memmove is the price of the flat
+//!   array the module doc chose on purpose, and the queue is empty for every
+//!   diff that exposes nothing.
+//!
 //! # The one lifetime in this file
 //!
 //! `opset/batch.zig` hands a sink a **borrowed** mark set and frees it as soon
@@ -1562,6 +1612,18 @@ pub fn PatchBuilder(comptime D: type) type {
         /// memory, so it stays valid for as long as the patches do, and this
         /// field is never freed.
         last_mark_set: ?MarkSet = null,
+        /// The mark runs of the **tail** mark patch, in the array they are
+        /// built in. Arena memory like [`patches`](Self.patches), so it is
+        /// never freed on its own; what it is for is a **capacity that
+        /// survives from one event to the next**, which is the whole of what
+        /// [`appendMarks`](Self.appendMarks) is about.
+        ///
+        /// **Reset to an empty array whenever a new mark patch opens, and the
+        /// capacity is dropped with it.** A mark patch that is no longer the
+        /// tail keeps its own `marks` slice, and retaining the capacity here
+        /// would hand the next patch the very buffer that slice names. The
+        /// old array is arena memory and needs no free.
+        mark_scratch: std.ArrayList(Mark) = .empty,
         /// The cache `init` was handed, **taken over rather than copied**
         /// (`patch_builder.rs`:19`).
         ///
@@ -1921,9 +1983,14 @@ pub fn PatchBuilder(comptime D: type) type {
             }
             if (runs.isEmpty()) return;
             const path = (try self.getPath(obj)) orelse return;
-            var marks: std.ArrayList(Mark) = .empty;
-            try self.collectMarks(&marks, runs);
-            try self.push(obj, path, .{ .mark = .{ .marks = marks.items } });
+            // **A new patch, so the scratch starts over and its capacity goes
+            // with it.** The array the previous mark patch still points at is
+            // arena memory and outlives this; reusing its buffer would rewrite
+            // a patch that has already been built.
+            self.mark_scratch = .empty;
+            errdefer self.mark_scratch = .empty;
+            try self.collectMarks(&self.mark_scratch, runs);
+            try self.push(obj, path, .{ .mark = .{ .marks = self.mark_scratch.items } });
         }
 
         /// A new conflict appeared
@@ -1960,12 +2027,33 @@ pub fn PatchBuilder(comptime D: type) type {
         }
 
         /// Grows an open mark patch's array and adds one event's runs to it.
+        ///
+        /// **It appends to the array the patch already names, and that is the
+        /// whole change.** It used to build a *second* array, copy every run
+        /// the patch already carried into it, append the new ones and publish
+        /// that — so a log coalescing `n` mark events onto one patch copied
+        /// `1 + 2 + … + (n-1)` runs, which is **O(n²) in the patch's mark
+        /// count**. Upstream pushes onto the `Vec` it already holds
+        /// ([`patch_builder.rs`:330-335](../../github-automerge-automerge/rust/automerge/src/patches/patch_builder.rs)),
+        /// so it is O(n) and this now is too.
+        ///
+        /// **The array can move, so the patch is re-pointed at it.** Growing a
+        /// `std.ArrayList` reallocates, and a patch holds a slice rather than
+        /// the list, so `action.mark.marks` is rewritten after the appends. A
+        /// patch's slice is only ever read between events — the walk finishes
+        /// before any caller sees the batch — so that is safe, and it is the
+        /// same rule [`patches`](Self.patches) itself runs under.
+        ///
+        /// **A refused append leaves the patch naming what it named before**,
+        /// which is what the copy bought and what is still bought here: the
+        /// runs that made it in are arena memory [`Patches.deinit`] releases
+        /// with everything else, and the length is put back below.
         fn appendMarks(self: *Self, action: *PatchAction, runs: *const MarkRuns) Error!void {
             var a = action;
-            var out: std.ArrayList(Mark) = .empty;
-            try out.appendSlice(self.gpa, a.mark.marks);
-            try self.collectMarks(&out, runs);
-            a.mark.marks = out.items;
+            const was = self.mark_scratch.items.len;
+            errdefer self.mark_scratch.shrinkRetainingCapacity(was);
+            try self.collectMarks(&self.mark_scratch, runs);
+            a.mark.marks = self.mark_scratch.items;
         }
 
         /// Copies every run of `runs` into `out`, **name and value**: a name
@@ -4243,6 +4331,118 @@ test "two adjacent events on one object are one patch, and two objects are two" 
         "root path=[] Insert { index: 9, values: [{ value: Str(\"z\"), obj: 3@0, conflict: false }] }",
         "1@0 path=[root.Map(\"list\")] Insert { index: 0, values: [{ value: Str(\"c\"), obj: 4@0, conflict: false }] }",
     });
+}
+
+test "n mark events on one object coalesce into one patch holding every run, in order" {
+    const gpa = testing.allocator;
+    // **`list_obj` hangs in the root's registers**, because
+    // [`PatchBuilder.getPath`] resolves a path by asking the document where
+    // the object hangs (`:1758`) and then reading the property off the making
+    // operation's key, and a root with no register naming it
+    // answers nothing — the patch would be dropped, not built. The second
+    // half of this test is about what a *second* mark patch does to the first
+    // one's array, and it cannot ask that of a patch that was never built.
+    const root_items = [_]MapItem{.{
+        .key = "list",
+        .value = .{ .object = .list },
+        .id = opId(1, 0),
+        .conflict = false,
+    }};
+    const doc: TestDoc = .{ .objs = &.{
+        .{ .id = .root, .typ = .map, .map_items = &root_items },
+        .{ .id = list_obj, .typ = .list, .parent = .root },
+    } };
+
+    // **Driven through the builder, not through a [`PatchLog`], and that is
+    // deliberate.** `PatchLog.mark` folds consecutive mark runs into **one**
+    // event as it records them (`patches.zig`:2652-2668`, upstream's
+    // `patch_log.rs`:456-459`), so a log cannot hand
+    // [`PatchBuilder.appendMarks`] more than one call per patch and the arm
+    // cannot be reached twice through that door at all. The builder is the
+    // only way to say what is being claimed here: **n calls into the
+    // coalescing arm, one patch out.**
+    var out: Patches = .init(gpa);
+    defer out.deinit();
+    // The seed is an empty map, so it has no array and `path_map_gpa` only
+    // has to be the allocator every growth and the one free go through.
+    var builder: PatchBuilder(TestDoc) = .init(&out, &doc, .{}, gpa, null, .unicode_code_point);
+    defer builder.deinit();
+
+    // **Many calls, one object.** The count is the point: it is what turns a
+    // shape that could be exercised once into one whose cost is visible.
+    // `appendMarks` used to build a *second* array, copy the patch's whole
+    // run list into it and publish that, so `n` calls copied
+    // `1 + 2 + … + (n-1)` runs — quadratic in `n`. It appends now, as upstream
+    // pushes onto the `Vec` it already holds
+    // ([`patch_builder.rs`:330-335](../../github-automerge-automerge/rust/automerge/src/patches/patch_builder.rs)).
+    //
+    // **Two runs per call, so the growth is not one-per-call** and a builder
+    // that kept only the last call's runs cannot pass.
+    const n = 64;
+    for (0..n) |k| {
+        var runs: MarkRuns = .init(gpa);
+        defer runs.deinit();
+        var set = try MarkSet.fromPairs(gpa, &.{
+            .{ .name = "bold", .value = ival(1) },
+            .{ .name = "link", .value = sval("https://example.com") },
+        });
+        defer set.deinit();
+        try runs.add(k * 4, 4, &set);
+        try builder.mark(.root, &runs);
+    }
+
+    // **One patch, not `n`.** The head is empty so nothing coalesces into it.
+    try testing.expectEqual(@as(usize, 1), builder.patches.items.len);
+    const action = builder.patches.items[0].action;
+    try testing.expect(std.meta.activeTag(action) == .mark);
+
+    // **Every run of every call is present.** That is the property the copy
+    // used to preserve and the append must too: an append into the wrong
+    // array would carry one call's runs, or the last call's, and this count is
+    // what says it does not.
+    try testing.expectEqual(@as(usize, 2 * n), action.mark.marks.len);
+
+    // **The name-sorted order each call contributed is kept**, and the pairs
+    // concatenate. `MarkRuns` sorts by name, so each pair is `bold` then
+    // `link` ([`MarkRuns`]'s own doc comment calls the order load-bearing).
+    for (0..n) |k| {
+        const at = 2 * k;
+        try testing.expectEqualStrings("bold", action.mark.marks[at].name);
+        try testing.expectEqualStrings("link", action.mark.marks[at + 1].name);
+        try testing.expect(action.mark.marks[at].value.eql(.{ .int = 1 }));
+        try testing.expect(action.mark.marks[at + 1].value.eql(.{
+            .str = "https://example.com",
+        }));
+        // **And the bounds are the ones this call asked for**, not a later
+        // one's: the runs are appended in order, not merged by name across
+        // calls, which is upstream's shape too (it pushes; it does not fold).
+        try testing.expectEqual(@as(usize, k * 4), action.mark.marks[at].start);
+        try testing.expectEqual(@as(usize, k * 4 + 4), action.mark.marks[at].end);
+    }
+
+    // **A second object opens a second patch, and the first one's runs are
+    // untouched.** This is what the scratch's reset is for: a new mark patch
+    // must not start by writing over the array the first still names.
+    {
+        var runs: MarkRuns = .init(gpa);
+        defer runs.deinit();
+        var set = try MarkSet.fromPairs(gpa, &.{
+            .{ .name = "bold", .value = ival(1) },
+            .{ .name = "link", .value = sval("https://example.com") },
+        });
+        defer set.deinit();
+        try runs.add(0, 4, &set);
+        try builder.mark(list_obj, &runs);
+    }
+    try testing.expectEqual(@as(usize, 2), builder.patches.items.len);
+    try testing.expectEqual(@as(usize, 2 * n), builder.patches.items[0].action.mark.marks.len);
+    try testing.expectEqual(@as(usize, 2), builder.patches.items[1].action.mark.marks.len);
+
+    // **And the batch carries both, in order**, which is what the arena's copy
+    // out of the builder is for.
+    try out.items.appendSlice(out.allocator(), builder.patches.items);
+    try testing.expectEqual(@as(usize, 2), out.len());
+    try testing.expectEqual(@as(usize, 2 * n), out.slice()[0].action.mark.marks.len);
 }
 
 test "a delete that lands inside the insert before it takes the elements back out" {

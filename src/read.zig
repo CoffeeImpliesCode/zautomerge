@@ -2054,7 +2054,7 @@ pub fn getCursorPositionFor(
     // can**: [`OpSet.seekListOpid`](opset/op_set.zig) is fallible for the same
     // question and returns `error.InvalidIndex` when the row the id names lies
     // outside the object's range
-    // ([`op_set.zig`:3145](../opset/op_set.zig)'s range check, and the two prefix
+    // ([`op_set.zig`:4007](../opset/op_set.zig)'s range check, and the two prefix
     // descents below it). **So the
     // refusal arrives under the wrong name, and this is the one place the name
     // is put back**: upstream's `InvalidCursor` for this arm is the port's
@@ -2073,10 +2073,10 @@ pub fn getCursorPositionFor(
     //
     // **It also makes the present and a historical read agree with each
     // other**, which they did not before. With a clock the port takes the slow
-    // arm alone ([`seekListOpid`](opset/op_set.zig):3093), which answers `null`
+    // arm alone ([`seekListOpid`](opset/op_set.zig):3951), which answers `null`
     // for an id outside the object and so already refused with
     // `InvalidCursor`; without one the fast arm's range check ran first
-    // ([`:3145`](../opset/op_set.zig)) and refused with `InvalidIndex`. **Same
+    // ([`:4007`](../opset/op_set.zig)) and refused with `InvalidIndex`. **Same
     // cursor, same object, two names, depending only on whether a clock was in
     // play.** Upstream has one name because it has one question and one `None`.
     const found = cursormod.getCursorPosition(
@@ -2346,7 +2346,7 @@ const OpSpec = struct {
     value: optypes.ScalarValue = .null_value,
     /// **Whether the row inserts into a sequence rather than overwriting a
     /// key** — and every mark row does
-    /// ([`op_set.zig:4015-4021`](../opset/op_set.zig) is the port's own
+    /// ([`op_set.zig:6378-6382`](../opset/op_set.zig) is the port's own
     /// `markBegin` helper and says "Both halves of a mark are inserts, which is
     /// what upstream's `insert_mark_end_after` produces", `transaction/inner.rs:830-866`).
     /// A mark that is not an insert has a register of its raw key and the row
@@ -3947,7 +3947,7 @@ test "a target that is not an object is a defined refusal, and a map has no curs
     // (`:1778-1781`); **the port's [`OpSet.seekListOpid`](opset/op_set.zig) is
     // fallible for the same question and raises `error.InvalidIndex` when the
     // row the id names is outside the object's range**
-    // ([op_set.zig:3145](../opset/op_set.zig)), so the refusal arrived under
+    // ([op_set.zig:4007](../opset/op_set.zig)), so the refusal arrived under
     // the wrong name.** [`getCursorPosition`] now puts upstream's name back,
     // and this is the expectation that changed with it — **not** a
     // transcription fix and not a second source of truth about which rows an
@@ -3955,7 +3955,7 @@ test "a target that is not an object is a defined refusal, and a map has no curs
     // decided.
     //
     // **It also closes an inconsistency inside the port.** With a clock the
-    // seek takes the slow arm alone ([`seekListOpid`](opset/op_set.zig):3093),
+    // seek takes the slow arm alone ([`seekListOpid`](opset/op_set.zig):3951),
     // which answers `null` and already refused with `InvalidCursor`; without
     // one the fast arm's range check ran first and refused with
     // `InvalidIndex`. **The same cursor and the same object refused under two

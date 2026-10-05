@@ -139,6 +139,23 @@
 //! position, [`OpSet.seekListOpid`](opset/op_set.zig) to resolve one, and
 //! [`OpSet.seqLength`](opset/op_set.zig) for `Cursor.end`.
 //!
+//! **Making a cursor is one of those three, not two.** It used to be two:
+//! [`getCursor`] made a second [`OpSet.seekListOpid`] call to recover the
+//! register's start for the offset, and that call was not a descent but an
+//! **O(rows in the object) walk** in every build, because
+//! [`OpSet.seekListOpid`] answered its fast arm and ran
+//! [`OpSet.seekListOpidSlow`](opset/op_set.zig) beside it and compared the
+//! two. **That comparison is behind
+//! [`OpSet.check_slow_paths`](opset/op_set.zig) now**
+//! ([`op_set.zig`:3953-3956](opset/op_set.zig)) — upstream spells it a
+//! `debug_assert_eq!` (`op_set.rs:846`) that its release profile compiles out,
+//! while here the second arm is a `Grouped` walk over every register in the
+//! object, so an always-on comparison was O(rows) on every cursor resolve.
+//! The number the call fetched was already in the first answer's `index`, so
+//! the call bought nothing but the walk. **The cost is read off the source,
+//! not measured**: the test at the foot of this file is the witness that the
+//! two numbers are equal, and no gate in `bench/` reaches a cursor.
+//!
 //! # A cursor names the row the query answered, and that is upstream's rule
 //!
 //! Upstream mints `OpCursor::new(op.id, ...)` over `found.ops.last()`
@@ -169,6 +186,13 @@
 //! *every* row of a register, the overwritten one included: measured on
 //! [`set_over_insert`], the element `2@0` and the `set` over it `3@0` both
 //! answer index `0`, and both arms of the cross-check agree.
+//!
+//! **Which is why [`getCursor`] can read the element's start off the
+//! [`OpSet.seekOpsByIndex`] it already made**, and does: the descent it
+//! landed on is that same prefix. It used to make a second
+//! [`OpSet.seekListOpid`] call to be told the number this paragraph says it
+//! already had; see "Where a cursor is resolved" above for what that call
+//! cost.
 //!
 //! **The argument that once said otherwise, and the document it needed.** It
 //! was that a `set` over an element is a *second* top row in a register of
@@ -753,23 +777,68 @@ pub fn getCursor(
     // The register's own start, so the offset is measured from the element
     // and not from wherever the query happened to land. A list element's
     // start is the index itself, so the subtraction is zero there; a `set`
-    // over a two-unit text element is in the same register, so the id of
-    // **either** row answers the same start and the overwrite does not move
+    // over a two-unit text element is in the same register, so **every** row
+    // of that register answers the same start and the overwrite does not move
     // the offset.
     //
-    // `seek_list_opid` finds the register a row belongs to — a walk of the
-    // object's registers with a containment test on the row's position
-    // ([`op_set.rs:878-896`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs))
-    // — so **the cursor comes back to the index it was taken at** for every
-    // row `seek_ops_by_index` can hand back, because they are all in one
-    // register. That is the round trip, and it is structural rather than
-    // checked: the fast arm's prefix arithmetic agrees only while the index
-    // holds one winner per register, which is what
-    // [`OpSet.seekListOpid`](opset/op_set.zig)'s cross-check is there to
-    // report.
-    const start = (try set.seekListOpid(obj, elem.id, seq_type, clock)) orelse
-        return error.InvalidIndex;
-    const offset = std.math.cast(u32, i - start.index) orelse return error.InvalidIndex;
+    // **`found.index` is that start, and it was already in hand.** This line
+    // used to make a second descent — [`OpSet.seekListOpid`] — to fetch it,
+    // which was the second of the two descents a round-3 audit named here,
+    // and it was not the cheap shape that audit assumed. `seekListOpid`
+    // answered the fast arm **and ran [`OpSet.seekListOpidSlow`] beside it
+    // and compared the two**, and that slow arm walks the object's registers
+    // from its first row to the row asked about (now
+    // [`op_set.zig`:4071-4087](opset/op_set.zig), upstream's
+    // `op_set.rs`:878-896). **So the second descent cost O(rows in the object)
+    // per cursor, in every build.**
+    //
+    // **That comparison is behind [`OpSet.check_slow_paths`] now**
+    // ([`op_set.zig`:3953-3956](opset/op_set.zig)), so a cursor pays for one
+    // descent either way: upstream spells the comparison a
+    // `debug_assert_eq!` (`op_set.rs:846`) and its release profile compiles
+    // that out ([`rust/Cargo.toml`:14-16](../../github-automerge-automerge/rust/Cargo.toml)),
+    // and the walk is O(rows in the object) here. Five cross-checks in
+    // `op_set.zig` sit behind that flag ([`op_set.zig`:3746, 3953, 4346,
+    // 4788, 4976](opset/op_set.zig)); the sixth,
+    // [`OpSet.findOpByIdAndVis`](opset/op_set.zig), is ungated because its
+    // slow arm stops at the end of the row's own register
+    // (`op_set.rs:1131-1132`). **Each gated comparison has a default-build
+    // witness test** that calls both arms directly, so the comparison is still
+    // made — the gate decides who pays for it, not whether it happens.
+    // Reading `index` off `found` instead makes a cursor O(log rows) plus one
+    // register's width, which is what the first descent already costs.
+    //
+    // **The two numbers are the same number, and the reason is the index.**
+    // `found.index` is the start of the register `seek_ops_by_index` landed
+    // on — `index` unchanged for a list, where an element is one unit wide
+    // ([`op_set.zig`:3839](opset/op_set.zig)), and the prefix the descent
+    // consumed for a text ([`op_set.zig`:3884](opset/op_set.zig),
+    // [`:3896`](opset/op_set.zig)), which is the element's start by that arm's
+    // own sentence ([`op_set.zig`:3858-3860](opset/op_set.zig)). `seek_list_opid`
+    // answers the start of the register the *named row* belongs to. Those are
+    // one register, because every row `seek_ops_by_index` hands back is a row
+    // of the register it landed on and a register carries exactly one
+    // `index.top` ([`OpSet.validateTopIndex`](opset/op_set.zig), upstream's
+    // `assert_eq!(first_top, last_vis)`, `op_set.rs`:196-212), so the prefix
+    // before any of its rows is the same value. That is the round trip, and
+    // it is structural rather than checked.
+    //
+    // **What the removed call was the witness for, and where it still is.**
+    // It compared the fast descent against the walk. That comparison is not
+    // gone: [`getCursorPosition`] makes the same call at [`:872`](cursor.zig)
+    // and once per step of its backward walk at [`:914`](cursor.zig), and
+    // three tests in `op_set.zig` compare the two arms directly and pin the
+    // answers as literals ([`op_set.zig`:11266-11277](opset/op_set.zig),
+    // [`:11330-11341`](opset/op_set.zig),
+    // [`:11407-11409`](opset/op_set.zig)).
+    // **The two refusals the call could raise here were unreachable**, which
+    // is the same claim the two arms above it already make: the id came off
+    // a row this query returned for this object, so `getOpIdPos` finds it and
+    // it is inside the object's range. `error.InvalidIndex` below is the one
+    // refusal this function really has, and it fires at the same place it
+    // always did.
+    if (found.index > i) return error.InvalidIndex;
+    const offset = std.math.cast(u32, i - found.index) orelse return error.InvalidIndex;
 
     return .{ .op = OpCursor.init(elem, offset, move_cursor, actor) };
 }
@@ -2593,6 +2662,94 @@ test "a cursor inside a multi-unit text element keeps the offset, which is this 
     defer gpa.free(inside_str);
     try testing.expectEqualSlices(u8, "2@0123456789abcdef", inside_str);
     try testing.expectEqualSlices(u8, inside_str, edge_str);
+}
+
+test "the offset is the register's own start, which the first descent already answers" {
+    const gpa = testing.allocator;
+
+    // **The claim is an equality between two numbers this file used to fetch
+    // from two places.** [`getCursor`] reads the register's start off
+    // `seekOpsByIndex`'s `found.index`; it used to read it off a second
+    // `seekListOpid` call, whose cost was an O(rows in the object) walk. This
+    // test is the witness that the two are the same number, computed the old
+    // way beside the new one on **every position of every fixture** — so the
+    // cheap answer is checked against the expensive one rather than assumed
+    // equal to it.
+    //
+    // The four fixtures are the four shapes that separate them if anything
+    // can: a plain text ([`hello_world`], one register per character), a
+    // **multi-unit** element ([`wide`], where the requested index is inside
+    // the element and the start is not the index), a register of **one
+    // insert and one `set` over it** ([`set_over_insert`], where the cursor
+    // names the `set` and the insert it shadows is in the same register), and
+    // a row hanging by the **head** ([`head_set_list`], the one row whose id
+    // is not the element).
+    const cases = [_]struct { name: []const u8, rows: []const Rec, obj: ExId, seq: SequenceType }{
+        .{ .name = "hello_world", .rows = &hello_world, .obj = t_obj, .seq = .text },
+        .{ .name = "wide", .rows = &wide, .obj = t_obj, .seq = .text },
+        .{ .name = "set_over_insert", .rows = &set_over_insert, .obj = l_obj, .seq = .list },
+        .{ .name = "head_set_list", .rows = &head_set_list, .obj = l_obj, .seq = .list },
+    };
+    for (cases) |c| {
+        const doc = try Doc.build(gpa, &solo_actor, c.rows);
+        defer doc.destroy();
+        const len = try doc.set.seqLength(c.obj, .unicode_code_point, null);
+
+        var i: usize = 0;
+        while (i < len) : (i += 1) {
+            // The expensive answer, taken the way `getCursor` used to take
+            // it: the row the query named, resolved back to its register.
+            var found = try doc.set.seekOpsByIndex(gpa, c.obj, i, c.seq, null);
+            defer found.deinit(gpa);
+            if (found.ops.items.len == 0) continue;
+            const row = found.ops.items[found.ops.items.len - 1];
+            const named = ElemId.fromOpId(row.id());
+            const walked = (try doc.set.seekListOpid(c.obj, named.id, c.seq, null)).?;
+
+            // **The cheap answer is the same number.** This is the assertion
+            // the removal rests on.
+            if (found.index != walked.index) {
+                std.debug.print(
+                    "{s}[{d}]: seek index {d}, register start {d}\n",
+                    .{ c.name, i, found.index, walked.index },
+                );
+                return error.TestExpectedEqual;
+            }
+
+            // **And the cursor carries exactly that offset**, so the cheap
+            // answer is not merely equal to the expensive one, it is the one
+            // the cursor is built from.
+            const cursor = try getCursor(gpa, &doc.set, c.obj, .fromIndex(i), null, .after);
+            try testing.expectEqual(
+                @as(u32, @intCast(i - found.index)),
+                cursor.op.offset,
+            );
+            // **And the round trip closes**: the cursor comes back to the
+            // position it was taken at.
+            try testing.expectEqual(
+                i,
+                try getCursorPosition(&doc.set, c.obj, cursor, null),
+            );
+        }
+    }
+
+    // **A register of one insert and one `set` over it is the case the
+    // argument is about, pinned as literals rather than as an equality with
+    // another function's output.** Both ids answer index 0 on
+    // [`set_over_insert`], so whichever row the descent names, the start is
+    // 0 and the offset is 0.
+    {
+        const doc = try Doc.build(gpa, &solo_actor, &set_over_insert);
+        defer doc.destroy();
+        try testing.expectEqual(@as(usize, 1), try doc.set.seqLength(l_obj, .unicode_code_point, null));
+        for ([_]OpId{ OpId.init(2, 0), OpId.init(3, 0) }) |id| {
+            const here = (try doc.set.seekListOpid(l_obj, id, .list, null)).?;
+            try testing.expectEqual(@as(usize, 0), here.index);
+        }
+        const c = try getCursor(gpa, &doc.set, l_obj, .fromIndex(0), null, .after);
+        try testing.expectEqual(@as(u32, 0), c.op.offset);
+        try testing.expectEqual(@as(usize, 0), try getCursorPosition(&doc.set, l_obj, c, null));
+    }
 }
 
 // ── Across a save and a load ───────────────────────────────────────────────

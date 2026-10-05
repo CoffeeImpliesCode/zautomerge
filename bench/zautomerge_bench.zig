@@ -22,7 +22,10 @@
 //! over `src/opset/op_set.zig:3500-3503`), and the per-change arena in
 //! `anonymize`, whose gate is peak RSS rather than instructions and which
 //! `bench/README.md` §8 gives as a standalone command line. The three that can
-//! be gated through the public surface are the last three workloads here.
+//! be gated through the public surface are three of the last four workloads
+//! here; the fourth, `insert-loop`, is a fifth gate and not one of the audit's
+//! four — it measures a cost the audit did not name, which another gate here
+//! found by accident while measuring its own fixture.
 //!
 //! Every workload prints one machine-readable line on **stdout**:
 //!
@@ -46,6 +49,20 @@
 //! Run one workload per process and `perf stat`'s instruction count belongs to
 //! that workload alone, which is what makes it diffable across a before/after
 //! build. Always report the load average next to any wall-clock number.
+//!
+//! Two things that sentence leaves out, both measured, both of which have
+//! bitten this file:
+//!
+//! **`zig build bench` does not forward its arguments and installs no binary.**
+//! `zig build bench -- --list` runs all eleven workloads and prints all eleven
+//! `BENCH` lines. Build the executable once with the `zig build-exe` line in
+//! `bench/README.md` §7 — `-O ReleaseFast` goes **before** the first `-M`, or
+//! the binary comes out `Debug` — and call it directly.
+//!
+//! **An instruction count belongs to the process, not to the timed region.**
+//! `list-width` prints what share of the process its subject had and fails the
+//! run if that share falls under `list_width_subject_floor_pct`; read that
+//! line before quoting the count for any workload that times a region.
 //!
 //! USAGE
 //!
@@ -71,7 +88,7 @@ const OpId = am.OpId;
 const TextEncoding = am.TextEncoding;
 const ChangeHash = am.ChangeHash;
 
-/// The buffer stdout is written through. Ten short lines would not need one;
+/// The buffer stdout is written through. Eleven short lines would not need one;
 /// a reader that wants the file before the process has exited does.
 const stdout_buffer_len = 8 * 1024;
 
@@ -419,13 +436,33 @@ const Sizes = struct {
     opid_changes: usize,
     /// How many `hashForOpid` calls each arm is timed over.
     opid_calls: usize,
-    /// Elements in the list `list-width` walks.
+    /// Elements in the list `list-width` walks. **Neither size changed.** The
+    /// fixture used to cost about 1011 s at 50 000 against a 16.1 s subject;
+    /// it is now one batched splice, so the walk is the cost and the element
+    /// count is the thing being measured rather than the thing being paid for.
     list_width_elements: usize,
-    /// Times that walk runs. One pass over a reduced list is close to the
-    /// clock's floor, so this is what lifts it above.
+    /// Times that walk runs. One pass over 50 000 elements is already 8 s, so
+    /// this lifts nothing at the default size; it exists so the `--full` point
+    /// and the default point are the same shape.
     list_width_passes: usize,
 
-    // The three added workloads have **no test case behind them**, so `full`
+    /// Ascending `Transaction.insert` calls in ONE transaction and ONE commit:
+    /// the **small** of the two sizes `insert-loop` builds, so the per-insert
+    /// cost has a smaller point to be flat against. **Scaled by the same factor
+    /// as `insert_large` under `--full`**, because the ratio between the two
+    /// sizes is the measurement and a run whose ratio moved would be measuring
+    /// something else.
+    insert_small: usize,
+    /// The **large** of the two: exactly `insert_loop_size_ratio` times
+    /// `insert_small`, and the run fails if it is not
+    /// (`error.SizesAreNotAtTheDocumentedRatio`). **The ratio between the two
+    /// sizes IS the finding**: a per-insert cost flat in `n` reads about the
+    /// same at both, and one that grows with `n` — an O(rows) walk per insert —
+    /// reads `insert_loop_size_ratio` times as much at the large size. The
+    /// guard is `insert_loop_growth_ceiling`, which sits between the two.
+    insert_large: usize,
+
+    // The four added workloads have **no test case behind them**, so `full`
     // below is not "the case's exact size" for them; it is a larger documented
     // size of the same shape. `bench/README.md` §4 says which is which.
 
@@ -450,11 +487,13 @@ const Sizes = struct {
         .opid_calls = 400,
         .list_width_elements = 50_000,
         .list_width_passes = 2,
+        .insert_small = 2_500,
+        .insert_large = 10_000,
     };
 
     /// The sizes the port's own test cases use, exactly, for the seven cases
     /// there are seven test cases for — and a larger documented size of the
-    /// same shape for the three added workloads, which have none. `--full`.
+    /// same shape for the four added workloads, which have none. `--full`.
     const full: Sizes = .{
         .seg_reps = 500,
         .seg_single_passes = 1024,
@@ -471,7 +510,14 @@ const Sizes = struct {
         .opid_changes = 50_000,
         .opid_calls = 1_000,
         .list_width_elements = 200_000,
-        .list_width_passes = 4,
+        // **One** pass, not four. The walk is quadratic in the element count —
+        // that is the finding this gate exists for — so one pass over 200 000
+        // elements is already about 128 s and a second would buy no second
+        // point and cost another 128 s. `--full` is the larger *size*, not the
+        // larger sample count.
+        .list_width_passes = 1,
+        .insert_small = 5_000,
+        .insert_large = 20_000,
     };
 };
 
@@ -1636,12 +1682,182 @@ fn hashForOpidWorkload(ctx: Ctx) !Result {
 // row asked for (`src/opset/op_set.zig:3488-3492`). `mark-at-end` walks a text
 // through the same `ListRange`; this one walks a **list**, which is the object
 // `elementWidth` is written for and the shape the audit named.
+//
+// ── And the fixture is not what this gate measures ──────────────────────────
+//
+// The first version of this workload built its 50 000 elements with
+// `for (0..n) |i| try tx.insert(list, i, ...)` and timed the walk with
+// `measures_own_time`. `perf stat -e instructions` **counts the whole
+// process**, so that run reported the loop: 4.69e12 instructions over 1027 s
+// of wall clock against a subject timer of 16.1 s — about 98% of the count was
+// the fixture, and the `BENCH` line, which carried the subject, could not be
+// reconciled with the instruction count a reader was told to quote. A gate
+// whose headline number and whose headline metric disagree is worse than no
+// gate, because both look authoritative.
+//
+// Two things fix it, and both are here.
+//
+// **The lever was not "append at the end".** `tx.insert(list, i, …)` over
+// `i = 0..n` into an empty list *already* appends at the end every time: at
+// step `i` the list holds `i` elements, so `i` is the last index. The obvious
+// cheaper build was the one already in the file.
+//
+// **The lever is one call instead of `n`.** `am.transaction.spliceHeld`
+// (`src/transact.zig:2854`) is the door upstream's `Transactable::splice`
+// goes through (`src/transact.zig:2820-2821`, `inner.rs:673-799`), and it
+// reaches `Transaction.spliceListValues` (`src/transact.zig:1328`): **one**
+// `queryInsertAt` for the whole run and one `Batch.finish`
+// (`src/transact.zig:1343`, `:1373`), against **one** `queryInsertAt` and
+// **one** `insertLocalOp` per element for the loop, which goes through
+// `Transaction.insert` (`src/transact.zig:975-985`) → `doInsert`
+// (`src/transact.zig:866-897`) and so re-queries and re-splices the growing
+// op set once per element.
+//
+// **And the guard, so this cannot be misread again.** The workload fails with
+// `error.SubjectIsNotTheCost` unless the subject is at least
+// `list_width_subject_floor_pct` of everything the workload measured,
+// fixture and teardown included. A run whose fixture outweighs its subject
+// stops the run rather than printing a number that reads like a statement
+// about `elementWidth` and is not one.
 
 /// Thirteen bytes, eleven code points: the sibling text object's length under
 /// `.unicode_code_point` and under `.utf8_code_unit` are different numbers, so
 /// reading it back proves the document really is under the encoding asked for
 /// rather than under whichever one it defaulted to.
 const list_width_sample = "h\u{e9}llo w\u{f6}rld";
+
+/// **The floor the subject has to clear, as a percentage of everything this
+/// workload measured.** `perf stat -e instructions` counts the whole process,
+/// so a run whose fixture outweighs its subject reports the fixture whatever
+/// the `BENCH` line says, and the only way to stop that is to refuse the run.
+/// Ninety is far under the measured share and far over the ~1.5% the old
+/// fixture left, so an ordinary host cannot trip it by accident and a
+/// regression cannot pass by getting slower somewhere else.
+const list_width_subject_floor_pct = 90;
+
+/// How many elements the two fixture builders are compared over. Sixty-four is
+/// well past "long enough to have predecessors, successors and a visible
+/// tail", and small enough that the comparison costs nothing beside a walk of
+/// `list_width_elements`.
+const list_width_agree_elements = 64;
+
+/// The actor **both** fixture builders stamp on their document, so the two
+/// saved byte strings are comparable: the actor is in the footer of every
+/// change, so two documents built by different actors never save alike.
+const list_width_fixture_actor = "bench-list-width-fixture";
+
+/// One region's share of another, as a percentage. Only ever called with a
+/// non-zero `whole`; the total here is a document build plus a teardown.
+fn sharePct(part: u64, whole: u64) f64 {
+    if (whole == 0) return 0;
+    return @as(f64, @floatFromInt(part)) / @as(f64, @floatFromInt(whole)) * 100.0;
+}
+
+/// **Proves the batched fixture reads back as the sequential one.**
+///
+/// Two `.manual` documents of `elements` integers under key `"l"`: one built
+/// by `elements` `Transaction.insert` calls at ascending positions — what this
+/// workload used to do, and what a consumer that appends one element at a time
+/// still does — and one built by a single `am.transaction.spliceHeld`. Both
+/// are read back through the same `am.read.listRange` the subject uses, and
+/// every element has to agree: its index, a width of exactly 1, no conflict,
+/// not an object, and the integer written at that position. So a batch that
+/// made the walk cheaper by making it wrong fails here, at 64 elements, before
+/// the timed region is entered.
+///
+/// The saved bytes are **reported, not required**. The bytes are the
+/// document's identity on the wire and this workload's contract is the
+/// *materialized* document, so a difference there is a fact about the
+/// encoding and not a failure — and printing it puts the fact on the record
+/// rather than leaving the next reader to assume they are equal.
+///
+/// Returns `elements`, for the checksum.
+fn listFixtureAgreement(
+    gpa: Allocator,
+    io: Io,
+    enc: TextEncoding,
+    elements: usize,
+) !u64 {
+    var seq = try Document.initWithEncoding(gpa, io, enc, .manual);
+    defer seq.deinit();
+    seq.setActorId(.{ .bytes = list_width_fixture_actor });
+    var seq_tx = try am.manual_transaction.Transaction.open(gpa, &seq);
+    var seq_tx_live = true;
+    defer if (seq_tx_live) seq_tx.deinit();
+    const seq_list = try seq_tx.putObject(am.root, .{ .key = "l" }, .list);
+    for (0..elements) |i| _ = try seq_tx.insert(seq_list, i, .{ .int = @intCast(i) });
+    if ((try am.manual_transaction.commitWith(
+        &seq_tx,
+        am.manual_transaction.CommitOptions.none,
+    )) == null) return error.EmptyCommit;
+    seq_tx.deinit();
+    seq_tx_live = false;
+
+    var batch = try Document.initWithEncoding(gpa, io, enc, .manual);
+    defer batch.deinit();
+    batch.setActorId(.{ .bytes = list_width_fixture_actor });
+    var batch_tx = try am.manual_transaction.Transaction.open(gpa, &batch);
+    defer batch_tx.deinit();
+    const batch_list = try batch_tx.putObject(am.root, .{ .key = "l" }, .list);
+    {
+        const values = try gpa.alloc(am.hydrate.Value, elements);
+        defer gpa.free(values);
+        for (values, 0..) |*slot, i| slot.* = .{ .int = @intCast(i) };
+        try am.transaction.spliceHeld(&batch_tx, batch_list, 0, 0, gpa, values);
+    }
+    if ((try am.manual_transaction.commitWith(
+        &batch_tx,
+        am.manual_transaction.CommitOptions.none,
+    )) == null) return error.EmptyCommit;
+
+    var seq_walk = try am.read.listRange(&seq, seq_list, am.read.IndexRange.all());
+    var batch_walk = try am.read.listRange(&batch, batch_list, am.read.IndexRange.all());
+    var seen: usize = 0;
+    while (true) {
+        const a = try seq_walk.next();
+        const b = try batch_walk.next();
+        if (a == null or b == null) {
+            if (a != null or b != null) return error.FixturesDisagreeOnLength;
+            break;
+        }
+        if (a.?.index != seen or b.?.index != seen) return error.FixturesDisagreeOnIndex;
+        if (a.?.width != 1 or b.?.width != 1) return error.FixturesDisagreeOnWidth;
+        if (a.?.conflict or b.?.conflict) return error.FixtureConflicts;
+        const av = switch (a.?.value) {
+            .object => return error.FixtureElementIsAnObject,
+            .scalar => |s| switch (s) {
+                .int => |got| got,
+                else => return error.FixtureElementIsNotAnInt,
+            },
+        };
+        const bv = switch (b.?.value) {
+            .object => return error.FixtureElementIsAnObject,
+            .scalar => |s| switch (s) {
+                .int => |got| got,
+                else => return error.FixtureElementIsNotAnInt,
+            },
+        };
+        if (av != @as(i64, @intCast(seen))) return error.FixtureValueDiffers;
+        if (bv != av) return error.FixturesDisagreeOnValue;
+        seen += 1;
+    }
+    if (seen != elements) return error.FixturesDisagreeOnCount;
+    if (try am.read.length(&seq, seq_list) != elements) return error.FixtureLengthDiffers;
+    if (try am.read.length(&batch, batch_list) != elements) return error.FixtureLengthDiffers;
+
+    const seq_bytes = try seq.save(gpa);
+    defer gpa.free(seq_bytes);
+    const batch_bytes = try batch.save(gpa);
+    defer gpa.free(batch_bytes);
+    std.debug.print(
+        "#   list-width: the sequential and the batched {d}-element fixtures read back identically; their saved bytes are {s}\n",
+        .{
+            elements,
+            if (std.mem.eql(u8, seq_bytes, batch_bytes)) "identical" else "not identical",
+        },
+    );
+    return elements;
+}
 
 fn listWidth(ctx: Ctx) !Result {
     const gpa = ctx.gpa;
@@ -1651,44 +1867,46 @@ fn listWidth(ctx: Ctx) !Result {
     // fast one.
     if (n == 0 or passes == 0) return error.NothingToMeasure;
     // `measures_own_time` because the subject is the walk and not the
-    // fixture: one transaction holding 50 000 inserts costs about as much as
-    // reading them back, so timing the whole call would halve the signal.
+    // fixture. **That is only honest while the floor below holds**, which is
+    // why the fixture is one batched splice and why the workload refuses to
+    // report a run whose fixture outweighs its subject.
     var out: Result = .{ .iters = passes, .measures_own_time = true };
+    // The guard's own denominator: every region below, fixture and teardown
+    // included.
+    const total = Timer.start(ctx.io);
 
     // The port's default encoding, and the one `mark-at-end` uses, so the two
     // list walks are on the same measure.
     const enc: TextEncoding = .unicode_code_point;
 
-    // ── fixture, outside every clock ──
+    // ── fixture ──
     const build_started = Timer.start(ctx.io);
     var doc = try Document.initWithEncoding(gpa, ctx.io, enc, .manual);
-    defer doc.deinit();
+    var doc_live = true;
+    defer if (doc_live) doc.deinit();
     doc.setActorId(.{ .bytes = "bench-list-width" });
 
     var tx = try am.manual_transaction.Transaction.open(gpa, &doc);
-    defer tx.deinit();
+    var tx_live = true;
+    defer if (tx_live) tx.deinit();
     const list = try tx.putObject(am.root, .{ .key = "l" }, .list);
     const probe_text = try tx.putObject(am.root, .{ .key = "t" }, .text);
     try tx.spliceText(probe_text, 0, 0, list_width_sample);
-    // **One transaction, one commit, `n` operations.** A committed change per
-    // element would put `n` changes in the change graph and measure that too;
-    // `mark-at-end` splices 210 000 characters through one `spliceText`, so a
-    // single change this size is already well inside what the port does.
-    for (0..n) |i| _ = try tx.insert(list, i, .{ .int = @intCast(i) });
+    {
+        // **One splice, not `n` inserts.** Same list, same one transaction,
+        // same one commit; see the note at the head of this workload for what
+        // this replaces and what that cost.
+        const values = try gpa.alloc(am.hydrate.Value, n);
+        defer gpa.free(values);
+        for (values, 0..) |*slot, i| slot.* = .{ .int = @intCast(i) };
+        try am.transaction.spliceHeld(&tx, list, 0, 0, gpa, values);
+    }
     if ((try am.manual_transaction.commitWith(
         &tx,
         am.manual_transaction.CommitOptions.none,
     )) == null) return error.EmptyCommit;
-    out.addPhase("build-list", build_started.stop());
-
-    // ── the encoding, proved rather than assumed ──
-    if (am.read.textEncoding(&doc) != enc) return error.WrongTextEncoding;
-    if (try am.read.length(&doc, probe_text) != enc.width(list_width_sample)) {
-        return error.TextLengthIsNotInThisEncoding;
-    }
-    const sample_bytes = try am.read.text(&doc, probe_text, gpa);
-    defer gpa.free(sample_bytes);
-    if (!std.mem.eql(u8, sample_bytes, list_width_sample)) return error.TextBytesDiffer;
+    const build_ns = build_started.stop();
+    out.addPhase("build-list", build_ns);
 
     // ── the subject ──
     const read_started = Timer.start(ctx.io);
@@ -1724,14 +1942,401 @@ fn listWidth(ctx: Ctx) !Result {
     const read_ns = read_started.stop();
     out.addPhase("read-list", read_ns);
 
-    // And the independent oracle: `length` counts the object's visible
+    // ── everything that is not the subject, in one phase ──
+    //
+    // The encoding proof, the two fixture builders compared against each
+    // other, and the independent oracle: `length` counts the object's visible
     // elements without going anywhere near `elementWidth`, so the walk's own
     // count agreeing with it is a second, separate statement about the same
     // document.
+    const verify_started = Timer.start(ctx.io);
+    if (am.read.textEncoding(&doc) != enc) return error.WrongTextEncoding;
+    if (try am.read.length(&doc, probe_text) != enc.width(list_width_sample)) {
+        return error.TextLengthIsNotInThisEncoding;
+    }
+    const sample_bytes = try am.read.text(&doc, probe_text, gpa);
+    defer gpa.free(sample_bytes);
+    if (!std.mem.eql(u8, sample_bytes, list_width_sample)) return error.TextBytesDiffer;
+    out.mix(try listFixtureAgreement(gpa, ctx.io, enc, @min(n, list_width_agree_elements)));
     if (try am.read.length(&doc, list) != n) return error.ListLengthDiffers;
     out.mix(n);
+    const verify_ns = verify_started.stop();
+    out.addPhase("verify", verify_ns);
+
+    // ── the teardown, which `perf stat` counts and nothing timed ──
+    //
+    // Freeing a document this size is work the instruction count sees, so it
+    // belongs in the denominator the guard divides by rather than outside it.
+    const free_started = Timer.start(ctx.io);
+    tx.deinit();
+    tx_live = false;
+    doc.deinit();
+    doc_live = false;
+    const free_ns = free_started.stop();
+    out.addPhase("teardown", free_ns);
+
+    // ── the guard ──
+    const total_ns = total.stop();
+    std.debug.print(
+        "#   list-width: subject {d} ns of {d} ns measured = {d:.2}%" ++
+            " (floor {d}%); fixture {d:.2}%, verify {d:.2}%, teardown {d:.2}%\n",
+        .{
+            read_ns,
+            total_ns,
+            sharePct(read_ns, total_ns),
+            list_width_subject_floor_pct,
+            sharePct(build_ns, total_ns),
+            sharePct(verify_ns, total_ns),
+            sharePct(free_ns, total_ns),
+        },
+    );
+    if (read_ns * 100 < list_width_subject_floor_pct * total_ns) {
+        std.debug.print(
+            "#   list-width: the fixture outweighs the subject, so this run measures the fixture" ++
+                " and not `elementWidth`; refusing to report it\n",
+            .{},
+        );
+        return error.SubjectIsNotTheCost;
+    }
 
     out.ns = read_ns;
+    return out;
+}
+
+// ── Workload 11: n single-row inserts in ONE transaction, ONE commit ────────
+//
+// **This is the shape that measured about 1011 s.** 50 000
+// `tx.insert(list, i, …)` calls at ascending positions inside **one**
+// transaction, committed **once**, cost **about 1011 s of wall clock and
+// roughly 4.69e12 instructions** — the `list-width` fixture, quoted at
+// `bench/README.md` §7 and again at `src/opset/op_set.zig:4245-4253`. Two
+// O(rows)-per-insert stages sat on this path: `queryInsertAtSlow`'s
+// whole-object cross-check, now behind `check_slow_paths`
+// (`src/opset/op_set.zig:4264`), and `Column.rebuildAggs`, now narrowed to the
+// range the splice touched (`src/hexane/column.zig:6776`, called from
+// `Column.splice`'s settled arm at `src/hexane/column.zig:4303`).
+//
+// **And nothing measured it.** `list-width`'s fixture measured it as a
+// by-product and was deleted, because a gate that reports its own fixture's
+// cost is not a gate (`:1663-1673`). So the largest number this repository ever
+// recorded for a write path survived only as a comment about a *different*
+// workload, and a change could put either stage back with no gate noticing.
+// This one is that gate, and it differs from `list-width` in the way that
+// matters: **here the cost is the subject**, so there is no fixture for it to
+// be confused with, and nothing in this file measured it by accident.
+//
+// **The public chain**, all of it reachable from `@import("zautomerge")` and
+// none of it a private import:
+//
+//   * `am.manual_transaction.Transaction.open`     `src/transact.zig:480`
+//   * `am.manual_transaction.Transaction.putObject` `src/transact.zig:954`
+//   * `am.manual_transaction.Transaction.insert`    `src/transact.zig:975`
+//     → `Transaction.doInsert`                     `src/transact.zig:866`
+//       → `OpSet.queryInsertAt`                    `src/opset/op_set.zig:4213`
+//         → `OpSet.queryInsertAtSlow`              `src/opset/op_set.zig:4297`,
+//           reached on the fast path only behind `check_slow_paths`
+//           (`src/opset/op_set.zig:4264`) — the dominant of the two stages
+//       → `Transaction.insertLocalOp`              `src/transact.zig:632`
+//         → `OpSet.splice` → `Column.splice` → `Column.rebuildAggs`
+//                                                `src/hexane/column.zig:6776`
+//   * `am.manual_transaction.commitWith`           `src/transaction.zig:553`
+//
+// `hash-for-opid` (`:1530-1533`) opens and commits the same way, so the three
+// manual-transaction doors a consumer uses are all in this file.
+
+/// The map key the list is written under, on **both** arms. Reading it back by
+/// key in the reloaded document rather than reusing the id the transaction
+/// handed out is what proves the register itself survived the save.
+const insert_loop_key = "l";
+
+/// The actor **both** arms stamp on their documents. Fixed bytes, and a
+/// `CommitOptions.none` commit — whose time is **zero, not "now"**
+/// (`src/transaction.zig:178-180`) — make the change hash the same on every
+/// run, which is what lets the committed hash go into the checksum.
+const insert_loop_actor = "bench-insert-loop";
+
+/// **The factor `insert_loop_large` is `insert_loop_small` times.** Fixed, and
+/// checked at run time (`error.SizesAreNotAtTheDocumentedRatio`), because the
+/// growth guard below is a quadratic detector only at a *known* size ratio.
+const insert_loop_size_ratio = 4;
+
+/// **The per-insert cost at `insert_loop_large` may not exceed this multiple of
+/// the per-insert cost at `insert_loop_small`.**
+///
+/// The measurement is the *ratio*, not either number, because both numbers move
+/// with the host and the ratio does not:
+///
+/// * a per-insert cost **flat in `n`** — what a write path with no O(rows)
+///   stage costs — reads about **1.00**, and that is the finding;
+/// * a per-insert cost that **grows with `n`**, which is exactly what an
+///   O(rows)-per-insert stage is, reads about **4.00**: the size ratio.
+///
+/// Two sits between them with room for the wall clock's few percent on a busy
+/// host and for the fixed cost of opening a transaction and committing, which
+/// is a larger share of the small arm's total and so pulls the measured ratio
+/// *below* its true value — the direction that cannot hide a regression.
+/// A run past the ceiling **fails** and prints no `BENCH` line, the same
+/// refusal `list-width` makes when its fixture outweighs its subject
+/// (`error.SubjectIsNotTheCost`, `:1999`): a benchmark that cannot tell a flat
+/// cost from a quadratic one must not report a number that reads like a
+/// statement about which of the two it measured.
+const insert_loop_growth_ceiling = 2.0;
+
+/// What one arm cost, split by what the clock covered.
+const InsertLoopTiming = struct {
+    /// `Transaction.open` through the `commitWith` that returns. **The
+    /// subject**, and the region the ~1011 s figure was measured over.
+    build_ns: u64,
+    /// The save, the reload and the read-back of every element. Correctness,
+    /// deliberately outside `build_ns`.
+    verify_ns: u64,
+    /// Freeing the reloaded document, the saved bytes, the transaction and the
+    /// document. `perf stat` counts it and nothing timed it.
+    free_ns: u64,
+};
+
+/// Builds one arm: `n` `Transaction.insert` calls at **ascending** positions
+/// inside **one** transaction and **one** commit, then everything the run has to
+/// be able to claim about what that produced.
+///
+/// **Ascending positions are the shape that was measured**, and the note at
+/// `:1677-1680` says why "append at the end instead" is not a different shape
+/// at all: at step `i` the list holds `i` elements, so `i` *is* the last index.
+/// That loop was already appending, and it is the loop that cost 1011 s.
+///
+/// Every observation goes through `out`, so nothing here can be optimised away
+/// and both arms fold into one checksum.
+fn insertLoopShape(
+    gpa: Allocator,
+    io: Io,
+    n: usize,
+    out: *Result,
+) !InsertLoopTiming {
+    var t: InsertLoopTiming = .{ .build_ns = 0, .verify_ns = 0, .free_ns = 0 };
+
+    var doc = try Document.init(gpa, io, .manual);
+    var doc_live = true;
+    defer if (doc_live) doc.deinit();
+    doc.setActorId(.{ .bytes = insert_loop_actor });
+
+    // ── the subject ──
+    //
+    // The clock opens before `Transaction.open` and closes after `commitWith`
+    // returns, so the subject is the **whole transaction**: the list's own
+    // make, `n` single-row inserts, and the one commit that turns them into a
+    // change. Document creation is O(1) and the verification below is a phase,
+    // so neither is inside this region.
+    const started = Timer.start(io);
+    var tx = try am.manual_transaction.Transaction.open(gpa, &doc);
+    var tx_live = true;
+    defer if (tx_live) tx.deinit();
+    const list = try tx.putObject(am.root, .{ .key = insert_loop_key }, .list);
+
+    // **Every insert is an operation of its own, in order.** `insert` answers
+    // `WriteError!OpId` (`src/transact.zig:975`), so there is no null to
+    // confuse with a repeated write the way `put`'s `?OpId` has
+    // (`src/transact.zig:930`), and the counters are contiguous because
+    // `nextId` is `start_op + pending.len` (`src/transact.zig:515-518`). A loop
+    // that stopped early, skipped an element or reordered two inserts fails
+    // here instead of reporting a faster run.
+    var first_counter: u32 = 0;
+    for (0..n) |i| {
+        const id = try tx.insert(list, i, .{ .int = @intCast(i) });
+        if (i == 0) {
+            first_counter = id.counter;
+        } else if (id.counter != first_counter + @as(u32, @intCast(i))) {
+            return error.InsertOpIdsAreNotContiguous;
+        }
+    }
+    // The list's own make plus `n` inserts, staged and not yet committed.
+    if (tx.count() != n + 1) return error.WrongPendingOperationCount;
+
+    // **One commit.** A null hash is `Transaction.commit`'s answer for a
+    // transaction with nothing pending (`src/transact.zig:1418-1421`), so a
+    // null here would be the port refusing to write what it was asked to.
+    const hash = (try am.manual_transaction.commitWith(
+        &tx,
+        am.manual_transaction.CommitOptions.none,
+    )) orelse return error.EmptyCommit;
+    t.build_ns = started.stop();
+
+    // ── the transaction's final state ──
+    //
+    // `commit` sets `closed` on both exits (`src/transact.zig:1420`, `:1467`),
+    // and each of the three doors that can see it is asked: the field itself,
+    // `count` (`src/transact.zig:500`), which must be drained, and `maxOp`
+    // (`src/transaction.zig:379`), which refuses a closed transaction. A
+    // transaction left open would be one whose operations never reached the
+    // document; a non-empty pending list would be operations the commit did not
+    // carry.
+    if (!tx.closed) return error.TransactionIsNotClosedAfterCommit;
+    if (tx.count() != 0) return error.CommitLeftOperationsPending;
+    // Comparing the error union against the error literal is the door refusing
+    // in one line: a closed transaction answers `error.InvalidOp` and nothing
+    // else (`src/transaction.zig:379-380`).
+    if (am.manual_transaction.maxOp(&tx) != error.InvalidOp) {
+        return error.ClosedTransactionStillAnswersMaxOp;
+    }
+
+    // **One transaction and one commit is one change**, which is what the shape
+    // implies. `doc.graph` is a public field (`src/doc.zig:2616`) and
+    // `hash-for-opid` reads `doc.graph.len()` the same way (`:1613`).
+    if (doc.graph.len() != 1) return error.OneTransactionIsNotOneChange;
+    out.mix(doc.graph.len());
+    // Deterministic, because the actor above is fixed and the commit time is
+    // zero: the committed hash is the same on every run, so it belongs in the
+    // checksum, and it folds in every operation the change carries.
+    out.mix(hashFold(hash));
+
+    // ── the saved document, loaded back, and read ──
+    //
+    // **The read-back is on a reloaded document, not on `doc`.** A change that
+    // made the writes cheaper by writing something the encoder loses, or that
+    // the reader rebuilds differently, passes a read-back against the live
+    // document and fails this one. `Document.load` (`src/doc.zig:3801`) is the
+    // public door, and the encoding is the document's own — reported by
+    // `am.read.textEncoding` (`src/read.zig:2168`) rather than assumed, so the
+    // load cannot quietly disagree with the save about it.
+    const verify_started = Timer.start(io);
+    const bytes = try doc.save(gpa);
+    var bytes_live = true;
+    defer if (bytes_live) gpa.free(bytes);
+    var loaded = try Document.load(gpa, io, bytes, am.read.textEncoding(&doc), .manual);
+    var loaded_live = true;
+    defer if (loaded_live) loaded.deinit();
+    if (loaded.graph.len() != 1) return error.ReloadHasADifferentChangeCount;
+
+    // **The list is found by key in the reloaded document**, not by reusing the
+    // id the transaction handed out: a document that encoded the list but not
+    // the register naming it has to fail here. For an object value `DocItem.id`
+    // *is* that object's id (`src/read.zig:401-408`).
+    const found = (try am.read.get(&loaded, am.root, .{ .key = insert_loop_key })) orelse
+        return error.NoListUnderItsKey;
+    const holds_a_list = switch (found.value) {
+        .object => |kind| kind == .list,
+        .scalar => false,
+    };
+    if (!holds_a_list) return error.ReloadedRegisterIsNotAList;
+    const reloaded_list = found.id;
+
+    // **`am.read.length` on both**, and it is a prefix count with nothing to do
+    // with the walk below, so the two agreeing is a second and separate
+    // statement about the same document.
+    if (try am.read.length(&doc, list) != n) return error.ListLengthDiffers;
+    if (try am.read.length(&loaded, reloaded_list) != n) return error.ReloadLengthDiffers;
+
+    // **The list reads back with `n` elements at indices `0..n-1`, each the
+    // value it was given** — on the document that came back off the wire.
+    var walk = try am.read.listRange(&loaded, reloaded_list, am.read.IndexRange.all());
+    var seen: usize = 0;
+    while (try walk.next()) |item| {
+        if (item.index != seen) return error.ElementIndexDiffers;
+        // Every list element is one unit wide under every encoding
+        // (`src/opset/op.zig:2178-2181`), so a width read that reached the
+        // wrong row shows up as a number that is not 1.
+        if (item.width != 1) return error.ElementWidthDiffers;
+        if (item.conflict) return error.ElementConflicts;
+        switch (item.value) {
+            .object => return error.ElementIsAnObject,
+            .scalar => |v| switch (v) {
+                .int => |got| {
+                    if (got != @as(i64, @intCast(seen))) return error.ElementValueDiffers;
+                },
+                else => return error.ElementIsNotAnInt,
+            },
+        }
+        out.mix(item.index);
+        out.mix(item.width);
+        seen += 1;
+    }
+    if (seen != n) return error.ElementCountDiffers;
+    out.mix(seen);
+    t.verify_ns = verify_started.stop();
+
+    // ── the teardown, which `perf stat` counts and nothing timed ──
+    //
+    // Freeing a document this size is work the instruction count sees, so it is
+    // reported rather than assumed away.
+    const free_started = Timer.start(io);
+    loaded.deinit();
+    loaded_live = false;
+    gpa.free(bytes);
+    bytes_live = false;
+    tx.deinit();
+    tx_live = false;
+    doc.deinit();
+    doc_live = false;
+    t.free_ns = free_started.stop();
+    return t;
+}
+
+fn insertLoop(ctx: Ctx) !Result {
+    const gpa = ctx.gpa;
+    const small = ctx.sizes.insert_small;
+    const large = ctx.sizes.insert_large;
+    // A zero size would leave the loop inside `insertLoopShape` with nothing to
+    // iterate and the growth ratio with a division by zero, and a benchmark
+    // that measures nothing must fail rather than report a clean zero.
+    if (small == 0 or large == 0) return error.NothingToMeasure;
+    // The growth guard is a statement about a *known* size ratio, so the sizes
+    // are checked against the constant its reasoning is written for rather than
+    // trusted to still match it.
+    if (large != small * insert_loop_size_ratio) return error.SizesAreNotAtTheDocumentedRatio;
+
+    // `iters` is one `Transaction.insert` call **at the large size** and `ns` is
+    // that arm's subject alone, so `ns_per_iter` is the per-insert cost of the
+    // shape that regressed — the same division `hash-for-opid` makes, and the
+    // number to diff between two builds. The small arm is the contrast that
+    // says whether that cost grows with `n`.
+    var out: Result = .{ .iters = large, .measures_own_time = true };
+
+    // **The small arm first, on purpose.** Whichever arm runs second inherits a
+    // warm allocator and a warm code path, and the one that runs second here is
+    // the large one, so the reported growth ratio is biased *downward* — the
+    // direction that cannot turn a regression into a pass.
+    const small_arm = try insertLoopShape(gpa, ctx.io, small, &out);
+    out.addPhase("insert-small", small_arm.build_ns);
+    const large_arm = try insertLoopShape(gpa, ctx.io, large, &out);
+    out.addPhase("insert-large", large_arm.build_ns);
+    out.addPhase("verify", small_arm.verify_ns + large_arm.verify_ns);
+    out.addPhase("teardown", small_arm.free_ns + large_arm.free_ns);
+
+    // ── the growth ratio, which is the finding ──
+    //
+    // Printed per arm and as a ratio, because the two per-insert figures are
+    // the numbers comparable with the ~1011 s / 50 000 = **20.2 ms per insert**
+    // the old fixture recorded at 50 000, and the ratio is the number that is
+    // comparable between builds of any size.
+    const small_per = small_arm.build_ns / small;
+    const large_per = large_arm.build_ns / large;
+    const growth = (@as(f64, @floatFromInt(large_arm.build_ns)) / @as(f64, @floatFromInt(large))) /
+        (@as(f64, @floatFromInt(small_arm.build_ns)) / @as(f64, @floatFromInt(small)));
+    std.debug.print(
+        "#   insert-loop: {d} inserts in one transaction, one commit: {d} ns = {d} ns/insert\n",
+        .{ small, small_arm.build_ns, small_per },
+    );
+    std.debug.print(
+        "#   insert-loop: {d} inserts in one transaction, one commit: {d} ns = {d} ns/insert\n",
+        .{ large, large_arm.build_ns, large_per },
+    );
+    std.debug.print(
+        "#   insert-loop: per-insert cost grew {d:.3}x for a {d}x size change" ++
+            " (1.000 is flat in n, {d}.000 is a per-insert cost that grows with n;" ++
+            " ceiling {d:.3}x)\n",
+        .{ growth, insert_loop_size_ratio, insert_loop_size_ratio, insert_loop_growth_ceiling },
+    );
+
+    if (growth > insert_loop_growth_ceiling) {
+        std.debug.print(
+            "#   insert-loop: the per-insert cost grows with the document, which is the" ++
+                " O(rows)-per-insert stage this gate exists for; refusing to report a run" ++
+                " that cannot tell a flat cost from a quadratic one\n",
+            .{},
+        );
+        return error.InsertCostStillGrowsWithTheDocument;
+    }
+
+    out.ns = large_arm.build_ns;
     return out;
 }
 
@@ -1785,5 +2390,10 @@ const workloads = [_]Workload{
         .name = "list-width",
         .case = "src/iter/list_range.zig:884-901 `elementWidth` over src/opset/op_set.zig:3500-3503 `elemidAt` — no test case; added as a gate",
         .run = listWidth,
+    },
+    .{
+        .name = "insert-loop",
+        .case = "src/opset/op_set.zig:4264 `check_slow_paths` around `OpSet.queryInsertAtSlow` (:4297), and src/hexane/column.zig:6776 `Column.rebuildAggs`, both reached by src/transact.zig:975 `Transaction.insert` — no test case; added as a gate",
+        .run = insertLoop,
     },
 };

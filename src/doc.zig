@@ -9242,6 +9242,157 @@ test "a local commit's message and author footer survive the collector's re-enco
     try testing.expectEqualSlices(u8, got.change.bytes, got.body);
 }
 
+/// One change's worth of `n` operations on `n` distinct map keys, with `n`
+/// distinct values, numbered from `first_ctr`.
+///
+/// **Every column that can be a literal run is one here**, and that is the
+/// whole reason for the fixture. A run of equal values costs three bytes
+/// however long it is, so an encoder handed the same key and the same value
+/// `n` times is measured on its bookkeeping and not on its work. Distinct
+/// keys, counters and values put `key_str`, `obj_ctr`, `value_meta` and
+/// `value` into literal runs of `n` rows — the most work per row
+/// [`encodeChangeOps`] can be asked for, and therefore the shape in which a
+/// superlinear cost shows soonest rather than late.
+///
+/// The keys are written into one buffer and the specs borrow slices of it,
+/// which is the lifetime [`OpBuilder.init`] asks of its caller
+/// ([`op.zig`:703](opset/op.zig)).
+fn changeSpecs(
+    gpa: Allocator,
+    first_ctr: u32,
+    n: usize,
+) !struct { keys: []u8, specs: []OpSpec } {
+    // Twelve bytes a key, of which the printed form takes eight: `k` and
+    // seven digits. The slack is what lets the one `bufPrint` below answer a
+    // width it cannot meet with an error rather than with a trap.
+    const keys = try gpa.alloc(u8, n * 12);
+    errdefer gpa.free(keys);
+    const specs = try gpa.alloc(OpSpec, n);
+    errdefer gpa.free(specs);
+    for (specs, 0..) |*spec, i| {
+        const key = std.fmt.bufPrint(keys[i * 12 ..][0..8], "k{d:0>7}", .{i}) catch
+            return error.Overflow;
+        spec.* = .{
+            .ctr = first_ctr + @as(u32, @intCast(i)),
+            .key = KeyRef.fromStr(key),
+            .value = .{ .int = @intCast(i) },
+        };
+    }
+    return .{ .keys = keys, .specs = specs };
+}
+
+/// The bytes [`Document.commit`] allocates for one change of `n` operations,
+/// on a document that already holds `prior` operations in one earlier change.
+///
+/// **The counter is read around the commit and around nothing else.** The
+/// document, its actors, the operations, the rows they name and the
+/// transaction's own arguments are all built first, so what the difference
+/// measures is the encoder, the body's SHA-256 and the graph's one node —
+/// everything a commit does — and none of the cost of arriving at it.
+///
+/// `prior` is what makes the second test below possible: it puts rows the
+/// commit has no business reading underneath it, and the question is whether
+/// they move the number.
+fn commitAllocBytes(gpa: Allocator, n: usize, prior: usize) !usize {
+    // **`FailingAllocator` with no `fail_index` never fails**, so it is a real
+    // allocator and a byte counter at once
+    // ([`values.zig`:1225-1228](iter/values.zig)), and `allocated_bytes` is
+    // cumulative — a free adds to `freed_bytes` and takes nothing off it
+    // ([`marks.zig`:1013-1017](marks.zig)), which is exactly what a difference
+    // of two readings wants.
+    var failing: testing.FailingAllocator = .init(gpa, .{});
+    const inner = failing.allocator();
+    var doc = try Document.init(inner, std.testing.io, .auto);
+    defer doc.deinit();
+    doc.setActorId(.{ .bytes = actor_a });
+    const a = try doc.putActorRef(inner, .{ .bytes = actor_a });
+
+    // The earlier change, when there is one. It goes through the same door and
+    // through the same counter, and it runs entirely before the snapshot.
+    if (prior != 0) {
+        const earlier = try changeSpecs(gpa, 1, prior);
+        defer gpa.free(earlier.keys);
+        defer gpa.free(earlier.specs);
+        const ops = try buildOps(inner, a, earlier.specs);
+        defer freeChangeOps(inner, ops);
+        // One row per op, because every one of them is a write and not a
+        // delete (`op_set.zig:1453-1454`, said at `doc.zig:9219-9222`).
+        try testing.expectEqual(prior, doc.ops.splice(0, ops));
+        const args = try doc.transactionArgs(inner, null);
+        defer args.deinit(inner);
+        _ = try doc.commit(inner, args, ops, null, 1);
+    }
+
+    // The transaction's own arguments come first because they carry the
+    // counter the change starts at (`doc.zig:3398`), and the operations have
+    // to be numbered from it.
+    const args = try doc.transactionArgs(inner, null);
+    defer args.deinit(inner);
+    const made = try changeSpecs(gpa, std.math.cast(u32, args.start_op) orelse
+        return error.Overflow, n);
+    defer gpa.free(made.keys);
+    defer gpa.free(made.specs);
+    const ops = try buildOps(inner, a, made.specs);
+    defer freeChangeOps(inner, ops);
+    try testing.expectEqual(n, doc.ops.splice(0, ops));
+
+    const before = failing.allocated_bytes;
+    _ = try doc.commit(inner, args, ops, null, 2);
+    return failing.allocated_bytes - before;
+}
+
+test "a commit costs what its own operations cost, and not their square" {
+    const gpa = testing.allocator;
+    const small = 256;
+    const large = 4 * small;
+    const at_small = try commitAllocBytes(gpa, small, 0);
+    const at_large = try commitAllocBytes(gpa, large, 0);
+    std.debug.print(
+        "#   commit: {d} ops allocate {d} bytes, {d} ops allocate {d}\n",
+        .{ small, at_small, large, at_large },
+    );
+
+    // **The ratio, and why eight.** Bytes and not nanoseconds, so the number
+    // is the same on every run and does not move with the host's load. A
+    // linear encoder allocates `c * n` and reads 4.0 across a 4x size change;
+    // a quadratic one allocates `c * n * n` and reads 16.0. Eight sits
+    // between the two with room either way.
+    //
+    // **What this does and does not prove.** It pins the allocation shape,
+    // which is what a quadratic copy or a quadratic re-encode shows up as. A
+    // cost quadratic in comparisons alone would allocate nothing extra and
+    // pass here; that claim belongs to `insert-loop` in
+    // `bench/zautomerge_bench.zig`, which measures it instead of arguing it.
+    try testing.expect(at_small > 0);
+    try testing.expect(at_large <= 8 * at_small);
+}
+
+test "a commit does not read the rows the document already holds" {
+    const gpa = testing.allocator;
+    const n = 256;
+    const prior = 8 * n;
+    const on_empty = try commitAllocBytes(gpa, n, 0);
+    const on_loaded = try commitAllocBytes(gpa, n, prior);
+    std.debug.print(
+        "#   commit: {d} ops over 0 rows allocate {d} bytes, over {d} rows {d}\n",
+        .{ n, on_empty, prior, on_loaded },
+    );
+
+    // **The rows underneath are the document's, and the change's are not.**
+    // `Document.commit` encodes the `ops` it was handed and links one graph
+    // node (`doc.zig:5207-5216`); the op set is not read at all, so rows under
+    // it cannot move the number. An encoder that walked the document instead
+    // would read every one of the eight-times-larger set where this reads
+    // none, and the ratio would be near nine rather than near one.
+    //
+    // The arms differ in one more thing, because a change must: the loaded
+    // document's second change names the first as a dependency, so its header
+    // carries thirty-two more bytes. Three leaves that and the graph's own
+    // per-node growth room a long way below the ceiling.
+    try testing.expect(on_empty > 0);
+    try testing.expect(on_loaded <= 3 * on_empty);
+}
+
 test "an actor that sorts before one already in the table lands in the middle" {
     // **The insertion point is `binary_search`'s `Err` arm, not the end**
     // ([`automerge.rs:1309-1315`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),

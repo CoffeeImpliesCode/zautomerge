@@ -81,9 +81,17 @@
 //! reader rebuilds the body with every column inflated and every bit cleared,
 //! and the writer deflates each column whose length is at least
 //! `CompressConfig.threshold` and clears it again on the way back
-//! (`raw_column.rs:62-76`). Both directions are one pass that appends to two
-//! buffers and then concatenates them, which is what upstream's typestate
-//! does with `data_out` and `meta_out` (`document/compression.rs:244-330`).
+//! (`raw_column.rs:62-76`).
+//!
+//! **The two directions read different inputs, and that is why they are two
+//! functions.** The reader is handed bytes it did not build, so it reads the
+//! prefix, the two data blocks and the suffix back out of them
+//! ([`inflateBody`]); the writer is handed a [`DocumentBlock`], which already
+//! holds all four of those regions, so it never assembles the uncompressed
+//! body at all ([`compressBody`]). Both directions are one pass that appends
+//! to two buffers and then concatenates them, which is what upstream's
+//! typestate does with `data_out` and `meta_out`
+//! (`document/compression.rs:244-330`).
 //!
 //! `SaveOptions::deflate` maps to `Threshold(DEFLATE_MIN_SIZE)`, and
 //! `DEFLATE_MIN_SIZE` is 256 (`change.rs:17`, `automerge.rs:2337-2345`). The
@@ -580,7 +588,7 @@ fn decompressSets(
     const ops = try RawColumns.init(gpa, op_descs, op_data);
     defer ops.deinit(gpa);
 
-    const rewritten = try rewriteBody(gpa, body, layout, changes, ops, .decompress, 0);
+    const rewritten = try inflateBody(gpa, body, layout, changes, ops);
     // `RawColumns.init` copies the descriptors into its own list, so the two
     // arrays go back and only the rebuilt body survives.
     defer gpa.free(rewritten.change_descs);
@@ -834,7 +842,23 @@ pub fn writeBody(
     gpa: Allocator,
     block: DocumentBlock,
 ) ParseError!void {
-    _ = try writeBodyLayout(out, gpa, block);
+    // **The four regions, in the format's order, and nothing recorded about
+    // them.** A caller of this wants the bytes. The offsets a DEFLATE pass
+    // needs are the ones [`Layout`] carries on the read side, and on this side
+    // they are a function of the block rather than of a pass over it — which
+    // is the whole of what [`compressBody`] is built on.
+    try writePrefix(out, gpa, block);
+
+    // Both metadata blocks, then both data blocks: the order is the format's,
+    // and a reader locates the data from the lengths the metadata declares
+    // (`document.rs:223-231`).
+    try writeColumnMeta(out, gpa, block.changes);
+    try writeColumnMeta(out, gpa, block.ops);
+    try out.appendSlice(gpa, block.changes.data);
+    try out.appendSlice(gpa, block.ops.data);
+
+    try checkHeadIndexes(block);
+    try writeSuffix(out, gpa, block);
 }
 
 /// The body a document chunk carries, without the framing. Owned by the
@@ -867,18 +891,92 @@ pub fn writeChunk(
     block: DocumentBlock,
     config: CompressConfig,
 ) (ParseError || Allocator.Error)!void {
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(gpa);
-    const layout = try writeBodyLayout(&body, gpa, block);
-
     switch (config) {
-        .none => try chunk.writeChunk(out, gpa, .document, body.items),
+        .none => {
+            // The body has to exist whole before `chunk.writeChunk` can hash
+            // it, so this arm stages it. That is one copy of the block and
+            // not two: `chunk.writeChunk` appends into `out`, and the staging
+            // buffer is released on the way out.
+            var body: std.ArrayList(u8) = .empty;
+            defer body.deinit(gpa);
+            try writeBody(&body, gpa, block);
+            try chunk.writeChunk(out, gpa, .document, body.items);
+        },
         .threshold => |threshold| {
-            const rewritten = try rewriteBody(gpa, body.items, layout, block.changes, block.ops, .compress, threshold);
-            defer rewritten.deinit(gpa);
-            try chunk.writeChunk(out, gpa, .document, rewritten.bytes);
+            // **No staging pass, and that is the whole reason this arm does
+            // not go through `writeBody`.** The region offsets a rebuild needs
+            // are closed-form functions of the block — the prefix length, the
+            // two metadata lengths, the two data lengths and the suffix
+            // length — and in this direction every one of the five regions is
+            // already in the caller's hands: the prefix is written from
+            // `actors` and `heads`, the change and op data blocks *are*
+            // `changes.data` and `ops.data`, and the suffix comes from
+            // `head_indexes`. The uncompressed body was a carrier for bytes
+            // the block already held, and it was the largest allocation on a
+            // save: a document whose data deflates well spent the whole
+            // uncompressed body to produce a few hundred bytes.
+            //
+            // `checkBlock` runs the refusals `writeBody` would have run on the
+            // way past, in the same order and with the same names, so nothing
+            // below this line writes a byte before the block is known to be
+            // one this writer emits.
+            try checkBlock(block);
+            const body = try compressBody(gpa, block, threshold);
+            defer gpa.free(body);
+            try chunk.writeChunk(out, gpa, .document, body);
         },
     }
+}
+
+/// The compressed body of one document chunk, owned by the caller, and
+/// nothing else: the prefix, both metadata blocks with the lengths the DEFLATE
+/// pass produced, both data blocks, and the suffix.
+///
+/// This is the inflating direction's shape with the staged body taken out, and
+/// the reason it can be is that its input is a [`DocumentBlock`] rather than a
+/// body: the four regions that pass reads out of `src` are the prefix, the
+/// change data, the op data and the suffix, and a block supplies all four.
+/// Two buffers and a concatenation, because a column's length is only known
+/// once it has been processed and the metadata block precedes the data it
+/// describes — upstream's `meta_out`/`data_out` pair
+/// (`document/compression.rs:244-330`).
+fn compressBody(
+    gpa: Allocator,
+    block: DocumentBlock,
+    threshold: usize,
+) ParseError![]u8 {
+    // **`defer`, not `errdefer`, and the difference is the whole of the two
+    // buffers.** `meta_out` hands its buffer to `toOwnedSlice` on the way out
+    // and is empty afterwards, so its `defer` is a no-op there and the
+    // release on every path before it; `data_out` is a pure scratch buffer
+    // whose bytes are copied into `meta_out`, and nothing else owns it, so it
+    // has to be released on the success path too.
+    var meta_out: std.ArrayList(u8) = .empty;
+    defer meta_out.deinit(gpa);
+    var data_out: std.ArrayList(u8) = .empty;
+    defer data_out.deinit(gpa);
+
+    try writePrefix(&meta_out, gpa, block);
+    const change_descs = try processColumns(gpa, &data_out, block.changes, block.changes.data, .compress, threshold);
+    defer gpa.free(change_descs);
+    const op_descs = try processColumns(gpa, &data_out, block.ops, block.ops.data, .compress, threshold);
+    defer gpa.free(op_descs);
+
+    try writeColumnDescs(&meta_out, gpa, change_descs);
+    try writeColumnDescs(&meta_out, gpa, op_descs);
+    try meta_out.appendSlice(gpa, data_out.items);
+    try writeSuffix(&meta_out, gpa, block);
+    return meta_out.toOwnedSlice(gpa);
+}
+
+/// Every refusal `writeBody` raises on its way to the same body, in the order
+/// it raises them: the change set, the op set, then the suffix count. The
+/// metadata checks allocate nothing, which is why they can run before a single
+/// byte of the body exists.
+fn checkBlock(block: DocumentBlock) ParseError!void {
+    try checkColumnMeta(block.changes);
+    try checkColumnMeta(block.ops);
+    try checkHeadIndexes(block);
 }
 
 /// A complete document chunk, allocated and owned by the caller. See
@@ -894,14 +992,17 @@ pub fn encode(
     return out.toOwnedSlice(gpa);
 }
 
-/// Appends the uncompressed body and records where each region of it starts.
-fn writeBodyLayout(
+/// Appends the prefix: a count, then per actor a uleb128 length and that many
+/// bytes; then a count, then 32 raw bytes per head (`document.rs:208-220`).
+///
+/// One implementation for both writers, which is what makes the compressing
+/// arm's prefix the uncompressed arm's prefix: neither calls the other and
+/// neither repeats these lines.
+fn writePrefix(
     out: *std.ArrayList(u8),
     gpa: Allocator,
     block: DocumentBlock,
-) ParseError!Layout {
-    // The prefix: a count, then per actor a uleb128 length and that many
-    // bytes; then a count, then 32 raw bytes per head (`document.rs:208-220`).
+) Allocator.Error!void {
     try leb128.appendUnsigned(out, gpa, block.actors.len);
     for (block.actors) |actor| {
         try leb128.appendUnsigned(out, gpa, actor.len);
@@ -911,43 +1012,32 @@ fn writeBodyLayout(
     for (block.heads) |head| {
         try out.appendSlice(gpa, &head.bytes);
     }
+}
 
-    // Both metadata blocks, then both data blocks: the order is the format's,
-    // and a reader locates the data from the lengths the metadata declares
-    // (`document.rs:223-231`).
-    const meta_start = out.items.len;
-    try writeColumnMeta(out, gpa, block.changes);
-    try writeColumnMeta(out, gpa, block.ops);
-    const change_data_start = out.items.len;
-    try out.appendSlice(gpa, block.changes.data);
-    const op_data_start = out.items.len;
-    try out.appendSlice(gpa, block.ops.data);
-    const suffix_start = out.items.len;
+/// Appends the suffix: one uleb128 per head index (`document.rs:233-235`). A
+/// document with no indexes writes none, which is what a body written by an
+/// older implementation held (`document.rs:131-135`).
+fn writeSuffix(
+    out: *std.ArrayList(u8),
+    gpa: Allocator,
+    block: DocumentBlock,
+) Allocator.Error!void {
+    for (block.head_indexes) |index| try leb128.appendUnsigned(out, gpa, index);
+}
 
-    // The suffix: one uleb128 per head index (`document.rs:233-235`). A
-    // document with no indexes writes none, which is what a body written by
-    // an older implementation held (`document.rs:131-135`).
-    //
-    // **Zero indexes and one index per head are the only two bodies the
-    // suffix can spell, and the writer refuses the rest.** The reader reads
-    // exactly `heads.len()` values whenever anything is left after the op
-    // data, and none at all when nothing is (`document.rs:131-136`), so a
-    // partial list is a body this module's own reader refuses — one that stops
-    // inside the suffix, and one that leaves bytes past it. The two errors are
-    // the ones that reader would have reported for the body this would have
-    // emitted, so a caller sees the answer before the bytes exist.
+/// **Zero indexes and one index per head are the only two bodies the suffix
+/// can spell, and the writer refuses the rest.** The reader reads exactly
+/// `heads.len()` values whenever anything is left after the op data, and none
+/// at all when nothing is (`document.rs:131-136`), so a partial list is a body
+/// this module's own reader refuses — one that stops inside the suffix, and
+/// one that leaves bytes past it. The two errors are the ones that reader
+/// would have reported for the body this would have emitted, so a caller sees
+/// the answer before the bytes exist.
+fn checkHeadIndexes(block: DocumentBlock) ParseError!void {
     if (block.head_indexes.len != 0 and block.head_indexes.len != block.heads.len) {
         if (block.head_indexes.len < block.heads.len) return error.UnexpectedEnd;
         return error.TrailingBytes;
     }
-    for (block.head_indexes) |index| try leb128.appendUnsigned(out, gpa, index);
-
-    return .{
-        .meta_start = meta_start,
-        .change_data_start = change_data_start,
-        .op_data_start = op_data_start,
-        .suffix_start = suffix_start,
-    };
 }
 
 /// Appends one column metadata block: the column count, then per column its
@@ -981,9 +1071,27 @@ fn writeColumnMeta(
     gpa: Allocator,
     cols: RawColumns,
 ) ParseError!void {
+    try checkColumnMeta(cols);
     var count: std.ArrayList(u8) = .empty;
     defer count.deinit(gpa);
     try leb128.appendUnsigned(&count, gpa, cols.len());
+    for (cols.columns) |col| {
+        try leb128.appendUnsigned(&count, gpa, col.spec.raw);
+        try leb128.appendUnsigned(&count, gpa, col.len());
+    }
+    try out.appendSlice(gpa, count.items);
+}
+
+/// The refusals [`writeColumnMeta`] raises, without writing a byte: the DEFLATE
+/// bit, a descent, and a repeat, in that order and column by column.
+///
+/// **Split out so the compressing writer runs the same checks without the
+/// metadata.** `writeColumnMeta` cannot check as it walks, because the count
+/// leads the block and is only known once every column has been seen; a
+/// writer that never emits the uncompressed block still has to refuse exactly
+/// what the one that emits it refuses, and this is the one implementation
+/// both call.
+fn checkColumnMeta(cols: RawColumns) ParseError!void {
     var previous: ?ColumnSpec = null;
     for (cols.columns) |col| {
         if (col.spec.isCompressed()) return error.InvalidColumnSpec;
@@ -994,11 +1102,8 @@ fn writeColumnMeta(
                 .gt => {},
             }
         }
-        try leb128.appendUnsigned(&count, gpa, col.spec.raw);
-        try leb128.appendUnsigned(&count, gpa, col.len());
         previous = col.spec;
     }
-    try out.appendSlice(gpa, count.items);
 }
 
 /// Reads one column metadata block: a uleb128 count, then that many
@@ -1174,31 +1279,31 @@ const Rewritten = struct {
     }
 };
 
-/// Runs the DEFLATE pass over a body in one direction and returns the rebuilt
-/// body with the two column sets that index it.
+/// Runs the inflating half of the DEFLATE pass over a body and returns the
+/// rebuilt body with the two column sets that index it.
 ///
-/// The layout is the same in both directions and is the format's: the prefix,
-/// then both metadata blocks, then both data blocks, then the suffix. Because
-/// a column's new length is only known once it has been processed, the
-/// metadata is assembled in one buffer and the data in another and the two
-/// are concatenated at the end, which is what upstream's `data_out` and
-/// `meta_out` are for (`document/compression.rs:244-330`).
+/// **The other direction is [`compressBody`], and the split is not
+/// cosmetic.** This one is handed a body it did not build — the caller's own
+/// bytes — so it reads its prefix, its two data blocks and its suffix out of
+/// `src` through the [`Layout`] the reader recorded. The compressing direction
+/// is handed a [`DocumentBlock`] instead, which already holds all four of those
+/// regions, so it has no `src` to read and no layout to record: it is a
+/// different function over a different input, not a parameter away from this
+/// one. Both assemble the metadata in one buffer and the data in another and
+/// concatenate them, because a column's new length is only known once it has
+/// been processed and the metadata block precedes the data it describes —
+/// upstream's `data_out` and `meta_out` (`document/compression.rs:244-330`).
 ///
-/// `threshold` is only read in the compressing direction. There, a column is
-/// deflated when its length is at least the threshold
-/// (`raw_column.rs:62-76`); upstream also copies a column that already
-/// carries the DEFLATE bit, but its compressor is only ever handed an
-/// uncompressed set (`Document::new` builds one, `document.rs:199-202`), so
-/// that branch is not ported and `writeColumnMeta` refuses a deflated
-/// specification instead.
-fn rewriteBody(
+/// Upstream also copies a column that already carries the DEFLATE bit, but its
+/// compressor is only ever handed an uncompressed set (`Document::new` builds
+/// one, `document.rs:199-202`), so that branch is not ported and
+/// `checkColumnMeta` refuses a deflated specification instead.
+fn inflateBody(
     gpa: Allocator,
     src: []const u8,
     layout: Layout,
     changes: RawColumns,
     ops: RawColumns,
-    comptime dir: Direction,
-    threshold: usize,
 ) ParseError!Rewritten {
     var meta_out: std.ArrayList(u8) = .empty;
     defer meta_out.deinit(gpa);
@@ -1206,9 +1311,9 @@ fn rewriteBody(
     defer data_out.deinit(gpa);
 
     try meta_out.appendSlice(gpa, src[0..layout.meta_start]);
-    const change_descs = try processColumns(gpa, &data_out, changes, layout.changeData(src), dir, threshold);
+    const change_descs = try processColumns(gpa, &data_out, changes, layout.changeData(src), .decompress, 0);
     errdefer gpa.free(change_descs);
-    const op_descs = try processColumns(gpa, &data_out, ops, layout.opData(src), dir, threshold);
+    const op_descs = try processColumns(gpa, &data_out, ops, layout.opData(src), .decompress, 0);
     errdefer gpa.free(op_descs);
 
     try writeColumnDescs(&meta_out, gpa, change_descs);
@@ -2486,4 +2591,321 @@ fn expectColumnShape(cols: RawColumns, data: []const u8, want: []const ColumnSha
     }
     try testing.expect(it.next() == null);
     try testing.expectEqual(data.len, at);
+}
+
+// ── What the two writers hold, and what they refuse ──────────────────────
+
+/// An allocator that records what it hands out, so a test can state a bound on
+/// what a write holds at once rather than implying one. The same instrument as
+/// `storage/totality_test.zig` §`Meter`, trimmed to the two numbers read here.
+const ByteMeter = struct {
+    inner: Allocator,
+    /// Bytes handed out and not yet returned.
+    live: usize = 0,
+    /// The high-water mark of `live`.
+    peak_live: usize = 0,
+
+    fn allocator(self: *ByteMeter) Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *ByteMeter = @ptrCast(@alignCast(ctx));
+        const out = self.inner.rawAlloc(len, alignment, ra) orelse return null;
+        self.live += len;
+        self.peak_live = @max(self.peak_live, self.live);
+        return out;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *ByteMeter = @ptrCast(@alignCast(ctx));
+        if (!self.inner.rawResize(memory, alignment, new_len, ra)) return false;
+        if (new_len > memory.len) {
+            self.live += new_len - memory.len;
+        } else self.live -= memory.len - new_len;
+        self.peak_live = @max(self.peak_live, self.live);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *ByteMeter = @ptrCast(@alignCast(ctx));
+        const out = self.inner.rawRemap(memory, alignment, new_len, ra) orelse return null;
+        if (new_len > memory.len) {
+            self.live += new_len - memory.len;
+        } else self.live -= memory.len - new_len;
+        self.peak_live = @max(self.peak_live, self.live);
+        return out;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *ByteMeter = @ptrCast(@alignCast(ctx));
+        self.live -= memory.len;
+        self.inner.rawFree(memory, alignment, ra);
+    }
+};
+
+/// `count` op columns of `per` identical bytes each, so a test can make a
+/// block whose data deflates to almost nothing without a hexane encoding
+/// behind it. The column ids ascend, so the set is in the order the writer
+/// and the reader both require.
+///
+/// **Many columns rather than one large one**, and the reason is
+/// `chunk.compressRaw`: it reserves its output buffer at the length of the
+/// column it is given (`outputCapacity`, `chunk.zig:350-352`), so a single
+/// column of the whole body would have the compressor holding a buffer as
+/// large as the body and the bound below would say nothing.
+fn runsOf(gpa: Allocator, fill: u8, count: usize, per: usize) !Shape {
+    const data = try gpa.alloc(u8, count * per);
+    errdefer gpa.free(data);
+    @memset(data, fill);
+    const descs = try gpa.alloc(ColumnDesc, count);
+    defer gpa.free(descs);
+    for (descs, 0..) |*desc, i| {
+        desc.* = ColumnDesc.init(ColumnSpec.make(@intCast(2 + i), .rle_uint, false), per);
+    }
+    return .{ .cols = try RawColumns.init(gpa, descs, data), .data = data };
+}
+
+test "the compressing writer refuses what the uncompressed one refuses" {
+    const gpa = testing.allocator;
+    const actors = [_][]const u8{&[_]u8{0xaa}};
+    const one_head = [_]ChangeHash{.{ .bytes = @splat(0x11) }};
+    const two_heads = [_]ChangeHash{
+        .{ .bytes = @splat(0x11) },
+        .{ .bytes = @splat(0x22) },
+    };
+    const threshold = CompressConfig{ .threshold = deflate_min_size };
+
+    // **Both arms, both refusals, same names.** The compressing writer no
+    // longer stages the uncompressed body, and `writeColumnMeta` is the only
+    // place the column checks used to run — so this is the test that says the
+    // staging pass was not what enforced them.
+    {
+        const data = [_]u8{ 0x7f, 0x00 };
+        const descs = [_]ColumnDesc{
+            ColumnDesc.init(ColumnSpec.make(2, .actor, false), 1),
+            ColumnDesc.init(ColumnSpec.make(2, .actor, false), 1),
+        };
+        const cols = try RawColumns.init(gpa, &descs, &data);
+        defer cols.deinit(gpa);
+        const block = DocumentBlock.init(&actors, &one_head, empty_changes(), cols, &[_]u64{0});
+        try testing.expectError(error.DuplicateColumn, encode(gpa, block, .none));
+        try testing.expectError(error.DuplicateColumn, encode(gpa, block, threshold));
+    }
+    {
+        const data = [_]u8{ 0x7f, 0x00 };
+        const descs = [_]ColumnDesc{
+            ColumnDesc.init(ColumnSpec.make(4, .rle_uint, false), 1),
+            ColumnDesc.init(ColumnSpec.make(2, .actor, false), 1),
+        };
+        const cols = try RawColumns.init(gpa, &descs, &data);
+        defer cols.deinit(gpa);
+        const block = DocumentBlock.init(&actors, &one_head, empty_changes(), cols, &[_]u64{0});
+        try testing.expectError(error.InvalidColumnSpec, encode(gpa, block, .none));
+        try testing.expectError(error.InvalidColumnSpec, encode(gpa, block, threshold));
+    }
+    {
+        const data = [_]u8{0x7f};
+        const descs = [_]ColumnDesc{ColumnDesc.init(ColumnSpec.make(3, .boolean, true), 1)};
+        const cols = try RawColumns.init(gpa, &descs, &data);
+        defer cols.deinit(gpa);
+        const block = DocumentBlock.init(&actors, &one_head, empty_changes(), cols, &[_]u64{0});
+        try testing.expectError(error.InvalidColumnSpec, encode(gpa, block, .none));
+        try testing.expectError(error.InvalidColumnSpec, encode(gpa, block, threshold));
+    }
+
+    // And the suffix, whose two refusals are the reader's own names.
+    {
+        const data = [_]u8{0x01};
+        const descs = [_]ColumnDesc{ColumnDesc.init(ColumnSpec.make(3, .boolean, false), 1)};
+        const cols = try RawColumns.init(gpa, &descs, &data);
+        defer cols.deinit(gpa);
+        const short = DocumentBlock.init(&actors, &two_heads, empty_changes(), cols, &[_]u64{0});
+        const long = DocumentBlock.init(&actors, &one_head, empty_changes(), cols, &[_]u64{ 0, 1 });
+        try testing.expectError(error.UnexpectedEnd, encode(gpa, short, .none));
+        try testing.expectError(error.UnexpectedEnd, encode(gpa, short, threshold));
+        try testing.expectError(error.TrailingBytes, encode(gpa, long, .none));
+        try testing.expectError(error.TrailingBytes, encode(gpa, long, threshold));
+    }
+
+    // The half that keeps the refusals from being a blanket: a block with a
+    // column over the threshold still writes through the compressing arm, and
+    // reads back with that column's bytes.
+    {
+        var shape = try runsOf(gpa, 0x5a, 1, deflate_min_size * 4);
+        defer gpa.free(shape.data);
+        defer shape.cols.deinit(gpa);
+        const block = DocumentBlock.init(&actors, &one_head, empty_changes(), shape.cols, &[_]u64{0});
+        const framed = try encode(gpa, block, threshold);
+        defer gpa.free(framed);
+        try testing.expect(framed.len < deflate_min_size * 2);
+        var doc = try parseFramedChunk(try chunk.parseChunk(framed), gpa);
+        defer doc.deinit(gpa);
+        try testing.expect(doc.inflated != null);
+        try testing.expectEqualSlices(u8, shape.data, (try shape.cols.bytesFor(shape.cols.columns[0].spec)).?);
+    }
+}
+
+/// The empty column set, spelled once because the tests above build a block
+/// whose change side is empty in every case.
+fn empty_changes() RawColumns {
+    return .{ .columns = &.{}, .data = &.{} };
+}
+
+test "the compressing writer never holds the uncompressed body" {
+    const gpa = testing.allocator;
+    const actors = [_][]const u8{&[_]u8{0xaa}};
+    const heads = [_]ChangeHash{.{ .bytes = @splat(0x11) }};
+    const indexes = [_]u64{0};
+
+    // **Sixty-four columns of eight kilobytes, half a megabyte of one byte.**
+    // Each column deflates to a few hundred bytes, so the written body is a few
+    // kilobytes; the uncompressed body is half a megabyte, which is what the
+    // staging buffer this arm used to build would have cost.
+    var shape = try runsOf(gpa, 0x5a, 64, 8 * 1024);
+    defer gpa.free(shape.data);
+    defer shape.cols.deinit(gpa);
+    const block = DocumentBlock.init(&actors, &heads, empty_changes(), shape.cols, &indexes);
+
+    // **V, the uncompressed body, computed rather than measured** — which is
+    // the claim the whole arrangement rests on, so the test computes it the
+    // same way [`prefixLenOf`] and [`suffixLenOf`] do and checks it against a body
+    // that was actually written.
+    const plain = try encodeBody(gpa, block);
+    defer gpa.free(plain);
+    const V = prefixLenOf(block) + metaLenOf(block.changes) + metaLenOf(block.ops) +
+        block.changes.data.len + block.ops.data.len + suffixLenOf(block);
+    try testing.expectEqual(plain.len, V);
+
+    // **The compressing writer's high-water mark is below V, which the staging
+    // pass made impossible.** Every allocation it makes is the compressor's
+    // 64 KiB window, one column's reserved output buffer (8 KiB plus
+    // headroom), the deflated bytes themselves, or the body they are assembled
+    // into: eighty kilobytes or so against a half-megabyte body.
+    var meter: ByteMeter = .{ .inner = gpa };
+    {
+        const framed = try encode(meter.allocator(), block, .{ .threshold = deflate_min_size });
+        defer meter.allocator().free(framed);
+        try testing.expect(framed.len < 32 * 1024);
+        try testing.expect(meter.peak_live < V);
+    }
+    try testing.expectEqual(@as(usize, 0), meter.live);
+
+    // The uncompressed arm is the one that has to hold the body, and it holds
+    // it twice: its own staging buffer and the framed output. That is the
+    // contrast the claim is about, so it is measured too.
+    var other: ByteMeter = .{ .inner = gpa };
+    {
+        const unframed = try encode(other.allocator(), block, .none);
+        defer other.allocator().free(unframed);
+        try testing.expect(other.peak_live >= 2 * V);
+    }
+    try testing.expect(other.peak_live > meter.peak_live);
+    try testing.expectEqual(@as(usize, 0), other.live);
+}
+
+/// The number of bytes one column metadata block is: a count, then a
+/// specification and a length per column.
+fn metaLenOf(cols: RawColumns) usize {
+    var n: usize = leb128.unsignedSize(cols.len());
+    for (cols.columns) |col| n += leb128.unsignedSize(col.spec.raw) + leb128.unsignedSize(col.len());
+    return n;
+}
+
+/// The number of bytes [`writePrefix`] appends, computed rather than measured:
+/// a count, per actor a length prefix and its bytes, a count, and 32 bytes per
+/// head.
+fn prefixLenOf(block: DocumentBlock) usize {
+    var n: usize = leb128.unsignedSize(block.actors.len);
+    for (block.actors) |actor| n += leb128.unsignedSize(actor.len) + actor.len;
+    n += leb128.unsignedSize(block.heads.len) + hash_size * block.heads.len;
+    return n;
+}
+
+/// The number of bytes [`writeSuffix`] appends, computed rather than measured:
+/// one uleb128 per head index. Its counterpart on the read side is the sum the
+/// reader takes, and a suffix of any other length is one the writer refuses.
+fn suffixLenOf(block: DocumentBlock) usize {
+    var n: usize = 0;
+    for (block.head_indexes) |index| n += leb128.unsignedSize(index);
+    return n;
+}
+
+test "a body's regions sit where the block's own sizes put them" {
+    const gpa = testing.allocator;
+    // **The offsets are a function of the block, and this is the arithmetic
+    // that says so.** Every number below is computed from the block with
+    // nothing written; the body is then written and parsed, and every region
+    // has to land where the arithmetic said. A writer that needed a staging
+    // pass to learn an offset could not satisfy this.
+    const actors = [_][]const u8{ &[_]u8{0xaa}, &[_]u8{ 0xbb, 0xcc } };
+    const heads = [_]ChangeHash{
+        .{ .bytes = @splat(0x11) },
+        .{ .bytes = @splat(0x22) },
+    };
+    const indexes = [_]u64{ 1, 300 };
+
+    const specs = [_]ColumnSpec{
+        ColumnSpec.make(0, .actor, false),
+        ColumnSpec.make(0, .rle_uint, false),
+        ColumnSpec.make(1, .string, false),
+        ColumnSpec.make(4, .rle_uint, false),
+    };
+    var shape = try shapeOf(gpa, &specs);
+    defer gpa.free(shape.data);
+    defer shape.cols.deinit(gpa);
+    const block = DocumentBlock.init(&actors, &heads, empty_changes(), shape.cols, &indexes);
+
+    const meta_start = prefixLenOf(block);
+    const change_data_start = meta_start + metaLenOf(block.changes) + metaLenOf(block.ops);
+    const op_data_start = change_data_start + block.changes.data.len;
+    const suffix_start = op_data_start + block.ops.data.len;
+    const body_len = suffix_start + suffixLenOf(block);
+
+    const body = try encodeBody(gpa, block);
+    defer gpa.free(body);
+    try testing.expectEqual(body_len, body.len);
+
+    // The prefix, read as the reader reads it: two actors of one and two
+    // bytes, then two heads.
+    var in: Input = .init(body);
+    try testing.expectEqual(@as(u64, actors.len), try in.takeUleb());
+    for (actors) |actor| {
+        try testing.expectEqualSlices(u8, actor, try in.readStrBytes());
+    }
+    try testing.expectEqual(@as(u64, heads.len), try in.takeUleb());
+    for (heads) |head| try testing.expectEqualSlices(u8, head.bytes[0..], try in.take(head.bytes.len));
+    try testing.expectEqual(meta_start, in.pos);
+
+    // Both metadata blocks, then the data, then the suffix — each boundary
+    // where the arithmetic put it.
+    try testing.expectEqual(@as(u64, 0), try in.takeUleb()); // no change columns
+    try testing.expectEqual(@as(u64, specs.len), try in.takeUleb());
+    for (specs) |spec| {
+        try testing.expectEqual(@as(u64, spec.raw), try in.takeUleb());
+        try testing.expectEqual(@as(u64, 1), try in.takeUleb());
+    }
+    try testing.expectEqual(change_data_start, in.pos);
+    try testing.expectEqual(op_data_start, in.pos); // the change data block is empty
+    try testing.expectEqualSlices(u8, shape.data, (try in.sub(shape.cols.data.len)).rest());
+    try testing.expectEqual(suffix_start, in.pos);
+    try testing.expectEqual(@as(u64, indexes[0]), try in.takeUleb());
+    try testing.expectEqual(@as(u64, indexes[1]), try in.takeUleb());
+    try testing.expectEqual(body_len, in.pos);
+    try testing.expect(in.isEmpty());
+
+    // **And the same arithmetic through the compressing writer**, whose body
+    // is a different length and whose metadata says so: with nothing over the
+    // threshold it is the uncompressed body, byte for byte.
+    const huge = CompressConfig{ .threshold = std.math.maxInt(usize) };
+    const same = try encode(gpa, block, huge);
+    defer gpa.free(same);
+    const framed_plain = try encode(gpa, block, .none);
+    defer gpa.free(framed_plain);
+    try testing.expectEqualSlices(u8, framed_plain, same);
 }

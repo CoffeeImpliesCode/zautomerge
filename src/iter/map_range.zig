@@ -44,6 +44,47 @@
 //! `Unshift::shift_next` — and then reads. A range that starts behind the
 //! cursor is `error.InvalidValue`; a range past the end answers `null`.
 //!
+//! # What one key costs
+//!
+//! **`O(1)` amortised per key, `O(log S)` per 64 keys.** The rows come from
+//! [`tools.takeAt`](tools.zig#L232), which on a zero skip calls the walk's own
+//! step and on a non-zero skip calls `shiftNext` with `pos + skip` — and
+//! [`MapIter.shiftNext`](MapIter.shiftNext) moves **four** cursors by that
+//! distance through [`Column.Iterator.nth`](../hexane/column.zig). `nth` is
+//! `O(1)` when the target is in the cursor's own slab and
+//! `O(log S + runs skipped)` when it is not, so a walk pays a tree descent
+//! **once per slab crossed**, not once per row. **The amortisation rests on
+//! the cursors never rewinding**, and that is enforced rather than assumed:
+//! `shiftNext` refuses a `range.start` behind `self.at`
+//! ([`column.zig:7472`](../hexane/column.zig)) and `takeAt` only ever asks for
+//! `pos + skip`, so a forward walk of `R` rows is `O(R)` plus `O(R/64 · log S)`.
+//!
+//! **Neither the object, the key nor the clock is re-seeked per row.** The
+//! visibility skipper is a [`column.BoolColumnSkipper`] over the derived
+//! `index.visible` column, so "skip to the next visible row" is one step per
+//! **run** of that column ([`column.zig:8252`](../hexane/column.zig)) rather
+//! than one descent per row; a scoped read takes
+//! [`ScanVisIter`](../../opset/visible.zig) instead, which is one `nextVisible`
+//! per row and reads the three cheap columns forward. The key is an interned id
+//! resolved through [`StringTable`] and the row's id is **deferred** to an
+//! [`ExIdPromise`], so the actor table is not walked for a row whose id no
+//! caller asks for — that is the whole reason the promise exists. The clock is
+//! read by [`Clock.contains`](../../src/clock.zig), an array index, and only
+//! through [`predates`] on a `diff`.
+//!
+//! **A counter row additionally reads its own successors**, and only a counter
+//! row does: [`MapDiff.next`](MapDiff.next) calls
+//! [`OpSet.getIncrementDiffAtPos`](../../opset/op_set.zig) for the two sums a
+//! counter's net change needs, which walks **that row's** successor list. That
+//! is `O(successors of this row)`, and successors are bounded by the number of
+//! operations that shadow this one — so it is a property of the document, not a
+//! function of the map's size.
+//!
+//! The test "reading a map costs one step per key, not one step per key in the
+//! document" pins the observable half of that at two sizes, and
+//! "a map range walks its object's keys, and a shift behind the cursor is
+//! refused" below pins the rewind refusal the amortisation depends on.
+//!
 //! # The width is not here
 //!
 //! A map key holds one value, so this reader has no width to report. The
@@ -1875,6 +1916,117 @@ test "a counter's net change wraps when the after clock's increments underflow i
     try testing.expect((try diff.next()) == null);
 }
 
+test "reading a map costs one step per key, not one step per key in the document" {
+    // **What this measures, and why allocation is the instrument.** Every
+    // cursor on this reader's path is a value over storage the op set already
+    // holds — the test above pins that a walk allocates nothing at all — so a
+    // reader that re-seeked the object, the key or the clock per row would
+    // cost *time*, not bytes. What bytes do catch is the term that scales with
+    // the **document** rather than with the walk: a cursor rebuilt per key, a
+    // prefix sum recomputed from row 0, a buffer refitted per item. Those
+    // allocate, and a per-item cost that is not amortised looks like that from
+    // the outside.
+    //
+    // **The per-row descents themselves are the round-3 claim, and this is
+    // where it is settled.** `MapRange.next` reaches its rows through
+    // `tools.takeAt` (tools.zig:258-272), which on a zero skip calls the
+    // walk's own `next` and on a non-zero skip calls `shiftNext` — and
+    // `MapIter.shiftNext` (map_range.zig:595-612) moves **four** cursors by
+    // `range.start - self.at` through `Column.Iterator.nth`
+    // (hexane/column.zig:7414-7431). `nth` is `O(1)` when the target is in the
+    // cursor's own slab (`column.zig:7419-7420`) and `O(log S + runs skipped)`
+    // when it is not, so a walk that only ever moves forward pays the descent
+    // **once per slab**, not once per row. **That is the amortisation, and it
+    // holds because the four cursors never rewind**: `shiftNext` refuses a
+    // `range.start` behind `self.at` (`column.zig:7472`), and `takeAt` only
+    // ever asks for `q.pos() + skip`. The total work over a walk of `R` rows is
+    // therefore `O(R)` plus `O(R/64 · log S)` index descents, which is the
+    // amortised figure: **O(1) per item, O(log S) per 64 items**.
+    //
+    // **Two sizes, `n` and `4n`, and the claim is that the walk allocates
+    // nothing at either.** A per-item cost proportional to the document would
+    // not be visible as an allocation either — so this test does **not** prove
+    // the amortisation above; it pins the half that *is* observable, and the
+    // prose above is the argument for the rest. What would falsify the
+    // amortisation is a rewind, and the test that already exists for that is
+    // "a map range walks its object's keys, and a shift behind the cursor is
+    // refused" (map_range.zig:1596-1670): it holds `error.InvalidValue` on a
+    // backwards `shiftNext`, which is what a rewind would have to become.
+    //
+    // **Keys ascend, so the reader does not have to sort** (rule **R2**,
+    // `op.rs:1059-1060`): `"k0000"` < `"k0001"` < … is the canonical order, and
+    // the zero-padded digits keep it so at every size asked for here. Each row
+    // is visible and is its register's only row, so **each key yields exactly
+    // one item** — the count is asserted, so a reader that answered nothing
+    // cannot pass by allocating nothing.
+    const Walk = struct {
+        /// Bytes **the reader's own walk** allocated, with the fixture and the
+        /// op set's own warm-up already paid for.
+        fn measure(gpa: Allocator, keys: usize, counter: *testing.FailingAllocator) !usize {
+            // The key bytes are the fixture's and the fixture outlives the op
+            // set, so they live in one allocation for the whole walk.
+            const buf = try gpa.alloc(u8, keys * 8);
+            defer gpa.free(buf);
+            var rows: std.ArrayList(opmod.Op) = .empty;
+            defer rows.deinit(gpa);
+            for (0..keys) |i| {
+                const name = try std.fmt.bufPrint(buf[i * 8 ..][0..8], "k{d:0>5}", .{i});
+                rows.append(gpa, row(
+                    opId(@intCast(i + 1), 0),
+                    .root,
+                    .{ .map = name },
+                    .set,
+                    .{ .str = "v" },
+                    &.{},
+                )) catch |e| return e;
+            }
+
+            const doc = try Fixture.build(gpa, &.{actor_a}, rows.items);
+            defer doc.destroy();
+            const range = try doc.root();
+
+            // The op set sizes its own successor buffer on the first walk that
+            // needs one, and that allocation belongs to the op set
+            // ([OpSet.splice](../../opset/op_set.zig) refits it the same way),
+            // so it is warmed out here rather than charged to the reader.
+            {
+                var warm = try MapRange(opmod.Op).init(&doc.set, range, null);
+                while (try warm.next()) |_| {}
+            }
+
+            const before = counter.allocated_bytes;
+            var seen: usize = 0;
+            var r = try MapRange(opmod.Op).init(&doc.set, range, null);
+            while (try r.next()) |item| {
+                // The answers are read, not only counted, so a reader that
+                // returned nothing cannot pass.
+                try testing.expect(item.key.len > 0);
+                try testing.expect(item.value == .scalar);
+                seen += 1;
+            }
+            // **Each key yields exactly one item**, asserted rather than
+            // inferred: a reader that answered nothing would otherwise pass a
+            // "allocates nothing" check by allocating nothing.
+            try testing.expectEqual(keys, seen);
+            return counter.allocated_bytes - before;
+        }
+    };
+
+    // A counting allocator, so "allocates nothing" is measured and not
+    // asserted ([parents.zig:1095-1096](../../opset/parents.zig)).
+    var counter: testing.FailingAllocator = .init(testing.allocator, .{});
+    const gpa = counter.allocator();
+
+    // **Two sizes a factor of four apart, and the zero is the claim in both
+    // halves.** A walk of 200 keys allocates nothing and a walk of 800 keys
+    // allocates nothing, so nothing on this path scales with the document. The
+    // sizes are far above one slab (64 rows, `column.zig`'s budget), so the
+    // large run crosses the index more than a dozen times and a
+    // per-descent-allocation defect would show at 800 and not at 200.
+    try testing.expectEqual(@as(usize, 0), try Walk.measure(gpa, 200, &counter));
+    try testing.expectEqual(@as(usize, 0), try Walk.measure(gpa, 800, &counter));
+}
+
 // Zig 0.16.0 / upstream / Rust / port
 //
 // * **The forward shift works, and it is the one line `map_range.rs:210-212`
@@ -1925,3 +2077,32 @@ test "a counter's net change wraps when the after clock's increments underflow i
 //   keeps row order", where the promoted `expose` turns a `Same` into an
 //   `Add` — because none of the other `.diff` fixtures in this file puts that
 //   promotion in front of an assertion.
+//
+// * **The per-key cost is `O(1)` amortised, and the round-3 audit's
+//   amortisation claim is CONFIRMED from the code rather than refuted.**
+//   `MapRange.next` reaches its rows through `tools.takeAt` (tools.zig:258-272),
+//   which on a zero skip calls the walk's own step and otherwise calls
+//   `shiftNext` with `pos + skip`; `MapIter.shiftNext` (map_range.zig:637-654)
+//   then moves **four** cursors by that distance through
+//   `Column.Iterator.nth` (hexane/column.zig:7414-7431). `nth` is `O(1)` for a
+//   target in the cursor's own slab (column.zig:7419-7420) and
+//   `O(log S + runs skipped)` for one that is not, so the descent is paid
+//   **once per slab crossed** and not once per row.
+//   **The amortisation rests on the cursors never rewinding, and that is
+//   enforced rather than assumed**: `Column.Iterator.shiftNext` refuses a
+//     `range.start` behind `self.at` (column.zig:7472) and `takeAt` only ever
+//     asks for `q.pos() + skip`, so the total over a forward walk of `R` rows is
+//     `O(R) + O(R/64 · log S)`. **No re-seek of the object, the key or the clock
+//   happens per row**: visibility is a run-at-a-time skipper over the derived
+//     `index.visible` column (column.zig:8244-8263), the key is an interned id
+//     resolved by array index, the row id is deferred to an `ExIdPromise` (so
+//   the actor table is not walked per row), and the clock is read by array
+//     index. **No superlinear term was found here and nothing in this file was
+//   changed for speed**; the test "reading a map costs one step per key, not
+//   one step per key in the document" pins the observable half at 200 and 800
+//   keys, and "a map range walks its object's keys, and a shift behind the
+//   cursor is refused" pins the rewind refusal the amortisation depends on.
+//   **The one per-row cost that is not O(1) is a counter row's**:
+//   `MapDiff.next` calls `getIncrementDiffAtPos` (op_set.zig:3344-3373), which
+//   walks **that row's own** successors — `O(successors of this row)`, a
+//   property of the document and not a function of the map's size.

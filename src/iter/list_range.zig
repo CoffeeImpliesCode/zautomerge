@@ -599,11 +599,25 @@ pub fn ListDiffItem(comptime O: type) type {
         ///
         /// **Fallible, and upstream's is not**: the width is a read of
         /// `index.text` on the element's last row, and upstream has no width
-        /// to read. `rows` is the object's row range, which is what bounds it.
-        pub fn exportItem(self: Self, set: *opset.OpSet(O), rows: RowRange) ReadError!?ListRangeItem(O) {
+        /// to read. `rows` is the object's row range, which is what bounds it,
+        /// and `elems` is the walk that finds the element's last row.
+        ///
+        /// **`elems` is the caller's and is reused across elements**, which is
+        /// what makes a walk of ascending elements cost five `setMax` calls an
+        /// element rather than the ten column cursors
+        /// [`OpSet.elemidAt`](../../opset/op_set.zig) builds; see
+        /// [`elementWidth`]. It owns nothing and has no `deinit`, and the op
+        /// set must not be written while it is live — the same rule every walk
+        /// this op set hands out is under.
+        pub fn exportItem(
+            self: Self,
+            set: *opset.OpSet(O),
+            elems: *opset.OpSet(O).ElemCursor,
+            rows: RowRange,
+        ) ReadError!?ListRangeItem(O) {
             return .{
                 .index = self.index,
-                .width = try elementWidth(O, set, self.pos, rows.end),
+                .width = try elementWidth(O, set, elems, self.pos, rows.end),
                 .value = self.value,
                 .conflict = self.conflict,
                 .maybe_exid = ExIdPromise(O).init(set, self.id),
@@ -868,7 +882,7 @@ pub fn ListDiff(comptime O: type) type {
 }
 
 /// The width of the element the row at `pos` belongs to, in the op set's text
-/// encoding.
+/// encoding, read through `elems`.
 ///
 /// **Read from the element's *last* row, and that is the whole point**
 /// ([`op_set.rs:748-752`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)):
@@ -881,13 +895,39 @@ pub fn ListDiff(comptime O: type) type {
 /// Nothing is recomputed: the width is the op set's own answer, read at the
 /// row it wrote it on. A row with no width — a mark, a row that is not a
 /// winner — is zero.
+///
+/// # Why the cursor is the caller's, and not built here
+///
+/// **`elemidAt` cannot reuse anything**, and this is why it is not called here
+/// any more. It builds a fresh [`OpSet.ElemCursor`](../../opset/op_set.zig) and
+/// hands it straight to [`ElemWalk.at`](../../opset/op_set.zig), which sees a
+/// cursor that has never been placed and so takes [`ElemWalk.seek`]'s **rebuild**
+/// arm — five more `iterRange` calls (`op_set.zig:5855-5860`). That is **ten**
+/// column cursors built per element, of which the five `elemCursor` built are
+/// overwritten before anything reads them (`op_set.zig:3516-3519`,
+/// `:3544-3548`).
+///
+/// A caller walking elements in **ascending row order** never needs that: the
+/// cursor is already placed and the row it names is at or ahead of where it
+/// stands, so `seek` takes its **move** arm — `setMax` plus a forward
+/// `advanceTo` that is a no-op at the position asked for
+/// (`op_set.zig:5843-5849`). Five `setMax` calls per element, and no
+/// re-positioning of any column.
+///
+/// **Moving only goes forwards, so the answer never depends on the order the
+/// caller asked in**, which is what makes a held cursor a drop-in for
+/// `elemidAt` rather than a second contract
+/// ([`ElemWalk.at`](../../opset/op_set.zig)). [`ListRange`](ListRange) holds
+/// the one cursor; a caller that asks out of order gets the rebuild arm and
+/// the same answer.
 fn elementWidth(
     comptime O: type,
     set: *opset.OpSet(O),
+    elems: *opset.OpSet(O).ElemCursor,
     pos: usize,
     end: usize,
 ) ReadError!usize {
-    const elem = (try set.elemidAt(pos, end)) orelse return 0;
+    const elem = (try elems.at(pos, end)) orelse return 0;
     // `Column.get` answers three deep: "no such row"
     // ([`column.zig:1718-1719`](../hexane/column.zig)), then the column's own
     // `?u32` — null on a row that is not a `top` row, and
@@ -914,8 +954,14 @@ pub fn ListWalk(comptime O: type) type {
 /// A sequence object's visible elements, one at a time ([`ListRange`],
 /// [`list_range.rs:255-357`](../../github-automerge-automerge/rust/automerge/src/iter/list_range.rs)).
 ///
-/// Constructing one allocates nothing: four column cursors, a skipper and a
-/// lookahead, all of them values over storage the op set already holds.
+/// Constructing one allocates nothing: four column cursors, the width read's
+/// own element cursor, a skipper and a lookahead, all of them values over
+/// storage the op set already holds.
+///
+/// **The element cursor is what a whole-object walk costs its shape on.** It is
+/// built once and moved across elements, so the width read costs what a row
+/// costs rather than what re-positioning five columns costs; see
+/// [`elementWidth`] and [`ListRange.elems`].
 ///
 /// **It owns nothing and has no `deinit`.** Everything it holds is borrowed —
 /// the op set and the clock behind [`ListDiff`] — and the walks read the op set's
@@ -936,6 +982,27 @@ pub fn ListRange(comptime O: type) type {
         /// empty read [`IndexRange`] documents, not an error — see its first
         /// section.
         range: IndexRange,
+        /// The walk the width read is made through, **held across elements**
+        /// ([`OpSet.elemCursor`](../../opset/op_set.zig)).
+        ///
+        /// **This is what makes a walk of a whole object linear in its
+        /// elements rather than in its rows.** [`OpSet.elemidAt`] builds a
+        /// fresh cursor per call and hands it to a method that finds it
+        /// unplaced, so every element re-positions five columns from the slab
+        /// start (`op_set.zig:3516-3519`, `:5855-5860`). One cursor here takes
+        /// [`ElemWalk.seek`]'s **move** arm instead, because elements arrive in
+        /// ascending row order (`op_set.zig:5843-5849`); see [`elementWidth`].
+        ///
+        /// **It borrows the op set and is not a second owner of it.** The op
+        /// set has to outlive this reader and must not be written while it is
+        /// live — the rule every walk this op set hands out is under, and the
+        /// one this reader's other four cursors are already under. **A width
+        /// read of rows behind where it stands answers the same**: `seek`
+        /// rebuilds the five for such a row rather than rewinding them, so no
+        /// order of `at` calls changes an answer. **A `shiftNext` that put the
+        /// reader's own rows behind it never reaches this cursor at all** — see
+        /// [`shiftNext`](ListRange.shiftNext).
+        elems: opset.OpSet(O).ElemCursor,
 
         /// The reader over the object's `rows`, as the states `clock` names see
         /// them, restricted to `range`
@@ -961,6 +1028,7 @@ pub fn ListRange(comptime O: type) type {
             return .{
                 .iter = try ListDiff(O).init(set, obj_rows, .{ .current = clock }),
                 .range = range,
+                .elems = try set.elemCursor(),
             };
         }
 
@@ -985,7 +1053,7 @@ pub fn ListRange(comptime O: type) type {
             while (true) {
                 const item = (try self.iter.next()) orelse return null;
                 if (!self.range.contains(item.index)) continue;
-                return item.exportItem(self.iter.op_set, self.iter.rows);
+                return item.exportItem(self.iter.op_set, &self.elems, self.iter.rows);
             }
         }
 
@@ -1000,8 +1068,23 @@ pub fn ListRange(comptime O: type) type {
         /// reader's [`MapRange.shiftNext`](map_range.zig) needs only the first
         /// because it has no width to bound.
         ///
-        /// A range that starts behind the cursor is `error.InvalidValue`; a
-        /// range past the end answers `null`.
+        /// **`elems` is not repositioned here, and does not have to be.** It is
+        /// the width read's own cursor and it answers in any order
+        /// ([`ElemWalk.at`](../../opset/op_set.zig), `op_set.zig:5892-5900`):
+        /// `seek` moves the five forwards and rebuilds them for a row behind
+        /// them (`op_set.zig:5938-5962`), and the two paths differ in what they
+        /// read on the way to the row and not in what they answer. **A legal
+        /// shift cannot put the reader behind its own window** — the window's
+        /// start is at or ahead of where this reader stands, and `elems` never
+        /// stands beyond that — so the next width read is at or ahead of the
+        /// five and is served by moving them.
+        ///
+        /// **A range that starts behind the reader is `error.InvalidValue`**, and
+        /// that is upstream's rule and not this port's: the four row cursors are
+        /// a hexane `shift`, which is `set_max` plus `advance_to` and never
+        /// rewinds ([`Unshift.shift`](tools.zig), `tools.zig:387-398`;
+        /// `shift.rs:272-274`), and `shift_next` asserts the same
+        /// (`column.rs:629-633`). A range past the end answers `null`.
         pub fn shiftNext(self: *Self, rows: RowRange) ReadError!?ListRangeItem(O) {
             try self.iter.iter.shift(rows);
             self.iter.index = 0;
@@ -1131,6 +1214,15 @@ const Fixture = struct {
             self.table.deinit();
             return e;
         };
+        // **The table is a second owner and this is its error path.** `destroy`
+        // frees it beside the op set, and an error between the two — a refused
+        // `splice`, an index the op set will not rebuild
+        // ([`OpSet.rebuildIndex`](../../opset/op_set.zig)) — has to free it too,
+        // or a fixture that fails on its rows leaks the key strings `splice`
+        // interned before it refused. **Declared before the op set's own
+        // `errdefer` so it runs after it**: the op set borrows the table, so the
+        // borrower goes first.
+        errdefer self.table.deinit();
         errdefer self.set.deinit();
         _ = try self.set.splice(0, rows);
         try self.set.rebuildIndex();
@@ -1628,6 +1720,141 @@ test "a list range reader allocates nothing to construct or to read" {
     }
     try testing.expectEqual(@as(usize, 2), seen);
     try testing.expectEqual(before, counter.allocated_bytes);
+}
+
+test "a sequence walk moves one element cursor across elements, and answers what a fresh one answers" {
+    const gpa = testing.allocator;
+    // **One element of the object is two rows long**: the third element's
+    // register is an insert and a put, so the width read has to land on the
+    // put and not the insert. That is the case where a cursor asked for the
+    // wrong row answers a *plausible* wrong width rather than an error, so it
+    // is what makes this test worth writing.
+    //
+    // **It is a text object, not a list**, and that is load-bearing: a list
+    // element is one unit wide under every encoding whatever its value
+    // ([`Op.width`](../../opset/op.zig), `op.zig:2178-2181`), so on a list
+    // every width is 1 and a reader that read the wrong row would still be
+    // right. The widths below are 1, 2 and 4 — the third element's insert says
+    // `"xx"` and the put that supersedes it says `"yyyy"`, and only the put is
+    // `top` ([`index.zig`](../../opset/index.zig), `index.zig:718-720`), so a
+    // reader that read the element's **first** row answers 2 where the right
+    // answer is 4.
+    const text = made(1, 0);
+    const doc = try Fixture.build(gpa, &.{actor_a}, &.{
+        row(opId(1, 0), .root, .{ .map = "t" }, false, .make_text, .null_value, &.{}),
+        row(opId(2, 0), text, head(), true, .set, .{ .str = "a" }, &.{}),
+        row(opId(3, 0), text, anchored(opId(2, 0)), true, .set, .{ .str = "bb" }, &.{}),
+        // Element two, written twice: the insert and the put that wins it.
+        row(opId(4, 0), text, anchored(opId(3, 0)), true, .set, .{ .str = "xx" }, &.{}),
+        row(opId(5, 0), text, anchored(opId(4, 0)), false, .set, .{ .str = "yyyy" }, &.{}),
+    });
+    defer doc.destroy();
+    const rows = try doc.set.scopeToObj(text);
+
+    // **The walk the reader now makes**: one cursor, held, moved. It is the
+    // width read's own cursor and the reader never exposes it, so what is
+    // checked here is the answer and the fact that it is stable — see the
+    // equality against the per-element walk below.
+    var walk = try ListRange(opmod.Op).init(&doc.set, rows, null, .all());
+    var widths: [3]usize = undefined;
+    var seen: usize = 0;
+    while (try walk.next()) |item| {
+        try testing.expect(seen < widths.len);
+        widths[seen] = item.width;
+        seen += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), seen);
+    try testing.expectEqualSlices(usize, &.{ 1, 2, 4 }, &widths);
+
+    // **The same walk with a fresh cursor per element**, which is what
+    // `OpSet.elemidAt` does internally and what the reader used to do. This is
+    // the witness for the change being answer-preserving: it is the only
+    // statement here that says the two are the same, and it is checked against
+    // the widths above rather than against literals, so a reader that moved
+    // its cursor wrongly fails here and not on a hard-coded number.
+    //
+    // The three elements' registers start at rows `+0`, `+1` and `+2`, so the
+    // rows asked for are `rows.start`, `+1` and `+2`. The third element's
+    // register is **two** rows, which is why the last offset is 2 and not 3 —
+    // `+3` is the put inside that same register and `elemidAt` on it names the
+    // element `+2` already named, so asking there would test nothing new.
+    const first_row_of = [_]usize{ 0, 1, 2 };
+    for (first_row_of, widths) |offset, want| {
+        const elem = try doc.set.elemidAt(rows.start + offset, rows.end);
+        try testing.expect(elem != null);
+        const cell = (try doc.set.cols.index.text.get(elem.?.last_pos)) orelse return error.TestExpectedEqual;
+        const width = cell orelse return error.TestExpectedEqual;
+        try testing.expectEqual(want, @as(usize, width));
+    }
+
+    // **The cursor the reader holds is placed and ahead of the row it last
+    // answered**, which is the property that makes the next element's read a
+    // move rather than a rebuild. `isPlaced` is false only before the first
+    // successful read and after a refusal, so a walk that got this far and
+    // then rebuilt would still report true — so this pins the *placement*,
+    // and the widths above pin the answer.
+    try testing.expect(walk.elems.isPlaced());
+    try testing.expect(walk.elems.pos() >= rows.start);
+
+    // **A shift onto rows behind the reader is refused**, and the element
+    // cursor is what makes holding one across a shift safe rather than a way to
+    // read a stale row. The reader's row cursors are hexane shifts, which are
+    // `set_max` plus `advance_to` and never rewind
+    // ([`Unshift.shift`](tools.zig), `tools.zig:387-398`, `shift.rs:272-274`),
+    // and upstream's `shift_next` asserts the rule this port refuses with
+    // (`column.rs:629-633`, `assert!(range.start >= self.pos)`).
+    //
+    // **Read forward to the end first**, so the window below is behind the
+    // reader **because** the walk was exhausted and not by accident of where it
+    // stopped. **The third element's register is the two rows at
+    // `rows.start + 2` and `rows.start + 3`** — the insert and the put that
+    // supersedes it — so the window covers both of them and sits two registers
+    // behind where the reader stands. The error is what says so; a reader that
+    // answered it would be answering rows it has already passed, and the width
+    // it would report is the whole thing this test is about.
+    var shifted = try ListRange(opmod.Op).init(&doc.set, rows, null, .all());
+    while (try shifted.next()) |_| {}
+    try testing.expectError(error.InvalidValue, shifted.shiftNext(.{
+        .start = rows.start + 2,
+        .end = rows.start + 4,
+    }));
+    //
+    // **A window ahead of the reader is refused on this fixture too, and that is
+    // upstream's shape rather than this port's**: `BoolColumnSkipper.next`
+    // consumes the **whole run** of visible rows it lands in
+    // ([`BoolColumnSkipper.next`](../../hexane/column.zig), `iter/tools.rs:355-368`),
+    // and every row of this object is visible, so one read leaves the visible
+    // cursor at the end of the op set and nothing inside the object can be
+    // shifted onto. It is recorded here so the next reader of this test does not
+    // look for a successful shift here: the only window that answers is an empty
+    // one past the last row.
+
+    // **The width read behind where the cursor stands answers what a fresh one
+    // answers**, which is the promise that lets the cursor be held at all:
+    // `seek` moves the five forwards and rebuilds them for a row behind them,
+    // and the two paths differ in what they read on the way to the row and not
+    // in what they answer ([`ElemWalk.at`](../../opset/op_set.zig),
+    // `op_set.zig:5892-5900`, `:5938-5962`).
+    //
+    // **The rows read are the first element's**, two registers behind where the
+    // exhausted walk left the five — that walk last answered the third element,
+    // whose register opens at `rows.start + 2` — so this takes `seek`'s
+    // **rebuild** arm. The answer is the width the fresh `elemidAt` walk gave for
+    // offset 0: one, the width of `"a"`, and not the width of whichever row a
+    // cursor left in place would have answered.
+    const rebuilt = (try walk.elems.at(rows.start, rows.end)) orelse return error.TestExpectedEqual;
+    try testing.expectEqual(rows.start, rebuilt.last_pos);
+    const cell = (try doc.set.cols.index.text.get(rebuilt.last_pos)) orelse return error.TestExpectedEqual;
+    const width = cell orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(usize, 1), @as(usize, width));
+
+    // **And the answer that shift would have had is the answer a fresh cursor
+    // gives**, which is the point of the rebuild arm above: had the window been
+    // servable, the put that wins the third element carries the width of
+    // `"yyyy"`, four code points, on the **last** row of the register, and its
+    // insert says `"xx"`, so a width read that landed on the first row of the
+    // register would answer 2. That is the width the fresh walk above reported
+    // for offset 2, and it is the one this reader reported while walking.
 }
 
 test "an owned list item frees every byte it copied" {

@@ -363,22 +363,126 @@ pub const State = struct {
         return indexOfCapability(caps, .message_v2) != null;
     }
 
-    /// Records `hash` in `sent_hashes`, keeping the set ascending and
-    /// duplicate-free (`sync.rs:253`, upstream `BTreeSet::extend`).
-    pub fn insertSent(self: *State, hash: ChangeHash) !void {
-        // The binary search is over a sorted set, so an insert is an insert
-        // and not an append-with-a-sort.
-        var low: usize = 0;
-        var high: usize = self.sent_hashes.items.len;
-        while (low < high) {
-            const mid = low + (high - low) / 2;
-            switch (ChangeHash.order(self.sent_hashes.items[mid], hash)) {
-                .lt => low = mid + 1,
-                .gt => high = mid,
-                .eq => return,
-            }
+    /// Records every hash of `hashes` in `sent_hashes`, keeping the set
+    /// ascending and duplicate-free (`sync.rs:253`, upstream
+    /// `sent_hashes.extend(message_builder.hashes())`, `sync/state.rs:45`).
+    ///
+    /// **The whole list at once, because the caller has the whole list.**
+    /// Upstream extends a `BTreeSet`, which is `O(k log n)` and allocates a
+    /// node per new hash. A sorted array has no node, so the order has to be
+    /// materialised, and one hash at a time buys it with an `ArrayList.insert`
+    /// memmove: `O(k*n)` element moves for a message carrying `k` new hashes
+    /// into a set of `n`, and `O(k^2 R^2 / 4)` moves over a session of `R`
+    /// messages a peer has not answered. Here the batch is sorted once and
+    /// merged with the set in one pass, so a message costs `O(k log k + n + k)`
+    /// moves and a session `O(k R^2 / 2)`.
+    ///
+    /// `hashes` is **borrowed** and not retained: nothing here keeps a pointer
+    /// into it, which is what lets the caller pass the builder's own hash list
+    /// (`protocol.zig:588`, borrowed until `build` or `deinit`).
+    ///
+    /// **One allocation, and it is the only step that can fail**, so a failure
+    /// leaves the set exactly as it was. That is strictly stronger than the
+    /// per-hash insert this replaces, which had already added every hash
+    /// before the one that failed to allocate.
+    ///
+    /// The invariant is not weakened anywhere. `old` is ascending and
+    /// duplicate-free, `new_run[0..unique]` is ascending and duplicate-free by
+    /// construction, and the merge emits each run in order, dropping a hash the
+    /// two runs agree on. What comes back is therefore ascending and
+    /// duplicate-free, which is what [`State.encode`] asserts through
+    /// `message.encodeHashes` (`message.zig:524-530`) and what `sentContains`
+    /// binary-searches (`protocol.zig:1042-1046`).
+    pub fn extendSent(self: *State, hashes: []const ChangeHash) !void {
+        if (hashes.len == 0) return;
+        const gpa = self.gpa;
+        // The list owns `capacity` bytes, not `items.len` of them
+        // (`std.array_list.ArrayList.allocatedSlice`), so this is what has to
+        // be released and a later extend has to read back: a duplicate in the
+        // batch leaves the items shorter than the allocation, and freeing the
+        // items slice would hand the allocator the wrong length.
+        const old_allocated = self.sent_hashes.allocatedSlice();
+        const old = self.sent_hashes.items;
+        // One allocation for both halves of the work: the sorted new hashes in
+        // the tail of `out` and the answer written from the front. The old set
+        // is not touched until the last line, so nothing above can lose it.
+        const out = try gpa.alloc(ChangeHash, hashes.len + old.len);
+        errdefer gpa.free(out);
+        const new_run = out[old.len..];
+        @memcpy(new_run[0..hashes.len], hashes);
+        std.mem.sort(ChangeHash, new_run[0..hashes.len], {}, ChangeHash.lessThan);
+        // Dedupe in place. The write cursor runs at or behind the read cursor,
+        // so the entry being examined is never the slot being written.
+        var unique: usize = 1;
+        for (new_run[1..hashes.len], 1..) |hash, read_at| {
+            if (hash.eql(new_run[unique - 1])) continue;
+            new_run[unique] = hash;
+            unique += 1;
+            std.debug.assert(unique <= read_at + 1);
         }
-        try self.sent_hashes.insert(self.gpa, low, hash);
+        // The merge. Both runs are ascending, so one pass in order keeps the
+        // output ascending, and `.eq` writes the hash once and steps both
+        // cursors, which is what keeps it duplicate-free.
+        //
+        // **A write never lands on an unread entry of the new run.** Each step
+        // writes one element and consumes at least one input, so `at` never
+        // passes `from_old + from_new`, and the loop holds `from_old < old.len`,
+        // so `at < old.len + from_new` — the index the next iteration reads. The
+        // `.lt` arm is the one that leaves that read pending, so it is the one
+        // the bound is about.
+        var from_old: usize = 0;
+        var from_new: usize = 0;
+        var at: usize = 0;
+        while (from_old < old.len and from_new < unique) {
+            switch (ChangeHash.order(old[from_old], new_run[from_new])) {
+                .lt => {
+                    out[at] = old[from_old];
+                    from_old += 1;
+                },
+                .gt => {
+                    out[at] = new_run[from_new];
+                    from_new += 1;
+                },
+                .eq => {
+                    out[at] = old[from_old];
+                    from_old += 1;
+                    from_new += 1;
+                },
+            }
+            at += 1;
+        }
+        // At most one run is left over. The old run's tail is a separate
+        // allocation, so it is a plain move. The new run's tail overlaps `out`,
+        // but its destination starts at or below its source (`at` never passes
+        // `from_old + from_new`, which is at most `old.len + from_new`), and
+        // that is the direction `copyForwards` is correct for. The two tails
+        // together are the union, at most `old.len + unique`.
+        if (from_old < old.len) {
+            @memcpy(out[at..][0 .. old.len - from_old], old[from_old..]);
+            at += old.len - from_old;
+        }
+        if (from_new < unique) {
+            std.mem.copyForwards(ChangeHash, out[at..][0 .. unique - from_new], new_run[from_new..unique]);
+            at += unique - from_new;
+        }
+        std.debug.assert(at <= out.len);
+
+        // Installed whole, so nothing holding the state can see it half merged.
+        gpa.free(old_allocated);
+        self.sent_hashes = .{ .items = out[0..at], .capacity = out.len };
+    }
+
+    /// Records `hash` in `sent_hashes`, keeping the set ascending and
+    /// duplicate-free (`sync.rs:253`, upstream `BTreeSet::extend` of one
+    /// element).
+    ///
+    /// **This is [`State.extendSent`] over a one-element list, and there is one
+    /// implementation of the invariant rather than two.** It is not cheaper
+    /// than the logarithmic search and the `ArrayList.insert` memmove it
+    /// replaces — the order has to be materialised either way — so a caller
+    /// holding the whole list of hashes a message carried must use `extendSent`.
+    pub fn insertSent(self: *State, hash: ChangeHash) !void {
+        return self.extendSent(&.{hash});
     }
 
     /// Empties `sent_hashes` (`sync.rs:415`, `sync.rs:446`).
@@ -705,6 +809,164 @@ test "sent hashes are a set" {
     try testing.expectEqual(@as(usize, 0), state.sent_hashes.items.len);
     try state.insertSent(b);
     try testing.expectEqual(@as(usize, 1), state.sent_hashes.items.len);
+}
+
+/// A distinct hash per `n`, ascending in `n`, so a test can name a hundred of
+/// them without parsing 3 200 hex bytes. The count is written big-endian at
+/// offset 8 and byte 0 is never zero, so none of these is `ChangeHash.zero` —
+/// the hash no change has — and the order of two of them is the order of `n`.
+fn hashFor(n: usize) ChangeHash {
+    var hash = ChangeHash.zero;
+    hash.bytes[0] = 1;
+    std.mem.writeInt(u64, hash.bytes[8..16], n, .big);
+    return hash;
+}
+
+/// Ascending and duplicate free, which is the `BTreeSet` invariant
+/// [`State.encode`] asserts and `sentContains` binary-searches.
+fn expectSentSet(items: []const ChangeHash) !void {
+    for (items, 0..) |hash, at| {
+        if (at == 0) continue;
+        try testing.expect(ChangeHash.order(items[at - 1], hash) == .lt);
+    }
+}
+
+test "a bulk extend is the same set as one hash at a time" {
+    const gpa = testing.allocator;
+    // 100, so the stride below is coprime with the count and the scatter is a
+    // permutation: every hash arrives, none arrives twice, and none arrives in
+    // the order it would have been inserted in ascending.
+    const count = 100;
+
+    // One hash at a time, scattered, and every hash a second time: the shape
+    // the per-hash insert was fed, and the set arm has to drop the repeats.
+    var one_at_a_time = State.new(gpa);
+    defer one_at_a_time.deinit();
+    for (0..2) |_| {
+        for (0..count) |n| try one_at_a_time.insertSent(hashFor((n * 37) % count));
+    }
+
+    // The whole list in one call, in ascending order.
+    var all_at_once = State.new(gpa);
+    defer all_at_once.deinit();
+    var ascending: [count]ChangeHash = undefined;
+    for (&ascending, 0..) |*slot, n| slot.* = hashFor(n);
+    try all_at_once.extendSent(&ascending);
+
+    // And the shape a session has: rounds of new hashes, each batch carrying
+    // two hashes an earlier round already sent — one of them a repeat **within
+    // the batch**, which is the arm a merge of two sorted runs has to get right
+    // before the two runs are merged at all.
+    var by_round = State.new(gpa);
+    defer by_round.deinit();
+    var round: usize = 0;
+    while (round < count) {
+        const batch = @min(7 + round, count - round);
+        var mixed: [count + 2]ChangeHash = undefined;
+        for (mixed[0..batch], 0..) |*slot, i| slot.* = hashFor(round + i);
+        mixed[batch] = hashFor(round / 2);
+        mixed[batch + 1] = mixed[0];
+        try by_round.extendSent(mixed[0 .. batch + 2]);
+        round += batch;
+    }
+
+    // All three are the same set, and it is the ascending, duplicate-free set
+    // of a hundred hashes. A length check alone would pass a merge that sorted
+    // and dropped a hash.
+    try testing.expectEqual(@as(usize, count), one_at_a_time.sent_hashes.items.len);
+    try testing.expectEqualSlices(
+        ChangeHash,
+        one_at_a_time.sent_hashes.items,
+        all_at_once.sent_hashes.items,
+    );
+    try testing.expectEqualSlices(
+        ChangeHash,
+        one_at_a_time.sent_hashes.items,
+        by_round.sent_hashes.items,
+    );
+    try expectSentSet(by_round.sent_hashes.items);
+}
+
+/// One extend into a set that already holds `before`, with the `index`th
+/// allocation failing. `saw_out_of_memory` records that at least one index
+/// actually failed, so a run that never reached the extend cannot pass.
+fn extendOverExisting(
+    gpa: Allocator,
+    before: []const ChangeHash,
+    added: []const ChangeHash,
+    index: usize,
+    saw_out_of_memory: *bool,
+) !void {
+    var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = index });
+    const limited = failing.allocator();
+    var state = State.new(limited);
+    defer state.deinit();
+    // On an index where the setup itself runs out of memory there is nothing to
+    // say about the extend, so the index is passed over.
+    state.extendSent(before) catch |e| switch (e) {
+        error.OutOfMemory => return,
+        else => |other| return other,
+    };
+    state.extendSent(added) catch |e| switch (e) {
+        error.OutOfMemory => {
+            saw_out_of_memory.* = true;
+            // **Nothing moved.** The per-hash insert this replaced had already
+            // added the hashes that went in before the one that failed, so the
+            // retry below had to be told about them twice.
+            try testing.expectEqualSlices(ChangeHash, before, state.sent_hashes.items);
+            return;
+        },
+        else => |other| return other,
+    };
+    // The extend succeeded, so the set is the union — once each.
+    try testing.expectEqual(before.len + 2, state.sent_hashes.items.len);
+    try expectSentSet(state.sent_hashes.items);
+}
+
+test "an extend that cannot allocate moves nothing" {
+    const gpa = testing.allocator;
+    const before = [_]ChangeHash{ hashFor(1), hashFor(4), hashFor(9) };
+    // Two of the three are new, and one is already in the set: the batch that
+    // both has to add and has to leave alone.
+    const added = [_]ChangeHash{ hashFor(0), hashFor(9), hashFor(12) };
+
+    // How many allocations the whole run makes, so every one of them is walked
+    // rather than a guessed number of them. The count is measured rather than
+    // asserted: `extendSent` allocates once and the set it replaces is freed,
+    // so two extends make two.
+    const budget = blk: {
+        var probe: std.testing.FailingAllocator = .init(gpa, .{});
+        const limited = probe.allocator();
+        var state = State.new(limited);
+        defer state.deinit();
+        try state.extendSent(&before);
+        try state.extendSent(&added);
+        break :blk probe.allocations;
+    };
+
+    var saw_out_of_memory = false;
+    for (0..budget) |index| try extendOverExisting(gpa, &before, &added, index, &saw_out_of_memory);
+    try testing.expect(saw_out_of_memory);
+}
+
+/// Two extends and the set both of them have to leave, run with every
+/// allocation failing in turn. The overlap is the point: the second batch
+/// repeats a hash of the first, so a leak of the old buffer or of the new one
+/// is a leak on the path that frees both.
+fn extendTwice(gpa: Allocator, first: []const ChangeHash, second: []const ChangeHash) !void {
+    var state = State.new(gpa);
+    defer state.deinit();
+    try state.extendSent(first);
+    try state.extendSent(second);
+    try expectSentSet(state.sent_hashes.items);
+    try testing.expectEqual(@as(usize, 5), state.sent_hashes.items.len);
+}
+
+test "an extend releases what it replaced under every allocation failure" {
+    const gpa = testing.allocator;
+    const first = [_]ChangeHash{ hashFor(2), hashFor(5) };
+    const second = [_]ChangeHash{ hashFor(1), hashFor(5), hashFor(7), hashFor(3) };
+    try testing.checkAllAllocationFailures(gpa, extendTwice, .{ &first, &second });
 }
 
 test "a have is a last-sync list and a bloom" {

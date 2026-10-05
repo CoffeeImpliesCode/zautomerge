@@ -285,15 +285,31 @@ fn skipWire(comptime E: type, dec: *E.WireDecoder, n: usize, running: *i64) Pars
 /// The fast arm needs a fold that takes a whole run at once, because a
 /// prefix sum over a run of `count` equal lengths is `length * count` — the
 /// one multiplication every codec's accumulator already implies
-/// (`accumulateRun` on `PrefixBase`, `DeltaBase`, `BoolPrefixCodec`). A codec
-/// that does not publish one keeps the row-at-a-time walk; that is the case for
-/// the op set's `MetaPrefixCodec`, whose wire is `Rle(u64)`, whose declaration
-/// lives outside this file, and whose literal-run payloads carry refusals a
-/// count-only fold would step over unchecked (`rle.zig:518-531`). The boolean
-/// prefix codec publishes one precisely because a boolean run stores no
-/// payload, so every refusal it can raise comes from its own count varint —
-/// which the fold must read to learn the run's length
-/// (`bool.zig:300-311`).
+/// (`accumulateRun` on `PrefixBase` and `DeltaBase` here, and on the op set's
+/// `BoolPrefixCodec` and `MetaPrefixCodec`). The boolean prefix codec
+/// publishes one precisely because a boolean run stores no payload, so every
+/// refusal it can raise comes from its own count varint — which the fold must
+/// read to learn the run's length (`bool.zig:300-311`).
+///
+/// **The row-at-a-time arm below is the net, and it stays.** The gate is a
+/// declaration test on a comptime parameter, and `E` reaches here from
+/// outside this file — `BoolPrefixCodec` and `MetaPrefixCodec` live in
+/// `opset/columns.zig`, `ActorColumn` and `ActionColumn` in
+/// `opset/types.zig` — so the set of codecs instantiated against this
+/// function is not this file's to close. A codec that arrives without the
+/// fold gets the walk below, which is the answer it had anyway; one that
+/// arrives with it gets the multiplication.
+///
+/// **The objection once recorded here against `MetaPrefixCodec` was refuted
+/// against the decoder, and is restated so it is not recorded again.** It was
+/// that a literal run's payloads carry refusals a count-only fold would step
+/// over unchecked. There is no such fold: `nextRunMax` hands a literal run
+/// back one value at a time (`rle.zig:600-605`), and a repeat run's one
+/// payload is read through `readValue` inside `enterRun` before its count is
+/// charged (`rle.zig:640-668`). So every refusal `next` raises —
+/// `UnexpectedEnd`, `InvalidLeb128`, `Overflow`, `LengthExceedsInput`,
+/// `TooLarge`, `UnexpectedNull` — fires inside the run arm itself, at the run
+/// that carries it, which is where the row-at-a-time walk raised it too.
 fn accumulateWire(comptime E: type, dec: *E.WireDecoder, n: usize, running: *i64) ParseError!bool {
     if (comptime @hasDecl(E, "accumulateRun") and @hasDecl(E.WireDecoder, "nextRunMax")) {
         if (n == 0) return true;
@@ -2125,18 +2141,59 @@ fn PrefixBase(comptime P: type, comptime T: type) type {
 
         /// The item count and the sum of the row lengths. A sum that leaves
         /// `i64` is `error.Overflow` rather than a wrapped value.
+        ///
+        /// **A run at a time, which is the whole cost of this method.** The
+        /// weight of a slab is read on every write that touches it — once by
+        /// [`reindexFrom`](Column.reindexFrom) and once by
+        /// [`rebuildAggs`](Column.rebuildAggs) — so a row-at-a-time walk
+        /// makes a write that appends to a column of `n` rows cost `n`
+        /// decoder steps per slab, and a transaction of `n` such writes cost
+        /// `n²`. A run of `count` rows of one length adds `length * count`,
+        /// which `accumulateRun` spends in one multiplication, so the walk is
+        /// `O(runs in the slab)`.
+        ///
+        /// **A literal run is still folded one value at a time, and that is
+        /// the decoder's shape rather than a limit of this one.**
+        /// `nextRunMax` (`rle.zig:589`) charges a repeat or null run its whole
+        /// count and hands a literal run back one value at a time, because a
+        /// literal run's values are packed back to back and its count says
+        /// nothing about where any one of them starts
+        /// (`rle.zig:600-605`). So the expensive case is a slab of distinct
+        /// lengths, and it is exactly the case the row walk was for.
+        ///
+        /// **The refusals are the row walk's.** `accumulateRun` folds through
+        /// `addRunOf` (`column.zig:214`), which refuses a run whose *result*
+        /// leaves `i64`; a constant step makes the partial sums monotone
+        /// between the running value and that result, so both endpoints in
+        /// range is every intermediate in range, and the fold refuses exactly
+        /// what `count` calls to `addChecked` refuse. The decoder's own
+        /// refusals — a run count over `maxSlabLen`, a null run on a column
+        /// that has none, a payload that will not decode — are raised inside
+        /// `nextRunMax` itself (`rle.zig:640-668`), so the fold steps over none
+        /// of them. `accumulateWire` (`column.zig:297`) walks a whole column
+        /// this way for `runningAt`, so this is the fold already on the read
+        /// path, not a new one.
         pub fn weightOf(gpa: std.mem.Allocator, slab: *const Slab) ParseError!Weight {
             _ = gpa;
             var sum: i64 = 0;
             var dec = try WireDecoder.init(slab.data);
-            var i: usize = 0;
-            while (i < slab.len) : (i += 1) {
-                const w = (try dec.next()) orelse return error.InvalidValue;
-                if (comptime isNullable(T)) {
-                    // A row with no length contributes nothing to the sum.
-                    if (w) |v| sum = try addChecked(sum, @as(i64, @intCast(v)));
-                } else {
-                    sum = try addChecked(sum, @as(i64, @intCast(w)));
+            if (comptime @hasDecl(WireDecoder, "nextRunMax")) {
+                var left = slab.len;
+                while (left != 0) {
+                    const run = (try dec.nextRunMax(left)) orelse return error.InvalidValue;
+                    left -= run.count;
+                    try accumulateRun(run.value, run.count, &sum);
+                }
+            } else {
+                var i: usize = 0;
+                while (i < slab.len) : (i += 1) {
+                    const w = (try dec.next()) orelse return error.InvalidValue;
+                    if (comptime isNullable(T)) {
+                        // A row with no length contributes nothing to the sum.
+                        if (w) |v| sum = try addChecked(sum, @as(i64, @intCast(v)));
+                    } else {
+                        sum = try addChecked(sum, @as(i64, @intCast(w)));
+                    }
                 }
             }
             return .{ .len = slab.len, .prefix = sum };
@@ -2328,11 +2385,41 @@ fn DeltaBase(comptime P: type, comptime T: type) type {
         /// subtree that cannot hold the value being searched for
         /// (`delta/indexed.rs:15-20`).
         ///
-        /// A literal run's items carry a difference each, so its extremes
-        /// are not at the run's endpoints and the walk visits every one of
-        /// them. Upstream's loader folds runs in as they stream past
-        /// (`WeightFn::accumulate_run`, `column.rs:105-113`) and never pays
-        /// this; a splice does, once per slab it touches.
+        /// **A run at a time, and the extremes a run still costs O(1) for.**
+        /// The weight is read on every write that touches this slab — once by
+        /// [`reindexFrom`](Column.reindexFrom) and once by
+        /// [`rebuildAggs`](Column.rebuildAggs) — so a row-at-a-time walk
+        /// makes a write that appends to a column of `n` rows cost `n` steps
+        /// per slab, and a transaction of `n` such writes cost `n²`. The sum
+        /// over a run of `count` rows of one difference `d` is
+        /// `partial + count * d`, one call to `addRunOf` (`column.zig:214`);
+        /// and the partial sums the run passes through are `partial + k * d`
+        /// for `k` in `1..count`, which are **monotone in `k`** whatever the
+        /// sign of `d`, so the run's extremes are its first and its last and
+        /// nothing in between is looked at. That is what makes the extremes
+        /// `O(1)` per run as well.
+        ///
+        /// **A literal run is still one row at a time, and that is the
+        /// decoder's shape.** `nextRunMax` (`rle.zig:589`) hands a literal run
+        /// back one value at a time (`rle.zig:600-605`) because its values are
+        /// packed back to back; a repeat or null run comes back whole. So
+        /// **which codec this helps is decided by its differences, not by its
+        /// values**: `id_ctr` and `key_ctr` store contiguous op counters, so
+        /// every difference in them is `1`, the whole slab is one repeat run,
+        /// and they are the case the fold turns from `O(rows)` into `O(runs)`.
+        /// A column whose differences are all distinct is still walked a row
+        /// at a time, and that is the case the row walk was for.
+        ///
+        /// **The refusals are the row walk's.** Both endpoints the fold reads
+        /// are values the row walk computes and checks, and a constant step
+        /// leaves every intermediate between them, so `addRunOf` refuses
+        /// exactly what the `count` checked additions refuse — and refuses in
+        /// the same order, the run's first row before its last. An absent
+        /// difference holds the running sum where it is, so every row of a
+        /// null run lands on a value `lo`/`hi` already hold; the invariant
+        /// that makes that true is that `lo <= partial <= hi` before and
+        /// after every row, which starts at `0` and is kept by folding each
+        /// row's own value in, so the arm has nothing to do.
         pub fn weightOf(gpa: std.mem.Allocator, slab: *const Slab) ParseError!Weight {
             _ = gpa;
             if (slab.len == 0) return .zero;
@@ -2343,13 +2430,31 @@ fn DeltaBase(comptime P: type, comptime T: type) type {
             var partial: i64 = 0;
             var lo: i64 = 0;
             var hi: i64 = 0;
-            var n: usize = 0;
-            while (n < slab.len) : (n += 1) {
-                const w = (try dec.next()) orelse return error.InvalidValue;
-                // An absent value holds the running value where it is.
-                try accumulate(w, &partial);
-                lo = @min(lo, partial);
-                hi = @max(hi, partial);
+            if (comptime @hasDecl(WireDecoder, "nextRunMax")) {
+                var left = slab.len;
+                while (left != 0) {
+                    const run = (try dec.nextRunMax(left)) orelse return error.InvalidValue;
+                    left -= run.count;
+                    // An absent value holds the running value where it is, so
+                    // every row of the run lands on the `partial` the
+                    // invariant already covers; there is nothing to fold and
+                    // nothing to widen.
+                    const d = run.value orelse continue;
+                    const first = try addRunOf(partial, d, 1);
+                    const after = try addRunOf(partial, d, run.count);
+                    lo = @min(lo, @min(first, after));
+                    hi = @max(hi, @max(first, after));
+                    partial = after;
+                }
+            } else {
+                var n: usize = 0;
+                while (n < slab.len) : (n += 1) {
+                    const w = (try dec.next()) orelse return error.InvalidValue;
+                    // An absent value holds the running value where it is.
+                    try accumulate(w, &partial);
+                    lo = @min(lo, partial);
+                    hi = @max(hi, partial);
+                }
             }
             return .{ .len = slab.len, .total = partial, .min_offset = lo, .max_offset = hi };
         }
@@ -4188,12 +4293,13 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// whose refusal costs nothing.
         ///
         /// **What it costs.** One shallow copy of the slab list and one copy
-        /// of the index — both proportional to the slab count, the same order
-        /// as the per-splice cache rebuilds this write already ran — plus one
-        /// copy of each slab the cut re-encodes, and that one is bounded by
-        /// the run budget. It is a fixed price per call, not per value:
-        /// [`extend`](Column.extend) and [`remapped`](Column.remapped) hand a
-        /// whole run to one splice.
+        /// of the index — both proportional to the slab count, and the price
+        /// of the seam rather than of the write, since the two cache rebuilds
+        /// behind it are now proportional to the range the splice touched —
+        /// plus one copy of each slab the cut re-encodes, and that one is
+        /// bounded by the run budget. It is a fixed price per call, not per
+        /// value: [`extend`](Column.extend) and [`remapped`](Column.remapped)
+        /// hand a whole run to one splice.
         ///
         /// **`gpa` must be this column's own** —
         /// [`allocator`](Column.allocator), the value `deinit` releases it
@@ -4288,12 +4394,18 @@ pub fn Column(comptime T: type, comptime E: type) type {
 
             const s0 = self.slabHolding(index);
             const s1 = self.slabHolding(index + del);
-            if (s0 == s1) {
-                try self.spliceOneSlab(gpa, index, del, values, s0);
-            } else {
+            // **One range for both caches.** Every `settle` below answers the
+            // first slab its merge walk reached, which is the first slab
+            // whose weight can have moved, and the least of those answers is
+            // what both the index and the bases are correct from. The
+            // re-anchor's own settle is one of them — its merge policy can
+            // walk further left than the splice's — so it is in the minimum
+            // rather than after it.
+            const from = if (s0 == s1)
+                try self.spliceOneSlab(gpa, index, del, values, s0)
+            else
                 try self.spliceAcrossSlabs(gpa, index, del, values, s0, s1);
-            }
-            try self.rebuildAggs();
+            try self.rebuildAggs(from);
         }
 
         // ── The staged splice ───────────────────────────────────────────
@@ -4919,7 +5031,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 from = to;
             }
             try self.reindex();
-            try self.rebuildAggs();
+            try self.rebuildAggs(0);
             return self;
         }
 
@@ -5004,7 +5116,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
             };
             self.total_len = n;
             try self.reindex();
-            try self.rebuildAggs();
+            try self.rebuildAggs(0);
             return self;
         }
 
@@ -5053,7 +5165,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
             };
             self.total_len = n;
             try self.reindex();
-            try self.rebuildAggs();
+            try self.rebuildAggs(0);
             return self;
         }
 
@@ -6100,7 +6212,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 self.slabs.items.len = 0;
                 self.stagedGrew(0, 1, 0);
             }
-            try self.rebuildAggs();
+            try self.rebuildAggs(0);
             try self.reindex();
         }
 
@@ -6226,16 +6338,23 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// Puts `wire` on the row at `at`, re-encoding the runs around it and
         /// settling the layout again. The row's own value did not move, but
         /// the value in front of it did.
-        fn reanchorRow(self: *Self, gpa: std.mem.Allocator, at: usize, wire: E.Wire) ParseError!void {
+        ///
+        /// Answers the first slab the settle touched, which is where the
+        /// bases stop being right — see [`settle`](Column.settle).
+        fn reanchorRow(self: *Self, gpa: std.mem.Allocator, at: usize, wire: E.Wire) ParseError!usize {
             const si = self.slabHolding(at);
             const in_slab = at - self.tree.itemsBeforeSlab(si);
             try self.takeOwnership(si);
             try slabmod.splice(gpa, E, &self.slabs.items[si], in_slab, 1, &.{wire}, null);
-            try self.settle(si, 1);
+            return self.settle(si, 1);
         }
 
         /// A splice that lands inside one slab: the slab-level rebuild, with
         /// the delta re-anchor as the postfix.
+        ///
+        /// Answers the first slab the write touched, over both of its
+        /// settles — its own and, where the re-anchor lands in a later slab,
+        /// the re-anchor's.
         fn spliceOneSlab(
             self: *Self,
             gpa: std.mem.Allocator,
@@ -6243,7 +6362,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
             del: usize,
             values: []const T,
             si: usize,
-        ) ParseError!void {
+        ) ParseError!usize {
             const s = &self.slabs.items[si];
             const in_slab = index - self.tree.itemsBeforeSlab(si);
             // Only a delta column measures its values against a running
@@ -6300,20 +6419,25 @@ pub fn Column(comptime T: type, comptime E: type) type {
             // `insert` carry the absent rows a re-anchor took and put back,
             // so this is the same total the caller asked for.
             self.total_len = self.total_len - del_now + insert.len;
-            try self.settle(si, 1);
+            var from = try self.settle(si, 1);
             if (fix) |f| {
                 if (!in_this_slab) {
                     // The row to re-anchor stood past this slab, so the
                     // splice has already moved it: put its difference on
                     // it where it now stands.
-                    try self.reanchorRow(gpa, f.at + values.len - del, f.wire);
+                    from = @min(from, try self.reanchorRow(gpa, f.at + values.len - del, f.wire));
                 }
             }
+            return from;
         }
 
         /// A splice whose deleted range spans slabs: everything from the head
         /// of the first slab to the tail of the last is rebuilt, and the
         /// slabs in between are dropped without being decoded.
+        ///
+        /// Answers the first slab the write touched, over both of its
+        /// settles — its own and, where the re-anchor lands in a later slab,
+        /// the re-anchor's.
         fn spliceAcrossSlabs(
             self: *Self,
             gpa: std.mem.Allocator,
@@ -6322,7 +6446,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
             values: []const T,
             s0: usize,
             s1: usize,
-        ) ParseError!void {
+        ) ParseError!usize {
             var pieces: std.ArrayList(Slab) = .empty;
             defer pieces.deinit(gpa);
             // **The pieces are slabs, not wire runs.** Between the first one
@@ -6404,16 +6528,17 @@ pub fn Column(comptime T: type, comptime E: type) type {
             // that spans slabs puts a whole run of budgeted slabs where the
             // old range stood, and the merge policy is a property of the
             // range that was rebuilt, not of the slab that started it.
-            try self.settle(s0, placed);
+            var from = try self.settle(s0, placed);
             if (fix) |f| {
                 if (!anchored_in_tail) {
                     // The tail of the last slab was absent all the way, so
                     // the row to re-anchor stands in a later slab, which the
                     // splice has already moved: put its difference on it
                     // where it now stands.
-                    try self.reanchorRow(gpa, f.at + values.len - del, f.wire);
+                    from = @min(from, try self.reanchorRow(gpa, f.at + values.len - del, f.wire));
                 }
             }
+            return from;
         }
 
         /// Appends `piece` to `pieces`, freeing it if the list cannot grow.
@@ -6511,7 +6636,14 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// write-back goes through the same stage and publish as
         /// [`splice`](Column.splice) — so nothing outside this file is left
         /// that could reach a non-atomic step.
-        fn settle(self: *Self, lo: usize, count: usize) ParseError!void {
+        ///
+        /// **It answers the first slab the settle touched**, which is what
+        /// [`rebuildAggs`](Column.rebuildAggs) needs: everything in front of
+        /// that index kept both its bytes and its weight, so the index, the
+        /// bases and the merge policy all agree on where the column stopped
+        /// being what it was. A write that settles more than once — a splice
+        /// and the re-anchor behind it — takes the least of the answers.
+        fn settle(self: *Self, lo: usize, count: usize) ParseError!usize {
             if (self.slabs.items.len == 0) {
                 // A cut that spanned every slab and put nothing in its
                 // place. An empty column still keeps one empty slab, the
@@ -6519,7 +6651,9 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 try self.slabs.append(self.gpa, .empty);
                 self.stagedGrew(self.slabs.items.len - 1, 0, 1);
                 try self.reindex();
-                return;
+                // The list was empty a line ago: the seeded slab is the
+                // whole of it and nothing is in front of it to keep.
+                return 0;
             }
             // **A rebuilt range can be empty, and empty at the tail.** A cut
             // that removed every slab from `lo` on and put nothing back
@@ -6571,7 +6705,9 @@ pub fn Column(comptime T: type, comptime E: type) type {
             spilled.deinit(self.gpa);
 
             const range = try self.tryMergeRange(lo, lo + count + spill);
-            try self.reindexFrom(@min(lo, range.start));
+            const from = @min(lo, range.start);
+            try self.reindexFrom(from);
+            return from;
         }
 
         /// Merge slab `b` into slab `a` when one of them is undersized and
@@ -6748,8 +6884,54 @@ pub fn Column(comptime T: type, comptime E: type) type {
             self.tree = fresh;
         }
 
-        /// Rebuild the per-slab weight prefixes. Only a codec whose weight
-        /// carries a prefix keeps them.
+        /// Rebuild the per-slab weight prefixes **from slab `from` on**. Only
+        /// a codec whose weight carries a prefix keeps them.
+        ///
+        /// **`from` is the first slab whose weight can have moved**, and the
+        /// step that knows it is [`settle`](Column.settle). A splice
+        /// rewrites its slabs from the first it cut, and the merge policy
+        /// reaches no further left than the boundary it reports as
+        /// `range.start`, so every slab in front of that index kept both its
+        /// bytes and its weight. `agg_before[i]` is the merge of the weights
+        /// of slabs `0..i`, and those slabs are the same ones, so the
+        /// entries in front of `from` are already what a whole-column
+        /// rebuild would write: the entry at `from` is the seed this one
+        /// sums from, and the ones below it are not written at all. A load,
+        /// a fill and a slab seed have no such boundary and pass zero.
+        ///
+        /// **This is one aggregate of two, and the narrowing touches only
+        /// this one.** A column keeps its weights twice over: the flat
+        /// `agg_before` this rebuilds, read in O(1) by
+        /// [`baseOf`](Column.baseOf) — a delta row decodes against it, a
+        /// prefix column sums from it — and the positional index, whose
+        /// weight [`findByPrefix`](Tree.findByPrefix) and
+        /// [`findByPrefixSum`](Tree.findByPrefixSum) read to turn a row
+        /// number into a slab. The index is reconciled by
+        /// [`reindexFrom`](Column.reindexFrom) over the very same boundary
+        /// and is not this method's business; the two caches are written in
+        /// the same write and from the same `from`, so they cannot disagree
+        /// about where the column stopped being what it was.
+        ///
+        /// **A later merge cannot invalidate what this skipped, because
+        /// every merge has already run.** `tryMergeRange` is the only step
+        /// that reaches outside a rebuilt range, it runs inside `settle`,
+        /// and it moves its own cursor left every time it folds a pair — so
+        /// the index it reports is the leftmost slab any merge wrote to, and
+        /// every merge lands at or after it. A merge that spans further left
+        /// than the caller's own slab therefore **widens** the range this
+        /// rebuild is given rather than escaping it, which is what makes the
+        /// answer independent of the merge policy: the skipped entries sit
+        /// behind slabs no step of this write touched. A write that settles
+        /// twice — a splice, then the re-anchor behind it — takes the least
+        /// of the two answers, and both are values this rebuild's caller
+        /// already had.
+        ///
+        /// **What it costs.** One `weightOf` per slab from `from` on, and
+        /// `weightOf` is row-linear inside a slab, so a splice now pays for
+        /// the rows behind the slab it cut rather than for the column. An
+        /// append at the tail pays for the tail; a cut that collapses the
+        /// list pays for less than before; a cut at the head still pays for
+        /// the whole column, which is the case the boundary cannot help.
         ///
         /// **A refusal leaves the column's previous bases in place, whole.**
         /// The array is read as a slab's base — a delta or prefix column's
@@ -6761,21 +6943,38 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// of the array the column is still reading and only take its place
         /// once every weight is in, so neither the allocation nor a weight
         /// that will not measure can leave a short array behind.
-        fn rebuildAggs(self: *Self) ParseError!void {
+        fn rebuildAggs(self: *Self, from: usize) ParseError!void {
             if (!comptime E.tracks_prefix) {
                 self.agg_before.clearRetainingCapacity();
                 return;
             }
             const n = self.slabs.items.len;
+            // The same clamp [`reindexFrom`](Column.reindexFrom) makes: a
+            // tail that was removed outright puts the boundary one past the
+            // last slab, and there the whole of the work is the truncation.
+            const start = @min(from, n);
             const old = self.agg_before.items.len;
-            // Room for the bases and for the weights they are summed from,
-            // both past the end of the entries the column is still reading.
-            try self.agg_before.ensureTotalCapacity(self.gpa, old + n + 1);
-            const weights = self.agg_before.addManyAsSliceAssumeCapacity(n + 1)[0..n];
+            // **The base in front of slab `start`, read before the room is
+            // taken** — `ensureTotalCapacity` may move the buffer, and this
+            // is the one entry the rebuild reads rather than writes. It is in
+            // range because `start <= old`: where `start` is not zero it
+            // names a slab of the list being replaced, and that list had
+            // `old - 1` of them; where it is zero the entry would be the
+            // identity anyway, and a column whose array is still empty has
+            // none.
+            var acc = if (start == 0) identity else self.agg_before.items[start];
+            // Room for the weights of the slabs this rebuild weighs and for
+            // the one base past them, measured past the end of the entries
+            // the column is still reading. The scratch therefore starts at
+            // `old` and the writes below start at `start <= old`, so a write
+            // lands below every weight the loop has yet to read — and where
+            // the two coincide (`start` and `old` both zero) each iteration
+            // takes its weight by value before it writes over it.
+            try self.agg_before.ensureTotalCapacity(self.gpa, old + n - start + 1);
+            const weights = self.agg_before.addManyAsSliceAssumeCapacity(n - start + 1)[0 .. n - start];
             errdefer self.agg_before.shrinkRetainingCapacity(old);
-            for (self.slabs.items, weights) |*s, *w| w.* = try E.weightOf(self.gpa, s);
-            var acc = identity;
-            for (weights, 0..) |w, i| {
+            for (self.slabs.items[start..], weights) |*s, *w| w.* = try E.weightOf(self.gpa, s);
+            for (weights, start..) |w, i| {
                 self.agg_before.items[i] = acc;
                 acc = Weight.Aggregate.merge(acc, w);
             }
@@ -6790,22 +6989,31 @@ pub fn Column(comptime T: type, comptime E: type) type {
             // boolean an entry per slab at [`stageSplice`](Column.stageSplice)
             // — and it is pure waste:
             //
-            // * **What it writes is the column's own previous bases.** The
-            //   length is `old + n + 1` when the shrink is called, so the
-            //   fill covers the `old` entries in front of it and no further:
-            //   one entry per slab of the list this rebuild replaces, plus
-            //   the whole column's. It is *not* the spare capacity behind
-            //   them, and it is not a high-water mark — a column of `k`
-            //   slabs pays `k + 1` entries every splice, thirty-two bytes an
-            //   entry on a delta column (`btree.SlabAgg`) and sixteen on a
-            //   prefix one (`btree.PrefixWeight`), for bytes nothing reads.
+            // * **What it writes is this column's own earlier state.** The
+            //   length is `old + (n - start) + 1` when the shrink is called,
+            //   so the fill would cover the `old - start` entries past the
+            //   new length and no further: the tail of the bases this column
+            //   came in with, `items[n + 1 .. old)`, which is empty unless
+            //   the cut collapsed the list, and then the weights just
+            //   measured into the room past them. It is *not* the spare
+            //   capacity behind that, and it is not a high-water mark.
+            //   Narrowing is what shrinks it: the `start` entries in front of
+            //   the scratch are the bases this rebuild reuses rather than
+            //   re-measures, so a splice of a `k`-slab column that reaches
+            //   back `start` slabs paid `k + 1` entries a write before and
+            //   pays `k + 1 - start` after — thirty-two bytes an entry on a
+            //   delta column (`btree.SlabAgg`) and sixteen on a prefix one
+            //   (`btree.PrefixWeight`), for bytes nothing reads.
             // * Nothing in this file reads past the length.
             //   [`aggWeight`](Column.aggWeight) is the only reader and
             //   answers the identity for a slab past the end rather than
             //   indexing; [`checkInvariants`](Column.checkInvariants)
             //   checks the length before it compares entries; and the loop
-            //   above has just written `[0, n + 1)` in full, so the
-            //   entries that survive the truncation are all real.
+            //   above has just written `[start, n + 1)` in full, so every
+            //   entry the new length reaches is real. The entries in front
+            //   of `start` are the earlier rebuild's, and they are real for
+            //   the reason this whole method narrows: nothing behind them
+            //   moved.
             //
             // The `errdefer` above keeps its poison: that one is a refusal,
             // it is cold, and a trap on a half-measured tail is a real
@@ -6845,6 +7053,17 @@ pub fn Column(comptime T: type, comptime E: type) type {
             // so the bound is the larger of the two counts twice over: a
             // splice that collapses many slabs into one leaves `n` below the
             // count the array already has.
+            //
+            // **An upper bound, and narrowing only lowers the demand.**
+            // `rebuildAggs` now measures from the first slab the splice
+            // touched, so it asks for `old + (n - start) + 1` where it used to
+            // ask for `old + n + 1`. Every bound below still covers the
+            // wider ask, so the reservation is unchanged — and a
+            // `rebuildAggs` that turns out to need more than this is a
+            // refusal on the provisional column, which is what the doc
+            // above already says the seam is for. Lowering it here would
+            // trade a reserve that is always sufficient for one that is
+            // tight only when `start` is zero.
             const count = @max(n, self.slabs.items.len);
             try self.agg_before.ensureTotalCapacity(self.gpa, count + n + 2);
         }
@@ -9529,6 +9748,251 @@ test "a splice that collapses the slab list retires bases the column does not re
     // of the contract that lets the rebuild leave them alone.
 }
 
+/// Every base a narrow rebuild reuses is one a whole-column rebuild would
+/// write again unchanged. That is the whole correctness argument for
+/// narrowing, and it is checkable exhaustively rather than by sampling: for
+/// **every** `from` in `0..=slabCount`, the array the column already holds
+/// — which [`checkInvariants`](Column.checkInvariants) has held against the
+/// slabs' own running merge — must survive `rebuildAggs(from)` entry for
+/// entry. A rebuild that started at the wrong place, or that summed from
+/// the identity where it should have summed from the retained entry, fails
+/// on the first `from` that exposes it.
+fn expectNarrowReusesWholeColumn(comptime T: type, comptime E: type, col: *Column(T, E)) !void {
+    if (!comptime E.tracks_prefix) return;
+    const gpa = testing.allocator;
+    const count = col.slabCount();
+    for (0..count + 1) |from| {
+        const whole = try snapshotBases(T, E, gpa, col);
+        defer gpa.free(whole);
+        try col.rebuildAggs(from);
+        try expectBasesEqual(T, E, col, whole);
+    }
+}
+
+/// One column of `E`, many slabs, with slab zero made unweighable; see the
+/// test below for what that is for.
+fn narrowSkipWitness(comptime T: type, comptime E: type, model: []const T) !void {
+    const gpa = testing.allocator;
+    var col = try Column(T, E).initWithBudget(gpa, 4);
+    defer col.deinit();
+    try col.extend(gpa, model);
+    try testing.expect(col.slabCount() > 1);
+    try expectSound(T, E, &col);
+
+    // **A refusal at a non-zero boundary leaves the whole array alone.**
+    // This is the `errdefer` at its new depth: the rebuild is seeded from an
+    // entry it must not clobber before the scratch exists, and a weight that
+    // will not measure must roll the length back to where it was — leaving
+    // the retained prefix *and* the entries behind it exactly as they were.
+    // Both halves are checked by the same snapshot the reuse sweep uses.
+    const before = try snapshotBases(T, E, gpa, &col);
+    defer gpa.free(before);
+    const also_kept = col.slabs.items[1].len;
+    col.slabs.items[1].len = std.math.add(usize, also_kept, 1_000_000) catch unreachable;
+    try testing.expectError(error.InvalidValue, col.rebuildAggs(1));
+    try expectBasesEqual(T, E, &col, before);
+    col.slabs.items[1].len = also_kept;
+
+    const kept = col.slabs.items[0].len;
+    col.slabs.items[0].len = std.math.add(usize, kept, 1_000_000) catch unreachable;
+    try testing.expectError(error.InvalidValue, col.rebuildAggs(0));
+    // **Same column, same second.** Only the range differs, so the refusal
+    // above was the measurement of slab zero and not of the allocator.
+    col.rebuildAggs(1) catch |e| {
+        std.debug.print("narrow rebuild refused on a sound column: {s}\n", .{@errorName(e)});
+        return e;
+    };
+    // The narrow rebuild wrote nothing the wide one would have written
+    // differently, so the array a reader sees is the same one.
+    try expectBasesEqual(T, E, &col, before);
+    col.slabs.items[0].len = kept;
+    const read_back = try col.toSlice(gpa);
+    defer gpa.free(read_back);
+    try expectColumn(T, E, &col, read_back);
+}
+
+test "a narrow base rebuild does not weigh the slabs in front of its range" {
+    // **The cost claim, made observable.** Narrowing is only worth anything
+    // if the skipped slabs are *not measured and thrown away*, and an array
+    // recomputed in full and then discarded is indistinguishable from one
+    // that was never touched — so this makes the skipped slab
+    // **unweighable**. Its row count is pushed past what its bytes can
+    // decode, which is `error.InvalidValue` out of every `weightOf` the
+    // codec has, and the two rebuilds are then asked the same question
+    // about the same column. The wide one must refuse; the narrow one must
+    // come back with the array untouched.
+    //
+    // **The refusal is the other half of the answer.** `rebuildAggs(0)`
+    // measures into the room past the entries it is replacing and rolls the
+    // length back on a refusal, so the entries in front of the scratch are
+    // the column's own when it comes back — which is what lets the narrow
+    // call below read the array at all.
+    //
+    // The delta fixture is triples, for the reason the collapse test above
+    // gives: a delta column counts runs of equal *differences*, and three
+    // copies of a value are two differences of zero behind each other. The
+    // prefix fixture is the same numbers, which for that codec are row
+    // lengths rather than values.
+    const deltas = [_]i64{
+        100, 100, 100, 250, 250, 250, 400,  400,  400,  550,  550,  550,
+        700, 700, 700, 850, 850, 850, 1000, 1000, 1000, 1150, 1150, 1150,
+    };
+    try narrowSkipWitness(i64, Delta(i64), &deltas);
+    const widths = [_]u32{
+        100, 100, 100, 250, 250, 250, 400,  400,  400,  550,  550,  550,
+        700, 700, 700, 850, 850, 850, 1000, 1000, 1000, 1150, 1150, 1150,
+    };
+    try narrowSkipWitness(u32, Prefix(u32), &widths);
+}
+
+test "every base a narrow rebuild reuses is one a whole-column rebuild writes" {
+    // **The correctness argument, checked over every range rather than over
+    // one that happened to come up.** The narrowing rests on one claim: the
+    // entries in front of `from` describe slabs this write did not touch, so
+    // they are already the merge a rebuild from zero would produce. This
+    // takes that claim literally and asks the whole array for all
+    // `from` in `0..=slabCount`, on the two codecs that keep bases and on a
+    // plain one that keeps none.
+    const gpa = testing.allocator;
+    {
+        // A prefix column's weight is a row count and a sum, so distinct
+        // values are distinct runs and a budget of four cuts twenty of them
+        // into five slabs.
+        var col = try Column(u64, Prefix(u64)).initWithBudget(gpa, 4);
+        defer col.deinit();
+        for (1..21) |v| try col.append(gpa, @intCast(v));
+        try expectSound(u64, Prefix(u64), &col);
+        try expectNarrowReusesWholeColumn(u64, Prefix(u64), &col);
+    }
+    {
+        var col = try Column(i64, Delta(i64)).initWithBudget(gpa, 4);
+        defer col.deinit();
+        for (0..8) |k| for (0..3) |_| try col.append(gpa, @intCast(100 + 150 * k));
+        try expectSound(i64, Delta(i64), &col);
+        try expectNarrowReusesWholeColumn(i64, Delta(i64), &col);
+    }
+    {
+        // A plain column keeps no bases at all, so the array stays empty
+        // through the same sweep — the comptime arm the narrowing does not
+        // reach.
+        var col = try Column(u64, Rle(u64)).initWithBudget(gpa, 4);
+        defer col.deinit();
+        for (1..21) |v| try col.append(gpa, @intCast(v));
+        try expectNarrowReusesWholeColumn(u64, Rle(u64), &col);
+    }
+}
+
+/// One script of writes on a small-budget column of many slabs: head, tail,
+/// inside one slab, across every slab, and cuts that leave a range empty at
+/// the end of the column. Every step is checked against the plain array it
+/// is standing for, and the base array is swept for the reuse property
+/// after each one.
+fn exerciseNarrowRebuild(comptime T: type, comptime E: type, seed_vals: []const T) !void {
+    const gpa = testing.allocator;
+    var col = try Column(T, E).initWithBudget(gpa, 4);
+    defer col.deinit();
+    var model: std.ArrayList(T) = .empty;
+    defer model.deinit(gpa);
+    for (seed_vals) |v| {
+        try col.append(gpa, v);
+        try model.append(gpa, v);
+    }
+    try expectSound(T, E, &col);
+
+    // **A cut at a slab boundary that runs off the end and inserts
+    // nothing.** The rebuilt range comes out empty at the tail, so `settle`
+    // is handed `lo == slabs.len`, skips the split, and reports a boundary
+    // one past the last slab — the case `reindexFrom` clamps for and the one
+    // the narrow rebuild clamps for identically. It is reached only by a cut
+    // whose head piece is empty, which is why this row is a slab boundary
+    // rather than an arbitrary offset.
+    if (col.slabCount() > 1) {
+        const at = col.tree.itemsBeforeSlab(1);
+        try col.splice(gpa, at, col.len() - at, &.{});
+        try model.replaceRange(gpa, at, model.items.len - at, &.{});
+        try expectColumn(T, E, &col, model.items);
+        try expectNarrowReusesWholeColumn(T, E, &col);
+    }
+
+    const writes = [_]struct { index: usize, del: usize, ins: []const T }{
+        // At the head, where the boundary cannot help and the rebuild is
+        // still whole-column.
+        .{ .index = 0, .del = 0, .ins = seed_vals[0..2] },
+        // At the tail, where the boundary is the last slab or near it.
+        .{ .index = model.items.len, .del = 0, .ins = seed_vals[0..1] },
+        // Inside one slab.
+        .{ .index = 1, .del = 1, .ins = seed_vals[0..3] },
+        // Across slabs.
+        .{ .index = 0, .del = model.items.len, .ins = seed_vals[0..4] },
+    };
+    for (writes) |w| {
+        const index = @min(w.index, model.items.len);
+        const del = @min(w.del, model.items.len - index);
+        try col.splice(gpa, index, del, w.ins);
+        try model.replaceRange(gpa, index, del, w.ins);
+        try expectColumn(T, E, &col, model.items);
+        try expectNarrowReusesWholeColumn(T, E, &col);
+    }
+    try expectRoundTrip(T, E, &col, model.items);
+}
+
+test "a splice leaves the bases a whole-column rebuild would write" {
+    // **Every boundary a splice can take, on a column of several slabs.**
+    // The narrowing moved the rebuild off the whole list, and the witness
+    // for that being sound is that the array a splice leaves behind is the
+    // array a rebuild from zero leaves behind — which
+    // `expectColumn` checks on every step, because `checkInvariants` holds
+    // the array against the slabs' own running merge, and
+    // `expectNarrowReusesWholeColumn` then sweeps it for every boundary.
+    {
+        const vals = [_]i64{ 3, 3, 3, 1, 1, 2, 2, 2, 9, 9, 0, 4, 4, 4, 4, 7 };
+        try exerciseNarrowRebuild(i64, Delta(i64), &vals);
+    }
+    {
+        const vals = [_]?i64{ 5, 5, null, 5, 3, null, 9, 9, 9, 2, null, 2, 2, 7, 7 };
+        try exerciseNarrowRebuild(?i64, Prefix(?i64), &vals);
+    }
+    {
+        const vals = [_]u64{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+        try exerciseNarrowRebuild(u64, Rle(u64), &vals);
+    }
+}
+
+/// One column of `E` cut from a slab boundary off the end; see the test
+/// below.
+fn tailBoundaryWitness(comptime T: type, comptime E: type) !void {
+    const gpa = testing.allocator;
+    var col = try Column(T, E).initWithBudget(gpa, 4);
+    defer col.deinit();
+    for (0..8) |k| for (0..3) |_| try col.append(gpa, @intCast(100 + 150 * k));
+    try testing.expect(col.slabCount() > 1);
+    const want = try col.toSlice(gpa);
+    defer gpa.free(want);
+    // **A slab boundary, not an arbitrary offset**: a cut whose head piece
+    // is empty is what makes the rebuilt range come out with nothing in it.
+    const at = col.tree.itemsBeforeSlab(1);
+    try col.splice(gpa, at, want.len - at, &.{});
+    try expectColumn(T, E, &col, want[0..at]);
+    // The list lost every slab the cut spanned, and the array is one entry
+    // per surviving slab plus the whole column's — the length a reader may
+    // reach and no more.
+    try testing.expectEqual(col.slabCount() + 1, col.agg_before.items.len);
+    try expectNarrowReusesWholeColumn(T, E, &col);
+}
+
+test "a cut at a slab boundary off the end of a many-slab column leaves sound bases" {
+    // **The boundary one past the last slab, on its own.** The script above
+    // reaches it, and this pins it with the precondition it needs stated
+    // rather than found: several slabs, so a slab boundary exists to cut at,
+    // and a cut from it that inserts nothing, so the rebuilt range really
+    // does come out empty at the end of the column. That is the case where
+    // `settle` skips its split, `reindexFrom` clamps, and the narrow rebuild
+    // clamps to the same value — and the array still has to be the whole
+    // column's merge.
+    try tailBoundaryWitness(i64, Delta(i64));
+    try tailBoundaryWitness(u32, Prefix(u32));
+}
+
 /// Stages a splice in a frame of its own and hands the stage back **by
 /// value**, so by the time the caller has it the address it was built at no
 /// longer exists. This is the ordinary way a caller will use it — a helper
@@ -11587,6 +12051,346 @@ test "load_accumulates_delta_agg_weights" {
         }
         try testing.expectEqualSlices(usize, want.items, got.items);
     }
+}
+
+/// `Prefix.weightOf` as it stood before the run-level fold: one row at a
+/// time, with the checked addition per row.
+///
+/// **A copy of the replaced code rather than a description of it.** The claim
+/// the tests below make is a *substitution* — the fold over runs answers
+/// what the fold over rows answered — and only the replaced code itself
+/// witnesses that. `columns.zig`'s `boolWeightOfRows` is the same
+/// arrangement for `BoolPrefixCodec.weightOf`, which is why this file had
+/// no copy of its own until the other two codecs were folded as well.
+fn prefixWeightOfRows(comptime E: type, slab: *const slabmod.Slab) ParseError!E.Weight {
+    var sum: i64 = 0;
+    var dec = try E.WireDecoder.init(slab.data);
+    var i: usize = 0;
+    while (i < slab.len) : (i += 1) {
+        const w = (try dec.next()) orelse return error.InvalidValue;
+        // **The branch is on the wire type**, which is the whole difference
+        // between the two instantiations: a nullable prefix stores an absent
+        // row for a row with no length and that row contributes nothing to
+        // the sum, and a non-nullable one has no such row to skip. This is
+        // the branch `Prefix.weightOf` itself takes, at `:2175`.
+        if (comptime @typeInfo(E.Wire) == .optional) {
+            if (w) |v| sum = std.math.add(i64, sum, @intCast(v)) catch return error.Overflow;
+        } else {
+            sum = std.math.add(i64, sum, @intCast(w)) catch return error.Overflow;
+        }
+    }
+    return .{ .len = slab.len, .prefix = sum };
+}
+
+/// `Delta.weightOf` as it stood before the run-level fold: one row at a
+/// time, with the checked addition and both extremes folded in per row. The
+/// copy, for the reason `prefixWeightOfRows` gives.
+fn deltaWeightOfRows(comptime E: type, slab: *const slabmod.Slab) ParseError!E.Weight {
+    var partial: i64 = 0;
+    var lo: i64 = 0;
+    var hi: i64 = 0;
+    var dec = try E.WireDecoder.init(slab.data);
+    var n: usize = 0;
+    while (n < slab.len) : (n += 1) {
+        const w = (try dec.next()) orelse return error.InvalidValue;
+        try E.accumulate(w, &partial);
+        lo = @min(lo, partial);
+        hi = @max(hi, partial);
+    }
+    return .{ .len = slab.len, .total = partial, .min_offset = lo, .max_offset = hi };
+}
+
+/// One prefix case, held: the run fold and the row fold must answer the same
+/// weight, or refuse the same way, on the same bytes read as `declared_len`
+/// rows.
+///
+/// **`declared_len` is separate from the wire's own length on purpose.** Both
+/// walks bound themselves by the slab's declared length and not by the bytes,
+/// so the interesting cases are the two where that bound disagrees with what
+/// is there: a length past the end is `error.InvalidValue` in both, and a
+/// length short of it stops both early with the same shortened answer.
+fn expectPrefixWeightAgrees(comptime E: type, gpa: std.mem.Allocator, wires: []const E.Wire, declared_len: usize) !void {
+    const bytes = try E.wireEncode(gpa, wires, false);
+    defer gpa.free(bytes);
+    const slab: slabmod.Slab = .{ .data = bytes, .len = declared_len, .segments = 0, .tail = .zero };
+    const runs = E.weightOf(gpa, &slab);
+    const rows = prefixWeightOfRows(E, &slab);
+    if (runs) |w| {
+        const r = try rows;
+        try testing.expectEqual(r.len, w.len);
+        try testing.expectEqual(r.prefix, w.prefix);
+    } else |e| {
+        try testing.expectError(e, prefixWeightOfRows(E, &slab));
+    }
+}
+
+/// One delta case, held, on the same terms as `expectPrefixWeightAgrees` —
+/// and with all four halves of the weight compared, because the extremes are
+/// the half the run fold has to earn rather than inherit.
+fn expectDeltaWeightAgrees(comptime E: type, gpa: std.mem.Allocator, wires: []const E.Wire, declared_len: usize) !void {
+    const bytes = try E.wireEncode(gpa, wires, false);
+    defer gpa.free(bytes);
+    const slab: slabmod.Slab = .{ .data = bytes, .len = declared_len, .segments = 0, .tail = .zero };
+    const runs = E.weightOf(gpa, &slab);
+    const rows = deltaWeightOfRows(E, &slab);
+    if (runs) |w| {
+        const r = try rows;
+        try testing.expectEqual(r.len, w.len);
+        try testing.expectEqual(r.total, w.total);
+        try testing.expectEqual(r.min_offset, w.min_offset);
+        try testing.expectEqual(r.max_offset, w.max_offset);
+    } else |e| {
+        try testing.expectError(e, deltaWeightOfRows(E, &slab));
+    }
+}
+
+test "prefix_weight_agrees_with_the_row_walk" {
+    // **The shapes that decide the two arms.** All-equal lengths are one
+    // repeat run, which is the arm the fold exists for; all-distinct are one
+    // literal run, which `nextRunMax` hands back one value at a time and the
+    // fold therefore still walks row by row; and the mixed case has both, so
+    // a slab that is part one and part the other is where a wrong run
+    // boundary shows. `succ_count` and `index.text` are the two prefix
+    // columns an op-set insert writes, and both are all-equal or all-zero —
+    // which is the shape the fold turns from O(rows) into O(runs).
+    const gpa = testing.allocator;
+    const E = Prefix(u64);
+    var buf: [400]u64 = undefined;
+
+    // One repeat run.
+    @memset(buf[0..300], @as(u64, 5));
+    try expectPrefixWeightAgrees(E, gpa, buf[0..300], 300);
+
+    // One literal run.
+    for (buf[0..300], 0..) |*v, i| v.* = @as(u64, @intCast(i + 1));
+    try expectPrefixWeightAgrees(E, gpa, buf[0..300], 300);
+
+    // Repeat, literal, repeat, and a run of zero lengths: a slab whose runs
+    // change three times, which is where the sum has to be carried across
+    // the boundary rather than restarted.
+    {
+        var n: usize = 0;
+        for (0..120) |_| {
+            buf[n] = @as(u64, 9);
+            n += 1;
+        }
+        for (0..60) |i| {
+            buf[n] = @as(u64, @intCast(i + 1));
+            n += 1;
+        }
+        for (0..120) |_| {
+            buf[n] = @as(u64, 3);
+            n += 1;
+        }
+        for (0..40) |_| {
+            buf[n] = @as(u64, 0);
+            n += 1;
+        }
+        try expectPrefixWeightAgrees(E, gpa, buf[0..n], n);
+    }
+
+    // No rows at all, and one row.
+    try expectPrefixWeightAgrees(E, gpa, buf[0..0], 0);
+    buf[0] = @as(u64, 7);
+    try expectPrefixWeightAgrees(E, gpa, buf[0..1], 1);
+
+    // **The `i64` refusal.** Two lengths just over half the range each: the
+    // first step lands inside `i64`, the second leaves it, and so does the
+    // run's sum. **The arithmetic is deliberate and is the whole case** —
+    // `maxInt(i64) / 2` twice over is `maxInt(i64) - 1`, which fits and would
+    // make this case vacuous, so the length is one more than that.
+    //
+    // What the case pins is that the fold checks the run and not only its
+    // first row: a fold that read `partial + length` and stopped would answer
+    // a weight where the row walk refuses, and the row walk refuses at its
+    // second row. `addRunOf`'s own case is the other shape — a *negative*
+    // running value, where the span leaves `i64` but the result does not — and
+    // this is its mirror, so between them the two say the fold refuses no
+    // less and no more than the rows it replaced.
+    {
+        const over: u64 = @intCast(std.math.maxInt(i64) / 2 + 1);
+        buf[0] = over;
+        buf[1] = over;
+        try expectPrefixWeightAgrees(E, gpa, buf[0..2], 2);
+    }
+
+    // The two bounds that disagree with the bytes.
+    @memset(buf[0..10], @as(u64, 4));
+    try expectPrefixWeightAgrees(E, gpa, buf[0..10], 10);
+    try expectPrefixWeightAgrees(E, gpa, buf[0..10], 4);
+    try expectPrefixWeightAgrees(E, gpa, buf[0..10], 12);
+}
+
+test "prefix_weight_agrees_with_the_row_walk_nullable" {
+    // The nullable form, because the null run is the one run whose rows
+    // contribute nothing: `accumulateRun` returns on it untouched, and the
+    // weight is the sum of what is left.
+    const gpa = testing.allocator;
+    const E = Prefix(?u32);
+    var buf: [400]?u32 = undefined;
+
+    // All absent: one null run, and a weight of zero over three hundred rows.
+    @memset(buf[0..300], null);
+    try expectPrefixWeightAgrees(E, gpa, buf[0..300], 300);
+
+    // Every length present and equal, and then every one absent, so the sum
+    // is taken, discarded and taken again across two null boundaries.
+    for (buf[0..150]) |*v| v.* = @as(?u32, 6);
+    @memset(buf[150..300], null);
+    try expectPrefixWeightAgrees(E, gpa, buf[0..300], 300);
+
+    // A null run in the middle of a literal one.
+    for (buf[0..300], 0..) |*v, i| {
+        v.* = if (i % 7 == 0) null else @as(?u32, @intCast(i % 40));
+    }
+    try expectPrefixWeightAgrees(E, gpa, buf[0..300], 300);
+}
+
+test "delta_weight_agrees_with_the_row_walk" {
+    // **The run-level `min_offset`/`max_offset` are the whole claim.** A run
+    // of one difference `d` puts its rows at `partial + k*d`, monotone in `k`
+    // whatever the sign of `d`, so the fold reads the run's first and last
+    // and calls them its extremes. The decreasing case is the one that would
+    // catch a fold that took the wrong end; the literal case is the one that
+    // catches a fold that treats a run of `count` as a run of one value.
+    //
+    // **Every buffer below holds *differences*, not values**, because that is
+    // what `wireEncode` takes for this codec (`DeltaBase.wireOfOne`, `:2512`:
+    // a difference is a value measured from the one in front of it). A prefix
+    // column stores the row length itself, so for `Prefix` the wire entry and
+    // the value are the same number and the two tests read alike; here they
+    // are not, and a case written from values would build a slab of
+    // completely different differences than the one it names.
+    const gpa = testing.allocator;
+    // **`Delta(?i64)` is the instantiation used here** because a negative
+    // difference needs a signed wire, and `id_ctr` and `key_ctr` hold
+    // contiguous op counters — which is one repeat run of `+1`, the shape the
+    // fold exists for. `DeltaBase`'s wire is `?i64` whatever the column's own
+    // value type (`DeltaBase`, `:2292`), so the buffer is `?i64` and every
+    // row written below is present; the non-nullable instantiation has its
+    // own case at the foot.
+    const E = Delta(?i64);
+    var buf: [400]?i64 = undefined;
+
+    // One run of difference +1.
+    @memset(buf[0..300], @as(?i64, 1));
+    try expectDeltaWeightAgrees(E, gpa, buf[0..300], 300);
+
+    // One run of difference -1: the partial sums fall, so the run's
+    // *minimum* is its last row and its maximum the first. A fold that took
+    // the wrong end of the run would swap the two.
+    @memset(buf[0..300], @as(?i64, -1));
+    try expectDeltaWeightAgrees(E, gpa, buf[0..300], 300);
+
+    // A difference of zero: every row of the run lands on the value the run
+    // opened at, so both extremes are that one value. A fold that added
+    // `d * count` to the extremes would widen them by nothing and be right by
+    // accident, so the case is here to say the widening is not there.
+    @memset(buf[0..300], @as(?i64, 0));
+    try expectDeltaWeightAgrees(E, gpa, buf[0..300], 300);
+
+    // **A literal run, and its maximum interior.** The differences descend
+    // from 100 to -99 one at a time, so no two neighbours are equal and the
+    // whole slab is one literal run; the partial sums climb to their peak
+    // halfway down it and fall afterwards, so neither extreme of the slab is
+    // at either end of the run. That is the case a fold that treated a run
+    // as one value cannot answer.
+    for (buf[0..200], 0..) |*v, i| v.* = @as(i64, 100 - @as(i64, @intCast(i)));
+    try expectDeltaWeightAgrees(E, gpa, buf[0..200], 200);
+
+    // Repeat, literal, repeat, and a flat stretch: three run boundaries and a
+    // crossing of zero, so the carried sum and the carried extremes both have
+    // to survive a change of sign.
+    {
+        var n: usize = 0;
+        for (0..100) |_| {
+            buf[n] = @as(i64, 2);
+            n += 1;
+        }
+        for (0..60) |i| {
+            buf[n] = @as(i64, @intCast(i)) - 30;
+            n += 1;
+        }
+        for (0..100) |_| {
+            buf[n] = @as(i64, -5);
+            n += 1;
+        }
+        for (0..40) |_| {
+            buf[n] = @as(?i64, null);
+            n += 1;
+        }
+        try expectDeltaWeightAgrees(E, gpa, buf[0..n], n);
+    }
+
+    // No rows at all, and one row.
+    try expectDeltaWeightAgrees(E, gpa, buf[0..0], 0);
+    buf[0] = @as(?i64, 5);
+    try expectDeltaWeightAgrees(E, gpa, buf[0..1], 1);
+
+    // The two bounds that disagree with the bytes: a literal run of ten
+    // differences, read as ten rows, as four, and as twelve.
+    for (buf[0..10], 0..) |*v, i| v.* = @as(i64, @intCast(i));
+    try expectDeltaWeightAgrees(E, gpa, buf[0..10], 10);
+    try expectDeltaWeightAgrees(E, gpa, buf[0..10], 4);
+    try expectDeltaWeightAgrees(E, gpa, buf[0..10], 12);
+
+    // **The non-nullable instantiation**, whose wire cannot carry a null at
+    // all: so the arm that skips a null is never taken on a column that has
+    // none. Its differences only ever rise, which is what an unsigned delta
+    // column's wire can carry.
+    {
+        const U = Delta(u64);
+        var ubuf: [200]?i64 = undefined;
+        @memset(ubuf[0..150], @as(?i64, 3));
+        try expectDeltaWeightAgrees(U, gpa, ubuf[0..150], 150);
+        @memset(ubuf[0..150], @as(?i64, 0));
+        try expectDeltaWeightAgrees(U, gpa, ubuf[0..150], 150);
+        for (ubuf[0..150], 0..) |*v, i| v.* = @as(i64, @intCast(i % 17));
+        try expectDeltaWeightAgrees(U, gpa, ubuf[0..150], 150);
+    }
+}
+
+test "delta_weight_agrees_with_the_row_walk_nullable" {
+    // The absent row is the case the run fold's `orelse` arm exists for: it
+    // holds the running sum where it is, so every row of a null run lands on
+    // a value the extremes already cover, and the arm has nothing to fold.
+    // A long null run is therefore the case where that arm is worth anything
+    // at all, and it is why the case is a hundred rows rather than three.
+    const gpa = testing.allocator;
+    const E = Delta(?i64);
+    var buf: [400]?i64 = undefined;
+
+    // All absent: one null run of four hundred rows, and a weight whose
+    // extremes are both the slab's own base.
+    @memset(buf[0..400], null);
+    try expectDeltaWeightAgrees(E, gpa, buf[0..400], 400);
+
+    // A run, a null run, and a run of the other sign: the null run sits
+    // between two one-value runs whose partial sums are of opposite sign and
+    // do cross zero, so an arm that advanced the sum or the extremes across
+    // it would be wrong in a way a run of nulls alone could not show.
+    {
+        var n: usize = 0;
+        for (0..80) |_| {
+            buf[n] = @as(i64, 30);
+            n += 1;
+        }
+        for (0..120) |_| {
+            buf[n] = null;
+            n += 1;
+        }
+        for (0..80) |_| {
+            buf[n] = @as(i64, -100);
+            n += 1;
+        }
+        try expectDeltaWeightAgrees(E, gpa, buf[0..n], n);
+    }
+
+    // A null row among a literal one.
+    for (buf[0..300], 0..) |*v, i| {
+        v.* = if (i % 5 == 0) null else @as(?i64, @as(i64, @intCast(i % 90)) - 45);
+    }
+    try expectDeltaWeightAgrees(E, gpa, buf[0..300], 300);
 }
 
 test "load_accumulates_delta_agg_weights_nullable" {
@@ -17377,7 +18181,7 @@ test "splice_and_nullable" {
         cut.total_len += m.len;
     }
     try cut.reindex();
-    try cut.rebuildAggs();
+    try cut.rebuildAggs(0);
     try testing.expectEqual(@as(usize, 2), cut.slabCount());
     try expectSound(u64, Plain, &cut);
     const joined = try cut.encode(gpa);

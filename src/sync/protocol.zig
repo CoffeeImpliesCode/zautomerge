@@ -423,10 +423,13 @@ pub const MessageBuilder = struct {
 /// holding a freed list, because `last_sent_heads` is replaced only from an
 /// allocation that completed first (`sync.rs:251-253`). Nothing is rolled back
 /// past that point, so a caller that retries may find `have_responded` already
-/// set and `sent_hashes` already extended by the hashes that went in before
-/// the failure. What no error path reaches is the tail: `needs_reset` keeps
-/// its value until the heads that carry the reset exist, and `in_flight` is
-/// never set.
+/// set.
+/// `sent_hashes` is **not** in that sentence any more: it is extended by
+/// one `State.extendSent` over the whole payload hash list
+/// (`protocol.zig:588`), and that is a single allocation, so either every hash
+/// the message carries is in the set or none of them is. What no error path
+/// reaches is the tail: `needs_reset` keeps its value until the heads that
+/// carry the reset exist, and `in_flight` is never set.
 pub fn generateSyncMessage(
     gpa: Allocator,
     doc: *Document,
@@ -565,11 +568,24 @@ pub fn generateSyncMessage(
 
     // `sync.rs:251-253`. The new list is built before the old one is released,
     // so a failure here cannot leave the state holding a freed pointer.
+    //
+    // **The whole payload at once.** Upstream writes
+    // `sent_hashes.extend(message_builder.hashes())` (`sync.rs:253`) into a
+    // `BTreeSet`; this list is sorted, so the same call is
+    // `State.extendSent(builder.payloadHashes())`. The list is the builder's own
+    // and is borrowed here, not retained: `State.extendSent` copies it and
+    // `defer builder.deinit()` below frees it.
+    //
+    // One hash at a time was a memmove of half the list per carried hash, which
+    // is `O(k*n)` per message and `O(k^2 R^2)` over a session of `R`
+    // unanswered messages. The batch costs one sort and one merge instead. A
+    // caller outside this file needs no change for this: the loop that used to
+    // stand here was the only caller of the single-hash insert.
     state.have_responded = true;
     const sent_heads = try gpa.dupe(ChangeHash, our_heads);
     gpa.free(state.last_sent_heads);
     state.last_sent_heads = sent_heads;
-    for (builder.payloadHashes()) |hash| try state.insertSent(hash);
+    try state.extendSent(builder.payloadHashes());
 
     // `sync.rs:255-259`. `flags` is attached unconditionally
     // (`sync.rs:283`), so **every** generated message carries a flags section
@@ -703,8 +719,11 @@ pub fn receiveSyncMessage(
     // document does not have is dropped first, as upstream filters it
     // (`automerge.rs:1211-1215`), and a candidate that is not one of this
     // graph's changes survives, as `remove_ancestors` leaves it
-    // (`change_graph.rs:855-866`). The result keeps the caller's order and
-    // `sent_hashes` is ascending, so it stays a set.
+    // (`change_graph.rs:855-866`). The result is a **subsequence** of the input:
+    // `filterChanges` walks `candidates` in order and appends each one at most
+    // once (`change_graph.zig:1165-1174`), so a list that was ascending and
+    // duplicate-free still is, and the prune cannot break the invariant
+    // `State.extendSent` maintains.
     {
         const kept = try doc.graph.filterChanges(gpa, state.sent_hashes.items, owned.heads);
         defer gpa.free(kept);
@@ -1021,9 +1040,10 @@ fn changePayload(gpa: Allocator, doc: *Document, hash: ChangeHash) ProtocolError
 }
 
 /// Whether `sent_hashes` holds `hash` (`sync.rs:223`). The list is ascending
-/// and duplicate free — `State.insertSent` puts a hash in its sorted place
-/// and the receive path rebuilds the list by filtering the old one — so this
-/// is the same logarithmic search the upstream `BTreeSet` does.
+/// and duplicate free — `State.extendSent` merges a message's hashes into
+/// their sorted place, and the receive path rebuilds the list by filtering the
+/// old one, which keeps that order — so this is the same logarithmic search the
+/// upstream `BTreeSet` does.
 fn sentContains(state: *const State, hash: ChangeHash) bool {
     const items = state.sent_hashes.items;
     var low: usize = 0;
@@ -4253,6 +4273,101 @@ fn expectHeadHex(gpa: Allocator, doc: *const Document, hex: []const u8) !void {
     defer gpa.free(heads);
     try testing.expectEqual(@as(usize, 1), heads.len);
     try testing.expectEqualSlices(u8, want, &heads[0].bytes);
+}
+
+/// `sent` is the ascending, duplicate-free set of the document's own hashes
+/// from `from` to `to`, which is what one `generateSyncMessage` must have
+/// recorded for the payload it just built.
+///
+/// The expectation is read **off the document, not off the payload**: the
+/// hashes are enumerated from the change graph and sorted, so a message that
+/// carried the wrong hashes, carried one twice, or recorded them out of order
+/// all fail here rather than passing a length check.
+fn expectSentHashes(
+    gpa: Allocator,
+    doc: *Document,
+    sent: []const ChangeHash,
+    from: usize,
+    to: usize,
+) !void {
+    var built = try doc.getChanges(gpa, &.{});
+    defer built.deinit(gpa);
+    var expected: std.ArrayList(ChangeHash) = .empty;
+    defer expected.deinit(gpa);
+    try testing.expectEqual(to - from, sent.len);
+    for (built.slice()[from..to]) |one| try expected.append(gpa, one.change.hash);
+    std.mem.sort(ChangeHash, expected.items, {}, ChangeHash.lessThan);
+    try testing.expectEqualSlices(ChangeHash, expected.items, sent);
+}
+
+test "a generated message records every hash it carried, once, in order" {
+    // The line under test is the bulk extend in `generateSyncMessage`
+    // (`protocol.zig:588`), which is what replaced one `State.insertSent` call
+    // per carried hash. What has to survive the change is the set, not the
+    // call shape: `sent_hashes` is ascending and duplicate-free because
+    // `State.encode` asserts it (`message.zig:524-530`) and `sentContains`
+    // binary-searches it, and a merge that kept the order but lost a hash, or
+    // kept the hashes but recorded one twice, would still be a set by length.
+    //
+    // Both payload arms are here. The first message is the **whole document**
+    // — the peer advertised no heads and reads V2, so `sendDoc`
+    // (`state.zig:341-344`) answers with every hash in the graph and one extend
+    // records all of them. The second is a **change list**: five new hashes
+    // into an empty set, which is the shape `sync-roundtrip` runs twenty-four
+    // times over.
+    const gpa = testing.allocator;
+    var sender = try Document.init(gpa, testing.io, .manual);
+    defer sender.deinit();
+    sender.setActorId(.{ .bytes = "sync-sent-hashes-local" });
+    var peer = try Document.init(gpa, testing.io, .manual);
+    defer peer.deinit();
+    peer.setActorId(.{ .bytes = "sync-sent-hashes-peer" });
+
+    for (0..12) |index| {
+        try putAndCommit(gpa, &sender, "k", .{ .int = @intCast(index) }, @intCast(index));
+    }
+    try testing.expectEqual(@as(usize, 12), sender.graph.len());
+
+    var sender_state = State.new(gpa);
+    defer sender_state.deinit();
+    var peer_state = State.new(gpa);
+    defer peer_state.deinit();
+
+    // The peer's own first message, which is what tells the sender that the
+    // peer reads V2 and holds nothing.
+    {
+        const hello = (try generateSyncMessage(gpa, &peer, &peer_state)) orelse
+            return error.ExpectedAMessage;
+        try deliver(gpa, &sender, &sender_state, hello);
+    }
+    // The whole document, recorded as a set of twelve.
+    {
+        const snapshot = (try generateSyncMessage(gpa, &sender, &sender_state)) orelse
+            return error.ExpectedAMessage;
+        try expectSentHashes(gpa, &sender, sender_state.sent_hashes.items, 0, 12);
+        try deliver(gpa, &peer, &peer_state, snapshot);
+    }
+    // The peer's answer covers all of it, so the prune takes every hash back
+    // out (`sync.rs:430-431`, `protocol.zig:728-731`) — and the prune is the
+    // other thing that has to leave the set ascending, because it rebuilds the
+    // list by filtering the old one.
+    {
+        const answer = (try generateSyncMessage(gpa, &peer, &peer_state)) orelse
+            return error.ExpectedAMessage;
+        try deliver(gpa, &sender, &sender_state, answer);
+        try testing.expectEqual(@as(usize, 0), sender_state.sent_hashes.items.len);
+    }
+    // A delta: five changes, one payload, one extend.
+    for (0..5) |index| {
+        try putAndCommit(gpa, &sender, "k2", .{ .int = @intCast(index) }, @intCast(100 + index));
+    }
+    {
+        const delta = (try generateSyncMessage(gpa, &sender, &sender_state)) orelse
+            return error.ExpectedAMessage;
+        try expectSentHashes(gpa, &sender, sender_state.sent_hashes.items, 12, 17);
+        try deliver(gpa, &peer, &peer_state, delta);
+    }
+    try testing.expectEqual(@as(usize, 17), peer.graph.len());
 }
 
 // ── Zig 0.16.0 / upstream ───────────────────────────────────────────────────

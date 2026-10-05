@@ -50,6 +50,18 @@
 //! `recomputeHeads` derives the same set from the child edges, and is what a
 //! graph loaded from a stored document should be checked against.
 //!
+//! **The one place the sorted array is more expensive than upstream's tree.**
+//! A `BTreeSet` removes in `O(log H)`; a sorted array removes in `O(H)`,
+//! because `orderedRemove` shifts everything above the slot. Removing a
+//! change's dependencies one at a time is therefore `O(D * H)` where upstream
+//! is `O(D * log H)`, and `D` is a merge's width. So the departures are
+//! marked in a parallel scratch and the list is compacted **once**
+//! ([`updateHeads`](ChangeGraph.updateHeads)): `O(D * log H + H)` for a change
+//! that merges `D` heads out of `H`. The insertion is still `O(H)`, which is
+//! the irreducible cost of publishing a sorted borrowed slice from
+//! [`getHeads`](ChangeGraph.getHeads) and is what a fan of `C` concurrent
+//! changes pays `O(C^2)` for.
+//!
 //! ## Actor indices
 //!
 //! Every stored actor reference is an index into the document's actor table
@@ -465,6 +477,18 @@ pub const ChangeGraph = struct {
     /// The heads: the changes with no child, sorted ascending by hash. This is
     /// the `BTreeSet<ChangeHash>` of `change_graph.rs:41`.
     heads: std.ArrayList(ChangeHash),
+    /// One generation stamp per head slot, **positionally parallel** to `heads`
+    /// and the same length as it: `heads_stamp.items[at]` is the scratch slot of
+    /// `heads.items[at]`. It is what `updateHeads` marks a departing head with, so
+    /// that the departures are one compaction rather than one shift each — see
+    /// that method for why that matters, and for the invariant the pair keeps.
+    heads_stamp: std.ArrayList(u32),
+    /// The walk generation a head slot must carry to count as departing in the
+    /// `updateHeads` that is running, and the counter `heads_stamp` is marked
+    /// with. Separate from `stamp`, because the two scratches have separate
+    /// lifetimes: a node walk must not clear a head mark or the other way
+    /// round.
+    heads_epoch: u32,
     /// `seq_index[actor]` is that actor's changes in sequence order. Its
     /// length is the actor's next sequence number, and it is empty for an
     /// actor the graph has no change from.
@@ -503,6 +527,8 @@ pub const ChangeGraph = struct {
             .child_edges = .empty,
             .by_hash = .empty,
             .heads = .empty,
+            .heads_stamp = .empty,
+            .heads_epoch = 0,
             .seq_index = .empty,
             .clock_cache = .empty,
             .fragment_top = SeqClock.initEmpty(gpa),
@@ -522,6 +548,7 @@ pub const ChangeGraph = struct {
         self.child_edges.deinit(self.gpa);
         self.by_hash.deinit(self.gpa);
         self.heads.deinit(self.gpa);
+        self.heads_stamp.deinit(self.gpa);
         for (self.seq_index.items) |*list| list.deinit(self.gpa);
         self.seq_index.deinit(self.gpa);
         for (self.clock_cache.items) |*entry| entry.clock.deinit();
@@ -1660,6 +1687,20 @@ pub const ChangeGraph = struct {
     /// below it. A counter inside no change's interval belongs to no change:
     /// that is the gap an empty change leaves, and the counters below an
     /// actor's first change.
+    ///
+    /// **This is the only implementation of that question in the port.** It
+    /// used to have a second one — [`Transaction.hashForOpid`](transaction.zig)
+    /// walked the node table — and that cost `O(C)` in every change the
+    /// document held where this costs `O(log` changes by that actor `)`. The
+    /// two agree because both reduce to "the node whose range holds the
+    /// counter, and there is at most one", which holds because a per-actor
+    /// list is ordered by `seq` and one actor's changes own ascending,
+    /// non-overlapping counter ranges. The tests
+    /// `test "opidToHash and a full scan of the node table agree on every
+    /// counter of a many-change, many-actor graph"` and
+    /// `test "hashForOpid answers a many-change document as the graph's own
+    /// interval query does, and answers every null upstream lists"` are the
+    /// witnesses, one per file.
     pub fn opidToHash(self: *const ChangeGraph, id: OpId) ?ChangeHash {
         const list = self.actorChanges(id.actor) orelse return null;
         // The last change whose start_op is at or below the counter.
@@ -1987,6 +2028,7 @@ pub const ChangeGraph = struct {
         try self.visit_stamp.ensureUnusedCapacity(gpa, 1);
         try self.seq_index.items[actor].ensureUnusedCapacity(gpa, 1);
         try self.heads.ensureUnusedCapacity(gpa, 1);
+        try self.heads_stamp.ensureUnusedCapacity(gpa, 1);
         try self.parent_edges.ensureUnusedCapacity(gpa, meta.deps.len);
         try self.child_edges.ensureUnusedCapacity(gpa, meta.deps.len);
 
@@ -2044,13 +2086,98 @@ pub const ChangeGraph = struct {
     /// dependency is removed whether or not it has other children, because it
     /// now has this one.
     ///
-    /// The head set has room reserved by `pushNode`, so this cannot fail.
+    /// ## The departures are one pass, not one shift each
+    ///
+    /// Upstream's set is a `BTreeSet`, so `remove` is `O(log H)` and the whole
+    /// of `update_heads` is `O(D * log H)` ([`change_graph.rs`:513-518](../../github-automerge-automerge/rust/automerge/src/change_graph.rs)).
+    /// Here the set is a **sorted array**, and `orderedRemove` is a
+    /// `copyBackwards` over everything above the slot: `O(H)`. Removing the
+    /// dependencies one at a time therefore cost `D * H`, which is quadratic
+    /// in `D` — and `D` is the size of a merge. A change that names the `C`
+    /// concurrent heads it is merging shifted the head list `C` times.
+    ///
+    /// So the departing slots are **marked** in
+    /// [`heads_stamp`](ChangeGraph.heads_stamp) and the list is compacted once,
+    /// which is `O(D * log H + H)`. The marks are generation stamps rather than
+    /// a list of positions for the reason [`nextStamp`](ChangeGraph.nextStamp)
+    /// gives the node walk the same shape: marking costs `O(1)` per dependency
+    /// and needs no allocation, and the compaction needs no per-dependency
+    /// storage, so a merge of any width is one pass over a list that is at
+    /// most `H` long.
+    ///
+    /// **A dependency named twice is still one departure.** Both marks land on
+    /// the same slot, and the compaction reads each slot once. The
+    /// regression test is `test "a change that names the same dependency twice
+    /// drops the head once"`.
+    ///
+    /// ## The invariant, and what a stamp proves
+    ///
+    /// After any `updateHeads`:
+    ///
+    /// * `heads` is ascending by hash and duplicate-free. The compaction only
+    ///   removes, and the arriving hash is placed at its sorted index. A
+    ///   duplicate cannot arrive at all: `by_hash` is filled with
+    ///   `putAssumeCapacityNoClobber`, so a hash enters the graph once and
+    ///   this runs once per change.
+    /// * `heads_stamp` is the same length as `heads` and parallel to it slot
+    ///   for slot. The arriving hash's stamp goes in at the **same index** the
+    ///   head goes to, not at the end, which is what keeps the two arrays one
+    ///   shape. The stamp insert is one `memmove` of `u32`s at most `H` long,
+    ///   against the `ChangeHash` `memmove` of the same slot range on the
+    ///   line above it, so it adds no order of growth.
+    /// * **Every stamp is below `heads_epoch`.** The epoch is bumped before
+    ///   any marking and only ever rises, so every mark this call wrote was
+    ///   consumed by this call's compaction and none survives into the next
+    ///   one. That is what a reader of a stamp can prove: a slot carrying the
+    ///   current epoch is a slot this call marked, and no other slot is.
+    ///   `expectHeadSetIntact` checks it after every change in the head tests.
+    ///
+    /// The head set has a slot reserved by `pushNode` in both arrays, so
+    /// neither insert can fail.
     fn updateHeads(self: *ChangeGraph, hash: ChangeHash, deps: []const ChangeHash) void {
+        const epoch = self.nextHeadEpoch();
+        var departing: usize = 0;
         for (deps) |dep| {
             const at = hashSearch(self.heads.items, dep) orelse continue;
-            _ = self.heads.orderedRemove(at);
+            self.heads_stamp.items[at] = epoch;
+            departing += 1;
         }
-        self.heads.insertAssumeCapacity(hashInsertIndex(self.heads.items, hash), hash);
+        // A change whose dependencies all have children of their own already
+        // departs from nothing, and a list with nothing to drop must not be
+        // walked: this is the whole cost of adding a branch off an interior
+        // change.
+        if (departing != 0) {
+            var kept: usize = 0;
+            for (self.heads.items, self.heads_stamp.items) |head, stamp| {
+                if (stamp == epoch) continue;
+                // `kept` never runs ahead of the slot being read, so this
+                // only ever overwrites a slot already past.
+                self.heads.items[kept] = head;
+                self.heads_stamp.items[kept] = stamp;
+                kept += 1;
+            }
+            self.heads.items.len = kept;
+            self.heads_stamp.items.len = kept;
+        }
+        // Both arrays take their new slot at the same index. Appending the
+        // stamp instead would leave it describing a different head than
+        // `heads` does from that index on, and the next compaction would read
+        // a mark belonging to one slot off another.
+        const at = hashInsertIndex(self.heads.items, hash);
+        self.heads.insertAssumeCapacity(at, hash);
+        self.heads_stamp.insertAssumeCapacity(at, 0);
+    }
+
+    /// The head-scratch generation, the same counter-and-reset `nextStamp` is
+    /// for the node walk. Separate from `stamp`, because clearing one scratch
+    /// must not clear a mark in the other.
+    fn nextHeadEpoch(self: *ChangeGraph) u32 {
+        self.heads_epoch +%= 1;
+        if (self.heads_epoch == 0) {
+            @memset(self.heads_stamp.items, 0);
+            self.heads_epoch = 1;
+        }
+        return self.heads_epoch;
     }
 
     /// The child edges of `node`, as a node iterator.
@@ -2401,6 +2528,163 @@ test "a fork of two concurrent changes has two heads, merging gives one" {
     var kids = graph.children(graph.hashToIndex(c2).?);
     try testing.expectEqual(graph.hashToIndex(c4).?, kids.next().?);
     try testing.expect(kids.next() == null);
+}
+
+/// The head list is sorted, holds no duplicate, and is exactly the set of
+/// childless nodes — the two things `updateHeads` has to keep true, and the
+/// three things its compaction scratch has to keep true: one slot per head,
+/// parallel slot for slot, and no slot carrying the epoch the last
+/// `updateHeads` ran under. `recomputeHeads` derives the set from the child
+/// edges, so it is an independent answer.
+fn expectHeadSetIntact(gpa: Allocator, graph: *const ChangeGraph) !usize {
+    const heads = graph.getHeads();
+    try testing.expectEqual(heads.len, graph.heads_stamp.items.len);
+    // Nothing marked under the live epoch survived the compaction that epoch
+    // ran in. A stamp can be stale — that is what makes it a generation and
+    // not a flag — but it can never be *current*, which is the whole reason a
+    // reader may compare against `heads_epoch` without clearing anything.
+    for (graph.heads_stamp.items) |stamp| {
+        try testing.expect(stamp != graph.heads_epoch);
+    }
+    for (heads, 0..) |head, at| {
+        if (at == 0) continue;
+        try testing.expectEqual(std.math.Order.lt, ChangeHash.order(heads[at - 1], head));
+    }
+    try testing.expect(graph.headsAreCurrent(heads));
+    const derived = try graph.recomputeHeads(gpa);
+    defer gpa.free(derived);
+    try testing.expectEqualSlices(ChangeHash, derived, heads);
+    return heads.len;
+}
+
+test "a merge of many concurrent heads leaves the merge as the only head" {
+    const gpa = testing.allocator;
+    var b = Builder.init(gpa);
+    defer b.deinit();
+    const graph = &b.graph;
+
+    // Wide enough that the per-dependency `orderedRemove` this replaced was
+    // shifting a list of real length: `k` tips off one base, then one change
+    // that names all of them.
+    const k = 33;
+    const base = try b.change("a", 1, 1, &.{});
+    try testing.expectEqual(@as(usize, 1), try expectHeadSetIntact(gpa, graph));
+
+    const tips = try gpa.alloc(ChangeHash, k);
+    defer gpa.free(tips);
+    for (tips) |*tip| {
+        tip.* = try b.change("a", 2, 1, &.{base});
+        try testing.expect(graph.hasChange(tip.*));
+    }
+    // The fan left every tip a head and the base with a child.
+    try testing.expectEqual(@as(usize, k), try expectHeadSetIntact(gpa, graph));
+
+    // **Descending**, so the departures are not found in the order the sorted
+    // head list holds them. The compaction reads the list forwards whatever
+    // order the marks were made in.
+    const descending = try gpa.alloc(ChangeHash, k);
+    defer gpa.free(descending);
+    for (tips, 0..) |tip, i| {
+        descending[k - 1 - i] = tip;
+    }
+    // A second actor, so the merge also interns one.
+    const merged = try b.change("b", 2, 1, descending);
+
+    try testing.expectEqualSlices(ChangeHash, &.{merged}, graph.getHeads());
+    try testing.expectEqual(@as(usize, 1), try expectHeadSetIntact(gpa, graph));
+    try testing.expectEqual(@as(usize, 1), graph.seqForActor(1));
+    // Every tip is still in the graph and still named as a dependency of the
+    // merge: dropping a head must not unlink a change. The walk yields them in
+    // the order the change **named** them (`change_graph.rs:744-763` appends
+    // each parent to the tail of the child's list), which is `descending`, so
+    // that is the order to compare against — not `tips`.
+    try testing.expectEqual(@as(usize, k + 2), graph.len());
+    var deps = graph.depsForHash(merged);
+    for (descending) |dep| {
+        try testing.expectEqual(graph.hashToIndex(dep).?, deps.next().?);
+    }
+    try testing.expect(deps.next() == null);
+}
+
+test "a change that names the same dependency twice drops the head once" {
+    const gpa = testing.allocator;
+    var b = Builder.init(gpa);
+    defer b.deinit();
+    const graph = &b.graph;
+
+    const c1 = try b.change("a", 1, 1, &.{});
+    const c2 = try b.change("a", 2, 1, &.{c1});
+    const c3 = try b.change("a", 3, 1, &.{c1});
+    try testing.expectEqual(@as(usize, 2), try expectHeadSetIntact(gpa, graph));
+
+    // `c2` twice. A change's dependencies are distinct hashes in the format,
+    // but nothing here trusts that, and both marks land on one slot.
+    const c4 = try b.change("b", 4, 1, &.{ c3, c2, c2, c3 });
+    try testing.expectEqualSlices(ChangeHash, &.{c4}, graph.getHeads());
+    try testing.expectEqual(@as(usize, 1), try expectHeadSetIntact(gpa, graph));
+}
+
+test "a change off an interior node departs from no head" {
+    const gpa = testing.allocator;
+    var b = Builder.init(gpa);
+    defer b.deinit();
+    const graph = &b.graph;
+
+    const c1 = try b.change("a", 1, 1, &.{});
+    const c2 = try b.change("a", 2, 1, &.{c1});
+    const c3 = try b.change("a", 3, 1, &.{c2});
+    // `c2` is not a head — `c3` is its child — so this adds a head and drops
+    // none, which is the path that must not walk the list at all.
+    const c4 = try b.change("a", 4, 1, &.{c2});
+
+    var want = [_]ChangeHash{ c3, c4 };
+    std.mem.sort(ChangeHash, &want, {}, hashLessThan);
+    try testing.expectEqualSlices(ChangeHash, &want, graph.getHeads());
+    try testing.expectEqual(@as(usize, 2), try expectHeadSetIntact(gpa, graph));
+}
+
+test "the head set survives interleaved merges and branches" {
+    const gpa = testing.allocator;
+    var b = Builder.init(gpa);
+    defer b.deinit();
+    const graph = &b.graph;
+
+    // A fan of tips off one root, then a binary fold of them: every round takes
+    // the head set down by half and adds its own heads back, so departures and
+    // arrivals interleave and the list is neither append-only nor
+    // monotonically shrinking. One of the tips also grows a branch of its
+    // own, so a change whose dependencies are *not* heads lands in the middle
+    // of it.
+    // Sixteen, so the fold below halves to one without an odd one out.
+    var tips: [16]ChangeHash = undefined;
+    const root = try b.change("a", 1, 1, &.{});
+    _ = try expectHeadSetIntact(gpa, graph);
+    for (&tips) |*tip| {
+        tip.* = try b.change("a", 2, 1, &.{root});
+        _ = try expectHeadSetIntact(gpa, graph);
+    }
+    const branch = try b.change("b", 2, 1, &.{tips[0]});
+    try testing.expectEqual(@as(usize, tips.len), try expectHeadSetIntact(gpa, graph));
+
+    var live = tips;
+    var live_len: usize = tips.len;
+    while (live_len > 1) {
+        var next_len: usize = 0;
+        var at: usize = 0;
+        while (at < live_len) : (at += 2) {
+            // Two at a time, so every merge below names two heads.
+            const pair = [2]ChangeHash{ live[at], live[at + 1] };
+            const m = try b.change("b", 2, 1, &pair);
+            live[next_len] = m;
+            next_len += 1;
+            _ = try expectHeadSetIntact(gpa, graph);
+        }
+        live_len = next_len;
+    }
+    // One head from the fold, plus the branch that hung off a tip.
+    try testing.expectEqual(@as(usize, 2), try expectHeadSetIntact(gpa, graph));
+    try testing.expect(containsHash(graph.getHeads(), live[0]));
+    try testing.expect(containsHash(graph.getHeads(), branch));
 }
 
 test "getMissingDeps reports the hashes the graph does not have" {
@@ -2915,6 +3199,105 @@ test "opidToHash finds the change that owns an operation" {
     try testing.expect(graph.opidToHash(.{ .counter = 0, .actor = a }) == null);
     try testing.expect(graph.opidToHash(.{ .counter = 1, .actor = 7 }) == null);
     try testing.expect(c3.eql(graph.indexToHash(2).?));
+}
+
+/// The scan `Transaction.hashForOpid` used to run over the node table, kept
+/// here as the model the binary search is measured against.
+///
+/// **It reads the node table directly rather than going through a public
+/// accessor**, which is the point: `nodeAt` would hide the index arithmetic
+/// that made the old answer `O(C)`. Walking `0..len` is what the old code did,
+/// and this is that walk.
+fn scanForOpId(graph: *const ChangeGraph, id: OpId) ?ChangeHash {
+    var i: usize = 0;
+    while (i < graph.len()) : (i += 1) {
+        const node = graph.nodeAt(@intCast(i)) orelse continue;
+        if (node.actor != id.actor) continue;
+        const counter: u64 = id.counter;
+        if (counter < node.meta.start_op or counter > node.meta.max_op) continue;
+        return node.meta.hash;
+    }
+    return null;
+}
+
+test "opidToHash and a full scan of the node table agree on every counter of a many-change, many-actor graph" {
+    const gpa = testing.allocator;
+    var b = Builder.init(gpa);
+    defer b.deinit();
+    const graph = &b.graph;
+
+    // Six hundred changes over four actors, interleaved, with an empty change
+    // every tenth and one to three operations on the rest. **The shape is
+    // chosen so the two answers could disagree.** A per-actor list is only
+    // sorted by `start_op` if one actor's changes own ascending,
+    // non-overlapping counter ranges; a graph where they do not is the one
+    // shape where a binary search and a scan part company. So the fixture
+    // cycles four actors — each owning every fourth change, with the counter
+    // ranges of all four interleaved — and every tenth change is empty, which
+    // is what puts a `start_op == max_op + 1` change between two of the same
+    // actor's.
+    const actors = [_][]const u8{ "a", "b", "c", "d" };
+    var start_op: u64 = 1;
+    // How many operations the fixture wrote, which is how many
+    // `(actor, counter)` pairs some change must own. Carried rather than
+    // written out, so the assertion below cannot drift from the fixture.
+    var ops_written: usize = 0;
+    for (0..600) |i| {
+        const who = actors[i % actors.len];
+        // Every tenth change is empty, which is what makes `start_op` exceed
+        // `max_op` and leaves the next change to reuse the counter. That is
+        // the one shape where "the last change starting at or below the
+        // counter" and "the first node whose range holds it" could name
+        // different changes, and an empty change between two of one actor's
+        // changes is what produces it.
+        const num_ops: u64 = if (i % 10 == 9) 0 else @intCast(1 + (i % 3));
+        _ = try b.change(who, start_op, num_ops, &.{});
+        ops_written += @intCast(num_ops);
+        if (num_ops == 0) {
+            // An empty change owns no counter and does not advance the
+            // document's, so `start_op` is deliberately not moved here and the
+            // next change reuses it.
+            try testing.expectEqual(start_op, graph.maxOp() + 1);
+        } else {
+            start_op += num_ops;
+        }
+    }
+    try testing.expectEqual(@as(usize, 4), graph.numActors());
+
+    // **Every counter of every actor slot, against both answers.** Not a
+    // sample: a binary search that is off by one agrees with a scan on every
+    // counter but the one it lands on, and the point is that it lands on the
+    // same one every time. `1` to `maxOp() + 2` covers the counters no change
+    // owns on both sides — below the first and above the last — and the two
+    // counters past the end are where an off-by-one shows.
+    var agreed: usize = 0;
+    for (0..graph.numActors()) |slot| {
+        const actor: ActorIdx = @intCast(slot);
+        var counter: u64 = 1;
+        while (counter <= graph.maxOp() + 2) : (counter += 1) {
+            const id = OpId.init(@intCast(counter), actor);
+            const fast = graph.opidToHash(id);
+            const slow = scanForOpId(graph, id);
+            if (slow) |want| {
+                agreed += 1;
+                try testing.expect(fast != null);
+                try testing.expectEqual(want, fast.?);
+            } else {
+                try testing.expect(fast == null);
+            }
+        }
+    }
+    // **The comparison is not vacuous.** `agreed` counts the
+    // `(actor, counter)` pairs some change owns, and every operation in the
+    // fixture is owned by exactly one change of exactly one actor — so it is
+    // the fixture's own op count, carried here rather than written out. A
+    // graph whose counters nothing owned would fail this rather than pass
+    // having compared nothing.
+    try testing.expectEqual(ops_written, agreed);
+    // And a slot past the table answers null from both, rather than reading out
+    // of bounds on the way to a hash.
+    try testing.expect(graph.opidToHash(.{ .counter = 1, .actor = 99 }) == null);
+    try testing.expect(scanForOpId(graph, .{ .counter = 1, .actor = 99 }) == null);
 }
 
 test "an index the graph cannot name is refused, not truncated" {

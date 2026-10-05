@@ -46,10 +46,21 @@ result.** The two changes are real but aimed elsewhere:
 * **#4, streaming the load chunk list** (implemented this round; it had been
   dropped in round 2 as "the caller blocks it"). `ChunkStream` frames one chunk
   at a time and `doc.zig`'s load path adopts it, so a document load no longer
-  holds one 40-byte entry per chunk. It removes **allocations and retained
-  bytes on load**, not instructions on a benchmark that never loads in a loop.
-  Its gate is the `doc.jsonl` conformance vector and the totality cut sweep,
-  both green, not an instruction count.
+  holds one entry per chunk. It removes **allocations and retained bytes on
+  load**, not instructions on a benchmark that never loads in a loop. Its gate
+  is the `doc.jsonl` conformance vector and the totality cut sweep, both green,
+  not an instruction count.
+
+  **Two corrections, recorded 2026-10-06 (round 5).** The entry is
+  `@sizeOf(chunk.Chunk)` = **72 bytes**, not 40: two `[]const u8` (`data` and
+  `frame`), a 33-byte `?ChangeHash`, four checksum bytes and the type byte
+  (`src/storage/chunk.zig:97-131`). And the streaming is `Document.load`'s, not
+  the format's: `chunk.parseChunks` (`src/storage/chunk.zig:497`) is still the
+  reader in four places — `src/storage/totality_test.zig:312`, `splitStream` in
+  `src/sync/protocol.zig:1245` and in `src/v1.zig:789`, and `chunk.zig`'s own
+  tests — and `splitStream` runs **per sync message**, so a message still
+  materialises a chunk list. "No chunk list is materialised" is true of
+  `Document.load` and of nothing else.
 * **`rebuildAggs` no longer slack-fills.** `shrinkRetainingCapacity`
   (`std/array_list.zig:1186-1189`) is the length assignment plus
   `@memset(slack, undefined)`, and nothing reads past the length. The removed
@@ -154,6 +165,98 @@ run came one run over budget once its own leading pad was written, and
 below default, so nothing had caught it. Upstream counts the pad inside the
 budget (`bool.rs:312-317`, `:322-326`); the cut now spends it. Ledger entry 28.
 
+## Optimization round 5 (2026-10-06)
+
+Round 5 optimized the paths the four benchmark gates had just made visible,
+gated the last ungated fast/slow cross-check, and found that three of the
+round-3 audit's own claims were wrong. **No instruction count appears in this
+section.** The `insert-loop`, `hash-for-opid` and `list-width` figures are being
+re-measured, and the numbers recorded for them in *The new gates, and what one
+of them found* and in *Optimization round 1-8* are left exactly as they stand
+until that re-measurement replaces them. **The "what it measures" column of
+that gate table is superseded along with its figures**: all three of its
+subjects changed mechanism in round 5, and this section says what each is now.
+What follows is source inventory: every change with the site a reader can check,
+plus the corrections. Whether a change moved a count is the re-measurement's
+statement to make, not this section's.
+
+### What changed, and where
+
+| Change | Site | Shape |
+| --- | --- | --- |
+| `copyFold` copies a mark fold | `src/iter/spans.zig:269` | `O(names²)` per call → `O(names)` |
+| Span mark flattening is stamped, not walked | `src/iter/spans.zig:906`, read at `:733`, counter at `:801` | `O(R·M)` over a run of `R` rows under `M` names → `O(R+M)`, through `SpanState.marks_epoch` |
+| `ChangeGraph.updateHeads` marks then compacts once | `src/change_graph.zig:2141-2168`; scratch `:485`, `:491` | `Θ(C²)` → `Θ(C+H)` per change, through `heads_stamp`/`heads_epoch` |
+| `Column.weightOf` folds a slab once | `src/hexane/column.zig:1962`, `:2176`, `:2423`, `:3001`; `src/opset/columns.zig:269`, `:428` | `O(rows)` per slab → `O(1)`, for the prefix, delta and meta-prefix codecs |
+| `OpSet.addSucc` takes its successor width from the edges it just wrote | `src/opset/op_set.zig:2433`, the count from `writeSuccColumns` (`:2706`), applied through `reserveScratchTo` (`:2452`, `:2816`) | one pass over `succ_count` per row, gone — and `OpSet.undoSucc` (`:2606`) still calls `refitScratch` (`:2659`), correctly, because an undo cannot name the width it needs |
+| `ListRange` holds one element cursor | `src/iter/list_range.zig:1005`, used at `:923-941` | ten column cursors per element → one, moved |
+| `sync` merges a message's hashes in one pass | `src/sync/state.zig:396`, called at `src/sync/protocol.zig:588` | `O(k·n)` element moves per message → `O(k log k + n + k)` |
+| The storage chunk walk allocates nothing | `src/storage/chunk.zig:524`, adopted at `src/doc.zig:3857-3860` | 13–25 allocations and a 5.1 MB peak at 50 000 chunks → zero |
+| `document_chunk`'s compressing writer never holds the uncompressed body | `src/storage/document_chunk.zig:984`, asserted by the test at `:2760` | peak 333 370 → 74 961 bytes |
+| `cursor.getCursor` dropped its second descent | `src/cursor.zig:784-795`, module doc at `:142-146` | one `O(rows in the object)` `seekListOpid` per cursor resolve, gone |
+| `PatchBuilder.appendMarks` appends to the array it already names | `src/patches.zig:2051`, doc at `:2029-2051` | `O(n²)` → `O(n)` in a patch's mark count |
+
+**Three of those rows are not instruction counts, and are not offered as
+substitutes for them.** The `sync` row's cost is element *moves*, which the
+round-5 measurement put at 50× fewer at the gate's default size and 100× fewer
+at `--full`. The two storage rows are allocator counters: a peak live-byte
+high-water mark, and an allocation count. A `perf stat` pair is still the only
+evidence that any of this moved the instruction count, and none of it is
+recorded here.
+
+### The gates: five cross-checks, not two readers
+
+| Cross-check | Gate in this port | Upstream |
+| --- | --- | --- |
+| `OpSet.seekOpsByIndex` | `src/opset/op_set.zig:3746` | `#[cfg(feature = "slow_path_assertions")]`, `op_set.rs:645-649` |
+| `OpSet.calculateMarksAt` | `src/opset/op_set.zig:4788` | the same feature, `automerge.rs:1587-1591` |
+| `OpSet.markSetAtIndex` | `src/opset/op_set.zig:4976` | the same feature, `automerge.rs:1939-1943` |
+| `OpSet.seekListOpid` | `src/opset/op_set.zig:3953` | a plain `debug_assert_eq!`, `op_set.rs:846` |
+| `OpSet.queryInsertAt` | `src/opset/op_set.zig:4346` | a plain `debug_assert_eq!`, `op_set.rs:583-598` |
+
+Upstream pays nothing for the last two only because its release profile leaves
+`debug-assertions` off (`rust/Cargo.toml:14-16`), not because it gates them.
+Round 5 added `seekListOpid`'s gate, and that was the last ungated cross-check
+on a hot path: its slow arm is `iterObjAndFind` plus a `Grouped` walk over
+**every** register in the object, so an always-on comparison is
+`O(rows in the object)` on `Transaction.joinBlock`, on `OpSet.parentObject`'s
+`.seq` arm (`Parents.next` and `read.parents`) and on `PatchBuilder.getPath`
+through `doc.objectParent`. Three tests call `seekListOpidFast` and
+`seekListOpidSlow` directly and compare both answers in every build, so the gate
+decides who pays for the comparison, not whether it is made.
+
+**One cross-check is still ungated**, and it is the cheap one:
+`OpSet.findOpByIdAndVis`, whose slow arm stops at the end of the row's own
+register (`op_set.rs:1131-1132`).
+
+### Three of the round-3 audit's claims were wrong
+
+* **"`ChangeGraph.opidToHash` has no public entry point at all."** False. It is
+  `pub` at `src/change_graph.zig:1704` and has been since that file was written;
+  `Transaction.hashForOpid` (`src/transaction.zig:433-436`) now delegates to it,
+  and it was already called from `src/change_graph.zig:3279` and, from a test,
+  `src/change.zig:1142-1146`. No new `pub` was needed and none was added.
+* **"A document load no longer holds one 40-byte entry per chunk."** The size
+  was wrong: 72 bytes, as above.
+* **"The chunk list is never materialised."** True of `Document.load` and of
+  nothing else, as above.
+
+### The fixtures that were measuring the wrong thing
+
+* **The sync sent-hashes equivalence fixture generated its hashes ascending.**
+  `hashFor` (`src/sync/state.zig:818`) is ascending in `n`, so inserting them
+  one at a time landed every insert at the tail of the sorted list and the
+  memmove the comparison exists to exercise never ran. The test now feeds the
+  one-at-a-time arm a scattered permutation — `hashFor((n * 37) % count)`
+  (`:846`) — and still requires the bulk merge to produce the same set
+  (`:834`).
+* **The benchmark's phase accounting dropped a phase.** `phase_max` in
+  `bench/zautomerge_bench.zig:341` is 4 and `addPhase` (`:366-372`) returns
+  silently on the fifth, so a workload recording five phases reports four. No
+  sentence in this file or in `bench/README.md` quotes a phase count, so nothing
+  above needed correcting; the harness is not this document's to change, and the
+  count of phases a workload records is the harness's own business.
+
 ## Data-oriented audit (2026-10-05)
 
 A read-only audit of the optimized tree: twenty slices across disjoint modules,
@@ -189,6 +292,13 @@ upstream's `.unwrap()` only gets away with it on a column validated at load.
 Three more are real but have **no gate today** and stay proposals until one
 exists: the per-hash sorted insert in sync's `sent_hashes`, `hashForOpid`'s
 linear scan, and `listRange`'s six locates per element.
+
+**Superseded, 2026-10-06.** All three were gated in round 3, as
+`sync-roundtrip`, `hash-for-opid` and `list-width` in
+`bench/zautomerge_bench.zig`. The sentence is left as the audit wrote it on
+2026-10-05, because "no gate today" was true that day. Two of the three
+subjects have since changed mechanism — `sync-roundtrip` times a bulk merge and
+`hash-for-opid` an interval query — and the round-5 section records that.
 
 **Limits on this audit.** It is source analysis plus the instruction counts
 already measured; no proposal was built or timed. Every row above is an
@@ -1324,6 +1434,24 @@ Both halves are demonstrated: a corrupted tree is `error.InvariantViolation`
 with the option and silent without it, and each half fails if the gate is
 removed. What is left is **not** the mechanism: it is the finding the option
 made on its first run, and the cost.
+
+**Superseded in part, round 5 (2026-10-06).** This paragraph named two readers
+of `check_slow_paths`. There are **six** now: five op-set fast/slow
+cross-checks — `OpSet.seekOpsByIndex` (`src/opset/op_set.zig:3746`),
+`OpSet.seekListOpid` (`:3953`), `OpSet.queryInsertAt` (`:4346`),
+`OpSet.calculateMarksAt` (`:4788`) and `OpSet.markSetAtIndex` (`:4976`) — and
+`SlabBTree.assertSound` in `src/hexane/btree.zig`. Round 5 added
+`seekListOpid`'s, which was the last ungated cross-check on a hot path; the
+round-5 section has the full table with the upstream citations.
+
+**And two of the five are not upstream's `slow_path_assertions` at all.**
+`OpSet.seekListOpid` (`op_set.rs:846`) and `OpSet.queryInsertAt`
+(`op_set.rs:583-598`) are plain `debug_assert_eq!`s that upstream compiles out
+because its release profile leaves `debug-assertions` off
+(`rust/Cargo.toml:14-16`). Porting them behind this option was a port decision,
+not an upstream one. The one cross-check still ungated is
+`OpSet.findOpByIdAndVis`, cheap because its slow arm stops at the end of the
+row's own register (`op_set.rs:1131-1132`).
 
 **It found a defect.** With the option off the library suite is 1229 passed /
 1 skipped / 0 failed / 4m58s. With it on: 1228 passed / 0 skipped / **2 failed
