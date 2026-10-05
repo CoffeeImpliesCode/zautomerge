@@ -338,6 +338,45 @@ pub const Message = struct {
         };
     }
 
+    /// Serializes exactly heads/need/have/changes, omitting flags and version
+    /// as upstream `sync.rs:603-614`. Does not change the message's ownership.
+    pub fn serialize(self: Message, backend: anytype) @import("../autoserde.zig").BackendError(@TypeOf(backend))!void {
+        const serde = @import("../autoserde.zig");
+        try backend.beginMap();
+        try backend.mapKey("heads", 0);
+        try serde.serializeHashes(self.heads, backend);
+        try backend.mapKey("need", 1);
+        try serde.serializeHashes(self.need, backend);
+        try backend.mapKey("have", 2);
+        try backend.beginSeq();
+        for (self.have, 0..) |entry, index| {
+            try backend.element(index);
+            try entry.serialize(backend);
+        }
+        try backend.endSeq();
+        try backend.mapKey("changes", 3);
+        try backend.beginSeq();
+        for (self.changes.items, 0..) |bytes, index| {
+            try backend.element(index);
+            try backend.scalar(.{ .bytes = bytes });
+        }
+        try backend.endSeq();
+        try backend.endMap();
+    }
+
+    /// Writes compact field-exact JSON. Failure leaves a prefix to discard.
+    pub fn writeJson(self: Message, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        var backend: @import("../autoserde.zig").JsonSerializer = .{ .writer = writer };
+        try self.serialize(&backend);
+    }
+
+    /// Native std.json hook with normal enclosing-value separators.
+    pub fn jsonStringify(self: Message, jws: *std.json.Stringify) std.Io.Writer.Error!void {
+        try jws.beginWriteRaw();
+        try self.writeJson(jws.writer);
+        jws.endWriteRaw();
+    }
+
     /// Frees the three lists, every `have` in the list, and the chunk list
     /// (`sync.rs:529-547`). See the note on the type: a message consumed by
     /// the receive path has already given three of these away.
@@ -1373,4 +1412,74 @@ fn expectHashes(want: []const []const u8, got: []const ChangeHash) !void {
     for (want, got) |want_hex, hash| {
         try testing.expectEqualStrings(want_hex, &hashHex(hash));
     }
+}
+
+test "API parity sync serde omits flags and version" {
+    // The serde projection differs from the wire record and exposes exactly four fields.
+    const gpa = std.testing.allocator;
+    var message = Message.init(gpa);
+    defer message.deinit();
+    message.version = .v2;
+    message.flags = MessageFlags{ .bits = 0 };
+    message.have = try gpa.alloc(Have, 1);
+    message.have[0] = Have.empty(gpa);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try message.writeJson(&out.writer);
+    try std.testing.expectEqualStrings(
+        "{\"heads\":[],\"need\":[],\"have\":[{\"last_sync\":[],\"bloom\":" ++
+            "{\"num_entries\":0,\"num_bits_per_entry\":10,\"num_probes\":7,\"bits\":[]}}]," ++
+            "\"changes\":[]}",
+        out.written(),
+    );
+}
+
+test "API parity sync serde structured backend preserves chunk boundaries" {
+    // A non-JSON consumer receives separate chunks, including an empty chunk.
+    const gpa = std.testing.allocator;
+    var tokens = @import("../autoserde.zig").TokenStream.init(gpa);
+    defer tokens.deinit();
+    {
+        var message = Message.init(gpa);
+        defer message.deinit();
+        message.changes.items = try gpa.alloc([]u8, 2);
+        message.changes.items[0] = try gpa.dupe(u8, &.{ 0, 255 });
+        message.changes.items[1] = try gpa.dupe(u8, "");
+        try message.serialize(&tokens);
+    }
+    var chunks: usize = 0;
+    for (tokens.items.items) |token| switch (token) {
+        .scalar => |scalar| switch (scalar) {
+            .bytes => |bytes| {
+                if (chunks == 0) {
+                    try std.testing.expectEqualSlices(u8, &.{ 0, 255 }, bytes);
+                } else {
+                    try std.testing.expectEqual(@as(usize, 0), bytes.len);
+                }
+                chunks += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .key => |key| {
+            try std.testing.expect(!std.mem.eql(u8, key, "version"));
+            try std.testing.expect(!std.mem.eql(u8, key, "flags"));
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 2), chunks);
+}
+
+test "API parity sync serde native JSON hook nests in sequences and maps" {
+    // Raw-value hooks must participate in std.json's comma and colon state.
+    const gpa = std.testing.allocator;
+    var message = Message.init(gpa);
+    defer message.deinit();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try std.json.Stringify.value(.{ .messages = [_]Message{ message, message }, .after = true }, .{}, &out.writer);
+    try std.testing.expectEqualStrings(
+        "{\"messages\":[{\"heads\":[],\"need\":[],\"have\":[],\"changes\":[]}," ++
+            "{\"heads\":[],\"need\":[],\"have\":[],\"changes\":[]}],\"after\":true}",
+        out.written(),
+    );
 }

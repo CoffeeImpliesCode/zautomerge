@@ -92,12 +92,9 @@
 //! so a walk visits objects in `ObjId` order and not in the order it found
 //! them. Row order is that same order: the object columns are sorted by
 //! object, which is half of rule **R1**
-//! ([`op.zig:2211-2214`](../opset/op.zig)), and `ExId.order` is the same
-//! comparison the row order is stated in
-//! ([`types.zig:287-291`](../../src/types.zig), root first). **No ordering
-//! code is needed here and none is written**: the columns are already in
-//! `ObjId` order, and a walk that sorted its answers would be a second
-//! source of truth for something the data states.
+//! ([`op.zig:2211-2214`](../opset/op.zig)). The queue uses contextual resident
+//! `OpId` ordering, not public named-identity ordering by actor bytes. Columns
+//! are already in that same resident order, so returned items need no sort.
 //!
 //! # The unit is an object, not a row
 //!
@@ -220,6 +217,7 @@ const optypes = @import("../opset/types.zig");
 const opiter = @import("../opset/op_iter.zig");
 const opset = @import("../opset/op_set.zig");
 const patches = @import("../patches.zig");
+const hydrate = @import("../hydrate.zig");
 const listrange = @import("list_range.zig");
 const maprange = @import("map_range.zig");
 const spans = @import("spans.zig");
@@ -703,11 +701,10 @@ pub fn DiffItem(comptime O: type) type {
 
 /// What a document diff can raise.
 ///
-/// **The union of what all three leaf readers can raise**, which is
-/// [`maprange.ReadError`](map_range.zig) — a parse refusal, a walk refusal, a
-/// document refusal and an invariant check. Naming it here means one walk has
-/// one error set rather than three arm-specific ones.
-pub const DiffError = maprange.ReadError;
+/// The leaf reader errors plus recursive block/mark hydration errors.
+/// Returned spans are detached using the same iterator allocator and scope;
+/// allocation and hydration failures remain typed rather than suppressed.
+pub const DiffError = maprange.ReadError || hydrate.OpHydrateError;
 
 // ── The queue ───────────────────────────────────────────────────────────────
 
@@ -773,7 +770,12 @@ pub const ObjQueue = struct {
         if (self.items.items.len == 0) return null;
         var at: usize = 0;
         for (self.items.items[1..], 1..) |candidate, i| {
-            if (candidate.obj.order(self.items.items[at].obj) == .lt) at = i;
+            const candidate_id = candidate.obj.opId();
+            const current_id = self.items.items[at].obj.opId();
+            const order: std.math.Order = if (candidate_id) |id|
+                if (current_id) |current| id.order(current) else .gt
+            else if (current_id == null) .eq else .lt;
+            if (order == .lt) at = i;
         }
         return self.items.orderedRemove(at);
     }
@@ -850,7 +852,11 @@ pub fn DiffIter(comptime O: type) type {
         ) DiffError!Self {
             const set = doc.op_set;
             var obj_id_iter = ObjIdIter.init(try set.objIdIter(), null);
-            const scope = try obj_id_iter.ids.seekToValue(obj);
+            const resolved = set.resolveObjId(obj);
+            const scope: RowRange = if (resolved) |internal|
+                try obj_id_iter.ids.seekToValue(internal)
+            else
+                .{ .start = 0, .end = 0 };
             return .{
                 .gpa = gpa,
                 .next_objs = ObjQueue.init(gpa),
@@ -861,7 +867,7 @@ pub fn DiffIter(comptime O: type) type {
                 .span_iter = try spans.SpansDiff(O).init(gpa, set, scope, over, doc.text_encoding),
                 .iter_type = iterTypeOf(typ),
                 .recursive = recursive,
-                .obj = obj,
+                .obj = resolved orelse obj,
             };
         }
 
@@ -1105,18 +1111,15 @@ pub fn DocItemInternal(comptime O: type) type {
         /// [`MapDiffItem.exportItem`](map_range.zig) carries for the same
         /// reason.
         ///
-        /// **One arm converts and two are copies**, and the conversion is the
-        /// span: its text run is already owned, so exporting moves the buffer
-        /// and the mark set across rather than copying them
-        /// ([`SpanInternal.exportSpan`](spans.zig), `spans.rs:605-627`).
-        /// Upstream's takes an op set, a clock and an encoding for the same
-        /// conversion; the port's span carries the op set inside its
-        /// [`ExIdPromise`](map_range.zig), so it needs none of the three.
-        pub fn exportItem(self: Self) DocItem(O) {
+        /// Map and list arms remain borrowed. Text storage moves on success;
+        /// block maps and marks are detached through the supplied source set
+        /// and clock (`spans.rs:605-627`). Failure leaves the internal item
+        /// owned by its caller, which must deinitialize it.
+        pub fn exportItem(self: Self, gpa: Allocator, set: *opset.OpSet(O), clock: ?Clock) DiffError!DocItem(O) {
             return switch (self) {
                 .map => |m| DocItem(O){ .map = m },
                 .list => |l| DocItem(O){ .list = l },
-                .text => |t| DocItem(O){ .text = t.exportSpan() },
+                .text => |t| DocItem(O){ .text = try t.exportSpan(gpa, set, clock) },
             };
         }
 
@@ -1185,7 +1188,7 @@ pub fn DocItem(comptime O: type) type {
         /// ([`DocItem::id`](../../github-automerge-automerge/rust/automerge/src/iter/doc.rs),
         /// `iter/doc.rs:508-516`).
         pub fn id(self: *const Self) ?ObjId {
-            return switch (self.item) {
+            return switch (self.*) {
                 .map => |m| m.id(),
                 .list => |l| l.id(),
                 .text => null,
@@ -1200,7 +1203,7 @@ pub fn DocItem(comptime O: type) type {
         /// reached through [`DocObjItem.value`], which has a third arm for it
         /// (`iter/doc.rs:377`).
         pub fn value(self: *const Self) ?ValueRef {
-            return switch (self.item) {
+            return switch (self.*) {
                 .map => |m| m.value,
                 .list => |l| l.value,
                 .text => null,
@@ -1285,6 +1288,13 @@ pub fn DocObjItem(comptime O: type) type {
             };
         }
 
+        /// Copies every value payload, including text span bytes, into an
+        /// independent owner (`iter/doc.rs:373-380`). The result survives
+        /// releasing the item or document; OOM leaves the item unchanged.
+        pub fn valueOwned(self: *const Self, gpa: Allocator) !optypes.OwnedValueRef {
+            return self.value().intoOwned(gpa);
+        }
+
         /// Gives back the span this item carries, if it carries one. The map
         /// and list arms borrow the document and own nothing. **The item is
         /// unusable once this returns**: `self.* = undefined` is the last line,
@@ -1360,7 +1370,11 @@ pub fn DocIterInternal(comptime O: type) type {
         ) DiffError!Self {
             const set = doc.op_set;
             var obj_id_iter = ObjIdIter.init(try set.objIdIter(), null);
-            const scope = try obj_id_iter.ids.seekToValue(obj);
+            const resolved = set.resolveObjId(obj);
+            const scope: RowRange = if (resolved) |internal|
+                try obj_id_iter.ids.seekToValue(internal)
+            else
+                .{ .start = 0, .end = 0 };
             return .{
                 .gpa = gpa,
                 .next_objs = ObjQueue.init(gpa),
@@ -1369,7 +1383,7 @@ pub fn DocIterInternal(comptime O: type) type {
                 .list_iter = try listrange.ListRange(O).init(set, scope, clock, .all()),
                 .span_iter = try spans.SpansInternal(O).init(gpa, set, scope, clock, doc.text_encoding),
                 .iter_type = iterTypeOf(typ),
-                .obj = obj,
+                .obj = resolved orelse obj,
             };
         }
 
@@ -1461,18 +1475,23 @@ pub fn DocIterInternal(comptime O: type) type {
 /// The document's own naming for `obj` ([`OpSet::id_to_exid`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs),
 /// `op_set.rs:1054-1060`).
 ///
-/// **The root is the one id with two spellings and upstream's function is
-/// what decides between them**: `id_to_exid` answers `ExId::Root` for
-/// `types::ROOT` and an `ExId::Id` — counter, actor **bytes**, actor index —
-/// for everything else, and the port's [`Set.idToExid`](../opset/op_set.zig)
-/// makes the same test (`id.eql(OpId.root)`).
+/// Canonical root stays root. A named or unresolved ID never becomes root
+/// merely because it cannot be represented by a resident operation ID.
+/// Resident IDs export actor bytes from this document's table; unresolved
+/// inputs remain unchanged, and their empty walks emit no items.
 ///
 /// The ids this walk builds carry an actor *index* and no bytes
 /// ([`MadeObj`]), so this is where the actor table is read — **once per
 /// object the walk visits**, because [`DocIter.next`] refreshes only when the
 /// object changes (`iter/doc.rs:294-298`).
 fn exidOf(comptime O: type, set: *opset.OpSet(O), obj: ObjId) ObjId {
-    return set.idToExid(obj.opId() orelse OpId.root);
+    return switch (obj) {
+        .root, .named => obj,
+        .id => |id| if (set.getActor(id.actor)) |actor|
+            ObjId.withActor(id, actor)
+        else
+            obj,
+    };
 }
 
 /// The recursive walk over a document's items ([`DocIter`](../../github-automerge-automerge/rust/automerge/src/iter/doc.rs),
@@ -1518,11 +1537,12 @@ pub fn DocIter(comptime O: type) type {
             typ: types.ObjType,
             clock: ?Clock,
         ) DiffError!Self {
+            const inner = try DocIterInternal(O).init(gpa, doc, obj, typ, clock);
             return .{
                 .gpa = gpa,
                 .op_set = doc.op_set,
-                .obj_export = exidOf(O, doc.op_set, obj),
-                .inner = try DocIterInternal(O).init(gpa, doc, obj, typ, clock),
+                .obj_export = exidOf(O, doc.op_set, inner.obj),
+                .inner = inner,
             };
         }
 
@@ -1552,9 +1572,19 @@ pub fn DocIter(comptime O: type) type {
         /// arms borrow from different places, and the port's item borrows the
         /// span it already owns (see [`DocObjItem.value`]).
         pub fn next(self: *Self) DiffError!?DocObjItem(O) {
-            const got = (try self.inner.next()) orelse return null;
-            if (!self.obj_export.eql(got.obj)) self.obj_export = exidOf(O, self.op_set, got.obj);
-            return .{ .obj = self.obj_export, .item = got.item.exportItem() };
+            var got = (try self.inner.next()) orelse return null;
+            errdefer got.deinit(self.gpa);
+            const current = self.obj_export.opId();
+            const incoming = got.obj.opId();
+            const same = if (current) |id|
+                if (incoming) |next_id| id.eql(next_id) else false
+            else incoming == null;
+            if (!same) self.obj_export = exidOf(O, self.op_set, got.obj);
+            const clock: ?Clock = switch (self.inner.span_iter.iter.clock) {
+                .current => |value| value,
+                .diff => |clocks| clocks.after,
+            };
+            return .{ .obj = self.obj_export, .item = try got.item.exportItem(self.gpa, self.op_set, clock) };
         }
     };
 }
@@ -2745,7 +2775,7 @@ test "the recursive walk reads the root's rows, then every child, parents before
         defer item.deinit(gpa);
         if (seen >= answers.len) return error.TestUnexpectedResult;
         const want = answers[seen];
-        try testing.expect(item.obj.eql(want.obj));
+        try testing.expectEqual(want.obj.opId(), item.obj.opId());
         // **The key is null for anything that is not a map register**, and the
         // table's `""` is upstream's spelling of that rather than an empty
         // key — asserting the null is what tells the two apart.
@@ -2895,3 +2925,61 @@ test "the recursive walk reads the root's rows, then every child, parents before
 //   [`read.iterAt`](../../src/read.zig): resolve the id, build the clock, hand
 //   over the [`Doc`] handle — the two lines upstream's `iter_for` writes, and
 //   no more.
+
+test "API parity extracted document text survives item destruction" {
+    const gpa = testing.allocator;
+    var item: DocObjItem(opmod.Op) = .{
+        .obj = .root,
+        .item = .{ .text = .{ .text = .{
+            .text = try gpa.dupe(u8, "detached text"),
+            .marks = null,
+        } } },
+    };
+    var owned = try item.valueOwned(gpa);
+    defer owned.deinit(gpa);
+    item.deinit(gpa);
+    try testing.expectEqualStrings("detached text", owned.value.scalar.str);
+}
+
+test "API parity document and diff walks resolve named objects and never alias unknown IDs to root" {
+    const gpa = testing.allocator;
+    const child = made(1, 0);
+    const doc = try Fixture.build(gpa, encoding, &.{ actor_a, types.ActorId.init("other") }, &.{
+        row(opId(1, 0), .root, .{ .map = "m" }, false, .make_map, .null_value, null),
+        row(opId(2, 0), .root, .{ .map = "root" }, false, .set, .{ .str = "root-value" }, null),
+        row(opId(3, 0), child, .{ .map = "child" }, false, .set, .{ .str = "child-value" }, null),
+    });
+    defer doc.destroy();
+    const handle: Doc(opmod.Op) = .init(&doc.set, encoding);
+    const named = ObjId.withActor(opId(1, 1), actor_a);
+    var values = try DocIter(opmod.Op).init(gpa, &handle, named, .map, null);
+    defer values.deinit();
+    var value = (try values.next()) orelse return error.TestExpectedItem;
+    defer value.deinit(gpa);
+    try testing.expectEqualStrings("child", value.key().?);
+    try testing.expect(value.obj.eql(ObjId.withActor(opId(1, 0), actor_a)));
+    try testing.expect((try values.next()) == null);
+    var changes = try DiffIter(opmod.Op).init(gpa, &handle, named, .map, .{ .current = null }, true);
+    defer changes.deinit();
+    const change = (try changes.next()) orelse return error.TestExpectedItem;
+    try testing.expectEqualStrings("child", change.item.map.key);
+    try testing.expectEqual(opId(1, 0), change.obj.opId().?);
+    try testing.expect((try changes.next()) == null);
+    const absent = [_]ObjId{
+        ObjId.withActor(opId(1, 0), .init("unknown")),
+        ObjId.withActor(opId(9, 0), actor_a),
+        .{ .named = .{ .op = .{ .counter = 4294967296, .actor = 0 }, .actor = actor_a } },
+        .{ .id = opId(1, 99) },
+        ObjId.withActor(opId(0, 0), actor_a),
+    };
+    for (absent) |missing| {
+        for ([_]types.ObjType{ .map, .list, .text }) |typ| {
+            var empty_values = try DocIter(opmod.Op).init(gpa, &handle, missing, typ, null);
+            defer empty_values.deinit();
+            try testing.expect((try empty_values.next()) == null);
+            var empty_changes = try DiffIter(opmod.Op).init(gpa, &handle, missing, typ, .{ .current = null }, true);
+            defer empty_changes.deinit();
+            try testing.expect((try empty_changes.next()) == null);
+        }
+    }
+}

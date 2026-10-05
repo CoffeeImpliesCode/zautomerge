@@ -29,12 +29,11 @@ const am = @import("zautomerge");
 const Allocator = std.mem.Allocator;
 const Document = am.doc.Document;
 const Changes = am.doc.Changes;
-const Mode = am.doc.Mode;
 const Change = am.change_record.Change;
 const ChangeHash = am.ChangeHash;
 const ExId = am.ExId;
 const TextEncoding = am.TextEncoding;
-const Tx = am.manual_transaction.Transaction;
+const Tx = am.Transaction;
 
 const chunkmod = am.storage.chunk;
 const docchunk = am.storage.document_chunk;
@@ -128,11 +127,10 @@ pub const base_elements: usize = 200;
 /// as it lives: the op set draws actors through it, so a document may not
 /// outlive the provider it was handed.
 ///
-/// Every document here is [`Mode.manual`]. An autocommit document folds each
-/// mutating call into its own change and stamps the wall clock, and neither is
-/// what the reference wrote. Each transaction is committed explicitly, with its
-/// message and its timestamp, so the change's extras column carries what the
-/// oracle's records carry.
+/// Every document here is raw. Each transaction is committed explicitly, with
+/// its message and timestamp, so the change's extras column carries what the
+/// oracle's records carry. On script failure the caller destroys the complete
+/// document, so journal disposal need not attempt a fallible rollback.
 pub fn build(gpa: Allocator, io: std.Io, id: Id) !Document {
     return switch (id) {
         .map => scripted(gpa, io, mapScript),
@@ -157,7 +155,7 @@ fn scripted(
 }
 
 fn newDoc(gpa: Allocator, io: std.Io) !Document {
-    var doc = try Document.init(gpa, io, .manual);
+    var doc = try Document.init(gpa, io);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = &actor_a });
     return doc;
@@ -196,7 +194,7 @@ fn forkedMerged(gpa: Allocator, io: std.Io) !Document {
 fn mapScript(gpa: Allocator, doc: *Document) !void {
     {
         var tx = try Tx.open(gpa, doc);
-        defer tx.deinit();
+        defer tx.deinitClosed();
 
         _ = try tx.put(.root, .{ .key = "title" }, .{ .str = "title" });
         _ = try tx.put(.root, .{ .key = "int" }, .{ .int = -7 });
@@ -212,16 +210,18 @@ fn mapScript(gpa: Allocator, doc: *Document) !void {
         _ = try tx.put(nested, .{ .key = "value" }, .{ .int = 1 });
         _ = try tx.put(nested, .{ .key = "value" }, .{ .int = 2 });
         _ = try tx.delete(.root, .{ .key = "removed" });
-        _ = try tx.commit("map/base", commit_time);
+        var base_result = try tx.commitWith(.{ .message = "map/base", .time = commit_time });
+        base_result.deinit(gpa);
     }
 
     var update = try Tx.open(gpa, doc);
-    defer update.deinit();
+    defer update.deinitClosed();
     _ = try update.increment(.root, .{ .key = "counter" }, 3);
     _ = try update.increment(.root, .{ .key = "counter" }, -1);
     _ = try update.increment(.root, .{ .key = "counter" }, 10);
     _ = try update.put(.root, .{ .key = "title" }, .{ .str = "updated" });
-    _ = try update.commit("map/update", commit_time);
+    var result = try update.commitWith(.{ .message = "map/update", .time = commit_time });
+    result.deinit(gpa);
 }
 
 /// `list`: two hundred elements, then a commit that splices strings and whole
@@ -234,13 +234,14 @@ fn mapScript(gpa: Allocator, doc: *Document) !void {
 fn listScript(gpa: Allocator, doc: *Document) !void {
     const list = blk: {
         var base = try Tx.open(gpa, doc);
-        defer base.deinit();
+        defer base.deinitClosed();
 
         const made = try base.putObject(.root, .{ .key = "list" }, .list);
         for (0..base_elements) |index| {
             _ = try base.insert(made, index, .{ .int = @intCast(index) });
         }
-        _ = try base.commit("list/base", commit_time);
+        var base_result = try base.commitWith(.{ .message = "list/base", .time = commit_time });
+        base_result.deinit(gpa);
         break :blk made;
     };
 
@@ -253,7 +254,7 @@ fn listScript(gpa: Allocator, doc: *Document) !void {
     if (committed != base_elements) return error.ScriptDrift;
 
     var update = try Tx.open(gpa, doc);
-    defer update.deinit();
+    defer update.deinitClosed();
 
     _ = try update.insert(list, 0, .{ .str = "head" });
     _ = try update.insert(list, 100, .{ .str = "middle" });
@@ -268,7 +269,8 @@ fn listScript(gpa: Allocator, doc: *Document) !void {
     _ = try update.delete(list, .{ .index = 7 });
     _ = try update.delete(list, .{ .index = 7 });
     _ = try update.delete(list, .{ .index = 7 });
-    _ = try update.commit("list/update", commit_time);
+    var result = try update.commitWith(.{ .message = "list/update", .time = commit_time });
+    result.deinit(gpa);
 }
 
 /// `text`: a spliced text object, a delete that leaves a hole, a prepend, and a
@@ -277,11 +279,12 @@ fn listScript(gpa: Allocator, doc: *Document) !void {
 fn textScript(gpa: Allocator, doc: *Document) !void {
     {
         var base = try Tx.open(gpa, doc);
-        defer base.deinit();
+        defer base.deinitClosed();
 
         const text = try base.putObject(.root, .{ .key = "text" }, .text);
         try base.spliceText(text, 0, 0, "hello world");
-        _ = try base.commit("text/base", commit_time);
+        var base_result = try base.commitWith(.{ .message = "text/base", .time = commit_time });
+        base_result.deinit(gpa);
     }
 
     // Read through the document, not through a transaction: the reference
@@ -291,17 +294,19 @@ fn textScript(gpa: Allocator, doc: *Document) !void {
 
     {
         var hole = try Tx.open(gpa, doc);
-        defer hole.deinit();
+        defer hole.deinitClosed();
         try hole.spliceText(text_id, 5, 6, "");
-        _ = try hole.commit("text/delete", commit_time);
+        var hole_result = try hole.commitWith(.{ .message = "text/delete", .time = commit_time });
+        hole_result.deinit(gpa);
     }
 
     var prepend = try Tx.open(gpa, doc);
-    defer prepend.deinit();
+    defer prepend.deinitClosed();
     try prepend.spliceText(text_id, 0, 0, "αβγ");
     const second = try prepend.putObject(.root, .{ .key = "second" }, .text);
     try prepend.spliceText(second, 0, 0, "second");
-    _ = try prepend.commit("text/prepend", commit_time);
+    var result = try prepend.commitWith(.{ .message = "text/prepend", .time = commit_time });
+    result.deinit(gpa);
 }
 
 /// `marks`: every expansion there is, on one text object and on a second one
@@ -315,17 +320,18 @@ fn textScript(gpa: Allocator, doc: *Document) !void {
 fn marksScript(gpa: Allocator, doc: *Document) !void {
     {
         var base = try Tx.open(gpa, doc);
-        defer base.deinit();
+        defer base.deinitClosed();
 
         const text = try base.putObject(.root, .{ .key = "text" }, .text);
         try base.spliceText(text, 0, 0, "abcdefghij");
-        _ = try base.commit("marks/base", commit_time);
+        var base_result = try base.commitWith(.{ .message = "marks/base", .time = commit_time });
+        base_result.deinit(gpa);
     }
 
     const text_id = try childId(doc, "text");
 
     var edit = try Tx.open(gpa, doc);
-    defer edit.deinit();
+    defer edit.deinitClosed();
 
     try edit.mark(text_id, 3, 6, "bold", .after, .{ .int = 0 });
     try edit.mark(text_id, 0, 1, "italic", .none, .{ .bool_value = true });
@@ -337,7 +343,8 @@ fn marksScript(gpa: Allocator, doc: *Document) !void {
     try edit.mark(modes, 0, 1, "before", .before, .{ .str = "active" });
     try edit.mark(modes, 0, 1, "after", .after, .{ .str = "active" });
     try edit.mark(modes, 0, 1, "both", .both, .{ .str = "active" });
-    _ = try edit.commit("marks/edit", commit_time);
+    var result = try edit.commitWith(.{ .message = "marks/edit", .time = commit_time });
+    result.deinit(gpa);
 }
 
 /// The two documents the forked scenarios return. **A pair of owners**: the
@@ -366,7 +373,7 @@ fn forked(gpa: Allocator, io: std.Io) !Pair {
 
     {
         var base_tx = try Tx.open(gpa, &base);
-        defer base_tx.deinit();
+        defer base_tx.deinitClosed();
         _ = try base_tx.put(.root, .{ .key = "value" }, .{ .str = "base" });
         _ = try base_tx.put(.root, .{ .key = "counter" }, .{ .counter = .{ .current = 0 } });
         _ = try base_tx.put(.root, .{ .key = "doomed" }, .{ .str = "x" });
@@ -374,15 +381,16 @@ fn forked(gpa: Allocator, io: std.Io) !Pair {
         _ = try base_tx.insert(base_list, 0, .{ .int = 11 });
         _ = try base_tx.insert(base_list, 1, .{ .int = 22 });
         _ = try base_tx.insert(base_list, 2, .{ .int = 33 });
-        _ = try base_tx.commit("branch/base", commit_time);
+        var base_result = try base_tx.commitWith(.{ .message = "branch/base", .time = commit_time });
+        base_result.deinit(gpa);
     }
 
     const base_bytes = try base.save(gpa);
     defer gpa.free(base_bytes);
 
-    var left = try Document.load(gpa, io, base_bytes, encoding, .manual);
+    var left = try Document.load(gpa, io, base_bytes, encoding);
     errdefer left.deinit();
-    var right = try Document.load(gpa, io, base_bytes, encoding, .manual);
+    var right = try Document.load(gpa, io, base_bytes, encoding);
     errdefer right.deinit();
 
     left.setActorId(.{ .bytes = &actor_a });
@@ -393,21 +401,23 @@ fn forked(gpa: Allocator, io: std.Io) !Pair {
 
     {
         var left_tx = try Tx.open(gpa, &left);
-        defer left_tx.deinit();
+        defer left_tx.deinitClosed();
         _ = try left_tx.put(.root, .{ .key = "value" }, .{ .str = "left" });
         _ = try left_tx.increment(.root, .{ .key = "counter" }, 1);
         _ = try left_tx.delete(.root, .{ .key = "doomed" });
         _ = try left_tx.insert(left_list, 1, .{ .str = "left" });
-        _ = try left_tx.commit("branch/left", commit_time);
+        var left_result = try left_tx.commitWith(.{ .message = "branch/left", .time = commit_time });
+        left_result.deinit(gpa);
     }
 
     var right_tx = try Tx.open(gpa, &right);
-    defer right_tx.deinit();
+    defer right_tx.deinitClosed();
     _ = try right_tx.put(.root, .{ .key = "value" }, .{ .str = "right" });
     _ = try right_tx.increment(.root, .{ .key = "counter" }, 2);
     _ = try right_tx.delete(.root, .{ .key = "doomed" });
     _ = try right_tx.insert(right_list, 1, .{ .str = "right" });
-    _ = try right_tx.commit("branch/right", commit_time);
+    var result = try right_tx.commitWith(.{ .message = "branch/right", .time = commit_time });
+    result.deinit(gpa);
 
     return .{ .left = left, .right = right };
 }
@@ -693,21 +703,10 @@ pub fn checkCase(gpa: Allocator, io: std.Io, id: Id, record: Record, kind: []con
     var doc = try build(gpa, io, id);
     defer doc.deinit();
 
-    // The scripts are written against the manual door; a document that came
-    // back in autocommit mode would have folded every call into its own change
-    // and compared as a different history.
-    if (doc.documentMode() != Mode.manual) {
-        std.debug.print(
-            "save-interop: `{s}`: the built document is not in manual mode\n",
-            .{id.name()},
-        );
-        return Mismatch;
-    }
-
     const reference_bytes = try am.error_types.hexFrom(gpa, record.hex);
     defer gpa.free(reference_bytes);
 
-    var reference = try Document.load(gpa, io, reference_bytes, encoding, .manual);
+    var reference = try Document.load(gpa, io, reference_bytes, encoding);
     defer reference.deinit();
 
     try compareHeads(gpa, id, &doc, record);

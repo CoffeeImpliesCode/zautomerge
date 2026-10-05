@@ -85,6 +85,7 @@ fn Node(comptime T: type) type {
         const Self = @This();
 
         gpa: Allocator,
+        reserved: bool = false,
         /// The elements this node holds, in sequence order.
         elements: std.ArrayList(T) = .empty,
         /// The subtrees sitting between and after `elements`. A leaf has none;
@@ -95,6 +96,19 @@ fn Node(comptime T: type) type {
 
         fn init(gpa: Allocator) Self {
             return .{ .gpa = gpa };
+        }
+
+        fn initWithPolicy(gpa: Allocator, reserved: bool, internal: bool) Error!Self {
+            var node = Self.init(gpa);
+            errdefer node.deinit();
+            node.reserved = reserved;
+            if (reserved) {
+                node.elements = try std.ArrayList(T).initCapacity(gpa, 2 * B - 1);
+                if (internal) {
+                    node.children = try std.ArrayList(Self).initCapacity(gpa, 2 * B);
+                }
+            }
+            return node;
         }
 
         fn deinit(self: *Self) void {
@@ -186,13 +200,21 @@ fn Node(comptime T: type) type {
             // `Vec::split_off` upstream (`:209`, `:212`): the upper half gets
             // a buffer of its own, because a list may only be freed through
             // the pointer it was allocated with.
-            var upper = try std.ArrayList(T).initCapacity(self.gpa, full.elements.items.len - B);
+            const element_capacity = if (self.reserved)
+                2 * B - 1
+            else
+                full.elements.items.len - B;
+            var upper = try std.ArrayList(T).initCapacity(self.gpa, element_capacity);
             errdefer upper.deinit(self.gpa);
             upper.appendSliceAssumeCapacity(full.elements.items[B..]);
 
             var upper_children: std.ArrayList(Self) = .empty;
             if (!full.isLeaf()) {
-                upper_children = try std.ArrayList(Self).initCapacity(self.gpa, full.children.items.len - B);
+                const child_capacity = if (self.reserved)
+                    2 * B
+                else
+                    full.children.items.len - B;
+                upper_children = try std.ArrayList(Self).initCapacity(self.gpa, child_capacity);
                 errdefer upper_children.deinit(self.gpa);
                 upper_children.appendSliceAssumeCapacity(full.children.items[B..]);
             }
@@ -205,6 +227,7 @@ fn Node(comptime T: type) type {
             if (!full.isLeaf()) full.children.items.len = B;
 
             var successor = Self.init(self.gpa);
+            successor.reserved = self.reserved;
             successor.elements = upper;
             successor.children = upper_children;
             full.length = full.measure();
@@ -223,6 +246,13 @@ fn Node(comptime T: type) type {
         /// reservation is made before the caller knows which case it is in,
         /// and one unused slot costs nothing.
         fn reserveMerge(self: *Self, gpa: Allocator, other: *const Self) Error!void {
+            if (self.reserved) {
+                std.debug.assert(self.elements.capacity >=
+                    self.elements.items.len + 1 + other.elements.items.len);
+                std.debug.assert(self.children.capacity >=
+                    self.children.items.len + other.children.items.len);
+                return;
+            }
             try self.elements.ensureUnusedCapacity(gpa, 1 + other.elements.items.len);
             try self.children.ensureUnusedCapacity(gpa, other.children.items.len);
         }
@@ -272,6 +302,13 @@ fn Node(comptime T: type) type {
         /// Reserves the room a borrow needs: one element and one child, taken
         /// at the front or the back of the two lists.
         fn reserveBorrow(self: *Self) Error!void {
+            if (self.reserved) {
+                std.debug.assert(self.elements.capacity > self.elements.items.len);
+                if (!self.isLeaf()) {
+                    std.debug.assert(self.children.capacity > self.children.items.len);
+                }
+                return;
+            }
             try self.elements.ensureUnusedCapacity(self.gpa, 1);
             try self.children.ensureUnusedCapacity(self.gpa, 1);
         }
@@ -558,6 +595,17 @@ fn Node(comptime T: type) type {
         /// descend, split and merge in this file depends on.
         fn checkShape(self: *const Self) err.InternalError!void {
             if (self.elements.items.len > 2 * B - 1) return error.Invariant;
+            if (self.reserved) {
+                if (self.elements.capacity < 2 * B - 1) return error.Invariant;
+                if (self.isLeaf()) {
+                    if (self.children.capacity != 0) return error.Invariant;
+                } else {
+                    if (self.children.capacity < 2 * B) return error.Invariant;
+                }
+                for (self.children.items) |child| {
+                    if (!child.reserved) return error.Invariant;
+                }
+            }
             if (self.children.items.len != 0 and
                 self.children.items.len != self.elements.items.len + 1) return error.Invariant;
             var counted: usize = 0;
@@ -599,10 +647,18 @@ pub fn SequenceTree(comptime T: type) type {
         /// empties the root returns to; it holds no buffer of its own, so it
         /// needs no `deinit` beyond the one every tree gets.
         root: ?Node(T) = null,
+        reserved: bool = false,
 
         /// A new, empty sequence.
         pub fn init(gpa: Allocator) Self {
             return .{ .gpa = gpa };
+        }
+
+        /// A new, empty sequence whose nodes reserve the maximum rebalance
+        /// capacity on insertion. Initialization does not allocate. Every valid
+        /// removal is allocation-free, even after an insertion refuses memory.
+        pub fn initReserved(gpa: Allocator) Self {
+            return .{ .gpa = gpa, .reserved = true };
         }
 
         /// Releases every node of the tree, recursively: both of each node's
@@ -653,7 +709,7 @@ pub fn SequenceTree(comptime T: type) type {
             if (index > self.len()) return error.InvalidIndex;
 
             if (self.root == null) {
-                var fresh = Node(T).init(self.gpa);
+                var fresh = try Node(T).initWithPolicy(self.gpa, self.reserved, false);
                 errdefer fresh.deinit();
                 try fresh.elements.append(self.gpa, element);
                 fresh.length = 1;
@@ -670,21 +726,24 @@ pub fn SequenceTree(comptime T: type) type {
             // Grow a level: the full root becomes the first child of a fresh
             // one, the split then lifts its middle element into the new root,
             // and the element goes into whichever half the index falls in
-            // (`sequence_tree.rs:55-77`). `old_root` is the three-word header
-            // copy `mem::replace` makes upstream, and installing the fresh
-            // node first is what keeps the two from sharing a buffer: the old
-            // root's lists and the new root's child list must not be the same
-            // allocation, or the split below would cut the new root's own
-            // child list in half.
-            const old_root = root.*;
-            root.* = Node(T).init(self.gpa);
-            root.length = old_root.length;
-            root.children.append(self.gpa, old_root) catch |e| {
-                // Nothing was allocated, so the original root goes back whole.
-                root.* = old_root;
-                return e;
+            // (`sequence_tree.rs:55-77`). The provisional root borrows the old
+            // root until the split succeeds. On refusal, detach that child and
+            // release the provisional buffers: publishing an unsplit root with
+            // no elements and one child would break the removal descent.
+            var fresh = try Node(T).initWithPolicy(self.gpa, self.reserved, true);
+            fresh.length = root.length;
+            fresh.children.append(self.gpa, root.*) catch |failure| {
+                fresh.deinit();
+                return failure;
             };
-            try root.splitChild(0);
+            fresh.splitChild(0) catch |failure| {
+                // The failed split has not changed its child. Detach that
+                // borrowed root before releasing only the provisional buffers.
+                fresh.children.items.len = 0;
+                fresh.deinit();
+                return failure;
+            };
+            root.* = fresh;
 
             const first_child_len = root.children.items[0].length;
             if (first_child_len < index) {
@@ -733,6 +792,7 @@ pub fn SequenceTree(comptime T: type) type {
         /// same order, same `length`, same shape, no orphaned subtree and no
         /// leaked node. See the module doc for why the order is the other way
         /// round from upstream's.
+        /// Trees created with `initReserved` never allocate during removal.
         pub fn remove(self: *Self, index: usize) Error!T {
             if (self.root == null or index >= self.len()) return error.InvalidIndex;
             const root = &self.root.?;
@@ -776,6 +836,8 @@ pub fn SequenceTree(comptime T: type) type {
         pub fn checkInvariants(self: *const Self) err.InternalError!void {
             // A tree with no root holds nothing, which is consistent.
             const root = if (self.root) |*r| r else return;
+            if (root.elements.items.len == 0) return error.Invariant;
+            if (root.reserved != self.reserved) return error.Invariant;
             // `checkShape` re-derives every node's `length` from its children
             // (`:423`), so the root's is checked with the rest. It used to be
             // checked a second time here, against `len()` — which is
@@ -1301,6 +1363,92 @@ fn removeUnderFailure(gpa: Allocator) !void {
 
 test "a removal refused for want of memory leaves the sequence whole" {
     try testing.checkAllAllocationFailures(testing.allocator, removeUnderFailure, .{});
+}
+
+test "a refused full-root split leaves a removable original root" {
+    // Sweep the root's provisional buffers and split buffers in default mode.
+    for (0..6) |skip| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var tree = SequenceTree(u32).init(failing.allocator());
+        defer tree.deinit();
+        var model: [2 * B - 1]u32 = undefined;
+        for (&model, 0..) |*value, index| {
+            value.* = @intCast(index);
+            try tree.push(value.*);
+        }
+        failing.fail_index = failing.alloc_index + skip;
+        failing.resize_fail_index = failing.resize_index;
+        tree.push(9999) catch |failure| {
+            try testing.expectEqual(error.OutOfMemory, failure);
+            try expectMatches(&tree, &model);
+            failing.fail_index = std.math.maxInt(usize);
+            failing.resize_fail_index = std.math.maxInt(usize);
+            try testing.expectEqual(@as(u32, 0), try tree.remove(0));
+            try expectMatches(&tree, model[1..]);
+            continue;
+        };
+        try tree.checkInvariants();
+        try testing.expectEqual(model.len + 1, tree.len());
+    }
+}
+
+test "reserved leaf nodes allocate no child storage" {
+    // One leaf pays only for its bounded element buffer. Splitting it creates
+    // child storage in the internal root, not in either resulting leaf.
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var tree = SequenceTree(u32).initReserved(failing.allocator());
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try tree.push(0);
+    try testing.expectEqual(@as(usize, 1), failing.alloc_index);
+    try testing.expectEqual((2 * B - 1) * @sizeOf(u32), failing.allocated_bytes);
+    try testing.expectEqual(@as(usize, 0), tree.root.?.children.capacity);
+    for (1..2 * B) |i| try tree.push(@intCast(i));
+    try testing.expectEqual(@as(usize, 2 * B), tree.root.?.children.capacity);
+    for (tree.root.?.children.items) |child| {
+        try testing.expect(child.isLeaf());
+        try testing.expectEqual(@as(usize, 0), child.children.capacity);
+    }
+    try tree.checkInvariants();
+}
+
+test "reserved trees roll back inserted prefixes while allocation remains refused" {
+    // Refuse each allocation around leaf and multi-level root splits, then
+    // remove the published prefix without disarming the allocator.
+    for ([_]usize{ 2 * B - 1, 1024 }) |count| {
+        for (0..12) |skip| {
+            var failing = testing.FailingAllocator.init(testing.allocator, .{});
+            var tree = SequenceTree(u32).initReserved(failing.allocator());
+            defer tree.deinit();
+            var model: [1024]u32 = undefined;
+            for (0..count) |i| {
+                model[i] = @intCast(i);
+                try tree.push(model[i]);
+            }
+            failing.fail_index = failing.alloc_index + skip;
+            failing.resize_fail_index = failing.resize_index;
+            const at = count / 2;
+            var inserted: usize = 0;
+            while (inserted < 128) : (inserted += 1) {
+                tree.insert(at + inserted, 9999) catch |failure| {
+                    try testing.expectEqual(error.OutOfMemory, failure);
+                    try tree.checkInvariants();
+                    break;
+                };
+            }
+            while (inserted > 0) : (inserted -= 1) {
+                try testing.expectEqual(@as(u32, 9999), tree.remove(at) catch unreachable);
+            }
+            try expectMatches(&tree, model[0..count]);
+            // Also prune every remaining node, including internal separators.
+            failing.fail_index = failing.alloc_index;
+            while (!tree.isEmpty()) {
+                const index = tree.len() / 2;
+                _ = tree.remove(index) catch unreachable;
+                try tree.checkInvariants();
+            }
+        }
+    }
 }
 
 test "leaf pair removals preserve the separator only when it survives" {

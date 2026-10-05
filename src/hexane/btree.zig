@@ -52,10 +52,18 @@ pub const branch_factor: usize = 64;
 /// is the same width upstream chose (`btree.rs:194-197`).
 pub const NodeId = u32;
 
-/// The errors the slab index produces. Both variants are drawn from the
-/// crate-wide sets in `error.zig`: `Error.InvalidIndex` for a slab
-/// position outside the tree, and `OutOfMemory` for the arena.
-pub const TreeError = error{ InvalidIndex, OutOfMemory };
+/// Position, allocation and checked aggregate arithmetic errors.
+pub const TreeError = error{ InvalidIndex, OutOfMemory, Overflow };
+
+/// Normalizes legacy infallible providers and checked aggregate providers.
+/// Providers return `A` or `error{Overflow}!A`; the adapter allocates nothing.
+pub fn compose(comptime A: type, left: A, right: A) error{Overflow}!A {
+    const Result = @typeInfo(@TypeOf(A.Aggregate.merge)).@"fn".return_type.?;
+    if (comptime @typeInfo(Result) == .error_union) {
+        return try A.Aggregate.merge(left, right);
+    }
+    return A.Aggregate.merge(left, right);
+}
 
 /// The running min/max of a slab's prefix-sum range, plus the number of
 /// items in it. The weight of the value and delta columns
@@ -86,16 +94,15 @@ pub const SlabAgg = struct {
         /// The weight of no slabs at all: the identity of `merge`.
         pub const identity: SlabAgg = .zero;
         /// The weight of two adjacent spans, left before right.
-        pub fn merge(l: SlabAgg, r: SlabAgg) SlabAgg {
+        pub fn merge(l: SlabAgg, r: SlabAgg) error{Overflow}!SlabAgg {
             if (l.len == 0) return r;
             if (r.len == 0) return l;
             return .{
-                .len = l.len + r.len,
-                .total = l.total + r.total,
-                // Order-sensitive on purpose (btree.rs:110-122): the right
-                // slab's offsets are relative to the left slab's end.
-                .min_offset = @min(l.min_offset, l.total + r.min_offset),
-                .max_offset = @max(l.max_offset, l.total + r.max_offset),
+                .len = try std.math.add(usize, l.len, r.len),
+                .total = try std.math.add(i64, l.total, r.total),
+                // Right offsets are relative to the left span's end.
+                .min_offset = @min(l.min_offset, try std.math.add(i64, l.total, r.min_offset)),
+                .max_offset = @max(l.max_offset, try std.math.add(i64, l.total, r.max_offset)),
             };
         }
         /// How many column rows the weight covers.
@@ -123,24 +130,25 @@ pub const SlabAgg = struct {
 
     /// `uniform` for a column whose prefix sum never decreases, whose
     /// prefix values are therefore lengths.
-    pub fn monotone(len: usize, total: usize) SlabAgg {
-        return uniform(len, @intCast(total));
+    /// Returns `error.Overflow` when `total` is outside the signed prefix domain.
+    pub fn monotone(len: usize, total: usize) error{Overflow}!SlabAgg {
+        return uniform(len, std.math.cast(i64, total) orelse return error.Overflow);
     }
 
     /// Whether the slab's value range, shifted to `prefix_before`, contains
     /// `target` (`btree.rs:138-142`).
     pub fn contains(self: SlabAgg, target: i64, prefix_before: i64) bool {
         return self.len > 0 and
-            target >= prefix_before + self.min_offset and
-            target <= prefix_before + self.max_offset;
+            @as(i128, target) >= @as(i128, prefix_before) + self.min_offset and
+            @as(i128, target) <= @as(i128, prefix_before) + self.max_offset;
     }
 
     /// Whether the slab's value range, shifted to `prefix_before`,
     /// overlaps the closed range `[lo, hi]` (`btree.rs:144-148`).
     pub fn overlaps(self: SlabAgg, lo: i64, hi: i64, prefix_before: i64) bool {
         return self.len > 0 and
-            prefix_before + self.max_offset >= lo and
-            prefix_before + self.min_offset <= hi;
+            @as(i128, prefix_before) + self.max_offset >= lo and
+            @as(i128, prefix_before) + self.min_offset <= hi;
     }
 };
 
@@ -163,16 +171,16 @@ fn ceilDiv(a: usize, b: usize) usize {
 
 /// The B+tree over slab aggregates, generic over the weight `A`.
 ///
-/// `A` must declare a namespace `Aggregate` with `identity: A`,
-/// `merge(A, A) A`, `itemCount(A) usize` and `eql(A, A) bool`. This is
-/// upstream's `SlabAggregate` trait (`btree.rs:47-54`), and the second
-/// weight the port needs — the prefix column's `(len, prefix)` — is one
-/// more instantiation of it.
+/// `A.Aggregate` supplies `identity: A`, `merge(A, A) A` or
+/// `merge(A, A) error{Overflow}!A`, `itemCount(A) usize` and `eql(A, A) bool`.
+/// Checked providers refuse any unrepresentable stored summary.
 pub fn Tree(comptime A: type) type {
     return struct {
         const Self = @This();
 
-        const merge = A.Aggregate.merge;
+        fn merge(left: A, right: A) error{Overflow}!A {
+            return compose(A, left, right);
+        }
         const itemCount = A.Aggregate.itemCount;
         const eql = A.Aggregate.eql;
         const identity = A.Aggregate.identity;
@@ -240,14 +248,18 @@ pub fn Tree(comptime A: type) type {
         root: NodeId,
         /// Number of logical slabs, equal to the sum of the leaf lengths.
         total_slabs: usize,
+        /// Validated full-tree summary, so readers do not replay arithmetic.
+        root_agg: A,
 
         /// A tree with one empty leaf root and no slabs. The root leaf is
-        /// the only node, so a fresh tree holds zero slabs.
-        pub fn init(gpa: std.mem.Allocator) TreeError!Self {
+        /// the only node, so a fresh tree holds zero slabs. Only allocation
+        /// can fail; no aggregate arithmetic or index lookup is performed.
+        /// The caller owns the result and releases it with `deinit`.
+        pub fn init(gpa: std.mem.Allocator) std.mem.Allocator.Error!Self {
             var nodes: std.ArrayList(?Node) = .empty;
             errdefer nodes.deinit(gpa);
             try nodes.append(gpa, .{ .leaf = .empty });
-            return .{ .gpa = gpa, .nodes = nodes, .free = .empty, .root = 0, .total_slabs = 0 };
+            return .{ .gpa = gpa, .nodes = nodes, .free = .empty, .root = 0, .total_slabs = 0, .root_agg = identity };
         }
 
         /// Copies the arena and every node buffer into `gpa`, preserving node
@@ -263,6 +275,7 @@ pub fn Tree(comptime A: type) type {
                 .free = .empty,
                 .root = self.root,
                 .total_slabs = self.total_slabs,
+                .root_agg = self.root_agg,
             };
             errdefer result.deinit();
             try result.nodes.ensureTotalCapacity(gpa, self.nodes.items.len);
@@ -306,7 +319,7 @@ pub fn Tree(comptime A: type) type {
 
         /// The merged aggregate of every slab in the tree.
         pub fn rootAgg(self: *const Self) A {
-            return self.aggOf(self.root);
+            return self.root_agg;
         }
 
         /// Bulk-builds a tree over `aggs`: leaves of `branch_factor` slabs,
@@ -314,6 +327,8 @@ pub fn Tree(comptime A: type) type {
         /// tree has after a column is loaded, so a later incremental edit
         /// starts from the same tree a straight build would have made
         /// (`btree.rs:317-362`).
+        /// The caller owns the result. Failure frees the candidate; `aggs`
+        /// remains borrowed and unchanged, including on `error.Overflow`.
         pub fn fromSlice(gpa: std.mem.Allocator, aggs: []const A) TreeError!Self {
             var tree = try Self.init(gpa);
             errdefer tree.deinit();
@@ -324,15 +339,16 @@ pub fn Tree(comptime A: type) type {
             defer level.deinit(gpa);
 
             var i: usize = 0;
-            while (i < aggs.len) : (i += branch_factor) {
-                const chunk = aggs[i..@min(i + branch_factor, aggs.len)];
+            while (i < aggs.len) {
+                const chunk = aggs[i..][0..@min(branch_factor, aggs.len - i)];
                 const leaf = try copyOf(gpa, A, chunk);
                 const id = tree.alloc(.{ .leaf = leaf }) catch |e| {
                     var owned = leaf;
                     owned.deinit(gpa);
                     return e;
                 };
-                try level.append(gpa, .{ .id = id, .agg = mergeAll(chunk), .slab_count = chunk.len });
+                try level.append(gpa, .{ .id = id, .agg = try mergeAll(chunk), .slab_count = chunk.len });
+                i += chunk.len;
             }
 
             while (level.items.len > 1) {
@@ -345,74 +361,39 @@ pub fn Tree(comptime A: type) type {
             // goes back on the free list.
             tree.release(tree.root);
             tree.root = level.items[0].id;
+            tree.root_agg = level.items[0].agg;
             return tree;
         }
 
         /// Replaces the aggregate of the slab at `slab_idx`
         /// (`btree.rs:366-410`).
+        /// `error.Overflow` leaves the slab and every cached ancestor unchanged.
         pub fn updateSlab(self: *Self, slab_idx: usize, new_agg: A) TreeError!void {
             if (slab_idx >= self.total_slabs) return error.InvalidIndex;
-
-            var path: std.ArrayList(PathEntry) = .empty;
-            defer path.deinit(self.gpa);
-
-            var remaining = slab_idx;
-            var node_id = self.root;
-            while (true) {
-                switch (self.node(node_id).*) {
-                    .leaf => break,
-                    .internal => |n| {
-                        var picked: ?struct { index: usize, id: NodeId } = null;
-                        for (n.items, 0..) |c, i| {
-                            if (remaining < c.slab_count) {
-                                picked = .{ .index = i, .id = c.id };
-                                break;
-                            }
-                            remaining -= c.slab_count;
-                        }
-                        // Unreachable while the cached slab counts are
-                        // correct, and the bounds check above already
-                        // proved the position is inside the tree.
-                        const p = picked orelse return error.InvalidIndex;
-                        try path.append(self.gpa, .{ .node = node_id, .child = p.index });
-                        node_id = p.id;
-                    },
-                }
-            }
-
-            switch (self.nodeMut(node_id).*) {
-                .leaf => |l| l.items[remaining] = new_agg,
-                .internal => return error.InvalidIndex,
-            }
-
-            // The slab count is unchanged, so only the aggregate needs
-            // refreshing on the way back up.
-            var i = path.items.len;
-            while (i > 0) {
-                i -= 1;
-                const entry = path.items[i];
-                const child = self.node(entry.node).internal.items[entry.child].id;
-                const agg = self.aggOf(child);
-                self.nodeMut(entry.node).internal.items[entry.child].agg = agg;
-            }
+            try self.splice(slab_idx, slab_idx + 1, &.{new_agg});
         }
 
         /// Replaces the slabs in `[start, end)` with `new` (upstream
         /// `splice`, `btree.rs:412-438`).
+        /// `error.InvalidIndex` and `error.Overflow` leave the tree unchanged.
+        /// Allocation refusal during structural publication retains the existing
+        /// abort-only contract: callers must discard their staged candidate.
         pub fn splice(self: *Self, start: usize, end: usize, new: []const A) TreeError!void {
             if (start > end or end > self.total_slabs) return error.InvalidIndex;
             if (start == end and new.len == 0) return;
-
-            // The common prefix of the removed and inserted runs is a pure
-            // in-place rewrite: no structure changes, and the delta below
-            // is usually empty.
-            const common = @min(end - start, new.len);
-            if (common > 0) try self.overwriteRange(start, new[0..common]);
-
-            const delta_start = start + common;
-            const delta_new = new[common..];
-            if (delta_start == end and delta_new.len == 0) return;
-            try self.spliceStructural(delta_start, end, delta_new);
+            const total = try std.math.add(usize, self.total_slabs - (end - start), new.len);
+            if (new.len == end - start) {
+                // Fold each affected ancestor once, with every replacement
+                // present. Intermediate partial overwrites need not fit.
+                const summary = try self.rewriteSummary(self.root, 0, start, new, false);
+                _ = try self.rewriteSummary(self.root, 0, start, new, true);
+                self.root_agg = summary;
+                return;
+            }
+            const summary = try self.preflightStructural(start, end, new);
+            try self.spliceStructural(start, end, new);
+            self.total_slabs = total;
+            self.root_agg = summary;
         }
 
         // ── Arena ────────────────────────────────────────────────────────
@@ -426,7 +407,7 @@ pub fn Tree(comptime A: type) type {
             }
             // Reserve the free-list room first: a release must never fail,
             // and one free entry per arena slot is always enough.
-            try self.free.ensureTotalCapacity(self.gpa, self.nodes.items.len + 1);
+            try self.free.ensureTotalCapacity(self.gpa, try std.math.add(usize, self.nodes.items.len, 1));
             // `NodeId` is a `u32`, so the arena cannot grow past what it
             // addresses. Upstream mints the index unchecked
             // (`btree.rs:284-290`) and relies on the arena being small; the
@@ -464,24 +445,16 @@ pub fn Tree(comptime A: type) type {
         }
 
         /// The aggregate of every slab under `id` (`btree.rs:308-313`).
-        fn aggOf(self: *const Self, id: NodeId) A {
+        fn aggOf(self: *const Self, id: NodeId) error{Overflow}!A {
             return switch (self.node(id).*) {
-                .leaf => |l| mergeAll(l.items),
-                .internal => |n| summarizeSlots(n.items).agg,
-            };
-        }
-
-        /// The number of slabs under `id` (`btree.rs:1165-1170`).
-        fn slabCountOf(self: *const Self, id: NodeId) usize {
-            return switch (self.node(id).*) {
-                .leaf => |l| l.items.len,
-                .internal => |n| summarizeSlots(n.items).slab_count,
+                .leaf => |l| try mergeAll(l.items),
+                .internal => |n| (try summarizeSlots(n.items)).agg,
             };
         }
 
         /// The aggregate and slab count of an internal node
         /// (`btree.rs:1154-1163`).
-        fn internalSummary(self: *const Self, id: NodeId) Summary {
+        fn internalSummary(self: *const Self, id: NodeId) error{Overflow}!Summary {
             return summarizeSlots(self.node(id).internal.items);
         }
 
@@ -498,21 +471,215 @@ pub fn Tree(comptime A: type) type {
 
         /// Folds `items` left to right from the identity
         /// (`merge_all`, `btree.rs:88-94`).
-        fn mergeAll(items: []const A) A {
+        fn mergeAll(items: []const A) error{Overflow}!A {
             var acc = identity;
-            for (items) |x| acc = merge(acc, x);
+            for (items) |x| acc = try merge(acc, x);
             return acc;
         }
 
         /// Folds the cached child aggregates of an internal node.
-        fn summarizeSlots(slots: []const ChildSlot) Summary {
+        fn summarizeSlots(slots: []const ChildSlot) error{Overflow}!Summary {
             var acc = identity;
             var slab_count: usize = 0;
             for (slots) |s| {
-                acc = merge(acc, s.agg);
-                slab_count += s.slab_count;
+                acc = try merge(acc, s.agg);
+                slab_count = try std.math.add(usize, slab_count, s.slab_count);
             }
             return .{ .agg = acc, .slab_count = slab_count };
+        }
+
+        /// Computes the final weights without writing, then repeats the
+        /// same folds while publishing. Unaffected children use their cache.
+        fn rewriteSummary(
+            self: *Self,
+            id: NodeId,
+            base: usize,
+            start: usize,
+            new: []const A,
+            comptime publish: bool,
+        ) error{Overflow}!A {
+            var acc = identity;
+            const end = start + new.len; // Bounds were checked by splice.
+            switch (self.node(id).*) {
+                .leaf => |l| {
+                    for (l.items, 0..) |old, i| {
+                        const pos = base + i;
+                        const value = if (pos >= start and pos < end) new[pos - start] else old;
+                        acc = try merge(acc, value);
+                        if (publish) l.items[i] = value;
+                    }
+                },
+                .internal => |n| {
+                    var cursor = base;
+                    for (n.items, 0..) |c, i| {
+                        const child_end = cursor + c.slab_count;
+                        const value = if (cursor < end and child_end > start)
+                            try self.rewriteSummary(c.id, cursor, start, new, publish)
+                        else
+                            c.agg;
+                        acc = try merge(acc, value);
+                        if (publish) self.nodeMut(id).internal.items[i].agg = value;
+                        cursor = child_end;
+                    }
+                },
+            }
+            return acc;
+        }
+
+        fn plannedSlot(summary: Summary) ChildSlot {
+            return .{ .id = 0, .agg = summary.agg, .slab_count = summary.slab_count };
+        }
+
+        /// Summary-only equivalent of splitInternal/buildLevel. It owns
+        /// only a temporary list, never nodes or a publication journal.
+        fn plannedGroups(self: *const Self, slots: []const ChildSlot, balanced: bool) TreeError!std.ArrayList(ChildSlot) {
+            var out: std.ArrayList(ChildSlot) = .empty;
+            errdefer out.deinit(self.gpa);
+            if (slots.len == 0) return out;
+            const groups = ceilDiv(slots.len, branch_factor);
+            const base = slots.len / groups;
+            const rem = slots.len % groups;
+            var at: usize = 0;
+            for (0..groups) |i| {
+                const size = if (balanced) base + @intFromBool(i < rem) else @min(branch_factor, slots.len - at);
+                try out.append(self.gpa, plannedSlot(try summarizeSlots(slots[at..][0..size])));
+                at += size;
+            }
+            return out;
+        }
+
+        /// Mirrors makeLeaves and buildChildrenAtHeight exactly; signed
+        /// relative summaries must fit at every newly introduced boundary.
+        fn plannedChildren(self: *const Self, aggs: []const A, height: usize) TreeError!std.ArrayList(ChildSlot) {
+            if (height > 0) {
+                var below = try self.plannedChildren(aggs, height - 1);
+                defer below.deinit(self.gpa);
+                return self.plannedGroups(below.items, true);
+            }
+            var out: std.ArrayList(ChildSlot) = .empty;
+            errdefer out.deinit(self.gpa);
+            if (aggs.len == 0) return out;
+            const groups = ceilDiv(aggs.len, branch_factor);
+            const base = aggs.len / groups;
+            const rem = aggs.len % groups;
+            var at: usize = 0;
+            for (0..groups) |i| {
+                const size = base + @intFromBool(i < rem);
+                try out.append(self.gpa, .{ .id = 0, .agg = try mergeAll(aggs[at..][0..size]), .slab_count = size });
+                at += size;
+            }
+            return out;
+        }
+
+        fn plannedPropagate(self: *const Self, path: []const PathEntry, replacement_in: std.ArrayList(ChildSlot)) TreeError!A {
+            var replacement = replacement_in;
+            defer replacement.deinit(self.gpa);
+            var i = path.len;
+            while (i > 0) {
+                i -= 1;
+                const step = path[i];
+                var siblings = try copyOf(self.gpa, ChildSlot, self.node(step.node).internal.items);
+                defer siblings.deinit(self.gpa);
+                try siblings.replaceRange(self.gpa, step.child, 1, replacement.items);
+                const next = try self.plannedGroups(siblings.items, true);
+                replacement.deinit(self.gpa);
+                replacement = next;
+            }
+            while (replacement.items.len > branch_factor) {
+                const next = try self.plannedGroups(replacement.items, false);
+                replacement.deinit(self.gpa);
+                replacement = next;
+            }
+            return (try summarizeSlots(replacement.items)).agg;
+        }
+
+        fn plannedBulk(self: *const Self, aggs: []const A) TreeError!A {
+            var slots: std.ArrayList(ChildSlot) = .empty;
+            defer slots.deinit(self.gpa);
+            var at: usize = 0;
+            while (at < aggs.len) {
+                const size = @min(branch_factor, aggs.len - at);
+                try slots.append(self.gpa, .{ .id = 0, .agg = try mergeAll(aggs[at..][0..size]), .slab_count = size });
+                at += size;
+            }
+            while (slots.items.len > 1) {
+                const next = try self.plannedGroups(slots.items, false);
+                slots.deinit(self.gpa);
+                slots = next;
+            }
+            return (try summarizeSlots(slots.items)).agg;
+        }
+
+        fn preflightStructural(self: *const Self, start: usize, end: usize, new: []const A) TreeError!A {
+            if (self.total_slabs == 0) return self.plannedBulk(new);
+            var path: std.ArrayList(PathEntry) = .empty;
+            defer path.deinit(self.gpa);
+            const loc = (try self.locateLeafForStart(start, &path)) orelse return error.InvalidIndex;
+            const leaf = self.node(loc.leaf).leaf.items;
+            if (end <= loc.leaf_start + leaf.len) {
+                var combined = try copyOf(self.gpa, A, leaf);
+                defer combined.deinit(self.gpa);
+                try combined.replaceRange(self.gpa, start - loc.leaf_start, end - start, new);
+                const children = try self.plannedChildren(combined.items, 0);
+                const root_summary = try self.plannedPropagate(path.items, children);
+                // The mutation refreshes ancestors before the optional merge,
+                // so both representations must have representable summaries.
+                if (path.items.len > 0 and combined.items.len > 0 and
+                    combined.items.len < branch_factor / 4 and new.len < end - start)
+                {
+                    const last = path.items[path.items.len - 1];
+                    const siblings = self.node(last.node).internal.items;
+                    const dst = if (last.child > 0) last.child - 1 else last.child;
+                    const src = if (last.child > 0) last.child else last.child + 1;
+                    if (src < siblings.len) {
+                        const neighbor = if (last.child > 0) dst else src;
+                        const count = try std.math.add(usize, combined.items.len, siblings[neighbor].slab_count);
+                        if (count <= branch_factor) {
+                            var merged: std.ArrayList(A) = .empty;
+                            defer merged.deinit(self.gpa);
+                            const other = self.node(siblings[neighbor].id).leaf.items;
+                            try merged.appendSlice(self.gpa, if (last.child > 0) other else combined.items);
+                            try merged.appendSlice(self.gpa, if (last.child > 0) combined.items else other);
+                            var parent = try copyOf(self.gpa, ChildSlot, siblings);
+                            defer parent.deinit(self.gpa);
+                            parent.items[dst] = .{ .id = 0, .agg = try mergeAll(merged.items), .slab_count = count };
+                            _ = parent.orderedRemove(src);
+                            const replacement = try self.plannedGroups(parent.items, true);
+                            return self.plannedPropagate(path.items[0 .. path.items.len - 1], replacement);
+                        }
+                    }
+                }
+                return root_summary;
+            }
+
+            var end_path: std.ArrayList(PathEntry) = .empty;
+            defer end_path.deinit(self.gpa);
+            _ = (try self.locateLeafForStart(end - 1, &end_path)) orelse return error.InvalidIndex;
+            var d: usize = 0;
+            while (d < @min(path.items.len, end_path.items.len) and
+                path.items[d].child == end_path.items[d].child) : (d += 1)
+            {}
+            if (d == @min(path.items.len, end_path.items.len)) return error.InvalidIndex;
+            const lca = path.items[d].node;
+            const left = path.items[d].child;
+            const right = end_path.items[d].child;
+            const siblings = self.node(lca).internal.items;
+            var offset: usize = 0;
+            for (path.items[0..d]) |step| {
+                for (self.node(step.node).internal.items[0..step.child]) |c| offset += c.slab_count;
+            }
+            for (siblings[0..left]) |c| offset += c.slab_count;
+            var combined: std.ArrayList(A) = .empty;
+            defer combined.deinit(self.gpa);
+            for (siblings[left .. right + 1]) |c| try self.collectInto(c.id, &combined);
+            try combined.replaceRange(self.gpa, start - offset, end - start, new);
+            var children = try self.plannedChildren(combined.items, self.subtreeHeight(siblings[left].id));
+            defer children.deinit(self.gpa);
+            var parent = try copyOf(self.gpa, ChildSlot, siblings);
+            defer parent.deinit(self.gpa);
+            try parent.replaceRange(self.gpa, left, right - left + 1, children.items);
+            const replacement = try self.plannedGroups(parent.items, true);
+            return self.plannedPropagate(path.items[0..d], replacement);
         }
 
         // ── Bulk build helpers ───────────────────────────────────────────
@@ -527,8 +694,8 @@ pub fn Tree(comptime A: type) type {
             var out: std.ArrayList(ChildSlot) = .empty;
             errdefer out.deinit(gpa);
             var i: usize = 0;
-            while (i < slots.len) : (i += branch_factor) {
-                const chunk = slots[i..@min(i + branch_factor, slots.len)];
+            while (i < slots.len) {
+                const chunk = slots[i..][0..@min(branch_factor, slots.len - i)];
                 const children = try copyOf(gpa, ChildSlot, chunk);
                 const slot = self.makeInternal(children) catch |e| {
                     var owned = children;
@@ -536,6 +703,7 @@ pub fn Tree(comptime A: type) type {
                     return e;
                 };
                 try out.append(gpa, slot);
+                i += chunk.len;
             }
             return out;
         }
@@ -543,12 +711,9 @@ pub fn Tree(comptime A: type) type {
         /// Allocates an internal node over `children`, taking ownership of
         /// the list, and returns its slot.
         fn makeInternal(self: *Self, children: std.ArrayList(ChildSlot)) TreeError!ChildSlot {
-            const summary = summarizeSlots(children.items);
-            const id = self.alloc(.{ .internal = children }) catch |e| {
-                var owned = children;
-                owned.deinit(self.gpa);
-                return e;
-            };
+            // Ownership transfers only after both summary and allocation succeed.
+            const summary = try summarizeSlots(children.items);
+            const id = try self.alloc(.{ .internal = children });
             return .{ .id = id, .agg = summary.agg, .slab_count = summary.slab_count };
         }
 
@@ -578,6 +743,7 @@ pub fn Tree(comptime A: type) type {
             for (0..num_leaves) |c| {
                 const size = base + @intFromBool(c < rem);
                 const chunk = aggs[i..][0..size];
+                const summary = try mergeAll(chunk);
                 const reuse = if (c == 0) first_leaf_id else null;
                 const id: NodeId = if (reuse) |known|
                     known
@@ -601,7 +767,7 @@ pub fn Tree(comptime A: type) type {
                 }
                 try out.append(self.gpa, .{
                     .id = id,
-                    .agg = mergeAll(chunk),
+                    .agg = summary,
                     .slab_count = size,
                 });
                 i += size;
@@ -645,36 +811,6 @@ pub fn Tree(comptime A: type) type {
         }
 
         // ── Splice ───────────────────────────────────────────────────────
-
-        /// Rewrites `new` over the slabs starting at `start` without
-        /// touching the structure (`overwrite_range`, `btree.rs:442-469`).
-        fn overwriteRange(self: *Self, start: usize, new: []const A) TreeError!void {
-            var path: std.ArrayList(PathEntry) = .empty;
-            defer path.deinit(self.gpa);
-
-            var cursor = start;
-            var i: usize = 0;
-            while (i < new.len) {
-                path.clearRetainingCapacity();
-                const loc = (try self.locateLeafForStart(cursor, &path)) orelse return;
-                const leaf_len = switch (self.node(loc.leaf).*) {
-                    .leaf => |l| l.items.len,
-                    .internal => return error.InvalidIndex,
-                };
-                const local_start = cursor - loc.leaf_start;
-                const count = @min(leaf_len - local_start, new.len - i);
-                // Only reachable if the cached slab counts are stale;
-                // bail rather than spin.
-                if (count == 0) return;
-                switch (self.nodeMut(loc.leaf).*) {
-                    .leaf => |l| @memcpy(l.items[local_start..][0..count], new[i..][0..count]),
-                    .internal => return error.InvalidIndex,
-                }
-                self.updateAncestorAggregates(path.items, loc.leaf);
-                cursor += count;
-                i += count;
-            }
-        }
 
         /// Routes the structural part of a splice (`splice_structural`,
         /// `btree.rs:473-482`).
@@ -721,23 +857,23 @@ pub fn Tree(comptime A: type) type {
 
             const local_start = start - loc.leaf_start;
             const local_end = end - loc.leaf_start;
-            const new_leaf_len = leaf_len + new.len - (end - start);
+            const new_leaf_len = try std.math.add(usize, leaf_len - (end - start), new.len);
 
             if (new_leaf_len <= branch_factor) {
                 if (new_leaf_len == 0 and loc.leaf != self.root) {
                     // An empty non-root leaf is not allowed: remove it and
                     // cascade. The root, if it is this leaf, is emptied in
                     // place below.
-                    self.removeAndCascade(path.items);
-                    self.total_slabs = self.total_slabs + new.len - (end - start);
+                    try self.removeAndCascade(path.items);
+                    self.total_slabs = try std.math.add(usize, self.total_slabs - (end - start), new.len);
                     return true;
                 }
                 switch (self.nodeMut(loc.leaf).*) {
                     .leaf => |*l| try l.replaceRange(self.gpa, local_start, local_end - local_start, new),
                     .internal => return error.InvalidIndex,
                 }
-                self.updateAncestorAggregates(path.items, loc.leaf);
-                self.total_slabs = self.total_slabs + new.len - (end - start);
+                try self.updateAncestorAggregates(path.items, loc.leaf);
+                self.total_slabs = try std.math.add(usize, self.total_slabs - (end - start), new.len);
                 if (new.len < end - start) {
                     // The leaf shrank: merge it with a sibling if it went
                     // under a quarter full.
@@ -762,7 +898,7 @@ pub fn Tree(comptime A: type) type {
 
             const children = try self.makeLeaves(combined.items, loc.leaf);
             try self.propagateSplits(path.items, children);
-            self.total_slabs = self.total_slabs + new.len - (end - start);
+            self.total_slabs = try std.math.add(usize, self.total_slabs - (end - start), new.len);
             return true;
         }
 
@@ -849,7 +985,7 @@ pub fn Tree(comptime A: type) type {
                 try siblings.replaceRange(self.gpa, left_child, right_child - left_child + 1, children.items);
                 break :blk siblings.items.len;
             };
-            self.total_slabs = self.total_slabs + new.len - (end - start);
+            self.total_slabs = try std.math.add(usize, self.total_slabs - (end - start), new.len);
 
             if (new_lca_len == 0) {
                 // Every child of the LCA went away. An empty internal node
@@ -859,10 +995,10 @@ pub fn Tree(comptime A: type) type {
                 if (lca_path.len == 0) {
                     self.resetToEmptyLeaf(lca_id);
                 } else {
-                    self.removeAndCascade(lca_path);
+                    try self.removeAndCascade(lca_path);
                 }
             } else if (new_lca_len <= branch_factor) {
-                const summary = self.internalSummary(lca_id);
+                const summary = try self.internalSummary(lca_id);
                 var replacement: std.ArrayList(ChildSlot) = .empty;
                 errdefer replacement.deinit(self.gpa);
                 try replacement.append(self.gpa, .{
@@ -892,7 +1028,7 @@ pub fn Tree(comptime A: type) type {
         /// root becomes a fresh empty leaf. Surviving ancestors get their
         /// cached aggregate and slab count refreshed
         /// (`remove_and_cascade`, `btree.rs:657-685`).
-        fn removeAndCascade(self: *Self, path: []const PathEntry) void {
+        fn removeAndCascade(self: *Self, path: []const PathEntry) error{Overflow}!void {
             var i = path.len;
             while (i > 0) {
                 i -= 1;
@@ -914,7 +1050,7 @@ pub fn Tree(comptime A: type) type {
                     }
                     continue; // cascade
                 }
-                self.updateAncestorAggregates(path[0..i], parent_id);
+                try self.updateAncestorAggregates(path[0..i], parent_id);
                 return;
             }
         }
@@ -971,7 +1107,7 @@ pub fn Tree(comptime A: type) type {
                 return; // only child: cascade and collapse handle it
             const src_idx = if (child_idx > 0) child_idx else child_idx + 1;
 
-            const combined = siblings[dst_idx].slab_count + siblings[src_idx].slab_count;
+            const combined = try std.math.add(usize, siblings[dst_idx].slab_count, siblings[src_idx].slab_count);
             if (combined > branch_factor) return;
             const dst_id = siblings[dst_idx].id;
             const src_id = siblings[src_idx].id;
@@ -981,12 +1117,12 @@ pub fn Tree(comptime A: type) type {
             try self.appendLeafList(dst_id, moved.items);
             self.release(src_id);
 
-            const agg = self.aggOf(dst_id);
+            const agg = try self.aggOf(dst_id);
             const parent = &self.nodeMut(parent_id).internal;
             parent.items[dst_idx].agg = agg;
             parent.items[dst_idx].slab_count = combined;
             _ = parent.orderedRemove(src_idx);
-            self.updateAncestorAggregates(path[0 .. path.len - 1], parent_id);
+            try self.updateAncestorAggregates(path[0 .. path.len - 1], parent_id);
         }
 
         /// Empties the leaf at `id` and hands its aggregate list to the
@@ -1040,7 +1176,6 @@ pub fn Tree(comptime A: type) type {
             const first_size = base + @intFromBool(rem > 0);
 
             var tail: std.ArrayList(ChildSlot) = .empty;
-            errdefer tail.deinit(self.gpa);
             {
                 const siblings = &self.nodeMut(node_id).internal;
                 const buf = try self.gpa.dupe(ChildSlot, siblings.items[first_size..]);
@@ -1052,7 +1187,7 @@ pub fn Tree(comptime A: type) type {
             var out: std.ArrayList(ChildSlot) = .empty;
             errdefer out.deinit(self.gpa);
 
-            const first = self.internalSummary(node_id);
+            const first = try self.internalSummary(node_id);
             try out.append(self.gpa, .{
                 .id = node_id,
                 .agg = first.agg,
@@ -1107,7 +1242,7 @@ pub fn Tree(comptime A: type) type {
                     break :blk siblings.items.len;
                 };
                 if (new_total <= branch_factor) {
-                    const summary = self.internalSummary(parent_id);
+                    const summary = try self.internalSummary(parent_id);
                     // The slots are now the parent's; the list carries
                     // only the parent itself up to the next level.
                     replacement.clearRetainingCapacity();
@@ -1152,25 +1287,19 @@ pub fn Tree(comptime A: type) type {
                     // overflow arm with an empty `path` — the old root was
                     // the leaf being rewritten, and its slot is among the
                     // groups already.
-                    if (replacement.items.len <= branch_factor) {
-                        const children = replacement;
-                        replacement = .empty;
-                        const id = self.alloc(.{ .internal = children }) catch |e| {
-                            var owned = children;
-                            owned.deinit(self.gpa);
-                            return e;
-                        };
-                        self.root = id;
-                    } else {
+                    while (replacement.items.len > branch_factor) {
                         const groups = try self.buildLevel(self.gpa, replacement.items);
                         replacement.deinit(self.gpa);
-                        const id = self.alloc(.{ .internal = groups }) catch |e| {
-                            var owned = groups;
-                            owned.deinit(self.gpa);
-                            return e;
-                        };
-                        self.root = id;
+                        replacement = groups;
                     }
+                    const children = replacement;
+                    replacement = .empty;
+                    const slot = self.makeInternal(children) catch |e| {
+                        var owned = children;
+                        owned.deinit(self.gpa);
+                        return e;
+                    };
+                    self.root = slot.id;
                 },
             }
         }
@@ -1217,16 +1346,18 @@ pub fn Tree(comptime A: type) type {
         /// Recomputes each ancestor's cached aggregate and slab count from
         /// the subtree below it (`update_ancestor_aggregates`,
         /// `btree.rs:1014-1025`).
-        fn updateAncestorAggregates(self: *Self, path: []const PathEntry, leaf_id: NodeId) void {
+        fn updateAncestorAggregates(self: *Self, path: []const PathEntry, leaf_id: NodeId) error{Overflow}!void {
             var current = leaf_id;
             var i = path.len;
             while (i > 0) {
                 i -= 1;
-                const agg = self.aggOf(current);
-                const count = self.slabCountOf(current);
+                const summary: Summary = switch (self.node(current).*) {
+                    .leaf => |l| .{ .agg = try mergeAll(l.items), .slab_count = l.items.len },
+                    .internal => |n| try summarizeSlots(n.items),
+                };
                 const slot = &self.nodeMut(path[i].node).internal.items[path[i].child];
-                slot.agg = agg;
-                slot.slab_count = count;
+                slot.agg = summary.agg;
+                slot.slab_count = summary.slab_count;
                 current = path[i].node;
             }
         }
@@ -1237,6 +1368,8 @@ pub fn Tree(comptime A: type) type {
         /// before it. `null` when `pos` is at or past the end
         /// (`find_by_prefix`, `btree.rs:1192-1227`).
         pub fn findByPrefix(self: *const Self, pos: usize) ?PositionalHit {
+            // Checked constructors/mutations bound every nonnegative partial
+            // item count by itemCount(root_agg), and slab counts by len().
             var cursor_id = self.root;
             var remaining = pos;
             var slab_base: usize = 0;
@@ -1300,11 +1433,13 @@ pub fn Tree(comptime A: type) type {
         /// A target at or past the total answers `len()`, the one-past-the-
         /// end position every caller here checks for
         /// (`prefix.rs:615-617`).
+        /// `error.Overflow` means an absolute running endpoint did not fit i64;
+        /// the tree is unchanged and no partial hit is returned.
         pub fn findByPrefixSum(
             self: *const Self,
             comptime incr: fn (A) i64,
             target: i64,
-        ) PrefixSumHit {
+        ) error{Overflow}!PrefixSumHit {
             var prefix: i64 = 0;
             var items: usize = 0;
             var slab_base: usize = 0;
@@ -1313,15 +1448,16 @@ pub fn Tree(comptime A: type) type {
                 switch (self.node(cursor).*) {
                     .leaf => |l| {
                         for (l.items, 0..) |a, i| {
-                            if (target <= prefix + incr(a)) {
+                            const after = try std.math.add(i64, prefix, incr(a));
+                            if (target <= after) {
                                 return .{
                                     .slab = slab_base + i,
                                     .items_before = items,
                                     .prefix_before = prefix,
                                 };
                             }
-                            prefix += incr(a);
-                            items += itemCount(a);
+                            prefix = after;
+                            items = try std.math.add(usize, items, itemCount(a));
                         }
                         return .{
                             .slab = slab_base + l.items.len,
@@ -1332,14 +1468,15 @@ pub fn Tree(comptime A: type) type {
                     .internal => |n| {
                         var descended = false;
                         for (n.items) |c| {
-                            if (target <= prefix + incr(c.agg)) {
+                            const after = try std.math.add(i64, prefix, incr(c.agg));
+                            if (target <= after) {
                                 cursor = c.id;
                                 descended = true;
                                 break;
                             }
-                            prefix += incr(c.agg);
-                            items += itemCount(c.agg);
-                            slab_base += c.slab_count;
+                            prefix = after;
+                            items = try std.math.add(usize, items, itemCount(c.agg));
+                            slab_base = try std.math.add(usize, slab_base, c.slab_count);
                         }
                         if (!descended) {
                             return .{
@@ -1357,6 +1494,8 @@ pub fn Tree(comptime A: type) type {
         /// `slab_idx == len()` and answers with the total
         /// (`items_before_slab`, `btree.rs:1232-1265`).
         pub fn itemsBeforeSlab(self: *const Self, slab_idx: usize) usize {
+            // Every accumulated row count is a prefix of the checked root's
+            // nonnegative item count, so no arithmetic refusal is needed.
             var remaining = slab_idx;
             var items: usize = 0;
             var cursor_id = self.root;
@@ -1411,7 +1550,7 @@ pub fn Tree(comptime A: type) type {
             node_empty,
             /// Leaves are not all at the same depth.
             non_uniform_depth,
-            /// A cached child aggregate or slab count is stale.
+            /// A cached child/root aggregate or slab count is stale.
             stale_child_summary,
         };
 
@@ -1443,7 +1582,10 @@ pub fn Tree(comptime A: type) type {
                     .node_overfull => std.fmt.bufPrint(buf, "node {d} holds {d} entries, over the branch factor", .{ at, self.actual }) catch "node overfull",
                     .node_empty => std.fmt.bufPrint(buf, "node {d} is empty", .{at}) catch "empty node",
                     .non_uniform_depth => std.fmt.bufPrint(buf, "node {d} sits at depth {d}, not {d}", .{ at, self.actual, self.expected }) catch "non-uniform depth",
-                    .stale_child_summary => std.fmt.bufPrint(buf, "node {d} caches the wrong summary for child {d}", .{ at, child }) catch "stale child summary",
+                    .stale_child_summary => if (self.child == null)
+                        "the root caches the wrong aggregate"
+                    else
+                        std.fmt.bufPrint(buf, "node {d} caches the wrong summary for child {d}", .{ at, child }) catch "stale child summary",
                 };
             }
         };
@@ -1477,6 +1619,9 @@ pub fn Tree(comptime A: type) type {
                     .expected = self.total_slabs,
                     .actual = info.slabs,
                 };
+            }
+            if (!eql(info.agg, self.root_agg)) {
+                return Violation{ .kind = .stale_child_summary, .node = self.root };
             }
 
             // The free list must hold every dead node exactly once and no
@@ -1580,7 +1725,7 @@ pub fn Tree(comptime A: type) type {
                     } else {
                         leaf_depth.* = depth;
                     }
-                    return .{ .slabs = l.items.len, .agg = mergeAll(l.items) };
+                    return .{ .slabs = l.items.len, .agg = try mergeAll(l.items) };
                 },
                 .internal => |n| {
                     if (n.items.len == 0) {
@@ -1604,8 +1749,8 @@ pub fn Tree(comptime A: type) type {
                             fail.* = .{ .kind = .stale_child_summary, .node = id, .child = c.id };
                             return .{ .slabs = 0, .agg = identity };
                         }
-                        slabs += child.slabs;
-                        agg = merge(agg, child.agg);
+                        slabs = try std.math.add(usize, slabs, child.slabs);
+                        agg = try merge(agg, child.agg);
                     }
                     return .{ .slabs = slabs, .agg = agg };
                 },
@@ -1637,7 +1782,8 @@ pub const FoundSlab = struct {
 ///
 /// `O(log slabs)`: descends by item count, accumulating the prefix sum and
 /// item count of the children passed on the way.
-pub fn findSlabAtItem(tree: *const SlabBTree, item_idx: usize) FoundSlab {
+/// Returns `error.Overflow` for an unrepresentable absolute prefix; no mutation.
+pub fn findSlabAtItem(tree: *const SlabBTree, item_idx: usize) error{Overflow}!FoundSlab {
     var prefix: i64 = 0;
     var items_before: usize = 0;
     var slab_base: usize = 0;
@@ -1650,8 +1796,8 @@ pub fn findSlabAtItem(tree: *const SlabBTree, item_idx: usize) FoundSlab {
                     if (remaining < a.len) {
                         return .{ .index = slab_base + i, .prefix = prefix, .items_before = items_before };
                     }
-                    prefix += a.total;
-                    items_before += a.len;
+                    prefix = try std.math.add(i64, prefix, a.total);
+                    items_before = try std.math.add(usize, items_before, a.len);
                     remaining -= a.len;
                 }
                 return .{
@@ -1668,9 +1814,9 @@ pub fn findSlabAtItem(tree: *const SlabBTree, item_idx: usize) FoundSlab {
                         descended = true;
                         break;
                     }
-                    prefix += c.agg.total;
-                    items_before += c.agg.len;
-                    slab_base += c.slab_count;
+                    prefix = try std.math.add(i64, prefix, c.agg.total);
+                    items_before = try std.math.add(usize, items_before, c.agg.len);
+                    slab_base = try std.math.add(usize, slab_base, c.slab_count);
                     remaining -= c.agg.len;
                 }
                 if (!descended) {
@@ -1687,7 +1833,7 @@ pub fn findSlabAtItem(tree: *const SlabBTree, item_idx: usize) FoundSlab {
 ///
 /// `O(log slabs)`: descends by comparing `target` with the running prefix
 /// sums of the sibling subtrees.
-pub fn findSlabAtPrefix(tree: *const SlabBTree, target: i64) FoundSlab {
+pub fn findSlabAtPrefix(tree: *const SlabBTree, target: i64) error{Overflow}!FoundSlab {
     var prefix: i64 = 0;
     var items_before: usize = 0;
     var slab_base: usize = 0;
@@ -1696,11 +1842,12 @@ pub fn findSlabAtPrefix(tree: *const SlabBTree, target: i64) FoundSlab {
         switch (tree.node(node).*) {
             .leaf => |l| {
                 for (l.items, 0..) |a, i| {
-                    if (target <= prefix + a.total) {
+                    const after = try std.math.add(i64, prefix, a.total);
+                    if (target <= after) {
                         return .{ .index = slab_base + i, .prefix = prefix, .items_before = items_before };
                     }
-                    prefix += a.total;
-                    items_before += a.len;
+                    prefix = after;
+                    items_before = try std.math.add(usize, items_before, a.len);
                 }
                 return .{
                     .index = slab_base + l.items.len,
@@ -1711,14 +1858,15 @@ pub fn findSlabAtPrefix(tree: *const SlabBTree, target: i64) FoundSlab {
             .internal => |n| {
                 var descended = false;
                 for (n.items) |c| {
-                    if (target <= prefix + c.agg.total) {
+                    const after = try std.math.add(i64, prefix, c.agg.total);
+                    if (target <= after) {
                         node = c.id;
                         descended = true;
                         break;
                     }
-                    prefix += c.agg.total;
-                    items_before += c.agg.len;
-                    slab_base += c.slab_count;
+                    prefix = after;
+                    items_before = try std.math.add(usize, items_before, c.agg.len);
+                    slab_base = try std.math.add(usize, slab_base, c.slab_count);
                 }
                 if (!descended) {
                     return .{ .index = slab_base, .prefix = prefix, .items_before = items_before };
@@ -1782,7 +1930,9 @@ pub const FindByValue = struct {
 
     /// The next slab containing the target, or `null` at the end of the
     /// walk.
-    pub fn next(self: *FindByValue) ?ValueHit {
+    /// On `error.Overflow`, the failing slab is not consumed; earlier progress
+    /// remains. The tree is never mutated.
+    pub fn next(self: *FindByValue) error{Overflow}!?ValueHit {
         while (self.stack.items.len > 0) {
             const top = self.stack.items.len - 1;
             switch (self.tree.node(self.stack.items[top].node).*) {
@@ -1799,9 +1949,11 @@ pub const FindByValue = struct {
                         .items_before = self.stack.items[top].items_before,
                         .prefix_before = prefix,
                     };
+                    const after = try std.math.add(i64, prefix, agg.total);
+                    const items_after = try std.math.add(usize, hit.items_before, agg.len);
                     self.stack.items[top].next_child += 1;
-                    self.stack.items[top].prefix_before += agg.total;
-                    self.stack.items[top].items_before += agg.len;
+                    self.stack.items[top].prefix_before = after;
+                    self.stack.items[top].items_before = items_after;
                     if (agg.contains(self.target, prefix)) return hit;
                 },
                 .internal => |n| {
@@ -1813,10 +1965,13 @@ pub const FindByValue = struct {
                     const prefix = self.stack.items[top].prefix_before;
                     const slab_base = self.stack.items[top].slab_base;
                     const items_before = self.stack.items[top].items_before;
+                    const after = try std.math.add(i64, prefix, child.agg.total);
+                    const slabs_after = try std.math.add(usize, slab_base, child.slab_count);
+                    const items_after = try std.math.add(usize, items_before, child.agg.len);
                     self.stack.items[top].next_child += 1;
-                    self.stack.items[top].prefix_before += child.agg.total;
-                    self.stack.items[top].slab_base += child.slab_count;
-                    self.stack.items[top].items_before += child.agg.len;
+                    self.stack.items[top].prefix_before = after;
+                    self.stack.items[top].slab_base = slabs_after;
+                    self.stack.items[top].items_before = items_after;
                     if (child.agg.contains(self.target, prefix)) {
                         // The stack was sized to the tree's height, so
                         // there is always room for one more level.
@@ -1871,7 +2026,9 @@ pub const FindByValueRange = struct {
 
     /// The next slab overlapping the range, or `null` at the end of the
     /// walk.
-    pub fn next(self: *FindByValueRange) ?ValueHit {
+    /// On `error.Overflow`, the failing slab is not consumed; earlier progress
+    /// remains. The tree is never mutated.
+    pub fn next(self: *FindByValueRange) error{Overflow}!?ValueHit {
         while (self.stack.items.len > 0) {
             const top = self.stack.items.len - 1;
             switch (self.tree.node(self.stack.items[top].node).*) {
@@ -1888,9 +2045,11 @@ pub const FindByValueRange = struct {
                         .items_before = self.stack.items[top].items_before,
                         .prefix_before = prefix,
                     };
+                    const after = try std.math.add(i64, prefix, agg.total);
+                    const items_after = try std.math.add(usize, hit.items_before, agg.len);
                     self.stack.items[top].next_child += 1;
-                    self.stack.items[top].prefix_before += agg.total;
-                    self.stack.items[top].items_before += agg.len;
+                    self.stack.items[top].prefix_before = after;
+                    self.stack.items[top].items_before = items_after;
                     if (agg.overlaps(self.lo, self.hi, prefix)) return hit;
                 },
                 .internal => |n| {
@@ -1902,10 +2061,13 @@ pub const FindByValueRange = struct {
                     const prefix = self.stack.items[top].prefix_before;
                     const slab_base = self.stack.items[top].slab_base;
                     const items_before = self.stack.items[top].items_before;
+                    const after = try std.math.add(i64, prefix, child.agg.total);
+                    const slabs_after = try std.math.add(usize, slab_base, child.slab_count);
+                    const items_after = try std.math.add(usize, items_before, child.agg.len);
                     self.stack.items[top].next_child += 1;
-                    self.stack.items[top].prefix_before += child.agg.total;
-                    self.stack.items[top].slab_base += child.slab_count;
-                    self.stack.items[top].items_before += child.agg.len;
+                    self.stack.items[top].prefix_before = after;
+                    self.stack.items[top].slab_base = slabs_after;
+                    self.stack.items[top].items_before = items_after;
                     if (child.agg.overlaps(self.lo, self.hi, prefix)) {
                         std.debug.assert(self.stack.items.len < self.stack.capacity);
                         self.stack.appendAssumeCapacity(.{
@@ -1927,6 +2089,150 @@ pub const FindByValueRange = struct {
 
 const testing = std.testing;
 
+test "checked composition refuses unrepresentable aggregate endpoints" {
+    const hi = std.math.maxInt(i64);
+    const lo = std.math.minInt(i64);
+    try testing.expectError(error.Overflow, compose(SlabAgg, simple(1, hi), simple(1, 1)));
+    try testing.expectError(error.Overflow, compose(SlabAgg, simple(1, lo), simple(1, -1)));
+    try testing.expectError(error.Overflow, compose(SlabAgg, .{ .len = std.math.maxInt(usize) }, .{ .len = 1 }));
+    try testing.expectError(error.Overflow, compose(SlabAgg, .{ .len = 1, .total = hi }, .{ .len = 1, .total = -1, .max_offset = 1 }));
+    try testing.expectError(error.Overflow, compose(SlabAgg, .{ .len = 1, .total = lo }, .{ .len = 1, .total = 1, .min_offset = -1 }));
+    try testing.expectEqualDeep(simple(2, hi), try compose(SlabAgg, simple(1, hi), simple(1, 0)));
+    try testing.expectEqualDeep(simple(2, lo), try compose(SlabAgg, simple(1, lo), simple(1, 0)));
+    if (std.math.cast(i64, std.math.maxInt(usize))) |total| {
+        try testing.expectEqual(total, (try SlabAgg.monotone(1, std.math.maxInt(usize))).total);
+    } else {
+        try testing.expectError(error.Overflow, SlabAgg.monotone(1, std.math.maxInt(usize)));
+    }
+}
+
+test "arithmetic refusal leaves tree updates and splices unchanged" {
+    const hi = std.math.maxInt(i64);
+    const initial = [_]SlabAgg{ simple(1, hi - 1), simple(1, 1) };
+    var tree = try SlabBTree.fromSlice(testing.allocator, &initial);
+    defer tree.deinit();
+    const before = tree.rootAgg();
+    try testing.expectError(error.Overflow, tree.updateSlab(1, simple(1, 2)));
+    try testing.expectEqualDeep(before, tree.rootAgg());
+    try testing.expectEqual(FoundSlab{ .index = 1, .prefix = hi - 1, .items_before = 1 }, try findSlabAtItem(&tree, 1));
+    try testing.expectError(error.Overflow, tree.splice(1, 2, &.{simple(1, 2)}));
+    try testing.expectEqualDeep(before, tree.rootAgg());
+    try testing.expectError(error.Overflow, tree.splice(2, 2, &.{simple(1, 1)}));
+    try testing.expectEqualDeep(before, tree.rootAgg());
+    try testing.expectEqual(@as(usize, 2), tree.len());
+    try expectSound(&tree);
+    try testing.expectError(error.Overflow, SlabBTree.fromSlice(testing.allocator, &.{ simple(1, hi), simple(1, 1) }));
+}
+
+test "range comparisons do not overflow translated endpoints" {
+    const hi = std.math.maxInt(i64);
+    const lo = std.math.minInt(i64);
+    try testing.expect(simple(1, 1).contains(hi, hi));
+    try testing.expect(!simple(1, 1).contains(lo, hi));
+    try testing.expect(simple(1, -1).overlaps(lo, lo, lo));
+    try testing.expect(!simple(1, -1).overlaps(hi, hi, lo));
+}
+
+test "a structural split refuses relative overflow without changing source slabs" {
+    const hi = std.math.maxInt(i64);
+    var aggs = [_]SlabAgg{simple(1, 0)} ** branch_factor;
+    aggs[0] = simple(1, -hi);
+    aggs[40] = simple(1, hi);
+    aggs[41] = simple(1, 1);
+    aggs[42] = simple(1, -1);
+    var tree = try SlabBTree.fromSlice(testing.allocator, &aggs);
+    defer tree.deinit();
+    const before = tree.rootAgg();
+    try testing.expectError(error.Overflow, tree.splice(0, 0, &.{simple(1, 0)}));
+    try testing.expectEqualDeep(before, tree.rootAgg());
+    try testing.expectEqual(branch_factor, tree.len());
+    var prefix: i64 = 0;
+    for (aggs, 0..) |a, i| {
+        try testing.expectEqual(FoundSlab{ .index = i, .prefix = prefix, .items_before = i }, try findSlabAtItem(&tree, i));
+        prefix = try std.math.add(i64, prefix, a.total);
+    }
+    try expectSound(&tree);
+}
+
+test "a multi-leaf rewrite checks its final summaries instead of partial publication" {
+    const hi = std.math.maxInt(i64);
+    var aggs = [_]SlabAgg{simple(1, 0)} ** (branch_factor * 2);
+    aggs[0] = simple(1, hi);
+    aggs[branch_factor] = simple(1, -hi);
+    var tree = try SlabBTree.fromSlice(testing.allocator, &aggs);
+    defer tree.deinit();
+    aggs[0] = simple(1, -hi);
+    aggs[branch_factor] = simple(1, hi);
+    try tree.splice(0, aggs.len, &aggs);
+    try testing.expectEqualDeep(try referenceRoot(&aggs), tree.rootAgg());
+    try testing.expectEqual(FoundSlab{ .index = branch_factor, .prefix = -hi, .items_before = branch_factor }, try findSlabAtItem(&tree, branch_factor));
+    try expectSound(&tree);
+}
+
+test "allocation refusal during structural preflight leaves the source readable" {
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+    const initial = [_]SlabAgg{ simple(1, 3), simple(1, -1) };
+    var tree = try SlabBTree.fromSlice(failing.allocator(), &initial);
+    defer tree.deinit();
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try testing.expectError(error.OutOfMemory, tree.splice(1, 1, &.{simple(1, 4)}));
+    try testing.expectEqual(@as(usize, 2), tree.len());
+    try testing.expectEqualDeep(try referenceRoot(&initial), tree.rootAgg());
+    try testing.expectEqual(FoundSlab{ .index = 1, .prefix = 3, .items_before = 1 }, try findSlabAtItem(&tree, 1));
+}
+
+test "the composition adapter preserves infallible aggregate providers" {
+    const Maximum = struct {
+        value: usize,
+        const Weight = @This();
+        pub const Aggregate = struct {
+            pub const identity: Weight = .{ .value = 0 };
+            pub fn merge(left: Weight, right: Weight) Weight {
+                return .{ .value = @max(left.value, right.value) };
+            }
+            pub fn itemCount(_: Weight) usize {
+                return 0;
+            }
+            pub fn eql(left: Weight, right: Weight) bool {
+                return left.value == right.value;
+            }
+        };
+    };
+    var tree = try Tree(Maximum).fromSlice(testing.allocator, &.{ .{ .value = 4 }, .{ .value = 9 } });
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 9), tree.rootAgg().value);
+    try tree.updateSlab(0, .{ .value = 12 });
+    try testing.expectEqual(@as(usize, 12), tree.rootAgg().value);
+    try tree.splice(1, 2, &.{});
+    try testing.expectEqual(@as(usize, 12), tree.rootAgg().value);
+}
+
+test "checked row totals retain the full usize boundary" {
+    const max = std.math.maxInt(usize);
+    var tree = try SlabBTree.fromSlice(testing.allocator, &.{ simple(max - 1, 0), simple(1, 0) });
+    defer tree.deinit();
+    try testing.expectEqual(max, tree.rootAgg().len);
+    try testing.expectEqual(max, tree.itemsBeforeSlab(2));
+    try testing.expectEqual(SlabBTree.PositionalHit{ .slab = 1, .items_before = max - 1 }, tree.findByPrefix(max - 1).?);
+    try testing.expectEqual(@as(?SlabBTree.PositionalHit, null), tree.findByPrefix(max));
+    try testing.expectError(error.Overflow, tree.updateSlab(1, simple(2, 0)));
+    try testing.expectEqual(max, tree.rootAgg().len);
+    try testing.expectError(error.Overflow, SlabBTree.fromSlice(testing.allocator, &.{ simple(max, 0), simple(1, 0) }));
+}
+
+test "prefix-sum queries explicitly refuse overflowing ancestor translations" {
+    const Increment = struct {
+        fn increment(a: SlabAgg) i64 {
+            return if (a.len == 1) std.math.minInt(i64) else -1;
+        }
+    };
+    var tree = try SlabBTree.fromSlice(testing.allocator, &.{ simple(1, 0), simple(2, 0) });
+    defer tree.deinit();
+    try testing.expectError(error.Overflow, tree.findByPrefixSum(Increment.increment, 0));
+    try testing.expectEqual(@as(i64, 0), tree.rootAgg().total);
+}
+
 /// A slab whose items all carry the prefix increment `total` (upstream
 /// `simple_agg`, `btree.rs:1706-1713`).
 fn simple(len: usize, total: i64) SlabAgg {
@@ -1946,8 +2252,8 @@ fn referenceByValue(aggs: []const SlabAgg, target: i64, out: *std.ArrayList(Valu
                 .prefix_before = prefix,
             });
         }
-        prefix += a.total;
-        items_before += a.len;
+        prefix = try std.math.add(i64, prefix, a.total);
+        items_before = try std.math.add(usize, items_before, a.len);
     }
 }
 
@@ -1963,8 +2269,8 @@ fn referenceByRange(aggs: []const SlabAgg, lo: i64, hi: i64, out: *std.ArrayList
                 .prefix_before = prefix,
             });
         }
-        prefix += a.total;
-        items_before += a.len;
+        prefix = try std.math.add(i64, prefix, a.total);
+        items_before = try std.math.add(usize, items_before, a.len);
     }
 }
 
@@ -1981,9 +2287,9 @@ fn referenceByPrefix(aggs: []const SlabAgg, pos: usize) ?SlabBTree.PositionalHit
 }
 
 /// The reference root aggregate: every slab merged left to right.
-fn referenceRoot(aggs: []const SlabAgg) SlabAgg {
+fn referenceRoot(aggs: []const SlabAgg) error{Overflow}!SlabAgg {
     var acc = SlabAgg.zero;
-    for (aggs) |a| acc = SlabAgg.Aggregate.merge(acc, a);
+    for (aggs) |a| acc = try SlabAgg.Aggregate.merge(acc, a);
     return acc;
 }
 
@@ -1997,7 +2303,8 @@ fn expectSound(tree: anytype) !void {
 
 test "a fresh tree is empty and finds nothing" {
     const gpa = testing.allocator;
-    var tree = try SlabBTree.init(gpa);
+    const init: *const fn (std.mem.Allocator) std.mem.Allocator.Error!SlabBTree = SlabBTree.init;
+    var tree = try init(gpa);
     defer tree.deinit();
 
     try testing.expect(tree.isEmpty());
@@ -2008,12 +2315,12 @@ test "a fresh tree is empty and finds nothing" {
 
     var hit = try FindByValue.init(&tree, 0);
     defer hit.deinit();
-    try testing.expectEqual(@as(?ValueHit, null), hit.next());
+    try testing.expectEqual(@as(?ValueHit, null), try hit.next());
     try expectSound(&tree);
 }
 
 test "a monotone column's weight spans the offsets zero to total" {
-    const w = SlabAgg.monotone(3, 7);
+    const w = try SlabAgg.monotone(3, 7);
     try testing.expectEqual(@as(usize, 3), w.len);
     try testing.expectEqual(@as(i64, 7), w.total);
     try testing.expectEqual(@as(i64, 0), w.min_offset);
@@ -2021,7 +2328,7 @@ test "a monotone column's weight spans the offsets zero to total" {
 
     // Two of them: the right slab's offsets shift by the left's total,
     // which is what the order-sensitive merge is for.
-    const two = SlabAgg.Aggregate.merge(w, w);
+    const two = try SlabAgg.Aggregate.merge(w, w);
     try testing.expectEqual(@as(usize, 6), two.len);
     try testing.expectEqual(@as(i64, 14), two.total);
     try testing.expectEqual(@as(i64, 0), two.min_offset);
@@ -2151,15 +2458,15 @@ test "splice replaces a slab in place" {
     try testing.expectEqual(@as(usize, 23), tree.itemsBeforeSlab(11));
     try testing.expectEqual(
         FoundSlab{ .index = 10, .prefix = 45, .items_before = 20 },
-        findSlabAtItem(&tree, 22),
+        try findSlabAtItem(&tree, 22),
     );
     var want: std.ArrayList(ValueHit) = .empty;
     defer want.deinit(gpa);
     try referenceByValue(&aggs, 10 * 2 + 999, &want);
     var got = try FindByValue.init(&tree, 10 * 2 + 999);
     defer got.deinit();
-    for (want.items) |w| try testing.expectEqualDeep(w, got.next().?);
-    try testing.expectEqual(@as(?ValueHit, null), got.next());
+    for (want.items) |w| try testing.expectEqualDeep(w, (try got.next()).?);
+    try testing.expectEqual(@as(?ValueHit, null), try got.next());
 }
 
 test "splice grows and then shrinks the tree" {
@@ -2181,7 +2488,7 @@ test "splice grows and then shrinks the tree" {
     try aggs.replaceRange(gpa, 7, 4, &.{});
     try testing.expectEqual(11, tree.len());
     try expectSound(&tree);
-    try testing.expect(SlabAgg.Aggregate.eql(tree.rootAgg(), referenceRoot(aggs.items)));
+    try testing.expect(SlabAgg.Aggregate.eql(tree.rootAgg(), try referenceRoot(aggs.items)));
 
     // Every value in a wide window must land where a linear scan puts it.
     var target: i64 = -10;
@@ -2192,7 +2499,7 @@ test "splice grows and then shrinks the tree" {
         var got = try FindByValue.init(&tree, target);
         defer got.deinit();
         var i: usize = 0;
-        while (got.next()) |hit| : (i += 1) {
+        while (try got.next()) |hit| : (i += 1) {
             try testing.expectEqualDeep(want.items[i], hit);
         }
         try testing.expectEqual(want.items.len, i);
@@ -2223,7 +2530,7 @@ test "inserting one slab at a time keeps every invariant" {
     // The tree is now three levels deep, and every position still resolves
     // to the right slab.
     try testing.expect(tree.subtreeHeight(tree.root) >= 2);
-    try testing.expect(SlabAgg.Aggregate.eql(tree.rootAgg(), referenceRoot(aggs.items)));
+    try testing.expect(SlabAgg.Aggregate.eql(tree.rootAgg(), try referenceRoot(aggs.items)));
     var items: usize = 0;
     for (aggs.items, 0..) |a, i| {
         const hit = tree.findByPrefix(items).?;
@@ -2303,7 +2610,7 @@ test "point lookup resolves every item of a deep tree" {
         try testing.expectEqualDeep(want, tree.findByPrefix(pos).?);
         try testing.expect(pos - want.items_before < aggs.items[want.slab].len);
 
-        const found = findSlabAtItem(&tree, pos);
+        const found = try findSlabAtItem(&tree, pos);
         try testing.expectEqual(want.slab, found.index);
         try testing.expectEqual(want.items_before, found.items_before);
         var prefix: i64 = 0;
@@ -2311,7 +2618,7 @@ test "point lookup resolves every item of a deep tree" {
         try testing.expectEqual(prefix, found.prefix);
     }
     // One past the end lands after the last slab.
-    const past = findSlabAtItem(&tree, total_items);
+    const past = try findSlabAtItem(&tree, total_items);
     try testing.expectEqual(aggs.items.len, past.index);
     try testing.expectEqual(total_items, past.items_before);
     try testing.expectEqual(@as(?SlabBTree.PositionalHit, null), tree.findByPrefix(total_items));
@@ -2327,20 +2634,20 @@ test "findSlabAtPrefix lands on the first slab that reaches the target" {
     // Upstream's cases (btree.rs:1937-1948), with the target a prefix sum.
     try testing.expectEqual(
         FoundSlab{ .index = 0, .prefix = 0, .items_before = 0 },
-        findSlabAtPrefix(&tree, 10),
+        try findSlabAtPrefix(&tree, 10),
     );
     try testing.expectEqual(
         FoundSlab{ .index = 1, .prefix = 10, .items_before = 5 },
-        findSlabAtPrefix(&tree, 15),
+        try findSlabAtPrefix(&tree, 15),
     );
     try testing.expectEqual(
         FoundSlab{ .index = 3, .prefix = 60, .items_before = 15 },
-        findSlabAtPrefix(&tree, 100),
+        try findSlabAtPrefix(&tree, 100),
     );
     // Past the total: one-past-the-end with the full totals.
     try testing.expectEqual(
         FoundSlab{ .index = 10, .prefix = 550, .items_before = 50 },
-        findSlabAtPrefix(&tree, 9999),
+        try findSlabAtPrefix(&tree, 9999),
     );
 }
 
@@ -2364,7 +2671,7 @@ test "a value range query returns exactly the overlapping slabs" {
             var got = try FindByValueRange.init(&tree, lo, hi);
             defer got.deinit();
             var i: usize = 0;
-            while (got.next()) |hit| : (i += 1) {
+            while (try got.next()) |hit| : (i += 1) {
                 try testing.expect(i < want.items.len);
                 try testing.expectEqualDeep(want.items[i], hit);
             }
@@ -2390,7 +2697,7 @@ test "a value range query returns exactly the overlapping slabs" {
         var got = try FindByValueRange.init(&deep, lo_i, hi_i);
         defer got.deinit();
         var i: usize = 0;
-        while (got.next()) |hit| : (i += 1) {
+        while (try got.next()) |hit| : (i += 1) {
             try testing.expect(i < want.items.len);
             try testing.expectEqualDeep(want.items[i], hit);
         }
@@ -2408,15 +2715,15 @@ test "a value query finds the one slab holding a rare value" {
 
     var got = try FindByValue.init(&tree, 500 + 10_000);
     defer got.deinit();
-    const first = got.next().?;
+    const first = (try got.next()).?;
     try testing.expectEqual(@as(usize, 500), first.slab);
     try testing.expectEqual(@as(usize, 500), first.items_before);
     // The next slab starts exactly where the big one ended, and the
     // comparison is inclusive, so it is reported too — and nothing after.
-    const second = got.next().?;
+    const second = (try got.next()).?;
     try testing.expectEqual(@as(usize, 501), second.slab);
     try testing.expectEqual(@as(i64, 10_500), second.prefix_before);
-    try testing.expectEqual(@as(?ValueHit, null), got.next());
+    try testing.expectEqual(@as(?ValueHit, null), try got.next());
 }
 
 test "updateSlab rewrites the aggregate and its ancestors" {
@@ -2434,7 +2741,7 @@ test "updateSlab rewrites the aggregate and its ancestors" {
 
     var got = try FindByValue.init(&tree, prefix_before + 999_999);
     defer got.deinit();
-    try testing.expectEqual(@as(usize, 100), got.next().?.slab);
+    try testing.expectEqual(@as(usize, 100), (try got.next()).?.slab);
 
     // A single-slab tree has nothing to refresh above it.
     var one = try SlabBTree.fromSlice(gpa, &.{simple(3, 10)});
@@ -2589,7 +2896,7 @@ test "a spliced range is applied in slab order" {
     try tree.splice(0, 0, aggs.items);
     try testing.expectEqual(3, tree.len());
     try expectSound(&tree);
-    try testing.expect(SlabAgg.Aggregate.eql(tree.rootAgg(), referenceRoot(aggs.items)));
+    try testing.expect(SlabAgg.Aggregate.eql(tree.rootAgg(), try referenceRoot(aggs.items)));
 }
 
 /// A tree deep enough for every structural rule to apply: `2 * B²` slabs
@@ -2736,7 +3043,7 @@ test "the invariant checker rejects a corrupted tree" {
         const second = tree.node(tree.root).internal.items[1].id;
         // The grafted slot carries the right summary, so the depth is the
         // only thing wrong with it.
-        const summary = tree.internalSummary(second);
+        const summary = try tree.internalSummary(second);
         switch (tree.nodeMut(first).*) {
             .internal => |*n| {
                 _ = n.orderedRemove(0);
@@ -2914,7 +3221,7 @@ fn mixedSpliceSweep(gpa: std.mem.Allocator, sweep: Sweep, comptime gated: bool) 
 
             try testing.expectEqual(aggs.items.len, tree.len());
             if (comptime gated) try tree.assertSound() else try expectSound(&tree);
-            try testing.expect(SlabAgg.Aggregate.eql(tree.rootAgg(), referenceRoot(aggs.items)));
+            try testing.expect(SlabAgg.Aggregate.eql(tree.rootAgg(), try referenceRoot(aggs.items)));
 
             const total_items: usize = blk: {
                 var sum: usize = 0;
@@ -2939,7 +3246,7 @@ fn mixedSpliceSweep(gpa: std.mem.Allocator, sweep: Sweep, comptime gated: bool) 
                 var got = try FindByValue.init(&tree, target);
                 defer got.deinit();
                 var i: usize = 0;
-                while (got.next()) |hit| : (i += 1) {
+                while (try got.next()) |hit| : (i += 1) {
                     try testing.expect(i < want.items.len);
                     try testing.expectEqualDeep(want.items[i], hit);
                 }
@@ -2954,7 +3261,7 @@ fn mixedSpliceSweep(gpa: std.mem.Allocator, sweep: Sweep, comptime gated: bool) 
                 var got = try FindByValueRange.init(&tree, lo, hi);
                 defer got.deinit();
                 var i: usize = 0;
-                while (got.next()) |hit| : (i += 1) {
+                while (try got.next()) |hit| : (i += 1) {
                     try testing.expect(i < want.items.len);
                     try testing.expectEqualDeep(want.items[i], hit);
                 }
@@ -3003,8 +3310,8 @@ const PrefixWeight = struct {
 
     pub const Aggregate = struct {
         pub const identity: PrefixWeight = .{ .len = 0, .prefix = 0 };
-        pub fn merge(l: PrefixWeight, r: PrefixWeight) PrefixWeight {
-            return .{ .len = l.len + r.len, .prefix = l.prefix + r.prefix };
+        pub fn merge(l: PrefixWeight, r: PrefixWeight) error{Overflow}!PrefixWeight {
+            return .{ .len = try std.math.add(usize, l.len, r.len), .prefix = try std.math.add(usize, l.prefix, r.prefix) };
         }
         pub fn itemCount(w: PrefixWeight) usize {
             return w.len;
@@ -3222,7 +3529,7 @@ fn expectQueries(
         defer walk.deinit();
         var got: std.ArrayList(usize) = .empty;
         defer got.deinit(gpa);
-        while (walk.next()) |hit| {
+        while (try walk.next()) |hit| {
             if (hit.slab >= p.lens.items.len) return error.BtreeHitOutOfRange;
             // A hit names a slab, not an item, so the items are the slab's
             // and the ones in range among them are the answer.
@@ -3242,7 +3549,7 @@ fn expectQueries(
 /// and item count.
 fn expectItemLookup(rec: corpus.Record, values: []const i64, p: *const Partition) !void {
     for (0..values.len) |i| {
-        const hit = findSlabAtItem(&p.tree, i);
+        const hit = try findSlabAtItem(&p.tree, i);
         if (hit.index >= p.lens.items.len or
             hit.items_before > i or
             i >= hit.items_before + p.lens.items[hit.index] or

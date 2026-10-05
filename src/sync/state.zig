@@ -72,6 +72,40 @@ pub const Have = struct {
         return .{ .gpa = gpa, .last_sync = &.{}, .bloom = .empty(gpa) };
     }
 
+    /// Serializes exactly `last_sync` and the bloom filter's public projection.
+    /// Payloads are borrowed only for the backend calls; this does not alter wire bytes.
+    pub fn serialize(self: Have, backend: anytype) @import("../autoserde.zig").BackendError(@TypeOf(backend))!void {
+        const serde = @import("../autoserde.zig");
+        try backend.beginMap();
+        try backend.mapKey("last_sync", 0);
+        try serde.serializeHashes(self.last_sync, backend);
+        try backend.mapKey("bloom", 1);
+        try backend.beginMap();
+        try backend.mapKey("num_entries", 0);
+        try backend.scalar(.{ .uint = self.bloom.num_entries });
+        try backend.mapKey("num_bits_per_entry", 1);
+        try backend.scalar(.{ .uint = self.bloom.num_bits_per_entry });
+        try backend.mapKey("num_probes", 2);
+        try backend.scalar(.{ .uint = self.bloom.num_probes });
+        try backend.mapKey("bits", 3);
+        try backend.scalar(.{ .bytes = self.bloom.bits });
+        try backend.endMap();
+        try backend.endMap();
+    }
+
+    /// Writes compact JSON progressively; writer refusal leaves a partial value.
+    pub fn writeJson(self: Have, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        var backend: @import("../autoserde.zig").JsonSerializer = .{ .writer = writer };
+        try self.serialize(&backend);
+    }
+
+    /// Native std.json hook, including correct separators when nested in another value.
+    pub fn jsonStringify(self: Have, jws: *std.json.Stringify) std.Io.Writer.Error!void {
+        try jws.beginWriteRaw();
+        try self.writeJson(jws.writer);
+        jws.endWriteRaw();
+    }
+
     /// Frees the `last_sync` list and the filter (`state.rs:84-90`).
     pub fn deinit(self: *Have) void {
         self.gpa.free(self.last_sync);

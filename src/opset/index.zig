@@ -158,7 +158,9 @@ pub const ObjIndex = struct {
     /// does not hold is null rather than a guess.
     pub fn objectType(self: *const ObjIndex, obj: ObjId) ?ObjType {
         if (obj.isRoot()) return .map;
-        const id = obj.opId() orelse return null;
+        // Public named IDs must be resolved by the owning OpSet first.
+        if (obj != .id) return null;
+        const id = obj.id;
         const info = self.map.get(id) orelse return null;
         return info.obj_type;
     }
@@ -170,7 +172,8 @@ pub const ObjIndex = struct {
     /// an object the index does not hold.
     pub fn objectParent(self: *const ObjIndex, obj: ObjId) ?ObjId {
         if (obj.isRoot()) return null;
-        const id = obj.opId() orelse return null;
+        if (obj != .id) return null;
+        const id = obj.id;
         const info = self.map.get(id) orelse return null;
         return info.parent;
     }
@@ -341,6 +344,8 @@ pub const MarkOrderValidator = struct {
     ) ParseError!void {
         // index.rs:39-41 — one failure is the whole report.
         if (self.order != null) return;
+        // The loader supplies canonical column IDs, not public repair hints.
+        if (op.objId() == .named) return error.InvalidValue;
         switch (mark_index orelse return) {
             .start => |s| try self.begins.put(self.gpa, s.id, op.objId()),
             .end => |begin| self.checkEnd(op, begin),
@@ -353,7 +358,7 @@ pub const MarkOrderValidator = struct {
         const seen = self.begins.get(begin);
         if (seen == null) {
             self.order = .{ .end_before_begin = .{ .end = op.id(), .begin = begin } };
-        } else if (!seen.?.eql(op.objId())) {
+        } else if (!sameRowObject(seen.?, op.objId())) {
             self.order = .{ .end_in_other_object = .{ .end = op.id(), .begin = begin } };
         }
     }
@@ -395,6 +400,8 @@ pub fn checkMarkOrder(v: *MarkOrderValidator) MarkOrderError!void {
 /// (`storage/document.rs:337`), whose names live in the document's own string
 /// storage. `columns.splice` cannot make that claim, which is why it interns
 /// the name through the document's table first (columns.zig:990-998).
+/// The scalar can borrow the value column during this mutation-free walk;
+/// `MarkIndexColumn.extend` takes its independent byte copy before caching it.
 fn markBuilderOf(o: Op) ParseError!?MarkIndexBuilder {
     const word = o.markIndex() orelse return null;
     return switch (markidx.MarkIdx.load(word)) {
@@ -568,7 +575,7 @@ pub const IndexBuilder = struct {
     }
 
     /// Gives back everything the builder reserved, including the index and the
-    /// validator. Not needed after [`finish`], which consumes it.
+    /// validator. Required after a refused `finish`; success consumes it.
     pub fn deinit(self: *IndexBuilder) void {
         self.freeScratch();
         self.obj_info.deinit();
@@ -697,16 +704,14 @@ pub const IndexBuilder = struct {
     /// Builds the five columns and hands the mark validator back
     /// (`IndexBuilder::finish`, `op_set2/op_set/index.rs:220-255`).
     ///
-    /// Consumes the builder, so there is nothing to `deinit` afterwards.
+    /// Consumes the builder only on success. On error the caller still owns
+    /// every builder allocation and must `deinit` it. The newly built columns
+    /// are cleaned up here without releasing any builder storage.
     /// [`Rebuilt.mark_order`] still has to be checked
     /// ([`checkMarkOrder`]) before the indexes are installed.
-    pub fn finish(self: IndexBuilder) ParseError!Rebuilt {
-        var b = self;
-        // In its own name because `freeScratch` gives the accumulation back
-        // below and the two scratch buffers still need the allocator when
-        // their `defer`s run.
+    pub fn finish(self: *IndexBuilder) ParseError!Rebuilt {
+        const b = self;
         const gpa = b.gpa;
-        errdefer b.deinit();
         b.flush();
 
         // `text` is `widths.zip(top)` with the width kept only where the row
@@ -751,6 +756,7 @@ pub const IndexBuilder = struct {
         const obj_info = b.obj_info;
         const mark_order = b.mark_order;
         b.freeScratch();
+        b.* = undefined;
         return .{
             .indexes = .{
                 .text = text,
@@ -869,6 +875,16 @@ const ObjSpan = struct {
     key: optypes.KeyRef,
 };
 
+// Only column/table IDs reach row grouping. Named IDs require the owning
+// OpSet's actor table first; never treat an unverified cached hint as identity.
+fn sameRowObject(a: ObjId, b: ObjId) bool {
+    return switch (a) {
+        .root => b == .root,
+        .id => |id| b == .id and id.eql(b.id),
+        .named => false,
+    };
+}
+
 /// Drives `b` over `ops` the way the loader does: a flush at every
 /// `(obj, elemid_or_key)` change, then `processOp`, then one `processSucc` per
 /// successor (`change/collector.rs:39-72`).
@@ -876,7 +892,7 @@ fn drive(b: *IndexBuilder, ops: []const Op) ParseError!void {
     var last: ?ObjSpan = null;
     for (ops) |o| {
         const here = ObjSpan{ .obj = o.objId(), .key = o.elemidOrKey() };
-        if (last == null or !last.?.obj.eql(here.obj) or !last.?.key.eql(here.key)) {
+        if (last == null or !sameRowObject(last.?.obj, here.obj) or !last.?.key.eql(here.key)) {
             b.flush();
         }
         last = here;
@@ -1146,8 +1162,21 @@ fn expectSameIndex(a: anytype, b: anytype, gpa: Allocator) !void {
 /// Rebuilds `ops` and gives the result back to the caller, which frees it.
 fn rebuild(gpa: Allocator, ops: []const Op, succs: usize) !Rebuilt {
     var b = try IndexBuilder.init(gpa, ops.len, succs, encoding);
+    errdefer b.deinit();
     try drive(&b, ops);
     return b.finish();
+}
+
+fn rebuildAllocations(gpa: Allocator) !void {
+    const ops = streamOps();
+    var out = try rebuild(gpa, &ops, 3);
+    defer out.deinit();
+    try testing.expectEqual(ops.len, out.indexes.text.len());
+}
+
+test "a refused index rebuild has one cleanup owner at every allocation" {
+    // The caller owns the builder until finish successfully transfers it.
+    try testing.checkAllAllocationFailures(testing.allocator, rebuildAllocations, .{});
 }
 
 /// The mark verdict `ops` produces, read from a validator of its own so a test
@@ -1158,6 +1187,17 @@ fn markVerdict(gpa: Allocator, ops: []const Op) ParseError!?MarkOrder {
     defer v.deinit();
     for (ops) |o| try v.processOp(o);
     return v.takeError();
+}
+
+test "mark grouping refuses public actor hints without an authoritative table" {
+    var validator = MarkOrderValidator.init(testing.allocator);
+    defer validator.deinit();
+    const begin = at(2, 0);
+    const named = ObjId.withActor(at(1, 999), .{ .bytes = "actor" });
+    try testing.expectError(error.InvalidValue, validator.processMarkIndex(
+        row(begin, named, .{ .map = "t" }, false, .mark, .null_value, "bold", &.{}),
+        .{ .start = .{ .id = begin, .data = MarkData.init("bold", .{ .int = 1 }) } },
+    ));
 }
 
 test "a rebuild over a hand-built stream reproduces the splice-built index, row for row" {

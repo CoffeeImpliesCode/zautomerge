@@ -13,9 +13,8 @@
 //!
 //! Nothing in this file reads or writes storage. `MarkStateMachine` takes mark
 //! operations and gives back a set; where those operations come from is the op
-//! set's business, and so are the two queries upstream keeps in this file that
-//! cannot be written until the op set exists — `RichTextQueryState`
-//! (`marks.rs:402-432`) and `NonDeletedMarks` (`marks.rs:437-464`).
+//! set's business. `NonDeletedMarks` is a borrowed view of visible marks
+//! (`marks.rs:437-464`).
 //!
 //! ## The fold
 //!
@@ -355,20 +354,24 @@ pub const MarkAccumulatorIter = struct {
 /// A name whose value is `Null` is an unmark tombstone: the mark exists in the
 /// document and has been removed, which is different from the name being
 /// absent (`marks.rs:170-171`, `:180-187`).
+///
+/// `init` and `fromPairs` borrow payloads; `dup` owns independent payloads.
+/// Every set owns its entries array and is released exactly once with `deinit`.
+/// Assignment does not clone storage; use `dup` for an independent owner.
 pub const MarkSet = struct {
-    /// The allocator the entries array is allocated with. It is retained for
-    /// the set's whole life, so it must outlive it; the names the set holds
-    /// are borrowed, not allocated with it.
+    /// Retained for the set's whole lifetime and used for all its allocations.
     gpa: Allocator,
     /// The entries, sorted by name. See `MarkAccumulator` for why this is a
     /// flat array rather than a map.
     entries: std.ArrayList(Entry) = .empty,
+    /// False for borrowed constructors; true for deep-owned duplicates.
+    /// Do not change this after entries have been stored.
+    owns_payloads: bool = false,
 
     /// One mark name and the value it holds here.
     pub const Entry = struct {
-        /// The mark name. **Borrowed**: whoever produced it keeps it alive, and
-        /// a caller that frees the storage this points at leaves the set and
-        /// every iterator over it naming freed bytes. See [`MarkSet.put`].
+        /// Borrows source storage in a borrowed set, or the set's own allocation
+        /// in an owned set. Invalidated by replacement, removal or teardown.
         name: []const u8,
         value: ScalarValue,
     };
@@ -387,12 +390,40 @@ pub const MarkSet = struct {
         return set;
     }
 
-    /// Releases the entries array. **The names are not freed** — they are
-    /// borrowed, see [`MarkSet.put`] — and no mark value owns bytes. The set is
-    /// `undefined` afterward and a second call is a double free.
+    /// Releases the entries array and, for an owned set, all names and scalar
+    /// payloads. The set is invalid afterward; release it exactly once.
     pub fn deinit(self: *MarkSet) void {
+        if (self.owns_payloads) {
+            for (self.entries.items) |*entry| {
+                self.gpa.free(entry.name);
+                entry.value.deinitOwned(self.gpa);
+            }
+        }
         self.entries.deinit(self.gpa);
         self.* = undefined;
+    }
+
+    /// Deep independent copy, including names, scalar bytes and actor IDs.
+    /// The result retains `gpa` and must be released once with `deinit`.
+    /// On allocation failure the source remains unchanged.
+    pub fn dup(self: *const MarkSet, gpa: Allocator) Error!MarkSet {
+        var out = MarkSet.init(gpa);
+        out.owns_payloads = true;
+        errdefer out.deinit();
+        try out.entries.ensureTotalCapacity(gpa, self.entries.items.len);
+        for (self.entries.items) |entry| {
+            const name = try gpa.dupe(u8, entry.name);
+            errdefer gpa.free(name);
+            const scalar = try entry.value.dup(gpa);
+            out.entries.appendAssumeCapacity(.{ .name = name, .value = scalar });
+        }
+        return out;
+    }
+
+    /// Borrowed visible-mark view, with no allocation. Mutating or releasing
+    /// this set invalidates the view and any entries reached through it.
+    pub fn nonDeletedMarks(self: *const MarkSet) NonDeletedMarks {
+        return .{ .set = self };
     }
 
     /// The entries, in name order (`marks.rs:136-139`).
@@ -419,11 +450,9 @@ pub const MarkSet = struct {
     /// Sets `name` to `value`, replacing any value it already had
     /// (`marks.rs:152-155`, `BTreeMap::insert`).
     ///
-    /// **The name is retained by borrow and never copied.** A caller that
-    /// frees the storage `name` points at leaves this set, and every iterator
-    /// over it, naming freed bytes; the in-tree producers point into the op
-    /// set's string table, which outlives every mark set made from it. Pass a
-    /// literal or a permanent buffer when the source is not.
+    /// Borrowed sets retain the name and scalar payloads by borrow. Owned sets
+    /// copy inputs, so callers can release them immediately after success;
+    /// inputs may also refer to this set's current entries.
     ///
     /// On `error.OutOfMemory` nothing is stored and the set is unchanged.
     pub fn put(self: *MarkSet, name: []const u8, v: ScalarValue) Error!void {
@@ -431,15 +460,38 @@ pub const MarkSet = struct {
         if (at < self.entries.items.len and
             std.mem.eql(u8, self.entries.items[at].name, name))
         {
-            self.entries.items[at].value = v;
+            if (self.owns_payloads) {
+                const replacement = try v.dup(self.gpa);
+                self.entries.items[at].value.deinitOwned(self.gpa);
+                self.entries.items[at].value = replacement;
+            } else {
+                self.entries.items[at].value = v;
+            }
             return;
         }
-        try self.entries.insert(self.gpa, at, .{ .name = name, .value = v });
+        if (self.owns_payloads) {
+            const copied_name = try self.gpa.dupe(u8, name);
+            errdefer self.gpa.free(copied_name);
+            var copied_value = try v.dup(self.gpa);
+            errdefer copied_value.deinitOwned(self.gpa);
+            try self.entries.insert(self.gpa, at, .{
+                .name = copied_name,
+                .value = copied_value,
+            });
+        } else {
+            try self.entries.insert(self.gpa, at, .{ .name = name, .value = v });
+        }
     }
 
     /// Drops `name` if it is present (`marks.rs:156-159`).
     pub fn remove(self: *MarkSet, name: []const u8) void {
-        if (self.find(name)) |index| _ = self.entries.orderedRemove(index);
+        if (self.find(name)) |index| {
+            var removed = self.entries.orderedRemove(index);
+            if (self.owns_payloads) {
+                self.gpa.free(removed.name);
+                removed.value.deinitOwned(self.gpa);
+            }
+        }
     }
 
     /// Whether the set holds no names at all. A set holding only unmark
@@ -458,14 +510,15 @@ pub const MarkSet = struct {
     /// error the partially built result is released as well and nothing is
     /// handed back.
     ///
-    /// The names in the result are the same borrowed names the receiver held;
-    /// see [`MarkSet.put`].
+    /// Borrowed inputs produce borrowed payloads; owned inputs produce an
+    /// independent owned result before releasing the consumed source.
     pub fn withoutUnmarks(self: MarkSet) Error!MarkSet {
         // Upstream clones the whole map and retains on the clone
         // (`marks.rs:183-186`, with its own `FIXME - do I need this clone?`).
         // Same work here: the clone is the flat array this builds, and the
         // original is freed rather than dropped, because Zig has no drop.
         var out = MarkSet.init(self.gpa);
+        out.owns_payloads = self.owns_payloads;
         errdefer out.deinit();
         // **A plain `defer`, not `errdefer` plus a call on the success path.**
         // The release is the same on both, and one deferred call cannot be
@@ -524,6 +577,53 @@ pub const MarkSet = struct {
             }
         }
         return lo;
+    }
+};
+
+/// Borrowed view that ignores Null tombstones (`marks.rs:437-464`).
+/// Holds no storage; the source set must stay alive and unmodified.
+pub const NonDeletedMarks = struct {
+    set: *const MarkSet,
+
+    /// Number of visible names, excluding Null tombstones.
+    pub fn len(self: NonDeletedMarks) usize {
+        var count: usize = 0;
+        for (self.set.entries.items) |entry| {
+            if (entry.value != .null_value) count += 1;
+        }
+        return count;
+    }
+
+    /// Whether no visible names remain.
+    pub fn isEmpty(self: NonDeletedMarks) bool {
+        for (self.set.entries.items) |entry| {
+            if (entry.value != .null_value) return false;
+        }
+        return true;
+    }
+
+    /// Equality of visible names and values; tombstones do not participate.
+    pub fn eql(a: NonDeletedMarks, b: NonDeletedMarks) bool {
+        var ai: usize = 0;
+        var bi: usize = 0;
+        while (true) {
+            while (ai < a.set.entries.items.len and
+                a.set.entries.items[ai].value == .null_value) : (ai += 1)
+            {}
+            while (bi < b.set.entries.items.len and
+                b.set.entries.items[bi].value == .null_value) : (bi += 1)
+            {}
+            const a_done = ai == a.set.entries.items.len;
+            const b_done = bi == b.set.entries.items.len;
+            if (a_done or b_done) return a_done and b_done;
+            const am = a.set.entries.items[ai];
+            const bm = b.set.entries.items[bi];
+            if (!std.mem.eql(u8, am.name, bm.name) or !am.value.eql(bm.value)) {
+                return false;
+            }
+            ai += 1;
+            bi += 1;
+        }
     }
 };
 
@@ -1533,9 +1633,8 @@ test "expand mark decomposes and recomposes" {
 // one for one, with no gaps; the diff block at the bottom of this file says
 // which parts are the port's own deviations and which are upstream's.
 
-const docmod = @import("doc.zig");
+const automod = @import("autocommit.zig");
 const readmod = @import("read.zig");
-const transmod = @import("transact.zig");
 const spanmod = @import("iter/spans.zig");
 const hydmod = @import("hydrate.zig");
 const opmod = @import("opset/op.zig");
@@ -1544,13 +1643,13 @@ const opsetmod = @import("opset/op_set.zig");
 /// The op set [`hydrateMap`] walks: the one every document in this crate holds.
 const HydrateSet = opsetmod.OpSet(opmod.ChangeOp);
 
-const Document = docmod.Document;
+const AutoCommit = automod.AutoCommit;
 const ExId = types.ExId;
 
 /// A document with one text object at `text`, which is where every test in
 /// this section starts. Upstream's `AutoCommit::new()` plus its `put_object`.
 const MarkFixture = struct {
-    doc: Document,
+    doc: AutoCommit,
     text: ExId,
 
     fn deinit(self: *MarkFixture) void {
@@ -1559,58 +1658,78 @@ const MarkFixture = struct {
 };
 
 fn markFixture(gpa: Allocator) !MarkFixture {
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try AutoCommit.init(gpa, std.testing.io);
     errdefer doc.deinit();
     // A named actor, so a change hash does not come out of the allocator
     // (`std.testing.allocator` is the arbiter).
-    doc.setActorId(.{ .bytes = "0123456789abcdef" });
-    const text = try transmod.putObject(&doc, .root, .{ .key = "text" }, .text);
+    try doc.setActorId(.{ .bytes = "0123456789abcdef" });
+    const text = try doc.putObject(.root, .{ .key = "text" }, .text);
+    // An open facade is address-stable; close it before returning by value.
+    _ = try doc.commit();
     return .{ .doc = doc, .text = text };
 }
 
-/// The spans one `updateSpans` call is handed, owned.
-///
-/// **Each text span owns its bytes and its own mark set**, which is what
-/// [`Span.deinit`](iter/spans.zig) gives back, so a caller that builds a list
-/// has to free every member. The mark *names* in a set are borrowed and are
-/// not freed.
+/// Borrowed update inputs backed by stable owned maps and mark sets.
 const NewSpans = struct {
     gpa: Allocator,
-    items: std.ArrayList(spanmod.Span) = .empty,
+    items: std.ArrayList(spanmod.SpanInput) = .empty,
 
     fn init(gpa: Allocator) NewSpans {
         return .{ .gpa = gpa };
     }
 
     fn deinit(self: *NewSpans) void {
-        for (self.items.items) |*s| s.deinit(self.gpa);
+        for (self.items.items) |s| switch (s) {
+            .block => |map| {
+                const owned = @constCast(map);
+                owned.deinit();
+                self.gpa.destroy(owned);
+            },
+            .text => |t| if (t.marks) |marks| {
+                const owned = @constCast(marks);
+                owned.deinit();
+                self.gpa.destroy(owned);
+            },
+        };
         self.items.deinit(self.gpa);
     }
 
-    /// `Span::Text { text, marks: None }` (`diff_marks.rs`:44-47`).
     fn plain(self: *NewSpans, s: []const u8) !void {
-        try self.items.append(self.gpa, .{
-            .text = .{ .text = try self.gpa.dupe(u8, s), .marks = null },
-        });
+        try self.items.append(self.gpa, .{ .text = .{ .text = s } });
     }
 
-    /// `Span::Text { text, marks: markset(..) }`. The entries are name-sorted
-    /// by [`MarkSet.put`] whatever order they are written in, which is what
-    /// upstream's `MarkSet` does (`marks.rs`:213-221`).
     fn marked(self: *NewSpans, s: []const u8, entries: []const MarkSet.Entry) !void {
-        var set = MarkSet.init(self.gpa);
-        errdefer set.deinit();
-        for (entries) |e| try set.put(e.name, e.value);
-        try self.items.append(self.gpa, .{
-            .text = .{ .text = try self.gpa.dupe(u8, s), .marks = set },
-        });
+        var borrowed = MarkSet.init(self.gpa);
+        defer borrowed.deinit();
+        for (entries) |entry| try borrowed.put(entry.name, entry.value);
+        const owned = try self.gpa.create(MarkSet);
+        errdefer self.gpa.destroy(owned);
+        owned.* = try borrowed.dup(self.gpa);
+        errdefer owned.deinit();
+        try self.items.append(self.gpa, .{ .text = .{ .text = s, .marks = owned } });
     }
 
-    /// `Span::Block(..)` (`diff_marks.rs`:633`). The port's block span names an
-    /// object the document already holds, where upstream carries a hydrated
-    /// map; see the diff block at the bottom of this file.
-    fn block(self: *NewSpans, id: ExId) !void {
-        try self.items.append(self.gpa, .{ .block = id });
+    fn block(self: *NewSpans, doc: *AutoCommit, id: ExId) !void {
+        var hydrated = try hydmod.hydrateMap(HydrateSet, &doc.doc.ops, self.gpa, id, null);
+        defer hydrated.deinit();
+        const map = try self.gpa.create(hydmod.Map);
+        errdefer self.gpa.destroy(map);
+        map.* = try hydrated.object.map.dup(self.gpa);
+        errdefer map.deinit();
+        try self.items.append(self.gpa, .{ .block = map });
+    }
+
+    fn emptyBlock(self: *NewSpans) !void {
+        const map = try self.gpa.create(hydmod.Map);
+        errdefer self.gpa.destroy(map);
+        map.* = hydmod.Map.init(self.gpa, .root);
+        errdefer map.deinit();
+        try self.items.append(self.gpa, .{ .block = map });
+    }
+
+    fn putBlock(self: *NewSpans, index: usize, key: []const u8, scalar: ScalarValue) !void {
+        const map = @constCast(self.items.items[index].block);
+        try map.putOwned(key, hydmod.MapValue.init(hydmod.Value.fromScalar(scalar), false));
     }
 };
 
@@ -1620,29 +1739,33 @@ const ReadSpan = struct {
     /// The span's text; the object replacement character for a block, which is
     /// what [`Span.asStr`](iter/spans.zig) reports for one.
     text: []u8,
-    /// Whether the span is a block marker.
-    block: bool,
-    /// The marks, copied. The **names** are the document's and are not freed.
+    /// Deep-owned hydrated payload for a block span.
+    block: ?hydmod.Map = null,
+    /// Deep-owned names and scalar payloads, independent of iterator spans.
     marks: []MarkSet.Entry,
 
     fn deinit(self: *ReadSpan, gpa: Allocator) void {
         gpa.free(self.text);
+        if (self.block) |*map| map.deinit();
+        for (self.marks) |*entry| {
+            gpa.free(entry.name);
+            entry.value.deinitOwned(gpa);
+        }
         gpa.free(self.marks);
     }
 };
 
 /// What a ported test expects one span to say.
 const WantSpan = struct {
-    /// The text. Ignored for a block, which is compared by [`block`] alone.
+    /// Text or an expected borrowed hydrated block payload.
     text: []const u8 = "",
-    /// Whether this is a block marker rather than a run of text.
-    block: bool = false,
+    block: ?*const hydmod.Map = null,
     /// The marks, in name order.
     marks: []const MarkSet.Entry = &.{},
 };
 
 /// The spans of `obj` as a reader sees them, each one owned by `gpa`.
-fn readSpanList(gpa: Allocator, doc: *const Document, obj: ExId) ![]ReadSpan {
+fn readSpanList(gpa: Allocator, doc: *const AutoCommit, obj: ExId) ![]ReadSpan {
     var out: std.ArrayList(ReadSpan) = .empty;
     errdefer {
         for (out.items) |*s| s.deinit(gpa);
@@ -1654,32 +1777,55 @@ fn readSpanList(gpa: Allocator, doc: *const Document, obj: ExId) ![]ReadSpan {
         var span = found;
         // The walk hands the span over (`Spans.next`, `spans.zig`:1332`), so
         // its bytes are this function's from here.
-        errdefer span.deinit(gpa);
+        defer span.deinit(gpa);
         switch (span) {
             .text => |t| {
                 const copy = try gpa.dupe(u8, t.text);
                 errdefer gpa.free(copy);
                 var entries: std.ArrayList(MarkSet.Entry) = .empty;
-                errdefer entries.deinit(gpa);
+                errdefer {
+                    for (entries.items) |*entry| {
+                        gpa.free(entry.name);
+                        entry.value.deinitOwned(gpa);
+                    }
+                    entries.deinit(gpa);
+                }
                 if (t.marks) |set| {
                     var it = set.iter();
-                    while (it.next()) |entry| try entries.append(gpa, entry.*);
+                    while (it.next()) |entry| {
+                        const name = try gpa.dupe(u8, entry.name);
+                        errdefer gpa.free(name);
+                        var scalar = try entry.value.dup(gpa);
+                        errdefer scalar.deinitOwned(gpa);
+                        try entries.append(gpa, .{ .name = name, .value = scalar });
+                    }
+                }
+                const marks = try entries.toOwnedSlice(gpa);
+                errdefer {
+                    for (marks) |*entry| {
+                        gpa.free(entry.name);
+                        entry.value.deinitOwned(gpa);
+                    }
+                    gpa.free(marks);
                 }
                 try out.append(gpa, .{
                     .text = copy,
-                    .block = false,
-                    .marks = try entries.toOwnedSlice(gpa),
+                    .block = null,
+                    .marks = marks,
                 });
             },
-            .block => {
+            .block => |*map| {
+                const copy = try gpa.dupe(u8, span.asStr());
+                errdefer gpa.free(copy);
+                var owned = try map.dup(gpa);
+                errdefer owned.deinit();
                 try out.append(gpa, .{
-                    .text = try gpa.dupe(u8, span.asStr()),
-                    .block = true,
+                    .text = copy,
+                    .block = owned,
                     .marks = &.{},
                 });
             },
         }
-        span.deinit(gpa);
     }
     return out.toOwnedSlice(gpa);
 }
@@ -1700,7 +1846,7 @@ fn marksEql(a: []const MarkSet.Entry, b: []const MarkSet.Entry) bool {
 /// wrong length with the wrong spans passes one.
 fn expectDocSpans(
     gpa: Allocator,
-    doc: *const Document,
+    doc: *const AutoCommit,
     obj: ExId,
     want: []const WantSpan,
 ) !void {
@@ -1715,10 +1861,10 @@ fn expectDocSpans(
     var same = want.len == got.len;
     if (same) {
         for (want, got) |x, y| {
-            // A block is compared as a block; its text is the placeholder
-            // either side, and comparing it would say nothing.
-            const ok = if (x.block or y.block)
-                x.block == y.block
+            const ok = if (x.block) |expected|
+                if (y.block) |*actual| expected.eql(actual) else false
+            else if (y.block != null)
+                false
             else
                 std.mem.eql(u8, x.text, y.text) and marksEql(x.marks, y.marks);
             if (!ok) {
@@ -1731,7 +1877,7 @@ fn expectDocSpans(
 
     try w.print("expected {d} spans, got {d}\n  want:\n", .{ want.len, got.len });
     for (want) |s| {
-        if (s.block) {
+        if (s.block != null) {
             try w.print("    Block\n", .{});
         } else {
             try w.print("    Text {s} marks=[", .{s.text});
@@ -1741,7 +1887,7 @@ fn expectDocSpans(
     }
     try w.print("  got:\n", .{});
     for (got) |s| {
-        if (s.block) {
+        if (s.block != null) {
             try w.print("    Block\n", .{});
         } else {
             try w.print("    Text {s} marks=[", .{s.text});
@@ -1761,10 +1907,7 @@ fn writeMarkList(w: *std.Io.Writer, entries: []const MarkSet.Entry) !void {
     }
 }
 
-/// A [`ScalarValue`] as one token. `ScalarValue` has no `format` of its own
-/// ([`src/value.zig`](value.zig)) and `patches.zig`'s printer is private to
-/// that file, so this is the same switch spelled again: a mark's value is a
-/// scalar, and a failure message has to be able to say which one.
+/// Render scalar mark values for comparison diagnostics.
 fn writeScalar(w: *std.Io.Writer, s: ScalarValue) !void {
     switch (s) {
         .null_value => try w.writeAll("Null"),
@@ -1788,15 +1931,15 @@ test "diff_marks: overlapping marks lose one and keep the other" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "hello world");
-    try transmod.mark(&f.doc, f.text, 6, 11, "bold", .both, .{ .bool_value = true });
-    try transmod.mark(&f.doc, f.text, 6, 11, "italic", .both, .{ .bool_value = true });
+    try f.doc.spliceText(f.text, 0, 0, "hello world");
+    try f.doc.mark(f.text, 6, 11, "bold", .both, .{ .bool_value = true });
+    try f.doc.mark(f.text, 6, 11, "italic", .both, .{ .bool_value = true });
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.plain("hello ");
     try spans.marked("world", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "hello " },
@@ -1811,16 +1954,16 @@ test "diff_marks: overlapping marks change boundaries" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "hello beautiful world");
-    try transmod.mark(&f.doc, f.text, 0, 15, "bold", .both, .{ .bool_value = true });
-    try transmod.mark(&f.doc, f.text, 6, 21, "italic", .both, .{ .bool_value = true });
+    try f.doc.spliceText(f.text, 0, 0, "hello beautiful world");
+    try f.doc.mark(f.text, 0, 15, "bold", .both, .{ .bool_value = true });
+    try f.doc.mark(f.text, 6, 21, "italic", .both, .{ .bool_value = true });
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.marked("hello", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
     try spans.plain(" beautiful ");
     try spans.marked("world", &.{.{ .name = "italic", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "hello", .marks = &.{.{ .name = "bold", .value = .{ .bool_value = true } }} },
@@ -1836,9 +1979,9 @@ test "diff_marks: overlapping marks take on a third" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "hello world");
-    try transmod.mark(&f.doc, f.text, 0, 11, "bold", .both, .{ .bool_value = true });
-    try transmod.mark(&f.doc, f.text, 6, 11, "italic", .both, .{ .bool_value = true });
+    try f.doc.spliceText(f.text, 0, 0, "hello world");
+    try f.doc.mark(f.text, 0, 11, "bold", .both, .{ .bool_value = true });
+    try f.doc.mark(f.text, 6, 11, "italic", .both, .{ .bool_value = true });
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
@@ -1852,7 +1995,7 @@ test "diff_marks: overlapping marks take on a third" {
         .{ .name = "italic", .value = .{ .bool_value = true } },
         .{ .name = "underline", .value = .{ .bool_value = true } },
     });
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     // Upstream joins every span's text and compares it with the whole, because
     // "the exact number of spans depends on grapheme clustering"
@@ -1872,7 +2015,7 @@ test "diff_marks: overlapping marks take on a third" {
         } },
     });
 
-    const all = try f.doc.text(gpa, f.text);
+    const all = try f.doc.text(f.text, gpa);
     defer gpa.free(all);
     try testing.expectEqualStrings("hello world", all);
 }
@@ -1884,13 +2027,13 @@ test "diff_marks: a mark expands" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "bold text");
-    try transmod.mark(&f.doc, f.text, 0, 4, "bold", .both, .{ .bool_value = true });
+    try f.doc.spliceText(f.text, 0, 0, "bold text");
+    try f.doc.mark(f.text, 0, 4, "bold", .both, .{ .bool_value = true });
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.marked("bold text", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "bold text", .marks = &.{.{ .name = "bold", .value = .{ .bool_value = true } }} },
@@ -1904,14 +2047,14 @@ test "diff_marks: a mark contracts" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "bold text");
-    try transmod.mark(&f.doc, f.text, 0, 9, "bold", .both, .{ .bool_value = true });
+    try f.doc.spliceText(f.text, 0, 0, "bold text");
+    try f.doc.mark(f.text, 0, 9, "bold", .both, .{ .bool_value = true });
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.marked("bold", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
     try spans.plain(" text");
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "bold", .marks = &.{.{ .name = "bold", .value = .{ .bool_value = true } }} },
@@ -1926,14 +2069,14 @@ test "diff_marks: a mark shifts position" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "bold text");
-    try transmod.mark(&f.doc, f.text, 0, 4, "bold", .both, .{ .bool_value = true });
+    try f.doc.spliceText(f.text, 0, 0, "bold text");
+    try f.doc.mark(f.text, 0, 4, "bold", .both, .{ .bool_value = true });
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.plain("text ");
     try spans.marked("bold", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "text " },
@@ -1948,15 +2091,15 @@ test "diff_marks: a mark splits in two" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "bold text here");
-    try transmod.mark(&f.doc, f.text, 0, 14, "bold", .both, .{ .bool_value = true });
+    try f.doc.spliceText(f.text, 0, 0, "bold text here");
+    try f.doc.mark(f.text, 0, 14, "bold", .both, .{ .bool_value = true });
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.marked("bold", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
     try spans.plain(" text ");
     try spans.marked("here", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "bold", .marks = &.{.{ .name = "bold", .value = .{ .bool_value = true } }} },
@@ -1972,14 +2115,14 @@ test "diff_marks: adjacent marks of one name merge" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "bold text");
-    try transmod.mark(&f.doc, f.text, 0, 4, "bold", .both, .{ .bool_value = true });
-    try transmod.mark(&f.doc, f.text, 5, 9, "bold", .both, .{ .bool_value = true });
+    try f.doc.spliceText(f.text, 0, 0, "bold text");
+    try f.doc.mark(f.text, 0, 4, "bold", .both, .{ .bool_value = true });
+    try f.doc.mark(f.text, 5, 9, "bold", .both, .{ .bool_value = true });
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.marked("bold text", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "bold text", .marks = &.{.{ .name = "bold", .value = .{ .bool_value = true } }} },
@@ -1993,7 +2136,7 @@ test "diff_marks: adjacent marks of one name stay separate" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "bold text");
+    try f.doc.spliceText(f.text, 0, 0, "bold text");
 
     // Applied twice, because upstream applies it twice and reads the spans
     // after: the second pass is what proves the shape is stable rather than
@@ -2004,7 +2147,7 @@ test "diff_marks: adjacent marks of one name stay separate" {
         try spans.marked("bold", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
         try spans.plain(" ");
         try spans.marked("text", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
-        try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+        try f.doc.updateSpans(f.text, spans.items.items);
     }
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
@@ -2021,13 +2164,13 @@ test "diff_marks: different marks side by side" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "bolditalic");
+    try f.doc.spliceText(f.text, 0, 0, "bolditalic");
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.marked("bold", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
     try spans.marked("italic", &.{.{ .name = "italic", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "bold", .marks = &.{.{ .name = "bold", .value = .{ .bool_value = true } }} },
@@ -2045,7 +2188,7 @@ test "diff_marks: a mark over empty text produces no span" {
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.marked("", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{});
 }
@@ -2061,7 +2204,7 @@ test "diff_marks: marks over whitespace" {
     defer spans.deinit();
     try spans.marked(" ", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
     try spans.marked("\n", &.{.{ .name = "italic", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = " ", .marks = &.{.{ .name = "bold", .value = .{ .bool_value = true } }} },
@@ -2076,13 +2219,13 @@ test "diff_marks: removing all the text from a marked span" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "hello world");
-    try transmod.mark(&f.doc, f.text, 0, 5, "bold", .both, .{ .bool_value = true });
+    try f.doc.spliceText(f.text, 0, 0, "hello world");
+    try f.doc.mark(f.text, 0, 5, "bold", .both, .{ .bool_value = true });
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.plain(" world");
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{.{ .text = " world" }});
 }
@@ -2094,20 +2237,20 @@ test "diff_marks: a mark spans across a block" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "bold");
-    const block = try transmod.splitBlock(&f.doc, f.text, 4);
-    try transmod.spliceText(&f.doc, f.text, 5, 0, "text");
+    try f.doc.spliceText(f.text, 0, 0, "bold");
+    const block = try f.doc.splitBlock(f.text, 4);
+    try f.doc.spliceText(f.text, 5, 0, "text");
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.marked("bold", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
-    try spans.block(block);
+    try spans.block(&f.doc, block);
     try spans.marked("text", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "bold", .marks = &.{.{ .name = "bold", .value = .{ .bool_value = true } }} },
-        .{ .block = true },
+        .{ .block = spans.items.items[1].block },
         .{ .text = "text", .marks = &.{.{ .name = "bold", .value = .{ .bool_value = true } }} },
     });
 }
@@ -2119,20 +2262,20 @@ test "diff_marks: a mark ends at a block boundary" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "bold");
-    const block = try transmod.splitBlock(&f.doc, f.text, 4);
-    try transmod.spliceText(&f.doc, f.text, 5, 0, "text");
+    try f.doc.spliceText(f.text, 0, 0, "bold");
+    const block = try f.doc.splitBlock(f.text, 4);
+    try f.doc.spliceText(f.text, 5, 0, "text");
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.marked("bold", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
-    try spans.block(block);
+    try spans.block(&f.doc, block);
     try spans.plain("text");
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "bold", .marks = &.{.{ .name = "bold", .value = .{ .bool_value = true } }} },
-        .{ .block = true },
+        .{ .block = spans.items.items[1].block },
         .{ .text = "text" },
     });
 }
@@ -2144,7 +2287,7 @@ test "diff_marks: marks nested inside one another" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "italic bold and italic just italic");
+    try f.doc.spliceText(f.text, 0, 0, "italic bold and italic just italic");
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
@@ -2154,7 +2297,7 @@ test "diff_marks: marks nested inside one another" {
         .{ .name = "bold", .value = .{ .bool_value = true } },
     });
     try spans.marked(" just italic", &.{.{ .name = "italic", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "italic ", .marks = &.{.{ .name = "italic", .value = .{ .bool_value = true } }} },
@@ -2173,7 +2316,7 @@ test "diff_marks: many marks on one run of text" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "formatted");
+    try f.doc.spliceText(f.text, 0, 0, "formatted");
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
@@ -2183,7 +2326,7 @@ test "diff_marks: many marks on one run of text" {
         .{ .name = "link", .value = .{ .str = "https://example.com" } },
         .{ .name = "underline", .value = .{ .bool_value = true } },
     });
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     // **Four marks, named.** Upstream only counts them (`diff_marks.rs`:751`),
     // which passes on four marks of the same name; a set is a map from name to
@@ -2205,13 +2348,13 @@ test "diff_marks: a mark's value changes its link url" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "click here");
-    try transmod.mark(&f.doc, f.text, 0, 10, "link", .both, .{ .str = "https://old.com" });
+    try f.doc.spliceText(f.text, 0, 0, "click here");
+    try f.doc.mark(f.text, 0, 10, "link", .both, .{ .str = "https://old.com" });
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.marked("click here", &.{.{ .name = "link", .value = .{ .str = "https://new.com" } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "click here", .marks = &.{.{ .name = "link", .value = .{ .str = "https://new.com" } }} },
@@ -2225,13 +2368,13 @@ test "diff_marks: a mark's value changes its colour" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "colored");
-    try transmod.mark(&f.doc, f.text, 0, 7, "color", .both, .{ .str = "red" });
+    try f.doc.spliceText(f.text, 0, 0, "colored");
+    try f.doc.mark(f.text, 0, 7, "color", .both, .{ .str = "red" });
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.marked("colored", &.{.{ .name = "color", .value = .{ .str = "blue" } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "colored", .marks = &.{.{ .name = "color", .value = .{ .str = "blue" } }} },
@@ -2245,13 +2388,13 @@ test "diff_marks: a mark's value changes type" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "text");
-    try transmod.mark(&f.doc, f.text, 0, 4, "custom", .both, .{ .bool_value = true });
+    try f.doc.spliceText(f.text, 0, 0, "text");
+    try f.doc.mark(f.text, 0, 4, "custom", .both, .{ .bool_value = true });
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.marked("text", &.{.{ .name = "custom", .value = .{ .str = "value" } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     // **The value is a string, not the boolean it was.** The old mark is gone
     // and the new one is in its place, which is the whole of the test.
@@ -2284,12 +2427,12 @@ test "diff_marks: three marks grow in three directions" {
         .{ .name = "after", .value = .{ .bool_value = true } },
         .{ .name = "none", .value = .{ .bool_value = true } },
     });
-    try transmod.updateSpansWithConfig(&f.doc, f.text, &config, spans.items.items);
+    try f.doc.updateSpansWithConfig(f.text, &config, spans.items.items);
 
     // Upstream's two inserts (`diff_marks.rs`:894`, `:896`): `"a"` at 0 and
     // `"b"` at 5, which is the end of `"atext"` and not of `"text"`.
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "a");
-    try transmod.spliceText(&f.doc, f.text, 5, 0, "b");
+    try f.doc.spliceText(f.text, 0, 0, "a");
+    try f.doc.spliceText(f.text, 5, 0, "b");
 
     // **Which mark is over which text, and no mark over the other end.**
     // Upstream asserts a count of three (`diff_marks.rs`:902`) and says
@@ -2328,11 +2471,11 @@ test "diff_marks: a mark with expand none stays where it is" {
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.marked("text", &.{.{ .name = "mark", .value = .{ .bool_value = true } }});
-    try transmod.updateSpansWithConfig(&f.doc, f.text, &config, spans.items.items);
+    try f.doc.updateSpansWithConfig(f.text, &config, spans.items.items);
 
     // Upstream's inserts at both boundaries (`diff_marks.rs`:923-924`).
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "before ");
-    try transmod.spliceText(&f.doc, f.text, 11, 0, " after");
+    try f.doc.spliceText(f.text, 0, 0, "before ");
+    try f.doc.spliceText(f.text, 11, 0, " after");
 
     // **Both inserted runs are unmarked, and each is an absence rather than a
     // length.** Upstream compares the three spans, which is what this does.
@@ -2357,14 +2500,14 @@ test "diff_marks: a mark over a family emoji" {
     // U+1F468 ZWJ U+1F469 ZWJ U+1F467 ZWJ U+1F466, spelled out because the
     // joiners are invisible and a failure would not show what went wrong.
     const family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "Hello " ++ family ++ " world");
+    try f.doc.spliceText(f.text, 0, 0, "Hello " ++ family ++ " world");
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.plain("Hello ");
     try spans.marked(family, &.{.{ .name = "emoji", .value = .{ .bool_value = true } }});
     try spans.plain(" world");
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "Hello " },
@@ -2380,17 +2523,17 @@ test "diff_marks: a mark over text that is not plain ASCII" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "caf\u{e9}");
+    try f.doc.spliceText(f.text, 0, 0, "caf\u{e9}");
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.marked("caf\u{e9}", &.{.{ .name = "accented", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "caf\u{e9}", .marks = &.{.{ .name = "accented", .value = .{ .bool_value = true } }} },
     });
-    const all = try f.doc.text(gpa, f.text);
+    const all = try f.doc.text(f.text, gpa);
     defer gpa.free(all);
     try testing.expectEqualStrings("caf\u{e9}", all);
 }
@@ -2402,15 +2545,15 @@ test "diff_marks: removing a mark from the middle of its range" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "bold text here");
-    try transmod.mark(&f.doc, f.text, 0, 14, "bold", .both, .{ .bool_value = true });
+    try f.doc.spliceText(f.text, 0, 0, "bold text here");
+    try f.doc.mark(f.text, 0, 14, "bold", .both, .{ .bool_value = true });
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.marked("bold", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
     try spans.plain(" text ");
     try spans.marked("here", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "bold", .marks = &.{.{ .name = "bold", .value = .{ .bool_value = true } }} },
@@ -2426,8 +2569,8 @@ test "diff_marks: removing marks leaves gaps" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "a b c d e");
-    try transmod.mark(&f.doc, f.text, 0, 9, "mark", .both, .{ .bool_value = true });
+    try f.doc.spliceText(f.text, 0, 0, "a b c d e");
+    try f.doc.mark(f.text, 0, 9, "mark", .both, .{ .bool_value = true });
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
@@ -2437,7 +2580,7 @@ test "diff_marks: removing marks leaves gaps" {
     try spans.marked("c", &.{m});
     try spans.plain(" d ");
     try spans.marked("e", &.{m});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "a", .marks = &.{m} },
@@ -2455,32 +2598,24 @@ test "diff_marks: a block's properties change while its marks stay" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    const block = try transmod.splitBlock(&f.doc, f.text, 0);
-    try transmod.spliceText(&f.doc, f.text, 1, 0, "marked text");
-    try transmod.mark(&f.doc, f.text, 1, 7, "bold", .both, .{ .bool_value = true });
-
-    // The port's block span names the object rather than carrying a hydrated
-    // map, so the properties are written through `put`; see the diff block.
-    _ = try transmod.put(&f.doc, block, .{ .key = "type" }, .{ .str = "paragraph" });
-    _ = try transmod.put(&f.doc, block, .{ .key = "level" }, .{ .int = 1 });
+    const block = try f.doc.splitBlock(f.text, 0);
+    try f.doc.spliceText(f.text, 1, 0, "marked text");
+    try f.doc.mark(f.text, 1, 7, "bold", .both, .{ .bool_value = true });
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
-    try spans.block(block);
+    try spans.block(&f.doc, block);
+    try spans.putBlock(0, "type", .{ .str = "paragraph" });
+    try spans.putBlock(0, "level", .{ .int = 1 });
     try spans.marked("marked", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
     try spans.plain(" text");
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
-        .{ .block = true },
+        .{ .block = spans.items.items[0].block },
         .{ .text = "marked", .marks = &.{.{ .name = "bold", .value = .{ .bool_value = true } }} },
         .{ .text = " text" },
     });
-    // **And the block really carries the properties**, which the span walk
-    // cannot see: upstream asserts only the span count, and the block's
-    // contents are the other half of what `update_spans` was asked for.
-    try expectBlockKey(&f.doc, gpa, block, "type", .{ .str = "paragraph" });
-    try expectBlockKey(&f.doc, gpa, block, "level", .{ .int = 1 });
 }
 
 // 28 ──────────────────────────────────────────────────────────────────────────
@@ -2498,7 +2633,7 @@ test "diff_marks: update_spans is idempotent" {
         defer spans.deinit();
         try spans.marked("hello ", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
         try spans.marked("world", &.{.{ .name = "italic", .value = .{ .bool_value = true } }});
-        try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+        try f.doc.updateSpans(f.text, spans.items.items);
 
         // `getHeads` allocates and the slice is the caller's
         // (`doc.zig`:3601-3606`), so every round's copy is freed here and only
@@ -2524,22 +2659,22 @@ test "diff_marks: alternating mark changes" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "text");
+    try f.doc.spliceText(f.text, 0, 0, "text");
 
     var bold = NewSpans.init(gpa);
     defer bold.deinit();
     try bold.marked("text", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, bold.items.items);
+    try f.doc.updateSpans(f.text, bold.items.items);
 
     var bare = NewSpans.init(gpa);
     defer bare.deinit();
     try bare.plain("text");
-    try transmod.updateSpans(&f.doc, f.text, bare.items.items);
+    try f.doc.updateSpans(f.text, bare.items.items);
 
     var italic = NewSpans.init(gpa);
     defer italic.deinit();
     try italic.marked("text", &.{.{ .name = "italic", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, italic.items.items);
+    try f.doc.updateSpans(f.text, italic.items.items);
 
     // **Italic, and only italic.** A mark that survives its own removal, or a
     // bold that never went, would both pass a length check.
@@ -2564,7 +2699,7 @@ test "diff_marks: a mix of scripts and emoji" {
     try spans.marked(" \u{0645}\u{0631}\u{062d}\u{0628}\u{0627}", &.{
         .{ .name = "arabic", .value = .{ .bool_value = true } },
     });
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "Hello " },
@@ -2584,32 +2719,26 @@ test "diff_marks: blocks with marked content" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    // Two blocks with the properties upstream's `hydrate_map!` carries, made
-    // by splitting rather than by `update_spans` itself; see the diff block.
-    const heading = try transmod.splitBlock(&f.doc, f.text, 0);
-    try transmod.spliceText(&f.doc, f.text, 1, 0, "One");
-    const para = try transmod.splitBlock(&f.doc, f.text, 4);
-    try transmod.spliceText(&f.doc, f.text, 5, 0, "tail");
-    _ = try transmod.put(&f.doc, heading, .{ .key = "type" }, .{ .str = "heading" });
-    _ = try transmod.put(&f.doc, heading, .{ .key = "level" }, .{ .int = 1 });
-    _ = try transmod.put(&f.doc, para, .{ .key = "type" }, .{ .str = "paragraph" });
-
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
-    try spans.block(heading);
+    // diff_marks.rs:1254-1287 creates both blocks through their map payloads.
+    try spans.emptyBlock();
+    try spans.putBlock(0, "type", .{ .str = "heading" });
+    try spans.putBlock(0, "level", .{ .int = 1 });
     try spans.plain("Chapter ");
     try spans.marked("One", &.{.{ .name = "emphasis", .value = .{ .bool_value = true } }});
-    try spans.block(para);
+    try spans.emptyBlock();
+    try spans.putBlock(3, "type", .{ .str = "paragraph" });
     try spans.plain("This is the ");
     try spans.marked("first", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
     try spans.plain(" chapter.");
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
-        .{ .block = true },
+        .{ .block = spans.items.items[0].block },
         .{ .text = "Chapter " },
         .{ .text = "One", .marks = &.{.{ .name = "emphasis", .value = .{ .bool_value = true } }} },
-        .{ .block = true },
+        .{ .block = spans.items.items[3].block },
         .{ .text = "This is the " },
         .{ .text = "first", .marks = &.{.{ .name = "bold", .value = .{ .bool_value = true } }} },
         .{ .text = " chapter." },
@@ -2629,7 +2758,7 @@ test "diff_marks: an empty span between two marked ones" {
     try spans.marked("a", &.{m});
     try spans.plain("");
     try spans.marked("b", &.{m});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     // **The empty span is not there and the two marked runs are one.** A
     // reader that emitted the empty run, or that failed to coalesce, would
@@ -2646,7 +2775,7 @@ test "diff_marks: one mark name with three different values" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "red blue green");
+    try f.doc.spliceText(f.text, 0, 0, "red blue green");
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
@@ -2655,7 +2784,7 @@ test "diff_marks: one mark name with three different values" {
     try spans.marked("blue", &.{.{ .name = "color", .value = .{ .str = "blue" } }});
     try spans.plain(" ");
     try spans.marked("green", &.{.{ .name = "color", .value = .{ .str = "green" } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     // **Each run carries its own value.** Three runs of one mark name with the
     // value of the first on all three would pass upstream's count.
@@ -2675,21 +2804,23 @@ test "diff_marks: update_spans with nothing but blocks" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "text");
-    const first = try transmod.splitBlock(&f.doc, f.text, 4);
-    try transmod.spliceText(&f.doc, f.text, 5, 0, "more");
-    const second = try transmod.splitBlock(&f.doc, f.text, 7);
+    try f.doc.spliceText(f.text, 0, 0, "text");
+    _ = try f.doc.splitBlock(f.text, 4);
+    try f.doc.spliceText(f.text, 5, 0, "more");
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
-    try spans.block(first);
-    try spans.block(second);
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try spans.emptyBlock();
+    try spans.emptyBlock();
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     // **Two block markers and no text at all.** Upstream asserts only that
     // some block survives; saying what is left is the stronger statement and
     // it is what "remove all the text" has to mean.
-    try expectDocSpans(gpa, &f.doc, f.text, &.{ .{ .block = true }, .{ .block = true } });
+    try expectDocSpans(gpa, &f.doc, f.text, &.{
+        .{ .block = spans.items.items[0].block },
+        .{ .block = spans.items.items[1].block },
+    });
 }
 
 // 35 ──────────────────────────────────────────────────────────────────────────
@@ -2699,30 +2830,26 @@ test "diff_marks: marks survive a block update" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    const block = try transmod.splitBlock(&f.doc, f.text, 0);
-    _ = try transmod.put(&f.doc, block, .{ .key = "type" }, .{ .str = "p" });
-
     var first = NewSpans.init(gpa);
     defer first.deinit();
-    try first.block(block);
+    // diff_marks.rs:1428-1454 changes block properties through update_spans.
+    try first.emptyBlock();
+    try first.putBlock(0, "type", .{ .str = "p" });
     try first.marked("marked", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, first.items.items);
-
-    _ = try transmod.put(&f.doc, block, .{ .key = "type" }, .{ .str = "h1" });
-    _ = try transmod.put(&f.doc, block, .{ .key = "level" }, .{ .int = 1 });
+    try f.doc.updateSpans(f.text, first.items.items);
 
     var second = NewSpans.init(gpa);
     defer second.deinit();
-    try second.block(block);
+    try second.emptyBlock();
+    try second.putBlock(0, "type", .{ .str = "h1" });
+    try second.putBlock(0, "level", .{ .int = 1 });
     try second.marked("marked", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, second.items.items);
+    try f.doc.updateSpans(f.text, second.items.items);
 
     try expectDocSpans(gpa, &f.doc, f.text, &.{
-        .{ .block = true },
+        .{ .block = second.items.items[0].block },
         .{ .text = "marked", .marks = &.{.{ .name = "bold", .value = .{ .bool_value = true } }} },
     });
-    try expectBlockKey(&f.doc, gpa, block, "type", .{ .str = "h1" });
-    try expectBlockKey(&f.doc, gpa, block, "level", .{ .int = 1 });
 }
 
 // 36 ──────────────────────────────────────────────────────────────────────────
@@ -2732,165 +2859,174 @@ test "diff_marks: an insertion at the end of an expanding mark writes no mark" {
     var f = try markFixture(gpa);
     defer f.deinit();
 
-    try transmod.spliceText(&f.doc, f.text, 0, 0, "hello world");
-    try transmod.mark(&f.doc, f.text, 6, 11, "bold", .both, .{ .bool_value = true });
+    try f.doc.spliceText(f.text, 0, 0, "hello world");
+    try f.doc.mark(f.text, 6, 11, "bold", .both, .{ .bool_value = true });
 
-    // Upstream commits here and reads the change the next one produces
-    // (`diff_marks.rs`:1487`, `:1505-1507`). The port has no per-change row
-    // count to read, so it counts the rows the call adds: one change is one
-    // set of rows written by one transaction, which is the same number.
-    const before = f.doc.ops.len();
+    // Match the upstream commit boundary (diff_marks.rs:1487). Count the
+    // operation rows added by the following update: only its two insertions.
+    _ = try f.doc.commit();
+    const before = f.doc.doc.ops.len();
 
     var spans = NewSpans.init(gpa);
     defer spans.deinit();
     try spans.plain("hello ");
     try spans.marked("wworldd", &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
-    try transmod.updateSpans(&f.doc, f.text, spans.items.items);
+    try f.doc.updateSpans(f.text, spans.items.items);
 
     // **Two rows, and two rows is exactly the two inserted characters.** The
     // mark already expands to cover what was typed at its end, so the second
     // pass of `update_spans` finds the mark it wants already there
     // (`text_diff.rs`:206-213`) and writes no unmark and no mark. Four more
     // rows would mean the mark had been torn down and rewritten.
-    try testing.expectEqual(@as(usize, 2), f.doc.ops.len() - before);
+    try testing.expectEqual(@as(usize, 2), f.doc.doc.ops.len() - before);
     try expectDocSpans(gpa, &f.doc, f.text, &.{
         .{ .text = "hello " },
         .{ .text = "wworldd", .marks = &.{.{ .name = "bold", .value = .{ .bool_value = true } }} },
     });
 }
 
-/// Asserts a block map holds `key` with `want`.
-///
-/// **The span walk cannot see inside a block** — a block span is a marker
-/// (`spans.rs`:416-417`) — so this is the only way a ported test can say
-/// anything about the properties `update_spans` was given. It reads the block
-/// the way any consumer would: [`hydrateMap`] over the op set.
-fn expectBlockKey(
-    doc: *Document,
-    gpa: Allocator,
-    block: ExId,
-    key: []const u8,
-    want: value.ScalarValue,
-) !void {
-    var hydrated = try hydmod.hydrateMap(HydrateSet, &doc.ops, gpa, block, null);
-    defer hydrated.deinit();
-    const m = switch (hydrated) {
-        .object => |o| switch (o) {
-            .map => |mm| mm,
-            else => {
-                std.debug.print("block is not a map\n", .{});
-                return error.TestExpectedEqual;
-            },
-        },
-        else => {
-            std.debug.print("block hydrated to a scalar\n", .{});
-            return error.TestExpectedEqual;
-        },
-    };
-    const found = m.get(key) orelse {
-        std.debug.print("block has no key {s}\n", .{key});
-        return error.TestExpectedEqual;
-    };
-    const scalar = found.toScalar() orelse {
-        std.debug.print("block key {s} is not a scalar\n", .{key});
-        return error.TestExpectedEqual;
-    };
-    if (!scalar.eql(want)) {
-        std.debug.print("block key {s} is {any}, want {any}\n", .{ key, scalar, want });
-        return error.TestExpectedEqual;
+test "diff_marks: copied reader marks survive span and document teardown" {
+    const gpa = testing.allocator;
+    var fixture = try markFixture(gpa);
+    var fixture_live = true;
+    defer if (fixture_live) fixture.deinit();
+    try fixture.doc.spliceText(fixture.text, 0, 0, "linked");
+    try fixture.doc.mark(fixture.text, 0, 6, "link", .both, .{ .str = "https://example.com" });
+    const found = try readSpanList(gpa, &fixture.doc, fixture.text);
+    defer {
+        for (found) |*span| span.deinit(gpa);
+        gpa.free(found);
     }
+    fixture.deinit();
+    fixture_live = false;
+    try testing.expectEqual(@as(usize, 1), found.len);
+    try testing.expectEqualStrings("linked", found[0].text);
+    try testing.expect(marksEql(found[0].marks, &.{
+        .{ .name = "link", .value = .{ .str = "https://example.com" } },
+    }));
 }
 
-// Zig 0.16.0 / upstream / Rust / port
-//
-// * **The section above is a port of
-//   `$AUTOMERGE_REF/rust/automerge/tests/diff_marks.rs`: thirty-six upstream
-//   tests, thirty-six ported, one for one, in upstream's order.** Each carries
-//   its upstream line numbers.
-//
-// * **`UpdateSpansConfig` is ported, and [API.md](../API.md) still drops the
-//   type.** Upstream's `update_spans` takes a config (`marks.rs`:468-473`) and
-//   [`apply_marks_diff`](../../github-automerge-automerge/rust/automerge/src/text_diff.rs):216-226
-//   and [`:229-245`](../../github-automerge-automerge/rust/automerge/src/text_diff.rs)
-//   read `per_mark_expands` for the mark being removed and for the mark being
-//   written, and `default_expand` for a name the map does not hold
-//   (`text_diff.rs`:217-221`, `:235-239`). The port spells that
-//   [`UpdateSpansConfig`] and threads it from
-//   [`Transaction.updateSpansWithConfig`](transact.zig) to
-//   [`Transaction.applyMarkDiff`](transact.zig), where both reads are
-//   `config.expandFor(name)` — upstream's `.per_mark_expands.get(name).copied()
-//   .unwrap_or(config.default_expand)`. **This is a change to `transact.zig`,
-//   which the earlier port of this file named as outside its slice, and it is
-//   additive**: [`transact.updateSpans`](transact.zig) keeps its signature and
-//   is now upstream's `update_spans` with `UpdateSpansConfig::default()`,
-//   which is what wrote every mark with [`ExpandMark.after`] before. The two
-//   cases that needed it — `multiple_marks_different_expand_behaviors`
-//   (`diff_marks.rs`:864-903`) and `marks_with_expand_none_at_boundaries`
-//   (`:906-944`) — are cases 21 and 22 above.
-//
-// * **A block span names an object here and carries a hydrated map upstream.**
-//   Upstream's `Span::Block(Map)` (`spans.rs`:416-417`) holds the block's
-//   contents, so `update_spans` can create a block and set its properties in
-//   one step — `block_properties_change_with_marks`
-//   (`diff_marks.rs`:1091-1127`) and `block_with_marked_content`
-//   (`:1250-1292`) both hand it properties. This port's `Span.block` is the
-//   row's own [`ExId`](types.zig), so the properties are written with
-//   [`transact.put`](transact.zig) **before** the `update_spans` call, and the
-//   ported tests then assert both halves: the spans, which is what upstream
-//   asserts, **and** the block's properties read back out of the document by
-//   [`expectBlockKey`], which is the thing the span walk cannot see. The
-//   deviation is the port's own, already recorded at `transact.zig`:2290-2292`.
-//
-// * **`update_spans_which_inserts_at_the_end_of_expand_mark_doesnt_generate_mark_changes`
-//   counts rows, not `change.decode().operations.len()`.** Upstream commits,
-//   takes the hash of the change the last transaction produced and decodes it
-//   (`diff_marks.rs`:1505-1507`). This port's autocommit document does not hand
-//   back per-change operation lists, so the test counts the rows
-//   `update_spans` added to the op set. One change is one transaction's rows,
-//   so it is the same number, and the two inserted characters are the two it
-//   asserts — which is upstream's assertion, restated over the thing the port
-//   can read.
-//
-// * **Several upstream tests assert only a span count and this port asserts the
-//   spans.** `many_marks_on_same_text` (`:744-752`) counts marks,
-//   `nested_marks` (`:718-719`), `unmark_creates_gaps` (`:1086-1087`),
-//   `complex_unicode_text` (`:1245-1246`) and `block_with_marked_content`
-//   (`:1290-1291`) count spans, `multiple_marks_different_expand_behaviors`
-//   (`:902`) counts three spans and says nothing about which mark is over
-//   which of them, and `marks_with_different_values_same_name` (`:1367-1394`)
-//   checks three values out of five spans. A count passes on a mirror of the
-//   wrong length with the wrong spans in it, and [AGENTS.md](../AGENTS.md)
-//   says a test that only shows something is not broken has to go. Each of
-//   those is asserted here in full: which mark is over which text, by name and
-//   by value. **Case 21 is where that matters most, and the measurement is not
-//   the one this block first claimed.** Perturbing
-//   [`UpdateSpansConfig.expandFor`] to a fixed [`ExpandMark.both`] — the
-//   closest thing to a permissive reader — does not give three wrong spans, it
-//   gives **one**: `atextb` carrying all three names, so upstream's count of
-//   three (`:902`) fails too. Case 22 under the same perturbation gives one
-//   span, `before text after`, with the mark over the inserted runs. Both were
-//   measured on 2026-10-01: `2` failures, `0` compile errors, exit 1, and the
-//   diagnostics name the marks.
-//
-// * **All thirty-six pass; the three failures an earlier version of this block
-//   recorded are gone, and what fixed them is named here.**
-//   `overlapping_marks_change_boundaries` (`:73-131`) and
-//   `overlapping_marks_add_third_mark` (`:134-194`) were recorded as reading
-//   five and four spans where upstream reads three and three, with the cause
-//   given as [`NextText.canExtend`](iter/spans.zig) comparing a generation
-//   counter where upstream compares mark sets (`spans.rs`:495-498); and
-//   `update_spans_which_inserts_at_the_end_of_expand_mark_doesnt_generate_mark_changes`
-//   (`:1473-1508`) was recorded as faulting in `appendPayload`
-//   ([`columnar/encoding.zig`](columnar/encoding.zig)) while committing.
-//   Neither is true of the tree now.
-//
-//   **Measured 2026-10-01**, `zig test -Mroot=src/root.zig
-//   --dep build_options -Mbuild_options=… --test-filter diff_marks`: 38 tests
-//   matched the filter, **36 of them `marks.test.diff_marks`**, all OK, exit 0,
-//   zero leaked. The 36 is `grep -c 'marks.test.diff_marks'` over the run log;
-//   the other two are unnamed root test blocks that match only because their
-//   bodies mention the file. The span-boundary cause is fixed and the fix is
-//   where the block said it would have to be: `NextText.canExtend`
-//   (`iter/spans.zig`:598-606`) builds the two mark sets with `markView` and
-//   compares them with `flattenedEql`, which is upstream's test, where the
-//   generation counter was.
+test "parity rich marks filtered view ignores null tombstones" {
+    // The borrowed view must compare visible names and values, not tombstones.
+    var left = MarkSet.init(std.testing.allocator);
+    defer left.deinit();
+    var right = MarkSet.init(std.testing.allocator);
+    defer right.deinit();
+    try left.put("deleted", .null_value);
+    try testing.expect(left.nonDeletedMarks().isEmpty());
+    try left.put("bold", .{ .bool_value = true });
+    try right.put("bold", .{ .bool_value = true });
+    const visible = left.nonDeletedMarks();
+    try testing.expectEqual(@as(usize, 1), visible.len());
+    try testing.expect(visible.eql(right.nonDeletedMarks()));
+    try right.put("bold", .{ .bool_value = false });
+    try testing.expect(!visible.eql(right.nonDeletedMarks()));
+}
+
+test "parity rich marks duplicate owns names and scalar bytes" {
+    // Releasing the source buffers must not invalidate the independent copy.
+    const gpa = std.testing.allocator;
+    const name = try gpa.dupe(u8, "link");
+    const payload = try gpa.dupe(u8, "target");
+    var source = MarkSet.init(gpa);
+    try source.put(name, .{ .str = payload });
+    var copied = try source.dup(gpa);
+    defer copied.deinit();
+    source.deinit();
+    gpa.free(name);
+    gpa.free(payload);
+    const entry = copied.entries.items[0];
+    try std.testing.expectEqualStrings("link", entry.name);
+    try std.testing.expectEqualStrings("target", entry.value.str);
+    try copied.put("link", .{ .str = "replacement" });
+    try std.testing.expectEqualStrings("replacement", copied.entries.items[0].value.str);
+}
+
+fn ownedMarksAllocationBoundaries(gpa: Allocator) !void {
+    var source = try MarkSet.fromPairs(gpa, &.{
+        .{ .name = "actor", .value = .{ .actor_id = .{ .bytes = "actor-bytes" } } },
+        .{ .name = "bytes", .value = .{ .bytes = "binary" } },
+        .{ .name = "link", .value = .{ .str = "target" } },
+        .{ .name = "unknown", .value = .{
+            .unknown = .{ .type_code = 12, .bytes = "future" },
+        } },
+    });
+    defer source.deinit();
+    var owned = source.dup(gpa) catch |failure| {
+        try testing.expectEqualStrings("target", source.entries.items[2].value.str);
+        return failure;
+    };
+    defer owned.deinit();
+    try testing.expect(owned.eql(&source));
+    // Replacement must copy before releasing an aliased prior payload.
+    owned.put(owned.entries.items[2].name, owned.entries.items[2].value) catch |failure| {
+        try testing.expect(owned.eql(&source));
+        return failure;
+    };
+    owned.put("added", .{ .str = "new" }) catch |failure| {
+        try testing.expect(owned.eql(&source));
+        return failure;
+    };
+    owned.remove("actor");
+    try testing.expectEqual(@as(usize, 4), owned.len());
+    try testing.expectEqualStrings("actor-bytes", source.entries.items[0].value.actor_id.bytes);
+    try testing.expectEqualStrings("target", source.entries.items[2].value.str);
+}
+
+test "parity rich marks owned duplication and mutation allocation boundaries" {
+    // Every refused allocation preserves its input and releases partial copies.
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        ownedMarksAllocationBoundaries,
+        .{},
+    );
+}
+
+fn ownedMarksStripAllocationBoundaries(gpa: Allocator) !void {
+    var source = try MarkSet.fromPairs(gpa, &.{
+        .{ .name = "gone", .value = .null_value },
+        .{ .name = "link", .value = .{ .str = "target" } },
+    });
+    defer source.deinit();
+    const owned = try source.dup(gpa);
+    // Consumed on success and failure: no separate owned.deinit is permitted.
+    var visible = try owned.withoutUnmarks();
+    defer visible.deinit();
+    try testing.expectEqual(@as(usize, 1), visible.len());
+    try testing.expectEqualStrings("link", visible.entries.items[0].name);
+    try testing.expectEqualStrings("target", visible.entries.items[0].value.str);
+    try visible.put("link", visible.entries.items[0].value);
+}
+
+test "parity rich marks owned filtering survives consumed source allocation boundaries" {
+    // The filtered owned result remains usable after its input is destroyed.
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        ownedMarksStripAllocationBoundaries,
+        .{},
+    );
+}
+
+test "parity rich marks owned insertion copies transient inputs and removal is independent" {
+    // Mutation of a duplicate retains no caller buffers or source payloads.
+    const gpa = testing.allocator;
+    var source = MarkSet.init(gpa);
+    defer source.deinit();
+    try source.put("original", .{ .str = "unchanged" });
+    var owned = try source.dup(gpa);
+    defer owned.deinit();
+    {
+        const name = try gpa.dupe(u8, "transient");
+        defer gpa.free(name);
+        const actor = try gpa.dupe(u8, "ephemeral-actor");
+        defer gpa.free(actor);
+        try owned.put(name, .{ .actor_id = .{ .bytes = actor } });
+    }
+    try testing.expectEqualStrings("transient", owned.entries.items[1].name);
+    try testing.expectEqualStrings(
+        "ephemeral-actor",
+        owned.entries.items[1].value.actor_id.bytes,
+    );
+    owned.remove("original");
+    try testing.expectEqualStrings("unchanged", source.entries.items[0].value.str);
+}

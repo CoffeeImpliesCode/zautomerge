@@ -677,16 +677,45 @@ pub fn receiveSyncMessage(
     state: *State,
     message: Message,
 ) ProtocolError!void {
-    state.in_flight = false;
-    // The message is this call's from the first statement, so its guard is
-    // armed **before** the first fallible one. `getHeads` allocating the
-    // `before_heads` list used to be such a step and returned a message
-    // nobody owned: three lists and a chunk list, leaked whole.
+    return receiveSyncMessageImpl(gpa, doc, state, message, null);
+}
+
+/// Receives through the same protocol state machine with a borrowed external log.
+/// Consumes `message` on every path. Actor mismatch leaves doc/state/log unchanged.
+pub fn receiveSyncMessageWithPatchLog(
+    gpa: Allocator,
+    doc: *Document,
+    state: *State,
+    message: Message,
+    log: *@import("../patches.zig").PatchLog,
+) ProtocolError!void {
+    return receiveSyncMessageImpl(gpa, doc, state, message, log);
+}
+
+fn receiveSyncMessageImpl(
+    gpa: Allocator,
+    doc: *Document,
+    state: *State,
+    message: Message,
+    log: ?*@import("../patches.zig").PatchLog,
+) ProtocolError!void {
     var owned = message;
     errdefer owned.deinit();
+    if (log == null) state.in_flight = false;
 
     const before_heads = try doc.getHeads(gpa);
     defer gpa.free(before_heads);
+    const changes_is_empty = owned.changes.isEmpty();
+    if (log) |sink| {
+        // Doc applies its branch-specific actor contract while loading once,
+        // before peer flags or acknowledgement state can be published.
+        if (!changes_is_empty and !state.read_only) {
+            const joined = try owned.changes.join(gpa);
+            defer gpa.free(joined);
+            _ = try doc.loadIncrementalWithPatchLog(gpa, joined, sink);
+        }
+        state.in_flight = false;
+    }
 
     // `sync.rs:404-418`. Capabilities are **replaced**, never accumulated, and
     // a message with no flags section leaves the previous list alone, so a
@@ -700,11 +729,12 @@ pub fn receiveSyncMessage(
     }
 
     // `sync.rs:420-428`.
-    const changes_is_empty = owned.changes.isEmpty();
     if (!changes_is_empty and !state.read_only) {
-        const joined = try owned.changes.join(gpa);
-        defer gpa.free(joined);
-        _ = try doc.loadIncremental(gpa, joined);
+        if (log == null) {
+            const joined = try owned.changes.join(gpa);
+            defer gpa.free(joined);
+            _ = try doc.loadIncremental(gpa, joined);
+        }
         const after_heads = try doc.getHeads(gpa);
         defer gpa.free(after_heads);
         // `advance_heads` (`sync.rs:827-850`): what we gained, plus the old
@@ -813,6 +843,10 @@ pub fn receiveSyncMessage(
 /// (`sync.rs:370-381`). A port that emitted chunks in hash-map order would
 /// produce valid but different bytes, which is why neither arm below reads a
 /// map's iteration order.
+///
+/// Repeated `need` entries remain repeated when `have` is empty, or when they
+/// fall outside the derived graph selection. Entries in that graph selection
+/// are emitted once in graph order (`sync.rs:323-329,370-381`).
 ///
 /// Two things in here are easy to get wrong:
 ///
@@ -987,33 +1021,35 @@ fn buildPayload(
     const all_hashes = try getHashesToSend(gpa, doc, their.have, their.need);
     defer gpa.free(all_hashes);
 
-    // `sync.rs:221-224`: deduplicate against what has already gone on the wire
-    // this session, on the hashes, before any change is materialised.
+    // `sync.rs:221-224`: preserve selection order while excluding hashes
+    // already sent. The allocated hash list is call-local and can be compacted.
+    var selected_len: usize = 0;
+    for (all_hashes) |hash| {
+        if (sentContains(state, hash)) continue;
+        all_hashes[selected_len] = hash;
+        selected_len += 1;
+    }
+    const hashes = all_hashes[0..selected_len];
+
+    // Choose the existing V2 snapshot before reconstructing any changes.
+    // Count every selected occurrence, not unique hashes. Equality remains a
+    // change batch (`sync.rs:225-231`).
+    if (hashes.len > doc.graph.len() / 3 and state.supportsV2Messages()) {
+        return wholeDocument(gpa, doc);
+    }
+    var changes = try doc.getChangesByHashes(gpa, hashes);
+    defer changes.deinit(gpa);
     var payloads: std.ArrayList(ChangePayload) = .empty;
-    // Each payload's bytes belong to this function until the builder has
-    // copied them, so they are released here rather than left to the caller.
-    // The builder dupes on the way in (`MessageBuilder::new_v1`), which is
-    // what makes a borrowed `ChangePayload` safe at all.
+    // The builder copies the frames; every temporary remains ours until then.
     defer {
         for (payloads.items) |payload| gpa.free(payload.raw);
         payloads.deinit(gpa);
     }
-    for (all_hashes) |hash| {
-        if (sentContains(state, hash)) continue;
-        // The bytes are this loop's until the append that takes them has
-        // completed. The `defer` above owns what was appended and nothing
-        // else, so a failed append has to release this one itself.
-        const made = try changePayload(gpa, doc, hash);
-        errdefer gpa.free(made.raw);
-        try payloads.append(gpa, made);
+    try payloads.ensureTotalCapacity(gpa, changes.len());
+    for (changes.slice()) |built| {
+        const raw = try built.change.encode(gpa);
+        payloads.appendAssumeCapacity(.{ .raw = raw, .hash = built.change.hash });
     }
-
-    // `sync.rs:225-228`: more than a third of the document is cheaper as one
-    // snapshot than as a change list, but only if the peer can read one chunk.
-    if (payloads.items.len > doc.graph.len() / 3 and state.supportsV2Messages()) {
-        return wholeDocument(gpa, doc);
-    }
-    // `sync.rs:230-231`.
     return MessageBuilder.new(gpa, payloads.items, state);
 }
 
@@ -1029,14 +1065,6 @@ fn wholeDocument(gpa: Allocator, doc: *Document) ProtocolError!MessageBuilder {
         return e;
     };
     return MessageBuilder.newV2(gpa, data, hashes);
-}
-
-/// One change as the wire sees it: the framed chunk and its hash. The chunk is
-/// what upstream's `Change::raw_bytes` is (`sync/message_builder.rs:30`).
-fn changePayload(gpa: Allocator, doc: *Document, hash: ChangeHash) ProtocolError!ChangePayload {
-    var built = (try doc.getChangeByHash(gpa, hash)) orelse return error.MissingHash;
-    defer built.deinit(gpa);
-    return .{ .raw = try built.change.encode(gpa), .hash = built.change.hash };
 }
 
 /// Whether `sent_hashes` holds `hash` (`sync.rs:223`). The list is ascending
@@ -1235,26 +1263,28 @@ const Framed = struct {
 
 /// A stored change stream split into its framed chunks, each re-framed so it
 /// can go into a message on its own.
+/// This is a fixture helper, not the live sync message path.
 ///
 /// **Re-framed, not copied:** `chunkmod.writeChunk` is the writer for the
-/// framing `parseChunks` reads, so the bytes a peer receives here are the bytes
+/// framing `ChunkStream` reads, so the bytes a peer receives here are the bytes
 /// a reader will accept, checksum included. The hash is `changeHashOf`, which is
 /// what a change chunk's identity is (`chunk.rs:300-312`) — the same value
 /// `parseChange` computes for the same body.
 fn splitStream(gpa: Allocator, bytes: []const u8) ![]Framed {
-    const chunks = try chunkmod.parseChunks(bytes, gpa);
-    defer gpa.free(chunks);
+    var stream = chunkmod.ChunkStream.init(bytes);
     var out: std.ArrayList(Framed) = .empty;
     errdefer {
         for (out.items) |framed| gpa.free(framed.bytes);
         out.deinit(gpa);
     }
-    for (chunks) |c| {
+    while (try stream.next()) |c| {
         var framed: std.ArrayList(u8) = .empty;
         errdefer framed.deinit(gpa);
         try chunkmod.writeChunk(&framed, gpa, c.typ, c.data);
+        const owned = try framed.toOwnedSlice(gpa);
+        errdefer gpa.free(owned);
         try out.append(gpa, .{
-            .bytes = try framed.toOwnedSlice(gpa),
+            .bytes = owned,
             .hash = chunkmod.changeHashOf(c.typ, c.data),
         });
     }
@@ -1266,9 +1296,71 @@ fn freeFramed(gpa: Allocator, frames: []Framed) void {
     gpa.free(frames);
 }
 
+fn splitStreamAndFree(gpa: Allocator, bytes: []const u8) !void {
+    const frames = try splitStream(gpa, bytes);
+    defer freeFramed(gpa, frames);
+}
+
+fn splitStreamRejectLater(gpa: Allocator, bytes: []const u8) !void {
+    const frames = splitStream(gpa, bytes) catch |failure| switch (failure) {
+        error.InvalidMagic => return,
+        else => return failure,
+    };
+    defer freeFramed(gpa, frames);
+    return error.TestUnexpectedResult;
+}
+
+test "protocol splitStream spends only the required frame output allocation budget" {
+    // Measure the writer and output-vector costs separately from parsing.
+    // The fixture payloads are the same change streams used by message tests.
+    const gpa = testing.allocator;
+    for ([_][]const u8{ two_changes_out_of_order_fixture, other_actor_fixture }) |name| {
+        const bytes = try readFixture(gpa, name);
+        defer gpa.free(bytes);
+        const chunks = try chunkmod.parseChunks(bytes, gpa);
+        defer gpa.free(chunks);
+        var output_cost: testing.FailingAllocator = .init(gpa, .{});
+        const counted_output = output_cost.allocator();
+        var vector: std.ArrayList(Framed) = .empty;
+        defer vector.deinit(counted_output);
+        for (chunks) |c| {
+            var frame: std.ArrayList(u8) = .empty;
+            defer frame.deinit(counted_output);
+            try chunkmod.writeChunk(&frame, counted_output, c.typ, c.data);
+            const owned = try frame.toOwnedSlice(counted_output);
+            defer counted_output.free(owned);
+            try vector.append(counted_output, .{
+                .bytes = &.{},
+                .hash = chunkmod.changeHashOf(c.typ, c.data),
+            });
+        }
+        const owned_vector = try vector.toOwnedSlice(counted_output);
+        defer counted_output.free(owned_vector);
+
+        var actual_cost: testing.FailingAllocator = .init(gpa, .{});
+        const counted_actual = actual_cost.allocator();
+        const frames = try splitStream(counted_actual, bytes);
+        defer freeFramed(counted_actual, frames);
+        try testing.expectEqual(chunks.len, frames.len);
+        for (chunks, frames) |c, framed| {
+            try testing.expectEqualSlices(u8, c.frame, framed.bytes);
+            try testing.expect(chunkmod.changeHashOf(c.typ, c.data).eql(framed.hash));
+            try testing.expect(c.frame.ptr != framed.bytes.ptr);
+        }
+        try testing.expectEqual(output_cost.alloc_index, actual_cost.alloc_index);
+        try testing.checkAllAllocationFailures(gpa, splitStreamAndFree, .{bytes});
+
+        // A later bad header must discard frames already produced by the stream.
+        const malformed = try std.mem.concat(gpa, u8, &.{ bytes, &.{ 0, 0, 0, 0 } });
+        defer gpa.free(malformed);
+        try splitStreamRejectLater(gpa, malformed);
+        try testing.checkAllAllocationFailures(gpa, splitStreamRejectLater, .{malformed});
+    }
+}
+
 /// A document that has applied `parts`, in order.
 fn docWith(gpa: Allocator, parts: []const []const u8) !Document {
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = "cccccccccccccccccccccccccccccccc" });
     for (parts) |part| _ = try doc.loadIncremental(gpa, part);
@@ -1572,7 +1664,7 @@ test "a peer with no heads is sent the document once, and a read-only peer then 
     defer gpa.free(other);
     var a = try docWith(gpa, &.{ stream, other });
     defer a.deinit();
-    var b = try Document.init(gpa, std.testing.io, .auto);
+    var b = try Document.init(gpa, std.testing.io);
     defer b.deinit();
     b.setActorId(.{ .bytes = "cccccccccccccccccccccccccccccccc" });
     try testing.expectEqual(@as(u64, 0), b.stats().num_changes);
@@ -1753,7 +1845,7 @@ test "a change that arrives before its dependency is queued, then applied" {
     try testing.expectEqualSlices(u8, &h_child.bytes, &source_heads[0].bytes);
     try testing.expect(!h_parent.eql(h_child));
 
-    var target = try Document.init(gpa, std.testing.io, .auto);
+    var target = try Document.init(gpa, std.testing.io);
     defer target.deinit();
     target.setActorId(.{ .bytes = "cccccccccccccccccccccccccccccccc" });
     var state = State.new(gpa);
@@ -1808,7 +1900,7 @@ test "a change the document already has changes nothing" {
     defer gpa.free(stream);
     var source = try docWith(gpa, &.{stream});
     defer source.deinit();
-    var target = try Document.init(gpa, std.testing.io, .auto);
+    var target = try Document.init(gpa, std.testing.io);
     defer target.deinit();
     target.setActorId(.{ .bytes = "cccccccccccccccccccccccccccccccc" });
     var state = State.new(gpa);
@@ -1846,7 +1938,7 @@ test "peers agree on V2 when both can, and stay on V1 when one cannot" {
     defer gpa.free(stream);
     var a = try docWith(gpa, &.{stream});
     defer a.deinit();
-    var b = try Document.init(gpa, std.testing.io, .auto);
+    var b = try Document.init(gpa, std.testing.io);
     defer b.deinit();
     b.setActorId(.{ .bytes = "cccccccccccccccccccccccccccccccc" });
     var sa = State.new(gpa);
@@ -1882,7 +1974,7 @@ test "peers agree on V2 when both can, and stay on V1 when one cannot" {
     // (`state.rs:198-200`, `sync.rs:225`). At this commit a hand-written
     // unflagged message is the only way such a peer exists, because every
     // generated message carries flags.
-    var c = try Document.init(gpa, std.testing.io, .auto);
+    var c = try Document.init(gpa, std.testing.io);
     defer c.deinit();
     c.setActorId(.{ .bytes = "cccccccccccccccccccccccccccccccc" });
     var sc = State.new(gpa);
@@ -1909,7 +2001,7 @@ test "a malformed message is refused and the document is unchanged" {
 
     var source = try docWith(gpa, &.{stream});
     defer source.deinit();
-    var target = try Document.init(gpa, std.testing.io, .auto);
+    var target = try Document.init(gpa, std.testing.io);
     defer target.deinit();
     target.setActorId(.{ .bytes = "cccccccccccccccccccccccccccccccc" });
     var state = State.new(gpa);
@@ -2022,7 +2114,7 @@ test "the shared heads advance from what was sent, not from what was claimed" {
     defer gpa.free(stream);
     var source = try docWith(gpa, &.{stream});
     defer source.deinit();
-    var target = try Document.init(gpa, std.testing.io, .auto);
+    var target = try Document.init(gpa, std.testing.io);
     defer target.deinit();
     target.setActorId(.{ .bytes = "cccccccccccccccccccccccccccccccc" });
     var state = State.new(gpa);
@@ -2170,7 +2262,7 @@ test "a peer whose first have names a change we lack gets a reset" {
     defer gpa.free(stream);
     var source = try docWith(gpa, &.{stream});
     defer source.deinit();
-    var other = try Document.init(gpa, std.testing.io, .auto);
+    var other = try Document.init(gpa, std.testing.io);
     defer other.deinit();
     other.setActorId(.{ .bytes = "cccccccccccccccccccccccccccccccc" });
     var state = State.new(gpa);
@@ -2774,13 +2866,12 @@ const Converge = struct {
 /// The converge scenario's base document, loaded from the reference's own
 /// `save()` bytes.
 ///
-/// **`.manual`, because the callers commit the change themselves** and an
-/// autocommit document would write one per call.
+/// Raw documents are returned because callers author changes in explicit transactions.
 fn convergeBase(gpa: Allocator, converge: *const Converge) !Document {
     const record = try converge.first("base");
     const bytes = try err.hexFrom(gpa, record.hex.?);
     defer gpa.free(bytes);
-    return Document.load(gpa, std.testing.io, bytes, docmod.defaultTextEncoding(), .manual);
+    return Document.load(gpa, std.testing.io, bytes, docmod.defaultTextEncoding());
 }
 
 /// The scenario's left actor, as the oracle wrote it.
@@ -2828,14 +2919,16 @@ fn convergeLeft(gpa: Allocator, doc: *Document, actor: []const u8, time: i64) !v
     // for.
     const text = (try readmod.get(doc, .root, .{ .key = "text" })).?.id;
     var t = try trans.Transaction.open(gpa, doc);
-    defer t.deinit();
+    // This private fixture caller destroys doc on error; success commits below.
+    defer t.deinitClosed();
     _ = try t.put(.root, .{ .key = "contested" }, .{ .str = "left" });
     _ = try t.put(.root, .{ .key = "only_left" }, .{ .int = 1 });
     try t.increment(.root, .{ .key = "counter" }, 1);
     _ = try t.delete(.root, .{ .key = "doomed" });
     try t.mark(text, 1, 4, "bold", .both, .{ .bool_value = true });
     try t.spliceText(text, 8, 0, "!");
-    _ = try t.commit("left", time);
+    var committed = try t.commitWith(.{ .message = "left", .time = time });
+    defer committed.deinit(gpa);
 }
 
 /// The right peer's single commit: the mirror of [`convergeLeft`], case for
@@ -2845,7 +2938,8 @@ fn convergeRight(gpa: Allocator, doc: *Document, actor: []const u8, time: i64) !
     doc.setActorId(.{ .bytes = actor });
     const text = (try readmod.get(doc, .root, .{ .key = "text" })).?.id;
     var t = try trans.Transaction.open(gpa, doc);
-    defer t.deinit();
+    // The private fixture caller destroys doc on error.
+    defer t.deinitClosed();
     _ = try t.put(.root, .{ .key = "contested" }, .{ .str = "right" });
     _ = try t.put(.root, .{ .key = "only_right" }, .{ .int = 2 });
     try t.increment(.root, .{ .key = "counter" }, 2);
@@ -2854,7 +2948,8 @@ fn convergeRight(gpa: Allocator, doc: *Document, actor: []const u8, time: i64) !
     // the mark covers it does not depend on `ExpandMark`, which is what makes
     // this the case that shows the mark survived the merge.
     try t.spliceText(text, 2, 0, "XY");
-    _ = try t.commit("right", time);
+    var committed = try t.commitWith(.{ .message = "right", .time = time });
+    defer committed.deinit(gpa);
 }
 
 /// How many rounds the exchange takes, **read from the reference's own
@@ -3757,9 +3852,11 @@ fn putAndCommit(
     time: i64,
 ) !void {
     var t = try trans.Transaction.open(gpa, doc);
-    defer t.deinit();
+    // Every caller owns doc and destroys it on fixture failure.
+    defer t.deinitClosed();
     _ = try t.put(.root, .{ .key = key }, scalar);
-    _ = try t.commit("put", time);
+    var committed = try t.commitWith(.{ .message = "put", .time = time });
+    defer committed.deinit(gpa);
 }
 
 /// The last change `from` committed, applied to `into` **out of band** — by
@@ -3786,16 +3883,14 @@ test "a change applied out of band, concurrent to the last sync heads" {
     // heads* — upstream's own words, and the reason the final `sync` takes the
     // slower path (`sync.rs:1300`).
     const gpa = testing.allocator;
-    // `.manual`, not `.auto`: the two tests below open a transaction to make
-    // each change, and `Transaction.open` refuses an autocommit handle
-    // (`transact.zig:394`) because an autocommit document commits on its own.
-    var doc1 = try Document.init(gpa, std.testing.io, .manual);
+    // Raw documents use explicit transactions to create each authored change.
+    var doc1 = try Document.init(gpa, std.testing.io);
     defer doc1.deinit();
     doc1.setActorId(.{ .bytes = "0123456789abcdef" });
-    var doc2 = try Document.init(gpa, std.testing.io, .manual);
+    var doc2 = try Document.init(gpa, std.testing.io);
     defer doc2.deinit();
     doc2.setActorId(.{ .bytes = "89abcdef01234567" });
-    var doc3 = try Document.init(gpa, std.testing.io, .manual);
+    var doc3 = try Document.init(gpa, std.testing.io);
     defer doc3.deinit();
     doc3.setActorId(.{ .bytes = "fedcba9876543210" });
 
@@ -3861,9 +3956,9 @@ test "the in-flight bit does not sabotage a concurrent change" {
     // encodes a property of the bloom filter, and a loop that no longer reaches
     // the false positive is a test that has quietly stopped being able to fail.
     for (0..300) |_| {
-        var doc1 = try Document.init(gpa, std.testing.io, .manual);
+        var doc1 = try Document.init(gpa, std.testing.io);
         defer doc1.deinit();
-        var doc2 = try Document.init(gpa, std.testing.io, .manual);
+        var doc2 = try Document.init(gpa, std.testing.io);
         defer doc2.deinit();
         var s1 = State.new(gpa);
         defer s1.deinit();
@@ -4172,7 +4267,7 @@ test "a third of the document is the boundary, and at it a change list goes out"
     const actor_b = try err.hexFrom(gpa, third_actor_b);
     defer gpa.free(actor_b);
     for (third_cases) |case| {
-        var sender = try Document.init(gpa, std.testing.io, .manual);
+        var sender = try Document.init(gpa, std.testing.io);
         defer sender.deinit();
         sender.setActorId(.{ .bytes = actor_a });
         for (0..case.total) |index| {
@@ -4182,9 +4277,11 @@ test "a third of the document is the boundary, and at it a change list goes out"
             // change and therefore part of its hash, so it is written out here
             // rather than borrowed from a helper whose message is its own.
             var t = try trans.Transaction.open(gpa, &sender);
-            defer t.deinit();
+            // Sender is destroyed if any setup step returns an error.
+            defer t.deinitClosed();
             _ = try t.put(.root, .{ .key = third_key }, .{ .int = @intCast(index) });
-            _ = try t.commit(third_key, third_time);
+            var committed = try t.commitWith(.{ .message = third_key, .time = third_time });
+            defer committed.deinit(gpa);
         }
         // **The fixture is the reference's fixture.** The head hash pins every
         // change behind it — each one depends on the one before it — and the
@@ -4200,7 +4297,7 @@ test "a third of the document is the boundary, and at it a change list goes out"
         try testing.expectEqual(case.hashes_to_send > case.threshold, case.document);
 
         // The peer, holding a real prefix of the sender's own changes.
-        var peer = try Document.init(gpa, std.testing.io, .manual);
+        var peer = try Document.init(gpa, std.testing.io);
         defer peer.deinit();
         peer.setActorId(.{ .bytes = actor_b });
         var all = try sender.getChanges(gpa, &.{});
@@ -4316,10 +4413,10 @@ test "a generated message records every hash it carried, once, in order" {
     // into an empty set, which is the shape `sync-roundtrip` runs twenty-four
     // times over.
     const gpa = testing.allocator;
-    var sender = try Document.init(gpa, testing.io, .manual);
+    var sender = try Document.init(gpa, testing.io);
     defer sender.deinit();
     sender.setActorId(.{ .bytes = "sync-sent-hashes-local" });
-    var peer = try Document.init(gpa, testing.io, .manual);
+    var peer = try Document.init(gpa, testing.io);
     defer peer.deinit();
     peer.setActorId(.{ .bytes = "sync-sent-hashes-peer" });
 
@@ -4379,8 +4476,8 @@ test "a generated message records every hash it carried, once, in order" {
 // ```
 //
 // (`sync.rs:225`) and the port reads the same decision at `protocol.zig:995`:
-// `payloads.items.len` is `hashes.len()` (both count the vector *after* the
-// `sent_hashes` filter of `sync.rs:221-224`), `doc.graph.len()` is
+// `hashes.len` counts the vector after the `sent_hashes` filter of
+// `sync.rs:221-224`; `doc.graph.len()` is
 // `change_graph.len()` (`change_graph.rs:188-190`, the sender's **change**
 // count — not the peer's, not an actor count, not a clock length), `/ 3` is an
 // unsigned integer division and therefore truncating, `>` is `>` and not `>=`,
@@ -4470,3 +4567,462 @@ test "a generated message records every hash it carried, once, in order" {
 // report is charged to every test after it. A failing assertion in these tests
 // must never leak, so every message a test owns between an assertion and a
 // free is now released by `defer` rather than by a trailing `deinit()`.
+
+test "API parity external sync log retains receive event order" {
+    // Two receives share one caller-owned log and produce an ordered mirror update.
+    const PatchLog = @import("../patches.zig").PatchLog;
+    const gpa = testing.allocator;
+    var source = try Document.init(gpa, testing.io);
+    defer source.deinit();
+    var target = try Document.init(gpa, testing.io);
+    defer target.deinit();
+    var state = State.new(gpa);
+    defer state.deinit();
+    var log = PatchLog.active(gpa);
+    defer log.deinit();
+    for ([_][]const u8{ "first", "second" }, 0..) |key, index| {
+        try putAndCommit(gpa, &source, key, .{ .int = @intCast(index) }, 0);
+        if (index == 0) try log.bind(source.patchIdentity(), source.ops.actors.items);
+        var change = (try source.getLastLocalChange(gpa)).?;
+        defer change.deinit(gpa);
+        var message = Message.init(gpa);
+        message.heads = try source.getHeads(gpa);
+        message.changes.items = try gpa.alloc([]u8, 1);
+        message.changes.items[0] = try change.change.encode(gpa);
+        try @This().receiveSyncMessageWithPatchLog(gpa, &target, &state, message, &log);
+        const source_heads = try source.getHeads(gpa);
+        defer gpa.free(source_heads);
+        try expectSameHashes(source_heads, state.shared_heads);
+    }
+    var patches = try log.makePatches(Document, &target);
+    defer patches.deinit();
+    try testing.expectEqual(@as(usize, 2), patches.items.items.len);
+    try testing.expectEqualStrings("first", patches.items.items[0].action.put_map.key);
+    try testing.expectEqualStrings("second", patches.items.items[1].action.put_map.key);
+    const first = (try readmod.get(&target, .root, .{ .key = "first" })).?;
+    const second = (try readmod.get(&target, .root, .{ .key = "second" })).?;
+    try testing.expectEqual(@as(i64, 0), first.value.scalar.int);
+    try testing.expectEqual(@as(i64, 1), second.value.scalar.int);
+}
+
+test "API parity external sync accepts compatible empty message across documents" {
+    // Empty actor tables are compatible even when the document owners differ.
+    const PatchLog = @import("../patches.zig").PatchLog;
+    const gpa = testing.allocator;
+    var owner = try Document.init(gpa, testing.io);
+    defer owner.deinit();
+    var target = try Document.init(gpa, testing.io);
+    defer target.deinit();
+    var log = PatchLog.active(gpa);
+    defer log.deinit();
+    try log.bind(owner.patchIdentity(), owner.ops.actors.items);
+    var state = State.new(gpa);
+    defer state.deinit();
+    state.in_flight = true;
+    state.peer_read_only = true;
+    var message = Message.init(gpa);
+    message.flags = .{ .bits = msg.MessageFlags.sync_reset };
+    try @This().receiveSyncMessageWithPatchLog(gpa, &target, &state, message, &log);
+    try testing.expect(!state.in_flight);
+    try testing.expect(!state.peer_read_only);
+    try testing.expect(state.their_capabilities != null);
+    try testing.expectEqual(@as(usize, 0), target.graph.len());
+    try testing.expectEqual(@as(usize, 0), log.events.items.len);
+}
+
+test "API parity external sync actor mismatch preserves document peer state and retained log" {
+    // A nonempty B receiver cannot publish an A-owned event stream, including reset flags.
+    const gpa = testing.allocator;
+    var owner = try Document.init(gpa, testing.io);
+    defer owner.deinit();
+    owner.setActorId(.{ .bytes = "A" });
+    // Raw transactions default to inactive logs; retain a real A-owned event.
+    var sink = @import("../patches.zig").PatchLog.active(gpa);
+    defer sink.deinit();
+    var tx = try trans.Transaction.openWithPatchLog(gpa, &owner, &sink, null);
+    defer tx.deinitClosed();
+    _ = try tx.put(.root, .{ .key = "owned" }, .{ .bool_value = true });
+    var committed = try tx.commit();
+    defer committed.deinit(gpa);
+    var log = committed.patch_log.take();
+    defer log.deinit();
+    var target = try Document.init(gpa, testing.io);
+    defer target.deinit();
+    target.setActorId(.{ .bytes = "B" });
+    try putAndCommit(gpa, &target, "base", .{ .bool_value = true }, 0);
+    var source = try target.fork(gpa);
+    defer source.deinit();
+    source.setActorId(.{ .bytes = "B" });
+    try putAndCommit(gpa, &source, "incoming", .{ .int = 2 }, 0);
+    var incoming = (try source.getLastLocalChange(gpa)).?;
+    defer incoming.deinit(gpa);
+    const before_save = try target.save(gpa);
+    defer gpa.free(before_save);
+    const before_heads = try target.getHeads(gpa);
+    defer gpa.free(before_heads);
+    try testing.expectEqual(@as(usize, 1), target.graph.len());
+    try testing.expectEqual(@as(usize, 1), before_heads.len);
+    try expectSameHashes(before_heads, incoming.change.deps);
+    try testing.expectEqualStrings("B", incoming.change.actor.bytes);
+    try testing.expectEqual(@as(usize, 1), log.actors.items.len);
+    try testing.expectEqualStrings("A", log.actors.items[0].bytes);
+    try testing.expect(log.isActive());
+    try testing.expectEqual(@as(usize, 1), log.events.items.len);
+    try testing.expectError(error.PatchLogMismatch, log.validateActors(target.ops.actors.items));
+    const before_actor = target.actor;
+    const before_base = (try readmod.get(&target, .root, .{ .key = "base" })).?;
+    try testing.expect(before_base.value.scalar.bool_value);
+    try testing.expect((try readmod.get(&target, .root, .{ .key = "incoming" })) == null);
+    const before_actors = target.ops.actors.items.ptr;
+    const before_events = log.events.items;
+    const before_log_actors = log.actors.items;
+    const before_completed = log.completed.items.items;
+    const before_identity = log.identity;
+    var state = State.new(gpa);
+    defer state.deinit();
+    state.in_flight = true;
+    state.peer_read_only = true;
+    state.have_responded = true;
+    state.needs_reset = true;
+    state.shared_heads = try gpa.dupe(ChangeHash, before_heads);
+    state.last_sent_heads = try gpa.dupe(ChangeHash, before_heads);
+    state.their_heads = try gpa.dupe(ChangeHash, before_heads);
+    state.their_need = try gpa.dupe(ChangeHash, before_heads);
+    try state.extendSent(before_heads);
+    const before_state = state;
+    var message = Message.init(gpa);
+    errdefer message.deinit();
+    message.flags = .{ .bits = msg.MessageFlags.sync_reset };
+    message.heads = try source.getHeads(gpa);
+    {
+        const encoded = try incoming.change.encode(gpa);
+        errdefer gpa.free(encoded);
+        message.changes.items = try gpa.alloc([]u8, 1);
+        message.changes.items[0] = encoded;
+    }
+    const consumed = message;
+    message = Message.init(gpa);
+    try testing.expectError(error.PatchLogMismatch, @This().receiveSyncMessageWithPatchLog(gpa, &target, &state, consumed, &log));
+    try testing.expectEqualDeep(before_state, state);
+    const after_save = try target.save(gpa);
+    defer gpa.free(after_save);
+    const after_heads = try target.getHeads(gpa);
+    defer gpa.free(after_heads);
+    try testing.expectEqualSlices(u8, before_save, after_save);
+    try expectSameHashes(before_heads, after_heads);
+    try testing.expect(before_actors == target.ops.actors.items.ptr);
+    try testing.expectEqual(@as(usize, 1), target.ops.actors.items.len);
+    try testing.expectEqualStrings("B", target.ops.actors.items[0].bytes);
+    try testing.expectEqualDeep(before_actor, target.actor);
+    const after_base = (try readmod.get(&target, .root, .{ .key = "base" })).?;
+    try testing.expect(after_base.id.eql(before_base.id));
+    try testing.expect(after_base.value.scalar.bool_value);
+    try testing.expect((try readmod.get(&target, .root, .{ .key = "incoming" })) == null);
+    try testing.expect(before_events.ptr == log.events.items.ptr);
+    try testing.expectEqual(before_events.len, log.events.items.len);
+    try testing.expect(before_log_actors.ptr == log.actors.items.ptr);
+    try testing.expectEqual(before_log_actors.len, log.actors.items.len);
+    try testing.expect(before_completed.ptr == log.completed.items.items.ptr);
+    try testing.expectEqual(before_completed.len, log.completed.items.items.len);
+    try testing.expectEqual(before_identity, log.identity);
+    var retained = try log.makePatches(Document, &owner);
+    defer retained.deinit();
+    try testing.expectEqual(@as(usize, 1), retained.items.items.len);
+    try testing.expectEqualStrings("owned", retained.items.items[0].action.put_map.key);
+    try testing.expect(retained.items.items[0].action.put_map.value.scalar.bool_value);
+}
+
+test "API parity external sync does not migrate actors for empty or read only receives" {
+    // An ignored payload cannot create an actor mismatch that the reference never checks.
+    const PatchLog = @import("../patches.zig").PatchLog;
+    const gpa = testing.allocator;
+    var owner = try Document.init(gpa, testing.io);
+    defer owner.deinit();
+    owner.setActorId(.{ .bytes = "A" });
+    try putAndCommit(gpa, &owner, "owned", .{ .bool_value = true }, 0);
+    var target = try Document.init(gpa, testing.io);
+    defer target.deinit();
+    target.setActorId(.{ .bytes = "B" });
+    try putAndCommit(gpa, &target, "base", .{ .bool_value = true }, 0);
+    var log = PatchLog.active(gpa);
+    defer log.deinit();
+    try log.bind(owner.patchIdentity(), owner.ops.actors.items);
+    const log_actors = log.actors.items;
+    const log_identity = log.identity;
+    const before = try target.save(gpa);
+    defer gpa.free(before);
+    for ([_]bool{ false, true }) |read_only| {
+        var state = State.new(gpa);
+        defer state.deinit();
+        state.read_only = read_only;
+        state.in_flight = true;
+        var message = Message.init(gpa);
+        errdefer message.deinit();
+        message.flags = .{ .bits = msg.MessageFlags.sync_reset };
+        if (read_only) {
+            var incoming = (try target.getLastLocalChange(gpa)).?;
+            defer incoming.deinit(gpa);
+            const encoded = try incoming.change.encode(gpa);
+            errdefer gpa.free(encoded);
+            message.changes.items = try gpa.alloc([]u8, 1);
+            message.changes.items[0] = encoded;
+        }
+        const consumed = message;
+        message = Message.init(gpa);
+        try @This().receiveSyncMessageWithPatchLog(gpa, &target, &state, consumed, &log);
+        try testing.expect(!state.in_flight);
+        try testing.expectEqual(read_only, state.read_only);
+    }
+    const after = try target.save(gpa);
+    defer gpa.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+    try testing.expect(log_actors.ptr == log.actors.items.ptr);
+    try testing.expectEqual(log_actors.len, log.actors.items.len);
+    try testing.expectEqual(log_identity, log.identity);
+    try testing.expectEqual(@as(usize, 0), log.events.items.len);
+}
+
+fn generateOrderedBatchAndFree(
+    gpa: Allocator,
+    sender: *Document,
+    requested: []const ChangeHash,
+    framed: []const Framed,
+    v2: bool,
+) !void {
+    var state = State.new(gpa);
+    defer state.deinit();
+    state.their_heads = try gpa.dupe(ChangeHash, &.{framed[0].hash});
+    state.their_have = try gpa.alloc(Have, 0);
+    state.their_need = try gpa.dupe(ChangeHash, requested);
+    if (v2) state.their_capabilities = try gpa.dupe(Capability, &.{.message_v2});
+    var message = (try generateSyncMessage(gpa, sender, &state)) orelse
+        return error.ExpectedAMessage;
+    defer message.deinit();
+    try testing.expectEqual(
+        if (v2) msg.MessageVersion.v2 else msg.MessageVersion.v1,
+        message.version,
+    );
+    try testing.expect(!carriesDocument(&message));
+    const joined = try message.changes.join(gpa);
+    defer gpa.free(joined);
+    const actual = try splitStream(gpa, joined);
+    defer {
+        for (actual) |frame| gpa.free(frame.bytes);
+        gpa.free(actual);
+    }
+    try testing.expectEqual(requested.len, actual.len);
+    for (actual, requested) |frame, hash| {
+        try testing.expect(hash.eql(frame.hash));
+        for (framed) |expected| {
+            if (!expected.hash.eql(hash)) continue;
+            try testing.expectEqualSlices(u8, expected.bytes, frame.bytes);
+        }
+    }
+    // Without an acknowledgement the selected hashes are not sent twice.
+    state.in_flight = false;
+    const repeated = try generateSyncMessage(gpa, sender, &state);
+    if (repeated) |owned| {
+        var reply = owned;
+        defer reply.deinit();
+        try testing.expect(reply.changes.isEmpty());
+    }
+}
+
+test "sync change batches retain requested wire order in V1 and threshold-equal V2" {
+    const gpa = testing.allocator;
+    const bytes = try twoChangeStream(gpa);
+    defer gpa.free(bytes);
+    const framed = try splitStream(gpa, bytes);
+    defer {
+        for (framed) |frame| gpa.free(frame.bytes);
+        gpa.free(framed);
+    }
+    var sender = try docWith(gpa, &.{bytes});
+    defer sender.deinit();
+    sender.setActorId(.{ .bytes = "ordered-batch-sender" });
+    const requested = [_]ChangeHash{ framed[1].hash, framed[0].hash };
+    // V1 must still send changes when the selected set exceeds a third.
+    try generateOrderedBatchAndFree(gpa, &sender, &requested, framed, false);
+    for (0..4) |i| {
+        try putAndCommit(gpa, &sender, "more", .{ .int = @intCast(i) }, @intCast(i));
+    }
+    for ([_]bool{ false, true }) |v2| {
+        try generateOrderedBatchAndFree(gpa, &sender, &requested, framed, v2);
+        try testing.checkAllAllocationFailures(
+            gpa,
+            generateOrderedBatchAndFree,
+            .{ &sender, &requested, framed, v2 },
+        );
+        try generateOrderedBatchAndFree(gpa, &sender, &requested, framed, v2);
+    }
+}
+
+test "growing sync history sends only new changes while acknowledgements are withheld" {
+    const gpa = testing.allocator;
+    var sender = try Document.init(gpa, testing.io);
+    defer sender.deinit();
+    sender.setActorId(.{ .bytes = "withheld-ack-sender" });
+    var peer = try Document.init(gpa, testing.io);
+    defer peer.deinit();
+    var sender_state = State.new(gpa);
+    defer sender_state.deinit();
+    var peer_state = State.new(gpa);
+    defer peer_state.deinit();
+    for (0..12) |i| {
+        try putAndCommit(gpa, &sender, "base", .{ .int = @intCast(i) }, @intCast(i));
+    }
+    try deliver(gpa, &sender, &sender_state, (try generateSyncMessage(gpa, &peer, &peer_state)).?);
+    try deliver(gpa, &peer, &peer_state, (try generateSyncMessage(gpa, &sender, &sender_state)).?);
+    try deliver(gpa, &sender, &sender_state, (try generateSyncMessage(gpa, &peer, &peer_state)).?);
+    for (0..3) |i| {
+        try putAndCommit(gpa, &sender, "delta", .{ .int = @intCast(i) }, @intCast(100 + i));
+        var latest = (try sender.getLastLocalChange(gpa)).?;
+        defer latest.deinit(gpa);
+        const expected = try latest.change.encode(gpa);
+        defer gpa.free(expected);
+        var outgoing = (try generateSyncMessage(gpa, &sender, &sender_state)).?;
+        errdefer outgoing.deinit();
+        try testing.expectEqual(@as(usize, 1), outgoing.changes.items.len);
+        try testing.expectEqualSlices(u8, expected, outgoing.changes.items[0]);
+        try expectSentHashes(gpa, &sender, sender_state.sent_hashes.items, 12, 13 + i);
+        const transferred = outgoing;
+        outgoing = Message.init(gpa);
+        try deliver(gpa, &peer, &peer_state, transferred);
+    }
+    try sender.debugCmp(&peer);
+    // Deliver just the eventual acknowledgement, then the retained sent set clears.
+    try deliver(gpa, &sender, &sender_state, (try generateSyncMessage(gpa, &peer, &peer_state)).?);
+    try testing.expectEqual(@as(usize, 0), sender_state.sent_hashes.items.len);
+}
+
+fn generateDuplicateNeedAndFree(
+    gpa: Allocator,
+    sender: *Document,
+    requested: []const ChangeHash,
+    framed: []const Framed,
+    v2: bool,
+    with_have: bool,
+    document: bool,
+) !void {
+    var peer = Message.init(gpa);
+    defer peer.deinit();
+    peer.version = if (v2) .v2 else .v1;
+    if (v2) peer.flags = .{ .bits = 0 };
+    peer.heads = try gpa.dupe(ChangeHash, &.{framed[0].hash});
+    peer.need = try gpa.dupe(ChangeHash, requested);
+    if (with_have) {
+        // Nothing is in to_send, so even with have every need occurrence survives.
+        var have = try haveWithLastSync(gpa, sender.graph.getHeads());
+        errdefer have.deinit();
+        peer.have = try gpa.alloc(Have, 1);
+        peer.have[0] = have;
+    }
+    const peer_bytes = try peer.encode(gpa);
+    defer gpa.free(peer_bytes);
+    var state = State.new(gpa);
+    defer state.deinit();
+    try receiveSyncMessage(gpa, sender, &state, try Message.decode(gpa, peer_bytes));
+    try expectSameHashes(requested, state.their_need.?);
+    var message = (try generateSyncMessage(gpa, sender, &state)) orelse
+        return error.ExpectedAMessage;
+    defer message.deinit();
+    const encoded = try message.encode(gpa);
+    defer gpa.free(encoded);
+    var decoded = try Message.decode(gpa, encoded);
+    defer decoded.deinit();
+    try testing.expectEqual(
+        if (v2) msg.MessageVersion.v2 else msg.MessageVersion.v1,
+        decoded.version,
+    );
+    try testing.expectEqual(document, carriesDocument(&decoded));
+    if (!document) {
+        const joined = try decoded.changes.join(gpa);
+        defer gpa.free(joined);
+        const actual = try splitStream(gpa, joined);
+        defer {
+            for (actual) |frame| gpa.free(frame.bytes);
+            gpa.free(actual);
+        }
+        try testing.expectEqual(requested.len, actual.len);
+        for (actual, requested) |frame, hash| {
+            try testing.expect(hash.eql(frame.hash));
+            const expected = blk: {
+                for (framed) |candidate| {
+                    if (candidate.hash.eql(hash)) break :blk candidate;
+                }
+                return error.TestUnexpectedResult;
+            };
+            try testing.expectEqualSlices(u8, expected.bytes, frame.bytes);
+        }
+    }
+    state.in_flight = false;
+    if (try generateSyncMessage(gpa, sender, &state)) |owned| {
+        var reply = owned;
+        defer reply.deinit();
+        try testing.expect(reply.changes.isEmpty());
+    }
+}
+
+test "duplicate encoded peer need retains exact frames and counts occurrences at the V2 boundary" {
+    // Three occurrences equal the threshold; four exceed it even with only two unique hashes.
+    const gpa = testing.allocator;
+    const bytes = try twoChangeStream(gpa);
+    defer gpa.free(bytes);
+    const original = try splitStream(gpa, bytes);
+    defer {
+        for (original) |frame| gpa.free(frame.bytes);
+        gpa.free(original);
+    }
+    var sender = try docWith(gpa, &.{bytes});
+    defer sender.deinit();
+    sender.setActorId(.{ .bytes = "duplicate-need-sender" });
+    const empty_hash = try sender.emptyCommit(gpa, "empty", 0);
+    var empty = (try sender.getChangeByHash(gpa, empty_hash)).?;
+    defer empty.deinit(gpa);
+    const empty_bytes = try empty.change.encode(gpa);
+    defer gpa.free(empty_bytes);
+    const framed = [_]Framed{
+        original[0],
+        original[1],
+        .{ .bytes = empty_bytes, .hash = empty_hash },
+    };
+    for (0..6) |i| {
+        try putAndCommit(gpa, &sender, "more", .{ .int = @intCast(i) }, @intCast(i));
+    }
+    try testing.expectEqual(@as(usize, 9), sender.graph.len());
+    var equal = [_]ChangeHash{ original[0].hash, original[0].hash, empty_hash };
+    var above = [_]ChangeHash{ original[1].hash, empty_hash, original[1].hash, empty_hash };
+    // The wire encoder accepts sorted lists with repeats; decoding must keep every repeat.
+    std.mem.sort(ChangeHash, &equal, {}, ChangeHash.lessThan);
+    std.mem.sort(ChangeHash, &above, {}, ChangeHash.lessThan);
+    for ([_]bool{ false, true }) |v2| {
+        for ([_]bool{ false, true }) |with_have| {
+            for ([_][]const ChangeHash{ &equal, &above }) |requested| {
+                const document = v2 and requested.len > sender.graph.len() / 3;
+                try generateDuplicateNeedAndFree(
+                    gpa,
+                    &sender,
+                    requested,
+                    &framed,
+                    v2,
+                    with_have,
+                    document,
+                );
+                try testing.checkAllAllocationFailures(
+                    gpa,
+                    generateDuplicateNeedAndFree,
+                    .{ &sender, requested, framed[0..], v2, with_have, document },
+                );
+                try generateDuplicateNeedAndFree(
+                    gpa,
+                    &sender,
+                    requested,
+                    &framed,
+                    v2,
+                    with_have,
+                    document,
+                );
+            }
+        }
+    }
+}

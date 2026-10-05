@@ -323,10 +323,14 @@ pub fn ScanVisIter(comptime O: type) type {
         }
 
         /// Repositions the window to `rows`, leaving the cursor on its start.
-        pub fn shift(self: *Self, rows: RowRange) void {
-            self.id.shift(rows);
-            self.action.shift(rows);
-            self.succ.shift(rows);
+        ///
+        /// A `ParseError` leaves this cursor unchanged.
+        pub fn shift(self: *Self, rows: RowRange) ParseError!void {
+            var staged = self.*;
+            try staged.id.shift(rows);
+            try staged.action.shift(rows);
+            try staged.succ.shift(rows);
+            self.* = staged;
         }
 
         /// Repositions onto `rows` and reads the row at its start

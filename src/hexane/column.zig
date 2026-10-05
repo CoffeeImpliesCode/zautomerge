@@ -107,8 +107,8 @@ pub const LenWeight = struct {
         /// The weight of no slabs at all.
         pub const identity: LenWeight = .zero;
         /// The weight of two adjacent spans, in order.
-        pub fn merge(l: LenWeight, r: LenWeight) LenWeight {
-            return .{ .len = l.len + r.len };
+        pub fn merge(l: LenWeight, r: LenWeight) error{Overflow}!LenWeight {
+            return .{ .len = std.math.add(usize, l.len, r.len) catch return error.Overflow };
         }
         /// How many column rows the weight covers. The only component a
         /// Fenwick prefix query reads.
@@ -148,8 +148,11 @@ pub const PrefixWeight = struct {
         /// The weight of no slabs at all.
         pub const identity: PrefixWeight = .zero;
         /// The weight of two adjacent spans, in order.
-        pub fn merge(l: PrefixWeight, r: PrefixWeight) PrefixWeight {
-            return .{ .len = l.len + r.len, .prefix = l.prefix + r.prefix };
+        pub fn merge(l: PrefixWeight, r: PrefixWeight) error{Overflow}!PrefixWeight {
+            return .{
+                .len = std.math.add(usize, l.len, r.len) catch return error.Overflow,
+                .prefix = std.math.add(i64, l.prefix, r.prefix) catch return error.Overflow,
+            };
         }
         /// How many column rows the weight covers. The only component a
         /// Fenwick prefix query reads.
@@ -368,29 +371,29 @@ pub fn clampRange(range: RowRange, len: usize) RowRange {
     return .{ .start = start, .end = @max(@min(range.end, len), start) };
 }
 
-/// The length one row contributes to a prefix column's running sum: the
-/// value itself, or nothing at all for a row with no length. A null row
-/// is the prefix identity, which is what keeps the transform reversible
-/// (`prefix.rs:287-312`).
-fn prefixUnit(comptime T: type, v: T) i64 {
-    // A boolean prefix column counts its `true` rows: a `true` is one unit
-    // long and a `false` is none, which is `val as usize` upstream
-    // (`prefix.rs:319-320`) and the codec's own `accumulate` spells the same
-    // rule — `opset/columns.zig:193-197` for the op set's `insert` and
-    // `index.top`. Without this arm `@intCast` refuses a `bool` at compile
-    // time, so `PrefixIter`, `get_index_for_total` and `find_prefix_in_slab`
-    // are all unreachable over a `Column(bool, …)`. The arm is the same
-    // `@intFromBool` the codec uses, so the row's unit and the slab weight
-    // are the same number.
-    if (comptime T == bool) return @intFromBool(v);
-    if (comptime @typeInfo(T) == .pointer) {
-        @compileError("a prefix column's rows are integers or booleans: a byte payload has no length of its own");
+/// The codec-defined contribution of one wire value. A metadata word uses
+/// its length bits, a boolean its true bit, and an absent row contributes zero.
+fn prefixContribution(comptime E: type, value: E.Wire) ParseError!i64 {
+    var contribution: i64 = 0;
+    try E.accumulate(value, &contribution);
+    return contribution;
+}
+
+fn signedPrefixNeedsEndpointCheck(comptime E: type) bool {
+    if (!E.tracks_prefix or E.is_delta) return false;
+    return switch (@typeInfo(payloadOf(E.Wire))) {
+        .int => |int| int.signedness == .signed,
+        else => false,
+    };
+}
+
+/// One codec-defined fold, with the checked row walk for legacy codecs.
+fn accumulateCodecRun(comptime E: type, value: E.Wire, count: usize, running: *i64) ParseError!void {
+    if (comptime @hasDecl(E, "accumulateRun")) {
+        try E.accumulateRun(value, count, running);
+    } else {
+        for (0..count) |_| try E.accumulate(value, running);
     }
-    if (comptime @typeInfo(T) == .optional) {
-        const inner = v orelse return 0;
-        return @as(i64, @intCast(inner));
-    }
-    return @as(i64, @intCast(v));
 }
 
 /// Whether `T` is a byte payload — a `[]const u8` or an optional of one.
@@ -525,64 +528,33 @@ pub const RunCursor = struct {
 /// stepped over: there is nothing to divide by, and upstream's callers
 /// are gated on the sum never decreasing (`prefix.rs:113-115`).
 ///
-/// **A literal run is walked one item at a time, because its items each
-/// carry their own length.** Upstream's decoder hands a literal group back
-/// as a run of *one* item per value (`rle/decoder.rs:516-522`), so the
-/// ceiling division there always divides by a single item's length. This
-/// port's `RunAt` is a whole *segment*, and the one thing a segment does not
-/// say is what its items are: `first_value` is the first of them
-/// (`slab.zig:250-255`). Reading a literal as `count` copies of that first
-/// value adds up a sum the column does not have, and the descent then
-/// answers a row past the one holding `target` — which is how a two-unit text
-/// element came back as the element behind it.
-/// **The walk advances.** Every turn asks for the run holding `items`, and
-/// `items` is the end of the run the last turn read, so the asks move
-/// forward one run at a time while the walk is handed the point the last one
-/// stopped reading at. The runs it skips that way are exactly the ones a
-/// walk from byte 0 would have skipped (`runAtOrAfter`'s own rule), so a
-/// slab of `K` runs costs `K` header parses where a fresh scan per run costs
-/// `1 + 2 + ... + K` — and this loop is inside every prefix search.
+/// Decode forward once: literal runs are yielded one row at a time, while
+/// compressed runs fold by count (Rust prefix.rs:111-150). This avoids replay
+/// from each literal's run header and respects codec-defined widths.
 fn findPrefixInSlab(comptime E: type, slab: *const Slab, target: i64) ParseError!usize {
+    var dec = try E.WireDecoder.init(slab.data);
     var items: usize = 0;
     var acc: i64 = 0;
-    var cursor: ?RunCursor = null;
-    while (try E.runAtOrAfter(slab.data, items, cursor)) |ra| {
-        const n = ra.seg.itemCount();
-        if (ra.seg.kind == .literal) {
-            // One item is one run upstream, so one item is one division: the
-            // loop below stops on the first item whose own width carries the
-            // sum to `target`, and for that item `remaining <= each`, so
-            // `divCeil(remaining, each)` is 1 — the landing is that item.
-            // An item of no width cannot be the landing, and is stepped over.
-            for (0..n) |k| {
-                const each = prefixUnit(E.Wire, try E.literalValueAt(slab.data, ra.seg, k));
-                const peek = std.math.add(i64, acc, each) catch return error.Overflow;
-                if (peek >= target) return items + k + 1;
-                acc = peek;
-            }
-            items = ra.seg.item_end;
-            cursor = ra.cursor;
-            continue;
-        }
-        const p = if (ra.seg.first_value) |v| prefixUnit(E.Wire, v) else 0;
-        if (p == 0) {
-            items = ra.seg.item_end;
-            cursor = ra.cursor;
-            continue;
-        }
-        const span = std.math.mul(i64, p, @as(i64, @intCast(n))) catch return error.Overflow;
-        const peek = std.math.add(i64, acc, span) catch return error.Overflow;
+    while (items < slab.len) {
+        const run: RunOf(E.Wire) = if (comptime @hasDecl(E.WireDecoder, "nextRunMax")) blk: {
+            const decoded = (try dec.nextRunMax(slab.len - items)) orelse return error.InvalidValue;
+            break :blk .{ .count = decoded.count, .value = decoded.value };
+        } else .{
+            .count = 1,
+            .value = (try dec.next()) orelse return error.InvalidValue,
+        };
+        var peek = acc;
+        try accumulateCodecRun(E, run.value, run.count, &peek);
         if (peek >= target) {
+            const each = try prefixContribution(E, run.value);
+            if (each <= 0) return error.InvalidValue;
             const remaining = std.math.sub(i64, target, acc) catch return error.Overflow;
-            // The ceiling division `find_prefix_in_slab` uses to land
-            // inside the run (`prefix.rs:138-143`).
-            const needed = std.math.divCeil(i64, remaining, p) catch return error.Overflow;
-            if (needed < 1 or needed > @as(i64, @intCast(n))) return error.InvalidValue;
+            const needed = std.math.divCeil(i64, remaining, each) catch return error.Overflow;
+            if (needed < 1 or @as(u64, @intCast(needed)) > run.count) return error.InvalidValue;
             return items + @as(usize, @intCast(needed));
         }
         acc = peek;
-        items = ra.seg.item_end;
-        cursor = ra.cursor;
+        items += run.count;
     }
     return items;
 }
@@ -711,6 +683,15 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
             return error.UnexpectedNull;
         }
 
+        /// The absolute value of a negative literal-run header, including
+        /// the minimum `i64` value, without signed-negation overflow.
+        fn literalCount(header: i64) ParseError!usize {
+            std.debug.assert(header < 0);
+            const count_minus_one = std.math.cast(usize, -(header + 1)) orelse
+                return error.Overflow;
+            return std.math.add(usize, count_minus_one, 1) catch return error.Overflow;
+        }
+
         /// The last value of the run `seg` describes and its byte width, or
         /// null when the run carries no value. One walk of a literal run;
         /// O(1) for a repeat or null run.
@@ -721,7 +702,7 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
                 const v = try payloadRead(P, Payload, bytes, seg.byte_start + hdr.len);
                 return .{ .value = v.value, .len = v.len };
             }
-            const count = std.math.cast(usize, -hdr.value) orelse return error.Overflow;
+            const count = try literalCount(hdr.value);
             var pos = seg.byte_start + hdr.len;
             var last: Payload = undefined;
             var last_len: usize = 0;
@@ -791,7 +772,7 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
                     value = try nullWire();
                     end = payload + n_hdr.len;
                 } else {
-                    count = std.math.cast(usize, -hdr.value) orelse return error.Overflow;
+                    count = try literalCount(hdr.value);
                     var p = payload;
                     const first = try payloadRead(P, Payload, bytes, p);
                     value = first.value;
@@ -969,7 +950,7 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
                     end = payload + n.len;
                     kind = .absent;
                 } else {
-                    count = std.math.cast(usize, -hdr.value) orelse return error.Overflow;
+                    count = try literalCount(hdr.value);
                     var p = payload;
                     const first = try payloadRead(P, Payload, bytes, p);
                     value = first.value;
@@ -1069,6 +1050,9 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
             try w.finish();
             return w.take();
         }
+
+        /// Canonical seam writer. Encoded payload borrows must remain live until finish.
+        pub const WireSpliceWriter = RunWriter(Payload, Nullable, P);
 
         /// One run of `len` copies of `value`, in O(1).
         pub fn wireFill(gpa: std.mem.Allocator, len: usize, value: Wire, opens_with_true: bool) ParseError![]u8 {
@@ -1276,8 +1260,6 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
             /// Items left in the literal run being served, and the byte
             /// offset of the next one.
             lit_left: usize,
-            /// One past the last byte of the literal run being served.
-            lit_end: usize,
             /// The byte offset of the next item of the literal run being
             /// served. A literal run's payload is read one value at a time,
             /// so this walks the run rather than decoding it whole.
@@ -1296,7 +1278,6 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
                     .prev_lit = null,
                     .lit_left = 0,
                     .lit_pos = 0,
-                    .lit_end = 0,
                 };
             }
 
@@ -1306,7 +1287,7 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
                 return self.item;
             }
 
-            /// The byte offset one past the run last served — the cut point
+            /// The byte offset one past the last completed run — the cut point
             /// for a slab that ends there.
             pub fn bytePos(self: *const LoadCursor) usize {
                 return self.pos;
@@ -1322,6 +1303,7 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
                 if (hdr.value > 0) {
                     if (hdr.value < 2) return error.InvalidValue; // rule 1
                     const v = try payloadRead(P, Payload, self.bytes, payload);
+                    try validatePayload(v.value);
                     const end = payload + v.len;
                     const value: Wire = v.value;
                     try self.checkBoundary(value); // rules 6 and 8
@@ -1361,35 +1343,40 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
                         .after_opens_with_true = false,
                     };
                 }
-                const count = std.math.cast(usize, -hdr.value) orelse return error.Overflow;
+                // This conversion avoids negating the minimum signed header.
+                const count = try literalCount(hdr.value);
                 if (count == 0) return error.InvalidValue; // rule 3
                 if (self.prev) |p| {
                     if (std.meta.activeTag(p) == .lit) return error.InvalidValue; // rule 4
                 }
-                // The literal run's payloads are walked once to find where
-                // it ends; the values themselves are read again, one per
-                // step, so a caller that wants each of them gets each.
+                // Decode each literal payload only when its item is requested.
+                // A partially consumed load does not parse the unrequested
+                // tail (`rle/load.rs:203-226`; `rle/decoder.rs:227-257`).
                 const first = try payloadRead(P, Payload, self.bytes, payload);
-                var p = payload + first.len;
-                var k: usize = 1;
-                while (k < count) : (k += 1) p += (try payloadRead(P, Payload, self.bytes, p)).len;
-                self.pos = p;
-                self.lit_end = p;
                 self.lit_pos = payload;
                 self.lit_left = count;
-                return self.nextLiteral();
+                return self.nextLiteralValue(first.value, first.len);
             }
 
             /// The next item of the literal run being served.
             fn nextLiteral(self: *LoadCursor) ParseError!?Step {
                 const v = try payloadRead(P, Payload, self.bytes, self.lit_pos);
-                self.lit_pos += v.len;
+                return self.nextLiteralValue(v.value, v.len);
+            }
+
+            fn nextLiteralValue(
+                self: *LoadCursor,
+                payload: Payload,
+                payload_len: usize,
+            ) ParseError!?Step {
+                try validatePayload(payload);
+                self.lit_pos += payload_len;
                 self.lit_left -= 1;
                 // A literal run is served one item per step, so the row
                 // count moves one at a time here too: `items` is what a
                 // caller measures a slab's rows against.
                 self.item = std.math.add(usize, self.item, 1) catch return error.Overflow;
-                const value: Wire = v.value;
+                const value: Wire = payload;
                 if (self.prev_lit) |pl| {
                     // Rule 7: no two consecutive equal values inside a
                     // literal run.
@@ -1401,7 +1388,7 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
                 self.prev_lit = value;
                 const last = self.lit_left == 0;
                 if (last) {
-                    self.pos = self.lit_end;
+                    self.pos = self.lit_pos;
                     self.prev = .{ .lit = value };
                 }
                 return .{
@@ -1409,9 +1396,17 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
                     .value = value,
                     .kind = .literal,
                     .last_of_run = last,
-                    .run_end = self.lit_end,
+                    .run_end = if (last) self.lit_pos else 0,
                     .after_opens_with_true = false,
                 };
+            }
+
+            fn validatePayload(payload: Payload) ParseError!void {
+                if (comptime Utf8) {
+                    // Rust's String unpack path validates every payload as UTF-8
+                    // (`lib.rs:700-723`).
+                    if (!std.unicode.utf8ValidateSlice(payload)) return error.InvalidUtf8;
+                }
             }
 
             /// Rule 8: a run's first value may not equal the previous
@@ -1552,11 +1547,28 @@ fn BoolEncoder(comptime V: type, comptime P: type) type {
         /// opening pad, and a column's second slab starts at run zero
         /// however many runs the first one had (`bool.rs:988-1002`).
         segments: usize,
+        /// Parity at the start of this buffer, not at the start of the slab.
+        /// A splice middle can follow an odd number of copied runs.
+        opens_with_true: bool,
 
         /// An encoder holding nothing, with no run in progress. The allocator
         /// is the caller's and is not released; `deinit` is.
         pub fn init(gpa: std.mem.Allocator) Self {
-            return .{ .gpa = gpa, .out = .empty, .pending = null, .count = 0, .total = 0, .segments = 0 };
+            return initOpening(gpa, false);
+        }
+
+        /// An empty writer placed at the given run parity. The caller owns
+        /// the bytes returned by `take` and releases them with `gpa`.
+        pub fn initOpening(gpa: std.mem.Allocator, opens_with_true: bool) Self {
+            return .{
+                .gpa = gpa,
+                .out = .empty,
+                .pending = null,
+                .count = 0,
+                .total = 0,
+                .segments = 0,
+                .opens_with_true = opens_with_true,
+            };
         }
 
         /// Frees the encode buffer. The allocator itself is the caller's, and
@@ -1588,34 +1600,49 @@ fn BoolEncoder(comptime V: type, comptime P: type) type {
         /// `error.OutOfMemory` there leaves the run in progress and nothing
         /// written for the new value.
         pub fn append(self: *Self, v: V) ParseError!void {
-            if (self.pending) |p| {
-                if (p == v) {
-                    self.count += 1;
-                    self.total += 1;
-                    return;
-                }
-                try self.flush();
-            }
-            self.pending = v;
-            self.count = 1;
-            self.total += 1;
+            try self.appendN(v, 1);
         }
 
         /// Appends `n` copies of `v` as one run, extending the run in
         /// progress when it already carries `v`. `n == 0` appends nothing.
         pub fn appendN(self: *Self, v: V, n: usize) ParseError!void {
             if (n == 0) return;
-            if (self.pending) |p| {
-                if (p == v) {
-                    self.count += n;
-                    self.total += n;
-                    return;
-                }
-                try self.flush();
-            }
+            const total = std.math.add(usize, self.total, n) catch return error.Overflow;
+            const count = if (self.pending != null and self.pending.? == v)
+                std.math.add(usize, self.count, n) catch return error.Overflow
+            else
+                n;
+            _ = std.math.cast(u64, count) orelse return error.TooLarge;
+            if (self.pending != null and self.pending.? != v) try self.flush();
             self.pending = v;
-            self.count = n;
-            self.total += n;
+            self.count = count;
+            self.total = total;
+        }
+
+        /// Appends supplied values in order, coalescing their run boundaries.
+        pub fn extend(self: *Self, values: []const V) ParseError!void {
+            for (values) |value| try self.append(value);
+        }
+
+        /// Copies a clipped range from the caller's validated run table.
+        /// Counts are appended directly; encoded repeats never become row arrays.
+        /// `segs` must describe `bytes`, as returned by `Bool.segmentsOf`.
+        pub fn appendEncodedRange(
+            self: *Self,
+            bytes: []const u8,
+            segs: []const slabmod.Segment(V),
+            from: usize,
+            to: usize,
+        ) ParseError!void {
+            _ = bytes;
+            const length = if (segs.len == 0) 0 else segs[segs.len - 1].item_end;
+            if (from > to or to > length) return error.InvalidValue;
+            _ = std.math.add(usize, self.total, to - from) catch return error.Overflow;
+            for (segs) |seg| {
+                if (from >= seg.item_end or seg.item_start >= to) continue;
+                const count = @min(to, seg.item_end) - @max(from, seg.item_start);
+                try self.appendN(seg.first_value orelse return error.InvalidValue, count);
+            }
         }
 
         /// Writes the run in progress, so every appended value is in the
@@ -1632,8 +1659,11 @@ fn BoolEncoder(comptime V: type, comptime P: type) type {
         /// column's second slab starts at run zero however many runs the
         /// first one had (`bool.rs:988-1002`).
         pub fn take(self: *Self) ParseError![]u8 {
+            if (self.pending != null) return error.InvalidValue;
+            const bytes = try self.out.toOwnedSlice(self.gpa);
             self.segments = 0;
-            return self.out.toOwnedSlice(self.gpa);
+            self.opens_with_true = false;
+            return bytes;
         }
 
         fn flush(self: *Self) ParseError!void {
@@ -1641,13 +1671,121 @@ fn BoolEncoder(comptime V: type, comptime P: type) type {
             // A run sequence read from its own start opens on a `false`
             // run, so a column whose first value is `true` spends a run on
             // the pad that lets it (`bool.rs:988-1002`).
-            if (v and self.segments == 0) try P.appendUnsigned(&self.out, self.gpa, 0);
-            try P.appendUnsigned(&self.out, self.gpa, @as(u64, @intCast(self.count)));
-            self.segments += 1;
+            const count = std.math.cast(u64, self.count) orelse return error.TooLarge;
+            const segments = std.math.add(usize, self.segments, 1) catch return error.Overflow;
+            const old_len = self.out.items.len;
+            // A refusal after writing the pad must not leave a second pad on
+            // retry. Capacity can grow, but the published bytes stay unchanged.
+            errdefer self.out.items.len = old_len;
+            if (v and self.segments == 0 and !self.opens_with_true) {
+                try P.appendUnsigned(&self.out, self.gpa, 0);
+            }
+            try P.appendUnsigned(&self.out, self.gpa, count);
+            self.segments = segments;
             self.pending = null;
             self.count = 0;
         }
     };
+}
+
+test "counted boolean ranges preserve clipped runs and opening parity" {
+    // The ordinary encoder is the oracle for every clipped encoded range.
+    const gpa = testing.allocator;
+    for ([_]usize{ 1, 2, 127, 128, 255, 256 }) |count| {
+        var values: [520]bool = undefined;
+        @memset(values[0..count], true);
+        @memset(values[count..][0..count], false);
+        values[count * 2] = true;
+        const source = values[0 .. count * 2 + 1];
+        const bytes = try Bool.wireEncode(gpa, source, false);
+        defer gpa.free(bytes);
+        const segs = try Bool.segmentsOf(gpa, bytes);
+        defer gpa.free(segs);
+        for ([_]usize{ 0, 1, count, count + 1, source.len }) |from| {
+            for ([_]bool{ false, true }) |opening| {
+                var writer = Bool.WireSpliceWriter.initOpening(gpa, opening);
+                defer writer.deinit();
+                try writer.appendEncodedRange(bytes, segs, from, source.len);
+                try writer.extend(&.{ false, true, true });
+                try writer.appendN(true, 2);
+                try writer.finish();
+                const got = try writer.take();
+                defer gpa.free(got);
+                var want: std.ArrayList(bool) = .empty;
+                defer want.deinit(gpa);
+                try want.appendSlice(gpa, source[from..]);
+                try want.appendSlice(gpa, &.{ false, true, true, true, true });
+                const expected = try Bool.wireEncode(gpa, want.items, opening);
+                defer gpa.free(expected);
+                try testing.expectEqualSlices(u8, expected, got);
+            }
+        }
+    }
+}
+
+test "counted boolean writer refuses overflow before changing pending runs" {
+    // A tiny encoded count reaches the length limit without constructing rows.
+    const gpa = testing.allocator;
+    var writer = Bool.WireSpliceWriter.init(gpa);
+    defer writer.deinit();
+    try writer.appendN(true, std.math.maxInt(usize));
+    try testing.expectError(error.Overflow, writer.append(false));
+    try testing.expectError(error.Overflow, writer.appendN(true, 1));
+    try testing.expectEqual(std.math.maxInt(usize), writer.len());
+    try writer.finish();
+    const got = try writer.take();
+    defer gpa.free(got);
+    const expected = try Bool.wireFill(gpa, std.math.maxInt(usize), true, false);
+    defer gpa.free(expected);
+    try testing.expectEqualSlices(u8, expected, got);
+}
+
+test "boolean windows preserve bounds and typed parser refusals" {
+    // Bounds precede output allocation; run totals must refuse rather than trap.
+    const gpa = testing.allocator;
+    const bytes = try Bool.wireFill(gpa, 1_000_000, true, false);
+    defer gpa.free(bytes);
+    const window = try Bool.wireRange(gpa, bytes, 999_997, 1_000_000);
+    defer gpa.free(window);
+    try testing.expectEqualSlices(bool, &.{ true, true, true }, window);
+    try testing.expectError(error.InvalidValue, Bool.wireRange(gpa, bytes, 1, 0));
+    try testing.expectError(error.InvalidValue, Bool.wireRange(gpa, bytes, 0, 1_000_001));
+    try testing.expectError(error.UnexpectedEnd, Bool.wireRange(gpa, &.{0x80}, 0, 0));
+    const maximum = try Bool.wireFill(gpa, std.math.maxInt(usize), false, false);
+    defer gpa.free(maximum);
+    var overflowing: std.ArrayList(u8) = .empty;
+    defer overflowing.deinit(gpa);
+    try overflowing.appendSlice(gpa, maximum);
+    try overflowing.append(gpa, 1);
+    try testing.expectError(error.Overflow, Bool.wireRange(gpa, overflowing.items, 0, 0));
+}
+
+fn countedBooleanFlushAllocationFailure(gpa: std.mem.Allocator) !void {
+    var writer = Bool.WireSpliceWriter.init(gpa);
+    defer writer.deinit();
+    try writer.appendN(true, std.math.maxInt(usize));
+    writer.finish() catch |failure| {
+        try testing.expectEqual(error.OutOfMemory, failure);
+        try testing.expectEqual(@as(usize, 0), writer.out.items.len);
+        try testing.expectEqual(@as(?bool, true), writer.pending);
+        try testing.expectEqual(std.math.maxInt(usize), writer.count);
+        return failure;
+    };
+    const bytes = try writer.take();
+    defer gpa.free(bytes);
+    const expected = try Bool.wireFill(testing.allocator, std.math.maxInt(usize), true, false);
+    defer testing.allocator.free(expected);
+    try testing.expectEqualSlices(u8, expected, bytes);
+}
+
+test "counted boolean flush allocation failures preserve the opening pad and ownership" {
+    // Refuse either count write or final ownership transfer, including a pad
+    // successfully written before the pending count needs a larger buffer.
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        countedBooleanFlushAllocationFailure,
+        .{},
+    );
 }
 
 /// One value's byte width and how to read it, and how one value is
@@ -1772,21 +1910,71 @@ fn RunWriter(comptime Payload: type, comptime Nullable: bool, comptime P: type) 
         pub fn appendN(self: *Self, v: rleElement(Payload, Nullable), n: usize) !void {
             if (n == 0) return;
             if (comptime Nullable) {
-                const present = v orelse {
+                if (v == null) {
+                    const count = std.math.add(usize, self.null_count, n) catch
+                        return error.Overflow;
                     try self.flushLiteral();
                     try self.flushRepeat();
-                    self.null_count += n;
+                    self.null_count = count;
                     return;
-                };
-                try self.startRun(present, n);
-                return;
+                }
             }
-            try self.startRun(v, n);
+            const present = if (comptime Nullable) v.? else v;
+            var count = n;
+            if (self.rep_value) |previous| {
+                if (rle.payloadEql(Payload, previous, present)) {
+                    count = std.math.add(usize, count, self.rep_count) catch
+                        return error.Overflow;
+                }
+            } else if (self.lit.items.len != 0 and
+                rle.payloadEql(Payload, self.lit.items[self.lit.items.len - 1], present))
+            {
+                count = std.math.add(usize, count, 1) catch return error.Overflow;
+            }
+            if (count > std.math.maxInt(i64)) return error.TooLarge;
+            // Two scalar transitions establish the same literal/repeat boundary;
+            // the remaining copies only extend its count, without visiting rows.
+            try self.append(v);
+            if (n == 1) return;
+            try self.append(v);
+            std.debug.assert(self.rep_value != null);
+            self.rep_count += n - 2;
         }
 
         /// Appends every value of `values`, in order.
         pub fn extend(self: *Self, values: []const rleElement(Payload, Nullable)) !void {
             for (values) |v| try self.append(v);
+        }
+
+        /// Streams a range from a validated run table without expanding repeats.
+        /// Literal payload slices borrow `bytes` until this writer is finished.
+        pub fn appendEncodedRange(
+            self: *Self,
+            bytes: []const u8,
+            segs: []const slabmod.Segment(rleElement(Payload, Nullable)),
+            from: usize,
+            to: usize,
+        ) ParseError!void {
+            const len = if (segs.len == 0) 0 else segs[segs.len - 1].item_end;
+            if (from > to or to > len) return error.InvalidValue;
+            for (segs) |seg| {
+                if (from >= seg.item_end or seg.item_start >= to) continue;
+                const lo = @max(from, seg.item_start) - seg.item_start;
+                const hi = @min(to, seg.item_end) - seg.item_start;
+                switch (seg.kind) {
+                    .repeat, .absent => try self.appendN(seg.first_value.?, hi - lo),
+                    .literal => {
+                        const hdr = try P.readSigned(bytes[seg.byte_start..]);
+                        var pos = seg.byte_start + hdr.len;
+                        for (0..hi) |i| {
+                            const value = try payloadRead(P, Payload, bytes, pos);
+                            if (i >= lo) try self.append(value.value);
+                            pos += value.len;
+                        }
+                    },
+                    .pad => return error.InvalidValue,
+                }
+            }
         }
 
         /// Writes the runs still in progress, in output order.
@@ -1825,19 +2013,6 @@ fn RunWriter(comptime Payload: type, comptime Nullable: bool, comptime P: type) 
             try self.lit.append(self.gpa, v);
         }
 
-        fn startRun(self: *Self, v: Payload, n: usize) !void {
-            if (self.lit.items.len != 0 and rle.payloadEql(Payload, self.lit.items[self.lit.items.len - 1], v)) {
-                self.lit.shrinkRetainingCapacity(self.lit.items.len - 1);
-            }
-            try self.flushAll();
-            if (n == 1) {
-                try self.lit.append(self.gpa, v);
-                return;
-            }
-            self.rep_value = v;
-            self.rep_count = n;
-        }
-
         fn flushAll(self: *Self) !void {
             try self.flushLiteral();
             try self.flushRepeat();
@@ -1869,6 +2044,70 @@ fn RunWriter(comptime Payload: type, comptime Nullable: bool, comptime P: type) 
             self.segments += 1;
         }
     };
+}
+
+test "counted run writer matches elementwise canonical transitions" {
+    // Counted runs must retain singleton literals and coalesce pending repeats.
+    const gpa = testing.allocator;
+    var writer = RunWriter(u32, true, rle.Leb128).init(gpa);
+    defer writer.deinit();
+    try writer.append(7);
+    try writer.appendN(7, 3);
+    try writer.appendN(7, 2);
+    try writer.appendN(8, 1);
+    try writer.appendN(9, 1);
+    try writer.appendN(null, 2);
+    try writer.appendN(null, 1);
+    try writer.appendN(10, 2);
+    try writer.finish();
+    const got = try writer.take();
+    defer gpa.free(got);
+    const want = try RleOption(u32).wireEncode(
+        gpa,
+        &.{ 7, 7, 7, 7, 7, 7, 8, 9, null, null, null, 10, 10 },
+        false,
+    );
+    defer gpa.free(want);
+    try testing.expectEqualSlices(u8, want, got);
+}
+
+test "counted run writer preserves count boundaries and byte payload transitions" {
+    // The same counted primitive used by splice must agree with ordinary append.
+    const gpa = testing.allocator;
+    for ([_]usize{ 1, 2, 63, 64, 127, 128 }) |count| {
+        var counted = RunWriter([]const u8, true, rle.Leb128).init(gpa);
+        defer counted.deinit();
+        var scalar = RunWriter([]const u8, true, rle.Leb128).init(gpa);
+        defer scalar.deinit();
+        const values = [_]?[]const u8{ "head", "payload", "payload", null, null, "tail" };
+        for (values) |value| {
+            try counted.appendN(value, count);
+            for (0..count) |_| try scalar.append(value);
+        }
+        try counted.finish();
+        try scalar.finish();
+        const got = try counted.take();
+        defer gpa.free(got);
+        const want = try scalar.take();
+        defer gpa.free(want);
+        try testing.expectEqualSlices(u8, want, got);
+    }
+}
+
+test "counted run writer refuses repeat count overflow before extending the run" {
+    // A compressed input can reach the signed wire count limit without allocating rows.
+    const gpa = testing.allocator;
+    var writer = RunWriter(u32, false, rle.Leb128).init(gpa);
+    defer writer.deinit();
+    const count: usize = @intCast(std.math.maxInt(i64));
+    try writer.appendN(300, count);
+    try testing.expectError(error.TooLarge, writer.appendN(300, 1));
+    try writer.finish();
+    const got = try writer.take();
+    defer gpa.free(got);
+    const want = try Rle(u32).wireFill(gpa, count, 300, false);
+    defer gpa.free(want);
+    try testing.expectEqualSlices(u8, want, got);
 }
 
 fn rleElement(comptime Payload: type, comptime Nullable: bool) type {
@@ -1943,6 +2182,7 @@ fn RleBase(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
         pub const wireRunItems = Base.wireRunItems;
         pub const wireEncode = Base.wireEncode;
         pub const wireFill = Base.wireFill;
+        pub const WireSpliceWriter = Base.WireSpliceWriter;
         /// The bytes of a slab holding `len` copies of the column *value*
         /// `value` (`Column::fill`, `column.rs:1227-1245`). A run-length
         /// column stores the value, so this is one run and O(1).
@@ -2125,6 +2365,7 @@ fn PrefixBase(comptime P: type, comptime T: type) type {
         pub const wireRunItems = Base.wireRunItems;
         pub const wireEncode = Base.wireEncode;
         pub const wireFill = Base.wireFill;
+        pub const WireSpliceWriter = Base.WireSpliceWriter;
         /// The bytes of a slab holding `len` copies of the column *value*
         /// `value` (`Column::fill`, `column.rs:1227-1245`). A prefix
         /// column stores the length itself, so this is one run and O(1).
@@ -2142,15 +2383,8 @@ fn PrefixBase(comptime P: type, comptime T: type) type {
         /// The item count and the sum of the row lengths. A sum that leaves
         /// `i64` is `error.Overflow` rather than a wrapped value.
         ///
-        /// **A run at a time, which is the whole cost of this method.** The
-        /// weight of a slab is read on every write that touches it — once by
-        /// [`reindexFrom`](Column.reindexFrom) and once by
-        /// [`rebuildAggs`](Column.rebuildAggs) — so a row-at-a-time walk
-        /// makes a write that appends to a column of `n` rows cost `n`
-        /// decoder steps per slab, and a transaction of `n` such writes cost
-        /// `n²`. A run of `count` rows of one length adds `length * count`,
-        /// which `accumulateRun` spends in one multiplication, so the walk is
-        /// `O(runs in the slab)`.
+        /// Measures only a changed slab during reconciliation. Repeats fold
+        /// by count; literals are read individually and are budget-bounded.
         ///
         /// **A literal run is still folded one value at a time, and that is
         /// the decoder's shape rather than a limit of this one.**
@@ -2216,11 +2450,9 @@ fn PrefixBase(comptime P: type, comptime T: type) type {
         /// Folds a wire value into a running sum, without realizing it: a
         /// row with no length contributes nothing to the sum.
         pub fn accumulate(w: Wire, running: *i64) ParseError!void {
-            if (comptime isNullable(T)) {
-                if (w) |v| running.* = try addChecked(running.*, @as(i64, @intCast(v)));
-            } else {
-                running.* = try addChecked(running.*, @as(i64, @intCast(w)));
-            }
+            const value = if (comptime isNullable(T)) w orelse return else w;
+            const contribution = std.math.cast(i64, value) orelse return error.Overflow;
+            running.* = try addChecked(running.*, contribution);
         }
 
         /// `accumulate` over `count` rows of one length: a prefix sum
@@ -2235,12 +2467,9 @@ fn PrefixBase(comptime P: type, comptime T: type) type {
             // can span more than `i64` on its own — a prefix sum folded from a
             // large negative running value must refuse exactly what `count`
             // checked additions refuse, and no more.
-            if (comptime isNullable(T)) {
-                const v = w orelse return;
-                running.* = try addRunOf(running.*, @as(i64, @intCast(v)), count);
-                return;
-            }
-            running.* = try addRunOf(running.*, @as(i64, @intCast(w)), count);
+            const value = if (comptime isNullable(T)) w orelse return else w;
+            const contribution = std.math.cast(i64, value) orelse return error.Overflow;
+            running.* = try addRunOf(running.*, contribution, count);
         }
 
         /// The wire entry one value takes on a column whose running value
@@ -2350,6 +2579,7 @@ fn DeltaBase(comptime P: type, comptime T: type) type {
         pub const wireRunItems = Base.wireRunItems;
         pub const wireEncode = Base.wireEncode;
         pub const wireFill = Base.wireFill;
+        pub const WireSpliceWriter = Base.WireSpliceWriter;
         pub const wireSlice = Base.wireSlice;
         pub const lastValueOfRun = Base.lastValueOfRun;
         pub const litTail = Base.litTail;
@@ -2385,13 +2615,8 @@ fn DeltaBase(comptime P: type, comptime T: type) type {
         /// subtree that cannot hold the value being searched for
         /// (`delta/indexed.rs:15-20`).
         ///
-        /// **A run at a time, and the extremes a run still costs O(1) for.**
-        /// The weight is read on every write that touches this slab — once by
-        /// [`reindexFrom`](Column.reindexFrom) and once by
-        /// [`rebuildAggs`](Column.rebuildAggs) — so a row-at-a-time walk
-        /// makes a write that appends to a column of `n` rows cost `n` steps
-        /// per slab, and a transaction of `n` such writes cost `n²`. The sum
-        /// over a run of `count` rows of one difference `d` is
+        /// Measures changed slabs once, folding repeats and their extrema.
+        /// The sum over `count` rows of one difference `d` is
         /// `partial + count * d`, one call to `addRunOf` (`column.zig:214`);
         /// and the partial sums the run passes through are `partial + k * d`
         /// for `k` in `1..count`, which are **monotone in `k`** whatever the
@@ -2439,7 +2664,10 @@ fn DeltaBase(comptime P: type, comptime T: type) type {
                     // every row of the run lands on the `partial` the
                     // invariant already covers; there is nothing to fold and
                     // nothing to widen.
-                    const d = run.value orelse continue;
+                    const d = run.value orelse {
+                        if (comptime !Nullable) return error.UnexpectedNull;
+                        continue;
+                    };
                     const first = try addRunOf(partial, d, 1);
                     const after = try addRunOf(partial, d, run.count);
                     lo = @min(lo, @min(first, after));
@@ -2450,6 +2678,9 @@ fn DeltaBase(comptime P: type, comptime T: type) type {
                 var n: usize = 0;
                 while (n < slab.len) : (n += 1) {
                     const w = (try dec.next()) orelse return error.InvalidValue;
+                    if (comptime !Nullable) {
+                        if (w == null) return error.UnexpectedNull;
+                    }
                     // An absent value holds the running value where it is.
                     try accumulate(w, &partial);
                     lo = @min(lo, partial);
@@ -2679,11 +2910,12 @@ fn BoolCodec(comptime P: type) type {
             while (pos < bytes.len) {
                 const c = try P.readUnsigned(bytes[pos..]);
                 const count = std.math.cast(usize, c.value) orelse return error.Overflow;
+                const item_end = std.math.add(usize, item, count) catch return error.Overflow;
                 const seg: slabmod.Segment(Wire) = .{
                     .byte_start = pos,
                     .byte_end = pos + c.len,
                     .item_start = item,
-                    .item_end = item + count,
+                    .item_end = item_end,
                     .first_value = if (count == 0) null else value,
                     .opens_with_true = value,
                     .kind = if (count == 0) .pad else if (count == 1) .literal else .repeat,
@@ -2694,7 +2926,7 @@ fn BoolCodec(comptime P: type) type {
                 } else {
                     try spill.append(gpa, seg);
                 }
-                item = std.math.add(usize, item, count) catch return error.Overflow;
+                item = item_end;
                 pos += c.len;
                 // Only the very first run may hold no items, and it does not
                 // flip the parity: it is the pad that lets a slab open on
@@ -2711,8 +2943,8 @@ fn BoolCodec(comptime P: type) type {
         }
 
         /// The wire values for rows `from..to` of `bytes`, as a fresh
-        /// caller-owned slice. Decodes the whole slab and copies the window out
-        /// of it, so `from > to` or `to` past the end is `error.InvalidValue`.
+        /// caller-owned slice. Visits encoded runs and allocates only the
+        /// requested rows; reversed or out-of-bounds ranges are `error.InvalidValue`.
         pub fn wireRange(gpa: std.mem.Allocator, bytes: []const u8, from: usize, to: usize) ParseError![]Wire {
             const segs = try segmentsOf(gpa, bytes);
             defer gpa.free(segs);
@@ -2741,10 +2973,17 @@ fn BoolCodec(comptime P: type) type {
             to: usize,
         ) ParseError![]Wire {
             _ = bytes;
-            const all = try wireAllFromSegs(gpa, Self, segs);
-            defer gpa.free(all);
-            if (to > all.len or from > to) return error.InvalidValue;
-            return gpa.dupe(Wire, all[from..to]);
+            const length = if (segs.len == 0) 0 else segs[segs.len - 1].item_end;
+            if (from > to or to > length) return error.InvalidValue;
+            const out = try gpa.alloc(Wire, to - from);
+            errdefer gpa.free(out);
+            for (segs) |seg| {
+                if (from >= seg.item_end or seg.item_start >= to) continue;
+                const lo = @max(from, seg.item_start) - from;
+                const hi = @min(to, seg.item_end) - from;
+                @memset(out[lo..hi], seg.first_value orelse return error.InvalidValue);
+            }
+            return out;
         }
 
         /// The canonical encoding of `wires`, as a run sequence read from a
@@ -2821,6 +3060,8 @@ fn BoolCodec(comptime P: type) type {
         /// The streaming encoder over this column's values
         /// (`ColumnEncoding::Encoder`, `encoding.rs:126-129`).
         pub const StreamEncoder = BoolEncoder(bool, P);
+        /// The same counted boolean writer, placed at a splice middle's parity.
+        pub const WireSpliceWriter = StreamEncoder;
 
         /// A boolean run stores no value, so there is no literal tail to record.
         pub fn litTail(bytes: []const u8, seg: slabmod.Segment(Wire)) ParseError!u32 {
@@ -3182,12 +3423,10 @@ pub fn Column(comptime T: type, comptime E: type) type {
         pub const Wire = E.Wire;
         /// What the index stores per slab.
         pub const Weight = E.Weight;
-        /// The default run budget one slab may hold. A column may be built
-        /// with another (`Column::initWithBudget`,
-        /// `LoadOpts::withMaxSegments`); this is what `init` and `load`
-        /// use, and it is unchanged from the budget the port has always
-        /// used, so every existing slab layout and every golden byte is the
-        /// same one.
+        /// Default maintenance budget. Unsigned tracked and untracked
+        /// codecs charge each literal row; signed tracked codecs preserve
+        /// wire-run partitions to keep local sums representable. Whole-column
+        /// encoding remains canonical (`slab.usesLiteralBudget`).
         pub const max_segments: usize = default_max_segments;
 
         const Tree = btree.Tree(Weight);
@@ -3216,10 +3455,9 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// for the whole column. Only a codec whose weight carries a prefix
         /// keeps it: that is a slab's base, in O(1).
         agg_before: std.ArrayList(Weight),
-        /// The run budget one slab of *this* column may hold. Upstream's
-        /// `Column::max_segments` is a field set by `with_max_segments`
-        /// (`column.rs:1121-1135`) and read by every split, merge and copy
-        /// decision; a `pub const` cannot be that.
+        /// Per-column maintenance budget used by split, merge and load.
+        /// See `slab.usesLiteralBudget`; `Slab.segments` is always the
+        /// separate codec wire-header metric.
         budget: usize,
         /// Bumped by every mutation, so a suspended cursor can tell that
         /// the column it was reading has been written since
@@ -3241,9 +3479,9 @@ pub fn Column(comptime T: type, comptime E: type) type {
             return initWithBudget(gpa, max_segments);
         }
 
-        /// A column with no values and no slabs, holding at most
-        /// `budget` runs per slab (`Column::with_max_segments`,
-        /// `column.rs:1121-1126`).
+        /// An empty column whose slabs hold at most `budget` maintenance
+        /// units: literal rows or whole runs, as `slab.usesLiteralBudget`
+        /// requires for the codec's arithmetic domain.
         ///
         /// Upstream asserts `budget >= 2`, because its loader halves the
         /// budget to find a cut point and its splices refuse a slab over the
@@ -3257,13 +3495,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
             return .{
                 .gpa = gpa,
                 .slabs = .empty,
-                // The tree's own error set has an out-of-range variant a
-                // fresh tree never reaches — it has no slabs to be out of
-                // range of — so it becomes the refusal the column reports.
-                .tree = Tree.init(gpa) catch |e| switch (e) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.InvalidIndex => return error.InvalidValue,
-                },
+                .tree = try Tree.init(gpa),
                 .total_len = 0,
                 .agg_before = .empty,
                 .budget = budget,
@@ -3322,7 +3554,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
             return &self.slabs.items[index];
         }
 
-        /// The run count of every slab, which is what the budget is about.
+        /// The wire-header count of every slab, independent of decode budget.
         pub fn slabSegments(self: *const Self, gpa: std.mem.Allocator) ParseError![]usize {
             const out = try gpa.alloc(usize, self.slabs.items.len);
             errdefer gpa.free(out);
@@ -3690,7 +3922,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
             if (self.isEmpty()) return self.total_len + 1;
             // The index descends by running sum, so the slab the target
             // lands in is one lookup, not a walk.
-            const hit = self.tree.findByPrefixSum(E.weightIncrement, target);
+            const hit = try self.tree.findByPrefixSum(E.weightIncrement, target);
             if (hit.slab >= self.slabs.items.len) return self.total_len + 1;
             const remaining = std.math.sub(i64, target, hit.prefix_before) catch return error.Overflow;
             return hit.items_before + try findPrefixInSlab(E, &self.slabs.items[hit.slab], remaining);
@@ -3740,7 +3972,11 @@ pub fn Column(comptime T: type, comptime E: type) type {
             /// `total()` less this row's own contribution
             /// (`prefix.rs:715-719`).
             pub fn prefix(self: PrefixedValue) i64 {
-                return self.sum - prefixUnit(T, self.value);
+                // Every yielded value has already passed this codec's checked
+                // accumulation. Its contribution is not necessarily its wire
+                // word: value metadata contributes word >> 4.
+                const contribution = prefixContribution(E, self.value) catch unreachable;
+                return std.math.sub(i64, self.sum, contribution) catch unreachable;
             }
         };
 
@@ -3789,7 +4025,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
             /// the window. O(1).
             pub fn next(self: *PrefixIter) ParseError!?PrefixedValue {
                 const v = (try self.inner.next()) orelse return null;
-                self.sum = try addChecked(self.sum, prefixUnit(T, v));
+                try E.accumulate(v, &self.sum);
                 return .{ .value = v, .sum = self.sum };
             }
 
@@ -3799,8 +4035,16 @@ pub fn Column(comptime T: type, comptime E: type) type {
             /// column, which is the only place it lives; a jump inside
             /// one walks its runs and adds each (`prefix.rs:810-836`).
             pub fn nth(self: *PrefixIter, n: usize) ParseError!?PrefixedValue {
-                if (n >= self.inner.items_left) {
-                    if (self.inner.items_left > 0) _ = try self.nth(self.inner.items_left - 1);
+                // setMax preserves the requested window, including an end
+                // beyond the data. Bound the lookup by actual rows as well:
+                // upstream drains through nth before EOF (prefix.rs:810-835),
+                // so the final real contribution cannot be dropped.
+                const actual_left = std.math.sub(usize, self.col.total_len, self.inner.at) catch
+                    return error.InvalidValue;
+                const reachable = @min(self.inner.items_left, actual_left);
+                if (n >= reachable) {
+                    if (reachable > 0) _ = try self.nth(reachable - 1);
+                    self.inner.items_left = 0;
                     return null;
                 }
                 // A jump inside the current slab is walked run at a time,
@@ -3810,32 +4054,40 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 // (`same_slab_nth`, `prefix.rs:818-821` and
                 // `prefix.rs:847-859`).
                 if (n < self.inner.slab_remaining) return self.sameSlabNth(n);
-                // A jump that leaves the slab reads the absolute prefix
-                // back from the column, which is the only place it lives
-                // (`prefix.rs:831-833`).
-                const absolute = try self.col.runningAt(self.inner.at + n);
-                self.sum = std.math.sub(i64, absolute, self.base) catch return error.Overflow;
-                const v = (try self.inner.nth(n)) orelse return null;
-                self.sum = try addChecked(self.sum, prefixUnit(T, v));
-                return .{ .value = v, .sum = self.sum };
+                // Descend once and begin at the target slab's start. The one
+                // run walk below both positions the decoder and folds the
+                // target prefix; runningAt + inner.nth replayed that prefix.
+                const target = std.math.add(usize, self.inner.at, n) catch return error.Overflow;
+                const hit = self.col.tree.findByPrefix(target) orelse return error.InvalidValue;
+                const skipped = std.math.sub(usize, hit.items_before, self.inner.at) catch
+                    return error.InvalidValue;
+                self.inner.items_left = std.math.sub(usize, self.inner.items_left, skipped) catch
+                    return error.InvalidValue;
+                self.inner.at = hit.items_before;
+                self.inner.slab_idx = hit.slab;
+                self.inner.dec = try E.WireDecoder.init(self.col.slabs.items[hit.slab].data);
+                self.inner.slab_remaining = self.col.slabs.items[hit.slab].len;
+                self.inner.running = self.col.baseOf(hit.slab);
+                self.sum = std.math.sub(i64, self.inner.running, self.base) catch return error.Overflow;
+                return self.sameSlabNth(target - hit.items_before);
             }
 
             /// The value `n` rows ahead inside the current slab, with the
             /// sum carried over every run the jump crosses
             /// (`same_slab_nth`, `prefix.rs:847-859`). One step per run,
             /// which is what makes an in-slab `nth` cheaper than a row
-            /// walk; `null` when the slab has no run left, which the
-            /// caller's `n < slab_remaining` does not allow.
+            /// walk. A missing advertised row is malformed, not valid EOF:
+            /// nth has already bounded the target by the actual row count.
             fn sameSlabNth(self: *PrefixIter, n: usize) ParseError!?PrefixedValue {
                 var left = n;
-                while (try self.inner.nextRunMax(left + 1)) |run| {
-                    const each = prefixUnit(T, run.value);
-                    const span = std.math.mul(i64, each, @as(i64, @intCast(run.count))) catch return error.Overflow;
-                    self.sum = try addChecked(self.sum, span);
+                while (try self.inner.nextRunMax(
+                    std.math.add(usize, left, 1) catch return error.Overflow,
+                )) |run| {
+                    try self.accumulateRun(run.value, run.count);
                     if (run.count > left) return .{ .value = run.value, .sum = self.sum };
                     left -= run.count;
                 }
-                return null;
+                return error.InvalidValue;
             }
 
             /// The next run of equal values, described by its *final* row:
@@ -3843,10 +4095,12 @@ pub fn Column(comptime T: type, comptime E: type) type {
             /// (`prefix.rs:935-947`).
             pub fn nextRun(self: *PrefixIter) ParseError!?RunOf(PrefixedValue) {
                 const run = (try self.inner.nextRun()) orelse return null;
-                const each = prefixUnit(T, run.value);
-                const span = std.math.mul(i64, each, @as(i64, @intCast(run.count))) catch return error.Overflow;
-                self.sum = try addChecked(self.sum, span);
+                try self.accumulateRun(run.value, run.count);
                 return .{ .count = run.count, .value = .{ .value = run.value, .sum = self.sum } };
+            }
+
+            fn accumulateRun(self: *PrefixIter, value: T, count: usize) ParseError!void {
+                try accumulateCodecRun(E, value, count, &self.sum);
             }
 
             /// This cursor as a run iterator over plain values, the prefix
@@ -3904,10 +4158,10 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 return self.inner.maxPos();
             }
 
-            /// Truncates the window at `pos`. It can shorten the window
-            /// and extend it again; a `pos` past the end of the data
-            /// simply stops the cursor there
-            /// (`Iter::set_max`, `column.rs:505-512`).
+            /// Truncates the window at `pos` and can extend it again
+            /// (`PrefixIter::set_max`, `prefix.rs:899-907`). The requested
+            /// logical end is retained until EOF; an end beyond the data
+            /// never advances the position beyond the actual rows.
             pub fn setMax(self: *PrefixIter, at: usize) void {
                 self.inner.setMax(at);
             }
@@ -4033,42 +4287,18 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// `range.start` before the first `next`
         /// (`PrefixColumn::iter_range`, `prefix.rs:668-676`).
         ///
-        /// **`iter()` then `setMax(end)` then `advanceBy(start)`, and the
-        /// order is the behaviour.** Upstream builds the whole-column
-        /// cursor and *accumulates* the skipped widths into `total`
-        /// (`advance_by`, `prefix.rs:903-907`), so every sum this hands
-        /// back is **absolute** — the prefix at `range.start`, and the
-        /// running total through each row after it. A consumer therefore
-        /// subtracts `base` from a sum rather than reading an offset out of
-        /// it, which is upstream's own `op_set2/op_set.rs:976` and `:995`.
-        /// Parking that same number in `base` instead and leaving `sum` at
-        /// zero answers the same questions in a *window-relative* space,
-        /// which is a different answer and one no upstream caller is
-        /// written against.
-        ///
-        /// **A window-relative variant was patched here once and removed on
-        /// 2026-10-01; bringing it back takes two edits and this note.**
-        /// Here: `it.base = try self.getPrefix(start)` and `it.sum = 0`
-        /// after the `advanceBy`, which is the whole of it — the cursor's
-        /// position and its window were always upstream's, so only the sums
-        /// moved. In `src/opset/op_set.zig`: `OpSet.calculateMarks`'s
-        /// compensation, which took `seq_base` from `getPrefix` and read
-        /// the cursor's sums as object-relative. The symptom it had is worth
-        /// stating, because it was not a wrong number but a refusal: with
-        /// the sums relative, `pv.prefix()` is 0 at the start of every
-        /// window, so `cast(usize, 0 - base)` is `error.Overflow` for every
-        /// object that does not begin at column row 0 — 23 tests across
-        /// `op_set`, `read`, `sync`, `doc`, `transaction` and `cursor`.
-        /// Pinned in both directions: `test "prefix_iter_proptest"`
-        /// ([`column.zig`](column.zig)) holds the absolute sums, and
-        /// `src/opset/op_set.zig`'s mark tests hold the subtraction.
+        /// Widths before the start are accumulated into the absolute sum,
+        /// not installed as a window-relative base (prefix.rs:668-676,
+        /// :903-907). Position first and truncate second so an empty window
+        /// retains a decoder that setMax can extend. resetPrefix is the only
+        /// public operation that rebases subsequent reported sums.
         pub fn prefixIterRange(self: *const Self, range: RowRange) ParseError!PrefixIter {
             if (!comptime E.is_prefix_column) return error.Unsupported;
-            const start = @min(range.start, self.total_len);
-            const end = @min(range.end, self.total_len);
+            const window = clampRange(range, self.total_len);
             var it = try self.prefixIter();
-            it.setMax(end);
-            try it.advanceBy(start);
+            // Position even an empty window at start, so setMax can extend it.
+            try it.advanceBy(window.start);
+            it.setMax(window.end);
             return it;
         }
 
@@ -4249,6 +4479,37 @@ pub fn Column(comptime T: type, comptime E: type) type {
             comptime f: fn (@TypeOf(ctx), T) T,
         ) ParseError!void {
             const out = try self.remapped(gpa, ctx, f);
+            errdefer {
+                var abandoned = out;
+                abandoned.deinit();
+            }
+            if (self.staging) |st| {
+                var borrowed: usize = 0;
+                for (self.slabs.items, 0..) |_, i| {
+                    if (!self.ownedByStage(i)) borrowed += 1;
+                }
+                try st.detached.ensureUnusedCapacity(st.gpa, borrowed);
+                try st.owned.ensureTotalCapacity(st.gpa, out.slabs.items.len);
+                // Both reservations precede releasing any provisional buffer.
+                // Originals move only into the detached ledger until publication.
+                for (self.slabs.items, 0..) |*slab, i| {
+                    if (self.ownedByStage(i)) {
+                        slab.deinit(self.gpa);
+                    } else {
+                        st.detached.appendAssumeCapacity(slab.*);
+                    }
+                }
+                const counter = self.counter +% 1;
+                self.slabs.deinit(self.gpa);
+                self.tree.deinit();
+                self.agg_before.deinit(self.gpa);
+                self.* = out;
+                self.counter = counter;
+                self.staging = st;
+                st.owned.items.len = self.slabs.items.len;
+                @memset(st.owned.items, true);
+                return;
+            }
             // The mapping is total — every value comes back through `f`, in
             // the source's order — so the new column has the same rows in the
             // same order and the same length, with every value *mapped*: only
@@ -4283,8 +4544,8 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// the rebuilt slab at the run budget and coalesces the neighbours of
         /// the rebuilt range, and both take their room from `reserveSlabs`
         /// before the first byte moves, so neither can fail after the list has
-        /// moved. The index rebuild behind them cannot: `reindexFrom` hands
-        /// the new list to `Tree.splice`, which grows nodes and leaf buffers
+        /// moved. The index rebuild behind them cannot: `reindexRange` hands
+        /// the affected interval to `Tree.splice`, which grows nodes and leaf buffers
         /// out of the tree's own arena (`btree.zig:402-416`, `:422-439`), and
         /// that arena is not the column's to reserve. A column that reserved
         /// everything it could reach would still be refused there, holding
@@ -4423,6 +4684,9 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// policy reaches for — so the work is O(the cut and the slabs in
         /// the index), never O(the values).
         const Staging = struct {
+            /// Ledger and detached original buffers retain their source allocator
+            /// even when a provisional remap migrates its replacement storage.
+            gpa: std.mem.Allocator,
             /// One flag per slab, the same length as the provisional list:
             /// true when this stage owns that slab's buffer, false when the
             /// buffer is still the original column's. A slab the provisional
@@ -4474,7 +4738,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
         fn takeOwnership(self: *Self, i: usize) ParseError!void {
             if (self.ownedByStage(i)) return;
             const st = self.staging.?;
-            try st.detached.append(self.gpa, self.slabs.items[i]);
+            try st.detached.append(st.gpa, self.slabs.items[i]);
             errdefer _ = st.detached.orderedRemove(st.detached.items.len - 1);
             self.slabs.items[i] = try self.slabs.items[i].clone(self.gpa);
             st.owned.items[i] = true;
@@ -4488,7 +4752,8 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 self.slabs.items[i].deinit(self.gpa);
                 return;
             }
-            try self.staging.?.detached.append(self.gpa, self.slabs.items[i]);
+            const st = self.staging.?;
+            try st.detached.append(st.gpa, self.slabs.items[i]);
         }
 
         /// Keeps the ownership flags the same length as the slab list after
@@ -4580,6 +4845,8 @@ pub fn Column(comptime T: type, comptime E: type) type {
             /// after a publish is a no-op, so `defer s.deinit()` beside
             /// `col.publish(s)` is safe rather than a double free.
             spent: bool,
+            /// A bound overlay has already applied this edit to its provisional column.
+            provisional: bool = false,
 
             /// **The abort.** Frees the slabs this stage re-encoded and its
             /// own bookkeeping, and leaves the original column exactly as it
@@ -4603,8 +4870,8 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 // Only the list buffer: those slabs' buffers are still the
                 // original column's, which is the whole reason they are
                 // recorded rather than freed.
-                self.stage.detached.deinit(self.staged.gpa);
-                self.stage.owned.deinit(self.staged.gpa);
+                self.stage.detached.deinit(self.stage.gpa);
+                self.stage.owned.deinit(self.stage.gpa);
                 self.staged.slabs.deinit(self.staged.gpa);
                 self.staged.agg_before.deinit(self.staged.gpa);
                 self.staged.tree.deinit();
@@ -4630,6 +4897,11 @@ pub fn Column(comptime T: type, comptime E: type) type {
             pub fn publish(self: *StagedSplice, col: *Self) void {
                 std.debug.assert(!self.spent);
                 std.debug.assert(col == self.col);
+                if (self.provisional) {
+                    std.debug.assert(col.staging != null);
+                    self.deinit();
+                    return;
+                }
                 // The column must not have been written since the stage was
                 // built, or the staged layout describes a column that no
                 // longer exists.
@@ -4638,6 +4910,10 @@ pub fn Column(comptime T: type, comptime E: type) type {
                     self.deinit();
                     return;
                 }
+                self.publishPrepared(col);
+            }
+
+            fn publishPrepared(self: *StagedSplice, col: *Self) void {
                 // `ArrayList.deinit` releases the buffer, not the slabs, and
                 // the staged list names every slab this column had.
                 col.slabs.deinit(col.gpa);
@@ -4650,9 +4926,10 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 col.counter = self.counter;
                 // In neither list now: the staged one dropped them and the
                 // column's own is gone.
-                for (self.stage.detached.items) |*s| s.deinit(col.gpa);
-                self.stage.detached.deinit(col.gpa);
-                self.stage.owned.deinit(col.gpa);
+                for (self.stage.detached.items) |*s| s.deinit(self.stage.gpa);
+                self.stage.detached.deinit(self.stage.gpa);
+                self.stage.owned.deinit(self.stage.gpa);
+                col.gpa = self.staged.gpa;
                 self.staged.slabs = .empty;
                 self.staged.agg_before = .empty;
                 self.spent = true;
@@ -4666,6 +4943,102 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 return self.new_len;
             }
         };
+
+        /// Multiple writes over borrowed slabs, published together or discarded together.
+        /// Initialize in place with `beginOverlay`. Source, overlay, and bound view stay
+        /// at stable addresses until capture, publish, or abort. A failed provisional
+        /// write requires aborting the whole overlay, not continuing or publishing it.
+        /// Metadata is copied once; unchanged encoded slab buffers remain borrowed.
+        pub const Overlay = struct {
+            prepared: StagedSplice,
+            source_counter: usize,
+            bound: ?*Self = null,
+
+            /// Transfers the provisional column into a stable caller-owned view.
+            /// Ordinary mutators on the view contribute to this overlay's ledger.
+            pub fn bind(self: *Overlay, view: *Self) void {
+                std.debug.assert(!self.prepared.spent);
+                std.debug.assert(self.bound == null);
+                std.debug.assert(view != self.prepared.col);
+                std.debug.assert(view != &self.prepared.staged);
+                view.* = self.prepared.staged;
+                view.staging = &self.prepared.stage;
+                self.prepared.staged = undefined;
+                self.bound = view;
+            }
+
+            /// Takes back the provisional view; the view is invalidated, not deinitialized.
+            pub fn capture(self: *Overlay, view: *Self) void {
+                std.debug.assert(self.bound == view);
+                std.debug.assert(view.staging == &self.prepared.stage);
+                self.prepared.staged = view.*;
+                self.prepared.staged.staging = null;
+                view.* = undefined;
+                self.bound = null;
+            }
+
+            /// Publishes all successful edits without allocating. Consumes the overlay.
+            /// The unchanged source must be the one passed to `beginOverlay`.
+            pub fn publish(self: *Overlay, source: *Self) void {
+                std.debug.assert(!self.prepared.spent);
+                std.debug.assert(source == self.prepared.col);
+                std.debug.assert(source.counter == self.source_counter);
+                if (self.bound) |view| self.capture(view);
+                self.prepared.new_len = self.prepared.staged.total_len;
+                self.prepared.counter = self.prepared.staged.counter;
+                self.prepared.publishPrepared(source);
+            }
+
+            /// Aborts all edits, releasing only provisional owned buffers and metadata.
+            /// Automatically captures a bound view. Safe after publish or prior abort.
+            pub fn deinit(self: *Overlay) void {
+                if (self.prepared.spent) return;
+                if (self.bound) |view| self.capture(view);
+                self.prepared.deinit();
+            }
+        };
+
+        /// Initializes an unbound overlay at its final address without copying payloads.
+        /// On refusal the source is unchanged and `out.deinit()` is safe.
+        pub fn beginOverlay(self: *Self, out: *Overlay) ParseError!void {
+            std.debug.assert(self.staging == null);
+            out.* = .{
+                .prepared = .{
+                    .col = self,
+                    .staged = undefined,
+                    .stage = .{ .gpa = self.gpa, .owned = .empty, .detached = .empty },
+                    .new_len = self.total_len,
+                    .counter = self.counter,
+                    .noop = false,
+                    .spent = false,
+                },
+                .source_counter = self.counter,
+            };
+            self.prepareStage(&out.prepared) catch |failure| {
+                // prepareStage owns cleanup once its cloned tree exists.
+                out.prepared.spent = true;
+                return failure;
+            };
+        }
+
+        fn prepareStage(self: *Self, st: *StagedSplice) ParseError!void {
+            st.staged = .{
+                .gpa = self.gpa,
+                .slabs = .empty,
+                .tree = try self.tree.clone(self.gpa),
+                .total_len = self.total_len,
+                .agg_before = .empty,
+                .budget = self.budget,
+                .counter = self.counter,
+            };
+            errdefer st.deinit();
+            try st.stage.owned.resize(self.gpa, self.slabs.items.len + 1);
+            @memset(st.stage.owned.items, false);
+            try st.stage.detached.ensureTotalCapacity(self.gpa, self.slabs.items.len + 1);
+            try st.staged.agg_before.appendSlice(self.gpa, self.agg_before.items);
+            try st.staged.slabs.appendSlice(self.gpa, self.slabs.items);
+            st.stage.owned.items.len = self.slabs.items.len;
+        }
 
         /// Builds the splice that replaces `[index, index + del)` with
         /// `values` beside the column instead of inside it, and returns it
@@ -4692,6 +5065,10 @@ pub fn Column(comptime T: type, comptime E: type) type {
         ///
         /// The returned stage is the caller's to release — `defer
         /// stage.deinit()` — or to publish, which consumes it.
+        ///
+        /// On a bound Overlay view, the edit instead runs directly on that
+        /// provisional column and returns a bookkeeping-only token. A refused
+        /// edit requires aborting the whole overlay; its source is unchanged.
         pub fn stageSplice(
             self: *Self,
             index: usize,
@@ -4699,44 +5076,32 @@ pub fn Column(comptime T: type, comptime E: type) type {
             values: []const T,
         ) ParseError!StagedSplice {
             if (index > self.total_len or del > self.total_len - index) return error.InvalidValue;
+            if (self.staging != null) {
+                try self.spliceInPlace(self.gpa, index, del, values);
+                return .{
+                    .col = self,
+                    .staged = undefined,
+                    .stage = .{ .gpa = self.gpa, .owned = .empty, .detached = .empty },
+                    .new_len = self.total_len,
+                    .counter = self.counter,
+                    .noop = true,
+                    .spent = false,
+                    .provisional = true,
+                };
+            }
 
             var st = StagedSplice{
                 .col = self,
                 .staged = undefined,
-                .stage = Staging{ .owned = .empty, .detached = .empty },
+                .stage = .{ .gpa = self.gpa, .owned = .empty, .detached = .empty },
                 .new_len = std.math.add(usize, self.total_len - del, values.len) catch return error.Overflow,
                 .counter = self.counter +% 1,
                 .noop = del == 0 and values.len == 0,
                 .spent = false,
             };
             if (st.noop) return st;
-            st.staged = .{
-                .gpa = self.gpa,
-                .slabs = .empty,
-                .tree = try self.tree.clone(self.gpa),
-                .total_len = self.total_len,
-                .agg_before = .empty,
-                .budget = self.budget,
-                .counter = self.counter,
-            };
+            try self.prepareStage(&st);
             errdefer st.deinit();
-
-            // Room for the flags and for the one empty slab an empty column
-            // is seeded with, so `stagedGrew` never has to allocate on a path
-            // where the slab list is already moving.
-            // `resize` grows to `slabs.len + 1` and leaves the new slot
-            // uninitialized, so every flag is written before it is read; the
-            // spare slot is the one an empty column's seeded empty slab will
-            // take. The length then drops back to the slab count, and the
-            // spare capacity stays for `stagedGrew`.
-            try st.stage.owned.resize(self.gpa, self.slabs.items.len + 1);
-            @memset(st.stage.owned.items, false);
-            try st.stage.detached.ensureTotalCapacity(self.gpa, self.slabs.items.len + 1);
-            try st.staged.agg_before.appendSlice(self.gpa, self.agg_before.items);
-            // The provisional layout: the same slab structs, sharing their
-            // buffers, and a flag per slab saying the buffer is not ours.
-            try st.staged.slabs.appendSlice(self.gpa, self.slabs.items);
-            st.stage.owned.items.len = self.slabs.items.len;
             st.staged.staging = &st.stage;
 
             // **The mutating core, not [`splice`](Column.splice).** `splice`
@@ -4996,10 +5361,9 @@ pub fn Column(comptime T: type, comptime E: type) type {
             return out.toOwnedSlice(gpa);
         }
 
-        /// A column over the wire form, on the default run budget. The
-        /// bytes are validated as a whole — a run sequence with the
-        /// canonical rules — and then cut into slabs at half the run
-        /// budget, so a later insert has room (`rle/load.rs:185-196`).
+        /// Validate canonical bytes and initially fill half the maintenance
+        /// budget. Compressed runs stay cheap; signed tracked codecs keep
+        /// their original wire-run boundaries (`slab.usesLiteralBudget`).
         pub fn load(gpa: std.mem.Allocator, bytes: []const u8) ParseError!Self {
             return loadWithBudget(gpa, bytes, max_segments);
         }
@@ -5008,31 +5372,16 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// (`LoadOpts::with_max_segments`, `column.rs:1151-1161`).
         pub fn loadWithBudget(gpa: std.mem.Allocator, bytes: []const u8, budget: usize) ParseError!Self {
             try E.canonicalSlab(bytes);
-            var self = try Self.initWithBudget(gpa, budget);
-            errdefer self.deinit();
-
-            const segs = try E.segmentsOf(gpa, bytes);
-            defer gpa.free(segs);
-            const target = @max(self.budget / 2, 1);
-            var from: usize = 0;
-            while (from < segs.len) {
-                const to = @min(from + target, segs.len);
-                // The cut is never empty: `target` is at least one run and
-                // the loop only runs with a run left, so `from < to` and
-                // `to - 1` names the last run in the cut. Spelled at the
-                // subtraction, with the zero case named, so the bound is
-                // read where it is needed rather than inferred.
-                if (to == 0 or from >= to) return error.InvalidValue;
-                const piece = try E.wireSlice(gpa, bytes, segs[from].byte_start, segs[to - 1].byte_end, segs[from].opens_with_true);
-                errdefer gpa.free(piece);
-                const m = try slabmod.measure(gpa, E, piece);
-                try self.slabs.append(gpa, .{ .data = piece, .len = m.len, .segments = m.segments, .tail = m.tail });
-                self.total_len = std.math.add(usize, self.total_len, m.len) catch return error.Overflow;
-                from = to;
+            if (budget < 2) return error.InvalidValue;
+            var slabs: std.ArrayList(Slab) = .empty;
+            defer {
+                for (slabs.items) |*s| s.deinit(gpa);
+                slabs.deinit(gpa);
             }
-            try self.reindex();
-            try self.rebuildAggs(0);
-            return self;
+            var weights: std.ArrayList(Weight) = .empty;
+            defer weights.deinit(gpa);
+            try appendBoundedBytes(gpa, &slabs, &weights, bytes, loadTarget(budget));
+            return fromWeights(gpa, &slabs, &weights, budget);
         }
 
         /// The options a load takes (`LoadOpts`, `load_opts.rs:18-96`).
@@ -5084,10 +5433,9 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 return next;
             }
 
-            /// Cut the loaded slabs at `budget` runs each
-            /// (`with_max_segments`, `load_opts.rs:75-79`). A budget below
-            /// two is refused by the load rather than asserted here, so an
-            /// untrusted value gets an error.
+            /// Set the maintenance decode-work budget; loading initially
+            /// fills half of it. Values below two are refused by the load,
+            /// not asserted against an untrusted caller.
             pub fn withMaxSegments(self: LoadOpts, n: usize) LoadOpts {
                 var next = self;
                 next.max_segments = n;
@@ -5194,19 +5542,51 @@ pub fn Column(comptime T: type, comptime E: type) type {
             }
             const fresh = Tree.fromSlice(gpa, weights.items) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.Overflow => return error.Overflow,
                 error.InvalidIndex => return error.InvalidValue,
             };
             self.tree.deinit();
             self.tree = fresh;
+            try self.validateDomain();
+            try self.validateSignedPrefixRange(0, self.slabs.items.len);
             if (comptime E.tracks_prefix) {
                 var acc = identity;
                 try self.agg_before.append(gpa, acc);
                 for (weights.items) |w| {
-                    acc = Weight.Aggregate.merge(acc, w);
+                    acc = try btree.compose(Weight, acc, w);
                     try self.agg_before.append(gpa, acc);
                 }
             }
             return self;
+        }
+
+        fn loadTarget(budget: usize) usize {
+            return @max(budget / 2, if (E.Wire == bool) @as(usize, 2) else 1);
+        }
+
+        /// Prepare bytes and weights together before transferring any slab.
+        /// The caller retains its previous complete lists on refusal.
+        fn appendBoundedBytes(
+            gpa: std.mem.Allocator,
+            slabs: *std.ArrayList(Slab),
+            weights: *std.ArrayList(Weight),
+            bytes: []const u8,
+            budget: usize,
+        ) ParseError!void {
+            var pieces = try slabmod.partitionToBudget(gpa, E, bytes, budget);
+            defer {
+                for (pieces.items) |*s| s.deinit(gpa);
+                pieces.deinit(gpa);
+            }
+            var measured: std.ArrayList(Weight) = .empty;
+            defer measured.deinit(gpa);
+            try measured.ensureTotalCapacity(gpa, pieces.items.len);
+            for (pieces.items) |*s| measured.appendAssumeCapacity(try E.weightOf(gpa, s));
+            try slabs.ensureUnusedCapacity(gpa, pieces.items.len);
+            try weights.ensureUnusedCapacity(gpa, measured.items.len);
+            slabs.appendSliceAssumeCapacity(pieces.items);
+            weights.appendSliceAssumeCapacity(measured.items);
+            pieces.items.len = 0;
         }
 
         /// Streaming load (`Column::load_iter`, `column.rs:1173-1193`;
@@ -5285,15 +5665,28 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 while (true) {
                     const cursor_step = try self.cursor.next() orelse return null;
                     self.cut_items = std.math.add(usize, self.cut_items, cursor_step.count) catch return error.Overflow;
-                    self.cut_segments += 1;
-                    if (cursor_step.last_of_run and self.cut_segments == self.target) {
+                    if (comptime slabmod.usesLiteralBudget(E)) {
+                        self.cut_segments = std.math.add(usize, self.cut_segments, 1) catch return error.Overflow;
+                    } else if (cursor_step.last_of_run) {
+                        self.cut_segments = std.math.add(usize, self.cut_segments, 1) catch return error.Overflow;
+                    }
+                    if (cursor_step.last_of_run and self.cut_segments >= self.target) {
                         try self.cutSlab(cursor_step.run_end, cursor_step.after_opens_with_true);
                     }
                     // The boolean codec's opening pad holds no items and
                     // yields no run (`rle/load.rs:148-160`).
                     if (cursor_step.count == 0) continue;
                     if (cursor_step.value) |v| {
-                        return .{ .count = cursor_step.count, .value = try E.valueOfWire(v, &self.running) };
+                        const value = try E.valueOfWire(v, &self.running);
+                        if (comptime E.is_delta) {
+                            if (cursor_step.count > 1) {
+                                try accumulateCodecRun(E, v, cursor_step.count - 1, &self.running);
+                            }
+                            if (self.running < E.min_i64 or self.running > E.max_i64) return error.Overflow;
+                        } else if (comptime E.tracks_prefix) {
+                            try accumulateCodecRun(E, v, cursor_step.count, &self.running);
+                        }
+                        return .{ .count = cursor_step.count, .value = value };
                     }
                     return .{ .count = cursor_step.count, .value = try absentValueOf(E, &self.running) };
                 }
@@ -5354,24 +5747,8 @@ pub fn Column(comptime T: type, comptime E: type) type {
             fn cutSlab(self: *LoadIter, at: usize, opens_with_true: bool) ParseError!void {
                 if (self.cut_segments == 0) return;
                 const piece = try E.wireSlice(self.gpa, self.bytes, self.cut_start, at, opens_with_true);
-                const m = slabmod.measure(self.gpa, E, piece) catch |e| {
-                    self.gpa.free(piece);
-                    return e;
-                };
-                var slab: Slab = .{ .data = piece, .len = m.len, .segments = m.segments, .tail = m.tail };
-                const w = E.weightOf(self.gpa, &slab) catch |e| {
-                    self.gpa.free(piece);
-                    return e;
-                };
-                self.slabs.append(self.gpa, slab) catch |e| {
-                    self.gpa.free(piece);
-                    return e;
-                };
-                errdefer {
-                    _ = self.slabs.pop();
-                    slab.deinit(self.gpa);
-                }
-                try self.weights.append(self.gpa, w);
+                defer self.gpa.free(piece);
+                try appendBoundedBytes(self.gpa, &self.slabs, &self.weights, piece, self.target);
                 self.cut_start = at;
                 self.cut_segments = 0;
                 self.cut_items = 0;
@@ -5397,7 +5774,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 .slabs = .empty,
                 .weights = .empty,
                 .cut_start = 0,
-                .target = @max(budget / 2, 1),
+                .target = loadTarget(budget),
                 .cut_segments = 0,
                 .cut_items = 0,
                 .base = 0,
@@ -5448,12 +5825,10 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// The streaming encoder over this column's values (`EncoderApi`,
         /// `encoding.rs:187-240`).
         ///
-        /// A value is encoded as it is appended: nothing is staged in full
-        /// and then encoded, and a value is never copied more than once
-        /// into the slab it ends up in. With a run budget set, the encoder
-        /// rolls finished runs into slabs as it goes, so `intoColumn` hands
-        /// them straight to a column with no decode pass at all
-        /// (`RleEncoder::maybe_cut`, `encoder.rs:186-213`).
+        /// Values enter the existing canonical writer as they arrive.
+        /// Rolled buffers are partitioned into literal-bounded slabs and
+        /// measured once; `intoColumn` reuses their weights. A pending final
+        /// buffer is validated and partitioned by the same loader.
         pub const Encoder = struct {
             gpa: std.mem.Allocator,
             inner: E.StreamEncoder,
@@ -5462,7 +5837,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
             /// Their weights, measured as each was rolled — which is what
             /// lets `intoColumn` skip a second walk of the data.
             weights: std.ArrayList(Weight),
-            /// The run budget, or null for one contiguous buffer.
+            /// Decode-work budget, or null for one contiguous writer buffer.
             budget: ?usize,
             /// Values already rolled into `slabs`.
             len_flushed: usize,
@@ -5643,50 +6018,12 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 // either hands it over or gives it back, and neither leaves
                 // the encoder holding it.
                 self.spent = true;
-                // One owner on every path out: this function while the
-                // buffer is still a local, and `slabs` from the append on.
-                // The buffer is freed by hand until then rather than by a
-                // function-scoped `errdefer`, which would still be armed
-                // once `slabs` — and the column it becomes — owns it.
-                var slabs: std.ArrayList(Slab) = .empty;
-                errdefer {
-                    for (slabs.items) |*s| s.deinit(self.gpa);
-                    slabs.deinit(self.gpa);
-                }
-                var weights: std.ArrayList(Weight) = .empty;
-                // A plain `defer` and not an `errdefer`: `fromWeights`
-                // copies the weights into the tree and the aggregate prefix
-                // and consumes only the slabs, so this list is still this
-                // function's own on the way out — success included. An
-                // `errdefer` would leave the success path's buffer behind,
-                // and the borrowed lists the other two callers pass
-                // (`self.weights` here, the iterator's own) are freed by
-                // their owners, so exactly one free happens on every path.
-                defer weights.deinit(self.gpa);
-                const m = slabmod.measure(self.gpa, E, bytes) catch |e| {
-                    self.gpa.free(bytes);
-                    return e;
-                };
-                var slab: Slab = .{ .data = bytes, .len = m.len, .segments = m.segments, .tail = m.tail };
-                const w = E.weightOf(self.gpa, &slab) catch |e| {
-                    self.gpa.free(bytes);
-                    return e;
-                };
-                // The append is the one step the list's `errdefer` cannot
-                // cover: the slab is not in the list yet, so nothing above
-                // owns the buffer. `deinit` rather than a bare `free`,
-                // because an encoder with no values in it takes a zero-length
-                // buffer that must not be freed (`slab.zig:186-189`).
-                slabs.append(self.gpa, slab) catch |e| {
-                    slab.deinit(self.gpa);
-                    return e;
-                };
-                try weights.append(self.gpa, w);
-                return fromWeights(self.gpa, &slabs, &weights, budget);
+                defer self.gpa.free(bytes);
+                return loadWithBudget(self.gpa, bytes, budget);
             }
 
-            /// Rolls the pending buffer into a slab once the run budget is
-            /// reached. A no-op unless a budget was set.
+            /// Roll at the writer's run threshold; `rollSlab` also splits
+            /// literal payloads by the distinct decode-work budget.
             fn maybeCut(self: *Encoder) ParseError!void {
                 const n = self.budget orelse return;
                 const target = @max(n / 2, 1);
@@ -5699,26 +6036,8 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 if (self.inner.len() == self.len_flushed) return;
                 try self.inner.finish();
                 const bytes = try self.inner.take();
-                // The buffer has exactly one owner on every path out: this
-                // function until the slab is in the list, and the list from
-                // there on. Each path is spelled rather than left to a
-                // function-scoped `errdefer`, because that one is still
-                // armed once the list owns the bytes — and would then free
-                // what the list's own `deinit` frees.
-                const m = slabmod.measure(self.gpa, E, bytes) catch |e| {
-                    self.gpa.free(bytes);
-                    return e;
-                };
-                var slab: Slab = .{ .data = bytes, .len = m.len, .segments = m.segments, .tail = m.tail };
-                const w = E.weightOf(self.gpa, &slab) catch |e| {
-                    self.gpa.free(bytes);
-                    return e;
-                };
-                self.slabs.append(self.gpa, slab) catch |e| {
-                    slab.deinit(self.gpa);
-                    return e;
-                };
-                try self.weights.append(self.gpa, w);
+                defer self.gpa.free(bytes);
+                try appendBoundedBytes(self.gpa, &self.slabs, &self.weights, bytes, loadTarget(self.budget orelse max_segments));
                 self.len_flushed = self.inner.len();
             }
         };
@@ -6191,14 +6510,10 @@ pub fn Column(comptime T: type, comptime E: type) type {
         ///
         /// **A refusal leaves the column exactly as it was: still no slabs.**
         /// The seeded slab goes into a list whose room was taken first, and
-        /// the two rebuilds are the only steps after that which allocate —
-        /// so the order is what makes the undo possible. `rebuildAggs` runs
-        /// first and measures into room past the end of the array it
-        /// replaces, shrinking back on a refusal; `reindex` runs second and
-        /// builds the fresh tree before it tears the old one down. Whichever
-        /// of the two refuses, the other has not run and the tree is still
-        /// the one the column came in with. What is left to undo is a
-        /// length and a flag, because an empty slab owns nothing.
+        /// the index rebuild is the remaining allocation after reservation.
+        /// It builds a fresh tree before replacing the old one. The base
+        /// array has room already and then folds those retained weights.
+        /// Refusal therefore leaves only an empty slab and flag to remove.
         pub fn ensureSlab(self: *Self) ParseError!void {
             if (self.slabs.items.len != 0) return;
             // Room for the seeded slab, its ownership flag and the bases it
@@ -6212,8 +6527,53 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 self.slabs.items.len = 0;
                 self.stagedGrew(0, 1, 0);
             }
-            try self.rebuildAggs(0);
             try self.reindex();
+            try self.rebuildAggs(0);
+        }
+
+        /// Exact slab-prefix weight from the retained tree, including its
+        /// terminal boundary. During staging the slab list is already edited,
+        /// but this tree still describes the old interval until reconciliation.
+        /// Bases are only a derived read cache and may not have been seeded yet.
+        /// Skip complete subtrees using their checked summaries; compose only
+        /// the boundary path and leaf, without allocations or byte decoding.
+        fn indexedAggBefore(self: *const Self, si: usize) ParseError!Weight {
+            if (si > self.tree.len()) return error.InvalidValue;
+            if (si == 0) return identity;
+            if (si == self.tree.len()) return self.tree.rootAgg();
+            var remaining = si;
+            var acc = identity;
+            var node = self.tree.root;
+            while (true) {
+                switch (self.tree.nodes.items[node].?) {
+                    .leaf => |leaf| {
+                        for (leaf.items) |weight| {
+                            if (remaining == 0) return acc;
+                            remaining -= 1;
+                            acc = try btree.compose(Weight, acc, weight);
+                        }
+                        if (remaining != 0) return error.InvalidValue;
+                        return acc;
+                    },
+                    .internal => |children| {
+                        var descended = false;
+                        for (children.items) |child| {
+                            if (remaining == 0) return acc;
+                            if (remaining < child.slab_count) {
+                                node = child.id;
+                                descended = true;
+                                break;
+                            }
+                            remaining -= child.slab_count;
+                            acc = try btree.compose(Weight, acc, child.agg);
+                        }
+                        if (!descended) {
+                            if (remaining != 0) return error.InvalidValue;
+                            return acc;
+                        }
+                    },
+                }
+            }
         }
 
         /// The merged weight of the slabs before `si` — a slab's base.
@@ -6344,6 +6704,13 @@ pub fn Column(comptime T: type, comptime E: type) type {
         fn reanchorRow(self: *Self, gpa: std.mem.Allocator, at: usize, wire: E.Wire) ParseError!usize {
             const si = self.slabHolding(at);
             const in_slab = at - self.tree.itemsBeforeSlab(si);
+            // A changed repeat head may become a literal plus its surviving
+            // repeat. Reserve that growth before the slab is rewritten.
+            const units = try slabmod.decodeBudget(gpa, E, &self.slabs.items[si]);
+            const upper = std.math.add(usize, units, 2) catch return error.Overflow;
+            const spills = slabmod.splitSpillCount(E, upper, self.budget);
+            const reserve = std.math.add(usize, self.slabs.items.len, spills) catch return error.Overflow;
+            try self.reserveSlabs(std.math.add(usize, reserve, 1) catch return error.Overflow);
             try self.takeOwnership(si);
             try slabmod.splice(gpa, E, &self.slabs.items[si], in_slab, 1, &.{wire}, null);
             return self.settle(si, 1);
@@ -6407,8 +6774,12 @@ pub fn Column(comptime T: type, comptime E: type) type {
             // boolean mid can write in front of itself when the slab it was cut
             // out of had none. `splitSpillCount` is what that many runs come
             // apart into.
-            const spills = slabmod.splitSpillCount(E, s.segments + values.len + 1, self.budget);
-            try self.reserveSlabs(self.slabs.items.len + spills + 1);
+            const units = try slabmod.decodeBudget(gpa, E, s);
+            const with_insert = std.math.add(usize, units, insert.len) catch return error.Overflow;
+            const upper = std.math.add(usize, with_insert, 2) catch return error.Overflow;
+            const spills = slabmod.splitSpillCount(E, upper, self.budget);
+            const reserve = std.math.add(usize, self.slabs.items.len, spills) catch return error.Overflow;
+            try self.reserveSlabs(std.math.add(usize, reserve, 1) catch return error.Overflow);
 
             try self.takeOwnership(si);
             try slabmod.splice(gpa, E, &self.slabs.items[si], in_slab, del_now, insert, postfix);
@@ -6425,7 +6796,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
                     // The row to re-anchor stood past this slab, so the
                     // splice has already moved it: put its difference on
                     // it where it now stands.
-                    from = @min(from, try self.reanchorRow(gpa, f.at + values.len - del, f.wire));
+                    from = @min(from, try self.reanchorRow(gpa, f.at - del + values.len, f.wire));
                 }
             }
             return from;
@@ -6502,14 +6873,15 @@ pub fn Column(comptime T: type, comptime E: type) type {
             // has to be able to hold them before either happens. An
             // `insertSlice` that had to grow would come back with the range
             // gone from the column and the pieces still owned by `pieces`,
-            // which is the one owner that gives them back. The bound covers
-            // the split `settle` below makes at the run budget: a run is at
-            // least one byte, so a piece's own run count bounds what it can
-            // spill into.
+            // which is the one owner that gives them back. Every piece is
+            // charged: reanchoring can grow the tail's literal decode work
+            // even though the inserted pieces were already partitioned.
             const placed = pieces.items.len;
             const dropped = s1 + 1 - s0;
-            const head_spill = if (placed == 0) 0 else slabmod.splitSpillCount(E, pieces.items[placed - 1].segments, self.budget);
-            try self.reserveSlabs(self.slabs.items.len - dropped + placed + head_spill + 1);
+            const spills = try self.rangeSpillBound(pieces.items);
+            const replacement = std.math.add(usize, self.slabs.items.len - dropped, placed) catch return error.Overflow;
+            const reserve = std.math.add(usize, replacement, spills) catch return error.Overflow;
+            try self.reserveSlabs(std.math.add(usize, reserve, 1) catch return error.Overflow);
             // Drop the slabs the cut spanned and put the pieces in their
             // place, in one non-fallible step. The old slabs are freed by hand
             // because the list is holding them, not copies of them.
@@ -6535,7 +6907,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
                     // the row to re-anchor stands in a later slab, which the
                     // splice has already moved: put its difference on it
                     // where it now stands.
-                    from = @min(from, try self.reanchorRow(gpa, f.at + values.len - del, f.wire));
+                    from = @min(from, try self.reanchorRow(gpa, f.at - del + values.len, f.wire));
                 }
             }
             return from;
@@ -6560,17 +6932,8 @@ pub fn Column(comptime T: type, comptime E: type) type {
             try pieces.append(gpa, piece);
         }
 
-        /// Split `wires` into slabs at the run budget and append them.
-        ///
-        /// **A piece behind the first is cut one run short when it has to open
-        /// on a `true` run** — the pad a boolean piece writes is a run the wire
-        /// spends and `measure` counts, so a piece cut at the full budget
-        /// behind one lands a run over it (`slab.zig:1007-1048` for the
-        /// argument, `bool.rs:312-317` for upstream's own). This is the same
-        /// cut [`splitToBudget`](slabmod.splitToBudget) makes and takes the
-        /// same [`pieceRuns`](slabmod.pieceRuns), so a column cannot end a
-        /// splice with a slab the column's invariant checker refuses
-        /// (`column.zig:6881-6882`) on this path and not on that one.
+        /// Split wire values using the same literal-aware partitioner as
+        /// loads and spills. Boolean opening pads spend their own budget.
         fn appendBudgeted(
             self: *Self,
             gpa: std.mem.Allocator,
@@ -6580,19 +6943,29 @@ pub fn Column(comptime T: type, comptime E: type) type {
             if (wires.len == 0) return;
             const bytes = try E.wireEncode(gpa, wires, false);
             defer gpa.free(bytes);
-            const segs = try E.segmentsOf(gpa, bytes);
-            defer gpa.free(segs);
-            var from: usize = 0;
-            while (from < segs.len) {
-                const to = @min(from + slabmod.pieceRuns(E, segs, from, self.budget), segs.len);
-                try appendPiece(gpa, pieces, try cutPiece(gpa, E, bytes, segs, from, to));
-                from = to;
+            var bounded = try slabmod.partitionToBudget(gpa, E, bytes, self.budget);
+            defer {
+                for (bounded.items) |*s| s.deinit(gpa);
+                bounded.deinit(gpa);
             }
+            try pieces.appendSlice(gpa, bounded.items);
+            bounded.items.len = 0;
         }
 
-        /// Cut the first rebuilt slab back to the budget, coalesce the
-        /// neighbours of the whole rebuilt range, and bring the index and
-        /// the weight array back into step.
+        /// Checked spill capacity for exactly the slabs a rebuild rewrote.
+        /// Literal rows and compressed runs retain their codec's budget policy.
+        fn rangeSpillBound(self: *const Self, slabs: []const Slab) ParseError!usize {
+            var spills: usize = 0;
+            for (slabs) |*s| {
+                const units = try slabmod.decodeBudget(self.gpa, E, s);
+                const extra = slabmod.splitSpillCount(E, units, self.budget);
+                spills = std.math.add(usize, spills, extra) catch return error.Overflow;
+            }
+            return spills;
+        }
+
+        /// Cut every rebuilt slab back to the budget, coalesce neighbours of
+        /// the whole rebuilt range, and bring the index and bases back into step.
         ///
         /// `count` is how many slabs the rebuild put in place of the old
         /// ones: one for a splice inside a slab, and one per piece for a
@@ -6615,14 +6988,14 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// column does not name until they are in its list — so a list that
         /// had to grow at that point could only be answered by freeing them,
         /// which drops the tail of the column rather than refusing the
-        /// write. The bound is the slab's own run count over the budget, and
-        /// the bases are reserved with it because `rebuildAggs` refills them
-        /// from the list this step leaves behind.
+        /// write. The bound sums every rebuilt piece's decode-work spill,
+        /// including a reanchored tail, before any pieces transfer. Bases and
+        /// staged ownership flags are reserved for that same whole bound.
         ///
-        /// **A refusal past the split is only survivable on a provisional
-        /// column.** Everything up to and including the spill insert is
-        /// non-fallible, but the coalescing that follows and the index
-        /// rebuild behind it allocate against a list that has already moved:
+        /// **A refusal is only survivable on a provisional column.** Each
+        /// partition finishes before replacing its slab; its spill transfer
+        /// cannot fail. Later partitions, coalescing and the index rebuild
+        /// can still allocate against a list that has already moved:
         /// a refusal in either leaves this column holding the new slabs
         /// against an index that still describes the old ones. That is why
         /// [`splice`](Column.splice) runs this on the provisional column a
@@ -6648,65 +7021,46 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 // A cut that spanned every slab and put nothing in its
                 // place. An empty column still keeps one empty slab, the
                 // one the next splice lands in (`column.rs:1298-1306`).
-                try self.slabs.append(self.gpa, .empty);
+                try self.reserveSlabs(1);
+                self.slabs.appendAssumeCapacity(.empty);
                 self.stagedGrew(self.slabs.items.len - 1, 0, 1);
                 try self.reindex();
                 // The list was empty a line ago: the seeded slab is the
                 // whole of it and nothing is in front of it to keep.
                 return 0;
             }
-            // **A rebuilt range can be empty, and empty at the tail.** A cut
-            // that removed every slab from `lo` on and put nothing back
-            // leaves no slab at `lo`: there is nothing to split and no run
-            // budget to enforce, so both are vacuous. `count` is the number
-            // of pieces placed, so `lo == slabs.len` is exactly the case
-            // where the range came out empty at the end of the column, and
-            // that is the whole of the condition — a boundary of the range,
-            // not a special input. The two stages after the split are *not*
-            // vacuous: the index still has to drop the slabs the cut
-            // removed, so only the split is skipped.
-            const rebuilt = lo < self.slabs.items.len;
-            // Room for the split and for the bases that follow it, taken
-            // while the column still holds every value it had. `Slab.segments`
-            // is the run count `splitToBudget` cuts on, and
-            // `splitSpillCount` is the bound on the pieces that can come out
-            // of that many runs — the pad a boolean piece writes counted
-            // (`slab.zig:1007-1068`), so it is never one short.
-            const head_spill = if (rebuilt) slabmod.splitSpillCount(E, self.slabs.items[lo].segments, self.budget) else 0;
-            try self.reserveSlabs(self.slabs.items.len + head_spill);
-            // `spilled` has exactly one owner at every point and no guard
-            // outlives it. The previous shape armed an `errdefer` that closed
-            // over `spilled`, called `spilled.deinit` on the success path, and
-            // then let `tryMergeRange`/`reindexFrom` below fail: the guard
-            // then read `spilled.items` out of the `undefined` an
-            // `ArrayList.deinit` leaves behind, so it walked a garbage length
-            // over garbage item pointers and freed garbage — the general
-            // protection fault the apply-route allocation sweep hit. The
-            // items transfer to `self.slabs` on success; the list buffer is
-            // released once, here, and the two fallible calls after it hold no
-            // reference to `spilled` at all. Starting from `.empty` rather
-            // than from the call's own result keeps that true on the refusal
-            // path too: an empty list owns nothing, so releasing it is a
-            // no-op instead of a read of an uninitialised value.
-            var spilled: std.ArrayList(Slab) = .empty;
-            if (rebuilt) {
-                try self.takeOwnership(lo);
-                spilled = try slabmod.splitToBudget(self.gpa, E, &self.slabs.items[lo], self.budget);
+            if (lo > self.slabs.items.len or count > self.slabs.items.len - lo)
+                return error.InvalidValue;
+            var end = lo + count;
+            // An empty replacement has no slab to split, including when an
+            // unchanged suffix starts at lo. Reindex still removes the old
+            // interval. Charge only rewritten pieces, never that suffix.
+            const spills = try self.rangeSpillBound(self.slabs.items[lo..end]);
+            const reserve = std.math.add(usize, self.slabs.items.len, spills) catch return error.Overflow;
+            try self.reserveSlabs(reserve);
+            var at = lo;
+            while (at < end) {
+                try self.takeOwnership(at);
+                // All fallible partition work completes before this slab
+                // changes. The returned pieces then transfer without another
+                // allocation; no cleanup guard outlives their list buffer.
+                var spilled = try slabmod.splitToBudget(self.gpa, E, &self.slabs.items[at], self.budget);
+                const spill = spilled.items.len;
+                if (spill != 0) {
+                    self.slabs.insertSliceAssumeCapacity(at + 1, spilled.items);
+                    self.stagedGrew(at + 1, 0, spill);
+                    spilled.items.len = 0;
+                }
+                spilled.deinit(self.gpa);
+                // Skip the bounded spills, but retain them in the affected
+                // interval. The next original replacement moved by spill.
+                end += spill;
+                at += 1 + spill;
             }
-            const spill = spilled.items.len;
-            if (spill != 0) {
-                // Non-fallible: the room was taken above, so the pieces are
-                // put in their place rather than freed on a refusal that
-                // would drop the tail of the column.
-                self.slabs.insertSliceAssumeCapacity(lo + 1, spilled.items);
-                self.stagedGrew(lo + 1, 0, spill);
-                spilled.items.len = 0;
-            }
-            spilled.deinit(self.gpa);
 
-            const range = try self.tryMergeRange(lo, lo + count + spill);
-            const from = @min(lo, range.start);
-            try self.reindexFrom(from);
+            const range = try self.tryMergeRange(lo, end);
+            const from = range.start;
+            try self.reindexRange(from, range.end);
             return from;
         }
 
@@ -6715,33 +7069,20 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// `column.rs:1782-1797`). `null` when the pair was not merged, and
         /// otherwise how many slabs the merge spilled.
         ///
-        /// The pre-check is `sa + sb <= max_segments`, which is upstream's
-        /// rule and is not enough here. Upstream's `Slab.segments` counts a
-        /// literal run as its number of *values*
-        /// (`rle/load.rs:131-138`, `rle/state.rs:394-424`), so the metric
-        /// is additive across the seam. This port counts one literal run as
-        /// one run, and two literal runs meeting cannot become one — a
-        /// literal value equal to the previous one is not canonical
-        /// (`rle/decoder.rs:452-455`) and two adjacent literal runs are not
-        /// canonical either (`:444-451`) — so the seam that replaces two
-        /// runs is three and the merged slab is one run over the budget the
-        /// pre-check admitted it at. So the merged slab is cut back to the
-        /// budget, exactly as `settle` cuts the slab a splice rebuilt
-        /// (`column.rs:1866-1870`): the pair `63 + 1` is inside the
-        /// pre-check and its seam is three runs.
+        /// Decode units count literal rows and compressed runs, not headers.
+        /// A merged seam may add a unit, so reserve a conservative spill
+        /// bound and reconcile the actual canonical bytes after merging.
         fn tryMerge(self: *Self, a: usize, b: usize) ParseError!?usize {
             if (a >= self.slabs.items.len or b >= self.slabs.items.len) return null;
             const min_seg = @max(self.budget / 4, 1);
-            const sa = self.slabs.items[a].segments;
-            const sb = self.slabs.items[b].segments;
-            if (!((sa < min_seg or sb < min_seg) and sa + sb <= self.budget)) return null;
-            // Room for the split below, taken before the merge has put its
-            // values into `a`: after `splitToBudget` the spills are the only
-            // copy of the tail of the pair, and a list that had to grow at
-            // that point could only be answered by freeing them. The merge
-            // pre-check admits a pair of at most `budget` runs, and its seam
-            // costs at most three, so this is a bound and not an estimate.
-            try self.reserveSlabs(self.slabs.items.len + slabmod.splitSpillCount(E, sa + sb + 1, self.budget) + 1);
+            const sa = try slabmod.decodeBudget(self.gpa, E, &self.slabs.items[a]);
+            const sb = try slabmod.decodeBudget(self.gpa, E, &self.slabs.items[b]);
+            if (!((sa < min_seg or sb < min_seg) and sa <= self.budget and sb <= self.budget - sa)) return null;
+            const pair_units = std.math.add(usize, sa, sb) catch return error.Overflow;
+            const upper = std.math.add(usize, pair_units, 1) catch return error.Overflow;
+            const spills = slabmod.splitSpillCount(E, upper, self.budget);
+            const reserve = std.math.add(usize, self.slabs.items.len, spills) catch return error.Overflow;
+            try self.reserveSlabs(std.math.add(usize, reserve, 1) catch return error.Overflow);
             try self.takeOwnership(a);
             try slabmod.merge(self.gpa, E, &self.slabs.items[a], &self.slabs.items[b]);
             var spilled = try slabmod.splitToBudget(self.gpa, E, &self.slabs.items[a], self.budget);
@@ -6756,9 +7097,10 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 // Where `b` stood: the merge put its values into `a`, and
                 // the spill is the tail of the pair that did not fit.
                 self.slabs.insertSliceAssumeCapacity(b, spilled.items);
-                self.stagedGrew(b, 1, spill);
                 spilled.items.len = 0;
             }
+            // Removing a slab moves flags even when the merge has no spill.
+            self.stagedGrew(b, 1, spill);
             spilled.deinit(self.gpa);
             return spill;
         }
@@ -6778,10 +7120,8 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// reason the outward-right loop there is written as a bare
         /// `while` (`column.rs:215-216`).
         ///
-        /// `end` saturates at zero rather than wrapping: only `start` is
-        /// load-bearing (it is what the caller reindexes from), and a walk
-        /// cursor that has run off the left of the column has nothing left
-        /// to point at.
+        /// Both endpoints bound every rewritten slab. Unchanged suffix slabs
+        /// retain their indexed weights, including after an outward merge.
         fn tryMergeRange(self: *Self, lo: usize, hi: usize) ParseError!struct { start: usize, end: usize } {
             var start = lo;
             var end = hi;
@@ -6799,18 +7139,11 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 if (end >= start + 2) {
                     if (try self.tryMerge(end - 2, end - 1)) |spill| end = shrink(end, spill);
                 }
-                // The last slab of the range against the first slab after
-                // it. The pair straddles the boundary, so the merge removes
-                // a slab *outside* the range and `end` stays put: this is
-                // the outward walk to the right, and it has to go on after
-                // the range has collapsed onto its first slab, or the
-                // merged slab is left beside a short one that upstream folds
-                // in as well. Every pass either takes a slab out of the
-                // column or lands one on the budget, where no further merge
-                // can fit, so the walk ends (`try_merge_range_skeleton`,
-                // `column.rs:215-216`).
+                // The outward-right merge consumes one old suffix slab. Its
+                // head stays inside the range; any spill must join it too.
                 while (end > 0) {
-                    if (try self.tryMerge(end - 1, end) == null) break;
+                    const spill = (try self.tryMerge(end - 1, end)) orelse break;
+                    end += spill;
                 }
                 if (end >= start + 2) {
                     if (try self.tryMerge(start, start + 1)) |spill| end = shrink(end, spill);
@@ -6824,34 +7157,39 @@ pub fn Column(comptime T: type, comptime E: type) type {
             return .{ .start = start, .end = end };
         }
 
-        /// Replace the index's leaves from `start` on with the weights of the
-        /// column's slabs from `start` on.
-        ///
-        /// The index is only correct from the first slab a splice touched:
-        /// everything before it kept both its bytes and its weight, and the
-        /// merge policy only reaches outwards from the range.
-        ///
-        /// **A tail that was removed outright puts `start` one past the last
-        /// slab while the tree still names the slabs that are gone.** The
-        /// walk then starts at the end of the list and its whole job is the
-        /// truncation `Tree.splice` performs with an empty replacement — so
-        /// the walk starts at `@min(start, slabs.len)` rather than at
-        /// `start`, and there is no early return for "nothing to do". The
-        /// no-op case is already a no-op one level down: `Tree.splice` returns
-        /// when its range is empty and its replacement is too
-        /// (`btree.zig:404`), which is what an index that already agrees with
-        /// the slab list hits here.
-        fn reindexFrom(self: *Self, start: usize) ParseError!void {
-            const from = @min(start, self.slabs.items.len);
+        /// Reconcile just the affected post-merge interval, retaining the
+        /// unchanged suffix leaves (Rust hexane/edit.rs:595-606). The suffix
+        /// length maps the new endpoint to the old tree, even for deletion.
+        fn reindexRange(self: *Self, start: usize, end: usize) ParseError!void {
+            const suffix = self.slabs.items.len - end;
+            if (suffix > self.tree.len()) return error.InvalidValue;
+            const old_end = self.tree.len() - suffix;
+            if (start > end or start > old_end) return error.InvalidValue;
             var weights: std.ArrayList(Weight) = .empty;
             defer weights.deinit(self.gpa);
-            for (self.slabs.items[from..]) |*s| {
-                try weights.append(self.gpa, try E.weightOf(self.gpa, s));
+            try weights.ensureTotalCapacity(self.gpa, end - start);
+            for (self.slabs.items[start..end]) |*s| {
+                weights.appendAssumeCapacity(try E.weightOf(self.gpa, s));
             }
-            self.tree.splice(from, self.tree.len(), weights.items) catch |e| switch (e) {
+            if (comptime signedPrefixNeedsEndpointCheck(E)) {
+                const before = E.weightIncrement(try self.indexedAggBefore(start));
+                const after = E.weightIncrement(try self.indexedAggBefore(old_end));
+                var new_increment: i128 = 0;
+                for (weights.items) |weight| {
+                    new_increment = std.math.add(i128, new_increment, E.weightIncrement(weight)) catch return error.Overflow;
+                }
+                const old_increment = @as(i128, after) - @as(i128, before);
+                // Equal interval totals leave every untouched suffix endpoint
+                // unchanged; otherwise its absolute endpoints need rechecking.
+                const checked_end = if (new_increment == old_increment) end else self.slabs.items.len;
+                try self.validateSignedPrefixRange(start, checked_end);
+            }
+            self.tree.splice(start, old_end, weights.items) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.Overflow => return error.Overflow,
                 error.InvalidIndex => return error.InvalidValue,
             };
+            try self.validateDomain();
         }
 
         /// Rebuild the whole index from the slabs. `load` uses it; a splice
@@ -6878,147 +7216,92 @@ pub fn Column(comptime T: type, comptime E: type) type {
             for (self.slabs.items) |*s| try weights.append(self.gpa, try E.weightOf(self.gpa, s));
             const fresh = Tree.fromSlice(self.gpa, weights.items) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.Overflow => return error.Overflow,
                 error.InvalidIndex => return error.InvalidValue,
             };
             self.tree.deinit();
             self.tree = fresh;
+            try self.validateDomain();
+            try self.validateSignedPrefixRange(0, self.slabs.items.len);
         }
 
-        /// Rebuild the per-slab weight prefixes **from slab `from` on**. Only
-        /// a codec whose weight carries a prefix keeps them.
-        ///
-        /// **`from` is the first slab whose weight can have moved**, and the
-        /// step that knows it is [`settle`](Column.settle). A splice
-        /// rewrites its slabs from the first it cut, and the merge policy
-        /// reaches no further left than the boundary it reports as
-        /// `range.start`, so every slab in front of that index kept both its
-        /// bytes and its weight. `agg_before[i]` is the merge of the weights
-        /// of slabs `0..i`, and those slabs are the same ones, so the
-        /// entries in front of `from` are already what a whole-column
-        /// rebuild would write: the entry at `from` is the seed this one
-        /// sums from, and the ones below it are not written at all. A load,
-        /// a fill and a slab seed have no such boundary and pass zero.
-        ///
-        /// **This is one aggregate of two, and the narrowing touches only
-        /// this one.** A column keeps its weights twice over: the flat
-        /// `agg_before` this rebuilds, read in O(1) by
-        /// [`baseOf`](Column.baseOf) — a delta row decodes against it, a
-        /// prefix column sums from it — and the positional index, whose
-        /// weight [`findByPrefix`](Tree.findByPrefix) and
-        /// [`findByPrefixSum`](Tree.findByPrefixSum) read to turn a row
-        /// number into a slab. The index is reconciled by
-        /// [`reindexFrom`](Column.reindexFrom) over the very same boundary
-        /// and is not this method's business; the two caches are written in
-        /// the same write and from the same `from`, so they cannot disagree
-        /// about where the column stopped being what it was.
-        ///
-        /// **A later merge cannot invalidate what this skipped, because
-        /// every merge has already run.** `tryMergeRange` is the only step
-        /// that reaches outside a rebuilt range, it runs inside `settle`,
-        /// and it moves its own cursor left every time it folds a pair — so
-        /// the index it reports is the leftmost slab any merge wrote to, and
-        /// every merge lands at or after it. A merge that spans further left
-        /// than the caller's own slab therefore **widens** the range this
-        /// rebuild is given rather than escaping it, which is what makes the
-        /// answer independent of the merge policy: the skipped entries sit
-        /// behind slabs no step of this write touched. A write that settles
-        /// twice — a splice, then the re-anchor behind it — takes the least
-        /// of the two answers, and both are values this rebuild's caller
-        /// already had.
-        ///
-        /// **What it costs.** One `weightOf` per slab from `from` on, and
-        /// `weightOf` is row-linear inside a slab, so a splice now pays for
-        /// the rows behind the slab it cut rather than for the column. An
-        /// append at the tail pays for the tail; a cut that collapses the
-        /// list pays for less than before; a cut at the head still pays for
-        /// the whole column, which is the case the boundary cannot help.
-        ///
-        /// **A refusal leaves the column's previous bases in place, whole.**
-        /// The array is read as a slab's base — a delta or prefix column's
-        /// running value in front of that slab — and `aggWeight` answers the
-        /// identity for a slab past its end, so an array shortened by a
-        /// failed rebuild would not fail loudly: every slab past the
-        /// truncation would read its base as zero and decode against it.
-        /// The new bases are therefore measured into the room past the end
-        /// of the array the column is still reading and only take its place
-        /// once every weight is in, so neither the allocation nor a weight
-        /// that will not measure can leave a short array behind.
+        /// Delta weights already cache all relative extrema. The checked
+        /// root translates them into the complete realized-value domain.
+        fn validateDomain(self: *const Self) ParseError!void {
+            if (comptime E.is_delta) {
+                const root = self.tree.rootAgg();
+                if (root.min_offset < E.min_i64 or root.max_offset > E.max_i64) return error.Overflow;
+            }
+        }
+
+        /// Signed prefix weights cache only final increments, not interior
+        /// extrema. Check the necessary changed interval against its absolute
+        /// base without adding another authoritative weight representation.
+        /// Unsigned/meta contributions are monotone and covered by the root.
+        fn validateSignedPrefixRange(self: *const Self, start: usize, end: usize) ParseError!void {
+            if (comptime signedPrefixNeedsEndpointCheck(E)) {
+                var running = E.weightIncrement(try self.indexedAggBefore(start));
+                for (self.slabs.items[start..end]) |slab| {
+                    var dec = try E.WireDecoder.init(slab.data);
+                    var left = slab.len;
+                    while (left != 0) {
+                        if (comptime @hasDecl(E.WireDecoder, "nextRunMax")) {
+                            const run = (try dec.nextRunMax(left)) orelse return error.InvalidValue;
+                            try accumulateCodecRun(E, run.value, run.count, &running);
+                            left -= run.count;
+                        } else {
+                            const value = (try dec.next()) orelse return error.InvalidValue;
+                            try E.accumulate(value, &running);
+                            left -= 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Rebuild absolute bases from retained, reconciled tree weights.
+        /// Only affected slabs were decoded by reindexRange; suffix work here
+        /// is aggregate arithmetic, not another byte replay. This reads the
+        /// same leaf representation that Tree owns (btree.zig:201-205).
+        /// All callers must reconcile the tree before rebuilding bases.
         fn rebuildAggs(self: *Self, from: usize) ParseError!void {
             if (!comptime E.tracks_prefix) {
                 self.agg_before.clearRetainingCapacity();
                 return;
             }
             const n = self.slabs.items.len;
-            // The same clamp [`reindexFrom`](Column.reindexFrom) makes: a
-            // tail that was removed outright puts the boundary one past the
-            // last slab, and there the whole of the work is the truncation.
-            const start = @min(from, n);
-            const old = self.agg_before.items.len;
-            // **The base in front of slab `start`, read before the room is
-            // taken** — `ensureTotalCapacity` may move the buffer, and this
-            // is the one entry the rebuild reads rather than writes. It is in
-            // range because `start <= old`: where `start` is not zero it
-            // names a slab of the list being replaced, and that list had
-            // `old - 1` of them; where it is zero the entry would be the
-            // identity anyway, and a column whose array is still empty has
-            // none.
-            var acc = if (start == 0) identity else self.agg_before.items[start];
-            // Room for the weights of the slabs this rebuild weighs and for
-            // the one base past them, measured past the end of the entries
-            // the column is still reading. The scratch therefore starts at
-            // `old` and the writes below start at `start <= old`, so a write
-            // lands below every weight the loop has yet to read — and where
-            // the two coincide (`start` and `old` both zero) each iteration
-            // takes its weight by value before it writes over it.
-            try self.agg_before.ensureTotalCapacity(self.gpa, old + n - start + 1);
-            const weights = self.agg_before.addManyAsSliceAssumeCapacity(n - start + 1)[0 .. n - start];
-            errdefer self.agg_before.shrinkRetainingCapacity(old);
-            for (self.slabs.items[start..], weights) |*s, *w| w.* = try E.weightOf(self.gpa, s);
-            for (weights, start..) |w, i| {
-                self.agg_before.items[i] = acc;
-                acc = Weight.Aggregate.merge(acc, w);
-            }
+            if (self.tree.len() != n) return error.InvalidValue;
+            // Missing bases require seeding the read cache, never inventing a
+            // zero base for a nonempty prefix. The reconciled tree is exact.
+            const start = if (from < self.agg_before.items.len) @min(from, n) else 0;
+            var acc = try self.indexedAggBefore(start);
+            // Reserve before writes; checked composition still propagates
+            // arithmetic refusal to the owner of this provisional column.
+            const needed = std.math.add(usize, n, 1) catch return error.Overflow;
+            try self.agg_before.ensureTotalCapacity(self.gpa, needed);
+            self.agg_before.items.len = needed;
+            var slab: usize = 0;
+            try self.rebuildBasesNode(self.tree.root, start, &slab, &acc);
             self.agg_before.items[n] = acc;
-            // **The length moves; the slack behind it is left alone.**
-            //
-            // `shrinkRetainingCapacity` is the length assignment *plus* a
-            // `@memset` of everything past the new length with `undefined`
-            // (`std/array_list.zig:1186-1189`). On this array that fill is
-            // the largest `compiler_rt.memset` a single splice of a
-            // prefix-tracking column reaches — the only other is the one
-            // boolean an entry per slab at [`stageSplice`](Column.stageSplice)
-            // — and it is pure waste:
-            //
-            // * **What it writes is this column's own earlier state.** The
-            //   length is `old + (n - start) + 1` when the shrink is called,
-            //   so the fill would cover the `old - start` entries past the
-            //   new length and no further: the tail of the bases this column
-            //   came in with, `items[n + 1 .. old)`, which is empty unless
-            //   the cut collapsed the list, and then the weights just
-            //   measured into the room past them. It is *not* the spare
-            //   capacity behind that, and it is not a high-water mark.
-            //   Narrowing is what shrinks it: the `start` entries in front of
-            //   the scratch are the bases this rebuild reuses rather than
-            //   re-measures, so a splice of a `k`-slab column that reaches
-            //   back `start` slabs paid `k + 1` entries a write before and
-            //   pays `k + 1 - start` after — thirty-two bytes an entry on a
-            //   delta column (`btree.SlabAgg`) and sixteen on a prefix one
-            //   (`btree.PrefixWeight`), for bytes nothing reads.
-            // * Nothing in this file reads past the length.
-            //   [`aggWeight`](Column.aggWeight) is the only reader and
-            //   answers the identity for a slab past the end rather than
-            //   indexing; [`checkInvariants`](Column.checkInvariants)
-            //   checks the length before it compares entries; and the loop
-            //   above has just written `[start, n + 1)` in full, so every
-            //   entry the new length reaches is real. The entries in front
-            //   of `start` are the earlier rebuild's, and they are real for
-            //   the reason this whole method narrows: nothing behind them
-            //   moved.
-            //
-            // The `errdefer` above keeps its poison: that one is a refusal,
-            // it is cold, and a trap on a half-measured tail is a real
-            // diagnostic rather than a cost.
-            self.agg_before.items.len = n + 1;
+        }
+
+        fn rebuildBasesNode(self: *Self, node: usize, from: usize, slab: *usize, acc: *Weight) ParseError!void {
+            switch (self.tree.nodes.items[node].?) {
+                .leaf => |leaf| for (leaf.items) |weight| {
+                    const at = slab.*;
+                    slab.* += 1;
+                    if (at < from) continue;
+                    self.agg_before.items[at] = acc.*;
+                    acc.* = try btree.compose(Weight, acc.*, weight);
+                },
+                .internal => |children| for (children.items) |child| {
+                    if (slab.* + child.slab_count <= from) {
+                        slab.* += child.slab_count;
+                    } else {
+                        try self.rebuildBasesNode(child.id, from, slab, acc);
+                    }
+                },
+            }
         }
 
         /// Room in the slab list for `n` slabs, and in the base array for
@@ -7041,31 +7324,16 @@ pub fn Column(comptime T: type, comptime E: type) type {
             // The ownership flags move with the list: `stagedGrew` cannot
             // allocate, so the room for every flag a staged splice inserts
             // is taken here, alongside the room for the slab it belongs to.
-            if (self.staging) |st| try st.owned.ensureTotalCapacity(self.gpa, n);
+            if (self.staging) |st| try st.owned.ensureTotalCapacity(st.gpa, n);
             // A codec whose weight carries no prefix keeps no bases, so it
             // has nothing to reserve: `rebuildAggs` clears the array and
             // never fills it, and an allocation here would be memory every
             // splice of such a column pays for and never uses.
             if (!comptime E.tracks_prefix) return;
-            // Room for the bases `rebuildAggs` writes and for the weights it
-            // sums them from, which it measures past the end of the array it
-            // is replacing. That array is as long as the slab list is now,
-            // so the bound is the larger of the two counts twice over: a
-            // splice that collapses many slabs into one leaves `n` below the
-            // count the array already has.
-            //
-            // **An upper bound, and narrowing only lowers the demand.**
-            // `rebuildAggs` now measures from the first slab the splice
-            // touched, so it asks for `old + (n - start) + 1` where it used to
-            // ask for `old + n + 1`. Every bound below still covers the
-            // wider ask, so the reservation is unchanged — and a
-            // `rebuildAggs` that turns out to need more than this is a
-            // refusal on the provisional column, which is what the doc
-            // above already says the seam is for. Lowering it here would
-            // trade a reserve that is always sufficient for one that is
-            // tight only when `start` is zero.
-            const count = @max(n, self.slabs.items.len);
-            try self.agg_before.ensureTotalCapacity(self.gpa, count + n + 2);
+            // Bases are folded directly from tree weights; no duplicate
+            // weight scratch is required behind the published prefix array.
+            const bases = std.math.add(usize, n, 1) catch return error.Overflow;
+            try self.agg_before.ensureTotalCapacity(self.gpa, bases);
         }
 
         // ── The invariants ──────────────────────────────────────────────
@@ -7102,12 +7370,13 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// its last slab can be a run long.
         pub fn mergeableNeighbours(self: *const Self) ?Violation {
             const min_seg = @max(self.budget / 4, 1);
-            for (self.slabs.items, 0..) |s, i| {
-                if (i == 0) continue;
-                const prev = self.slabs.items[i - 1].segments;
-                if ((prev < min_seg or s.segments < min_seg) and prev + s.segments <= self.budget) {
+            var prev: usize = 0;
+            for (self.slabs.items, 0..) |*s, i| {
+                const units = slabmod.decodeBudget(self.gpa, E, s) catch return .{ .what = "invalid slab decode budget", .at = i };
+                if (i != 0 and (prev < min_seg or units < min_seg) and prev <= self.budget and units <= self.budget - prev) {
                     return .{ .what = "adjacent slabs should have been merged", .at = i };
                 }
+                prev = units;
             }
             return null;
         }
@@ -7127,8 +7396,8 @@ pub fn Column(comptime T: type, comptime E: type) type {
             var total: usize = 0;
             for (self.slabs.items, 0..) |*s, i| {
                 if (self.total_len != 0 and s.len == 0) return .{ .what = "empty slab", .at = i };
-                if (!(s.segments <= self.budget or s.segments == 1)) {
-                    return .{ .what = "slab over the run budget", .at = i };
+                if (try slabmod.decodeBudget(self.gpa, E, s) > self.budget) {
+                    return .{ .what = "slab over the decode budget", .at = i };
                 }
                 const m = try slabmod.measure(self.gpa, E, s.data);
                 if (m.len != s.len) return .{ .what = "slab length disagrees with its bytes", .at = i };
@@ -7148,6 +7417,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
             }
             const tree_bad = self.tree.checkInvariants() catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.Overflow => return error.Overflow,
                 error.InvalidIndex => return .{ .what = "the slab index is out of range", .at = 0 },
             };
             if (tree_bad) |v| {
@@ -7175,7 +7445,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
                     if (!Weight.Aggregate.eql(self.agg_before.items[i], acc)) {
                         return .{ .what = "weight prefix disagrees with the slabs before it", .at = i };
                     }
-                    acc = Weight.Aggregate.merge(acc, try E.weightOf(self.gpa, s));
+                    acc = try btree.compose(Weight, acc, try E.weightOf(self.gpa, s));
                 }
                 if (!Weight.Aggregate.eql(self.agg_before.items[self.slabs.items.len], acc)) {
                     return .{ .what = "weight prefix disagrees with the whole column", .at = 0 };
@@ -8002,31 +8272,6 @@ pub fn Column(comptime T: type, comptime E: type) type {
         /// not by run (`shift.rs:170-204`).
         pub const runs_shiftable = Shiftable(Runs);
     };
-}
-
-/// A standalone slab over the runs `[from, to)` of `bytes`.
-///
-/// `from < to`: the only caller cuts a non-empty run range, from a
-/// `from < segs.len` loop with a budget of at least one run, so the last
-/// run in the cut is `segs[to - 1]`. A range that came out empty is
-/// refused rather than underflowed.
-fn cutPiece(
-    gpa: std.mem.Allocator,
-    comptime E: type,
-    bytes: []const u8,
-    segs: []const slabmod.Segment(E.Wire),
-    from: usize,
-    to: usize,
-) ParseError!Slab {
-    // `from < to` — the only caller cuts a non-empty run range, from a
-    // `from < segs.len` loop with a budget of at least one run — so the
-    // last run in the cut is `segs[to - 1]`, and `to` is not zero. Named
-    // the way the subtraction reads it.
-    if (to == 0 or from >= to) return error.InvalidValue;
-    const piece = try E.wireSlice(gpa, bytes, segs[from].byte_start, segs[to - 1].byte_end, segs[from].opens_with_true);
-    errdefer gpa.free(piece);
-    const m = try slabmod.measure(gpa, E, piece);
-    return .{ .data = piece, .len = m.len, .segments = m.segments, .tail = m.tail };
 }
 
 /// The item an adapter over `I` names: what `I.next` yields with the error
@@ -9007,6 +9252,153 @@ test "a prefix cursor's runs carry the running sum through the run" {
     try testing.expect((try it.nextRun()) == null);
 }
 
+test "metadata prefix cursors report codec byte offsets across windows and resets" {
+    const E = @import("../opset/columns.zig").MetaPrefixCodec;
+    const gpa = testing.allocator;
+    const words = [_]u64{ 0x04, 0x15, 0x27, 0x27, 0x27, 0x38, 0x49, 0x0a, 0x5b, 0x6c, 0x7d, 0x8e };
+    var col = try Column(u64, E).initWithBudget(gpa, 4);
+    defer col.deinit();
+    try col.extend(gpa, &words);
+    for (0..words.len + 1) |start| {
+        var it = try col.prefixIterRange(.{ .start = start, .end = start });
+        try testing.expectEqual(try col.getPrefix(start), it.prefix());
+        try testing.expect((try it.next()) == null);
+        it.setMax(words.len);
+        for (start..words.len) |row| {
+            const pv = (try it.next()).?;
+            try testing.expectEqual(words[row], pv.value);
+            try testing.expectEqual(try col.getPrefix(row), pv.prefix());
+            try testing.expectEqual(try col.getPrefix(row + 1), pv.total());
+        }
+        var jumps = try col.prefixIterRange(.{ .start = start, .end = words.len });
+        if (start < words.len) {
+            const row = words.len - 1;
+            const pv = (try jumps.nth(row - start)).?;
+            try testing.expectEqual(try col.getPrefix(row), pv.prefix());
+            try testing.expectEqual(try col.getPrefix(row + 1), pv.total());
+        }
+        var reset = try col.prefixIterRange(.{ .start = start, .end = words.len });
+        const base = reset.prefix();
+        reset.resetPrefix();
+        while (try reset.nextRun()) |run| {
+            const row = reset.pos() - 1;
+            try testing.expectEqual(try col.getPrefix(row) - base, run.value.prefix());
+            try testing.expectEqual(try col.getPrefix(row + 1) - base, run.value.total());
+        }
+        var shifted = try col.prefixIter();
+        if (start < words.len) {
+            const pv = (try shifted.shiftNext(.{ .start = start, .end = words.len })).?;
+            try testing.expectEqual(try col.getPrefix(start), pv.prefix());
+            const last = (try shifted.seekTo(words.len - 1)) orelse pv;
+            try testing.expectEqual(try col.getPrefix(words.len), last.total());
+        }
+    }
+}
+
+test "prefix run folding permits a wide span with representable endpoints" {
+    const E = Prefix(i64);
+    const gpa = testing.allocator;
+    const increment = std.math.maxInt(i64);
+    const bytes = try E.wireEncode(gpa, &.{ std.math.minInt(i64), increment, increment }, false);
+    defer gpa.free(bytes);
+    var col = try Column(i64, E).load(gpa, bytes);
+    defer col.deinit();
+    var it = try col.prefixIter();
+    const first = (try it.next()).?;
+    try testing.expectEqual(std.math.minInt(i64), first.total());
+    try testing.expectEqual(@as(i64, 0), first.prefix());
+    // The two-row repeat's product exceeds i64, but its absolute endpoints fit.
+    const run = (try it.nextRun()).?;
+    try testing.expectEqual(@as(usize, 2), run.count);
+    try testing.expectEqual(@as(i64, std.math.maxInt(i64) - 1), run.value.total());
+    try testing.expectEqual(@as(i64, -1), run.value.prefix());
+    try testing.expect((try it.nextRun()) == null);
+}
+
+fn exerciseLiteralBudget(comptime T: type, comptime E: type, model: []const T) !void {
+    const gpa = testing.allocator;
+    const wire = try E.wireOfInsert(gpa, 0, model);
+    defer gpa.free(wire.wires);
+    const canonical = try E.wireEncode(gpa, wire.wires, false);
+    defer gpa.free(canonical);
+    for ([_]usize{ 2, 3, 4, 7, 64 }) |budget| {
+        var loaded = try Column(T, E).loadWithBudget(gpa, canonical, budget);
+        defer loaded.deinit();
+        try expectColumn(T, E, &loaded, model);
+        const saved = try loaded.encode(gpa);
+        defer gpa.free(saved);
+        try testing.expectEqualSlices(u8, canonical, saved);
+        const opts = Column(T, E).LoadOpts.new().withMaxSegments(budget);
+        const stream = try Column(T, E).loadIter(gpa, canonical, opts);
+        var streamed = try stream.finalize();
+        defer streamed.deinit();
+        try expectColumn(T, E, &streamed, model);
+        const stream_saved = try streamed.encode(gpa);
+        defer gpa.free(stream_saved);
+        try testing.expectEqualSlices(u8, canonical, stream_saved);
+        var encoder = Column(T, E).Encoder.init(gpa);
+        defer encoder.deinit();
+        try encoder.maxSegments(budget);
+        for (model) |value| try encoder.append(value);
+        var encoded = try encoder.intoColumn();
+        defer encoded.deinit();
+        try expectColumn(T, E, &encoded, model);
+        const encoder_saved = try encoded.encode(gpa);
+        defer gpa.free(encoder_saved);
+        try testing.expectEqualSlices(u8, canonical, encoder_saved);
+        var mutated = try Column(T, E).initWithBudget(gpa, budget);
+        defer mutated.deinit();
+        try mutated.extend(gpa, model);
+        if (model.len > 2) {
+            try mutated.splice(gpa, 1, 1, model[0..2]);
+            try mutated.splice(gpa, 1, 2, model[1..2]);
+        }
+        try expectColumn(T, E, &mutated, model);
+        const mutation_saved = try mutated.encode(gpa);
+        defer gpa.free(mutation_saved);
+        try testing.expectEqualSlices(u8, canonical, mutation_saved);
+    }
+}
+
+test "literal boundaries retain canonical bytes through loads encoders and staged edits" {
+    var values: [129]u32 = undefined;
+    var nullable: [129]?u32 = undefined;
+    var deltas: [129]i64 = undefined;
+    for (0..values.len) |i| {
+        values[i] = @intCast(127 + i * 129);
+        nullable[i] = if (i % 17 == 0) null else values[i];
+        deltas[i] = @intCast(i * i + 100);
+    }
+    for ([_]usize{ 0, 1, 2, 3, 4, 63, 64, 65, 127, 128, 129 }) |n| {
+        try exerciseLiteralBudget(u32, Prefix(u32), values[0..n]);
+        try exerciseLiteralBudget(?u32, RleOption(u32), nullable[0..n]);
+        try exerciseLiteralBudget(i64, Delta(i64), deltas[0..n]);
+    }
+}
+
+test "a multi-piece delta replacement bounds its reanchored literal tail" {
+    // The cut ends before a compressed difference run. Reanchoring its first
+    // row opens another literal while the rest of the tail must keep its values.
+    const gpa = testing.allocator;
+    const E = Delta(u32);
+    const values = [_]u32{ 10, 11, 13, 16, 21, 26, 31, 37, 44, 52, 61, 71, 82, 94 };
+    var col = try Column(u32, E).initWithBudget(gpa, 4);
+    defer col.deinit();
+    try col.extend(gpa, &values);
+    var model: std.ArrayList(u32) = .empty;
+    defer model.deinit(gpa);
+    try model.appendSlice(gpa, &values);
+    try step(u32, E, &col, &model, 1, 3, &.{ 100, 103 });
+    try expectRoundTrip(u32, E, &col, model.items);
+    const wires = try E.wireOfInsert(gpa, 0, model.items);
+    defer gpa.free(wires.wires);
+    const want = try E.wireEncode(gpa, wires.wires, false);
+    defer gpa.free(want);
+    const got = try col.encode(gpa);
+    defer gpa.free(got);
+    try testing.expectEqualSlices(u8, want, got);
+}
+
 //  The successor columns are loaded at a *different* length from the rest of
 //  the op set: the grand total of `succ_count` is how many successors there
 //  are, and it is a prefix sum (`op_set2/columns.rs:294-300`). So a prefix
@@ -9370,6 +9762,97 @@ fn sweepSplice(
     }
 }
 
+test "literal split and affected interval reconciliation survive allocation refusal" {
+    var model: [17]u32 = undefined;
+    var ins: [13]u32 = undefined;
+    for (&model, 0..) |*v, i| v.* = @intCast(128 + i * 129);
+    for (&ins, 0..) |*v, i| v.* = @intCast(1000 + i * 257);
+    try sweepSplice(u32, Prefix(u32), &model, &ins, 0, 1);
+    try sweepSplice(u32, Prefix(u32), &model, &ins, 7, 2);
+    try sweepSplice(u32, Prefix(u32), &model, &.{}, 4, model.len - 4);
+    // The replacement has a head, an inserted piece and a full tail whose
+    // first compressed difference becomes a literal on reanchoring.
+    const delta = [_]u32{ 10, 11, 13, 16, 21, 26, 31, 37, 44, 52, 61, 71, 82, 94 };
+    try sweepSplice(u32, Delta(u32), &delta, &.{ 100, 103 }, 1, 3);
+}
+
+test "counted prefix column splices preserve source and bases on allocation refusal" {
+    // The actual column stage owns bytes and index metadata until publication.
+    const prefixes = @import("../opset/columns.zig");
+    var booleans: [260]bool = undefined;
+    @memset(booleans[0..2], false);
+    @memset(booleans[2..130], true);
+    @memset(booleans[130..258], false);
+    @memset(booleans[258..], true);
+    try sweepSplice(bool, prefixes.BoolPrefixCodec, &booleans, &.{false}, 64, 1);
+    try sweepStageBases(bool, prefixes.BoolPrefixCodec, &booleans, &.{ false, true }, 129, 2);
+    var words: [260]u64 = undefined;
+    @memset(words[0..2], 0x17);
+    @memset(words[2..130], 0x16);
+    @memset(words[130..258], 0x28);
+    @memset(words[258..], 0x16);
+    try sweepSplice(u64, prefixes.MetaPrefixCodec, &words, &.{0x17}, 64, 1);
+    try sweepStageBases(u64, prefixes.MetaPrefixCodec, &words, &.{ 0x17, 0x16 }, 129, 2);
+}
+
+test "prefix cursors refuse malformed and overflowing wire contributions" {
+    const gpa = testing.allocator;
+    const E = Prefix(u64);
+    const C = Column(u64, E);
+    const bad = try E.wireEncode(gpa, &.{std.math.maxInt(u64)}, false);
+    defer gpa.free(bad);
+    try testing.expectError(error.Overflow, C.load(gpa, bad));
+    const bad_stream = try C.loadIter(gpa, bad, .{});
+    try testing.expectError(error.Overflow, bad_stream.finalize());
+    var bad_slab = try slabmod.init(gpa, E, bad);
+    defer bad_slab.deinit(gpa);
+    try testing.expectError(error.Overflow, findPrefixInSlab(E, &bad_slab, 1));
+
+    const Meta = @import("../opset/columns.zig").MetaPrefixCodec;
+    const M = Column(u64, Meta);
+    const max_word = std.math.maxInt(u64);
+    const overflow_bytes = try Meta.wireFill(gpa, 9, max_word, false);
+    defer gpa.free(overflow_bytes);
+    try testing.expectError(error.Overflow, M.load(gpa, overflow_bytes));
+    const meta_stream = try M.loadIter(gpa, overflow_bytes, .{});
+    try testing.expectError(error.Overflow, meta_stream.finalize());
+    var meta_slab = try slabmod.init(gpa, Meta, overflow_bytes);
+    defer meta_slab.deinit(gpa);
+    try testing.expectError(error.Overflow, findPrefixInSlab(Meta, &meta_slab, 1));
+
+    // A decoder/inverse-slab walk accepts raw run bytes, not a fabricated column.
+    const truncated = [_]u8{ 0x7e, 0x10, 0x80 };
+    var short = try E.WireDecoder.init(&truncated);
+    try testing.expectEqual(@as(u64, 16), (try short.next()).?);
+    try testing.expectError(error.UnexpectedEnd, short.next());
+    const raw_slab = slabmod.fromParts(@constCast(&truncated), 2, 1, .zero);
+    try testing.expectEqual(@as(usize, 1), try findPrefixInSlab(E, &raw_slab, 16));
+    try testing.expectError(error.UnexpectedEnd, findPrefixInSlab(E, &raw_slab, 17));
+    try testing.expectError(error.UnexpectedEnd, C.load(gpa, &truncated));
+    const truncated_stream = try C.loadIter(gpa, &truncated, .{});
+    try testing.expectError(error.UnexpectedEnd, truncated_stream.finalize());
+
+    // The tenth payload exceeds the one remaining unsigned bit.
+    const tenth = [_]u8{0x7f} ++ ([_]u8{0x80} ** 9) ++ [_]u8{0x02};
+    try testing.expectError(error.Overflow, C.load(gpa, &tenth));
+    const tenth_stream = try C.loadIter(gpa, &tenth, .{});
+    try testing.expectError(error.Overflow, tenth_stream.finalize());
+
+    // Three individually legal compressed counts exceed the column row domain.
+    var writer = E.WireSpliceWriter.init(gpa);
+    defer writer.deinit();
+    const count: usize = @intCast(std.math.maxInt(i64));
+    try writer.appendN(0, count);
+    try writer.appendN(1, count);
+    try writer.appendN(2, 2);
+    try writer.finish();
+    const counted = try writer.take();
+    defer gpa.free(counted);
+    try testing.expectError(error.Overflow, C.load(gpa, counted));
+    const counted_stream = try C.loadIter(gpa, counted, .{});
+    try testing.expectError(error.Overflow, counted_stream.finalize());
+}
+
 test "a refused splice leaves the length, the values and the caches in step" {
     // **A splice rewrites the slab bytes before the last step that can be
     // refused.** The splice path takes that step's room while the column is
@@ -9539,6 +10022,156 @@ test "a staged splice publishes whole, and a refused one moves nothing" {
     const opt_none = [_]?i64{};
     try sweepTwoStages(?i64, Prefix(?i64), &opt_model, &opt_ins, 2, 1, 4, 2);
     try sweepTwoStages(?i64, Prefix(?i64), &opt_model, &opt_none, 2, 3, 4, 2);
+}
+
+fn overlayEdits(comptime C: type, view: *C, gpa: std.mem.Allocator) !void {
+    var first = try view.stageSplice(4, 2, &.{ 100, 100 });
+    defer first.deinit();
+    try testing.expectEqual(view.len(), first.newLen());
+    first.publish(view);
+    try view.splice(gpa, 4, 1, &.{101});
+    try view.splice(gpa, 60, 4, &.{ 200, 201, 202, 203 });
+    try view.splice(gpa, 20, 8, &.{ 300, 301 });
+    const Map = struct {
+        fn identity(_: void, value: u32) u32 {
+            return value;
+        }
+    };
+    try view.remap(gpa, {}, Map.identity);
+}
+
+fn columnOverlayAllocationFailure(gpa: std.mem.Allocator, publish: bool) !void {
+    try exerciseColumnOverlay(Rle(u32), gpa, publish);
+}
+
+fn exerciseColumnOverlay(comptime E: type, gpa: std.mem.Allocator, publish: bool) !void {
+    const C = Column(u32, E);
+    var model: [72]u32 = undefined;
+    for (&model, 0..) |*v, i| v.* = @intCast(i / 2);
+    var col = try C.initWithBudget(gpa, 4);
+    defer col.deinit();
+    try col.extend(gpa, &model);
+    const old_counter = col.counter;
+    const old_bytes = try col.encode(testing.allocator);
+    defer testing.allocator.free(old_bytes);
+    const untouched = col.slabs.items[0].data;
+    const saved = try testing.allocator.dupe(u8, untouched);
+    defer testing.allocator.free(saved);
+    var overlay: C.Overlay = undefined;
+    col.beginOverlay(&overlay) catch |failure| {
+        try expectColumn(u32, E, &col, &model);
+        return failure;
+    };
+    defer overlay.deinit();
+    var view: C = undefined;
+    overlay.bind(&view);
+    overlayEdits(C, &view, gpa) catch |failure| {
+        overlay.deinit();
+        try testing.expectEqual(old_counter, col.counter);
+        try testing.expectEqualSlices(u8, saved, untouched);
+        try expectColumn(u32, E, &col, &model);
+        // A fresh ordinary write must still be usable after overlay abort.
+        try col.set(gpa, 0, model[0]);
+        try expectColumn(u32, E, &col, &model);
+        return failure;
+    };
+    try testing.expectEqualSlices(u8, saved, untouched);
+    try expectColumn(u32, E, &col, &model);
+    overlay.capture(&view);
+    var want: [66]u32 = undefined;
+    @memcpy(want[0..20], model[0..20]);
+    want[4] = 101;
+    want[5] = 100;
+    want[20] = 300;
+    want[21] = 301;
+    @memcpy(want[22..], model[28..]);
+    @memcpy(want[54..58], &[_]u32{ 200, 201, 202, 203 });
+    if (publish) {
+        overlay.publish(&col);
+        try expectColumn(u32, E, &col, &want);
+        const bytes = try col.encode(testing.allocator);
+        defer testing.allocator.free(bytes);
+        var encoder = C.Encoder.init(testing.allocator);
+        defer encoder.deinit();
+        try encoder.extend(&want);
+        const canonical = try encoder.save();
+        defer testing.allocator.free(canonical);
+        try testing.expectEqualSlices(u8, canonical, bytes);
+    } else {
+        overlay.deinit();
+        const bytes = try col.encode(testing.allocator);
+        defer testing.allocator.free(bytes);
+        try testing.expectEqualSlices(u8, old_bytes, bytes);
+        try testing.expectEqual(old_counter, col.counter);
+        try col.set(gpa, 0, model[0]);
+        try expectColumn(u32, E, &col, &model);
+    }
+}
+
+test "column multi-edit overlay preserves borrowed buffers canonical publication and abort" {
+    // Existing stage and ordinary mutators share one provisional ownership ledger.
+    try columnOverlayAllocationFailure(testing.allocator, true);
+    try columnOverlayAllocationFailure(testing.allocator, false);
+}
+
+test "column multi-edit overlay preserves delta and prefix base metadata" {
+    // Cross-slab edits and remapping retain logical values and cached slab bases.
+    try exerciseColumnOverlay(Delta(u32), testing.allocator, true);
+    try exerciseColumnOverlay(Delta(u32), testing.allocator, false);
+    try exerciseColumnOverlay(Prefix(u32), testing.allocator, true);
+    try exerciseColumnOverlay(Prefix(u32), testing.allocator, false);
+}
+
+test "column multi-edit overlay survives every allocation failure without poisoning source" {
+    // Observe the source with an independent allocator after each aborted stage.
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        columnOverlayAllocationFailure,
+        .{true},
+    );
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        columnOverlayAllocationFailure,
+        .{false},
+    );
+}
+
+test "column overlay remap and borrowed payload insert retain source ownership" {
+    // A full remap after local edits must join the same durable ownership ledger.
+    const gpa = testing.allocator;
+    const E = Rle([]const u8);
+    const C = Column([]const u8, E);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var source = try C.initWithBudget(gpa, 4);
+    defer source.deinit();
+    try source.extend(gpa, &.{ "head", "payload", "payload", "payload", "tail" });
+    const saved = try source.encode(gpa);
+    defer gpa.free(saved);
+    const segs = try E.segmentsOf(gpa, source.slabs.items[0].data);
+    defer gpa.free(segs);
+    const borrowed = segs[1].first_value.?;
+    var overlay: C.Overlay = undefined;
+    try source.beginOverlay(&overlay);
+    defer overlay.deinit();
+    var view: C = undefined;
+    overlay.bind(&view);
+    try view.splice(gpa, 2, 1, &.{borrowed});
+    const Map = struct {
+        fn identity(_: void, value: []const u8) []const u8 {
+            return value;
+        }
+    };
+    try view.remap(arena.allocator(), {}, Map.identity);
+    try view.splice(arena.allocator(), 2, 1, &.{"payload"});
+    const before_publish = try source.encode(gpa);
+    defer gpa.free(before_publish);
+    try testing.expectEqualSlices(u8, saved, before_publish);
+    overlay.publish(&source);
+    const got = try source.encode(gpa);
+    defer gpa.free(got);
+    try testing.expectEqualSlices(u8, saved, got);
+    try testing.expect((try source.checkInvariants()) == null);
 }
 
 /// The per-slab bases a caller could see, copied out with `gpa` and not
@@ -9740,7 +10373,6 @@ test "a splice that collapses the slab list retires bases the column does not re
     // running merge; it is pinned here as well because it is the length,
     // and not the fill behind it, that the rebuild now relies on.
     try testing.expectEqual(col.slabCount() + 1, col.agg_before.items.len);
-    try testing.expect(col.agg_before.capacity > col.agg_before.items.len);
     // The retired entries are the bases of slabs this column no longer
     // has. They are in the buffer, they are past the length, and the read
     // above is unaffected by them — `expectColumn` decoded every row
@@ -9767,82 +10399,6 @@ fn expectNarrowReusesWholeColumn(comptime T: type, comptime E: type, col: *Colum
         try col.rebuildAggs(from);
         try expectBasesEqual(T, E, col, whole);
     }
-}
-
-/// One column of `E`, many slabs, with slab zero made unweighable; see the
-/// test below for what that is for.
-fn narrowSkipWitness(comptime T: type, comptime E: type, model: []const T) !void {
-    const gpa = testing.allocator;
-    var col = try Column(T, E).initWithBudget(gpa, 4);
-    defer col.deinit();
-    try col.extend(gpa, model);
-    try testing.expect(col.slabCount() > 1);
-    try expectSound(T, E, &col);
-
-    // **A refusal at a non-zero boundary leaves the whole array alone.**
-    // This is the `errdefer` at its new depth: the rebuild is seeded from an
-    // entry it must not clobber before the scratch exists, and a weight that
-    // will not measure must roll the length back to where it was — leaving
-    // the retained prefix *and* the entries behind it exactly as they were.
-    // Both halves are checked by the same snapshot the reuse sweep uses.
-    const before = try snapshotBases(T, E, gpa, &col);
-    defer gpa.free(before);
-    const also_kept = col.slabs.items[1].len;
-    col.slabs.items[1].len = std.math.add(usize, also_kept, 1_000_000) catch unreachable;
-    try testing.expectError(error.InvalidValue, col.rebuildAggs(1));
-    try expectBasesEqual(T, E, &col, before);
-    col.slabs.items[1].len = also_kept;
-
-    const kept = col.slabs.items[0].len;
-    col.slabs.items[0].len = std.math.add(usize, kept, 1_000_000) catch unreachable;
-    try testing.expectError(error.InvalidValue, col.rebuildAggs(0));
-    // **Same column, same second.** Only the range differs, so the refusal
-    // above was the measurement of slab zero and not of the allocator.
-    col.rebuildAggs(1) catch |e| {
-        std.debug.print("narrow rebuild refused on a sound column: {s}\n", .{@errorName(e)});
-        return e;
-    };
-    // The narrow rebuild wrote nothing the wide one would have written
-    // differently, so the array a reader sees is the same one.
-    try expectBasesEqual(T, E, &col, before);
-    col.slabs.items[0].len = kept;
-    const read_back = try col.toSlice(gpa);
-    defer gpa.free(read_back);
-    try expectColumn(T, E, &col, read_back);
-}
-
-test "a narrow base rebuild does not weigh the slabs in front of its range" {
-    // **The cost claim, made observable.** Narrowing is only worth anything
-    // if the skipped slabs are *not measured and thrown away*, and an array
-    // recomputed in full and then discarded is indistinguishable from one
-    // that was never touched — so this makes the skipped slab
-    // **unweighable**. Its row count is pushed past what its bytes can
-    // decode, which is `error.InvalidValue` out of every `weightOf` the
-    // codec has, and the two rebuilds are then asked the same question
-    // about the same column. The wide one must refuse; the narrow one must
-    // come back with the array untouched.
-    //
-    // **The refusal is the other half of the answer.** `rebuildAggs(0)`
-    // measures into the room past the entries it is replacing and rolls the
-    // length back on a refusal, so the entries in front of the scratch are
-    // the column's own when it comes back — which is what lets the narrow
-    // call below read the array at all.
-    //
-    // The delta fixture is triples, for the reason the collapse test above
-    // gives: a delta column counts runs of equal *differences*, and three
-    // copies of a value are two differences of zero behind each other. The
-    // prefix fixture is the same numbers, which for that codec are row
-    // lengths rather than values.
-    const deltas = [_]i64{
-        100, 100, 100, 250, 250, 250, 400,  400,  400,  550,  550,  550,
-        700, 700, 700, 850, 850, 850, 1000, 1000, 1000, 1150, 1150, 1150,
-    };
-    try narrowSkipWitness(i64, Delta(i64), &deltas);
-    const widths = [_]u32{
-        100, 100, 100, 250, 250, 250, 400,  400,  400,  550,  550,  550,
-        700, 700, 700, 850, 850, 850, 1000, 1000, 1000, 1150, 1150, 1150,
-    };
-    try narrowSkipWitness(u32, Prefix(u32), &widths);
 }
 
 test "every base a narrow rebuild reuses is one a whole-column rebuild writes" {
@@ -10937,13 +11493,8 @@ test "the prefix sum over several runs of differing widths is the running total"
     try testing.expectEqual(@as(usize, 0), try col.getIndexForPrefix(0));
 }
 
-//  A descent crosses a slab boundary in the tree and then walks the runs of
-//  the slab it lands in, so the two halves have to agree at the seam. The
-//  widths here are five equal rows per block, block `b` being `b mod 4 + 1`
-//  units wide, except for block 63 — the last block of the first slab —
-//  whose five rows are `1, 2, 3, 1, 2` and so are one literal run. A slab
-//  holds 64 runs (`slab.zig:111-114`), so the seam is after row 319 and its 780
-//  units plus that literal's nine are 789.
+//  Repeated and literal widths exercise the indexed descent and unit
+//  boundaries. Exact slab cuts are not part of the public prefix contract.
 test "a prefix descent crosses a slab boundary and lands in the slab holding the unit" {
     const gpa = testing.allocator;
     const rows: usize = 1000;
@@ -10954,12 +11505,14 @@ test "a prefix descent crosses a slab boundary and lands in the slab holding the
         const block = i / 5;
         try col.append(gpa, if (block == 63) literal[i % 5] else @intCast(block % 4 + 1));
     }
-    try testing.expectEqual(@as(usize, 4), col.slabCount());
-    const first = col.tree.itemsBeforeSlab(1);
-    try testing.expectEqual(@as(usize, 320), first);
-    try testing.expectEqual(@as(i64, 789), try col.getPrefix(first));
+    const first: usize = 320;
+    for (1..col.slabCount()) |si| {
+        const boundary = col.tree.itemsBeforeSlab(si);
+        const prefix = try col.getPrefix(boundary);
+        try expectLanding(u32, Prefix(u32), &col, null, prefix, boundary, prefix);
+    }
 
-    // The literal run at the end of the first slab, one unit at a time. Rows
+    // The literal widths, one unit at a time. Rows
     // 315 to 319 are one, two, three, one and two units wide, so unit 780 is
     // row 315's, 781 and 782 are row 316's, 783 to 785 are row 317's, 786 is
     // row 318's and 787 and 788 are row 319's.
@@ -10971,8 +11524,7 @@ test "a prefix descent crosses a slab boundary and lands in the slab holding the
     try expectLanding(u32, Prefix(u32), &col, null, 784, 317, 783);
     try expectLanding(u32, Prefix(u32), &col, null, 785, 317, 783);
     try expectLanding(u32, Prefix(u32), &col, null, 786, 318, 786);
-    // Unit 788 is the last unit of the first slab and unit 789 is the first
-    // unit of the next, so this pair is the seam itself.
+    // Units 788 and 789 straddle the literal/repeat row boundary.
     try expectLanding(u32, Prefix(u32), &col, null, 787, 319, 787);
     try expectLanding(u32, Prefix(u32), &col, null, 788, 319, 787);
     try expectLanding(u32, Prefix(u32), &col, null, 789, 320, 789);
@@ -10981,9 +11533,7 @@ test "a prefix descent crosses a slab boundary and lands in the slab holding the
     try expectLanding(u32, Prefix(u32), &col, null, 794, 325, 794);
     try expectLanding(u32, Prefix(u32), &col, null, 795, 325, 794);
 
-    // A range cursor over the second slab alone agrees, with its sums in
-    // front of its own start: that range's units are 789 onwards, so its
-    // unit 5 is row 325's and its unit 6 is inside it.
+    // A nonzero range cursor reports the same row and byte-unit offsets.
     const seam = RowRange{ .start = first, .end = first + 10 };
     try expectLanding(u32, Prefix(u32), &col, seam, 0, 320, 0);
     try expectLanding(u32, Prefix(u32), &col, seam, 1, 321, 1);
@@ -11535,6 +12085,43 @@ test "load_garbage_data_is_error" {
     const gpa = testing.allocator;
     try testing.expectError(error.InvalidLeb128, Column(u64, Rle(u64)).load(gpa, &([_]u8{0xff} ** 11)));
 }
+test "minimum signed literal count remains total without overflow" {
+    const gpa = testing.allocator;
+    const E = Rle(u32);
+    // This minimum i64 header claims 2^63 values but carries one payload. On
+    // 64-bit hosts, streaming yields that value before refusing the missing
+    // tail; narrower hosts cannot represent the count.
+    const bytes = [_]u8{
+        0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7f, 0x01,
+    };
+
+    const count_error: anyerror = if (@sizeOf(usize) < @sizeOf(i64))
+        error.Overflow
+    else
+        error.UnexpectedEnd;
+    var cursor = E.LoadCursor.init(&bytes);
+    if (@sizeOf(usize) < @sizeOf(i64)) {
+        try testing.expectError(error.Overflow, cursor.next());
+    } else {
+        const first = (try cursor.next()).?;
+        try testing.expectEqual(@as(usize, 1), first.count);
+        try testing.expectEqual(@as(u32, 1), first.value.?);
+        try testing.expectError(error.UnexpectedEnd, cursor.next());
+    }
+    const segment = slabmod.Segment(E.Wire){
+        .byte_start = 0,
+        .byte_end = bytes.len,
+        .item_start = 0,
+        .item_end = 1,
+        .first_value = null,
+        .opens_with_true = false,
+        .kind = .literal,
+    };
+    try testing.expectError(count_error, E.lastValueOfRun(&bytes, segment));
+    try testing.expectError(count_error, E.segmentsOf(gpa, &bytes));
+    try testing.expectError(count_error, E.runAtOrAfter(&bytes, 0, null));
+    try testing.expectError(error.LengthExceedsInput, Column(u32, E).load(gpa, &bytes));
+}
 
 //  A load after a splice, a remove and another splice (`tests.rs:1911`).
 test "load_roundtrip_after_mutations" {
@@ -12007,7 +12594,7 @@ test "load_accumulates_prefix_weights" {
 fn deltaValueRows(gpa: std.mem.Allocator, col: *const Column(u64, Delta(u64)), target: i64, out: *std.ArrayList(usize)) !void {
     var find = try col.findByValue(target);
     defer find.deinit();
-    while (find.next()) |hit| {
+    while (try find.next()) |hit| {
         const slab = col.slabAt(hit.slab) orelse return error.InvalidValue;
         const rows: RowRange = .{ .start = hit.items_before, .end = hit.items_before + slab.len };
         var it = try col.iterRange(rows);
@@ -12419,7 +13006,7 @@ test "load_accumulates_delta_agg_weights_nullable" {
         defer got.deinit(gpa);
         var find = try loaded.findByValue(target);
         defer find.deinit();
-        while (find.next()) |hit| {
+        while (try find.next()) |hit| {
             const slab = loaded.slabAt(hit.slab) orelse return error.InvalidValue;
             const rows: RowRange = .{ .start = hit.items_before, .end = hit.items_before + slab.len };
             var it = try loaded.iterRange(rows);
@@ -13777,6 +14364,153 @@ test "prefix_shift_next_beyond_data" {
     try testing.expect((try it.shiftNext(.{ .start = 3, .end = 5 })) == null);
 }
 
+test "prefix EOF keeps the last row total when an exhausted window is extended" {
+    // setMax retains a logical end beyond the data; EOF still stands just
+    // behind the last actual row, with every actual contribution consumed.
+    const gpa = testing.allocator;
+    var col = try Column(u64, Prefix(u64)).init(gpa);
+    defer col.deinit();
+    try col.extend(gpa, &.{ 1, 2, 3 });
+    var it = try col.prefixIter();
+    const last = (try it.nth(2)).?;
+    try testing.expectEqual(@as(i64, 3), last.prefix());
+    try testing.expectEqual(@as(i64, 6), last.total());
+    try testing.expectEqual(@as(usize, 3), it.pos());
+    it.setMax(std.math.maxInt(usize));
+    try testing.expectEqual(std.math.maxInt(usize), it.maxPos());
+    try testing.expect((try it.nth(0)) == null);
+    try testing.expectEqual(@as(usize, 3), it.pos());
+    try testing.expectEqual(@as(usize, 0), it.itemsLeft());
+    try testing.expectEqual(@as(usize, 3), it.maxPos());
+    try testing.expectEqual(@as(i64, 6), it.prefix());
+    it.resetPrefix();
+    it.setMax(5);
+    try testing.expect((try it.seekTo(4)) == null);
+    try testing.expectEqual(@as(i64, 0), it.prefix());
+    try testing.expectEqual(@as(usize, 3), it.pos());
+
+    var clipped = try col.prefixIterRange(.{ .start = 5, .end = 5 });
+    try testing.expectEqual(@as(usize, 3), clipped.pos());
+    try testing.expectEqual(@as(i64, 6), clipped.prefix());
+    clipped.setMax(std.math.maxInt(usize));
+    try testing.expect((try clipped.nth(std.math.maxInt(usize))) == null);
+    try testing.expectEqual(@as(usize, 3), clipped.pos());
+    try testing.expectEqual(@as(i64, 6), clipped.prefix());
+
+    var no_rows = try Column(u64, Prefix(u64)).init(gpa);
+    defer no_rows.deinit();
+    var empty = try no_rows.prefixIter();
+    empty.setMax(std.math.maxInt(usize));
+    try empty.advanceTo(std.math.maxInt(usize));
+    try testing.expectEqual(@as(usize, 0), empty.pos());
+    try testing.expectEqual(@as(usize, 0), empty.itemsLeft());
+    try testing.expectEqual(@as(i64, 0), empty.prefix());
+}
+
+test "prefix forward operations drain only reachable rows at huge targets" {
+    // Every forward operation shares nth's EOF bound, including an empty
+    // window whose decoder must remain reusable after extending its maximum.
+    const gpa = testing.allocator;
+    var col = try Column(u64, Prefix(u64)).init(gpa);
+    defer col.deinit();
+    try col.extend(gpa, &.{ 1, 2, 3 });
+    const Operation = enum { nth, advance_to, advance_by, shift, shift_next, seek_to };
+    const limit = std.math.maxInt(usize);
+    for ([_]Operation{ .nth, .advance_to, .advance_by, .shift, .shift_next, .seek_to }) |op| {
+        var it = try col.prefixIterRange(.{ .start = 1, .end = 1 });
+        try testing.expect((try it.next()) == null);
+        it.setMax(limit);
+        switch (op) {
+            .nth => try testing.expect((try it.nth(limit)) == null),
+            .advance_to => try it.advanceTo(limit),
+            .advance_by => try it.advanceBy(limit),
+            .shift => try it.shift(.{ .start = limit, .end = limit }),
+            .shift_next => try testing.expect(
+                (try it.shiftNext(.{ .start = limit, .end = limit })) == null,
+            ),
+            .seek_to => try testing.expect((try it.seekTo(limit)) == null),
+        }
+        try testing.expectEqual(@as(usize, 3), it.pos());
+        try testing.expectEqual(@as(usize, 0), it.itemsLeft());
+        try testing.expectEqual(@as(i64, 6), it.prefix());
+        try testing.expect((try it.next()) == null);
+    }
+
+    var clipped = try col.prefixIterRange(.{ .start = 1, .end = 2 });
+    try testing.expect((try clipped.nth(limit)) == null);
+    try testing.expectEqual(@as(usize, 2), clipped.pos());
+    try testing.expectEqual(@as(i64, 3), clipped.prefix());
+    clipped.setMax(limit);
+    const last = (try clipped.seekTo(2)).?;
+    try testing.expectEqual(@as(i64, 3), last.prefix());
+    try testing.expectEqual(@as(i64, 6), last.total());
+    try testing.expect((try clipped.seekTo(limit)) == null);
+
+    var empty = try col.prefixIter();
+    try empty.shift(.{ .start = 2, .end = 2 });
+    try testing.expectEqual(@as(usize, 2), empty.pos());
+    try testing.expectEqual(@as(i64, 3), empty.prefix());
+    try testing.expect((try empty.next()) == null);
+    const reopened = (try empty.shiftNext(.{ .start = 2, .end = limit })).?;
+    try testing.expectEqual(@as(u64, 3), reopened.value);
+    try testing.expectEqual(@as(i64, 6), reopened.total());
+    try testing.expect((try empty.seekTo(1)) == null);
+    try testing.expectError(error.InvalidValue, empty.shiftNext(.{ .start = 1, .end = 5 }));
+    try testing.expectEqual(@as(usize, 3), empty.pos());
+}
+
+test "prefix EOF cross slab jumps keep metadata contributions and reset offsets" {
+    // Metadata contributes its byte width, not the packed word. A jump to
+    // the last real row and an EOF drain must carry the same reset offset.
+    const E = @import("../opset/columns.zig").MetaPrefixCodec;
+    const gpa = testing.allocator;
+    const words = [_]u64{ 0x04, 0x15, 0x27, 0x27, 0x27, 0x38, 0x49, 0x0a, 0x5b, 0x6c, 0x7d, 0x8e };
+    var col = try Column(u64, E).initWithBudget(gpa, 4);
+    defer col.deinit();
+    try col.extend(gpa, &words);
+    try testing.expect(col.slabCount() > 1);
+    const limit = std.math.maxInt(usize);
+    const base: i64 = 5;
+    var last_row = try col.prefixIterRange(.{ .start = 4, .end = 4 });
+    try testing.expectEqual(base, last_row.prefix());
+    last_row.resetPrefix();
+    last_row.setMax(limit);
+    const last = (try last_row.seekTo(words.len - 1)).?;
+    try testing.expectEqual(words[words.len - 1], last.value);
+    try testing.expectEqual(@as(i64, 32) - base, last.prefix());
+    try testing.expectEqual(@as(i64, 40) - base, last.total());
+    try testing.expectEqual(words.len, last_row.pos());
+    try testing.expect((try last_row.nth(0)) == null);
+    try testing.expectEqual(@as(i64, 40) - base, last_row.prefix());
+    try testing.expectEqual(words.len, last_row.maxPos());
+
+    var drain = try col.prefixIterRange(.{ .start = 4, .end = 4 });
+    drain.resetPrefix();
+    try testing.expect((try drain.shiftNext(.{ .start = limit, .end = limit })) == null);
+    try testing.expectEqual(words.len, drain.pos());
+    try testing.expectEqual(@as(i64, 40) - base, drain.prefix());
+    try testing.expectEqual(@as(usize, 0), drain.itemsLeft());
+    drain.resetPrefix();
+    drain.setMax(limit);
+    try drain.advanceBy(limit);
+    try testing.expectEqual(@as(i64, 0), drain.prefix());
+    try testing.expectEqual(words.len, drain.pos());
+}
+
+test "prefix EOF drains propagate malformed payload errors" {
+    // An oversized logical window must not turn a malformed actual row into
+    // valid EOF. Keep the slab's advertised rows and corrupt its final LEB byte.
+    const gpa = testing.allocator;
+    var col = try Column(u64, Prefix(u64)).init(gpa);
+    defer col.deinit();
+    try col.extend(gpa, &.{ 128, 128, 128 });
+    var it = try col.prefixIter();
+    const data = col.slabs.items[0].data;
+    data[data.len - 1] = 0x80;
+    it.setMax(std.math.maxInt(usize));
+    try testing.expectError(error.UnexpectedEnd, it.nth(std.math.maxInt(usize)));
+}
+
 //  `shift_next` and then `nth` (`tests.rs:590-607`).
 //
 //  Upstream's column is `PrefixColumn<bool>`, whose unit is the row's own
@@ -14657,12 +15391,8 @@ test "adjacent_lits_after_null_delete" {
 // budget of **8 runs a slab** over 200 runs of two, which is dozens of small
 // slabs, and a range of forty rows covers several of them.
 //
-// **The run budget counts segments, and a literal run is one segment
-// whatever values it holds** (`slab.zig:111-114`, `pinned_run_count`). So a
-// fixture of two hundred *distinct* values is one segment and one slab: it
-// would splice across no boundary at all and prove nothing. A repeated value
-// is what makes a run, and runs are what the budget counts — hence runs of
-// two, which is the smallest shape that reaches several slabs.
+// Repeated pairs keep the fixture's original row shape and compressed wire
+// bytes; the maintained budget now also bounds each literal row.
 //
 // **Whether the rebuilt range really crossed a boundary is asked of the rows,
 // not of the column's slab count.** `spansMoreThanOneSlab` locates the first
@@ -16773,7 +17503,7 @@ fn deltaRangeRows(
 ) !void {
     var find = try col.findByRange(lo, hi);
     defer find.deinit();
-    while (find.next()) |hit| {
+    while (try find.next()) |hit| {
         const slab = col.slabAt(hit.slab) orelse return error.InvalidValue;
         var it = try col.iterRange(.{
             .start = hit.items_before,
@@ -16800,7 +17530,7 @@ fn deltaRangeRows(
 fn deltaFindFirst(col: *const Column(u64, Delta(u64)), target: u64) !?usize {
     var find = try col.findByValue(@intCast(target));
     defer find.deinit();
-    while (find.next()) |hit| {
+    while (try find.next()) |hit| {
         const slab = col.slabAt(hit.slab) orelse return error.InvalidValue;
         var it = try col.iterRange(.{
             .start = hit.items_before,
@@ -16897,7 +17627,7 @@ test "fuzz_indexed_delta_column" {
             defer got.deinit(gpa);
             var find = try col.findByValue(@intCast(target));
             defer find.deinit();
-            while (find.next()) |hit| {
+            while (try find.next()) |hit| {
                 const slab = col.slabAt(hit.slab) orelse return error.InvalidValue;
                 var it = try col.iterRange(.{
                     .start = hit.items_before,
@@ -18162,33 +18892,22 @@ test "splice_and_nullable" {
 
     // Exercise the packed literal-header rewrite in Column.encode
     // (`column.rs:1360-1376`, `rle/splice.rs:1093-1110`, `codec.rs:207-219`).
-    // Seven distinct values form ONE literal run. Build two valid slabs
-    // explicitly so their literal/literal boundary must be joined on save.
+    // Seven distinct values form one canonical literal run. A small budget
+    // exercises literal/literal seams without prescribing the slab layout.
     const Plain = RleBase(u64, false, false, BeLen);
     const spread = [_]u64{ 0, 1, 2, 3, 4, 5, 6 };
-    var cut = try Column(u64, Plain).initWithBudget(gpa, 3);
+    var cut = try Column(u64, Plain).fromValues(gpa, &spread, 3);
     defer cut.deinit();
-    for ([_][]const u64{ spread[0..3], spread[3..] }) |part| {
-        const piece = try Plain.wireEncode(gpa, part, false);
-        errdefer gpa.free(piece);
-        const m = try slabmod.measure(gpa, Plain, piece);
-        try cut.slabs.append(gpa, .{
-            .data = piece,
-            .len = m.len,
-            .segments = m.segments,
-            .tail = m.tail,
-        });
-        cut.total_len += m.len;
-    }
-    try cut.reindex();
-    try cut.rebuildAggs(0);
-    try testing.expectEqual(@as(usize, 2), cut.slabCount());
     try expectSound(u64, Plain, &cut);
     const joined = try cut.encode(gpa);
     defer gpa.free(joined);
+    const canonical = try Plain.wireEncode(gpa, &spread, false);
+    defer gpa.free(canonical);
+    try testing.expectEqualSlices(u8, canonical, joined);
     var rejoined = try Column(u64, Plain).loadWithBudget(gpa, joined, 3);
     defer rejoined.deinit();
     try assertCol(u64, Plain, &rejoined, &spread);
+    try expectSound(u64, Plain, &rejoined);
 }
 
 test "string_and_bool_columns" {
@@ -18294,6 +19013,43 @@ test "load_iter_partial_consume_then_error" {
     try testing.expectEqual(@as(usize, 3), r.count);
     try testing.expectEqual(@as(u64, 5), r.value);
     try testing.expect((try ok.tryNextRun()) == null);
+}
+test "load_iter_literal_truncated_tail_is_deferred" {
+    // A caller receives the valid prefix; the next pull or finalization
+    // refuses the truncated tail.
+    const gpa = testing.allocator;
+    const Col = Column(u64, Rle(u64));
+    var iter = try Col.loadIter(gpa, &.{ 0x7e, 0x01, 0x80 }, Col.LoadOpts.new());
+    defer iter.deinit();
+
+    const first = (try iter.tryNextRun()).?;
+    try testing.expectEqual(@as(usize, 1), first.count);
+    try testing.expectEqual(@as(u64, 1), first.value);
+    try testing.expectError(error.UnexpectedEnd, iter.tryNextRun());
+    var draining = try Col.loadIter(gpa, &.{ 0x7e, 0x01, 0x80 }, Col.LoadOpts.new());
+    _ = try draining.tryNextRun();
+    try testing.expectError(error.UnexpectedEnd, draining.finalize());
+}
+
+test "load_iter_rejects_invalid_utf8_repeat" {
+    // A text repeat must reject its payload before exposing the run.
+    const gpa = testing.allocator;
+    var iter = try StrCol.loadIter(gpa, &.{ 0x02, 0x01, 0xff }, StrCol.LoadOpts.new());
+    try testing.expectError(error.InvalidUtf8, iter.tryNextRun());
+}
+
+test "load_iter_rejects_invalid_utf8_literal_incrementally" {
+    // A literal stream yields its valid prefix, then rejects the invalid value
+    // when the caller reaches it.
+    const gpa = testing.allocator;
+    var iter = try StrCol.loadIter(
+        gpa,
+        &.{ 0x7e, 0x01, 'a', 0x01, 0xff },
+        StrCol.LoadOpts.new(),
+    );
+    const first = (try iter.tryNextRun()).?;
+    try testing.expectEqualSlices(u8, "a", first.value);
+    try testing.expectError(error.InvalidUtf8, iter.tryNextRun());
 }
 
 test "load_accumulates_prefix_weights_partial_consume" {
@@ -19526,4 +20282,231 @@ test "string_splice_variable_length_values" {
         try want.appendSlice(gpa, &base);
         try expectBytesRoundTrip(StrCol, &col, want.items, textEql);
     }
+}
+
+test "metadata prefix unit seeks ignore packed type nibbles" {
+    const E = @import("../opset/columns.zig").MetaPrefixCodec;
+    const gpa = testing.allocator;
+    const words = [_]u64{ 0x0f, 0x13, 0x25, 0x25, 0x25, 0x06, 0x31, 0x42 };
+    var col = try Column(u64, E).initWithBudget(gpa, 4);
+    defer col.deinit();
+    try col.extend(gpa, &words);
+    for (0..words.len) |start| {
+        const begin = try col.getPrefix(start);
+        const total = try col.getPrefix(words.len);
+        var unit: i64 = 0;
+        while (unit <= total - begin + 1) : (unit += 1) {
+            var expected: ?usize = null;
+            var running = begin;
+            for (start..words.len) |row| {
+                running += @intCast(words[row] >> 4);
+                if (running > begin + unit) {
+                    expected = row;
+                    break;
+                }
+            }
+            var it = try col.prefixIterRange(.{ .start = start, .end = words.len });
+            const seek = try it.advancePrefix(unit);
+            if (expected) |row| {
+                try testing.expect(seek != null);
+                try testing.expectEqual(row, seek.?.pos);
+                try testing.expectEqual(try col.getPrefix(row), seek.?.pv.prefix());
+                try testing.expectEqual(try col.getPrefix(row) - begin, seek.?.delta);
+            } else {
+                try testing.expect(seek == null);
+            }
+        }
+    }
+}
+
+test "signed prefix slab boundaries preserve representable absolute endpoints" {
+    const gpa = testing.allocator;
+    const E = Prefix(i64);
+    const max = std.math.maxInt(i64);
+    var values: [34]i64 = undefined;
+    values[0] = -max;
+    for (1..32) |row| values[row] = if (row % 2 == 1) 1 else -1;
+    values[32] = max - 1;
+    values[33] = max - 1;
+    const inserted = try E.wireOfInsert(gpa, 0, &values);
+    defer gpa.free(inserted.wires);
+    try testing.expectEqual(@as(i64, 0), inserted.running);
+    const bytes = try E.wireEncode(gpa, inserted.wires, false);
+    defer gpa.free(bytes);
+    // The old default loader kept this two-header stream in one slab.
+    var col = try Column(i64, E).loadWithBudget(gpa, bytes, default_max_segments);
+    defer col.deinit();
+    var expected: i64 = 0;
+    for (values, 0..) |value, row| {
+        try testing.expectEqual(expected, try col.getPrefix(row));
+        expected = std.math.add(i64, expected, value) catch unreachable;
+    }
+    try testing.expectEqual(@as(i64, max - 1), expected);
+    try testing.expectEqual(expected, try col.getPrefix(values.len));
+    try testing.expect((try col.checkInvariants()) == null);
+    const encoded = try col.encode(gpa);
+    defer gpa.free(encoded);
+    try testing.expectEqualSlices(u8, bytes, encoded);
+}
+
+test "column loading and staged edits refuse overflowing signed aggregate totals" {
+    const gpa = testing.allocator;
+    const E = Prefix(i64);
+    const max = std.math.maxInt(i64);
+    const overflow = [_]i64{ max - 1, 1, 1 };
+    const inserted = try E.wireOfInsert(gpa, 0, &overflow);
+    defer gpa.free(inserted.wires);
+    try testing.expectEqual(@as(i64, 0), inserted.running);
+    const bytes = try E.wireEncode(gpa, inserted.wires, false);
+    defer gpa.free(bytes);
+    try testing.expectError(error.Overflow, Column(i64, E).loadWithBudget(gpa, bytes, 2));
+
+    var col = try Column(i64, E).initWithBudget(gpa, 2);
+    defer col.deinit();
+    try col.extend(gpa, &.{ max - 1, 1 });
+    const before = try col.encode(gpa);
+    defer gpa.free(before);
+    try testing.expectError(error.Overflow, col.splice(gpa, col.len(), 0, &.{1}));
+    const after = try col.encode(gpa);
+    defer gpa.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+    try testing.expectEqual(@as(i64, max), try col.getPrefix(col.len()));
+    try testing.expect((try col.checkInvariants()) == null);
+}
+
+test "signed prefix interval edits validate absolute bases and preserve refused sources" {
+    const gpa = testing.allocator;
+    const E = Prefix(i64);
+    const C = Column(i64, E);
+    const max = std.math.maxInt(i64);
+    // Repeats force multiple tree levels at the small load budgets. Edits in
+    // the middle require cached-subtree skips and a nonzero absolute base.
+    var model: [257]i64 = undefined;
+    model[0] = max - 1024;
+    for (1..model.len) |row| model[row] = switch ((row - 1) % 8) {
+        0, 1 => -2,
+        2, 3 => 3,
+        4, 5 => -4,
+        else => 1,
+    };
+    const bytes = try E.wireEncode(gpa, &model, false);
+    defer gpa.free(bytes);
+    const Edit = struct { at: usize, del: usize, values: []const i64 };
+    const edits = [_]Edit{
+        .{ .at = 131, .del = 4, .values = &.{ 4, -6 } },
+        .{ .at = 131, .del = 4, .values = &.{ 2, -3 } },
+        .{ .at = 131, .del = 6, .values = &.{} },
+        .{ .at = 131, .del = 4, .values = &.{} },
+        .{ .at = model.len, .del = 0, .values = &.{ 1, -1 } },
+        .{ .at = model.len, .del = 0, .values = &.{1} },
+    };
+    for ([_]usize{ 2, 4, default_max_segments }) |budget| {
+        for (edits) |edit| {
+            var col = try C.loadWithBudget(gpa, bytes, budget);
+            defer col.deinit();
+            var want: std.ArrayList(i64) = .empty;
+            defer want.deinit(gpa);
+            try want.appendSlice(gpa, model[0..edit.at]);
+            try want.appendSlice(gpa, edit.values);
+            try want.appendSlice(gpa, model[edit.at + edit.del ..]);
+            try col.splice(gpa, edit.at, edit.del, edit.values);
+            try expectColumn(i64, E, &col, want.items);
+            var running: i64 = 0;
+            for (want.items, 0..) |value, row| {
+                try testing.expectEqual(running, try col.getPrefix(row));
+                running = try std.math.add(i64, running, value);
+            }
+            try testing.expectEqual(running, try col.getPrefix(want.items.len));
+            const canonical = try E.wireEncode(gpa, want.items, false);
+            defer gpa.free(canonical);
+            const saved = try col.encode(gpa);
+            defer gpa.free(saved);
+            try testing.expectEqualSlices(u8, canonical, saved);
+        }
+    }
+
+    const overflowing_suffix = [_]i64{ max - 4, -8, -8, 9, 9 };
+    const suffix_bytes = try E.wireEncode(gpa, &overflowing_suffix, false);
+    defer gpa.free(suffix_bytes);
+    var source = try C.loadWithBudget(gpa, suffix_bytes, 2);
+    defer source.deinit();
+    // Removing a negative interval makes the untouched positive suffix overflow.
+    try testing.expectError(error.Overflow, source.splice(gpa, 1, 2, &.{}));
+    // An equal-total replacement still has to validate its interior endpoints.
+    try testing.expectError(error.Overflow, source.splice(gpa, 3, 2, &.{ max, 18 - max }));
+    const preserved = try source.encode(gpa);
+    defer gpa.free(preserved);
+    try testing.expectEqualSlices(u8, suffix_bytes, preserved);
+    try expectColumn(i64, E, &source, &overflowing_suffix);
+    const oom_model = [_]i64{ max - 16, -2, -2, 3, 3, -4, -4, 1, 1, 2, 2, -3, -3, 1, 1, 0, 0 };
+    try sweepSplice(i64, E, &oom_model, &.{ 2, -3 }, 3, 4);
+    try sweepSplice(i64, E, &oom_model, &.{}, 3, 6);
+}
+
+test "signed prefix interior overflow refuses loads and leaves staged sources intact" {
+    const gpa = testing.allocator;
+    const E = Prefix(i64);
+    const C = Column(i64, E);
+    const increment: i64 = @divTrunc(std.math.maxInt(i64), 3);
+    // Three legal repeats end at maxInt - 1. The following literal run
+    // cancels locally, but its first value overflows the absolute prefix.
+    var writer = E.WireSpliceWriter.init(gpa);
+    defer writer.deinit();
+    try writer.appendN(increment, 3);
+    try writer.appendN(2, 1);
+    try writer.appendN(-2, 1);
+    try writer.finish();
+    const bytes = try writer.take();
+    defer gpa.free(bytes);
+    try testing.expectError(error.Overflow, C.load(gpa, bytes));
+    try testing.expectError(error.Overflow, C.loadWithBudget(gpa, bytes, 2));
+    const stream = try C.loadIter(gpa, bytes, .{ .max_segments = 2 });
+    try testing.expectError(error.Overflow, stream.finalize());
+
+    var col = try C.fillWithBudget(gpa, 3, increment, 2);
+    defer col.deinit();
+    try testing.expectEqual(std.math.maxInt(i64) - 1, try col.getPrefix(3));
+    const before = try col.encode(gpa);
+    defer gpa.free(before);
+    try testing.expectError(error.Overflow, col.splice(gpa, col.len(), 0, &.{ 2, -2 }));
+    const after = try col.encode(gpa);
+    defer gpa.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+    try expectColumn(i64, E, &col, &.{ increment, increment, increment });
+    try testing.expect((try col.checkInvariants()) == null);
+}
+
+test "delta loads check repeated domain endpoints and nonnullable absence" {
+    const gpa = testing.allocator;
+    const E = Delta(u32);
+    const C = Column(u32, E);
+    var writer = E.WireSpliceWriter.init(gpa);
+    defer writer.deinit();
+    try writer.appendN(1, @as(usize, std.math.maxInt(u32)) + 1);
+    try writer.finish();
+    const bytes = try writer.take();
+    defer gpa.free(bytes);
+    try testing.expectError(error.Overflow, C.load(gpa, bytes));
+    const stream = try C.loadIter(gpa, bytes, .{});
+    try testing.expectError(error.Overflow, stream.finalize());
+
+    const absent = try E.wireFill(gpa, 2, null, false);
+    defer gpa.free(absent);
+    try testing.expectError(error.UnexpectedNull, C.load(gpa, absent));
+    const absent_stream = try C.loadIter(gpa, absent, .{});
+    try testing.expectError(error.UnexpectedNull, absent_stream.finalize());
+
+    var valid = try C.fromValues(gpa, &.{ 1, 2, 3, 4, 8, 12 }, default_max_segments);
+    defer valid.deinit();
+    const valid_bytes = try valid.encode(gpa);
+    defer gpa.free(valid_bytes);
+    var pull = try C.loadIter(gpa, valid_bytes, .{});
+    defer pull.deinit();
+    const first = (try pull.tryNextRun()).?;
+    try testing.expectEqual(@as(usize, 4), first.count);
+    try testing.expectEqual(@as(u32, 1), first.value);
+    const second = (try pull.tryNextRun()).?;
+    try testing.expectEqual(@as(usize, 2), second.count);
+    try testing.expectEqual(@as(u32, 8), second.value);
+    try testing.expect((try pull.tryNextRun()) == null);
 }

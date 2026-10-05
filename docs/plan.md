@@ -8,6 +8,13 @@ The survey that grounds every claim below lives in [survey/](survey/); each
 section carries `path:line` citations into the Rust source. Read a section
 before changing anything that depends on it.
 
+The current lifecycle and ownership contract is in [API.md](../API.md).
+The current gate record is at the top of [STATUS.md](STATUS.md).
+Dated verdicts below describe earlier source snapshots, not this API cutover.
+No phase is newly complete until its actual gate command finishes on the migrated source.
+The manifest version is `0.0.0`; upstream compatibility is separately `0.12.0`.
+`Stats` reports the package version and the actual Zig compiler version.
+
 ## 1. Compatibility contract
 
 `zautomerge` is a **direct translation**: same data model, same CRDT
@@ -28,23 +35,23 @@ Three things are normative and must be byte- or behaviour-exact:
 
 One thing is explicitly **not** normative: the exact bytes produced by
 `save()`. DEFLATE output is not reproducible across implementations, so
-`zautomerge.save()` produces a different, equally valid encoding. Equivalence
-is checked by loading the output with the Rust reference and comparing the
-materialized document, not by comparing bytes. Everything except the DEFLATE
-stream is byte-exact.
+`zautomerge.save()` can produce a different, equally valid compressed encoding.
+Equivalence is checked by loading both outputs and comparing materialized state,
+heads, changes, and normalized column bodies. Do not infer correctness for an
+unexercised malformed document from format compatibility.
 
-Text indexing: UTF-8 code points by default, matching the upstream default
-(`text_value::TextValue`, feature `utf8-indexing`). The wasm binding's forced
-UTF-16 is a binding policy, not a format requirement; `zautomerge` makes the
-encoding a document-level field and a compile-time default, so a consumer can
-build a UTF-16-indexed document. See [survey/07](survey/07-bindings.md) §Risk 2
-for the divergence this avoids in Rust.
+Native indexing supports Unicode code points, UTF-8 code units, UTF-16 code units, and grapheme units.
+The explicit compile-time indexing option selects `TextEncoding.platformDefault()`;
+without that option, Zig selects `unicode_code_point`.
+Encoding remains a document-level field and is not recovered from saved bytes or inferred from the OS.
+The wasm binding's forced UTF-16 is a binding policy, not a wire-format requirement.
+See [API.md](../API.md#conventions) and [survey/07](survey/07-bindings.md) for the boundary.
 
 ### 1.1 What the contract is checked against, and how hard
 
-This section is a statement of what a reader of this repository may rely on.
-Every claim in it was **measured by running the thing that produces it** on
-2026-10-01, and the two strongest of them were **proved by breaking them**.
+This section preserves historical measurements from 2026-10-01.
+Those runs exercised selected vectors and deliberate falsifications.
+They do not certify the current working tree.
 
 **The change-hash property is a property, not a hope.** `src/doc.zig:5941` and
 `:5943` hold the two expected hashes as **string literals**, and the bytes they
@@ -400,24 +407,24 @@ the `## Zig mapping notes` section of each survey file.
 | `enum E { A, B(..) }` | `union(enum)` | payload-carrying variants map exactly |
 | `#[repr(C)] enum` with explicit tags | `enum(c_int)` with explicit values | `AMvalType` and `AMmarkExpand` tag values are ABI; never renumber |
 | `Option<T>` | `?T` | `NULL` in the C ABI maps to `?*T` |
-| `Result<T, E>` | `!T` with an error set | 13 error types collapse to 3 error sets (§3.1) |
+| `Result<T, E>` | `E!T` with a named error set or operation-specific union | Callback failures retain their own error set in transaction outcomes. |
 | `&T` / `&mut T` | `*const T` / `*T` | every container stores its allocator explicitly |
 | `Vec<T>` | `std.ArrayList(T)` | unmanaged in 0.16; `ArrayListUnmanaged` is a deprecated alias. Every call takes the allocator |
-| `String` / `smol_str` | `[]const u8` into an arena, plus an intern table | key strings are interned per document; never a `[]u8` the caller must free |
+| `String` / `smol_str` | Borrowed byte slice or explicit owned copy | Document key views borrow intern storage. Detached values, rows, spans, and metadata own their copied bytes. |
 | `BTreeMap<K,V>` | `std.Treap` or a sorted `ArrayList` + binary search | see §5.1 — the port uses sorted arrays, not a treap |
 | `HashMap` | `std.StringHashMapUnmanaged` / `AutoHashMapUnmanaged` | used only for interning and memo tables, never on the format path |
-| `Rc<T>` | `*const T` plus an explicit lifetime owner | no `Rc` in Zig std; a returned value borrows the document |
+| `Rc<T>` | Explicit owned payload or borrowed pointer with a live owner | The public contract specifies which representation survives mutation and teardown. |
 | `RefCell<T>` | `*T` with a documented invariant | the lazily-built field carries its own `?T` |
 | `Arc<T>` | `std.atomic.Value(usize)` refcount, or an explicit shared owner | only in the bindings phase |
 | `Box::into_raw` | `gpa.create(T)` | the caller's allocator, not the page allocator |
-| `Iterator` / `impl Iterator` | struct with `next() ?Item` | no allocation per iterator; an iterator is a value, not a heap object |
-| `impl Trait` returned | concrete type | |
-| `dyn Trait` | a struct of function pointers (`vtable`) | used for exactly one thing, §3.2 |
+| `Iterator` / `impl Iterator` | Concrete fallible `next` iterator | Iterator preparation can allocate. Borrowed and owned item forms have distinct cleanup duties. |
+| `impl Trait` returned | Concrete type | |
+| Generic `ReadDoc` / `Transactable` implementations | Comptime adapter or concrete owner method | No runtime reader vtable. |
 | `macro_rules!` in the public API | none | the `log!` macro becomes a comptime-switchable no-op or a `std.log` call |
-| `serde` derive | hand-written encoder/decoder | only `autoserde` and the wasm JSON shapes need it |
+| `serde` derive | Explicit JSON codecs and compile-time serialization backend | Expanded changes, identities, scalars, sync messages, and generic document projection preserve their respective reference shapes. |
 | `panic!` / `unwrap` | `unreachable` where a preceding check proves it, else a real error | no `unreachable` on parser input |
 | `#[cfg(test)]` invariant checks | `comptime` debug flag or a `slow_path` build option | a struct field behind `-Dslow-path`, not a separate code path |
-| allocator-generic `impl Allocator` | `std.mem.Allocator` parameter | **every entry point that allocates takes one, and nothing else does** — a reader takes the document first and the allocator only where it needs one, a constructor takes it first, and an output-only door takes it where the answer is produced. The allocator an output-only door is given is the one that must free the answer |
+| allocator-generic `impl Allocator` | Explicit allocator argument or retained owner allocator | Output allocators are not document mutation allocators. Match release to the stated owner, not to a default allocator or allocator-context pointer alone. |
 | randomness reaching the OS directly | `std.Io` parameter | a constructor takes `io: std.Io`, borrows it, and the `Document` **keeps** it for later actor draws; tests pass `std.testing.io`, an executable passes its own live capability, and the C ABI binds one process-wide `std.Io.Threaded.global_single_threaded.io()`. **Nothing reaches for an ambient runtime**, and a refusal (`Canceled`, `EntropyUnavailable`) is an error rather than the panic upstream raises |
 
 ### 3.1 Error sets
@@ -464,26 +471,20 @@ variant. The `too_many_ops`, `too_many_deps`, `overflow_in_length`, and
 
 ### 3.2 Trait dispatch
 
-`ReadDoc` (**34** methods, `read.rs:21-311`) and `Transactable` (**20**
-methods, `transaction/transactable.rs:9-216`; this said 30 and 21) exist in
-Rust because
-`Automerge` and `AutoCommit` are two flavours of the same document, one
-requiring an explicit `Transaction` and one managing it. In Zig this is a
-single concrete `Document` plus a mode flag, and the "trait" becomes a `vtable`
-struct only where a caller genuinely holds either flavour polymorphically:
+Rust defines `ReadDoc` (34 methods, `read.rs:21-311`) and `Transactable`
+(20 methods, `transaction/transactable.rs:9-216`).
+The native owners are the mode-less raw `Document`, borrowed `Transaction`,
+and separate lazy `AutoCommit`. Automatic writers share one held transaction.
+Ordinary readers do not commit. History, save, diff, setters, and sync close it through declared barriers.
+The C `AMdoc` owns this same facade.
 
-```zig
-pub const ReadOps = struct {
-    ptr: *const anyopaque,
-    get: *const fn (ptr: *const anyopaque, obj: ExId, key: []const u8) Error!?Value,
-    // ... one field per ReadDoc method
-};
-```
-
-Every other function is a plain generic or concrete function. A method that
-would need `&mut self` on a read (`getHeads`, `getChanges` take `&mut self`
-upstream purely for interior-mutability caching) takes `*Document` in Zig and
-the cache is explicit.
+`read.ReadDoc(R)` and generic free functions dispatch at compile time.
+They accept raw, transaction, and automatic owners without a runtime function-pointer table.
+The generic history reader route differs from the inherent automatic barrier route.
+Explicit historical heads exclude pending operations.
+`hydrate(null)` follows the reference exception and reads raw current rows without scope.
+Returned historical walks borrow durable document-owned clocks until mutation.
+See [API.md](../API.md#read) for every method and [survey/01](survey/01-core-api.md) for reference contracts.
 
 ## 4. Module map
 
@@ -492,20 +493,20 @@ names so the two trees are diffable; the file layout mirrors it.
 
 | Zig module | Rust source | Port notes |
 | --- | --- | --- |
-| `zautomerge.types` | `types.rs`, `exid.rs` | `ExId`, `ActorId`, `OpId`, `ObjType`, `Prop`, `SequenceType`, `TextEncoding` |
+| `zautomerge.types` | `types.rs`, `exid.rs` | Stable `ExId`, `ActorId`, `Author`, resident `OpId` and `ElemId`, object/property kinds, and four encodings |
 | `zautomerge.value` | `value.rs`, `op_set2/types.rs` | `ScalarValue`, `Value`, `ValueMeta`, `OpType` |
-| `zautomerge.error` | `error.rs`, `columnar/encoding/col_error.rs` | the three error sets |
-| `zautomerge.clock` | `clock.rs` | `Clock` = `[]u32` indexed by actor index; `SeqClock`; `ClockRange` |
-| `zautomerge.change` | `change.rs`, `op_set2/change.rs` | `Change`, `ChangeMetadata`, `LoadChangeError` |
+| `zautomerge.error_types` and root error sets | `error.rs`, `columnar/encoding/col_error.rs` | The three base sets and operation-specific unions |
+| `zautomerge.clock` | `clock.rs` | Owned per-actor `u32` clock slots, `SeqClock`, and `ClockRange` |
+| `zautomerge.change_record`, root `Change` and expanded types | `change.rs`, `op_set2/change.rs` | Borrowed change header, low-level metadata, independently owned expanded decode, JSON and wire reconstruction |
 | `zautomerge.change_graph` | `change_graph.rs` | adjacency list, per-actor counters, cached clock per node |
 | `zautomerge.change_queue` | `change_queue.rs` | Kahn topological sort + `ChangeBatch` |
 | `zautomerge.opset` | `op_set2/**` | the op set: 16 columns, index columns, merge, batch apply |
 | `zautomerge.storage` | `storage/**` | chunk framing, `ColumnSpec`, `RawColumn`, document and change chunks, compression |
 | `zautomerge.columnar` | `columnar/**` | RLE, boolean, delta, raw encodings; the composite logical columns |
-| `zautomerge.hthane` | `hexane/**` | `Column`, `Slab`, `SlabBTree`, the edit cursor, the codecs |
 | `zautomerge.sync` | `sync.rs`, `sync/**` | `State`, `Message`, `BloomFilter`, v1 compatibility |
-| `zautomerge.transaction` | `transaction.rs`, `transaction/**` | `Transaction`, commit, rollback |
-| `zautomerge.doc` | `automerge.rs`, `autocommit.rs` | `Document` (Automerge + AutoCommit flavours) |
+| `zautomerge.transaction` | `transaction.rs`, `transaction/**` | Manual and owned transactions, owned commit results/logs, callback error outcomes, resumable rollback |
+| `zautomerge.doc` | `automerge.rs` | Raw `Document`, load options and rescue, owned document metadata, imports, diagnostics, logged incoming methods |
+| `zautomerge.autocommit`, root `AutoCommit` | `autocommit.rs` | Lazy held journal, closing barriers, address-stable pending clone, independent diff cache and sync wrapper |
 | `zautomerge.iter` | `iter.rs`, `iter/**` | `MapRange`, `ListRange`, `Spans`, `Keys`, `Values`, the diff machinery |
 | `zautomerge.read` | `read.rs` | the `ReadDoc` surface |
 | `zautomerge.patches` | `patches.rs`, `patches/**` | `PatchLog`, `PatchBuilder`, `ExposeQueue` |
@@ -513,13 +514,13 @@ names so the two trees are diffable; the file layout mirrors it.
 | `zautomerge.cursor` | `cursor.rs` | `Cursor`, `OpCursor` |
 | `zautomerge.textdiff` | `text_diff/**` | vendored Myers diff, Apache-2.0, attribution required (§9) |
 | `zautomerge.hexane` | `hexane/**` | `Column`, `Slab`, `SlabBTree`, the edit cursor, the codecs |
-| `zautomerge.hydrate` | `hydrate.rs`, `hydrate/**` | materialized mirror |
-| `zautomerge.autoserde` | `autoserde.rs` | non-`serde` JSON projection |
+| `zautomerge.hydrate` | `hydrate.rs`, `hydrate/**` | Flat scalar values, owned map/list/native-text mirrors, deep-owned register and block payloads |
+| `zautomerge.autoserde` | `autoserde.rs` | Generic reader projection, JSON backend and independent owned token stream |
 | `zautomerge.anonymize` | `anonymize.rs` | whole-document rewriter |
 
-Every public module is a separate file under `src/`, flat, mirroring the Rust
-layout. `src/opset/` and `src/hexane/` are the only subdirectories, because
-they are the only ones with more than six files.
+Module names follow the pinned tree where useful, but root reachability is the contract.
+`opset`, `hexane`, `iter`, `sync`, `storage`, `columnar`, and C modules have their own subdirectories.
+Do not infer an import alias from a Rust path or an old module-map spelling.
 
 **The C ABI is a separate tree and has two roots, on purpose.**
 `src/c/**` is `extern "C"` over libc and is reachable from `src/root.zig` as the
@@ -532,8 +533,10 @@ emits no symbol. The two roots are therefore:
 | `src/c/root.zig` | the **production** entry point: imports `c_abi` and forces the exports to be analysed | the installed static library `libzautomerge.a`, together with `src/c/result_from.c` |
 | `test/c/cabi.zig` | the **ABI check**: translates `include/automerge.h` and compares it against the library at comptime | a separate static library, `zautomerge-abi-check`, that `zig build ctest` depends on and that nothing links into the suite |
 
-**`zig test` cannot do either job**: it links no libc, which is why
-`src/root.zig`'s test block leaves the C modules out.
+Native production modules remain Zig implementations, not a Rust or C CRDT wrapper.
+Test roots intentionally link libc for the real stateless `std.heap.c_allocator` regression.
+That fixture does not make libc an implicit native document capability.
+The C production and ABI-check roots retain their own explicit libc linkage.
 
 ## 5. Core data model
 
@@ -544,24 +547,32 @@ every stored reference is that index. This is the single most important
 structural fact for the port, because it is what makes the on-disk columns
 `u32`-wide.
 
-```zig
-pub const ActorIdx = u32;          // index into Document.actors
-pub const Counter = u32;           // an op counter; 0 means "no object"
+Public identity and resident storage have different capacities:
 
-pub const ExId = union(enum) {     // object identity
-    id: struct { counter: Counter, actor: ActorIdx },
+```zig
+pub const ActorIdx = u32;
+pub const OpId = struct { counter: u32, actor: ActorIdx, /* methods omitted */ };
+pub const ExId = union(enum) {
+    id: OpId,
+    named: Named,
     root,
+    pub const Named = struct {
+        op: struct { counter: u64, actor: ActorIdx },
+        actor: ActorId,
+    };
 };
 ```
 
-`ExId::Id` field order is `(counter, actor, index)` upstream
-([survey/01](survey/01-core-api.md) §3); the third field is an in-memory
-lookup hint and is not serialised. The port keeps `counter` and `actor` only,
-and re-derives the hint, because a stale hint is worse than a missing one.
-
-`OpId` is `(counter, actor)`. `ActorId` is the external byte string; the
-document maps it to `ActorIdx` and owns the mapping for its whole life, so
-`ActorId` never appears in a column.
+This fragment describes the fields; use the real constructors rather than duplicate these types.
+Named identity is authoritative actor bytes plus a full `u64` counter.
+The `op.actor` field is only a cached actor-table hint.
+Stable equality, hashing, resolution, string/JSON codecs, and byte codecs must not trust a stale hint.
+The byte codec retains the checked hint and full counter (`exid.rs:24-123`).
+Document-returned named IDs borrow actor bytes.
+`parse`, `fromBytes`, and `dup` own them and require `deinitOwned(gpa)`.
+Resident rows and live resolution retain the `u32` bound.
+A wide ID can round-trip while failing live object or cursor resolution with a typed error.
+`ActorId` is the external arbitrary byte string; actor indices are document-local.
 
 Maps keyed by a hash map (`HashMap` in Rust) become a sorted `ArrayList` with
 binary search, because the iterators and the change graph both need ordered
@@ -570,28 +581,26 @@ traversal; the hash map is only an accelerator for `ActorId → ActorIdx`.
 ### 5.2 Values
 
 ```zig
-pub const ObjType = enum { map, list, text };
-pub const Prop = union(enum) { key: []const u8, index: Counter, seq: SequenceType };
-pub const ScalarValue = union(enum) {
-    null,
-    bool_: bool,
-    int: i64,
-    uint: u64,
-    f64_: f64,
-    str: []const u8,       // interned
-    bytes: []const u8,     // interned
-    counter: i64,
-    timestamp: i64,
-    actor_id: ActorId,
-    value_ref: ValueRef,   // an object reference; enum with an object id + type
-};
+pub const ObjType = enum { map, table, list, text };
+pub const Prop = union(enum) { key: []const u8, index: usize };
+pub const Value = union(enum) { object: ObjType, scalar: ScalarValue };
 ```
 
-`ScalarValue` is stored in a raw column, not as a native Zig union, because
-the wire format is a two-column split: `value_meta` (a `PrefixColumn` carrying
-`ValueMeta`) and `value` (a `RawColumn` of `(byte_length << 4) | type_code`
-plus opaque bytes). The union above is the **logical** model; the column
-encoder is §6.3.
+These fragments describe the public union shapes.
+Object identity belongs to `DocItem.id`, not to `Value.object`.
+`ScalarValue` has null, boolean, signed/unsigned integer, float, string, bytes,
+counter, timestamp, actor ID, and preserved unknown-value tags.
+The actual source spells the first tags `null_value`, `bool_value`, and `float`.
+Strings, bytes, and actor IDs borrow unless an owned constructor or conversion says otherwise.
+The public counter payload wraps an `i64` in `Counter.current`.
+Unknown values retain their wire tag and opaque bytes.
+`ValueRef` is the borrowed op-set row representation, not a scalar object-reference arm.
+
+Wire scalars use value metadata plus a raw byte column.
+`hydrate.Value` instead has flat scalar tags and `object.map`, `object.list`, or `object.text`.
+It has no nested `.scalar` payload arm.
+Use its `scalar`/`fromScalar` constructor or `toScalar` accessor.
+Hydrated object owners, scalar-copy wrappers, and plain borrowed scalars have separate teardown duties.
 
 ### 5.3 The op set
 
@@ -638,12 +647,13 @@ plain arrays.
 
 ### 5.4 Ownership
 
-Every public type that can return borrowed data states its owner in the
-signature: `pub fn get(doc: *const Document, obj: ExId, key: []const u8) Error!?DocItem`
-where `DocItem` is a copy, and `pub fn keyStr(doc: *const Document, idx: Interned) []const u8`
-where the slice lives in the document's intern arena. No public function
-returns memory the caller must free except the `save()` byte buffer and the
-explicitly-owned `OwnedTransaction`.
+Public declarations and [API.md](../API.md) state borrows explicitly.
+For example, `read.get(owner, obj, prop)` returns a `DocItem` whose scalar payload and ID actor bytes borrow.
+`read.text(owner, obj, gpa)` returns owned text.
+Owned map/list range conversions, span payloads, expanded changes, metadata, save buffers, and patch batches survive source teardown.
+`DocObjItem.valueOwned` detaches only its value, not the item identity or key.
+`Map.putOwned` copies scalar bytes but transfers composite owners on success; use `dup` for independence.
+These owners are not automatically freed by `Document.deinit`.
 
 **The rules the port actually applies, in the order a caller meets them:**
 
@@ -667,22 +677,22 @@ explicitly-owned `OwnedTransaction`.
   commit leaves it open for retry or rollback; `rollback` is resumable and
   pops what it has already undone, so a refusal hands the caller a *progressed*
   transaction rather than an unusable document.
-- **Native automatic failure retains recovery in the document.** Ownership
-  transfer allocates nothing and preserves the primary error. `recoverAuto`
-  resumes rollback; the next native write recovers before allocating new IDs.
-  Keep the document address stable and do not read rows while recovery is
-  pending. Manual producer partial publication is rollback-only, while a
-  refused manual commit still permits commit retry.
+- **Automatic recovery stays in the sole held journal.** A producer refusal after
+  publication makes that transaction rollback-only. Commit allocation refusal can be retried.
+  Retain the facade at its final address; do not inspect partial rows before rollback completes.
+  `Transaction.deinit` is fallible. `deinitClosed` is only for a closed journal
+  or one whose entire owning document immediately dies.
+  Closure outcomes preserve primary error, optional result, rollback progress,
+  and exactly one recovery transaction or terminal patch-log owner.
 - **Synchronization is the caller's, for every access including reads.** A
   `*const Document` receiver can still update shared scratch and caches, so two
   concurrent readers are a race; and a walk borrows state an apply or a commit
   invalidates. The C ABI widens this to global serialization because its
   `std.Io` provider is process-wide.
 
-`Transaction` upstream holds `&mut Document` for its whole life
-(`manual_transaction.rs`); the Zig `Transaction` holds `*Document` plus a
-generation stamp, and asserts the stamp at commit, because Zig cannot
-enforce a mutable borrow across a call boundary.
+The transaction borrows its document at a stable address for its whole life.
+The caller must prevent overlapping raw mutation, moving, and concurrent access.
+Zig does not enforce Rust's mutable-borrow rules.
 
 ## 6. Port phases
 
@@ -910,11 +920,10 @@ port.** Re-measured, not taken on trust:
   the same operation script, produce the same `save()` bytes modulo the
   DEFLATE stream.
 
-**Verdict 2026-10-04 — SATISFIED.** Both named upstream files are ported,
-and the live `save-interop` gate verifies the save-format clause. The existing
-case inventory is:
-
-- `tests/test.rs` — **140 / 140** present.
+**Current gate status — complete Debug, slow-path and ReleaseSafe roots pass.**
+The previous SATISFIED verdict and `tests/test.rs` 140/140 total did not prove case-for-case behavior.
+Consumer ledgers define scope; the [current STATUS checkpoint](STATUS.md#latest-observed-checkpoint-2026-10-08) records observed execution.
+The dated batch and save measurements below retain their original scope:
 - `tests/batch_insert.rs` — **46 / 46** present, in `test/upstream_batch_insert.zig`,
   wired by the `upstream_batch_insert_tests` step, **47/47 passing** with no leaks. The file carries two
   complementary row-order assertions: `expectKeys` (the keys in row order) and
@@ -958,35 +967,32 @@ not required to match.
 
 ### P6 — document API
 
-- `Document` (the `Automerge` and `AutoCommit` flavours), `Transaction`,
-  commit, rollback, `merge`, `apply_changes`, `load`, `save`, `get_heads`,
-  `get_missing_deps`, `fork`, `clone`, `split`, `history`.
-- Gate: the `ReadDoc` and `Transactable` surfaces in [API.md](../API.md) are
-  complete and every method has a test. The `lib.rs` address-book doctest is a
-  permanent test.
+- Separate raw `Document`, lazy `AutoCommit`, borrowed `Transaction`, and `OwnedTransaction`.
+- All reader and writer methods, closure outcomes, owned logs, complete load policies,
+  rescue, history/metadata, imports, diagnostics, fork/clone, diff/cache, and sync barriers.
+- Gate: every target method and lifecycle route in [API.md](../API.md) has a real consumer.
+  Native replay of the entire typed reference corpus must match success, refusal,
+  ownership-independent values, history, and follow-on state, including compatible foreign logs,
+  incompatible actor tables, and retained trailing-actor render refusal.
+  The crate-root address-book doctest remains a permanent end-to-end consumer.
 
-**Verdict 2026-10-01 — SATISFIED, with three `API.md` corrections.** The
-`ReadDoc` and `Transactable` surfaces are present and the crate-root address-book
-doctest is a permanent test (`test/example_test.zig`, **3/3**). Three
-declarations in `API.md` were wrong and are now corrected: `parents` had lost
-the `Result` that `read.rs:35` and `src/read.zig:1102` both carry; §Write's
-"twenty … one for one" counts **twenty-one** declarations against upstream's
-**twenty** methods; and `mark` / `unmark` do not match
-`transaction/transactable.rs:103-117` in arity or order.
+**Current verdict — native target consumers and complete Debug, slow-path and ReleaseSafe gates pass.**
+Final matched comparison is complete; consumer ledgers continue to define correctness scope. Comparison completion does not mean performance parity.
+Exact observed results live only in the [current STATUS checkpoint](STATUS.md#latest-observed-checkpoint-2026-10-08).
+No document `split` or deprecated mode/automatic-free-writer contract belongs to this gate.
 
 ### P7 — iteration and historical reads
 
 - `iter/**`, including the `Shiftable` repositioning abstraction that avoids
   per-object allocation, the diff iterators, and `ClockRange::Diff`.
-- Gate: `tests/text.rs` and `tests/text_encoding.rs` ported case-for-case,
-  including the 15 tests each run under 4 encodings.
+- Gate: all 21 `tests/text.rs` and 15 `tests/text_encoding.rs` cases ported case-for-case,
+  with four encodings wherever applicable and each exception explicitly justified.
 
-**Verdict 2026-10-01 — PARTLY SATISFIED.** The gate's numbers are themselves off:
-upstream's `tests/text.rs` has **21** `#[test]` functions and
-`tests/text_encoding.rs` has **15**, so "the 15 tests each" does not hold for the
-first file. Measured by name: `text.rs` **8 / 21** present, `text_encoding.rs`
-**10 / 15** present. The ported subset is green — the library suite is
-**1228/1228** — so this is a completeness gap, not a correctness one.
+**Current verdict — unchecked after migration.**
+Earlier name counts of 8/21 and 10/15 undercounted renamed cases.
+The later recorded source inventory was 21/21 and 15/15, with two four-encoding exceptions documented.
+Neither inventory proves the new native-unit, historical-clock, and owned-output contracts.
+Run the complete case-for-case consumer gate on the current source.
 
 ### P8 — sync
 
@@ -994,53 +1000,63 @@ first file. Measured by name: `text.rs` **8 / 21** present, `text_encoding.rs`
   `MessageBuilder`, the state machine, and the v1 compatibility path.
 - Gate: two `zautomerge` documents sync to convergence; a `zautomerge`
   document syncs with a Rust document in both directions, including a
-  deliberately v1-only peer. Port the five round-trip tests from
-  `sync/v1_compat_test/`.
+  deliberately v1-only peer. Port the three reference round-trip tests from
+  `sync/v1_compat_test/` (`mod.rs:473,496,519`).
 
-**Verdict 2026-10-01 — SATISFIED, and the gate's count is wrong.** `sync/v1_compat_test/`
-holds **three** round-trip tests (`mod.rs:473`, `:496`, `:519`); `bloom.rs` and
-`state.rs` declare none, so "the five" is not a measurable number. The port's
-`src/sync/v1.zig` carries **9** tests and covers both directions and a v1-only
-peer; `src/sync/protocol.zig:3193` drives a Zig and a Rust document in both
-directions byte for byte.
+**Current verdict — complete roots, reference/C consumers and fresh matched CLI correctness pass.**
+Historical v1 counts do not broaden current consumer scope. Final matched comparison is complete; sync generation remains a measured performance weakness.
+See the [authoritative STATUS checkpoint](STATUS.md#latest-observed-checkpoint-2026-10-08).
 
 ### P9 — patches, marks, cursors, text diff, hydrate, serde
 
-- Gate: `tests/diff_marks.rs` (36 tests) and `tests/test_mark_patches.rs`
-  ported; `hydrate` replays a patch stream into an equal mirror.
+- Gate: all cases in `tests/diff_marks.rs` and `tests/test_mark_patches.rs` retain their full assertions.
+  Replay ordered owned patches into a mirror after destroying their source owner.
+  Verify rich block payloads, native encoded units, mark expansion, malformed patch refusal,
+  expanded-change JSON/wire round trips, and generic serialization through JSON and non-JSON backends.
 
-**Verdict 2026-10-01 — SATISFIED, and this row was wrong for most of the day.**
-Both named files are ported: `tests/diff_marks.rs` is **36 of 36** — one
-`test "diff_marks: …"` block per upstream case, in `src/marks.zig`, every name
-upstream's own case translated (`overlapping_marks_remove_one_keep_other` →
-*overlapping marks lose one and keep the other*), and `--test-filter
-diff_marks` is green. `tests/test_mark_patches.rs` is **1 of 1** in
-`test/mark_patches_test.zig`, wired. The hydrate clause holds, with the log
-dropped before the mirror is read.
+**Current verdict — native replay and complete Debug, slow-path and ReleaseSafe gates pass.**
+Final matched comparison is complete. See the [current benchmark results](../bench/README.md#final-matched-results); cached-diff phase gains do not imply whole-process gains.
 
-**Current text representation:** `ConcreteTextValue` owns UTF-8 bytes and measures indices with a runtime `TextEncoding`.
-`removeRange` deletes one complete encoded span with one replacement allocation.
-Encoding or allocation refusal leaves the original buffer unchanged.
-Zero length and an out-of-range start retain the buffer without allocation.
-An overshooting end clamps without arithmetic overflow.
-An ordinary owner frees an old buffer only after the replacement changes its pointer.
-Patch coalescing and `hydrate.Text` use this range operation instead of repeated one-unit deletion.
+**Current text representation:** `ConcreteTextValue` owns native-unit trees.
+It preserves individual UTF-8 bytes, UTF-16 surrogate halves, Unicode code points, or stored grapheme units.
+`removeRange` deletes a clamped native-unit range without allocation.
+`spliceTextValue` requires matching encodings and preserves stored boundaries.
+`makeString(gpa)` returns owned lossy UTF-8. There is no borrowed `.bytes` or `asStr` buffer.
+Each owner disposes its own trees. Patch batches retain a live child allocator for theirs.
+See [API.md](../API.md#concretetextvalue) and `text_value.rs:36-192` for the reference shape.
 
-**Reference gap:** native-unit trees support edits that can split UTF-8 scalars or UTF-16 surrogate pairs (`text_value.rs:36,113,152`).
-Rust renders incomplete units lossily (`:60-62`, `:137-139`).
-The UTF-8-backed port refuses split scalar boundaries and recomputes current grapheme segmentation.
-It does not preserve incomplete native units or Rust's stored grapheme units.
-See [API.md](../API.md#concretetextvalue) for the caller contract and [STATUS.md](STATUS.md) for exercised paths.
+**Coverage correction.** The earlier name-presence count of 12 of 36 did not account for renamed tests.
+It could not rank P9's behavioral coverage.
+Counting `test "<upstream file>: …"` declarations is not sufficient either.
+A declaration can omit a required arm, remain commented, or test a different behavior.
+The former claim that all integration cases except one block case were ported was incorrect.
+Current consumer ledgers still bound exact case coverage for rescue, full block payloads,
+expanded-change/serde round trips, and external-log mismatch. Their source prerequisites now exist.
+Fixture load/refusal checks do not prove the upstream fixture's exact value semantics.
+No aggregate port total replaces that unsupported claim.
 
-**The correction, because the error was mine and it was load-bearing.** This row
-said *partly satisfied, and the weakest gate in the plan*, on a name-presence
-count of **12 of 36**. **That instrument is wrong for this port**: every ported
-case is renamed into English, so name-presence under-counts by roughly three, and
-ranking the gates on it made P9 look like the largest hole in the port when it
-was the most completely ported. The sound instrument is the port's own prefix
-convention — one `test "<upstream file>: …"` block per upstream case — and by
-that measure the whole of the upstream integration suite is ported bar **one**
-case of `block_tests.rs`. **See STATUS.md's table.**
+Selected exact regressions now have consumer tests in `test/upstream_doc_more.zig`:
+- Both-expanding bold-mark bundle decoding (`tests/test.rs:135-152`).
+- DocIter's object shift with losing conflicting text overwrites (`:722-755`).
+- UTF-16 incremental loading through change, compressed-change, and bundle chunks (`:4144-4178`).
+`test/upstream_clock_test.zig` consumes the reference clock vector through public document operations.
+It checks dependency-closed subsets, pairwise coverage and merges, heads, and missing dependencies.
+These cases expand behavioral coverage. They do not certify the full integration suite.
+See [STATUS.md](STATUS.md) for exercised checks.
+
+**Public surface implementation and verification are separate.**
+Owned `doc.ChangeMetadata` / `ChangeMetas` and the const readers `getChangesMeta` / `getChangeMetaByHash` are present.
+They own every slice and require one `deinit(gpa)` with the reader allocator.
+They retain raw footer extras and resolve author association, including inherited authors.
+`Document.hashForOpid` allocates nothing. `transaction.hashForOpid(tx, id)` forwards committed history lookup.
+These close Rust's metadata and document hash facade gaps (`automerge.rs:1516-1528,1554-1567`).
+See [API.md](../API.md#document) and `src/doc.zig` for ownership, frontier, error, and id rules.
+
+Native `AutoCommit`, full `LoadOptions`, owned-value rescue, `hasOurChanges`,
+full hydrated `Span` blocks and borrowed `SpanInput`, native text units,
+expanded changes, generic serialization, and automatic diff caching now exist in source.
+Their current verification limits remain explicit in [STATUS.md](STATUS.md).
+No source implementation or cache-hit semantic smoke establishes a matched performance result.
 
 ### P10 — bindings
 
@@ -1163,11 +1179,11 @@ Ordered by how likely they are to cost real time.
    equivalent, so each of these becomes an explicit field plus a comment that
    nobody verifies. Mitigation: enumerate them in the port, one per line, and
    cover each with a test.
-4. **Borrowing without lifetimes.** `Document` returns slices into its own
-   storage. Zig's borrow checker stops the easy mistakes, but a
-   `save()`-then-`mutate` sequence that invalidates a held slice is legal Zig
-   and a use-after-free. Mitigation: return owned copies from anything a
-   caller could hold across a mutation, even at a copy cost.
+4. **Borrowing without lifetimes.** Zig has no borrow checker.
+   Document slices and historical walks can outlive a valid owner or mutation boundary if misused.
+   Return explicit independent copies where the public contract permits retention.
+   Keep short-lived borrowed views cheap and document their invalidation.
+   Test disposal and mutation through actual consumers.
 5. **The v1 sync path.** It is maintained as a frozen copy of the pre-v2
    implementation (`sync/v1_compat_test/`, 907 lines). Porting it is
    mechanical; skipping it is not an option, because peers that do not

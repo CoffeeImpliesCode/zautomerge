@@ -693,8 +693,10 @@ pub fn InsertQuery(comptime O: type) type {
 
         /// Moves the walk's window to `rows` — the window only, not the
         /// position (`OpIter.shift`).
-        pub fn shift(self: *Self, rows: RowRange) void {
-            self.iter.shift(rows);
+        ///
+        /// A parse error leaves the walk's position and window unchanged.
+        pub fn shift(self: *Self, rows: RowRange) ParseError!void {
+            return self.iter.shift(rows);
         }
 
         /// Repositions the walk onto `rows` and reads the row at its start

@@ -52,7 +52,7 @@
 //! [`OpsFoundIter`] holds a walk, a clock and a `null` group
 //! (`found_op.rs:34-42`). The first group is built by the first `next` and it
 //! too allocates nothing. Only a row that survives both filters allocates, in
-//! `ops`.
+//! `ops` and the group's owned successor tail.
 //!
 //! # The group leaves the walk, and the allocator goes with it
 //!
@@ -98,9 +98,15 @@ const testing = std.testing;
 /// The rows one register holds, and the extent of that register in the op set
 /// (`OpsFound`, `op_set2/op_set.rs:1455-1461`).
 ///
-/// `ops` owns the row values; each row borrows the columns and the string
-/// table of the op set it came from, exactly as every other borrowed [`Op`]
-/// does (`op.zig:1600-1609`).
+/// `ops` owns the row values, and `succ_entries` owns their successor data.
+/// Payload slices still borrow the columns and string table of the source op
+/// set; this group does not clone strings or values.
+///
+/// Build with `appendRetained`, then call `finishRetained` before reading any
+/// retained successor entries. Until then each row's successor slice length
+/// is metadata only: its pointer may already be obsolete. Do not reorder,
+/// remove, or directly append rows during building. A finished group may move
+/// to another owner, but copying it does not create independent ownership.
 pub const OpsFound = struct {
     /// Where the register sits in its sequence, for a sequence read
     /// (`op_set2/op_set.rs:1457`).
@@ -108,10 +114,12 @@ pub const OpsFound = struct {
     /// The rows of the register that survived both filters, in row order — so
     /// ascending in op id, and the first is the winner.
     ///
-    /// This list is the group's one allocation. A group a caller receives from
-    /// [`OpsFoundIter.next`] carries it out, and [`deinit`] is what gives the
-    /// bytes back.
+    /// Owned row storage. Successor entries may be read only after
+    /// `finishRetained`; payload slices remain borrowed from the source op set.
     ops: std.ArrayList(Op),
+    /// Owned raw successor spans, concatenated in retained row order.
+    /// `finishRetained` binds the rows to this buffer after its final growth.
+    succ_entries: std.ArrayList(opmod.SuccEntry) = .empty,
     /// One past the register's last row, including the rows the filters
     /// dropped (`op_set2/op_set.rs:1459`).
     end_pos: usize,
@@ -124,17 +132,57 @@ pub const OpsFound = struct {
     /// caller never has to know that, and is not stored.
     pub fn init(gpa: Allocator) OpsFound {
         _ = gpa;
-        return .{ .index = 0, .ops = .empty, .end_pos = 0, .range = .{ .start = 0, .end = 0 } };
+        return .{
+            .index = 0,
+            .ops = .empty,
+            .succ_entries = .empty,
+            .end_pos = 0,
+            .range = .{ .start = 0, .end = 0 },
+        };
     }
 
-    /// Frees `ops` and nothing else: the rows themselves own nothing.
+    /// Frees `ops` and `succ_entries`, not the borrowed row payloads.
     ///
     /// Once only, and on the one owner of the group. The free poisons the
     /// receiver, so a second call reads undefined storage, and two copies of
-    /// one group freed through both free its buffer twice.
+    /// one group freed through both free its buffers twice.
     pub fn deinit(self: *OpsFound, gpa: Allocator) void {
         self.ops.deinit(gpa);
+        self.succ_entries.deinit(gpa);
         self.* = undefined;
+    }
+
+    /// Retains `row` and copies its complete raw successor span before the
+    /// source reader can overwrite it. The source span must not borrow this
+    /// group's `succ_entries`; payload slices are not copied.
+    ///
+    /// Call only while building, with the same allocator used for this group's
+    /// storage. On `error.OutOfMemory` neither list gains items, though its
+    /// capacity may grow. Until `finishRetained`, retained successor pointers
+    /// must not be dereferenced, even if they still happen to be live.
+    pub fn appendRetained(self: *OpsFound, gpa: Allocator, row: Op) Allocator.Error!void {
+        try self.ops.ensureUnusedCapacity(gpa, 1);
+        try self.succ_entries.ensureUnusedCapacity(gpa, row._succ.entries.len);
+        self.succ_entries.appendSliceAssumeCapacity(row._succ.entries);
+        self.ops.appendAssumeCapacity(row);
+    }
+
+    /// Publishes successor slices into the final owned buffer without reading
+    /// the obsolete source pointers. Preserves each cursor's position, read
+    /// count and deletion metadata.
+    ///
+    /// All rows must have been retained in their current order. After this
+    /// call do not append or grow either list; successor slices remain valid
+    /// until `deinit`, independently of the source reader's scratch storage.
+    pub fn finishRetained(self: *OpsFound) void {
+        var offset: usize = 0;
+        for (self.ops.items) |*row| {
+            const len = row._succ.entries.len;
+            std.debug.assert(len <= self.succ_entries.items.len - offset);
+            row._succ.entries = self.succ_entries.items[offset..][0..len];
+            offset += len;
+        }
+        std.debug.assert(offset == self.succ_entries.items.len);
     }
 
     /// How wide the register is in a sequence, which is the width of its last
@@ -298,9 +346,9 @@ pub fn OpsFoundIter(comptime I: type) type {
         /// the walk (`next`, `found_op.rs:48-76`).
         ///
         /// **The group handed back is the caller's**, moved out of this walk
-        /// rather than borrowed: it owns [`OpsFound.ops`], and the caller
-        /// frees it with the allocator this walk was built with. The walk
-        /// carries on with the register after it.
+        /// rather than borrowed: it owns row and successor storage, and the
+        /// caller frees it with the allocator this walk was built with. The
+        /// walk carries on with the register after it.
         ///
         /// A register whose rows were all filtered out is dropped rather than
         /// handed back empty, so a `null` is always the end of the walk (the
@@ -315,6 +363,7 @@ pub fn OpsFoundIter(comptime I: type) type {
         /// append for exactly that reason, and so does this.
         pub fn next(self: *Self) ReadOpError!?OpsFound {
             var result: ?OpsFound = null;
+            errdefer if (result) |*detached| detached.deinit(self.gpa);
             while (try self.iter.next()) |row| {
                 var op = row;
                 const key = op.elemidOrKey();
@@ -322,9 +371,7 @@ pub fn OpsFoundIter(comptime I: type) type {
                     // `result = self.found.take()` (`found_op.rs:53`) *moves*
                     // the ended group out and `self.found = Some(default)`
                     // (`:55`) puts a fresh one in its place, so exactly one of
-                    // the two owns `ops` at every point. The empty group this
-                    // displaces had nothing appended to it — a group with a row
-                    // in it is returned below — so it needs no free.
+                    // the two owns the group's buffers at every point.
                     result = self.found;
                     self.found = OpsFound.init(self.gpa);
                     self.last_key = key;
@@ -334,22 +381,27 @@ pub fn OpsFoundIter(comptime I: type) type {
                 group.end_pos = op.pos + 1;
                 group.range = .{ .start = self.start_pos, .end = op.pos + 1 };
                 if (op.action() != .increment and op.scopeToClock(self.clock)) {
-                    try group.ops.append(self.gpa, op);
+                    try group.appendRetained(self.gpa, op);
                 }
                 // `found_op.rs:65-68`: the group that just ended is handed back
                 // as soon as it is known to be non-empty.
-                if (result) |ended| {
-                    if (ended.ops.items.len > 0) return ended;
+                if (result) |*ended| {
+                    if (ended.ops.items.len > 0) {
+                        ended.finishRetained();
+                        return result;
+                    }
+                    ended.deinit(self.gpa);
+                    result = null;
                 }
             }
             // `found_op.rs:70-75`: the last group, and nothing if it is empty.
-            const found = self.found orelse return null;
+            var found = self.found orelse return null;
             self.found = null;
             if (found.ops.items.len == 0) {
-                var empty = found;
-                empty.deinit(self.gpa);
+                found.deinit(self.gpa);
                 return null;
             }
+            found.finishRetained();
             return found;
         }
 
@@ -852,4 +904,113 @@ test "resolveAction and width say what a single-row register needs" {
     // (`op_set2/op_set.rs:1464-1469`).
     try testing.expectEqual(@as(usize, 1), found.width(.list, .unicode_code_point));
     try testing.expectEqual(@as(usize, 0), empty.width(.list, .unicode_code_point));
+}
+
+test "retained successors preserve conflicting counter reads increment rollback and reload" {
+    // Unequal independent increment histories must survive a query that retains both conflicts.
+    // Exercise the retained results through native reads, mutation, rollback and durable reload.
+    const Document = @import("../doc.zig").Document;
+    const Transaction = @import("../transact.zig").Transaction;
+    const readmod = @import("../read.zig");
+    const gpa = testing.allocator;
+    const Check = struct {
+        fn values(items: []const readmod.DocItem, lower: i64, upper: i64) !void {
+            try testing.expectEqual(@as(usize, 2), items.len);
+            var actual: [2]i64 = undefined;
+            for (items, 0..) |item, index| {
+                try testing.expect(item.value == .scalar);
+                try testing.expect(item.value.scalar == .counter);
+                actual[index] = item.value.scalar.counter.current;
+            }
+            if (actual[0] > actual[1]) std.mem.swap(i64, &actual[0], &actual[1]);
+            try testing.expectEqualSlices(i64, &.{ lower, upper }, &actual);
+        }
+
+        fn document(doc: *Document, allocator: Allocator, lower: i64, upper: i64) !void {
+            const all = try readmod.getAll(doc, .root, .{ .key = "hits" }, allocator);
+            defer allocator.free(all);
+            try values(all, lower, upper);
+            const winner = (try readmod.get(doc, .root, .{ .key = "hits" })).?;
+            try testing.expect(winner.value == .scalar);
+            try testing.expect(winner.value.scalar == .counter);
+            try testing.expectEqual(upper, winner.value.scalar.counter.current);
+        }
+    };
+
+    var base = try Document.init(gpa, testing.io);
+    defer base.deinit();
+    base.setActorId(types.ActorId.init(&.{0x01}));
+    {
+        var tx = try Transaction.open(gpa, &base);
+        // The testing allocator does not inject allocation failure during cleanup.
+        defer tx.deinit() catch unreachable;
+        _ = try tx.put(.root, .{ .key = "hits" }, .{ .counter = .init(0) });
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+    }
+
+    var branch_a = try base.fork(gpa);
+    defer branch_a.deinit();
+    branch_a.setActorId(types.ActorId.init(&.{0x11}));
+    var branch_b = try base.fork(gpa);
+    defer branch_b.deinit();
+    branch_b.setActorId(types.ActorId.init(&.{0x22}));
+    {
+        var tx = try Transaction.open(gpa, &branch_a);
+        defer tx.deinit() catch unreachable;
+        _ = try tx.put(.root, .{ .key = "hits" }, .{ .counter = .init(10) });
+        try tx.increment(.root, .{ .key = "hits" }, 1);
+        try tx.increment(.root, .{ .key = "hits" }, 2);
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+    }
+    {
+        var tx = try Transaction.open(gpa, &branch_b);
+        defer tx.deinit() catch unreachable;
+        _ = try tx.put(.root, .{ .key = "hits" }, .{ .counter = .init(20) });
+        try tx.increment(.root, .{ .key = "hits" }, 4);
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+    }
+    {
+        const merged = try branch_a.merge(gpa, &branch_b);
+        defer gpa.free(merged);
+    }
+    try Check.document(&branch_a, gpa, 13, 24);
+
+    {
+        var tx = try Transaction.open(gpa, &branch_a);
+        defer tx.deinit() catch unreachable;
+        {
+            const before = try tx.getAll(.root, .{ .key = "hits" }, gpa);
+            defer gpa.free(before);
+            try Check.values(before, 13, 24);
+        }
+        try tx.increment(.root, .{ .key = "hits" }, 3);
+        {
+            const after = try tx.getAll(.root, .{ .key = "hits" }, gpa);
+            defer gpa.free(after);
+            try Check.values(after, 16, 27);
+            const winner = (try tx.get(.root, .{ .key = "hits" })).?;
+            try testing.expect(winner.value == .scalar);
+            try testing.expect(winner.value.scalar == .counter);
+            try testing.expectEqual(@as(i64, 27), winner.value.scalar.counter.current);
+        }
+        _ = try tx.rollback();
+    }
+    try Check.document(&branch_a, gpa, 13, 24);
+
+    {
+        var tx = try Transaction.open(gpa, &branch_a);
+        defer tx.deinit() catch unreachable;
+        try tx.increment(.root, .{ .key = "hits" }, 3);
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+    }
+    try Check.document(&branch_a, gpa, 16, 27);
+    const saved = try branch_a.save(gpa);
+    defer gpa.free(saved);
+    var reloaded = try Document.load(gpa, testing.io, saved, branch_a.textEncoding());
+    defer reloaded.deinit();
+    try Check.document(&reloaded, gpa, 16, 27);
 }

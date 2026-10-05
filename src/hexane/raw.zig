@@ -37,6 +37,12 @@
 //! rule [`RawColumn.get`] states is the same one [`RawColumn.slabAt`] and
 //! [`RawColumnIter.take`] carry.
 //!
+//! `RawColumn.beginOverlay` prepares a durable multi-edit projection without
+//! copying existing slab bytes. Bind a caller-held view, use ordinary mutators,
+//! capture it, then publish the overlay or abort it with `deinit`. The source
+//! stays unchanged until publication; source, overlay and bound view must remain
+//! live at stable addresses throughout that protocol.
+//!
 //! # A standalone column, not a `Column(T, E)`
 //!
 //! Upstream this type is a peer of `Column`, not an encoding for it, and
@@ -192,6 +198,129 @@ pub const RawColumn = struct {
     total_len: usize,
     /// The per-slab byte budget (`raw.rs:47-49`).
     max_segments: usize,
+    /// `null` for an owner; otherwise this arena is a borrowed overlay view.
+    overlay_owner: ?*Overlay = null,
+
+    /// Begins a durable multi-edit projection at `out`'s final address.
+    ///
+    /// Only slab descriptors and index metadata are copied; original bytes remain
+    /// borrowed. Source, overlay and any bound view must stay live and address
+    /// stable until publication or abort. Do not mutate or release the source
+    /// meanwhile. On allocation failure the source is unchanged and no overlay
+    /// resources survive. A successful overlay must be published or deinited.
+    pub fn beginOverlay(self: *Self, out: *Overlay) ParseError!void {
+        std.debug.assert(self.overlay_owner == null);
+        out.* = .{
+            .source = self,
+            .projected = self.*,
+            .originals = .empty,
+            .bound = null,
+            .spent = true,
+        };
+        out.projected.slabs = .empty;
+        out.projected.bit = .{ .gpa = self.gpa, .items = .empty };
+        out.projected.overlay_owner = out;
+        errdefer out.projected.slabs.deinit(self.gpa);
+        errdefer out.projected.bit.deinit();
+        errdefer out.originals.deinit(self.gpa);
+        try out.projected.slabs.appendSlice(self.gpa, self.slabs.items);
+        try out.projected.bit.items.appendSlice(self.gpa, self.bit.items.items);
+        const count = std.math.cast(u32, self.slabs.items.len) orelse return error.Overflow;
+        try out.originals.ensureTotalCapacity(self.gpa, count);
+        for (self.slabs.items) |slab| {
+            out.originals.putAssumeCapacity(@intFromPtr(slab.data.ptr), false);
+        }
+        out.spent = false;
+    }
+
+    /// A single-owner projection that borrows source bytes and owns its metadata
+    /// and replacement buffers. It must not be copied or moved while open.
+    /// `bind` lends the projection to one view; `capture` ends that loan.
+    /// Publication transfers retained and new buffers to the source. Abort
+    /// releases only new buffers. Both terminal operations invalidate the view.
+    pub const Overlay = struct {
+        /// The unchanged source, borrowed until a terminal operation.
+        source: *Self,
+        /// Owned metadata and a mixture of borrowed and new byte buffers.
+        projected: Self,
+        /// Original buffer identities; `true` means detached by a projected edit.
+        originals: std.AutoHashMapUnmanaged(usize, bool),
+        /// The sole live view, or `null` while the projection is captured.
+        bound: ?*Self,
+        /// Terminal operations have consumed this overlay when `true`.
+        spent: bool,
+
+        /// Lends the projection to `view`, which must be uninitialized storage.
+        /// Mutate it with ordinary arena methods; do not copy or deinit it.
+        /// Only one view may be bound, and no staged edit may outlive capture.
+        pub fn bind(self: *Overlay, view: *Self) void {
+            std.debug.assert(!self.spent);
+            std.debug.assert(self.bound == null);
+            std.debug.assert(view != self.source);
+            std.debug.assert(view != &self.projected);
+            view.* = self.projected;
+            view.overlay_owner = self;
+            self.bound = view;
+        }
+
+        /// Captures the sole bound view and invalidates its borrowed handle.
+        /// Every staged edit on the view must already be published or aborted.
+        pub fn capture(self: *Overlay, view: *Self) void {
+            std.debug.assert(!self.spent);
+            std.debug.assert(self.bound == view);
+            std.debug.assert(view.overlay_owner == self);
+            self.projected = view.*;
+            self.bound = null;
+            view.* = undefined;
+        }
+
+        /// Publishes to the original source without allocating. Consumes the
+        /// projection, frees detached originals once, and transfers all retained
+        /// original and new buffers. Captures a bound view before transfer.
+        /// All original borrowed reads are invalidated by this publication.
+        pub fn publish(self: *Overlay, source: *Self) void {
+            std.debug.assert(!self.spent);
+            std.debug.assert(source == self.source);
+            std.debug.assert(source.overlay_owner == null);
+            if (self.bound) |view| self.capture(view);
+            const gpa = source.gpa;
+            for (source.slabs.items) |*slab| {
+                if (self.originals.get(@intFromPtr(slab.data.ptr)).?) slab.deinit(gpa);
+            }
+            source.slabs.deinit(gpa);
+            source.bit.deinit();
+            source.* = self.projected;
+            source.overlay_owner = null;
+            self.originals.deinit(gpa);
+            self.spent = true;
+        }
+
+        /// Aborts without changing the source or invalidating its byte borrows.
+        /// Captures a bound view, frees only new buffers and metadata, and is a
+        /// no-op after abort or publication, so it is safe in a `defer`.
+        pub fn deinit(self: *Overlay) void {
+            if (self.spent) return;
+            if (self.bound) |view| self.capture(view);
+            const gpa = self.projected.gpa;
+            for (self.projected.slabs.items) |*slab| {
+                if (!self.originals.contains(@intFromPtr(slab.data.ptr))) slab.deinit(gpa);
+            }
+            self.projected.slabs.deinit(gpa);
+            self.projected.bit.deinit();
+            self.originals.deinit(gpa);
+            self.spent = true;
+        }
+
+        fn releaseSlab(self: *Overlay, slab: *RawSlab) void {
+            std.debug.assert(!self.spent);
+            if (self.originals.getPtr(@intFromPtr(slab.data.ptr))) |detached| {
+                std.debug.assert(!detached.*);
+                detached.* = true;
+            } else {
+                slab.deinit(self.projected.gpa);
+            }
+        }
+    };
 
     /// An empty arena with the default slab budget (`new`, `raw.rs:59-61`).
     pub fn init(gpa: std.mem.Allocator) ParseError!Self {
@@ -222,6 +351,7 @@ pub const RawColumn = struct {
     /// a second owner of the same buffers, so releasing both is a double
     /// free.
     pub fn deinit(self: *Self) void {
+        std.debug.assert(self.overlay_owner == null);
         for (self.slabs.items) |*s| s.deinit(self.gpa);
         self.slabs.deinit(self.gpa);
         self.bit.deinit();
@@ -286,10 +416,10 @@ pub const RawColumn = struct {
     ///
     /// **The receiver is not touched.** On every path, including every
     /// `error`, the slabs, their bytes, the length and the tree are exactly
-    /// as the call found them and [`checkInvariants`] still holds. The one
-    /// thing staging may change is the *spare capacity* of the slab list and
-    /// of the tree, which is what makes [`StagedSlice.publish`] unable to
-    /// fail; capacity is not observable through any answer this type gives.
+    /// as the call found them and [`checkInvariants`] still holds. Staging may
+    /// change the slab list's *spare capacity*, but never the published index.
+    /// It prepares checked point replacements or owns a complete prospective
+    /// tree, so [`StagedSlice.publish`] cannot allocate or fail.
     ///
     /// **The allocator is the arena's own, not a parameter**, so a staged edit
     /// comes out of exactly the allocator [`deinit`] releases it with and
@@ -319,7 +449,7 @@ pub const RawColumn = struct {
             .slots = undefined,
             .len = 0,
             .new_total = self.total_len,
-            .old_weight = indexmod.Bytes.zero,
+            .index_plan = .none,
             .count_before = self.slabs.items.len,
             .spent = false,
         };
@@ -333,7 +463,7 @@ pub const RawColumn = struct {
         const start: indexmod.SlabPos = if (count_before == 0)
             .{ .slab = 0, .offset = 0 }
         else
-            self.findSlab(index);
+            try self.findSlab(index);
         const first_len = if (count_before == 0) 0 else self.slabs.items[start.slab].data.len;
         const local_del = @min(del, first_len - start.offset);
         staged.new_total = std.math.add(usize, self.total_len - del, bytes.len) catch return error.Overflow;
@@ -391,22 +521,36 @@ pub const RawColumn = struct {
 
         for (plans[0..plan_count]) |range| {
             const buffer = try gpa.alloc(u8, range.end - range.start);
-            self.copySplicedRange(buffer, range, index, del, bytes);
+            errdefer gpa.free(buffer);
+            try self.copySplicedRange(buffer, range, index, del, bytes);
             staged.put(.{ .data = buffer });
         }
-        if (staged.drop > 0) staged.old_weight = .{ .n = self.slabs.items[staged.at].data.len };
-        const new_count = count_before - staged.drop + staged.len;
+        const new_count = try std.math.add(usize, count_before - staged.drop, staged.len);
+        if (staged.drop == 1 and staged.len == 1) {
+            staged.index_plan = .{ .point = try self.bit.preparePointUpdate(
+                staged.at,
+                .{ .n = self.slabs.items[staged.at].data.len },
+                .{ .n = staged.slots[0].data.len },
+            ) };
+        } else {
+            // The future layout borrows untouched lengths and reads replacements
+            // from staged slots. Its tree never aliases the published index.
+            var candidate: indexmod.Fenwick(indexmod.Bytes) = .{ .gpa = gpa, .items = .empty };
+            errdefer candidate.deinit();
+            const layout: *const StagedSlice = &staged;
+            try candidate.rebuildFrom(gpa, layout, new_count, StagedSlice.prospectiveSlabBytes);
+            staged.index_plan = .{ .rebuilt = candidate };
+        }
         try self.slabs.ensureTotalCapacity(gpa, new_count);
-        try self.bit.items.ensureTotalCapacity(gpa, new_count + 1);
         return staged;
     }
 
     /// An edit an arena has planned but not yet applied.
     ///
-    /// It owns the replacement buffers and it borrows the arena it was planned
-    /// against: **the arena must outlive the staged edit**, and
-    /// [`publish`](RawColumn.StagedSlice.publish) takes that same arena and no
-    /// other.
+    /// It owns replacement buffers and any prospective tree, and borrows the
+    /// arena it was planned against: **the arena must outlive the staged edit
+    /// and must not be mutated until publication or abort**. [`publish`] takes
+    /// that same arena and no other. Do not copy an open staged edit.
     ///
     /// The whole shape is the contract. `publish` is infallible and consumes,
     /// so every allocation the hand-over needs is taken by
@@ -442,10 +586,13 @@ pub const RawColumn = struct {
         len: usize,
         /// The arena's length once the edit has landed.
         new_total: usize,
-        /// The old weight of the slab at `at`, which the tree's point update
-        /// needs and which is only the right number when the edit replaced one
-        /// slab.
-        old_weight: indexmod.Bytes,
+        /// Checked replacements for an unchanged-cardinality single slab, or
+        /// the independently owned tree describing the complete future layout.
+        index_plan: union(enum) {
+            none,
+            point: indexmod.Fenwick(indexmod.Bytes).PreparedPointUpdate,
+            rebuilt: indexmod.Fenwick(indexmod.Bytes),
+        },
         /// The arena's slab count before the edit.
         count_before: usize,
         /// Whether `publish` or `deinit` has already taken the buffers.
@@ -471,7 +618,13 @@ pub const RawColumn = struct {
             const gpa = col.gpa;
             const added = self.len;
             // Nothing below allocates.
-            for (col.slabs.items[self.at..][0..self.drop]) |*old| old.deinit(gpa);
+            for (col.slabs.items[self.at..][0..self.drop]) |*old| {
+                if (col.overlay_owner) |overlay| {
+                    overlay.releaseSlab(old);
+                } else {
+                    old.deinit(gpa);
+                }
+            }
             // The tail moves as one block. It never reads the range just
             // released, which is why the move is here and not in
             // `replaceRangeAssumeCapacity`: that one copies forwards out of
@@ -489,14 +642,17 @@ pub const RawColumn = struct {
             self.len = 0;
             col.total_len = self.new_total;
 
-            // A like-for-like single-slab replacement needs one weight update;
-            // every other prepared layout needs a tree rebuild (raw.rs:251-258).
-            if (self.drop == 1 and added == 1) {
-                col.bit.pointUpdate(self.at, self.old_weight, .{ .n = col.slabs.items[self.at].data.len });
-            } else {
-                // Preparation reserved this exact tree before publication.
-                col.bit.rebuildFrom(gpa, col, col.slabs.items.len, slabBytes) catch unreachable;
+            // Like-for-like replacement keeps O(log S) point publication;
+            // structural edits transfer the already constructed tree.
+            switch (self.index_plan) {
+                .none => unreachable,
+                .point => |*prepared| col.bit.publishPointUpdate(prepared),
+                .rebuilt => |candidate| {
+                    col.bit.deinit();
+                    col.bit = candidate;
+                },
             }
+            self.index_plan = .none;
         }
 
         /// Releases the staged buffers without applying the edit, which is
@@ -510,6 +666,18 @@ pub const RawColumn = struct {
             const gpa = self.owner.gpa;
             for (self.slots[0..self.len]) |*s| s.deinit(gpa);
             self.len = 0;
+            switch (self.index_plan) {
+                .none, .point => {},
+                .rebuilt => |*candidate| candidate.deinit(),
+            }
+            self.index_plan = .none;
+        }
+
+        fn prospectiveSlabBytes(self: *const This, i: usize) indexmod.Bytes {
+            if (i < self.at) return slabBytes(self.owner, i);
+            const relative = i - self.at;
+            if (relative < self.len) return .{ .n = self.slots[relative].data.len };
+            return slabBytes(self.owner, self.at + self.drop + (relative - self.len));
         }
 
         fn put(self: *This, slab: RawSlab) void {
@@ -602,7 +770,7 @@ pub const RawColumn = struct {
             // single oversize slab that every later splice has to memmove
             // whole; the source's slabs are already budgeted and already cut
             // at value boundaries (`raw.rs:334-341`).
-            var chunks = src.chunksIn(sp.range.start, sp.range.end);
+            var chunks = try src.chunksIn(sp.range.start, sp.range.end);
             while (chunks.next()) |chunk| {
                 var staged = try self.stageSpliceSlice(at, del, chunk);
                 staged.publish(self);
@@ -630,10 +798,10 @@ pub const RawColumn = struct {
     pub fn get(self: *const Self, start: usize, end: usize) ParseError![]const u8 {
         if (end > self.total_len or start > end) return error.InvalidValue;
         if (start == end) return &.{};
-        const pos = self.bit.findSlab(start);
+        const pos = try self.bit.findSlab(start);
         const data = self.slabs.items[pos.slab].data;
         const span = end - start;
-        if (pos.offset + span > data.len) return error.InvalidValue;
+        if (pos.offset > data.len or span > data.len - pos.offset) return error.InvalidValue;
         return data[pos.offset..][0..span];
     }
 
@@ -652,7 +820,7 @@ pub const RawColumn = struct {
             // One past the end of the last slab.
             return .{ .col = self, .slab_idx = self.slabs.items.len, .offset_in_slab = 0, .byte_pos = pos };
         }
-        const at = self.bit.findSlab(pos);
+        const at = try self.bit.findSlab(pos);
         return .{ .col = self, .slab_idx = at.slab, .offset_in_slab = at.offset, .byte_pos = pos };
     }
 
@@ -700,7 +868,9 @@ pub const RawColumn = struct {
         var self = try Self.withMaxSegments(gpa, max_segments);
         errdefer self.deinit();
         if (data.len == 0) return self;
-        try self.slabs.append(gpa, .{ .data = try gpa.dupe(u8, data) });
+        // Reserve before copying; deinit owns the bytes as soon as they exist.
+        try self.slabs.ensureUnusedCapacity(gpa, 1);
+        self.slabs.appendAssumeCapacity(.{ .data = try gpa.dupe(u8, data) });
         self.total_len = data.len;
         try self.bit.rebuildFrom(gpa, &self, 1, onlySlabBytes);
         return self;
@@ -718,7 +888,8 @@ pub const RawColumn = struct {
     /// never globally.
     pub fn canMerge(self: *const Self, a_len: usize, b_len: usize) bool {
         const min = self.max_segments / 4;
-        return (a_len < min or b_len < min) and a_len + b_len <= self.max_segments;
+        return (a_len < min or b_len < min) and
+            a_len <= self.max_segments and b_len <= self.max_segments - a_len;
     }
 
     /// Whether the layout is canonical — the three postconditions the module
@@ -756,7 +927,7 @@ pub const RawColumn = struct {
     ///
     /// A byte at the very end lands in the last slab at its end, so an append
     /// goes into the slab already there instead of starting one.
-    fn findSlab(self: *const Self, index: usize) indexmod.SlabPos {
+    fn findSlab(self: *const Self, index: usize) error{Overflow}!indexmod.SlabPos {
         if (index == self.total_len) {
             const last = self.slabs.items.len - 1;
             return .{ .slab = last, .offset = self.slabs.items[last].data.len };
@@ -804,11 +975,11 @@ pub const RawColumn = struct {
         index: usize,
         del: usize,
         bytes: []const u8,
-    ) void {
+    ) error{Overflow}!void {
         var at = range.start;
         if (at < index) {
             const end = @min(range.end, index);
-            self.copyOriginalRange(out[0 .. end - at], at, end);
+            try self.copyOriginalRange(out[0 .. end - at], at, end);
             at = end;
             if (at == range.end) return;
         }
@@ -819,11 +990,11 @@ pub const RawColumn = struct {
             at = end;
             if (at == range.end) return;
         }
-        self.copyOriginalRange(out[at - range.start ..], at - bytes.len + del, range.end - bytes.len + del);
+        try self.copyOriginalRange(out[at - range.start ..], at - bytes.len + del, range.end - bytes.len + del);
     }
 
-    fn copyOriginalRange(self: *const Self, out: []u8, start: usize, end: usize) void {
-        var chunks = self.chunksIn(start, end);
+    fn copyOriginalRange(self: *const Self, out: []u8, start: usize, end: usize) error{Overflow}!void {
+        var chunks = try self.chunksIn(start, end);
         var written: usize = 0;
         while (chunks.next()) |chunk| {
             @memcpy(out[written..][0..chunk.len], chunk);
@@ -835,12 +1006,12 @@ pub const RawColumn = struct {
     /// The byte slices covering `start..end_in`, one per slab the range
     /// touches (`chunks_in`, `raw.rs:351-370`). The range is clamped to the
     /// arena, and an empty one yields nothing.
-    fn chunksIn(self: *const Self, start: usize, end_in: usize) ChunksIter {
+    fn chunksIn(self: *const Self, start: usize, end_in: usize) error{Overflow}!ChunksIter {
         const end = @min(end_in, self.total_len);
         var slab_idx: usize = 0;
         var offset: usize = 0;
         if (start < end) {
-            const at = self.findSlab(start);
+            const at = try self.findSlab(start);
             slab_idx = at.slab;
             offset = at.offset;
         }
@@ -2288,6 +2459,57 @@ test "prepared neighbour coalescing publishes with allocation refused" {
     try col.checkInvariants(gpa);
 }
 
+test "prepared point split empty and tail layouts publish with allocation refused" {
+    // Abort must preserve borrowed bytes and release candidate ownership once.
+    // Publication must not allocate for either point or structural handoff.
+    const Case = struct {
+        at: usize,
+        del: usize,
+        bytes: []const u8,
+        want: []const u8,
+        budget: usize = 4,
+    };
+    const cases = [_]Case{
+        .{ .at = 4, .del = 0, .bytes = "XYZ", .want = "abcdXYZefgh" },
+        .{ .at = 0, .del = 8, .bytes = "", .want = "" },
+        .{ .at = 8, .del = 0, .bytes = "!", .want = "abcdefgh!" },
+        .{ .at = 2, .del = 1, .bytes = "XYZ", .want = "abXYZdefgh", .budget = 32 },
+        .{ .at = 2, .del = 3, .bytes = "", .want = "abfgh", .budget = 32 },
+    };
+    for (cases) |case| {
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var col = try RawColumn.loadWithMaxSegments(gpa, "abcdefgh", case.budget);
+        defer col.deinit();
+        const borrowed = try col.get(0, 8);
+        var aborted = try col.stageSpliceSlice(case.at, case.del, case.bytes);
+        aborted.deinit();
+        aborted.deinit();
+        try testing.expectEqualStrings("abcdefgh", borrowed);
+        try expectArena(&col, gpa, "abcdefgh");
+        var staged = try col.stageSpliceSlice(case.at, case.del, case.bytes);
+        defer staged.deinit();
+        try testing.expectEqualStrings("abcdefgh", borrowed);
+
+        failing.fail_index = failing.alloc_index;
+        failing.resize_fail_index = failing.resize_index;
+        staged.publish(&col);
+        try testing.expectEqual(case.want.len, col.len());
+        for (case.want, 0..) |byte, pos| {
+            try testing.expectEqual(byte, (try col.get(pos, pos + 1))[0]);
+            var cursor = try col.iteratorAt(pos);
+            try testing.expectEqual(byte, (try cursor.take(1))[0]);
+            try testing.expectEqual(pos + 1, cursor.pos());
+        }
+        var end = try col.iteratorAt(col.len());
+        try testing.expectEqualStrings("", try end.take(0));
+        try testing.expectError(error.InvalidValue, end.take(1));
+        failing.fail_index = std.math.maxInt(usize);
+        failing.resize_fail_index = std.math.maxInt(usize);
+        try expectArena(&col, gpa, case.want);
+    }
+}
+
 test "publish consumes the staged edit, and deinit beside it is a no-op" {
     // `testing.allocator` is the arbiter: if `deinit` released buffers
     // `publish` had already handed over, the second free is a double free it
@@ -2363,6 +2585,145 @@ test "staging every column before publishing any keeps a group all-or-nothing" {
     try testing.expect(skip > 0);
     try expectWords(&left, &.{ 99, 1, 2, 3 });
     try expectWords(&right, &.{ 0, 1, 77, 3 });
+}
+
+fn rawOverlayMixedEdits(view: *RawColumn) !void {
+    var first = try view.stageSpliceSlice(4, 4, "WXYZ");
+    defer first.deinit();
+    first.publish(view);
+    try view.spliceSlice(5, 2, "!");
+    try view.spliceChunks(view.len(), 0, &.{ "12", "34" });
+    var aborted = try view.stageSpliceSlice(0, 4, "never");
+    aborted.deinit();
+}
+
+test "raw overlay mixed projected edits preserve borrowed source until publish" {
+    // Ordinary mutators must release provisional buffers, not borrowed source bytes.
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var source = try RawColumn.withMaxSegments(gpa, 4);
+    defer source.deinit();
+    try source.spliceSlice(0, 0, "abcd");
+    try source.spliceSlice(4, 0, "efgh");
+    try source.spliceSlice(8, 0, "ijkl");
+    const borrowed = source.slabs.items[1].data;
+    const retained = source.slabs.items[0].data.ptr;
+    var expected = try RawColumn.withMaxSegments(gpa, 4);
+    defer expected.deinit();
+    try expected.spliceSlice(0, 0, "abcd");
+    try expected.spliceSlice(4, 0, "efgh");
+    try expected.spliceSlice(8, 0, "ijkl");
+    try rawOverlayMixedEdits(&expected);
+
+    var overlay: RawColumn.Overlay = undefined;
+    try source.beginOverlay(&overlay);
+    defer overlay.deinit();
+    var view: RawColumn = undefined;
+    overlay.bind(&view);
+    try rawOverlayMixedEdits(&view);
+    try testing.expectEqualStrings("efgh", borrowed);
+    try expectArena(&source, gpa, "abcdefghijkl");
+    try expectSameArena(&view, &expected);
+    for (view.slabs.items, expected.slabs.items) |got, want| {
+        try testing.expectEqualSlices(u8, want.data, got.data);
+    }
+    for (view.bit.items.items, expected.bit.items.items) |got, want| {
+        try testing.expectEqual(want.n, got.n);
+    }
+    try view.checkInvariants(gpa);
+    overlay.capture(&view);
+    overlay.bind(&view);
+    const projected_bytes = try view.encode(gpa);
+    defer gpa.free(projected_bytes);
+    try testing.expectEqualStrings("abcdW!Zijkl1234", projected_bytes);
+    overlay.capture(&view);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    overlay.publish(&source);
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try expectSameArena(&source, &expected);
+    try testing.expectEqual(retained, source.slabs.items[0].data.ptr);
+    try source.checkInvariants(gpa);
+}
+
+test "raw overlay abort leaves source borrowed buffers and future edits usable" {
+    const gpa = testing.allocator;
+    var source = try RawColumn.loadWithMaxSegments(gpa, "abcdefghijkl", 4);
+    defer source.deinit();
+    const borrowed = try source.get(0, source.len());
+    var overlay: RawColumn.Overlay = undefined;
+    try source.beginOverlay(&overlay);
+    var view: RawColumn = undefined;
+    defer overlay.deinit();
+    overlay.bind(&view);
+    try rawOverlayMixedEdits(&view);
+    overlay.deinit();
+    overlay.deinit();
+    try testing.expectEqualStrings("abcdefghijkl", borrowed);
+    try expectArena(&source, gpa, "abcdefghijkl");
+    try source.spliceSlice(4, 4, "OK");
+    try expectArena(&source, gpa, "abcdOKijkl");
+    try source.checkInvariants(gpa);
+}
+
+fn rawOverlayAllocationFailures(gpa: std.mem.Allocator, publish: bool) !void {
+    var source = try RawColumn.withMaxSegments(gpa, 4);
+    defer source.deinit();
+    try source.spliceSlice(0, 0, "abcd");
+    try source.spliceSlice(4, 0, "efgh");
+    try source.spliceSlice(8, 0, "ijkl");
+    const original_slabs = source.slabs.items.ptr;
+    const original_tree = source.bit.items.items.ptr;
+    const borrowed = source.slabs.items[1].data;
+    var checking_original = true;
+    errdefer if (checking_original) {
+        std.debug.assert(source.len() == 12);
+        std.debug.assert(source.slabs.items.ptr == original_slabs);
+        std.debug.assert(source.bit.items.items.ptr == original_tree);
+        std.debug.assert(std.mem.eql(u8, borrowed, "efgh"));
+    };
+    var overlay: RawColumn.Overlay = undefined;
+    try source.beginOverlay(&overlay);
+    defer overlay.deinit();
+    var view: RawColumn = undefined;
+    overlay.bind(&view);
+    try rawOverlayMixedEdits(&view);
+    try testing.expectEqualStrings("efgh", borrowed);
+    overlay.capture(&view);
+    checking_original = false;
+    if (publish) {
+        overlay.publish(&source);
+        try expectArena(&source, testing.allocator, "abcdW!Zijkl1234");
+        try source.checkInvariants(testing.allocator);
+    } else {
+        overlay.deinit();
+        try testing.expectEqualStrings("efgh", borrowed);
+        try expectArena(&source, testing.allocator, "abcdefghijkl");
+        source.spliceSlice(4, 4, "OK") catch |failure| {
+            try testing.expectEqual(@as(usize, 12), source.len());
+            try testing.expectEqualStrings("efgh", borrowed);
+            return failure;
+        };
+        try expectArena(&source, testing.allocator, "abcdOKijkl");
+        try source.checkInvariants(testing.allocator);
+    }
+}
+
+test "raw overlay multi edit publication survives every allocation failure" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        rawOverlayAllocationFailures,
+        .{true},
+    );
+}
+
+test "raw overlay abort and reuse survive every allocation failure" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        rawOverlayAllocationFailures,
+        .{false},
+    );
 }
 
 test "max_segments_zero_rejected" {

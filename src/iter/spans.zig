@@ -46,19 +46,12 @@
 //! is the same fold with a [`tools.ClockRange`] in it, and is what a document
 //! diff or a patch log drives.
 //!
-//! # Two decisions that are not upstream's
+//! # Detached output
 //!
-//! * **A block is an [`types.ExId`], not a hydrated map.** Upstream's
-//!   `Span::Block(crate::hydrate::Map)` re-hydrates the block's map from the op
-//!   set at export time (`spans.rs:605-627`); there is no `hydrate` in the port
-//!   yet, and re-hydrating here would be a second implementation of it. The id
-//!   is what the row carries anyway — upstream holds an `OpId` until export
-//!   (`spans.rs:406`) — and the [`maprange.ExIdPromise`] resolves it at the one
-//!   point where the op set is in hand.
-//! * **Every span owns its bytes.** Upstream's text is a `String` and its marks
-//!   are `Arc<MarkSet>`s; the port has no `Arc`, and [`batch.MarkDiff.exportSet`]
-//!   allocates a fresh set, so [`Span`] hands out owned text and owned marks and
-//!   [`Span.deinit`] takes the allocator back.
+//! Blocks are hydrated maps at export time, using the same clock as the read.
+//! Text spans own their bytes and deeply copied mark names and values.
+//! [`Span.deinit`] releases every payload once. Input [`SpanInput`] values,
+//! in contrast, borrow caller maps, text, and mark sets for the write call.
 //!
 //! **Nothing here reads or writes a stored byte.** The columns, their ids and
 //! their order are the compatibility contract and this file is a reader over
@@ -84,15 +77,10 @@
 //! the same copy [`opset/batch.zig`](../opset/batch.zig) makes per patch event,
 //! and it is why nothing here needs a lifetime parameter.
 //!
-//! **And the run's buffer goes with the span, so a span outlives the reader
-//! that made it.** [`SpanState.flush`] hands the whole [`NextText`] over
-//! rather than copying out of it, and [`SpansDiff.next`] hands out a mark set
-//! [`batch.MarkDiff.exportSet`] allocated afresh. **A span this reader has
-//! already handed out therefore shares no storage with the fold**, which is
-//! what makes "a reader may be moved at any time" and "a span may be held" the
-//! same sentence: every `deinit` below releases only what the reader still
-//! holds, so freeing the reader never touches a span a caller already has, in
-//! either order.
+//! The buffered text transfers to the exported span. At the public export
+//! boundary mark names and scalar payloads are copied, and block maps are
+//! hydrated recursively. Public spans therefore outlive both the reader and
+//! its document; internal spans still borrow scalar payloads from the op set.
 //!
 //! **The two folds are copied separately and flattened once.** A patch's mark
 //! payload is one set, and [`batch.MarkDiff.exportSet`] is where the two folds
@@ -155,10 +143,11 @@ const opset = @import("../opset/op_set.zig");
 const column = @import("../hexane/column.zig");
 const maprange = @import("map_range.zig");
 const tools = @import("tools.zig");
+const hydrate = @import("../hydrate.zig");
 
 const Allocator = std.mem.Allocator;
 const Error = err.Error;
-const ReadError = maprange.ReadError;
+const ReadError = maprange.ReadError || hydrate.OpHydrateError;
 const ExIdPromise = maprange.ExIdPromise;
 const predates = maprange.predates;
 const RowRange = tools.RowRange;
@@ -465,14 +454,16 @@ pub fn SpanDiff(comptime O: type) type {
             self.* = undefined;
         }
 
-        /// The span as a caller reads it ([`SpanInternal::exportSpan`],
-        /// `spans.rs:605-627`).
-        ///
-        /// **A move, and not a copy**: the span already owns its text and its
-        /// resolved marks, so there is nothing left to flatten and nothing left
-        /// to allocate here.
-        pub fn exportSpan(self: Self) Span {
-            return self.span.exportSpan();
+        /// Detaches the public payload, using the requested object clock.
+        /// Consumes this span on success only; the caller retains it on error.
+        /// `gpa` must be the allocator that owns the internal text buffer.
+        pub fn exportSpan(
+            self: Self,
+            gpa: Allocator,
+            set: *opset.OpSet(O),
+            clock: ?Clock,
+        ) ReadError!Span {
+            return self.span.exportSpan(gpa, set, clock);
         }
     };
 }
@@ -535,32 +526,43 @@ pub fn SpanInternal(comptime O: type) type {
             self.* = undefined;
         }
 
-        /// The span as a caller reads it
-        /// ([`SpanInternal::exportSpan`], `spans.rs:605-627`).
-        ///
-        /// **One arm is missing and it is a decision, not an oversight.**
-        /// Upstream re-hydrates the block's map and, if the object turns out not
-        /// to be a map, logs a warning and substitutes an empty one
-        /// (`spans.rs:618-622`). The port has no `hydrate`, so it hands back the
-        /// [`types.ExId`] the row named; see the module doc.
-        pub fn exportSpan(self: Self) Span {
+        /// Detaches all payloads from the source op set.
+        /// Consumes text storage on success only; allocation failure leaves
+        /// this internal span owned by the caller.
+        /// Use the iterator's allocator for `gpa` and the result's deinit.
+        pub fn exportSpan(
+            self: Self,
+            gpa: Allocator,
+            set: *opset.OpSet(O),
+            clock: ?Clock,
+        ) ReadError!Span {
             return switch (self) {
-                .text => |t| .{ .text = .{ .text = t.text, .marks = t.marks } },
-                .obj => |o| .{ .block = o.id.exid() },
+                .text => |t| blk: {
+                    const detached = if (t.marks) |*mark_set|
+                        try mark_set.dup(gpa)
+                    else
+                        null;
+                    var old_marks = t.marks;
+                    if (old_marks) |*mark_set| mark_set.deinit();
+                    break :blk .{ .text = .{ .text = t.text, .marks = detached } };
+                },
+                .obj => |o| blk: {
+                    const value = try hydrate.hydrateMap(
+                        opset.OpSet(O),
+                        set,
+                        gpa,
+                        o.id.exid(),
+                        clock,
+                    );
+                    break :blk .{ .block = value.object.map };
+                },
             };
         }
     };
 }
 
-/// A sequence of block markers and text spans ([`Span`], `spans.rs:409-427`).
-///
-/// **Both payloads are owned**, because upstream's text is a `String` and its
-/// marks are `Arc<MarkSet>`s and the port has no `Arc`: a span must be
-/// releasable, which is why [`deinit`](Span.deinit) takes the allocator back.
-///
-/// The mark **names** inside `marks` are borrowed from the document's string
-/// table and are not freed with the set — the rule
-/// [`batch.MarkDiff.exportSet`] already states.
+/// Owned text runs and block maps. Every byte, mark and actor hint is detached.
+/// Release a returned span once with the allocator used by its iterator.
 pub const Span = union(enum) {
     /// A span of text and the marks that were active for that span
     /// (`spans.rs:412-415`).
@@ -570,28 +572,32 @@ pub const Span = union(enum) {
         /// The marks, or null when the span carries none (`spans.rs:414`).
         marks: ?MarkSet,
     },
-    /// A block marker, and the object it names (`spans.rs:416-417`). Upstream's
-    /// payload is a hydrated map; the id is the row's own.
-    block: ExId,
+    /// The complete block payload, owned independently of the document.
+    block: hydrate.Map,
 
-    /// Gives back every byte this span owns: the text, and the mark set's own
-    /// array. The mark names are the document's and stay.
-    ///
-    /// **And the span is dead once this returns**: the call ends in
-    /// `self.* = undefined`, so a second one reads undefined memory rather
-    /// than reaching an allocator that could diagnose the double free. A
-    /// `.block` arm owns nothing and frees nothing. **The document is
-    /// untouched** — the mark names stay valid in it, so releasing one span
-    /// shortens nobody else's life.
+    /// Releases every payload once. A shallow assignment is an ownership move.
     pub fn deinit(self: *Span, gpa: Allocator) void {
         switch (self.*) {
             .text => |*t| {
                 gpa.free(t.text);
                 if (t.marks) |*m| m.deinit();
             },
-            .block => {},
+            .block => |*block| block.deinit(),
         }
         self.* = undefined;
+    }
+
+    /// Deeply copies all payloads; both spans can be mutated and freed alone.
+    pub fn dup(self: *const Span, gpa: Allocator) Error!Span {
+        return switch (self.*) {
+            .block => |*block| .{ .block = try block.dup(gpa) },
+            .text => |t| blk: {
+                const text = try gpa.dupe(u8, t.text);
+                errdefer gpa.free(text);
+                const mark_set = if (t.marks) |*held| try held.dup(gpa) else null;
+                break :blk .{ .text = .{ .text = text, .marks = mark_set } };
+            },
+        };
     }
 
     /// The text a span reads as ([`Span::as_str`], `spans.rs:421-426`).
@@ -608,6 +614,16 @@ pub const Span = union(enum) {
             .block => placeholder,
         };
     }
+};
+
+/// Borrowed update-spans input. The writer copies block and mark payloads;
+/// every source slice/map/set must remain live only until the call returns.
+pub const SpanInput = union(enum) {
+    block: *const hydrate.Map,
+    text: struct {
+        text: []const u8,
+        marks: ?*const MarkSet = null,
+    },
 };
 
 // ── The fold ────────────────────────────────────────────────────────────────
@@ -906,7 +922,9 @@ const SpanState = struct {
     fn refreshMarks(self: *SpanState, folds: *const batch.RichTextDiff) Error!void {
         self.marks_epoch +%= 1;
         if (self.before) |*b| b.deinit();
+        self.before = null;
         if (self.after) |*a| a.deinit();
+        self.after = null;
         self.before = try copyFold(self.gpa, folds.before.current());
         self.after = try copyFold(self.gpa, folds.after.current());
     }
@@ -947,7 +965,8 @@ const SpanState = struct {
         std.debug.assert(self.next_diff == null);
 
         const flush_needed = if (self.next_text) |next| !next.canExtend(self, diff) else false;
-        const span: ?SpanDiff(O) = if (flush_needed) try SpanState.flush(O, self) else null;
+        var span: ?SpanDiff(O) = if (flush_needed) try SpanState.flush(O, self) else null;
+        errdefer if (span) |*owned| owned.deinit(self.gpa);
 
         if (self.next_text == null) self.next_text = try NextText.init(self, diff);
         const run = &self.next_text.?;
@@ -994,6 +1013,7 @@ const SpanState = struct {
                 }
             } else {
                 var run = try NextText.init(self, .add);
+                errdefer run.deinit(self.gpa);
                 run.marks = null;
                 try run.appendStr(self.gpa, self.encoding, s);
                 self.next_text = run;
@@ -1063,26 +1083,23 @@ const SpanState = struct {
     /// between it never reaches a caller's hands.
     fn flush(comptime O: type, self: *SpanState) Error!?SpanDiff(O) {
         std.debug.assert(self.next_diff == null);
-        var run = self.next_text orelse return null;
-        self.next_text = null;
+        const run = if (self.next_text) |*held| held else return null;
         if (run.len == 0) {
             run.deinit(self.gpa);
+            self.next_text = null;
             return null;
         }
-        const at = self.index;
-        if (run.diff != .del) self.index += run.len;
+        // Transfer an exact allocation-sized slice, not a best-effort shrink.
+        // OOM leaves the complete run in the state for the reader to release.
+        const text = try run.buff.toOwnedSlice(self.gpa);
+        const diff = run.diff;
+        const len = run.len;
         const marks_owned = run.marks;
-        run.marks = null;
-        // **The buffer is handed over, not copied** — and it is handed over
-        // *shunk to its own length*, because an allocator has to be given back
-        // exactly the slice it lent. The run was grown three times to three
-        // characters and its capacity is a hundred and twenty-nine, so handing
-        // the span `buff.items` and freeing that would be an invalid free
-        // rather than a leak.
-        run.buff.shrinkAndFree(self.gpa, run.buff.items.len);
-        const text = run.buff.items;
+        self.next_text = null;
+        const at = self.index;
+        if (diff != .del) self.index += len;
         return .{
-            .diff = run.diff,
+            .diff = diff,
             .span = .{ .text = .{
                 .text = text,
                 .index = at,
@@ -1147,8 +1164,8 @@ const PartialActionValues = struct {
     }
 
     /// Moves the **window** to `rows` and nothing else.
-    pub fn shift(self: *PartialActionValues, rows: RowRange) void {
-        self.inner.shift(rows);
+    pub fn shift(self: *PartialActionValues, rows: RowRange) err.ParseError!void {
+        return self.inner.shift(rows);
     }
 
     /// Repositions onto `rows` and reads the row at its start.
@@ -1713,23 +1730,39 @@ pub fn Spans(comptime O: type) type {
         /// ([`Iterator::next` for `Spans`](../../github-automerge-automerge/rust/automerge/src/iter/spans.rs),
         /// `spans.rs:635-645`).
         ///
-        /// **Takes no allocator and allocates nothing**: the text and the marks
-        /// were built by the fold, out of the allocator [`Spans.init`] was
-        /// given, and this hands them over. [`Span.deinit`](Span.deinit) takes
-        /// that same allocator back.
+        /// Allocates detached block maps and mark payloads using the iterator's
+        /// allocator. The caller releases each returned span once.
         pub fn next(self: *Self) ReadError!?Span {
-            const span = (try self.internal.next()) orelse return null;
-            const exported = span.exportSpan();
-            return exported;
+            const iter = &self.internal.iter;
+            const set = iter.op_set orelse return null;
+            var span = (try self.internal.next()) orelse return null;
+            errdefer span.deinit(iter.state.gpa);
+            return try span.exportSpan(
+                iter.state.gpa,
+                set,
+                switch (iter.clock) {
+                    .current => |clock| clock,
+                    .diff => |clocks| clocks.after,
+                },
+            );
         }
 
         /// Repositions onto `rows` and reads the first span in it
         /// ([`impl Spans`](../../github-automerge-automerge/rust/automerge/src/iter/spans.rs)
         /// via `SpansInternal::shift_next`, `spans.rs:255-257`).
         pub fn shiftNext(self: *Self, rows: RowRange) ReadError!?Span {
-            const span = (try self.internal.shiftNext(rows)) orelse return null;
-            const exported = span.exportSpan();
-            return exported;
+            const iter = &self.internal.iter;
+            const set = iter.op_set orelse return null;
+            var span = (try self.internal.shiftNext(rows)) orelse return null;
+            errdefer span.deinit(iter.state.gpa);
+            return try span.exportSpan(
+                iter.state.gpa,
+                set,
+                switch (iter.clock) {
+                    .current => |clock| clock,
+                    .diff => |clocks| clocks.after,
+                },
+            );
         }
     };
 }
@@ -1865,7 +1898,8 @@ const Table = struct {
             if (std.mem.eql(u8, item, text)) return std.math.cast(u32, i) orelse error.Overflow;
         }
         const id = std.math.cast(u32, self.items.items.len) orelse error.Overflow;
-        try self.items.append(gpa, try gpa.dupe(u8, text));
+        try self.items.ensureUnusedCapacity(gpa, 1);
+        self.items.appendAssumeCapacity(try gpa.dupe(u8, text));
         return id;
     }
 };
@@ -1921,7 +1955,11 @@ fn readAll(set: *Set, obj: ObjId, gpa: Allocator, clock: ?Clock) !std.ArrayList(
     errdefer freeSpans(&out, gpa);
     var reader = try Spans(opmod.Op).init(gpa, set, try set.scopeToObj(obj), clock, encoding);
     defer reader.deinit();
-    while (try reader.next()) |span| try out.append(gpa, span);
+    while (try reader.next()) |span| {
+        var owned = span;
+        errdefer owned.deinit(gpa);
+        try out.append(gpa, owned);
+    }
     return out;
 }
 
@@ -1945,7 +1983,11 @@ fn diffAll(
         encoding,
     );
     defer reader.deinit();
-    while (try reader.next()) |span| try out.append(gpa, span);
+    while (try reader.next()) |span| {
+        var owned = span;
+        errdefer owned.deinit(gpa);
+        try out.append(gpa, owned);
+    }
     return out;
 }
 
@@ -1988,11 +2030,11 @@ fn textOf(span: Span) ![]const u8 {
     };
 }
 
-/// The block id of `span`, or an error when it is text.
+/// The borrowed block metadata id of `span`, or an error when it is text.
 fn blockOf(span: Span) !ExId {
     return switch (span) {
         .text => error.TestUnexpectedResult,
-        .block => |b| b,
+        .block => |b| b.id,
     };
 }
 
@@ -2331,6 +2373,10 @@ test "a block marker is its own span of width one, and the text around it is unt
         row(opId(4, 0), text, head(), true, .set, .{ .str = "ab" }, false, null, &.{}),
         row(opId(6, 0), text, anchored(opId(4, 0)), true, .make_map, .null_value, false, null, &.{}),
         row(opId(5, 0), text, anchored(opId(6, 0)), true, .set, .{ .str = "cd" }, false, null, &.{}),
+        row(opId(8, 0), block, .{ .map = "attrs" }, false, .make_map, .null_value, false, null, &.{}),
+        row(opId(9, 0), block, .{ .map = "kind" }, false, .set, .{ .str = "paragraph" }, false, null, &.{}),
+        row(opId(10, 0), block, .{ .map = "level" }, false, .set, .{ .int = 2 }, false, null, &.{}),
+        row(opId(11, 0), made(8, 0), .{ .map = "align" }, false, .set, .{ .str = "center" }, false, null, &.{}),
     });
     defer doc.destroy();
 
@@ -2349,8 +2395,15 @@ test "a block marker is its own span of width one, and the text around it is unt
     try expectMarks(got.items[0], &.{});
     try expectMarks(got.items[2], &.{});
 
-    // **The block names the object its row made, and reads as one position.**
-    try testing.expect((try blockOf(got.items[1])).eql(block));
+    // The block owns the full hydrated object, including its nested payload.
+    try testing.expect((try blockOf(got.items[1])).eql(doc.set.idToExid(block.opId().?)));
+    try testing.expectEqual(@as(usize, 3), got.items[1].block.count());
+    try testing.expectEqualStrings("paragraph", got.items[1].block.get("kind").?.str);
+    try testing.expectEqual(@as(i64, 2), got.items[1].block.get("level").?.int);
+    const attrs = &got.items[1].block.get("attrs").?.object.map;
+    try testing.expect(attrs.id.eql(doc.set.idToExid(opId(8, 0))));
+    try testing.expectEqual(@as(usize, 1), attrs.count());
+    try testing.expectEqualStrings("center", attrs.get("align").?.str);
     try testing.expectEqualStrings("\u{fffc}", got.items[1].asStr());
     try testing.expectEqual(@as(usize, 1), encoding.width(got.items[1].asStr()));
 
@@ -2372,6 +2425,44 @@ test "a block marker is its own span of width one, and the text around it is unt
     const rendered = try renderAll(got.items, gpa);
     defer gpa.free(rendered);
     try testing.expectEqualStrings("ab\u{fffc}cd", rendered);
+}
+
+test "span collectors release transferred text marks and block maps on allocation failure" {
+    const text = made(1, 0);
+    const block = made(3, 0);
+    const doc = try Fixture.build(testing.allocator, &.{actor_a}, &.{
+        row(opId(1, 0), .root, .{ .map = "t" }, false, .make_text, .null_value, false, null, &.{}),
+        markBegin(opId(5, 0), text, head(), "bold", .{ .bool_value = true }),
+        row(opId(2, 0), text, head(), true, .set, .{ .str = "a" }, false, null, &.{}),
+        row(opId(3, 0), text, anchored(opId(2, 0)), true, .make_map, .null_value, false, null, &.{}),
+        row(opId(4, 0), text, anchored(opId(3, 0)), true, .set, .{ .str = "b" }, false, null, &.{}),
+        markEnd(opId(6, 0), text, anchored(opId(4, 0))),
+        row(opId(7, 0), block, .{ .map = "kind" }, false, .set, .{ .str = "paragraph" }, false, null, &.{}),
+    });
+    defer doc.destroy();
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn exercise(gpa: Allocator, set: *Set, obj: ObjId) !void {
+            var collected = try readAll(set, obj, gpa, null);
+            defer freeSpans(&collected, gpa);
+            try testing.expectEqual(@as(usize, 3), collected.items.len);
+            try testing.expectEqualStrings("a", collected.items[0].asStr());
+            try expectMarks(collected.items[0], &.{
+                .{ .name = "bold", .value = .{ .bool_value = true } },
+            });
+            try testing.expectEqualStrings("paragraph", collected.items[1].block.get("kind").?.str);
+            try testing.expectEqualStrings("b", collected.items[2].asStr());
+
+            var diff = try diffAll(set, obj, gpa, .now());
+            defer {
+                for (diff.items) |*span| span.deinit(gpa);
+                diff.deinit(gpa);
+            }
+            try testing.expectEqual(@as(usize, 3), diff.items.len);
+            try testing.expectEqualStrings("a", diff.items[0].span.text.text);
+            try testing.expect(diff.items[1].span == .obj);
+            try testing.expectEqualStrings("b", diff.items[2].span.text.text);
+        }
+    }.exercise, .{ &doc.set, text });
 }
 
 test "nested marks and overlapping marks give different sets, and the difference is what a reader renders" {
@@ -2482,6 +2573,7 @@ test "a scoped read differs from an unscoped one and is a span-for-span prefix o
         row(opId(2, 0), text, head(), true, .set, .{ .str = "ab" }, false, null, &.{}),
         row(opId(5, 0), text, anchored(opId(2, 0)), true, .make_map, .null_value, false, null, &.{}),
         row(opId(7, 0), text, anchored(opId(5, 0)), true, .set, .{ .str = "cd" }, false, null, &.{}),
+        row(opId(6, 0), block, .{ .map = "kind" }, false, .set, .{ .str = "paragraph" }, false, null, &.{}),
     });
     defer doc.destroy();
 
@@ -2508,7 +2600,9 @@ test "a scoped read differs from an unscoped one and is a span-for-span prefix o
             encoding.width(unscoped.items[i].asStr()),
         );
     }
-    try testing.expect((try blockOf(scoped.items[1])).eql(block));
+    try testing.expect((try blockOf(scoped.items[1])).eql(doc.set.idToExid(block.opId().?)));
+    try testing.expectEqualStrings("paragraph", scoped.items[1].block.get("kind").?.str);
+    try testing.expect(scoped.items[1].block.eql(&unscoped.items[1].block));
 }
 
 test "the diff says same, add and del, a deleted span costs no index, and a changed span is marked not replaced" {
@@ -2633,7 +2727,7 @@ test "the diff says same, add and del, a deleted span costs no index, and a chan
     // did not move — and it carries the mark that arrived with it, so a patch
     // consumer is told "this text, now bold" rather than being handed an
     // unmarked replacement for it.
-    var exported = got.items[0].exportSpan();
+    var exported = try got.items[0].exportSpan(gpa, &doc.set, after);
     // `exportSpan` moved the payload out of the item, so the item now holds a
     // pointer it no longer owns; clear it before the loop below frees it.
     got.items[0] = .{ .diff = .same, .span = .{ .obj = .{
@@ -2654,6 +2748,7 @@ test "empty text reads as nothing, and a text holding only a block reads as that
         row(opId(1, 0), .root, .{ .map = "e" }, false, .make_text, .null_value, false, null, &.{}),
         row(opId(2, 0), .root, .{ .map = "b" }, false, .make_text, .null_value, false, null, &.{}),
         row(opId(3, 0), only_block, head(), true, .make_map, .null_value, false, null, &.{}),
+        row(opId(4, 0), block, .{ .map = "kind" }, false, .set, .{ .str = "paragraph" }, false, null, &.{}),
     });
     defer doc.destroy();
 
@@ -2674,7 +2769,8 @@ test "empty text reads as nothing, and a text holding only a block reads as that
         var got = try readAll(&doc.set, only_block, gpa, null);
         defer freeSpans(&got, gpa);
         try testing.expectEqual(@as(usize, 1), got.items.len);
-        try testing.expect((try blockOf(got.items[0])).eql(block));
+        try testing.expect((try blockOf(got.items[0])).eql(doc.set.idToExid(block.opId().?)));
+        try testing.expectEqualStrings("paragraph", got.items[0].block.get("kind").?.str);
         try testing.expectEqual(@as(usize, 1), try doc.set.seqLength(only_block, encoding, null));
         const rendered = try renderAll(got.items, gpa);
         defer gpa.free(rendered);
@@ -2856,26 +2952,23 @@ test "a span outlives the reader that produced it, and freeing the reader does n
     defer doc.destroy();
     const rows = try doc.set.scopeToObj(text);
 
-    var reader = try Spans(opmod.Op).init(gpa, &doc.set, rows, null, encoding);
-    // **Constructing a reader allocates nothing**, so this is the line the
-    // span's own bytes are measured against.
-    try testing.expectEqual(@as(usize, 0), counter.allocated_bytes - counter.freed_bytes);
+    const held = blk: {
+        var reader = try Spans(opmod.Op).init(gpa, &doc.set, rows, null, encoding);
+        defer reader.deinit();
+        // Constructing a reader allocates nothing.
+        try testing.expectEqual(@as(usize, 0), counter.allocated_bytes - counter.freed_bytes);
+        break :blk (try reader.next()) orelse return error.TestExpectedItem;
+    };
 
-    const held = (try reader.next()) orelse return error.TestExpectedItem;
-    reader.deinit();
+    {
+        var owned = held;
+        defer owned.deinit(gpa);
+        // The reader is gone; the span's bytes and marks remain independent.
+        try testing.expectEqualStrings("ab", try textOf(owned));
+        try expectMarks(owned, &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
+    }
 
-    // **The reader is gone and the span still reads.** Its run buffer was
-    // handed over rather than borrowed and its mark set was exported afresh, so
-    // nothing it names belongs to the fold this call just released — and
-    // `testing.allocator` is what would say so if it did.
-    try testing.expectEqualStrings("ab", try textOf(held));
-    try expectMarks(held, &.{.{ .name = "bold", .value = .{ .bool_value = true } }});
-
-    // **And the span still owns what it was handed**, which is the other half
-    // of the same sentence: the count goes back to where constructing the
-    // reader found it, and only because the caller gave the bytes back.
-    var owned = held;
-    owned.deinit(gpa);
+    // The span and reader both released their independent storage exactly once.
     try testing.expectEqual(@as(usize, 0), counter.allocated_bytes - counter.freed_bytes);
 }
 
@@ -3044,6 +3137,17 @@ test "a marked text of many rows reads as one span, and its marks are copied per
             const begin_id = opId(@intCast(n + 2), 0);
             const end_id = opId(@intCast(n + 3), 0);
             var prev: OpId = begin_id;
+            try out.append(gpa, row(
+                text_obj.opId().?,
+                .root,
+                .{ .map = "t" },
+                false,
+                .make_text,
+                .null_value,
+                false,
+                null,
+                &.{},
+            ));
             try out.append(gpa, markBegin(begin_id, text_obj, head(), "bold", .{ .bool_value = true }));
             for (0..n) |i| {
                 const id = opId(@intCast(i + 2), 0);
@@ -3216,4 +3320,76 @@ test "a mark that opens and closes with no text between still splits no run" {
     // **`em` must not reach the span at all**, asserted by name so a span
     // carrying `em` plus something else is still a failure.
     try expectNoMark(got.items[0], "em");
+}
+
+test "parity rich span copies survive source teardown with detached marks and block actors" {
+    const gpa = testing.allocator;
+    var mark_name = [_]u8{ 'l', 'i', 'n', 'k' };
+    var mark_bytes = [_]u8{ 'u', 'r', 'l' };
+    var source_text = blk: {
+        var source_marks = MarkSet.init(gpa);
+        errdefer source_marks.deinit();
+        try source_marks.put(&mark_name, .{ .str = &mark_bytes });
+        break :blk Span{ .text = .{
+            .text = try gpa.dupe(u8, "text"),
+            .marks = source_marks,
+        } };
+    };
+    var copied_text = source_text.dup(gpa) catch |failure| {
+        source_text.deinit(gpa);
+        return failure;
+    };
+    defer copied_text.deinit(gpa);
+    source_text.deinit(gpa);
+    @memset(&mark_name, '!');
+    @memset(&mark_bytes, '!');
+    try testing.expectEqualStrings("text", copied_text.asStr());
+    const copied_marks = &copied_text.text.marks.?;
+    try testing.expectEqualStrings("link", copied_marks.entries.items[0].name);
+    try testing.expectEqualStrings("url", copied_marks.entries.items[0].value.str);
+
+    var actor_bytes = [_]u8{ 0x12, 0x34 };
+    const actor = types.ActorId.init(&actor_bytes);
+    var copied_block = blk: {
+        var source_block = Span{ .block = hydrate.Map.init(
+            gpa,
+            ExId.withActor(opId(7, 0), actor),
+        ) };
+        defer source_block.deinit(gpa);
+        try source_block.block.putOwned("actor", hydrate.MapValue.init(
+            .{ .actor_id = actor },
+            false,
+        ));
+        break :blk try source_block.dup(gpa);
+    };
+    defer copied_block.deinit(gpa);
+    @memset(&actor_bytes, 0xff);
+    try testing.expectEqualStrings(&.{ 0x12, 0x34 }, copied_block.block.id.named.actor.bytes);
+    try testing.expectEqualStrings(&.{ 0x12, 0x34 }, copied_block.block.get("actor").?.actor_id.bytes);
+    try testing.expectEqual(@as(usize, 1), copied_block.block.count());
+}
+
+test "parity rich span deep duplication releases partial copies on OOM" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn exercise(gpa: Allocator) !void {
+            var source = blk: {
+                var source_marks = MarkSet.init(gpa);
+                errdefer source_marks.deinit();
+                try source_marks.put("link", .{ .str = "target" });
+                break :blk Span{ .text = .{
+                    .text = try gpa.dupe(u8, "body"),
+                    .marks = source_marks,
+                } };
+            };
+            defer source.deinit(gpa);
+            var copied = source.dup(gpa) catch |failure| {
+                try testing.expectEqualStrings("body", source.asStr());
+                try testing.expectEqualStrings("target", source.text.marks.?.entries.items[0].value.str);
+                return failure;
+            };
+            defer copied.deinit(gpa);
+            try testing.expectEqualStrings("body", copied.asStr());
+            try testing.expect(copied.text.marks.?.eql(&source.text.marks.?));
+        }
+    }.exercise, .{});
 }

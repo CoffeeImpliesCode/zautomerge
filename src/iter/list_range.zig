@@ -207,12 +207,8 @@ pub const IndexRange = struct {
 /// [`intoOwned`](ListRangeItem.intoOwned) is the copy for a caller that has to
 /// hold one across a mutation.
 ///
-/// **The id is a second borrow**: resolving it reads the op set's actor table
-/// ([`ExIdPromise`]), and the [`ExId`] it produces holds **the actor's bytes**,
-/// which in a document are that document's arena ([`ExId.Named.actor`],
-/// `types.zig:280-288`). Neither [`intoOwned`](ListRangeItem.intoOwned) nor any
-/// other copy of this row releases it — the borrow survives the copy, so an
-/// owned element still has to be read while the document is alive.
+/// Resolving an ID borrows actor bytes until document teardown; `intoOwned`
+/// makes an independent copy alongside value payloads.
 ///
 /// **A sequence key is not a payload here.** The map reader's row carries the
 /// key out of the string table ([`MapRangeItem`]); this one carries no key,
@@ -268,54 +264,25 @@ pub fn ListRangeItem(comptime O: type) type {
             return self.maybe_exid.exid();
         }
 
-        /// A copy that owns its value
-        /// ([`ListRangeItem::into_owned`](../../github-automerge-automerge/rust/automerge/src/iter/list_range.rs), `list_range.rs:30-37`).
-        ///
-        /// # What survives a failure
-        ///
-        /// **Nothing.** The only reachable error is `error.OutOfMemory`, from
-        /// the one allocating step ([`ValueRef.intoOwned`](../../opset/types.zig)),
-        /// and it is the **last** fallible step before the item is built, so on
-        /// the error path the caller owns nothing and the row it passed in is
-        /// untouched. There is no partial copy to release and no key copy to
-        /// release, because this row has no key.
-        ///
-        /// # What the copy does *not* detach
-        ///
-        /// **`id` is still a borrow.** The copy resolves the promise and drops
-        /// the op set pointer, which is upstream's `into_owned`, but an [`ExId`]
-        /// is a counter plus **the actor's bytes** — in a document, that
-        /// document's arena ([`ExId.Named.actor`](../../src/types.zig),
-        /// `types.zig:280-288`). Nothing here copies or releases those bytes,
-        /// so an owned element still cannot outlive the document it was read
-        /// from; see [`OwnedListRangeItem`]'s field comment.
+        /// Copies scalar payloads and resolved ID actor bytes (`list_range.rs:30-37`).
+        /// The result survives document teardown. OOM transfers nothing and
+        /// leaves this borrowed item untouched.
         pub fn intoOwned(self: Self, gpa: Allocator) !OwnedListRangeItem {
+            var id_copy = try self.maybe_exid.exid().dup(gpa);
+            errdefer id_copy.deinitOwned(gpa);
             return .{
                 .index = self.index,
                 .width = self.width,
                 .value = try self.value.intoOwned(gpa),
                 .conflict = self.conflict,
-                .id = self.maybe_exid.intoOwned().exid(),
+                .id = id_copy,
             };
         }
     };
 }
 
-/// A [`ListRangeItem`] that owns its value
-/// ([`ListRangeItem<'static>`](../../github-automerge-automerge/rust/automerge/src/iter/list_range.rs), `list_range.rs:30`).
-///
-/// # "Owns its value" is the whole of what it owns
-///
-/// **`id` is not owned.** Upstream's `ExId::Id` holds an `ActorId` by value and
-/// its `ActorId` owns a `Vec<u8>` of actor bytes
-/// ([`exid.rs:17`](../../github-automerge-automerge/rust/automerge/src/exid.rs)),
-/// so `into_owned` has nothing to drop. The port's [`ExId`] **borrows** those
-/// bytes from whoever interned the actor ([`ExId.Named.actor`](../../src/types.zig),
-/// `types.zig:280-288`), and [`ListRangeItem.intoOwned`] resolves the promise
-/// without copying them — so an `OwnedListRangeItem` **still has to be read
-/// while the document is alive**, and neither
-/// [`deinit`](OwnedListRangeItem.deinit) nor any other call on this type
-/// releases or extends that borrow.
+/// A fully independent list item, owning value payloads and ID actor bytes.
+/// Copies share one owner and must not be released twice (`list_range.rs:30-37`).
 pub const OwnedListRangeItem = struct {
     /// Which visible element this is.
     index: usize,
@@ -328,28 +295,13 @@ pub const OwnedListRangeItem = struct {
     value: OwnedValueRef,
     /// Whether the element's register holds more than one visible value.
     conflict: bool,
-    /// The row's id, already resolved.
-    ///
-    /// **Still borrowing the actor's bytes** from the document that interned
-    /// the actor — the type's first section. This is the one field
-    /// [`ListRangeItem.intoOwned`] does not detach and
-    /// [`deinit`](OwnedListRangeItem.deinit) does not release.
+    /// The resolved ID, including independently owned actor bytes.
     id: ExId,
 
-    /// Gives back every byte [`ListRangeItem.intoOwned`] allocated, and nothing
-    /// this item borrowed.
-    ///
-    /// **Once, on the one owner, with the allocator the copy was taken with.**
-    /// The receiver is a pointer and the body ends in `self.* = undefined`, so a
-    /// second call reads undefined storage rather than freeing the value twice;
-    /// a **copy** carries those bytes but not the teardown, so deiniting both a
-    /// copy and the original is a double free. A *move* is fine.
-    ///
-    /// **The `id`'s actor bytes are not among the bytes this frees** — they
-    /// belong to the document, and a caller that outlives the document has to
-    /// keep its own copy of the actor (see the type's first section).
+    /// Releases all owned payloads exactly once with the constructor allocator.
     pub fn deinit(self: *OwnedListRangeItem, gpa: Allocator) void {
         self.value.deinit(gpa);
+        self.id.deinitOwned(gpa);
         self.* = undefined;
     }
 };
@@ -414,11 +366,8 @@ pub const ListEntry = struct {
 /// A walk of a sequence object's rows, one entry per row ([`ListIter`],
 /// [`list_range.rs:261-321`](../../github-automerge-automerge/rust/automerge/src/iter/list_range.rs)).
 ///
-/// **No step of its own**, for the reason [`iter/map_range.zig`](map_range.zig)'s
-/// [`MapIter`](map_range.zig) gives: [`tools.takeAt`](tools.zig#L232) reaches
-/// for the positional entry point first, this walk has [`shiftNext`], and a
-/// walk with no `next` cannot be handed to [`tools.Unshift`] — which is why
-/// [`ListDiff`] wraps the diff kernel and not this.
+/// Contiguous reads consume four forward streams. [`tools.takeAt`] selects
+/// the partial `next` for zero skips, including the final exhausted sentinel.
 ///
 /// **The insert count is a running sum, not a per-row flag**, and that is what
 /// makes two rows one element: the `insert` column is a prefix column, so
@@ -490,13 +439,40 @@ pub const ListIter = struct {
         return self.advanceTo(self.pos() +| amount);
     }
 
-    /// Moves the **window** to `rows` and nothing else
-    /// ([`Column.Iterator.shift`](../hexane/column.zig), `column.rs:538-545`).
-    pub fn shift(self: *ListIter, rows: RowRange) void {
-        self.id.shift(rows);
-        self.inserts.shift(rows);
-        self.action.shift(rows);
-        self.value.shift(rows);
+    /// Repositions all windows atomically. A typed refusal leaves every
+    /// cursor and window unchanged (`column.rs:538-545`).
+    pub fn shift(self: *ListIter, rows: RowRange) ReadError!void {
+        var staged = self.*;
+        try staged.id.shift(rows);
+        try staged.inserts.shift(rows);
+        try staged.action.shift(rows);
+        try staged.value.shift(rows);
+        self.* = staged;
+    }
+
+    /// Reads one row from the forward streams (`list_range.rs:301-310`).
+    /// Exhausted total readers remain partial, just as in `shiftNext`.
+    pub fn next(self: *ListIter) ReadError!?ListEntry {
+        const actor = try self.id.actor.next();
+        const ctr = try self.id.ctr.next();
+        const inserts = try self.inserts.next();
+        const action = if (self.action.pos() < self.action.maxPos())
+            try self.action.tryNext()
+        else
+            null;
+        const value = if (self.value.pos() < self.value.maxPos())
+            try self.value.tryNext()
+        else
+            null;
+        if (actor == null or ctr == null or inserts == null or action == null or value == null)
+            return null;
+        return ListEntry.init(
+            inserts.?.total(),
+            action.?,
+            value.?,
+            OpId.init(ctr.?, actor.?),
+            self.id.pos() - 1,
+        );
     }
 
     /// Repositions onto `rows` and reads the row at its start
@@ -535,13 +511,7 @@ comptime {
     // Claiming a nullable mark here would say "sometimes", which is not true
     // and would let a caller that checked it be told nothing.
     //
-    // **The mark does not claim a `next`, and does not need one.** The kernel
-    // is upstream's eight names (`shift.rs:19-74`) and `next` is not among
-    // them. [`tools.takeAt`](tools.zig#L232) falls through to `shiftNext` for
-    // a walk with no partial step (`tools.zig:232-246`), which is the same
-    // dispatch [`OpSet.actionValueIter`] makes over
-    // [`opiter.ActionValueIter`] — a walk with a total step and a positional
-    // entry point, and no `next` either.
+    // The partial `next` is additional to the eight positional kernel methods.
     _ = ListIter.shiftable;
 }
 
@@ -602,22 +572,18 @@ pub fn ListDiffItem(comptime O: type) type {
         /// to read. `rows` is the object's row range, which is what bounds it,
         /// and `elems` is the walk that finds the element's last row.
         ///
-        /// **`elems` is the caller's and is reused across elements**, which is
-        /// what makes a walk of ascending elements cost five `setMax` calls an
-        /// element rather than the ten column cursors
-        /// [`OpSet.elemidAt`](../../opset/op_set.zig) builds; see
-        /// [`elementWidth`]. It owns nothing and has no `deinit`, and the op
-        /// set must not be written while it is live — the same rule every walk
-        /// this op set hands out is under.
+        /// `elems` and `widths` are caller-held borrowed cursors reused across
+        /// elements. Neither owns storage, and mutation invalidates both.
         pub fn exportItem(
             self: Self,
             set: *opset.OpSet(O),
             elems: *opset.OpSet(O).ElemCursor,
+            widths: *opcols.TextColumn.Iterator,
             rows: RowRange,
         ) ReadError!?ListRangeItem(O) {
             return .{
                 .index = self.index,
-                .width = try elementWidth(O, set, elems, self.pos, rows.end),
+                .width = try elementWidth(O, set, elems, widths, self.pos, rows.end),
                 .value = self.value,
                 .conflict = self.conflict,
                 .maybe_exid = ExIdPromise(O).init(set, self.id),
@@ -896,46 +862,28 @@ pub fn ListDiff(comptime O: type) type {
 /// row it wrote it on. A row with no width — a mark, a row that is not a
 /// winner — is zero.
 ///
-/// # Why the cursor is the caller's, and not built here
-///
-/// **`elemidAt` cannot reuse anything**, and this is why it is not called here
-/// any more. It builds a fresh [`OpSet.ElemCursor`](../../opset/op_set.zig) and
-/// hands it straight to [`ElemWalk.at`](../../opset/op_set.zig), which sees a
-/// cursor that has never been placed and so takes [`ElemWalk.seek`]'s **rebuild**
-/// arm — five more `iterRange` calls (`op_set.zig:5855-5860`). That is **ten**
-/// column cursors built per element, of which the five `elemCursor` built are
-/// overwritten before anything reads them (`op_set.zig:3516-3519`,
-/// `:3544-3548`).
-///
-/// A caller walking elements in **ascending row order** never needs that: the
-/// cursor is already placed and the row it names is at or ahead of where it
-/// stands, so `seek` takes its **move** arm — `setMax` plus a forward
-/// `advanceTo` that is a no-op at the position asked for
-/// (`op_set.zig:5843-5849`). Five `setMax` calls per element, and no
-/// re-positioning of any column.
-///
-/// **Moving only goes forwards, so the answer never depends on the order the
-/// caller asked in**, which is what makes a held cursor a drop-in for
-/// `elemidAt` rather than a second contract
-/// ([`ElemWalk.at`](../../opset/op_set.zig)). [`ListRange`](ListRange) holds
-/// the one cursor; a caller that asks out of order gets the rebuild arm and
-/// the same answer.
+/// Both cursors are borrowed and held across ascending elements. `elems`
+/// resolves the complete register, including invisible rows; `widths` then
+/// consumes the text-index column forwards to that register's last row.
+/// A backwards or repeated request rebuilds only the width cursor.
 fn elementWidth(
     comptime O: type,
     set: *opset.OpSet(O),
     elems: *opset.OpSet(O).ElemCursor,
+    widths: *opcols.TextColumn.Iterator,
     pos: usize,
     end: usize,
 ) ReadError!usize {
     const elem = (try elems.at(pos, end)) orelse return 0;
-    // `Column.get` answers three deep: "no such row"
-    // ([`column.zig:1718-1719`](../hexane/column.zig)), then the column's own
-    // `?u32` — null on a row that is not a `top` row, and
-    // `index.text` is null there ([`columns.rs:466-471`](../../github-automerge-automerge/rust/automerge/src/op_set2/columns.rs))
-    // — and then the width. Two of the three peels are "no width", and they
-    // are both zero, so they are written as one line each rather than
-    // collapsed.
-    const cell = (try set.cols.index.text.get(elem.last_pos)) orelse return 0;
+    if (elem.last_pos < widths.pos()) {
+        widths.* = try set.cols.index.text.iterRange(.{ .start = elem.last_pos, .end = end });
+    } else {
+        widths.setMax(end);
+    }
+    const cell = (if (elem.last_pos == widths.pos())
+        try widths.next()
+    else
+        try widths.seekTo(elem.last_pos)) orelse return 0;
     const width = cell orelse return 0;
     return std.math.cast(usize, width) orelse error.Overflow;
 }
@@ -954,14 +902,9 @@ pub fn ListWalk(comptime O: type) type {
 /// A sequence object's visible elements, one at a time ([`ListRange`],
 /// [`list_range.rs:255-357`](../../github-automerge-automerge/rust/automerge/src/iter/list_range.rs)).
 ///
-/// Constructing one allocates nothing: four column cursors, the width read's
-/// own element cursor, a skipper and a lookahead, all of them values over
+/// Constructing one allocates nothing: four row streams, an element cursor,
+/// a forward text-width cursor, a skipper and lookahead, all borrowed from
 /// storage the op set already holds.
-///
-/// **The element cursor is what a whole-object walk costs its shape on.** It is
-/// built once and moved across elements, so the width read costs what a row
-/// costs rather than what re-positioning five columns costs; see
-/// [`elementWidth`] and [`ListRange.elems`].
 ///
 /// **It owns nothing and has no `deinit`.** Everything it holds is borrowed —
 /// the op set and the clock behind [`ListDiff`] — and the walks read the op set's
@@ -982,27 +925,13 @@ pub fn ListRange(comptime O: type) type {
         /// empty read [`IndexRange`] documents, not an error — see its first
         /// section.
         range: IndexRange,
-        /// The walk the width read is made through, **held across elements**
-        /// ([`OpSet.elemCursor`](../../opset/op_set.zig)).
-        ///
-        /// **This is what makes a walk of a whole object linear in its
-        /// elements rather than in its rows.** [`OpSet.elemidAt`] builds a
-        /// fresh cursor per call and hands it to a method that finds it
-        /// unplaced, so every element re-positions five columns from the slab
-        /// start (`op_set.zig:3516-3519`, `:5855-5860`). One cursor here takes
-        /// [`ElemWalk.seek`]'s **move** arm instead, because elements arrive in
-        /// ascending row order (`op_set.zig:5843-5849`); see [`elementWidth`].
-        ///
-        /// **It borrows the op set and is not a second owner of it.** The op
-        /// set has to outlive this reader and must not be written while it is
-        /// live — the rule every walk this op set hands out is under, and the
-        /// one this reader's other four cursors are already under. **A width
-        /// read of rows behind where it stands answers the same**: `seek`
-        /// rebuilds the five for such a row rather than rewinding them, so no
-        /// order of `at` calls changes an answer. **A `shiftNext` that put the
-        /// reader's own rows behind it never reaches this cursor at all** — see
-        /// [`shiftNext`](ListRange.shiftNext).
+        /// Borrowed complete-register resolver, held across elements.
+        /// It includes invisible rows and permits backward requests by
+        /// rebuilding its cursors. Mutation invalidates the borrow.
         elems: opset.OpSet(O).ElemCursor,
+        /// Borrowed forward text-index stream; widths are read on the complete
+        /// register's last row, not necessarily its last visible row.
+        widths: opcols.TextColumn.Iterator,
 
         /// The reader over the object's `rows`, as the states `clock` names see
         /// them, restricted to `range`
@@ -1029,6 +958,7 @@ pub fn ListRange(comptime O: type) type {
                 .iter = try ListDiff(O).init(set, obj_rows, .{ .current = clock }),
                 .range = range,
                 .elems = try set.elemCursor(),
+                .widths = try set.cols.index.text.iterRange(column.clampRange(obj_rows, set.len())),
             };
         }
 
@@ -1053,7 +983,7 @@ pub fn ListRange(comptime O: type) type {
             while (true) {
                 const item = (try self.iter.next()) orelse return null;
                 if (!self.range.contains(item.index)) continue;
-                return item.exportItem(self.iter.op_set, &self.elems, self.iter.rows);
+                return item.exportItem(self.iter.op_set, &self.elems, &self.widths, self.iter.rows);
             }
         }
 
@@ -1068,16 +998,9 @@ pub fn ListRange(comptime O: type) type {
         /// reader's [`MapRange.shiftNext`](map_range.zig) needs only the first
         /// because it has no width to bound.
         ///
-        /// **`elems` is not repositioned here, and does not have to be.** It is
-        /// the width read's own cursor and it answers in any order
-        /// ([`ElemWalk.at`](../../opset/op_set.zig), `op_set.zig:5892-5900`):
-        /// `seek` moves the five forwards and rebuilds them for a row behind
-        /// them (`op_set.zig:5938-5962`), and the two paths differ in what they
-        /// read on the way to the row and not in what they answer. **A legal
-        /// shift cannot put the reader behind its own window** — the window's
-        /// start is at or ahead of where this reader stands, and `elems` never
-        /// stands beyond that — so the next width read is at or ahead of the
-        /// five and is served by moving them.
+        /// The width cursors are held across forward object shifts. The next
+        /// width read extends the text-index window and advances to the complete
+        /// register's last row. They own no persistent or authoritative cache.
         ///
         /// **A range that starts behind the reader is `error.InvalidValue`**, and
         /// that is upstream's rule and not this port's: the four row cursors are
@@ -1195,7 +1118,8 @@ const Table = struct {
             if (std.mem.eql(u8, item, text)) return std.math.cast(u32, i) orelse error.Overflow;
         }
         const id = std.math.cast(u32, self.items.items.len) orelse error.Overflow;
-        try self.items.append(gpa, try gpa.dupe(u8, text));
+        try self.items.ensureUnusedCapacity(gpa, 1);
+        self.items.appendAssumeCapacity(try gpa.dupe(u8, text));
         return id;
     }
 };
@@ -1594,7 +1518,7 @@ test "an empty sequence reads as nothing, and a range past its end reads as noth
 
 test "a half-open index range is the shape the C binding builds, and `end - 1` is the last element it answers" {
     const gpa = testing.allocator;
-    const list = made(2, 0);
+    const list = made(1, 0);
     // **`test_get_range_values`'s list**
     // ([`automerge-c/test/list_tests.c:233-241`](../../github-automerge-automerge/rust/automerge-c/test/list_tests.c)):
     // eight elements named `First`…`Eighth`, which is what the case's
@@ -1874,7 +1798,7 @@ test "an owned list item frees every byte it copied" {
     try testing.expectEqual(@as(usize, 0), owned.index);
     try testing.expectEqual(@as(usize, 1), owned.width);
     try expectValue(owned.value.value, .{ .scalar = .{ .str = "a" } });
-    try testing.expect(owned.id.eql(.{ .id = opId(2, 0) }));
+    try testing.expectEqual(opId(2, 0), owned.id.opId().?);
 }
 
 test "a five-element list with one register written twice reads five elements, the later value, and a conflict only there" {
@@ -2074,3 +1998,115 @@ test "an element's net counter change wraps when the diff's two clocks are concu
 //   `list_range_bounds`'s `..`, `..=3` and `1..=3` arms have no port
 //   equivalent, and the case is covered by the eight shapes of "a half-open
 //   index range is the shape the C binding builds" instead.
+
+test "API parity owned list result survives document destruction" {
+    const gpa = testing.allocator;
+    const list = made(1, 0);
+    var owned = blk: {
+        const actor_bytes = try gpa.dupe(u8, &.{ 0, 255, 128 });
+        defer gpa.free(actor_bytes);
+        const doc = try Fixture.build(gpa, &.{types.ActorId.init(actor_bytes)}, &.{
+            row(opId(1, 0), .root, .{ .map = "l" }, false, .make_list, .null_value, &.{}),
+            row(opId(2, 0), list, head(), true, .set, .{ .str = "a" }, &.{}),
+        });
+        defer doc.destroy();
+        var got = try readAll(&doc.set, list, gpa, null);
+        defer got.deinit(gpa);
+        break :blk try got.items[0].intoOwned(gpa);
+    };
+    defer owned.deinit(gpa);
+    try expectValue(owned.value.value, .{ .scalar = .{ .str = "a" } });
+    try testing.expectEqualSlices(u8, &.{ 0, 255, 128 }, owned.id.actorBytes().?.bytes);
+}
+
+test "API parity failed list reposition preserves the next unread element and index" {
+    const gpa = testing.allocator;
+    const list = made(1, 0);
+    const doc = try Fixture.build(gpa, &.{actor_a}, &.{
+        row(opId(1, 0), .root, .{ .map = "l" }, false, .make_list, .null_value, &.{}),
+        row(opId(2, 0), list, head(), true, .set, .{ .str = "a" }, &.{}),
+        row(opId(3, 0), list, anchored(opId(2, 0)), true, .set, .{ .str = "b" }, &.{}),
+    });
+    defer doc.destroy();
+    const rows = try doc.set.scopeToObj(list);
+    var range = try ListRange(opmod.Op).init(&doc.set, rows, null, .all());
+    try testing.expectEqual(@as(usize, 0), (try range.next()).?.index);
+    try testing.expectError(error.InvalidValue, range.shiftNext(rows));
+    const next = (try range.next()).?;
+    try testing.expectEqual(@as(usize, 1), next.index);
+    try expectValue(next.value, .{ .scalar = .{ .str = "b" } });
+    try testing.expect((try range.next()) == null);
+}
+
+test "list row steps match positional reads and retain complete invisible register widths" {
+    const gpa = testing.allocator;
+    const text = made(1, 0);
+    const doc = try Fixture.build(gpa, &.{actor_a}, &.{
+        row(opId(1, 0), .root, .{ .map = "t" }, false, .make_text, .null_value, &.{}),
+        row(opId(2, 0), text, head(), true, .set, .{ .str = "old" }, &.{.{ .id = opId(3, 0), .inc = null }}),
+        row(opId(3, 0), text, anchored(opId(2, 0)), false, .set, .{ .str = "wider" }, &.{}),
+        row(opId(4, 0), text, anchored(opId(2, 0)), true, .set, .{ .str = "x" }, &.{}),
+    });
+    defer doc.destroy();
+    const rows = try doc.set.scopeToObj(text);
+    var forward = ListIter.init(
+        try doc.set.idIterRange(rows),
+        try doc.set.insertAccRange(rows),
+        try doc.set.actionIterRange(rows),
+        try doc.set.valueIterRange(rows),
+    );
+    var positional = forward;
+    var shifted = forward;
+    try shifted.shift(.{ .start = rows.start + 1, .end = rows.end });
+    try testing.expectEqualStrings("wider", (try shifted.next()).?.value.str);
+    try testing.expectEqualStrings("x", (try shifted.next()).?.value.str);
+    try testing.expect((try shifted.next()) == null);
+    for (rows.start..rows.end) |pos| {
+        const got = (try forward.next()).?;
+        const want = (try positional.shiftNext(.{ .start = pos, .end = rows.end })).?;
+        try testing.expectEqual(want.id, got.id);
+        try testing.expectEqual(want.pos, got.pos);
+        try testing.expectEqual(want.inserts, got.inserts);
+        try testing.expectEqual(want.action, got.action);
+        try testing.expect(want.value.eql(got.value));
+    }
+    try testing.expect((try forward.next()) == null);
+    try testing.expect((try forward.next()) == null);
+    var clock = try clockUpTo(gpa, 2);
+    defer clock.deinit();
+    var historical = try ListRange(opmod.Op).init(&doc.set, rows, clock, .all());
+    const item = (try historical.next()).?;
+    try expectValue(item.value, .{ .scalar = .{ .str = "old" } });
+    // The later invisible row completes this register and holds its current width.
+    try testing.expectEqual(@as(usize, 5), item.width);
+    try testing.expect((try historical.next()) == null);
+}
+
+test "short list row streams return partial exhaustion" {
+    const gpa = testing.allocator;
+    const list = made(1, 0);
+    const doc = try Fixture.build(gpa, &.{actor_a}, &.{
+        row(opId(1, 0), .root, .{ .map = "l" }, false, .make_list, .null_value, &.{}),
+        row(opId(2, 0), list, head(), true, .set, .{ .str = "payload" }, &.{}),
+    });
+    defer doc.destroy();
+    const rows = try doc.set.scopeToObj(list);
+    for (0..5) |short_column| {
+        var iter = ListIter.init(
+            try doc.set.idIterRange(rows),
+            try doc.set.insertAccRange(rows),
+            try doc.set.actionIterRange(rows),
+            try doc.set.valueIterRange(rows),
+        );
+        switch (short_column) {
+            0 => iter.id.actor.setMax(rows.start),
+            1 => iter.id.ctr.setMax(rows.start),
+            2 => iter.inserts.setMax(rows.start),
+            3 => iter.action.setMax(rows.start),
+            4 => iter.value.setMax(rows.start),
+            else => unreachable,
+        }
+        try testing.expect((try iter.next()) == null);
+        try testing.expect((try iter.next()) == null);
+    }
+}

@@ -762,14 +762,13 @@ There is **no separate handshake message**. The handshake is: the initiator emit
 
 ## Zig mapping notes
 
-**Traits.** `SyncDoc` is a plain object-safe trait with three methods, two of which take `&mut self` *and* `&mut State`. Zig has no trait objects. The natural mapping is free functions:
+**Traits.** Rust `SyncDoc` has three methods. `AutoCommit.sync()` closes pending writes and returns a borrowed native `Sync`.
+The owner must stay live at the same address during use (`src/autocommit.zig:375-430`).
+Raw `Document` sync uses the existing protocol functions, without an automatic transaction owner.
 
-```zig
-pub fn generateSyncMessage(doc: *const Automerge, st: *State) ?Message;
-pub fn receiveSyncMessage(doc: *Automerge, st: *State, msg: Message) AutomergeError!void;
-```
-
-`SyncWrapper<'a>` (`autocommit.rs:1301-1344`) exists only to (a) `ensure_transaction_closed()` and (b) route to `AutoCommit`'s own `patch_log` vs `PatchLog::null()` when the doc is in isolation mode (`autocommit.rs:1316-1330`). In Zig that is an explicit `ensureTransactionClosed()` at the call site plus one branch, not a decorator. No GAT, no `dyn`+assoc-type, no `pin`, no proc macro, no `unsafe` anywhere in the sync module.
+`SyncWrapper<'a>` (`autocommit.rs:1301-1344`) closes the transaction and selects the recording log or `PatchLog::null()`.
+Native `AutoCommit.receiveSyncMessage` keeps that isolation branch and consumes the message on every path (`src/autocommit.zig:387-401`).
+An external log stays caller-owned. The facade closes before the document checks actor compatibility (`src/autocommit.zig:403-412`).
 
 **`Option`/`Result`.** `Option<Message>` → `?Message`; `Option<Vec<ChangeHash>>` → `?[]ChangeHash`. Zig's `?T` is an explicit tag byte, so `?Message` is one byte larger than Rust's niche-packed `Option<Message>`; irrelevant except for ABI, and this type is never `extern struct`.
 

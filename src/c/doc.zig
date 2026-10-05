@@ -156,16 +156,13 @@
 //! one door is a compatibility defect of its own. It is answered by
 //! [`clockFromItems`] and `calculateMarksAt` now; see [`AMmarks`].
 //!
-//! ## 4. `AMrollback` and `AMpendingOps` are answered from the flavour
+//! ## 4. `AMrollback` and `AMpendingOps` share the native owner
 //!
-//! [`AMdoc`] is always an `AutoCommit`: `src/doc.rs:36` is
-//! `pub struct AMdoc(am::AutoCommit)` and the write surface's
-//! `requireAuto` ([transact.zig](../transact.zig)) is what the port's `.auto`
-//! mode is. `AutoCommit` closes its transaction at the end of every mutating
-//! call, so `pending_ops()` is `0` and `rollback()` is the
-//! `self.transaction.take()…unwrap_or(0)` of `autocommit.rs:742-750` with
-//! nothing to take. **Both are the reference's answers for an `AutoCommit` that
-//! has just returned from a mutating call**, and neither is a stub.
+//! [`AMdoc`] embeds `AutoCommit`, matching `pub struct AMdoc(am::AutoCommit)`.
+//! Mutations retain one transaction. Ordinary reads leave it open; commit, history,
+//! save, setters and sync close it. `AMpendingOps` reads that journal, and rollback
+//! cancels it. The count-only rollback ABI reports zero on refusal while retaining
+//! the journal so the caller can retry; destruction releases the whole owner.
 //!
 //! ## 5. Error text
 //!
@@ -194,12 +191,10 @@ const iterlist = @import("../iter/list_range.zig");
 const itermap = @import("../iter/map_range.zig");
 const opquery = @import("../opset/op_query.zig");
 const cursormod = @import("../cursor.zig");
-const readmod = @import("../read.zig");
 const marksmod = @import("../marks.zig");
 const changemod = @import("../change.zig");
 const clockmod = @import("../clock.zig");
 const hydmod = @import("../hydrate.zig");
-const protocol = @import("../sync/protocol.zig");
 const statemod = @import("../sync/state.zig");
 const msgmod = @import("../sync/message.zig");
 const chunkmod = @import("../storage/chunk.zig");
@@ -336,351 +331,136 @@ pub const c_io: std.Io = std.Io.Threaded.global_single_threaded.io();
 // so the layout here is the port's and not the C ABI's.
 // ---------------------------------------------------------------------------
 
-/// `AMdoc`. Rust: `src/doc.rs:35-36` — `pub struct AMdoc(am::AutoCommit)`.
-///
-/// **`AMdoc` is `AutoCommit`, and `AutoCommit` holds its transaction open
-/// across calls.** `ensure_transaction_open`
-/// ([`autocommit.rs:445-457`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs))
-/// opens one lazily and leaves it; only `commit_with` (`:728-739`),
-/// `rollback` (`:742-751`) and a read that needs it (`:459-468`) close it. A C
-/// consumer's `AMmapPutStr` is therefore **not a change**: it is an operation
-/// inside the change the consumer opens with `AMcommit`.
-///
-/// **This handle used to be `docmod.Document` outright, and that was a
-/// different API wearing the same header.** Every module function in
-/// [transact.zig](../transact.zig) opens a transaction, writes one operation
-/// and commits it, which is right for a *Zig* caller of the crate's own
-/// `Transactable` impl and wrong for this one, because a C caller drives
-/// `AutoCommit` directly. It cost one change per operation: `AMpendingOps`
-/// was always `0`, `AMrollback` always `0`, and three `put` + `AMcommit`
-/// pairs produced six changes. `tx` is that held transaction, opened through
-/// [`transact.openAutoHeld`] so the two doors keep their own commit
-/// semantics rather than sharing a helper that sometimes commits.
-///
-/// **The handle is never moved while a transaction is open.**
-/// [`transact.Transaction`]'s `doc` points at the document it was opened
-/// against, so a move would leave it addressing the old one. The only moves
-/// are [`AMcreate`], [`AMload`] and [`AMclone`], each of which boxes the
-/// document into a result item before anything writes to it; from then on the
-/// handle lives inside one `RcItem` allocation, which is never relocated,
-/// and `AMitemResult` shares that allocation rather than copying the item
-/// (`src/result.rs:504-525`). [`AMclone`] closes before it copies, so the
-/// copy is cloned with nothing open.
-///
-/// There is no `AMdocFree` because there is no route to an `AMdoc` other than
-/// a result item that owns it (`src/result.rs:557-562` is the only
-/// `Box::from_raw` in the reference's `src/`).
+/// Opaque C handle embedding the same native owning AutoCommit facade.
+/// Closed handles can transfer ownership into a result item. Open handles never move.
+/// Ordinary reads do not close; history, save, setters and sync use facade barriers.
 pub const AMdoc = struct {
-    /// The `Automerge` inside the `AutoCommit`. Rust: `doc.0` (`src/doc.rs:36`).
-    doc: docmod.Document,
-    /// `AutoCommit.transaction`, and `None` for the state
-    /// `ensure_transaction_closed` leaves behind. Rust: `autocommit.rs:445-457`.
-    tx: ?transact.Transaction = null,
+    owner: @import("../autocommit.zig").AutoCommit,
 
-    /// [`AutoCommit::ensure_transaction_open`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs:445-457).
-    ///
-    /// **The transaction is opened on the document's own allocator, and
-    /// there is no argument here to change that.** Upstream's `AMdoc` is a
-    /// newtype over `am::AutoCommit`
-    /// ([`src/doc.rs:36`](../../github-automerge-automerge/rust/automerge-c/src/doc.rs))
-    /// with no allocator anywhere on it and no `AMdoc_open` in the C ABI to
-    /// pass one to; [`ensure_transaction_open`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs:445-457)
-    /// takes the transaction out of the `AutoCommit` that already holds it.
-    /// **This port's `Transaction` is the opposite of a borrow: it owns
-    /// buffers, and every one of them has to be freed by the same allocator
-    /// that made it.** [`transact.Transaction.gpa`] says so in its own words
-    /// — "The allocator every owned buffer in this transaction belongs to,
-    /// **which is the document's**"
-    /// ([`transact.zig:330-332`](../transact.zig)) — and every other door
-    /// through this port's transaction opens the same way, `const gpa =
-    /// doc.allocator();` ([`transact.zig:2668`](../transact.zig),
-    /// `:2680`, `:2692` and the rest).
-    ///
-    /// **A hardcoded `c_alloc` here was not a second spelling of that; it was
-    /// a free of somebody else's memory.** A pending operation's undo log
-    /// belongs to the op set ([`op.zig:1230-1236`](../opset/op.zig)) and
-    /// [`transact.Transaction.deinit`] frees it with `self.gpa`
-    /// ([`transact.zig:452`](../transact.zig)), so an `AMdoc` on any
-    /// allocator but `c_alloc` reached `free` on a pointer it had not been
-    /// given, and the process died inside `__free` on the way out. It was
-    /// unreachable only because [`AMcreate`] uses `c_alloc` — which is a
-    /// fact about the one route, not a property of the type.
+    /// Borrows the one held engine; no second C transaction owner exists.
     pub fn open(self: *AMdoc) !*transact.Transaction {
-        if (self.tx) |*t| return t;
-        self.tx = try transact.openAutoHeld(self.allocator(), &self.doc);
-        return &self.tx.?;
+        return self.owner.ensureTransactionOpen();
     }
 
-    /// [`AutoCommit::ensure_transaction_closed`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs:459-468).
-    ///
-    /// **This is what a read does**, and it is why [`AMgetHeads`], [`AMsave`],
-    /// [`AMequal`] and the rest of the read surface are not free of the write
-    /// history: a `get` between two puts is a commit point, exactly as it is
-    /// upstream. A test that only checks that the value reads back would not
-    /// notice; one that checks how many changes the document gained would.
+    /// Publishes pending work through the native facade, retaining its owner on refusal.
     pub fn close(self: *AMdoc) !void {
-        if (self.tx) |*t| {
-            _ = try t.commit(null, null);
-            t.deinit();
-        }
-        self.tx = null;
+        return self.owner.ensureTransactionClosed();
     }
 
-    /// [`Drop`], which upstream does not write: `AutoCommit` has no `Drop`
-    /// impl, so the reference drops an open transaction along with the
-    /// document ([`autocommit.rs:63-72`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)
-    /// has no `impl Drop for AutoCommit`). **The transaction is dropped, not
-    /// committed.** Committing here would be a second answer to "what does
-    /// dropping an `AMdoc` do", and it is a dangerous one: a
-    /// [`transact.Transaction`] holds a `*Document` to the document it was
-    /// opened against ([`src/transact.zig:285`](../../github-automerge-automerge/rust/automerge/src/transact.zig)),
-    /// so a commit at teardown reallocates the graph's node array
-    /// ([`change_graph.zig:1070`](../../github-automerge-automerge/rust/automerge/src/change_graph.zig))
-    /// and then frees the buffer the copy being torn down still points at —
-    /// which is what made `item_tests.c`'s group teardown free an interior
-    /// pointer from `ChangeGraph.deinit`.
+    /// Destroys this handle and its pending journal without committing.
     pub fn deinit(self: *AMdoc) void {
-        if (self.tx) |*t| t.deinit();
-        self.tx = null;
-        self.doc.deinit();
+        self.owner.deinit();
         self.* = undefined;
     }
 
-    // The read surface a document is asked for most, kept as methods so the
-    // call sites read as they did when this handle *was* a `Document` and so
-    // that the close is not something a caller can forget at one site and not
-    // another. Everything else goes through `d.doc`, and closes by hand.
-
-    /// The encoding the document indexes text in. Rust: `AutoCommit::text_encoding`
-    /// (`src/doc.rs:279-282`).
-    ///
-    /// A property of the document's rows rather than of a transaction, so this
-    /// does **not** close: a read between two writes must not become a commit
-    /// point just because something asked what encoding is in force.
+    /// Returns native text indexing units without closing.
     pub fn textEncoding(self: *const AMdoc) types.TextEncoding {
-        return self.doc.textEncoding();
+        return self.owner.textEncoding();
     }
 
-    /// The document's own actor id, by value. Rust: `doc.get_actor().clone()`
-    /// (`src/doc.rs:302-304`).
-    ///
-    /// **The returned `ActorId` borrows the document's arena** and is
-    /// invalidated by the next mutation or by freeing the result the document
-    /// came from. Every C entry point that reports one copies it first
-    /// ([`actorValue`]), so this method's own borrow never reaches C.
+    /// Borrows the current actor; C result producers copy it.
     pub fn getActorId(self: *const AMdoc) ActorId {
-        return self.doc.getActorId();
+        return self.owner.getActorId();
     }
 
-    /// Sets the document's actor id for the changes it makes next. Rust:
-    /// `doc.set_actor(id.clone())` (`src/doc.rs:373-377`).
-    ///
-    /// **`id` borrows the caller's bytes**, which the document copies into its
-    /// own arena; the caller keeps ownership of whatever it passed.
-    pub fn setActorId(self: *AMdoc, id: ActorId) void {
-        self.doc.setActorId(id);
+    /// Closes pending work before changing the actor; bytes are copied into the owner.
+    pub fn setActorId(self: *AMdoc, id: ActorId) !void {
+        return self.owner.setActorId(id);
     }
 
-    /// [`Document.objectType`](doc.zig), which is what every `AMobjObjType`
-    /// and every object-kind branch of a read answers from. **No close**:
-    /// the object type is a property of the document's rows, and the rows a
-    /// pending transaction has written are already in them.
+    /// Resolves a live object's kind without closing.
     pub fn objectType(self: *const AMdoc, id: ExId) !ObjType {
-        return self.doc.objectType(id);
+        return self.owner.objectType(id);
     }
 
-    /// The allocator this document was built with.
-    ///
-    /// Every buffer the document and any transaction opened against it owns
-    /// belongs to it, which is why [`AMdoc.open`] takes no allocator argument
-    /// and why a document built on anything but `c_alloc` could not be freed
-    /// by the C ABI. A C caller has no use for this: the C surface binds
-    /// `c_allocator` at the boundary and there is no `AMdocAllocator`.
+    /// The allocator retained by the native owner.
     pub fn allocator(self: *const AMdoc) Allocator {
-        return self.doc.allocator();
+        return self.owner.allocator();
     }
 
-    /// [`AutoCommit::get_heads`](../../github-automerge-automerge/rust/automerge/src/automerge.rs:695-702),
-    /// which closes the transaction first (`autocommit.rs:459-468`).
+    /// Copies the scoped heads after closing pending work.
     pub fn getHeads(self: *AMdoc, gpa: Allocator) ![]ChangeHash {
-        try self.close();
-        return self.doc.getHeads(gpa);
+        return self.owner.getHeads(gpa);
     }
 
-    /// The document's complete save bytes. Rust: `doc.save()` (`src/doc.rs:91-98`).
-    ///
-    /// Closes the transaction first, so this is a commit point, and the
-    /// returned slice is **the caller's**: free it with the allocator it was
-    /// passed. It does not borrow the document.
+    /// Saves after closing; caller owns the returned bytes.
     pub fn save(self: *AMdoc, gpa: Allocator) ![]u8 {
-        try self.close();
-        return self.doc.save(gpa);
+        return self.owner.save(gpa);
     }
 
-    /// The bytes of the changes this document has that `have` does not name.
-    /// Rust: `doc.save_incremental(have)` (`src/doc.rs:113-127`).
-    ///
-    /// Closes the transaction first. The returned slice is the caller's and
-    /// must be freed with the allocator it was passed.
+    /// Saves changes since the owner's cursor after closing.
     pub fn saveIncremental(self: *AMdoc, gpa: Allocator) ![]u8 {
-        try self.close();
-        return self.doc.saveIncremental(gpa);
+        return self.owner.saveIncremental(gpa);
     }
 
-    /// Applies an incremental save to the document and answers how many
-    /// bytes it consumed. Rust: `doc.load_incremental(data)`
-    /// (`src/doc.rs:140-152`).
-    ///
-    /// Closes the transaction first, so this is a commit point. `bytes` is
-    /// read and not retained; a short or undecodable input is an error, never
-    /// a partial application.
+    /// Loads incremental data through the facade's scope-aware log policy.
     pub fn loadIncremental(self: *AMdoc, gpa: Allocator, bytes: []const u8) !usize {
-        try self.close();
-        return self.doc.loadIncremental(gpa, bytes);
+        return self.owner.loadIncremental(gpa, bytes);
     }
 
-    /// Integrates already-parsed changes and answers how many were applied.
-    /// Rust: `doc.apply_changes(changes)` (`src/doc.rs:171-183`).
-    ///
-    /// Closes the transaction first. `incoming` is borrowed for the call only;
-    /// the changes themselves are stored by value, and the caller keeps
-    /// ownership of the slice.
+    /// Applies changes through the facade's one batch engine and close barrier.
     pub fn applyChanges(self: *AMdoc, gpa: Allocator, incoming: []const changemod.Change) !usize {
-        try self.close();
-        return self.doc.applyChanges(gpa, incoming);
+        return self.owner.applyChanges(gpa, incoming);
     }
 
-    /// The document's changes that `have` does not name, in dependency order.
-    /// Rust: `doc.get_changes(have)` (`src/doc.rs:196-208`).
-    ///
-    /// Closes the transaction first. The returned `Changes` owns its change
-    /// bodies and must be released with `deinit(gpa)` and the same allocator —
-    /// it is not an `AMresult`, and no C entry point hands one out directly.
+    /// Copies committed changes after closing pending work.
     pub fn getChanges(self: *AMdoc, gpa: Allocator, have: []const ChangeHash) !docmod.Changes {
-        try self.close();
-        return self.doc.getChanges(gpa, have);
+        return self.owner.getChanges(gpa, have);
     }
 
-    /// The changes `other` has that this document does not. Rust:
-    /// `doc.get_changes_added(&other.0)` (`src/doc.rs:220-236`).
-    ///
-    /// Closes **both** documents first: upstream's `AutoCommit::get_changes_added`
-    /// borrows `&mut self` twice, so a held transaction on either side has to
-    /// be resolved before the comparison can see the same rows a C caller
-    /// sees. `other` is not consumed. The returned `Changes` belongs to the
-    /// caller.
+    /// Closes both owners and copies history absent from this handle.
     pub fn getChangesAdded(self: *AMdoc, gpa: Allocator, other: *AMdoc) !docmod.Changes {
-        try self.close();
-        try other.close();
-        return self.doc.getChangesAdded(gpa, &other.doc);
+        return self.owner.getChangesAdded(gpa, &other.owner);
     }
 
-    /// The hashes in `heads` that this document does not have. Rust:
-    /// `doc.get_missing_deps(heads)` (`src/doc.rs:249-266`).
-    ///
-    /// Closes the transaction first. The returned slice is the caller's and
-    /// must be freed with the allocator it was passed.
+    /// The inherent history lookup closes pending work.
     pub fn getMissingDeps(self: *AMdoc, gpa: Allocator, heads: []const ChangeHash) ![]ChangeHash {
-        try self.close();
-        return self.doc.getMissingDeps(gpa, heads);
+        return self.owner.getMissingDeps(gpa, heads);
     }
 
-    /// The change this document holds with `hash`, or null. Rust:
-    /// `doc.get_change_by_hash(&hash)` (`src/doc.rs:278-292`).
-    ///
-    /// Closes the transaction first. **The returned `Built` owns the change's
-    /// columns**, which is why every C entry point that wants one goes through
-    /// [`ownedChangeValue`] and copies the framed bytes rather than handing
-    /// the borrow out: a C caller holding it across a mutation would be
-    /// holding a pointer into storage the document is free to reallocate.
+    /// Copies one change after closing; caller releases the Built value.
     pub fn getChangeByHash(self: *AMdoc, gpa: Allocator, hash: ChangeHash) !?docmod.Built {
-        try self.close();
-        return self.doc.getChangeByHash(gpa, hash);
+        return self.owner.getChangeByHash(gpa, hash);
     }
 
-    /// The last change this document authored, or null. Rust:
-    /// `doc.get_last_local_change()` (`src/doc.rs:305-320`).
-    ///
-    /// Closes the transaction first, so a change written but not yet committed
-    /// is the answer. The returned `Built` belongs to the caller, on the same
-    /// terms as [`getChangeByHash`]'s.
+    /// Copies the last local change after closing pending work.
     pub fn getLastLocalChange(self: *AMdoc, gpa: Allocator) !?docmod.Built {
-        try self.close();
-        return self.doc.getLastLocalChange(gpa);
+        return self.owner.getLastLocalChange(gpa);
     }
 
-    /// Merges `other` into this document and answers the heads of the result.
-    /// Rust: `doc.merge(&mut other.0)` (`src/doc.rs:369-381`).
-    ///
-    /// Closes **both** documents first, for the same reason as
-    /// [`getChangesAdded`]. `other` is not consumed and stays usable. The
-    /// returned slice is the caller's and must be freed with the allocator it
-    /// was passed.
+    /// Closes both owners and merges through the native facade.
     pub fn merge(self: *AMdoc, gpa: Allocator, other: *AMdoc) ![]ChangeHash {
-        try self.close();
-        try other.close();
-        return self.doc.merge(gpa, &other.doc);
+        return self.owner.merge(gpa, &other.owner);
     }
 
-    /// [`AutoCommit::clone`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs:108-111)
-    /// closes the transaction before it copies, so the copy has nothing open.
-    pub fn cloneDoc(self: *AMdoc, gpa: Allocator) !AMdoc {
-        try self.close();
-        return .{ .doc = try self.doc.clone(gpa, .auto) };
+    /// Initializes an independent pending-preserving clone at its final address.
+    pub fn cloneInto(self: *const AMdoc, gpa: Allocator, destination: *AMdoc) !void {
+        return self.owner.cloneInto(gpa, &destination.owner);
     }
 
-    /// [`AutoCommit::fork`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs:356-367)
-    /// closes the transaction and returns the **new** `AutoCommit`; the
-    /// reference hands that value straight to `to_result`
-    /// ([`automerge-c/src/doc.rs:252`](../../github-automerge-automerge/rust/automerge-c/src/doc.rs)),
-    /// which makes it the result's one `AM_VAL_TYPE_DOC` item. Nothing is
-    /// discarded and nothing is a side effect.
+    /// Closes and returns a fresh closed fork.
     pub fn forkDoc(self: *AMdoc, gpa: Allocator) !AMdoc {
-        try self.close();
-        return .{ .doc = try self.doc.fork(gpa, .auto) };
+        return .{ .owner = try self.owner.fork(gpa) };
     }
 
-    /// [`AutoCommit::fork_at`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs:369-380)
-    /// through `AMfork`'s `heads` arm, and the same value out.
+    /// Closes and forks historical heads without retaining facade cursors.
     pub fn forkDocAt(self: *AMdoc, gpa: Allocator, heads: []const ChangeHash) !AMdoc {
-        try self.close();
-        return .{ .doc = try self.doc.forkAt(gpa, heads, .auto) };
+        return .{ .owner = try self.owner.forkAt(gpa, heads) };
     }
 
-    /// Rewinds the document to `heads`, dropping every change after them.
-    /// Rust: `doc.isolate(heads)` (`src/doc.rs:390-403`).
-    ///
-    /// Closes the transaction first, because an isolation point is a commit
-    /// point. This **destroys history**: anything the document held that
-    /// `heads` does not name is gone, including the caller's own uncommitted
-    /// writes.
+    /// Closes and selects a historical view without deleting full history.
     pub fn isolate(self: *AMdoc, gpa: Allocator, heads: []const ChangeHash) !void {
-        try self.close();
-        return self.doc.isolate(gpa, heads);
+        return self.owner.isolate(gpa, heads);
     }
 
-    /// [`AutoCommit::integrate`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs):439-443),
-    /// which is **fallible in this port** because it replays a view
-    /// transition ([`Document.patchTo`](doc.zig)).
-    ///
-    /// **There is no `AMintegrate` export and `include/automerge.h` declares
-    /// none**, so nothing downstream of this method moves; it is reachable
-    /// from Zig only. That is the whole of the C-ABI cost of widening
-    /// [`Document.integrate`](doc.zig).
+    /// Refusal closes neither scope nor recovery ownership; errors are propagated.
     pub fn integrate(self: *AMdoc) !void {
-        self.close() catch {};
-        return self.doc.integrate();
+        return self.owner.integrate();
     }
 
-    /// The document's counters. Rust: `doc.stats()` (`src/doc.rs:412-428`).
-    ///
-    /// Closes the transaction first, so the counts include the pending writes.
-    /// The returned `Stats` is a value that owns nothing; its borrowed slices
-    /// are views of the document's own storage and are invalidated by the next
-    /// mutation.
+    /// Nonclosing ReadDoc statistics include pending rows, as upstream does.
     pub fn stats(self: *AMdoc) !docmod.Stats {
-        try self.close();
-        return self.doc.stats();
+        return self.owner.stats();
     }
 };
 
@@ -1558,7 +1338,14 @@ pub fn boxError(alloc: Allocator, message: []const u8) !*AMresult {
 
 /// `AMresult::item(item)`. Rust: `src/result.rs:21-23`.
 pub fn boxItem(alloc: Allocator, item: Item) !*AMresult {
-    return try (try AMresult.initItem(alloc, try AMitem.create(alloc, item))).toOwned(alloc);
+    const boxed = try alloc.create(AMresult);
+    errdefer alloc.destroy(boxed);
+    boxed.* = AMresult.init(alloc);
+    errdefer boxed.deinit();
+    try boxed.variant.items.ensureTotalCapacity(alloc, 1);
+    const owned = try AMitem.create(alloc, item);
+    boxed.variant.items.appendAssumeCapacity(owned);
+    return boxed;
 }
 
 /// One item, one value. The shape of `to_result(Ok(value))` for every
@@ -1601,49 +1388,44 @@ pub fn boxValues(alloc: Allocator, values: []const Value) !*AMresult {
 /// is the reason this file can answer a `heads` argument at all, since
 /// `read.zig` itself passes `null` for the clock it has no parameter for.
 fn mutableOps(d: *const AMdoc) *docmod.Set {
-    return @constCast(&d.doc.ops);
+    return @constCast(&d.owner.doc.ops);
 }
 
 // ---------------------------------------------------------------------------
-// The write surface, through the handle's own open transaction.
+// The write surface delegates to the handle's native AutoCommit owner.
 //
-// Each of these is the module function of the same name in
-// [transact.zig](../transact.zig) with the `tx.commit(null, null)` at the end
-// of it **removed**, because `AMdoc` is `am::AutoCommit` (`src/doc.rs:36`) and
-// an `AutoCommit` holds its transaction open across calls
-// ([`autocommit.rs:445-457`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)).
-// They are thin on purpose: the operation is [`transact.Transaction`]'s and
-// there is one implementation of it. **What makes the change is one call —
-// [`AMdoc.open`] — and that it is not followed by a commit.**
+// Native and C consumers borrow exactly one held Transaction engine. These
+// helpers preserve the C result shapes while the facade owns pending recovery
+// and cache invalidation. No C helper commits after an ordinary mutation.
 // ---------------------------------------------------------------------------
 
 fn txPut(d: *AMdoc, obj: ExId, prop: Prop, value: ScalarValue) !OpId {
-    const made = try (try d.open()).put(obj, prop, value);
+    const made = try d.owner.put(obj, prop, value);
     return made orelse OpId.root;
 }
 
 fn txPutObject(d: *AMdoc, obj: ExId, prop: Prop, t: ObjType) !ExId {
-    return (try d.open()).putObject(obj, prop, t);
+    return d.owner.putObject(obj, prop, t);
 }
 
 fn txInsert(d: *AMdoc, obj: ExId, index: usize, value: ScalarValue) !OpId {
-    return (try d.open()).insert(obj, index, value);
+    return d.owner.insert(obj, index, value);
 }
 
 fn txInsertObject(d: *AMdoc, obj: ExId, index: usize, t: ObjType) !ExId {
-    return (try d.open()).insertObject(obj, index, t);
+    return d.owner.insertObject(obj, index, t);
 }
 
 fn txIncrement(d: *AMdoc, obj: ExId, prop: Prop, by: i64) !void {
-    return (try d.open()).increment(obj, prop, by);
+    return d.owner.increment(obj, prop, by);
 }
 
 fn txDelete(d: *AMdoc, obj: ExId, prop: Prop) !usize {
-    return (try d.open()).delete(obj, prop);
+    return d.owner.delete(obj, prop);
 }
 
 fn txSpliceText(d: *AMdoc, obj: ExId, pos: usize, del: isize, text: []const u8) !void {
-    return (try d.open()).spliceText(obj, pos, del, text);
+    return d.owner.spliceText(obj, pos, del, text);
 }
 
 fn txSplice(
@@ -1654,7 +1436,8 @@ fn txSplice(
     gpa: Allocator,
     values: []const hydmod.Value,
 ) !void {
-    return transact.spliceHeld(try d.open(), obj, pos, del, gpa, values);
+    _ = gpa;
+    return d.owner.splice(obj, pos, del, values);
 }
 
 fn txMark(
@@ -1666,7 +1449,7 @@ fn txMark(
     expand: marksmod.ExpandMark,
     value: ?ScalarValue,
 ) !void {
-    return (try d.open()).mark(obj, from, to, name, expand, value);
+    return d.owner.mark(obj, from, to, name, expand, value);
 }
 
 fn txUnmark(
@@ -1678,7 +1461,7 @@ fn txUnmark(
     name: []const u8,
     value: ?ScalarValue,
 ) !void {
-    return (try d.open()).unmark(obj, from, to, expand, name, value);
+    return d.owner.unmark(obj, from, to, expand, name, value);
 }
 
 /// `to_obj_id!` (Rust: `src/obj.rs:11-17`): **a null handle is the root**, not
@@ -1701,11 +1484,11 @@ fn objIdOf(doc: *const AMdoc, handle: ?*const AMobjId) !ExId {
     const h = handle orelse return .root;
     if (h.root) return .root;
     const cell = h.c_actor_id orelse return error.InvalidObjId;
-    const idx = doc.doc.ops.lookupActor(cell.body.*) orelse return error.InvalidObjId;
+    const idx = doc.owner.doc.ops.lookupActor(cell.body.*) orelse return error.InvalidObjId;
     const actor_idx = std.math.cast(types.ActorIdx, idx) orelse return error.InvalidObjId;
     if (h.counter > std.math.maxInt(u32)) return error.InvalidObjId;
     const named = ExId.withActor(OpId.init(@intCast(h.counter), actor_idx), cell.body.*);
-    return doc.doc.resolve(named) orelse error.InvalidObjId;
+    return doc.owner.doc.resolve(named) orelse error.InvalidObjId;
 }
 
 /// The reverse: an [`AMobjId`] for an [`ExId`]. Every C function that takes an
@@ -1723,16 +1506,14 @@ fn objIdOfEx(alloc: Allocator, doc: *const AMdoc, exid: ExId) !AMobjId {
             // (`types.zig:273-274`) carries it as `actor`, so it is already
             // the right number and needs no lookup.
             @as(usize, i.actor),
-            (doc.doc.getActor(i.actor) orelse ActorId.init(&.{})).bytes,
+            (doc.owner.doc.getActor(i.actor) orelse ActorId.init(&.{})).bytes,
         ),
         .named => |n| return AMobjId.of(
             alloc,
-            n.op.counter,
-            // The same component, from the same `id.actor()` upstream builds
-            // it from (`op_set.rs:1054-1060`); `ExId.Named` keeps the actor's
-            // bytes because the actor table it was minted from may be gone by
-            // the time a C caller reads the handle.
-            @as(usize, n.op.actor),
+            // Public Named counters are u64; exporting a handle never narrows to resident OpId.
+            exid.counter().?,
+            // Actor bytes are authoritative; the public id's index is only a repair hint.
+            doc.owner.doc.ops.lookupActor(n.actor) orelse return error.InvalidObjId,
             n.actor.bytes,
         ),
     }
@@ -1879,10 +1660,19 @@ fn headsOf(alloc: Allocator, items: ?*const AMitems) ![]ChangeHash {
 /// nothing, so `AMlistGet(doc, obj, pos, &empty)` answers nothing. Collapsing
 /// the two would make an empty `heads` mean "now", which is the opposite.
 fn clockFromItems(alloc: Allocator, doc: *const AMdoc, items: ?*const AMitems) !?Clock {
-    if (items == null) return null;
+    if (items == null) {
+        const owner = &@constCast(doc).owner;
+        const scope = if (owner.transaction) |*tx|
+            try tx.scopeClock()
+        else if (try owner.doc.readScope(owner.allocator())) |clock|
+            clock.*
+        else
+            null;
+        return if (scope) |clock| try clock.clone() else null;
+    }
     const hashes = try headsOf(alloc, items);
     defer alloc.free(hashes);
-    return try @constCast(doc).doc.graph.clockAt(alloc, hashes);
+    return try @constCast(doc).owner.doc.graph.clockAt(alloc, hashes);
 }
 
 /// `clamp!` (Rust: `src/doc/utils.rs:1-9`): a position past the object's end
@@ -2098,7 +1888,11 @@ fn changeResult(alloc: Allocator, built: docmod.Built) !*AMresult {
 /// `impl From<am::AutoCommit> for Value` (`src/item.rs:147-151`), which boxes
 /// the document so the item owns it and `AMresultFree` frees it.
 fn docResult(alloc: Allocator, doc: AMdoc) !*AMresult {
-    return try boxOne(alloc, .{ .doc = doc });
+    return boxOne(alloc, .{ .doc = doc }) catch |failure| {
+        var refused = doc;
+        refused.deinit();
+        return failure;
+    };
 }
 
 /// `read.zig`'s `taggedValue`, **copied**. See the module doc: the port's read
@@ -2494,7 +2288,6 @@ pub export fn AMchangeLoadDocument(src: ?[*]const u8, count: usize) ?*AMresult {
         c_io,
         s[0..count],
         cTextEncoding(),
-        .auto,
     ) catch |e| return failWith(c_alloc, e);
     defer doc.deinit();
     var changes = doc.getChanges(c_alloc, &.{}) catch |e| return failWith(c_alloc, e);
@@ -3177,18 +2970,6 @@ fn invalidItems(alloc: Allocator) ?*AMresult {
     return boxError(alloc, "Invalid `AMitems*`") catch null;
 }
 
-/// Copies `bytes` into the document's own arena.
-///
-/// [`Document.setActorId`](doc.zig) stores the bytes **as given** and never
-/// frees them — "a caller may hand it a string literal" (`doc.zig:3738-3741`) —
-/// so a C caller's buffer, which the ABI does not promise to outlive the call,
-/// cannot be the document's storage. The arena frees the copy with the
-/// document, which is what [`Document.forkAt`](doc.zig) does for the same reason
-/// (`doc.zig:3745-3752`).
-fn internActor(d: *const AMdoc, bytes: []const u8) ![]const u8 {
-    return @constCast(d).doc.arena.allocator().dupe(u8, bytes);
-}
-
 /// `to_sync_state_mut!` (Rust: `src/doc.rs:21-30`).
 fn invalidSyncState(alloc: Allocator) ?*AMresult {
     return boxError(alloc, "Invalid `AMsyncState*`") catch null;
@@ -3224,10 +3005,20 @@ pub export fn AMapplyChanges(doc: ?*AMdoc, items: ?*const AMitems) ?*AMresult {
 /// `to_result(doc.as_ref().clone())` moves an `AutoCommit` into
 /// `Value::Doc(RefCell::new(AMdoc::new(..)))` (`src/item.rs:147-151`), and
 /// `AMresultFree` is what frees it.
+/// Pending rows and their journal are deep-copied directly into the final result
+/// allocation without closing the source; either owner can roll back independently.
 pub export fn AMclone(doc: ?*const AMdoc) ?*AMresult {
     const d = doc orelse return invalidDoc(c_alloc);
-    const copy = @constCast(d).cloneDoc(c_alloc) catch |e| return failWith(c_alloc, e);
-    return docResult(c_alloc, copy) catch |e| failWith(c_alloc, e);
+    const boxed = boxVoid(c_alloc) catch |e| return failWith(c_alloc, e);
+    const item = AMresult.item(boxed) orelse unreachable;
+    const cell = item.getMut() orelse unreachable;
+    cell.value = .{ .doc = undefined };
+    d.cloneInto(c_alloc, &cell.value.?.doc) catch |e| {
+        cell.value = null;
+        abi.AMresultFree(boxed);
+        return failWith(c_alloc, e);
+    };
+    return boxed;
 }
 
 /// `AMcreate`. Rust: `src/doc.rs:126-131`.
@@ -3246,12 +3037,12 @@ pub export fn AMclone(doc: ?*const AMdoc) ?*AMresult {
 /// (`:80`), and that is `ops: OpSet::new(TextEncoding::platform_default())`
 /// ([`automerge.rs:272`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
 pub export fn AMcreate(actor_id: ?*const AMactorId) ?*AMresult {
-    var d: AMdoc = .{ .doc = docmod.Document.initWithEncoding(c_alloc, c_io, cTextEncoding(), .auto) catch |e|
-        return failWith(c_alloc, e) };
-    errdefer d.deinit();
+    var d: AMdoc = .{ .owner = @import("../autocommit.zig").AutoCommit.initWithEncoding(c_alloc, c_io, cTextEncoding()) catch |e| return failWith(c_alloc, e) };
     if (actor_id) |a| {
-        const kept = internActor(&d, a.body.bytes) catch |e| return failWith(c_alloc, e);
-        d.setActorId(.{ .bytes = kept });
+        d.setActorId(a.body.*) catch |e| {
+            d.deinit();
+            return failWith(c_alloc, e);
+        };
     }
     return docResult(c_alloc, d) catch |e| failWith(c_alloc, e);
 }
@@ -3275,10 +3066,8 @@ pub export fn AMcommit(doc: ?*AMdoc, message: AMbyteSpan, timestamp: ?*const i64
     const msg = if (message.src == null) null else spanStr(message) catch |e|
         return failWith(c_alloc, e);
     const time = if (timestamp) |t| t.* else null;
-    const t = d.open() catch |e| return failWith(c_alloc, e);
-    const hash = t.commit(msg, time) catch |e| return failWith(c_alloc, e);
-    t.deinit();
-    d.tx = null;
+    const hash = d.owner.commitWith(.{ .message = msg, .time = time }) catch |e|
+        return failWith(c_alloc, e);
     if (hash == null) return boxVoid(c_alloc) catch |e| failWith(c_alloc, e);
     return boxOne(c_alloc, .{ .change_hash = hash.? }) catch |e| failWith(c_alloc, e);
 }
@@ -3289,8 +3078,8 @@ pub export fn AMemptyChange(doc: ?*AMdoc, message: AMbyteSpan, timestamp: ?*cons
     const msg = if (message.src == null) null else spanStr(message) catch |e|
         return failWith(c_alloc, e);
     const time = if (timestamp) |t| t.* else null;
-    d.close() catch |e| return failWith(c_alloc, e);
-    const hash = d.doc.emptyCommit(c_alloc, msg, time) catch |e| return failWith(c_alloc, e);
+    const hash = d.owner.emptyChange(.{ .message = msg, .time = time }) catch |e|
+        return failWith(c_alloc, e);
     return boxOne(c_alloc, .{ .change_hash = hash }) catch |e| failWith(c_alloc, e);
 }
 
@@ -3541,19 +3330,7 @@ pub export fn AMgetCursorPosition(
         at = headsOf(c_alloc, heads) catch |e| return failWith(c_alloc, e);
     }
     defer if (at) |hashes| c_alloc.free(hashes);
-    // `get_scope`'s first arm (`autocommit.rs:794-805`): the shortcut only
-    // with no transaction in flight, the full clock with one.
-    const pos = if (at != null and d.tx != null) blk: {
-        // **`Some(self.doc.change_graph.clock_at(h))`** — `get_scope`'s
-        // transaction-in-flight arm (`:803`), and the clock [`clockFromItems`]
-        // builds. The hashes are the ones `headsOf` already read above, so this
-        // asks for the clock directly rather than reading the items twice.
-        var pending = @constCast(&d.doc).graph.clockAt(c_alloc, at.?) catch |e|
-            return failWith(c_alloc, e);
-        defer pending.deinit();
-        break :blk readmod.getCursorPositionFor(&d.doc, obj, cur.body, pending) catch |e|
-            return failWith(c_alloc, e);
-    } else readmod.getCursorPosition(&d.doc, obj, cur.body, at) catch |e|
+    const pos = @constCast(d).owner.getCursorPosition(obj, cur.body, at) catch |e|
         return failWith(c_alloc, e);
     return boxOne(c_alloc, valueUint(pos)) catch |e| failWith(c_alloc, e);
 }
@@ -3641,9 +3418,8 @@ pub export fn AMload(src: ?[*]const u8, count: usize) ?*AMresult {
         c_io,
         s[0..count],
         cTextEncoding(),
-        .auto,
     ) catch |e| return failWith(c_alloc, e);
-    return docResult(c_alloc, .{ .doc = loaded }) catch |e| failWith(c_alloc, e);
+    return docResult(c_alloc, .{ .owner = @import("../autocommit.zig").AutoCommit.fromDocument(loaded) }) catch |e| failWith(c_alloc, e);
 }
 
 /// `AMloadIncremental`. Rust: `src/doc.rs:623-631`.
@@ -3692,7 +3468,7 @@ pub export fn AMobjSize(
 pub export fn AMobjObjType(doc: ?*const AMdoc, obj_id: ?*const AMobjId) AMobjType {
     const d = doc orelse return .AM_OBJ_TYPE_DEFAULT;
     const obj = objIdOf(d, obj_id) catch return .AM_OBJ_TYPE_DEFAULT;
-    const t = d.doc.objectType(obj) catch return .AM_OBJ_TYPE_DEFAULT;
+    const t = d.owner.objectType(obj) catch return .AM_OBJ_TYPE_DEFAULT;
     return fromObjType(t);
 }
 
@@ -3760,7 +3536,7 @@ pub export fn AMobjItems(
 /// never had an open transaction at all.
 pub export fn AMpendingOps(doc: ?*const AMdoc) usize {
     const d = doc orelse return 0;
-    return if (d.tx) |t| t.count() else 0;
+    return d.owner.pendingOps();
 }
 
 /// `AMreceiveSyncMessage`. Rust: `src/doc.rs:791-803`.
@@ -3794,7 +3570,7 @@ pub export fn AMreceiveSyncMessage(
     // so a failure between the two would have nothing to release it.
     d.close() catch |e| return failWith(c_alloc, e);
     const received = msg.cloneForReceive() catch |e| return failWith(c_alloc, e);
-    protocol.receiveSyncMessage(c_alloc, &d.doc, &state.body, received) catch |e|
+    d.owner.receiveSyncMessage(c_alloc, &state.body, received) catch |e|
         return failWith(c_alloc, e);
     return boxVoid(c_alloc) catch |e| failWith(c_alloc, e);
 }
@@ -3811,8 +3587,7 @@ pub export fn AMgenerateSyncMessage(
 ) ?*AMresult {
     const d = doc orelse return invalidDoc(c_alloc);
     const state = sync_state orelse return invalidSyncState(c_alloc);
-    d.close() catch |e| return failWith(c_alloc, e);
-    const message = protocol.generateSyncMessage(c_alloc, &d.doc, &state.body) catch |e|
+    const message = d.owner.generateSyncMessage(c_alloc, &state.body) catch |e|
         return failWith(c_alloc, e);
     if (message == null) return boxVoid(c_alloc) catch |e| failWith(c_alloc, e);
     return boxOne(c_alloc, .{ .sync_message = syncmod.AMsyncMessage.init(c_alloc, message.?) }) catch |e|
@@ -3823,22 +3598,12 @@ pub export fn AMgenerateSyncMessage(
 ///
 /// **`0` for `NULL`** (`:820`).
 ///
-/// **And `0` for a document with nothing open**, which is upstream's own
-/// `unwrap_or(0)` ([`autocommit.rs:742-750`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)):
-/// `rollback` cancels the *open* transaction, and after a read or a commit
-/// there is none. This function used to answer `0` for a document with three
-/// operations pending, because the handle committed at the end of every
-/// mutating call and so never had one; [`AMpendingOps`] is the same shape and
-/// reports the same count.
+/// Zero also means no pending work. On allocation refusal this count-only ABI
+/// retains the native pending journal; a later rollback can finish cancellation.
+/// Ordinary reads do not implicitly commit or discard that journal.
 pub export fn AMrollback(doc: ?*AMdoc) usize {
     const d = doc orelse return 0;
-    if (d.tx) |*t| {
-        const n = t.rollback() catch return 0;
-        t.deinit();
-        d.tx = null;
-        return n;
-    }
-    return 0;
+    return d.owner.rollback() catch 0;
 }
 
 /// `AMsave`. Rust: `src/doc.rs:837-840`.
@@ -3865,8 +3630,7 @@ pub export fn AMsaveIncremental(doc: ?*AMdoc) ?*AMresult {
 pub export fn AMsetActorId(doc: ?*AMdoc, actor_id: ?*const AMactorId) ?*AMresult {
     const d = doc orelse return invalidDoc(c_alloc);
     const a = actor_id orelse return boxError(c_alloc, "Invalid `AMactorId*`") catch null;
-    const kept = internActor(d, a.body.bytes) catch |e| return failWith(c_alloc, e);
-    @constCast(d).setActorId(.{ .bytes = kept });
+    d.setActorId(a.body.*) catch |e| return failWith(c_alloc, e);
     return boxVoid(c_alloc) catch |e| failWith(c_alloc, e);
 }
 
@@ -3886,7 +3650,7 @@ pub export fn AMsplice(
 ) ?*AMresult {
     const d = doc orelse return invalidDoc(c_alloc);
     const obj = objIdOf(d, obj_id) catch |e| return failWith(c_alloc, e);
-    const len = mutableOps(d).seqLength(obj, d.textEncoding(), null) catch return failWith(c_alloc, error.NotAnObject);
+    const len = d.owner.length(obj) catch |e| return failWith(c_alloc, e);
     const at = clampPos(pos, len) catch |e| return failWith(c_alloc, e);
     var owners: std.ArrayList(optypes.OwnedValueRef) = .empty;
     defer {
@@ -3909,7 +3673,7 @@ pub export fn AMspliceText(
 ) ?*AMresult {
     const d = doc orelse return invalidDoc(c_alloc);
     const obj = objIdOf(d, obj_id) catch |e| return failWith(c_alloc, e);
-    const len = mutableOps(d).seqLength(obj, d.textEncoding(), null) catch return failWith(c_alloc, error.NotAnObject);
+    const len = d.owner.length(obj) catch |e| return failWith(c_alloc, e);
     const at = clampPos(pos, len) catch |e| return failWith(c_alloc, e);
     const body = spanStr(text) catch |e| return failWith(c_alloc, e);
     txSpliceText(d, obj, at, del, body) catch |e| return failWith(c_alloc, e);
@@ -4026,7 +3790,7 @@ fn listGetResult(
 pub export fn AMlistDelete(doc: ?*AMdoc, obj_id: ?*const AMobjId, pos: usize) ?*AMresult {
     const d = doc orelse return invalidDoc(c_alloc);
     const obj = objIdOf(d, obj_id) catch |e| return failWith(c_alloc, e);
-    const len = mutableOps(d).seqLength(obj, d.textEncoding(), null) catch 0;
+    const len = d.owner.length(obj) catch |e| return failWith(c_alloc, e);
     const at = adjustPos(pos, false, len) catch |e| return failWith(c_alloc, e);
     _ = txDelete(d, obj, .{ .index = at.pos }) catch |e| return failWith(c_alloc, e);
     return boxVoid(c_alloc) catch |e| failWith(c_alloc, e);
@@ -4041,7 +3805,7 @@ pub export fn AMlistGet(
 ) ?*AMresult {
     const d = doc orelse return invalidDoc(c_alloc);
     const obj = objIdOf(d, obj_id) catch |e| return failWith(c_alloc, e);
-    const len = mutableOps(d).seqLength(obj, d.textEncoding(), null) catch 0;
+    const len = @constCast(d).owner.length(obj) catch |e| return failWith(c_alloc, e);
     const at = adjustPos(pos, false, len) catch |e| return failWith(c_alloc, e);
     var clock = clockFromItems(c_alloc, d, heads) catch |e| return failWith(c_alloc, e);
     defer if (clock) |*c| c.deinit();
@@ -4058,7 +3822,7 @@ pub export fn AMlistGetAll(
 ) ?*AMresult {
     const d = doc orelse return invalidDoc(c_alloc);
     const obj = objIdOf(d, obj_id) catch |e| return failWith(c_alloc, e);
-    const len = mutableOps(d).seqLength(obj, d.textEncoding(), null) catch 0;
+    const len = @constCast(d).owner.length(obj) catch |e| return failWith(c_alloc, e);
     const at = adjustPos(pos, false, len) catch |e| return failWith(c_alloc, e);
     var clock = clockFromItems(c_alloc, d, heads) catch |e| return failWith(c_alloc, e);
     defer if (clock) |*c| c.deinit();
@@ -4094,7 +3858,7 @@ pub export fn AMlistIncrement(
 ) ?*AMresult {
     const d = doc orelse return invalidDoc(c_alloc);
     const obj = objIdOf(d, obj_id) catch |e| return failWith(c_alloc, e);
-    const len = mutableOps(d).seqLength(obj, d.textEncoding(), null) catch 0;
+    const len = d.owner.length(obj) catch |e| return failWith(c_alloc, e);
     const at = adjustPos(pos, false, len) catch |e| return failWith(c_alloc, e);
     txIncrement(d, obj, .{ .index = at.pos }, value) catch |e| return failWith(c_alloc, e);
     return boxVoid(c_alloc) catch |e| failWith(c_alloc, e);
@@ -4112,7 +3876,7 @@ fn listPut(
 ) ?*AMresult {
     const d = doc orelse return invalidDoc(c_alloc);
     const obj = objIdOf(d, obj_id) catch |e| return failWith(c_alloc, e);
-    const len = mutableOps(d).seqLength(obj, d.textEncoding(), null) catch 0;
+    const len = d.owner.length(obj) catch |e| return failWith(c_alloc, e);
     const at = adjustPos(pos, insert, len) catch |e| return failWith(c_alloc, e);
     if (at.insert) {
         _ = txInsert(d, obj, at.pos, value) catch |e| return failWith(c_alloc, e);
@@ -4211,7 +3975,7 @@ pub export fn AMlistPutObject(
     const d = doc orelse return invalidDoc(c_alloc);
     const t = toObjType(obj_type) catch |e| return failWith(c_alloc, e);
     const obj = objIdOf(d, obj_id) catch |e| return failWith(c_alloc, e);
-    const len = mutableOps(d).seqLength(obj, d.textEncoding(), null) catch 0;
+    const len = d.owner.length(obj) catch |e| return failWith(c_alloc, e);
     const at = adjustPos(pos, insert, len) catch |e| return failWith(c_alloc, e);
     const made: ExId = if (at.insert)
         (txInsertObject(d, obj, at.pos, t) catch |e| return failWith(c_alloc, e))
@@ -5088,7 +4852,7 @@ test "a handle taken out of an item points into the item's own allocation" {
     // dead frame and every mutating entry point faulted on the next call.
     const r = try docResult(
         testing.allocator,
-        AMdoc{ .doc = try docmod.Document.init(testing.allocator, std.testing.io, .auto) },
+        AMdoc{ .owner = try @import("../autocommit.zig").AutoCommit.init(testing.allocator, std.testing.io) },
     );
     defer dropResult(testing.allocator, r);
     const item = AMresult.item(r) orelse return error.Unexpected;
@@ -5106,15 +4870,97 @@ test "a handle taken out of an item points into the item's own allocation" {
     try testing.expect(got >= base and got < base + @sizeOf(RcItem));
 }
 
+test "API parity C clone preserves source pending writes and independent rollback" {
+    // AMclone must copy the held transaction without creating a commit on the source.
+    const result_abi = abi;
+    const created = AMcreate(null) orelse return error.Unexpected;
+    defer result_abi.AMresultFree(created);
+    var source: ?*AMdoc = null;
+    try testing.expect(AMitemToDoc(AMresult.item(created), &source));
+    const doc = source orelse return error.Unexpected;
+    const written = AMmapPutInt(doc, null, AMbyteSpan.of("pending"), 7) orelse
+        return error.Unexpected;
+    defer result_abi.AMresultFree(written);
+    try testing.expectEqual(AMstatus.ok, AMresult.status(written));
+    try testing.expectEqual(@as(usize, 1), AMpendingOps(doc));
+    const cloned = AMclone(doc) orelse return error.Unexpected;
+    defer result_abi.AMresultFree(cloned);
+    var copy: ?*AMdoc = null;
+    try testing.expect(AMitemToDoc(AMresult.item(cloned), &copy));
+    try testing.expectEqual(@as(usize, 1), AMpendingOps(doc));
+    try testing.expectEqual(@as(usize, 1), AMpendingOps(copy));
+    try testing.expectEqual(@as(usize, 1), AMrollback(copy));
+    try testing.expectEqual(@as(usize, 1), AMpendingOps(doc));
+    const read_back = AMmapGet(doc, null, AMbyteSpan.of("pending"), null) orelse
+        return error.Unexpected;
+    defer result_abi.AMresultFree(read_back);
+    var number: i64 = 0;
+    try testing.expect(AMitemToInt(AMresult.item(read_back), &number));
+    try testing.expectEqual(@as(i64, 7), number);
+    try testing.expectEqual(@as(usize, 1), AMpendingOps(doc));
+}
+
+test "API parity C actor setter commits pending writes under the old actor" {
+    // A setter is a barrier even though ordinary value reads leave the transaction open.
+    const result_abi = abi;
+    const actor = try newActorHandle(testing.allocator, "replacement");
+    defer destroyActorHandle(actor);
+    const created = AMcreate(null) orelse return error.Unexpected;
+    defer result_abi.AMresultFree(created);
+    var doc: ?*AMdoc = null;
+    try testing.expect(AMitemToDoc(AMresult.item(created), &doc));
+    const written = AMmapPutInt(doc, null, AMbyteSpan.of("pending"), 7) orelse
+        return error.Unexpected;
+    defer result_abi.AMresultFree(written);
+    try testing.expectEqual(@as(usize, 1), AMpendingOps(doc));
+    const changed = AMsetActorId(doc, actor) orelse return error.Unexpected;
+    defer result_abi.AMresultFree(changed);
+    try testing.expectEqual(AMstatus.ok, AMresult.status(changed));
+    try testing.expectEqual(@as(usize, 0), AMpendingOps(doc));
+    try testing.expectEqual(@as(usize, 0), AMrollback(doc));
+    const read_back = AMmapGet(doc, null, AMbyteSpan.of("pending"), null) orelse
+        return error.Unexpected;
+    defer result_abi.AMresultFree(read_back);
+    var number: i64 = 0;
+    try testing.expect(AMitemToInt(AMresult.item(read_back), &number));
+    try testing.expectEqual(@as(i64, 7), number);
+}
+
+test "API parity C heads expose the isolated view without discarding full history" {
+    // The opaque C handle uses the same scope policy as the native AutoCommit owner.
+    const result_abi = abi;
+    const created = AMcreate(null) orelse return error.Unexpected;
+    defer result_abi.AMresultFree(created);
+    var slot: ?*AMdoc = null;
+    try testing.expect(AMitemToDoc(AMresult.item(created), &slot));
+    const doc = slot orelse return error.Unexpected;
+    const first = AMmapPutInt(doc, null, AMbyteSpan.of("value"), 1) orelse
+        return error.Unexpected;
+    defer result_abi.AMresultFree(first);
+    const old_heads = try doc.getHeads(c_alloc);
+    defer c_alloc.free(old_heads);
+    const second = AMmapPutInt(doc, null, AMbyteSpan.of("value"), 2) orelse
+        return error.Unexpected;
+    defer result_abi.AMresultFree(second);
+    const full_heads = try doc.getHeads(c_alloc);
+    defer c_alloc.free(full_heads);
+    try doc.isolate(c_alloc, old_heads);
+    const isolated_heads = try doc.getHeads(c_alloc);
+    defer c_alloc.free(isolated_heads);
+    try testing.expectEqualSlices(ChangeHash, old_heads, isolated_heads);
+    try doc.integrate();
+    const integrated_heads = try doc.getHeads(c_alloc);
+    defer c_alloc.free(integrated_heads);
+    try testing.expectEqualSlices(ChangeHash, full_heads, integrated_heads);
+}
+
 test "AMmapGet answers one indexed item, and a VOID one when the register is empty" {
-    // **An `AMdoc` owns its `Document` by value** (`AMdoc.doc`, `:257`), so a
-    // test that needs both surfaces takes the document through the handle and
-    // reaches the library through `amdoc.doc`. There is no `AMdocFree`
-    // (`:251-254`) — a result item owns one, and this one is on the stack.
-    var amdoc = AMdoc{ .doc = try docmod.Document.init(testing.allocator, std.testing.io, .auto) };
+    // The C handle owns the native AutoCommit by value. The owner stays at this
+    // stack address while its held transaction is open, and deinit drops both.
+    var amdoc = AMdoc{ .owner = try @import("../autocommit.zig").AutoCommit.init(testing.allocator, std.testing.io) };
     defer amdoc.deinit();
-    const doc = &amdoc.doc;
-    _ = try transact.put(doc, .root, .{ .key = "k" }, .{ .str = "v" });
+    const doc = &amdoc.owner;
+    _ = try doc.put(.root, .{ .key = "k" }, .{ .str = "v" });
 
     const hit = try mapGetResult(
         testing.allocator,
@@ -5189,20 +5035,20 @@ test "AMsplice reads the scalars out of the items it was handed" {
 }
 
 test "the read surface answers for a document that has been written" {
-    var amdoc = AMdoc{ .doc = try docmod.Document.init(testing.allocator, std.testing.io, .auto) };
+    var amdoc = AMdoc{ .owner = try @import("../autocommit.zig").AutoCommit.init(testing.allocator, std.testing.io) };
     defer amdoc.deinit();
-    const doc = &amdoc.doc;
+    const doc = &amdoc.owner;
     // The root is a **map**, so the two sub-objects go in by key; an index on
     // the root is `InvalidOp`, not a second list.
-    const list_obj = try transact.putObject(doc, .root, .{ .key = "list" }, .list);
-    const text_obj = try transact.putObject(doc, .root, .{ .key = "text" }, .text);
-    _ = try transact.put(doc, .root, .{ .key = "name" }, .{ .str = "v" });
+    const list_obj = try doc.putObject(.root, .{ .key = "list" }, .list);
+    const text_obj = try doc.putObject(.root, .{ .key = "text" }, .text);
+    _ = try doc.put(.root, .{ .key = "name" }, .{ .str = "v" });
     // The list starts empty, so its two elements are **inserted**: a `put` at
     // index 0 of an empty list is out of bounds, which is the reference's
     // answer too.
-    _ = try transact.insert(doc, list_obj, 0, .{ .int = 1 });
-    _ = try transact.insert(doc, list_obj, 1, .{ .int = 2 });
-    try transact.spliceText(doc, text_obj, 0, 0, "hi");
+    _ = try doc.insert(list_obj, 0, .{ .int = 1 });
+    _ = try doc.insert(list_obj, 1, .{ .int = 2 });
+    try doc.spliceText(text_obj, 0, 0, "hi");
 
     const set = mutableOps(&amdoc);
     try testing.expectEqual(ObjType.list, try doc.objectType(list_obj));
@@ -5219,7 +5065,7 @@ test "the read surface answers for a document that has been written" {
     const heads = try doc.getHeads(testing.allocator);
     defer testing.allocator.free(heads);
     try testing.expectEqual(@as(usize, 1), heads.len);
-    var clock = try doc.graph.clockAt(testing.allocator, heads);
+    var clock = try doc.doc.graph.clockAt(testing.allocator, heads);
     defer clock.deinit();
     const past = try getAt(&amdoc, .root, .{ .key = "name" }, clock);
     try testing.expectEqualStrings("v", (past.?).value.scalar.str);
@@ -5262,7 +5108,7 @@ test "a held transaction and its document share one allocator" {
     // place that used to pass `c_alloc` instead, and the teardown below is
     // what it cost: a `free` of a pointer the allocator had not handed out,
     // and a process that died inside `__free`.
-    var amdoc = AMdoc{ .doc = try docmod.Document.init(testing.allocator, std.testing.io, .auto) };
+    var amdoc = AMdoc{ .owner = try @import("../autocommit.zig").AutoCommit.init(testing.allocator, std.testing.io) };
     defer amdoc.deinit();
 
     // **The document is deliberately not on `c_alloc`**, or the equality below
@@ -5279,7 +5125,7 @@ test "a held transaction and its document share one allocator" {
     try testing.expect(tx.gpa.ptr == doc_alloc.ptr);
     try testing.expect(tx.gpa.vtable == doc_alloc.vtable);
     _ = try tx.putObject(.root, .{ .key = "k" }, .map);
-    try testing.expect(amdoc.tx != null);
+    try testing.expect(amdoc.owner.pendingOps() != 0);
 }
 
 test "a C text index names the character a default-configured reference build names" {
@@ -5303,14 +5149,13 @@ test "a C text index names the character a default-configured reference build na
     // document hides that, which is why this line used to be `c_alloc`; it is
     // now the regression test for it, and the results the assertions below
     // read are still the ones a C caller frees with `AMresultFree`.
-    var amdoc = AMdoc{ .doc = try docmod.Document.initWithEncoding(
+    var amdoc = AMdoc{ .owner = try @import("../autocommit.zig").AutoCommit.initWithEncoding(
         testing.allocator,
         std.testing.io,
         cTextEncoding(),
-        .auto,
     ) };
     defer amdoc.deinit();
-    try testing.expectEqual(types.TextEncoding.utf8_code_unit, amdoc.doc.textEncoding());
+    try testing.expectEqual(types.TextEncoding.utf8_code_unit, amdoc.owner.textEncoding());
 
     const put = AMmapPutObject(&amdoc, null, AMbyteSpan.of("unicode"), .AM_OBJ_TYPE_TEXT);
     const made = put orelse return error.Unexpected;
@@ -5426,10 +5271,10 @@ test "a change's author is the document's actor, at that actor's own byte length
     // item (`impl From<am::ActorId> for Value`, `src/item.rs:141-145`), so the
     // span a C caller reads is a copy of `Change.actor` and whatever length
     // that is.
-    var doc = try docmod.Document.init(testing.allocator, std.testing.io, .auto);
+    var doc = try @import("../autocommit.zig").AutoCommit.init(testing.allocator, std.testing.io);
     defer doc.deinit();
-    doc.setActorId(.{ .bytes = &actor16 });
-    _ = try transact.put(&doc, .root, .{ .key = "a" }, .{ .str = "b" });
+    try doc.setActorId(.{ .bytes = &actor16 });
+    _ = try doc.put(.root, .{ .key = "a" }, .{ .str = "b" });
 
     var changes = try doc.getChanges(testing.allocator, &.{});
     defer changes.deinit(testing.allocator);
@@ -5465,19 +5310,19 @@ test "the hex a handle caches comes back with the handle, exactly once" {
 
 test "AMgetCursorPosition names a foreign cursor InvalidCursor, and AMgetCursor keeps InvalidIndex" {
     const gpa = testing.allocator;
-    var amdoc = AMdoc{ .doc = try docmod.Document.init(gpa, std.testing.io, .auto) };
+    var amdoc = AMdoc{ .owner = try @import("../autocommit.zig").AutoCommit.init(gpa, std.testing.io) };
     defer amdoc.deinit();
-    const doc = &amdoc.doc;
+    const doc = &amdoc.owner;
 
     // **Two objects, because the question is "a cursor naming a row of *another*
     // one".** Upstream's `seek_list_opid` searches within `obj_meta.id`'s own
     // rows and answers an `Option` (`op_set.rs:837-851`), and
     // `get_cursor_position_for` turns the empty answer into `InvalidCursor`
     // (`automerge.rs:1778-1781`). One object cannot be asked it.
-    const here = try transact.putObject(doc, .root, .{ .key = "here" }, .list);
-    const there = try transact.putObject(doc, .root, .{ .key = "there" }, .list);
-    _ = try transact.insert(doc, here, 0, .{ .int = 1 });
-    _ = try transact.insert(doc, there, 0, .{ .int = 2 });
+    const here = try doc.putObject(.root, .{ .key = "here" }, .list);
+    const there = try doc.putObject(.root, .{ .key = "there" }, .list);
+    _ = try doc.insert(here, 0, .{ .int = 1 });
+    _ = try doc.insert(there, 0, .{ .int = 2 });
 
     // The handles a C caller holds. **They are built with `c_alloc`, not the
     // testing allocator**, because [`objIdOfEx`] copies the actor's bytes into a
@@ -5563,14 +5408,14 @@ test "a cursor minted before an edit resolves at its own heads while a transacti
     // the arbiter, and the C ABI's own allocator is still what the reference's
     // cmocka suite uses at runtime.
     const gpa = testing.allocator;
-    var amdoc = AMdoc{ .doc = try docmod.Document.initWithEncoding(gpa, std.testing.io, cTextEncoding(), .auto) };
+    var amdoc = AMdoc{ .owner = try @import("../autocommit.zig").AutoCommit.initWithEncoding(gpa, std.testing.io, cTextEncoding()) };
     defer amdoc.deinit();
-    amdoc.setActorId(.{ .bytes = "0123456789abcdef" });
-    const doc = &amdoc.doc;
+    try amdoc.setActorId(.{ .bytes = "0123456789abcdef" });
+    const doc = &amdoc.owner;
 
     // One text element holding the whole string, as upstream's fixture has it.
-    const text = try transact.putObject(doc, .root, .{ .key = "text" }, .text);
-    try transact.spliceText(doc, text, 0, 0, "the sly fox jumped over the lazy dog");
+    const text = try doc.putObject(.root, .{ .key = "text" }, .text);
+    try doc.spliceText(text, 0, 0, "the sly fox jumped over the lazy dog");
 
     // The heads the cursor is about to be minted at, through the export a C
     // caller calls, and the `AMitems` over the result that owns them.
@@ -5598,7 +5443,7 @@ test "a cursor minted before an edit resolves at its own heads while a transacti
     // **The held transaction.** Nothing is committed, so the graph's heads are
     // still `heads1`'s while these operations are already in the op set.
     try (try amdoc.open()).spliceText(text, 0, 3, "Has the");
-    try testing.expect(amdoc.tx != null);
+    try testing.expect(amdoc.owner.pendingOps() != 0);
 
     // **At the present the cursor has moved with the text in front of it** —
     // three characters replaced by seven, so `+4`. This is the assertion that
@@ -5735,13 +5580,9 @@ test "a cursor minted before an edit resolves at its own heads while a transacti
 //   in [test/c/suite/mark_tests.c](../test/c/suite/mark_tests.c) matches on
 //   that message, so no case had to change to make the answer the right one.
 //
-// * **`AMpendingOps` and `AMrollback` answer `0` because the flavour has
-//   already committed.** `AMdoc` is always an `AutoCommit` (`src/doc.rs:36`) and
-//   the write surface is `requireAuto` ([transact.zig](../transact.zig)), whose
-//   `.auto` mode closes the transaction at the end of every mutating call. So
-//   `pending_ops()` is `0` and `rollback()` is the
-//   `self.transaction.take()…unwrap_or(0)` of `autocommit.rs:742-750` with
-//   nothing to take. Both are the reference's own answers between calls.
+// * `AMpendingOps` and `AMrollback` read the same native pending owner. Mutations
+//   remain pending until an explicit facade barrier, rather than committing after
+//   every call. The count-only rollback ABI retains cancellation state on refusal.
 //
 // * **`AMbytes`, `AMstr` and `AMstrCmp` are declared in the header and were
 //   missing from the library.** They are `#[no_mangle] pub extern "C"` upstream
@@ -5949,3 +5790,71 @@ test "a cursor minted before an edit resolves at its own heads while a transacti
 //   gone as well** (`an actor id's hex …` and `the hex a handle caches …`,
 //   each leaving a `newActorHandle` cell behind): the section now runs to a
 //   clean teardown under `std.testing.allocator` for every test in it.
+
+test "API parity C list reads and append boundaries use the isolated pending view" {
+    const gpa = testing.allocator;
+    var document: AMdoc = .{ .owner = try @import("../autocommit.zig").AutoCommit.init(gpa, std.testing.io) };
+    defer document.deinit();
+    const list = try document.owner.putObject(.root, .{ .key = "list" }, .list);
+    _ = try document.owner.insert(list, 0, .{ .int = 1 });
+    _ = try document.owner.insert(list, 1, .{ .int = 2 });
+    const old_heads = try document.getHeads(gpa);
+    defer gpa.free(old_heads);
+    _ = try document.owner.delete(list, .{ .index = 1 });
+    _ = try document.owner.commit();
+    try document.isolate(gpa, old_heads);
+    var object = try objIdOfEx(c_alloc, &document, list);
+    defer object.deinit();
+    const found = AMlistGet(&document, &object, 1, null) orelse return error.Unexpected;
+    defer abi.AMresultFree(found);
+    if (AMresult.status(found) == .error_)
+        std.debug.print("AMlistGet isolated: {s}\n", .{AMresult.errorMessage(found).slice()});
+    try testing.expectEqual(AMstatus.ok, AMresult.status(found));
+    const item = abi.AMresultItem(found) orelse return error.Unexpected;
+    var value: i64 = 0;
+    try testing.expect(AMitemToInt(item, &value));
+    try testing.expectEqual(@as(i64, 2), value);
+    const conflicts = AMlistGetAll(&document, &object, 1, null) orelse return error.Unexpected;
+    defer abi.AMresultFree(conflicts);
+    if (AMresult.status(conflicts) == .error_)
+        std.debug.print("AMlistGetAll isolated: {s}\n", .{AMresult.errorMessage(conflicts).slice()});
+    try testing.expectEqual(AMstatus.ok, AMresult.status(conflicts));
+    try testing.expectEqual(@as(usize, 1), AMresult.size(conflicts));
+    const appended = AMlistPutInt(&document, &object, std.math.maxInt(usize), true, 3) orelse
+        return error.Unexpected;
+    defer abi.AMresultFree(appended);
+    if (AMresult.status(appended) == .error_)
+        std.debug.print("AMlistPutInt isolated append: {s}\n", .{AMresult.errorMessage(appended).slice()});
+    try testing.expectEqual(AMstatus.ok, AMresult.status(appended));
+    const pending = AMlistGet(&document, &object, 2, null) orelse return error.Unexpected;
+    defer abi.AMresultFree(pending);
+    if (AMresult.status(pending) == .error_)
+        std.debug.print("AMlistGet pending: {s}; pending_ops={d}, scoped_length={d}\n", .{
+            AMresult.errorMessage(pending).slice(), document.owner.pendingOps(),
+            try document.owner.length(list),
+        });
+    try testing.expectEqual(AMstatus.ok, AMresult.status(pending));
+    try testing.expectEqual(@as(usize, 1), AMpendingOps(&document));
+    try testing.expectEqual(@as(usize, 1), AMrollback(&document));
+    try testing.expectEqual(@as(usize, 2), try document.owner.length(list));
+}
+
+test "API parity C object handles preserve wide public counters and reject resident overflow" {
+    const gpa = testing.allocator;
+    var document: AMdoc = .{ .owner = try @import("../autocommit.zig").AutoCommit.init(gpa, std.testing.io) };
+    defer document.deinit();
+    try document.setActorId(.{ .bytes = &.{1} });
+    _ = try document.owner.put(.root, .{ .key = "resident" }, .{ .int = 1 });
+    _ = try document.owner.commit();
+    try document.setActorId(.{ .bytes = &.{0} });
+    _ = try document.owner.put(.root, .{ .key = "earlier_actor" }, .{ .int = 2 });
+    _ = try document.owner.commit();
+    var identity = try ExId.parse(gpa, "4294967297@01");
+    defer identity.deinitOwned(gpa);
+    var handle = try objIdOfEx(gpa, &document, identity);
+    defer handle.deinit();
+    try testing.expectEqual(@as(u64, 4294967297), AMobjIdCounter(&handle));
+    try testing.expectEqual(@as(usize, 1), AMobjIdIndex(&handle));
+    try testing.expectError(error.InvalidObjId, objIdOf(&document, &handle));
+    try testing.expectEqual(@as(u64, 4294967297), AMobjIdCounter(&handle));
+}

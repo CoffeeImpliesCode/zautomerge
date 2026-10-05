@@ -303,6 +303,21 @@ pub fn Keys(comptime O: type) type {
             return try self.render(op.elemidOrKey());
         }
 
+        /// Returns a copied key that survives another step and document
+        /// teardown (`keys.rs:13`). The caller frees it with `gpa`.
+        /// A failed copy consumes the step but owns no returned storage.
+        pub fn nextOwned(self: *Self, gpa: Allocator) (KeysError || Allocator.Error)!?[]u8 {
+            const op = (try self.walk.next()) orelse return null;
+            return switch (op.elemidOrKey()) {
+                .map => |key| try gpa.dupe(u8, key),
+                .seq => |elem| blk: {
+                    if (elem.isHead()) break :blk try gpa.dupe(u8, head_text);
+                    const actor = self.op_set.getActor(elem.actor().?) orelse return error.InvalidActorIndex;
+                    break :blk try std.fmt.allocPrint(gpa, "{d}@{f}", .{ elem.icounter(), actor });
+                },
+            };
+        }
+
         /// [`OpSet::to_string`] for a key
         /// ([`op_set.rs:1093-1098`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)),
         /// on the two shapes a [`KeyRef`] has.
@@ -334,8 +349,8 @@ pub fn Keys(comptime O: type) type {
                         return error.InvalidActorIndex;
                     return std.fmt.bufPrint(
                         &self.buf,
-                        "{d}@{s}",
-                        .{ elem.icounter(), actor.bytes },
+                        "{d}@{f}",
+                        .{ elem.icounter(), actor },
                     ) catch error.Overflow;
                 },
             }
@@ -709,7 +724,7 @@ test "a map key that is a sequence anchor is rendered, not dropped" {
 
     var walk = try Keys(opmod.Op).ofObj(&doc.set, .root, null);
     defer walk.deinit(gpa);
-    try expectKeys(&walk, &.{ "a", "2@aaaaaaaa", "c" });
+    try expectKeys(&walk, &.{ "a", "2@6161616161616161", "c" });
 }
 
 test "a sequence's keys are its element ids, one per register" {
@@ -730,10 +745,23 @@ test "a sequence's keys are its element ids, one per register" {
     defer doc.destroy();
 
     // **One key per element — two rows, one key** — and the order is *element*
-    // order, not string order: `12@aaaaaaaa` sorts before `9@aaaaaaaa` as bytes
+    // order, not string order: `12@6161616161616161` sorts before `9@6161616161616161`
     // and does not come out first. That is what tells a row walk from a sort,
     // which a map fixture cannot do (rule R2 makes the two orders agree there).
     var walk = try Keys(opmod.Op).ofObj(&doc.set, list, null);
     defer walk.deinit(gpa);
-    try expectKeys(&walk, &.{ "9@aaaaaaaa", "12@aaaaaaaa" });
+    try expectKeys(&walk, &.{ "9@6161616161616161", "12@6161616161616161" });
+}
+
+test "API parity owned keys survive iterator and document destruction" {
+    const gpa = testing.allocator;
+    const doc = try Fixture.build(gpa, &.{actor_a}, &.{
+        mapRow(opId(1, 0), .root, "consumer-key", .{ .int = 1 }, &.{}),
+    });
+    var walk = try Keys(opmod.Op).ofObj(&doc.set, .root, null);
+    const key = (try walk.nextOwned(gpa)).?;
+    defer gpa.free(key);
+    walk.deinit(gpa);
+    doc.destroy();
+    try testing.expectEqualStrings("consumer-key", key);
 }

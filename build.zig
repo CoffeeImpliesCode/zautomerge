@@ -1,8 +1,21 @@
 const std = @import("std");
+const manifest = @import("build.zig.zon");
+
+const TextIndexing = enum {
+    unicode_code_point,
+    utf8_code_unit,
+    utf16_code_unit,
+    grapheme_cluster,
+};
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const text_indexing = b.option(
+        TextIndexing,
+        "text-indexing",
+        "Select native text indexing units; defaults to unicode_code_point.",
+    ) orelse .unicode_code_point;
 
     // Published native module and static C artifact share the same core.
     const mod = b.addModule("zautomerge", .{
@@ -48,6 +61,9 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "check_slow_paths", slow_path);
+    build_options.addOption([]const u8, "package_name", @tagName(manifest.name));
+    build_options.addOption([]const u8, "package_version", manifest.version);
+    build_options.addOption([]const u8, "text_indexing", @tagName(text_indexing));
     mod.addImport("build_options", build_options.createModule());
 
     // `zig build slow-path` is the gate P2's text names, and **it builds its
@@ -69,13 +85,19 @@ pub fn build(b: *std.Build) void {
     // library module every other step builds, so `zig build test
     // -Dslow-path` runs everything above with the `seekOpsByIndex`
     // cross-check live too.
+    // The published module stays pure Zig. Source tests use C-backed
+    // allocation, so libc is linked only into these test roots.
     const slow_options = b.addOptions();
     slow_options.addOption(bool, "check_slow_paths", true);
+    slow_options.addOption([]const u8, "package_name", @tagName(manifest.name));
+    slow_options.addOption([]const u8, "package_version", manifest.version);
+    slow_options.addOption([]const u8, "text_indexing", @tagName(text_indexing));
     const slow_lib_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
             .imports = &.{.{ .name = "build_options", .module = slow_options.createModule() }},
         }),
     });
@@ -85,7 +107,14 @@ pub fn build(b: *std.Build) void {
     );
     timedTest(b, slow_lib_tests, "library-slow-path", null, &.{slow_path_step});
 
-    const lib_tests = b.addTest(.{ .root_module = mod });
+    const library_test_root = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "build_options", .module = build_options.createModule() }},
+    });
+    const lib_tests = b.addTest(.{ .root_module = library_test_root });
 
     const test_step = b.step("test", "Run unit tests");
     timedTest(b, lib_tests, "library", null, &.{test_step});
@@ -146,6 +175,29 @@ pub fn build(b: *std.Build) void {
     });
     timedTest(b, upstream_doc_tests, "upstream-doc", null, &.{test_step});
 
+    // Public document consumers embed their Rust-generated vectors.
+    const clock_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/upstream_clock_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zautomerge", .module = mod }},
+        }),
+    });
+    const clock_test_step = b.step("clock-test", "Check document frontiers against the Rust clock corpus");
+    timedTest(b, clock_tests, "upstream-clock", null, &.{ test_step, clock_test_step });
+
+    const metadata_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/upstream_metadata_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zautomerge", .module = mod }},
+        }),
+    });
+    const metadata_test_step = b.step("metadata-test", "Check owned change metadata against Rust");
+    timedTest(b, metadata_tests, "upstream-metadata", null, &.{ test_step, metadata_test_step });
+
     // `rust/automerge/tests/test_mark_patches.rs` — a file holding **exactly
     // one** `#[test]` — ported case for case into `test/mark_patches_test.zig`.
     // Its own module, `zautomerge` imported by name, for the same reason as
@@ -199,7 +251,8 @@ pub fn build(b: *std.Build) void {
     timedTest(b, hexane_tests, "hexane", null, &.{test_step});
 
     // The C ABI's Zig tests need libc and a root under src/ so imports stay
-    // inside the module. The library test root deliberately links no libc.
+    // inside the module. The published `mod` stays pure Zig; its normal and
+    // forced-slow in-file test roots link libc for C-backed allocator tests.
     // Filter by module name to avoid a second run of the transitive library
     // tests. Anonymous import-collection tests remain in the filtered binary.
     const c_abi_tests = b.addTest(.{
@@ -400,11 +453,10 @@ pub fn build(b: *std.Build) void {
     timedTest(b, upstream_convert_string_tests, "upstream-convert-string", null, &.{test_step});
 
     // `test/upstream_rich_text_fuzz.zig` is `$AUTOMERGE_REF/rust/automerge/
-    // tests/rich_text_fuzz_crash.rs` — **8 of its 9** `#[test]` cases, ported
-    // case for case and in upstream's order, and the ninth recorded as a gap
-    // at its own upstream line (`rescue`, which needs a load that skips
-    // mark-order validation and a document-level `hydrate`; the port has
-    // neither). Run the same way as every other step above — its own module,
+    // tests/rich_text_fuzz_crash.rs` — all nine `#[test]` cases, ported
+    // case for case and in upstream's order. Rescue loads without mark-order
+    // validation and returns an independently owned hydrated tree. Run the
+    // same way as every other step above — its own module,
     // `zautomerge` imported by name, **no `setCwd`** because the file embeds
     // its one fixture with `@embedFile` rather than reading it at runtime.
     //
@@ -468,6 +520,18 @@ pub fn build(b: *std.Build) void {
     });
     timedTest(b, save_interop_tests, "save-interop", b.path("."), &.{test_step});
 
+    // Every api-parity vector is replayed by native public consumers, while
+    // ordinary conformance independently checks the reference's determinism.
+    const api_parity_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/api_parity_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zautomerge", .module = mod }},
+        }),
+    });
+    timedTest(b, api_parity_tests, "api-parity", null, &.{test_step});
+
     // `zig build ctest` builds the upstream C conformance suite — the cmocka
     // suite from `rust/automerge-c/test/`, copied verbatim into
     // `test/c/suite/` — against the C ABI, and runs it. It also depends on
@@ -496,14 +560,14 @@ pub fn build(b: *std.Build) void {
     // the test binary links none, which is why `src/root.zig:233-237` leaves it
     // out.
     //
-    // cmocka is a build-time-only dependency, reached the same way a system
-    // library is: with no option the compiler's own default search paths are
-    // used, and `-Dcmocka-prefix=<dir>` points at an installation for a
-    // platform whose compiler wrapper has no default. Nothing is vendored and
-    // no path is hardcoded.
-    const cmocka_prefix = b.option([]const u8, "cmocka-prefix", "Directory holding a cmocka installation's include/ and lib/, for a " ++
-        "platform whose compiler wrapper has no default search path. Empty " ++
-        "means the compiler's defaults.");
+    // Without a prefix, pkg-config supplies cmocka's linker metadata when
+    // available and the toolchain is the fallback. An explicit prefix selects
+    // that installation's headers and existing `lib` or `lib64` directory.
+    const cmocka_prefix = b.option(
+        []const u8,
+        "cmocka-prefix",
+        "Prefix holding cmocka's include/ and lib/ or lib64/ directories.",
+    );
 
     // Production root forces C exports without depending on test sources.
     const cabi_lib = b.addLibrary(.{
@@ -547,6 +611,69 @@ pub fn build(b: *std.Build) void {
     });
     abi_check.root_module.addIncludePath(b.path("include"));
 
+    // The manifest is a deferred host-tool import: published packages omit
+    // test/, so configuring a normal consumer must not import it here.
+    const shared_fixture_generator = b.addExecutable(.{
+        .name = "automerge-c-fixture-table",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/c/shared_fixture_table.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{
+                .name = "manifest",
+                .module = b.createModule(.{
+                    .root_source_file = b.path("test/fixtures/manifest.zig"),
+                    .target = b.graph.host,
+                    .optimize = .ReleaseSafe,
+                }),
+            }},
+        }),
+    });
+    const run_shared_fixture_generator = b.addRunArtifact(shared_fixture_generator);
+    const shared_header = run_shared_fixture_generator.captureStdOut(.{
+        .basename = "shared_fixtures.h",
+    });
+    const cabi_shared_lib = b.addLibrary(.{
+        .name = "zautomerge",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/c/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "zautomerge", .module = mod }},
+        }),
+    });
+    cabi_shared_lib.root_module.addCSourceFiles(.{
+        .root = b.path("src/c"),
+        .files = &.{"result_from.c"},
+    });
+    // This dynamic artifact belongs only to the explicit corpus gate; the
+    // default package still installs cabi_lib's static artifact and header.
+    const shared_consumer = b.addExecutable(.{
+        .name = "automerge-c-shared-corpus",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/c/shared_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    shared_consumer.root_module.addIncludePath(b.path("include"));
+    shared_consumer.root_module.addIncludePath(shared_header.dirname());
+    shared_consumer.root_module.addCSourceFiles(.{
+        .files = &.{"test/c/shared_corpus.c"},
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    shared_consumer.root_module.linkLibrary(cabi_shared_lib);
+    shared_consumer.step.dependOn(&abi_check.step);
+    shared_consumer.each_lib_rpath = true;
+    const run_shared_consumer = b.addRunArtifact(shared_consumer);
+    run_shared_consumer.setCwd(b.path("."));
+    run_shared_consumer.stdio = .inherit;
+    const ctest_shared_step = b.step("ctest-shared", "Run the C corpus consumer against the dynamic production ABI");
+    ctest_shared_step.dependOn(&run_shared_consumer.step);
+
     const ctest_exe = b.createModule(.{
         .root_source_file = b.path("test/c/main.zig"),
         .target = target,
@@ -580,13 +707,26 @@ pub fn build(b: *std.Build) void {
         // directory `zig build` was invoked from.
         const abs_prefix = if (std.fs.path.isAbsolute(prefix)) prefix else b.pathFromRoot(prefix);
         ctest_exe.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ abs_prefix, "include" }) });
-        // Both spellings, because a prefix that is not `/usr` may put its
-        // libraries in either: a distribution package uses `lib64` on
-        // 64-bit RPM systems and Nix uses `lib`. A path that does not exist
-        // is not an error for a linker search path, so one option covers
-        // every layout.
-        ctest_exe.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ abs_prefix, "lib" }) });
-        ctest_exe.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ abs_prefix, "lib64" }) });
+        // Only add library directories that exist. Missing candidates are
+        // normal across prefixes; other inspection errors stop configuration.
+        const lib_dir = b.pathJoin(&.{ abs_prefix, "lib" });
+        const lib64_dir = b.pathJoin(&.{ abs_prefix, "lib64" });
+        const has_lib_dir = directoryExistsAbsolute(b, lib_dir);
+        const has_lib64_dir = directoryExistsAbsolute(b, lib64_dir);
+        if (has_lib_dir) {
+            ctest_exe.addLibraryPath(.{ .cwd_relative = lib_dir });
+        }
+        if (has_lib64_dir) {
+            ctest_exe.addLibraryPath(.{ .cwd_relative = lib64_dir });
+        }
+        if (!has_lib_dir) {
+            if (!has_lib64_dir) {
+                std.debug.panic(
+                    "cmocka prefix '{s}' has no existing lib or lib64 directory",
+                    .{abs_prefix},
+                );
+            }
+        }
     }
     ctest_exe.addCSourceFiles(.{
         .root = b.path("test/c/suite"),
@@ -625,7 +765,11 @@ pub fn build(b: *std.Build) void {
         },
     });
     ctest_exe.linkLibrary(cabi_lib);
-    ctest_exe.linkSystemLibrary("cmocka", .{});
+    // An explicit prefix bypasses pkg-config so it cannot select a different
+    // installation; otherwise pkg-config may provide the package's link flags.
+    ctest_exe.linkSystemLibrary("cmocka", .{
+        .use_pkg_config = if (cmocka_prefix == null) .yes else .no,
+    });
 
     // Hoisted out of `addRunArtifact` because the API forces it, not because
     // it reads better. Zig 0.16's `ExecutableOptions` (`Build.zig:770-785`) has
@@ -660,11 +804,10 @@ pub fn build(b: *std.Build) void {
     // working directory, exactly as upstream's CMake copy step arranges it
     // (`rust/automerge-c/test/CMakeLists.txt:40-45`).
     run_ctest.setCwd(b.path("test/c/suite"));
-    // cmocka prints one line per case and a `[  PASSED  ] N test(s).` count
-    // (`cmocka_run_group_tests`), which is the per-case report this step
-    // exists to produce. `main.c` sums the group results, so a non-zero exit
-    // is a failing case and must stay a build failure.
-    run_ctest.expectExitCode(0);
+    // cmocka prints one line per case and a `[  PASSED  ] N test(s).` count.
+    // Inherit both streams so failing cases are visible; nonzero child exits
+    // still fail the build step.
+    run_ctest.stdio = .inherit;
 
     const ctest_step = b.step("ctest", "Run the upstream C conformance suite against the C ABI");
     ctest_step.dependOn(&run_ctest.step);
@@ -883,6 +1026,42 @@ pub fn build(b: *std.Build) void {
         "Measure the seven dominant workloads and print a machine-readable line each",
     );
     bench_step.dependOn(&run_bench.step);
+
+    // Matched public-surface driver uses the system allocator on both engines.
+    // Rust lives in the local oracle crate; its build/run recipe is in bench/README.md.
+    const matched_bin = b.addExecutable(.{
+        .name = "zautomerge-matched-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/matched_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "zautomerge", .module = mod }},
+        }),
+    });
+    const run_matched = b.addRunArtifact(matched_bin);
+    run_matched.has_side_effects = true;
+    if (b.args) |matched_args| {
+        run_matched.addArgs(matched_args);
+    } else {
+        run_matched.addArgs(&.{ "insert-growth", "small" });
+    }
+    const matched_step = b.step(
+        "bench-matched",
+        "Measure one deterministic workload matched to Rust Automerge",
+    );
+    matched_step.dependOn(&run_matched.step);
+
+    // Counter validation is deterministic and needs no PMU permissions.
+    const bench_counter_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/perf_instructions.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const bench_test_step = b.step("bench-test", "Check benchmark counter validity");
+    timedTest(b, bench_counter_tests, "bench-counter", null, &.{ test_step, bench_test_step });
 }
 
 /// Run one test root under `test/verification_runner.zig` and put that root's
@@ -1061,6 +1240,24 @@ fn existsInBuildRoot(b: *std.Build, rel: []const u8) bool {
     return true;
 }
 
+/// Opens `path` to confirm it is a directory. Missing or non-directory
+/// candidates may be skipped; other I/O errors stop configuration.
+fn directoryExistsAbsolute(b: *std.Build, path: []const u8) bool {
+    var directory = std.Io.Dir.openDirAbsolute(
+        b.graph.io,
+        path,
+        .{},
+    ) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => std.debug.panic(
+            "cannot inspect cmocka library directory '{s}': {s}",
+            .{ path, @errorName(err) },
+        ),
+    };
+    directory.close(b.graph.io);
+    return true;
+}
+
 /// Where the committed vectors live, relative to the build root.
 const golden_dir = "test/golden";
 
@@ -1078,9 +1275,10 @@ const golden_dir = "test/golden";
 /// | `converge`          | read at run time by `src/sync/protocol.zig` and `src/sync/v1.zig`        |
 /// | `converge-parallel` | read at run time by `src/sync/protocol.zig`                             |
 /// | `codec`             | read at run time by `src/hexane/codec_golden.zig`                      |
-/// | `clock`             | nothing yet: checked, and read by no test                              |
+/// | `clock`             | embedded by `test/upstream_clock_test.zig`, which checks all subset frontiers and pairwise coverage/merges |
 /// | `save-interop`       | read at run time by `test/save_interop_test.zig`, and the six scripts `zig build save-interop` replays against the live oracle |
 /// | `hexane-regression` | read at run time by `src/hexane/raw.zig`'s `cross_slab_fuzz_regression`, which replays upstream's seed-799 op list step by step against the port's own run-budget column |
+/// | `metadata`          | embedded by `test/upstream_metadata_test.zig`, which checks metadata fields, frontiers and ownership |
 ///
 /// `doc`, `change` and `diff` are recorded as the provenance of literals in
 /// `src/`, which is why re-recording them changes no test on its own: the
@@ -1124,4 +1322,6 @@ const golden_vectors = [_][]const u8{
     "clock",
     "save-interop",
     "hexane-regression",
+    "metadata",
+    "api-parity",
 };

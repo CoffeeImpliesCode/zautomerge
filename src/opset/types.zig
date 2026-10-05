@@ -95,10 +95,9 @@ pub const ValueMeta = value.ValueMeta;
 /// The type tag in a value metadata word (`op_set2/meta.rs:4-17`).
 pub const ValueType = value.ValueType;
 
-/// One change's identity, op range and footer (`op_set2/types.rs:748-760`).
-/// The port keeps it beside the change it was read from
-/// (`change.zig:236-334`), where `intoOwned` is the allocator-taking form of
-/// upstream's `into_owned` (`op_set2/types.rs:762-777`).
+/// Low-level encoded-change metadata, including decoded author and the
+/// complete opaque extra footer. Payloads borrow from the encoded change.
+/// For a document-independent owner, use the high-level `doc.ChangeMetadata`.
 pub const ChangeMetadata = change.ChangeMetadata;
 
 // ── Marks ──────────────────────────────────────────────────────────────────
@@ -299,9 +298,18 @@ pub const ValueRef = union(enum) {
         return .{
             .value = switch (self) {
                 .object => |o| ValueRef{ .object = o },
-                .scalar => |s| ValueRef{ .scalar = try dupScalar(gpa, s) },
+                .scalar => |s| ValueRef{ .scalar = try s.dup(gpa) },
             },
         };
+    }
+
+    /// Converts to the public object-kind/scalar value with independently
+    /// owned scalar bytes (`op_set2/types.rs:697-705`).
+    pub fn intoValue(self: ValueRef, gpa: Allocator) !value.OwnedValue {
+        return (switch (self) {
+            .object => |o| value.Value{ .object = o },
+            .scalar => |s| value.Value{ .scalar = s },
+        }).intoOwned(gpa);
     }
 };
 
@@ -320,37 +328,14 @@ pub const OwnedValueRef = struct {
     pub fn deinit(self: *OwnedValueRef, gpa: Allocator) void {
         switch (self.value) {
             .object => {},
-            .scalar => |s| freeScalar(gpa, s),
+            .scalar => |s| {
+                var owned = s;
+                owned.deinitOwned(gpa);
+            },
         }
         self.* = undefined;
     }
 };
-
-/// A copy of every payload in `v` that is a slice. The other variants hold
-/// only numbers, so copying them copies nothing.
-fn dupScalar(gpa: Allocator, v: ScalarValue) !ScalarValue {
-    return switch (v) {
-        .null_value, .bool_value, .int, .uint, .float, .counter, .timestamp => v,
-        .str => |s| ScalarValue{ .str = try gpa.dupe(u8, s) },
-        .bytes => |b| ScalarValue{ .bytes = try gpa.dupe(u8, b) },
-        .actor_id => |a| ScalarValue{ .actor_id = .{ .bytes = try gpa.dupe(u8, a.bytes) } },
-        .unknown => |u| ScalarValue{ .unknown = .{
-            .type_code = u.type_code,
-            .bytes = try gpa.dupe(u8, u.bytes),
-        } },
-    };
-}
-
-/// The inverse of `dupScalar`, for a value that came from it.
-fn freeScalar(gpa: Allocator, v: ScalarValue) void {
-    switch (v) {
-        .str => |s| gpa.free(s),
-        .bytes => |b| gpa.free(b),
-        .actor_id => |a| gpa.free(a.bytes),
-        .unknown => |u| gpa.free(u.bytes),
-        else => {},
-    }
-}
 
 // ── A scalar's raw form ────────────────────────────────────────────────────
 //
@@ -1238,4 +1223,16 @@ test "a counter round trips through the delta and prefix codecs" {
     const opt_got = try opt_back.toSlice(gpa);
     defer gpa.free(opt_got);
     try testing.expectEqualSlices(?u32, &with_gaps, opt_got);
+}
+
+test "API parity value reference owned conversion survives source release" {
+    const gpa = std.testing.allocator;
+    const bytes = try gpa.dupe(u8, &.{ 0, 255, 128 });
+    var owned = try (ValueRef{ .scalar = .{ .bytes = bytes } }).intoValue(gpa);
+    defer owned.deinit(gpa);
+    gpa.free(bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 128 }, owned.value.scalar.bytes);
+    var object = try (ValueRef{ .object = .text }).intoValue(gpa);
+    defer object.deinit(gpa);
+    try std.testing.expectEqual(types.ObjType.text, object.value.object);
 }

@@ -768,6 +768,8 @@ pub const MarkIndexColumn = struct {
     /// The `MarkData` of every live mark-begin op (`mark_index.rs:216`,
     /// `:277-286`). This is what `hasAnyMarks` and `markData` read
     /// (`:261-269`).
+    /// Scalar byte payloads are owned here, independently of producer or value
+    /// column storage. Names still borrow the document's interned string table.
     cache: std.AutoHashMapUnmanaged(OpId, MarkData),
     /// The per-slab prefix aggregates [`total`] reads, and the frontier that
     /// says how far into them is current ([`AggPrefix`]).
@@ -783,6 +785,71 @@ pub const MarkIndexColumn = struct {
     /// that this type is no longer free of a reader mutating it, so two
     /// threads sharing one index would race here.
     agg: *AggPrefix,
+    /// Non-null only in an unpublished, address-stable batch view.
+    staging: ?*Overlay = null,
+
+    /// Selective row staging and a bounded tail of mark-cache changes.
+    /// The source must stay alive and unchanged until publication or disposal.
+    /// Initialize in place and keep both this value and its bound view stable.
+    /// Provisional mark aggregates must not be queried after the first write.
+    pub const Overlay = struct {
+        source: *MarkIndexColumn,
+        rows: DataColumn.Overlay,
+        pending: std.ArrayList(StagedMarkIndex.Pending) = .empty,
+        at: usize = std.math.maxInt(usize),
+        insert_bound: usize = 0,
+        spent: bool = false,
+
+        /// Binds a provisional index. Capture it before disposing the overlay.
+        pub fn bind(self: *Overlay, view: *MarkIndexColumn) void {
+            std.debug.assert(!self.spent);
+            view.* = self.source.*;
+            view.staging = self;
+            self.rows.bind(&view.data);
+        }
+
+        /// Captures the final provisional rows and clears their staging link.
+        pub fn capture(self: *Overlay, view: *MarkIndexColumn) void {
+            std.debug.assert(view.staging == self);
+            self.rows.capture(&view.data);
+            view.staging = null;
+        }
+
+        /// Publishes rows and pending cache entries without allocating.
+        pub fn publish(self: *Overlay, source: *MarkIndexColumn) void {
+            std.debug.assert(!self.spent);
+            std.debug.assert(source == self.source);
+            self.rows.publish(&source.data);
+            for (self.pending.items) |record| source.applyPending(record);
+            const reached = @min(source.agg.entries.items.len, source.data.slabCount());
+            var row: usize = 0;
+            var frontier: usize = 0;
+            while (frontier < reached and row <= self.at and
+                source.agg.entries.items[frontier].start_row == row) : (frontier += 1)
+            {
+                row += source.data.slabAt(frontier).?.len;
+            }
+            source.agg.valid = @min(source.agg.valid, frontier);
+            self.pending.deinit(source.gpa);
+            self.spent = true;
+        }
+
+        /// Releases provisional storage; source entries and rows stay intact.
+        pub fn deinit(self: *Overlay) void {
+            if (self.spent) return;
+            self.rows.deinit();
+            for (self.pending.items) |*record| record.deinit(self.source.gpa);
+            self.pending.deinit(self.source.gpa);
+            self.spent = true;
+        }
+    };
+
+    /// Initializes a selective batch overlay without changing source entries.
+    /// Cache capacity may grow, but source rows and cache values do not change.
+    pub fn beginOverlay(self: *MarkIndexColumn, out: *Overlay) ParseError!void {
+        out.* = .{ .source = self, .rows = undefined };
+        try self.data.beginOverlay(&out.rows);
+    }
 
     /// A cursor over the rows, decoded (`mark_index.rs:252-254`, `:256-260`).
     ///
@@ -922,11 +989,24 @@ pub const MarkIndexColumn = struct {
     /// allocation and is not a second owner.
     pub fn deinit(self: *MarkIndexColumn) void {
         self.data.deinit();
+        var values = self.cache.valueIterator();
+        while (values.next()) |data| data.value.deinitOwned(self.gpa);
         self.cache.deinit(self.gpa);
         for (self.agg.entries.items) |*entry| entry.acc.deinit();
         self.agg.entries.deinit(self.gpa);
         self.gpa.destroy(self.agg);
         self.* = undefined;
+    }
+
+    /// Moves one staged scalar into the cache, releasing only the replaced or
+    /// removed entry's owned payload. Capacity is reserved before publication.
+    fn applyPending(self: *MarkIndexColumn, record: StagedMarkIndex.Pending) void {
+        if (self.cache.getPtr(record.id)) |old| old.value.deinitOwned(self.gpa);
+        if (record.data) |data| {
+            self.cache.putAssumeCapacity(record.id, data);
+        } else {
+            _ = self.cache.remove(record.id);
+        }
     }
 
     /// How many rows the index has, which is the op set's row count
@@ -1207,9 +1287,9 @@ pub const MarkIndexColumn = struct {
         /// by the time the publish runs, and a record that outlived it would
         /// be a dangling borrow on the path that has no error to catch it.
         ///
-        /// `MarkData`'s name inside it is still borrowed from the document's
-        /// string table, which is stable for as long as the op set is; what
-        /// is owned here is the record, not the bytes it points at.
+        /// The name still borrows the document's string table. An insertion
+        /// owns its scalar byte payload until it moves to the cache or overlay;
+        /// abort releases it without changing any existing cache entry.
         pub const Pending = struct {
             /// The begin operation's id, which is the cache's key
             /// (`mark_index.rs:216`).
@@ -1218,6 +1298,11 @@ pub const MarkIndexColumn = struct {
             /// entry out. A removal needs only the id, which is why one
             /// shape covers both directions.
             data: ?MarkData,
+
+            fn deinit(self: *Pending, gpa: Allocator) void {
+                if (self.data) |*data| data.value.deinitOwned(gpa);
+                self.data = null;
+            }
         };
 
         /// The rows, staged against this index's own `data` column, which
@@ -1246,6 +1331,7 @@ pub const MarkIndexColumn = struct {
         pub fn deinit(self: *StagedMarkIndex) void {
             if (self.spent) return;
             self.rows.deinit();
+            for (self.pending) |*record| record.deinit(self.gpa);
             if (self.pending.len != 0) self.gpa.free(self.pending);
             self.spent = true;
         }
@@ -1283,12 +1369,21 @@ pub const MarkIndexColumn = struct {
         pub fn publish(self: *StagedMarkIndex, col: *MarkIndexColumn) void {
             std.debug.assert(!self.spent);
             std.debug.assert(self.gpa.vtable == col.gpa.vtable);
-            for (self.pending) |p| {
-                if (p.data) |data| {
-                    col.cache.putAssumeCapacity(p.id, data);
-                } else {
-                    _ = col.cache.remove(p.id);
-                }
+            if (self.rows.noop and !self.rows.provisional) {
+                std.debug.assert(self.pending.len == 0);
+                self.rows.publish(&col.data);
+                self.spent = true;
+                return;
+            }
+            if (col.staging) |overlay| {
+                overlay.pending.appendSliceAssumeCapacity(self.pending);
+                overlay.at = @min(overlay.at, self.at);
+                self.rows.publish(&col.data);
+                if (self.pending.len != 0) self.gpa.free(self.pending);
+                self.spent = true;
+                return;
+            } else {
+                for (self.pending) |record| col.applyPending(record);
             }
             self.rows.publish(&col.data);
             // The prefix frontier, and the whole of what a publish owes the
@@ -1331,10 +1426,9 @@ pub const MarkIndexColumn = struct {
     /// publishes a renumbering, and the caller that has more to write stages
     /// every half before it publishes any.
     ///
-    /// **Both halves here are wholly owned.** A staged splice borrows the
-    /// original column's slabs, because a splice keeps most of them; a remap
-    /// rewrites every value, so the staged column shares nothing with the one
-    /// it was built from and both halves can be released on any refusal.
+    /// The rows and map shell are owned here. Scalar byte payloads borrow the
+    /// source cache until publication transfers its ownership to the new map.
+    /// Aborting this stage therefore releases no scalar payloads.
     pub const StagedRemap = struct {
         /// The renumbered rows, built with
         /// [`Column.remapped`](../../src/hexane/column.zig) and holding none of
@@ -1477,7 +1571,18 @@ pub const MarkIndexColumn = struct {
         // Room for the insertions, before a single record is made. This is
         // the reservation the doc above describes: it can move the map's
         // storage, and it cannot change an entry.
-        if (del == 0 and starts != 0) {
+        if (self.staging) |overlay| {
+            try overlay.pending.ensureUnusedCapacity(self.gpa, starts);
+            if (del == 0 and starts != 0) {
+                overlay.insert_bound = std.math.add(usize, overlay.insert_bound, starts) catch
+                    return error.Overflow;
+                const room = std.math.add(usize, overlay.source.cache.count(), overlay.insert_bound) catch
+                    return error.Overflow;
+                const capacity = std.math.cast(u32, room) orelse return error.Overflow;
+                try overlay.source.cache.ensureTotalCapacity(self.gpa, capacity);
+            }
+            self.cache = overlay.source.cache;
+        } else if (del == 0 and starts != 0) {
             const room = std.math.add(usize, self.cache.count(), starts) catch
                 return error.Overflow;
             const capacity = std.math.cast(u32, room) orelse return error.Overflow;
@@ -1492,14 +1597,20 @@ pub const MarkIndexColumn = struct {
         const no_pending = [_]StagedMarkIndex.Pending{};
         const pending: []StagedMarkIndex.Pending = if (starts == 0) @constCast(no_pending[0..]) else records_blk: {
             const out = try self.gpa.alloc(StagedMarkIndex.Pending, starts);
-            errdefer self.gpa.free(out);
             var at: usize = 0;
+            errdefer {
+                for (out[0..at]) |*record| record.deinit(self.gpa);
+                self.gpa.free(out);
+            }
             for (values) |maybe| {
                 if (maybe) |v| switch (v) {
                     .start => |s| {
                         out[at] = .{
                             .id = s.id,
-                            .data = if (del == 0) s.data else null,
+                            .data = if (del == 0) MarkData.init(
+                                s.data.name,
+                                try s.data.value.dup(self.gpa),
+                            ) else null,
                         };
                         at += 1;
                     },
@@ -1510,6 +1621,7 @@ pub const MarkIndexColumn = struct {
             break :records_blk out;
         };
         errdefer {
+            for (pending) |*record| record.deinit(self.gpa);
             if (pending.len != 0) self.gpa.free(pending);
         }
 
@@ -1541,13 +1653,11 @@ pub const MarkIndexColumn = struct {
     /// (`mark_index.rs:280-284`), and the reservation that makes the publish
     /// infallible is taken here rather than at the publish.
     ///
-    /// The `MarkData` kept is the one handed in, name and all, and
-    /// `MarkData`'s name is borrowed (`op_set2/types.rs:56-60`, and the rule
-    /// `marks.zig:133-136` states for `Mark`). So the name must outlive this
-    /// index: upstream gets that for free because its `MarkData<'static>` owns
-    /// a `String` (`op_set2/op.rs:75-79`), and a port caller has to hand in a
-    /// name that lives as long as the op set — the document's own interned
-    /// string, not a name borrowed out of the change being applied.
+    /// The name borrows the document's interned string table and must outlive
+    /// this index. Scalar byte payloads are copied during staging and owned by
+    /// the cache after publication, matching upstream's owned mark value
+    /// (`op_set2/op.rs:943-950`, `op_set2/types.rs:296-309`). They never borrow
+    /// transaction buffers or value-column resident slabs across mutations.
     ///
     /// Upstream's parameter is a `Vec` it consumes; a slice is the port's
     /// spelling.
@@ -2028,6 +2138,121 @@ fn buildColumn(gpa: Allocator, n: usize, spans: []const Span) !MarkIndexColumn {
     }
     try col.extend(0, values);
     return col;
+}
+
+fn retainedScalarAllocations(gpa: Allocator) !void {
+    var col = try MarkIndexColumn.init(gpa);
+    defer col.deinit();
+    for (0..4) |kind| {
+        var bytes = "example".*;
+        const scalar: @import("../value.zig").ScalarValue = switch (kind) {
+            0 => .{ .str = &bytes },
+            1 => .{ .bytes = &bytes },
+            2 => .{ .actor_id = .{ .bytes = &bytes } },
+            3 => .{ .unknown = .{ .type_code = 15, .bytes = &bytes } },
+            else => unreachable,
+        };
+        const begin = id(0, @intCast(kind + 1));
+        const values = [_]?MarkIndexBuilder{
+            .{ .start = .{ .id = begin, .data = MarkData.init("link", scalar) } },
+            .{ .end = begin },
+        };
+        var staged = try col.stageExtend(col.len(), &values);
+        defer staged.deinit();
+        @memset(&bytes, 0xaa);
+        staged.publish(&col);
+        const kept = col.markData(begin) orelse return error.TestUnexpectedResult;
+        const payload = switch (kept.value) {
+            .str, .bytes => |v| v,
+            .actor_id => |v| v.bytes,
+            .unknown => |v| v.bytes,
+            else => return error.TestUnexpectedResult,
+        };
+        try testing.expectEqualStrings("example", payload);
+    }
+    // Two begins in one stage cover refusal after only the first scalar copy.
+    const nested = [_]?MarkIndexBuilder{
+        .{ .start = .{ .id = id(0, 5), .data = MarkData.init("link", .{ .str = "outer" }) } },
+        .{ .start = .{ .id = id(0, 6), .data = MarkData.init("link", .{ .str = "inner" }) } },
+        .{ .end = id(0, 6) },
+        .{ .end = id(0, 5) },
+    };
+    try col.extend(col.len(), &nested);
+    var remapped = try col.stageRemap(0, .up);
+    defer remapped.deinit();
+    remapped.publish(&col);
+    try testing.expectEqualStrings("example", col.markData(id(1, 1)).?.value.str);
+    const removed = [_]?MarkIndexBuilder{
+        .{ .start = .{ .id = id(1, 1), .data = MarkData.init("link", .null_value) } },
+        .{ .end = id(1, 1) },
+    };
+    try col.undo(0, &removed);
+    try testing.expect(col.markData(id(1, 1)) == null);
+    try testing.expectEqualStrings("example", col.markData(id(1, 2)).?.value.bytes);
+}
+
+test "cached mark scalars own bytes before their producer storage expires" {
+    // Staging must retain all byte-bearing scalar variants independently.
+    try testing.checkAllAllocationFailures(testing.allocator, retainedScalarAllocations, .{});
+}
+
+test "a staged URL mark survives releasing its producer allocation" {
+    // A transaction may release its scalar buffer before the cache is read.
+    const gpa = testing.allocator;
+    var col = try MarkIndexColumn.init(gpa);
+    defer col.deinit();
+    var staged = blk: {
+        const url = try gpa.dupe(u8, "https://example.com");
+        defer gpa.free(url);
+        const values = [_]?MarkIndexBuilder{
+            .{ .start = .{ .id = id(0, 1), .data = MarkData.init("link", .{ .str = url }) } },
+            .{ .end = id(0, 1) },
+        };
+        break :blk try col.stageExtend(0, &values);
+    };
+    defer staged.deinit();
+    staged.publish(&col);
+    try testing.expectEqualStrings("https://example.com", col.markData(id(0, 1)).?.value.str);
+}
+
+fn retainedOverlayAllocations(gpa: Allocator) !void {
+    for ([_]bool{ false, true }) |publish| {
+        var col = try MarkIndexColumn.init(gpa);
+        defer col.deinit();
+        const old = [_]?MarkIndexBuilder{
+            .{ .start = .{ .id = id(0, 1), .data = MarkData.init("link", .{ .str = "old" }) } },
+            .{ .end = id(0, 1) },
+        };
+        try col.extend(0, &old);
+        var overlay: MarkIndexColumn.Overlay = undefined;
+        try col.beginOverlay(&overlay);
+        defer overlay.deinit();
+        {
+            var view: MarkIndexColumn = undefined;
+            overlay.bind(&view);
+            defer overlay.capture(&view);
+            var bytes = "new".*;
+            const added = [_]?MarkIndexBuilder{
+                .{ .start = .{ .id = id(0, 2), .data = MarkData.init("link", .{ .str = &bytes }) } },
+                .{ .end = id(0, 2) },
+            };
+            try view.extend(view.len(), &added);
+            @memset(&bytes, 0xaa);
+        }
+        if (publish) {
+            overlay.publish(&col);
+            try testing.expectEqualStrings("new", col.markData(id(0, 2)).?.value.str);
+        } else {
+            overlay.deinit();
+            try testing.expect(col.markData(id(0, 2)) == null);
+        }
+        try testing.expectEqualStrings("old", col.markData(id(0, 1)).?.value.str);
+    }
+}
+
+test "mark cache overlay transfers or releases only its new scalar bytes" {
+    // Failed staging, explicit abort and successful publication preserve old bytes.
+    try testing.checkAllAllocationFailures(testing.allocator, retainedOverlayAllocations, .{});
 }
 
 /// The builder one modelled row arrives as (`mark_index.rs:363-377`).

@@ -1079,9 +1079,11 @@ every loaded change. `wasm` only changes the `log!`/`__log!` macro bodies
 `Storage`, `ReadableStorage`, `WriteableStorage`, `DocInfo`, `LoadOptions`, `SaveOptions`,
 `AutoSave` — a grep for `ReadableStorage|WriteableStorage|AutoSave|DocInfo` over
 `rust/automerge/src` returns **zero hits** at this commit. Of the seven, only `Chunk`,
-`LoadOptions` and `SaveOptions` exist. There is no pluggable storage backend, no
-`Chunk`-streaming reader trait, no document-info accessor and no autosave helper. The port
-target is therefore: `Automerge::{load*, save*}` over `&[u8]` in, `Vec<u8>` out, plus `Bundle`.
+`LoadOptions` and `SaveOptions` exist. Rust has no pluggable storage backend,
+`Chunk`-streaming reader trait, or autosave helper in this slice.
+`ReadDoc::stats` supplies document counts, despite the absence of a `DocInfo` type.
+Native `Document` exposes load options, load-into, incremental load, save, incremental save, bundles, fragments, and stats.
+These entry points use explicit allocators (`src/doc.zig`, `Document.loadWithOptions`, `loadInto`, `saveIncremental`, `bundleFragments`, `stats`).
 
 ## Semantics
 
@@ -1659,19 +1661,15 @@ plain closures and there is no dynamic dispatch (`parse.rs:305-317`). Every comb
 6. **Three independent LEB128 implementations.** Write side: the `leb128` crate
    (`encodable_impls.rs:130-179`). Read side: the strict hand-rolled reader
    (`storage/parse/leb128.rs:13-97`). Bundle: hexane's `Codec`
-   (`rust/hexane/src/codec.rs:230-259`). A Zig port must implement the *strict* rules
-   (`Leb128Overlong`, `Leb128TooLarge`, the tenth-byte rule) or it will accept documents that
-   Rust rejects — and, worse, emit encodings that change change hashes.
-7. **DEFLATE.** `flate2` with the `zlib-rs` backend (`Cargo.toml:26`) is used for both the
-   document and bundle column compression and for whole compressed change chunks
-   (`raw_column.rs:62-76`, `chunk.rs:77-79`, `change/compressed.rs:23-30`). There is no DEFLATE
-   in the Zig standard library. A pure-Zig port needs either a zlib binding (defeats the point)
-   or a vendored zlib-rs port; and because the *bytes* only have to be valid DEFLATE streams
-   (not a specific compressor's output), any correct implementation interoperates — the
-   per-column deflate flag, the 256-byte threshold and the raw vs zlib wrapper choice are the
-   compatibility-relevant parts, not the compressor's specific output. **[INFERENCE]** I did not
-   verify that claim against a decompressor; a port must be tested against a real automerge file
-   in both directions.
+   (`rust/hexane/src/codec.rs:230-259`). Strict LEB128 rules remain a compatibility requirement.
+   Native readers check overlong encodings, overflow, and final-byte limits (`src/leb128.zig:146-230`).
+7. **DEFLATE.** Rust uses `flate2` with the `zlib-rs` backend (`Cargo.toml:26`)
+   for document/bundle columns and compressed changes (`raw_column.rs:62-76`, `chunk.rs:77-79`, `change/compressed.rs:23-30`).
+   Native compression and decompression use Zig 0.16 `std.compress.flate` (`src/storage/chunk.zig:363-383`, `:424-438`).
+   No zlib binding or vendored zlib-rs port is required.
+   Column flags, thresholds, and raw/zlib wrapper selection remain compatibility boundaries.
+   Compressed save bytes need not match Rust byte-for-byte.
+   Source support does not certify a new bidirectional load/save gate.
 8. **`Sink` trait + `(S, usize)` `finish`.** `RleEncoder<S, T>` is generic over the sink so the
    same encoder can own its buffer or borrow the caller's (`encoding.rs:23-36`,
    `rle.rs:15-21`, `:29-38`). In Zig the natural shape is always writing into the caller's

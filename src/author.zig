@@ -61,6 +61,42 @@ pub const Authors = struct {
     /// produces one, and only for the actor that was removed.
     pub const no_index: ActorIdx = std.math.maxInt(ActorIdx);
 
+    /// One staged insertion, borrowing its original table until publication or abort.
+    /// Do not copy this token or mutate the table before publishing it. Actor bytes
+    /// and reserved capacity belong to the table and survive an abort until `deinit`.
+    pub const PreparedInsert = struct {
+        owner: ?*Authors,
+        idx: ActorIdx,
+        previous_count: usize,
+        actor: ActorId,
+
+        /// Publishes the copied actor and its remap without allocation.
+        /// `authors` must be the unchanged table that prepared this token.
+        /// Consumes the token; a following `deinit` remains safe.
+        pub fn publish(self: *PreparedInsert, authors: *Authors) void {
+            std.debug.assert(self.owner == authors);
+            const n = self.previous_count;
+            const idx: usize = self.idx;
+            std.debug.assert(authors.items.items.len == n);
+            std.debug.assert(authors.items.capacity > n);
+            std.debug.assert(authors.remap_buf.capacity > n);
+            authors.remap_buf.clearRetainingCapacity();
+            for (0..n) |old| {
+                const to: ActorIdx = if (old < idx) @intCast(old) else @intCast(old + 1);
+                authors.remap_buf.appendAssumeCapacity(to);
+            }
+            authors.remap_buf.appendAssumeCapacity(self.idx);
+            authors.items.insertAssumeCapacity(idx, self.actor);
+            self.owner = null;
+        }
+
+        /// Aborts an unpublished insertion, or does nothing after publication.
+        /// Arena scratch and capacity remain owned by the table; allocates nothing.
+        pub fn deinit(self: *PreparedInsert) void {
+            self.owner = null;
+        }
+    };
+
     /// An empty table. `gpa` must be the allocator every later call passes.
     pub fn init(gpa: Allocator) Authors {
         return .{
@@ -145,8 +181,42 @@ pub const Authors = struct {
     /// `error.DuplicateActorId` if the actor is already in the table and
     /// `error.InvalidIndex` if `idx` is past the end or out of order.
     pub fn insertAt(self: *Authors, gpa: Allocator, idx: ActorIdx, actor: ActorId) Error!void {
+        var prepared = try self.prepareInsertAt(gpa, idx, actor);
+        defer prepared.deinit();
+        prepared.publish(self);
+    }
+
+    /// Copies `actor` and reserves insertion/remap capacity without changing the
+    /// table's actors or remap contents. Refusals match `insertAt`; allocation
+    /// failure may retain arena scratch and capacity, but publishes nothing.
+    /// The returned token must be published or aborted before another mutation.
+    /// Existing borrowed table/remap slices may be invalidated by capacity growth.
+    pub fn prepareInsertAt(
+        self: *Authors,
+        gpa: Allocator,
+        idx: ActorIdx,
+        actor: ActorId,
+    ) Error!PreparedInsert {
         const i: usize = idx;
-        _ = try self.insert(gpa, i, actor);
+        const n = self.items.items.len;
+        if (i > n or n > std.math.maxInt(ActorIdx)) return error.InvalidIndex;
+        if (self.search(actor).found) return error.DuplicateActorId;
+        if (i > 0 and ActorId.order(self.items.items[i - 1], actor) != .lt) {
+            return error.InvalidIndex;
+        }
+        if (i < n and ActorId.order(actor, self.items.items[i]) != .lt) {
+            return error.InvalidIndex;
+        }
+
+        const bytes = try self.arena.allocator().dupe(u8, actor.bytes);
+        try self.items.ensureUnusedCapacity(gpa, 1);
+        try self.remap_buf.ensureTotalCapacity(gpa, n + 1);
+        return .{
+            .owner = self,
+            .idx = idx,
+            .previous_count = n,
+            .actor = .{ .bytes = bytes },
+        };
     }
 
     /// Reserves room in the remap buffer for one entry per actor in the table
@@ -231,38 +301,11 @@ pub const Authors = struct {
         return .{ .idx = lo, .found = false };
     }
 
-    /// The shared body of `intern` and `insertAt`: check the position, copy
-    /// the bytes, record the remap, insert.
-    ///
-    /// The remap is filled before the table changes, so a table and its remap
-    /// never disagree, and the only fallible step after that is the insert
-    /// itself, which cannot fail once the capacity is reserved.
+    /// The shared insertion body keeps interning and explicit insertion on the
+    /// same preparation/publication path.
     fn insert(self: *Authors, gpa: Allocator, idx: usize, actor: ActorId) Error!usize {
-        const n = self.items.items.len;
-        if (idx > n or idx > std.math.maxInt(ActorIdx)) return error.InvalidIndex;
-        if (self.search(actor).found) return error.DuplicateActorId;
-        // Sorted strictly ascending, so a position is valid exactly when the
-        // actor fits strictly between its neighbours.
-        if (idx > 0 and ActorId.order(self.items.items[idx - 1], actor) != .lt) {
-            return error.InvalidIndex;
-        }
-        if (idx < n and ActorId.order(actor, self.items.items[idx]) != .lt) {
-            return error.InvalidIndex;
-        }
-
-        const arena_alloc = self.arena.allocator();
-        const bytes = try arena_alloc.dupe(u8, actor.bytes);
-
-        try self.items.ensureUnusedCapacity(gpa, 1);
-        try self.remap_buf.ensureTotalCapacity(gpa, n + 1);
-        self.remap_buf.clearRetainingCapacity();
-        for (0..n) |old| {
-            const to: ActorIdx = if (old < idx) @intCast(old) else @intCast(old + 1);
-            try self.remap_buf.append(gpa, to);
-        }
-        try self.remap_buf.append(gpa, @intCast(idx));
-
-        try self.items.insert(gpa, idx, .{ .bytes = bytes });
+        if (idx > std.math.maxInt(ActorIdx)) return error.InvalidIndex;
+        try self.insertAt(gpa, @intCast(idx), actor);
         return idx;
     }
 };
@@ -651,4 +694,73 @@ test "a removal after reserveRemap allocates nothing" {
     try std.testing.expectEqual(@as(ActorIdx, 0), remap[0]);
     try std.testing.expectEqual(Authors.no_index, remap[1]);
     try std.testing.expectEqual(@as(ActorIdx, 1), remap[2]);
+}
+
+test "prepared actor insertion preserves the table until publication or abort" {
+    // A consumer can abort after preparation without publishing a new actor or remap.
+    const gpa = std.testing.allocator;
+    var table = Authors.init(gpa);
+    defer table.deinit();
+    try table.insertAt(gpa, 0, .{ .bytes = "a" });
+    try table.insertAt(gpa, 1, .{ .bytes = "c" });
+    const old_remap = try gpa.dupe(ActorIdx, table.remap());
+    defer gpa.free(old_remap);
+
+    var scratch = [_]u8{'b'};
+    var aborted = try table.prepareInsertAt(gpa, 1, .{ .bytes = &scratch });
+    aborted.deinit();
+    try std.testing.expectEqual(@as(usize, 2), table.count());
+    try std.testing.expectEqualSlices(ActorIdx, old_remap, table.remap());
+    try std.testing.expect(table.lookup(.{ .bytes = "b" }) == null);
+
+    var prepared = try table.prepareInsertAt(gpa, 1, .{ .bytes = &scratch });
+    defer prepared.deinit();
+    scratch[0] = 'z';
+    try std.testing.expectEqual(@as(usize, 2), table.count());
+    try std.testing.expectEqualSlices(ActorIdx, old_remap, table.remap());
+    prepared.publish(&table);
+    try expectActorAt(table, 0, "a");
+    try expectActorAt(table, 1, "b");
+    try expectActorAt(table, 2, "c");
+    try std.testing.expectEqualSlices(ActorIdx, &.{ 0, 2, 1 }, table.remap());
+}
+
+fn preparedInsertConsumerAllocationFailures(gpa: Allocator) !void {
+    var table = Authors.init(gpa);
+    defer table.deinit();
+    try table.insertAt(gpa, 0, .{ .bytes = "a" });
+    try table.insertAt(gpa, 1, .{ .bytes = "c" });
+    const old_remap = try std.testing.allocator.dupe(ActorIdx, table.remap());
+    defer std.testing.allocator.free(old_remap);
+    var scratch: [4096]u8 = @splat('b');
+
+    var prepared = table.prepareInsertAt(gpa, 1, .{ .bytes = &scratch }) catch |failure| {
+        try std.testing.expectEqual(@as(usize, 2), table.count());
+        try expectActorAt(table, 0, "a");
+        try expectActorAt(table, 1, "c");
+        try std.testing.expectEqualSlices(ActorIdx, old_remap, table.remap());
+        return failure;
+    };
+    defer prepared.deinit();
+    // Real downstream consumer work may fail after author preparation succeeds.
+    const consumer_bytes = gpa.alloc(u8, 1) catch |failure| {
+        try std.testing.expectEqual(@as(usize, 2), table.count());
+        try expectActorAt(table, 0, "a");
+        try expectActorAt(table, 1, "c");
+        try std.testing.expectEqualSlices(ActorIdx, old_remap, table.remap());
+        return failure;
+    };
+    defer gpa.free(consumer_bytes);
+    prepared.publish(&table);
+    try expectActorAt(table, 1, &scratch);
+    try std.testing.expectEqualSlices(ActorIdx, &.{ 0, 2, 1 }, table.remap());
+}
+
+test "prepared actor insertion preserves prior state on every consumer allocation failure" {
+    // Exercise both preparation failures and failure in the downstream consumer.
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        preparedInsertConsumerAllocationFailures,
+        .{},
+    );
 }

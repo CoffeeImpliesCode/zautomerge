@@ -58,17 +58,11 @@
 //!   through the builder because [`PatchLog.mark`] folds consecutive runs into
 //!   one event as it records them (`:2700-2716`) and so cannot reach the arm
 //!   twice.
-//! * **Per coalesced text splice, O(bytes in the patch so far)**, and that one
-//!   is still true. [`ConcreteTextValue.splice`] allocates a replacement of
-//!   the whole value and copies both sides (`:481-488`), where upstream holds
-//!   a `SequenceTree<u8>` per encoding and splices in place
-//!   ([`text_value.rs`:36`](../../github-automerge-automerge/rust/automerge/src/text_value.rs),
-//!   `:48-51`). **A diff that coalesces many splices onto one text object is
-//!   quadratic in that object's length**, and it is a deliberate port choice,
-//!   not an oversight: this buffer cannot retain half a surrogate pair, which
-//!   a native-unit tree also cannot but handles by splitting (`:497-499`).
-//!   **Left alone and reported, not fixed** — the fix is to port the rope,
-//!   which is a change to a value type three modules read.
+//! * **Text splices retain native encoding units in a sequence tree**, matching
+//!   upstream's `SequenceTree<u8>`, `<u16>`, `<char>` and `<String>`
+//!   (`text_value.rs`:36`, `:75`, `:113`, `:152`). Mutations can split UTF-8
+//!   scalars or UTF-16 surrogate pairs; rendering is a separate, owned lossy
+//!   UTF-8 copy. Stored grapheme elements are not resegmented by concatenation.
 //! * **Once per `makePatches`, O(E log E)** for `E` events, the stable sort at
 //!   [`PatchLog.buildCurrent`]'s `std.sort.block` (`:3128`). Amortised over the
 //!   patches it produces that is the log's own size, not a per-patch cost.
@@ -107,10 +101,9 @@
 //! carries `Value<'static>` (`patch.rs`:39`, `:50`, `:61`) and gets there by
 //! cloning (`patch_builder.rs`:304`). The port's op-set types borrow their
 //! payload, and a patch has to survive the next mutation of the document it
-//! came from, so [`Patches`] owns an arena and **every slice a patch names is
-//! allocated in it**. `Patches.deinit` is the one free a consumer owes; a
-//! [`StagedLocal`] is freed with that arena and its own `deinit` releases only
-//! its array.
+//! came from, so [`Patches`] owns an arena for paths, IDs, scalars and marks.
+//! Native text trees use the arena's stable child allocator and are explicitly
+//! released before the arena. `Patches.deinit` is the one free a consumer owes.
 //!
 //! # The document is a parameter, not an import
 //!
@@ -262,19 +255,28 @@ pub const Span = union(enum) {
 /// The document reads [`PatchLog`] makes, by name ([`assertDoc`]).
 ///
 /// Nine names. They are upstream's, in the place upstream makes them:
-/// `idToExid`, `objectType` and `objectParent` are `doc.ops()` reads
+/// `exportPatchId`, `objectType` and `objectParent` are `doc.ops()` reads
 /// (`patch_builder.rs`:150-151`, `:160`), the three range walks are
 /// `doc.map_range_for` / `doc.list_range_for` / `doc.ops().spans`
 /// (`patch_log.rs`:736`, `:755`, `:767`; `automerge.rs`:1676-1697`;
 /// `op_set2/op_set.rs`:381`), and `actorList` is `doc.ops().actors`, which
 /// `opset/batch.zig` already hands the merge as `set.actors.items`
 /// (`batch.zig`:2065`).
+///
+/// This is the internal indexed-reader contract, not the raw `Document`
+/// surface. `objectType` returns `Error!ObjType`, with `NotAnObject` meaning
+/// absence; range iterator `next` calls can refuse reads. `clockAtScope`
+/// borrows a document-owned clock through `Error!*const Clock`. Raw documents
+/// enter through their adapter-owning patch methods.
+/// `exportPatchId(OpId) MakeError!ExId` is the required checked export: an
+/// absent resident actor returns `InvalidActorIndex` during rendering, never
+/// an unresolved replacement ID. Trusted indexed fixtures own their ID validity.
 pub const doc_decls = [_][]const u8{
     "textEncoding",
-    "idToExid",
+    "exportPatchId",
     "objectType",
     "objectParent",
-    "clockAt",
+    "clockAtScope",
     "actorList",
     "mapRangeFor",
     "listRangeFor",
@@ -376,13 +378,7 @@ const object_replacement: []const u8 = "\u{fffc}";
 /// A scalar read as an integer, or zero (`op_set2/types.rs`:247-254`). A
 /// timestamp counts, and so does a counter, whose payload is the same `i64`.
 fn scalarAsI64(v: ScalarValue) i64 {
-    return switch (v) {
-        .int => |i| i,
-        .timestamp => |i| i,
-        .uint => |u| @intCast(u),
-        .counter => |c| c.current,
-        else => 0,
-    };
+    return v.asI64OrDefault();
 }
 
 // ── ConcreteTextValue ───────────────────────────────────────────────────────
@@ -390,205 +386,294 @@ fn scalarAsI64(v: ScalarValue) i64 {
 /// The text a [`PatchAction.splice_text`] carries, in the units of the
 /// document's encoding ([`ConcreteTextValue`](text_value.rs):192-270`).
 ///
-/// **UTF-8-backed, with stricter mutation boundaries than upstream.**
-/// Upstream stores native units in `SequenceTree<u8>`, `<u16>`, `<char>`, or
-/// `<String>` (`text_value.rs`:36`, `:75`, `:113`, `:152`). Its UTF-8 and
-/// UTF-16 trees can retain partial scalars and render them lossily
-/// (`text_value.rs`:60-62`, `:137-139`). This type retains valid UTF-8 instead:
-/// mutations must land on scalar boundaries, or on current grapheme boundaries
-/// in grapheme mode. A split UTF-8 scalar or UTF-16 surrogate pair is refused.
-/// Grapheme boundaries are derived from the current bytes, not retained as
-/// independent tree elements after concatenation (`text_value.rs`:157-168`).
-/// Consumers deleting several encoded units use `removeRange`, so a complete
-/// scalar is removed without creating an unrepresentable intermediate value
-/// (`patch_builder.rs`:242-249`).
+/// Stores native encoding units in sequence trees, as upstream does
+/// (`text_value.rs`:36`, `:75`, `:113`, `:152`). UTF-8 and UTF-16 edits can
+/// retain partial scalars and render them lossily (`:60-62`, `:137-139`).
+/// Grapheme elements retain their original segmentation after concatenation.
 ///
-/// **Arena-oriented, and the obligation is on the type.** `gpa` owns `bytes`,
-/// and the one owner of a patch's copy is the [`Patches`] arena the value was
-/// built in, which frees it at [`Patches.deinit`]. [`ConcreteTextValue.deinit`]
-/// is for a value built with an ordinary allocator by
-/// [`ConcreteTextValue.init`] or [`ConcreteTextValue.dup`], and calling it on
-/// a patch's copy is a double free.
-///
-/// The methods that replace the text allocate a **new** buffer without freeing
-/// the old one. An arena reclaims both; an ordinary owning caller must free
-/// the old buffer only when a replacement was published. A no-op retains it.
-/// See `ConcreteTextValue.splice` and `ConcreteTextValue.removeRange`.
+/// Every tree owns its allocator-backed storage. A patch's text uses its
+/// [`Patches`] arena's stable child allocator, not an allocator pointing into
+/// the movable arena itself. Both ordinary values and patch-owned values must
+/// be deinitialized exactly once; `Patches` releases its trees automatically.
+/// `makeString` returns an independent UTF-8 allocation for the caller to free.
 pub const ConcreteTextValue = struct {
-    /// The allocator that owns `bytes`.
+    /// Retained allocator: its context must outlive this single owner. Copies
+    /// transfer ownership, not duplicate it; call deinit exactly once.
     gpa: Allocator,
-    /// How the indices into this value are counted
-    /// ([`ConcreteTextValue::new`](text_value.rs):200-207`).
-    enc: TextEncoding,
-    /// The text, as UTF-8, owned.
-    bytes: []const u8,
+    units: Units,
 
-    /// A value holding a copy of `s`, with `s` measured in `enc`
-    /// (`text_value.rs`:200-207`).
-    ///
-    /// `s` must be valid UTF-8; this copies it without whole-string validation.
-    /// **The copy is owned through `gpa`.** An arena makes `deinit`
-    /// unnecessary; an ordinary allocator makes it mandatory, exactly once.
+    pub const Unit = union(TextEncoding) {
+        unicode_code_point: u21,
+        utf8_code_unit: u8,
+        utf16_code_unit: u16,
+        grapheme_cluster: []const u8,
+    };
+    const Units = union(TextEncoding) {
+        unicode_code_point: seqtree.SequenceTree(u21),
+        utf8_code_unit: seqtree.SequenceTree(u8),
+        utf16_code_unit: seqtree.SequenceTree(u16),
+        grapheme_cluster: seqtree.SequenceTree([]const u8),
+    };
+
+    /// Copies UTF-8 into native units. UTF-8-unit storage also accepts invalid
+    /// bytes; other encodings return InvalidCharacter for invalid UTF-8.
+    /// Allocation refusal releases every provisional resource.
     pub fn init(gpa: Allocator, s: []const u8, enc: TextEncoding) Error!ConcreteTextValue {
-        return .{ .gpa = gpa, .enc = enc, .bytes = try gpa.dupe(u8, s) };
+        var out: ConcreteTextValue = .{ .gpa = gpa, .units = switch (enc) {
+            .utf8_code_unit => .{ .utf8_code_unit = .initReserved(gpa) },
+            .utf16_code_unit => .{ .utf16_code_unit = .initReserved(gpa) },
+            .unicode_code_point => .{ .unicode_code_point = .initReserved(gpa) },
+            .grapheme_cluster => .{ .grapheme_cluster = .initReserved(gpa) },
+        } };
+        errdefer out.deinit();
+        try out.splice(0, s);
+        return out;
     }
 
-    /// Frees `bytes` and nothing else, and leaves the value `undefined`.
-    ///
-    /// **A patch's copy is arena-owned and is freed by [`Patches.deinit`]
-    /// instead**; calling this on one would be a double free. It belongs to a
-    /// value built by [`ConcreteTextValue.init`] or
-    /// [`ConcreteTextValue.dup`] on an ordinary allocator, and it is called
-    /// exactly once.
+    /// Ownership of bytes transfers only after successful construction.
+    pub fn initOwned(gpa: Allocator, bytes: []u8, enc: TextEncoding) Error!ConcreteTextValue {
+        const out = try init(gpa, bytes, enc);
+        gpa.free(bytes);
+        return out;
+    }
+
+    pub fn encoding(self: *const ConcreteTextValue) TextEncoding {
+        return std.meta.activeTag(self.units);
+    }
+
     pub fn deinit(self: *ConcreteTextValue) void {
-        self.gpa.free(self.bytes);
+        if (self.units == .grapheme_cluster) {
+            var it = self.units.grapheme_cluster.iter();
+            while (it.next()) |s| self.gpa.free(s.*);
+        }
+        switch (self.units) {
+            inline else => |*tree| tree.deinit(),
+        }
         self.* = undefined;
     }
 
-    /// The number of units of `enc` in the text
-    /// ([`TextValue::len`](text_value.rs):65-67`, `:103-105`, `:141-143`, `:179-181`).
     pub fn len(self: ConcreteTextValue) usize {
-        return self.enc.width(self.bytes);
+        return switch (self.units) {
+            inline else => |tree| tree.len(),
+        };
     }
 
-    /// Borrows the current UTF-8 buffer until it is replaced or freed.
-    /// Unlike upstream's native-unit trees and lossy rendering
-    /// (`text_value.rs`:60-62`, `:137-139`), mutations preserve scalar boundaries.
-    pub fn asStr(self: ConcreteTextValue) []const u8 {
-        return self.bytes;
+    /// Reads a native unit, or null out of range. A returned grapheme slice is
+    /// borrowed and must not survive mutation or deinit.
+    pub fn get(self: *const ConcreteTextValue, index: usize) ?Unit {
+        return switch (self.units) {
+            inline else => |*tree, tag| if (tree.get(index)) |v|
+                @unionInit(Unit, @tagName(tag), v.*)
+            else
+                null,
+        };
     }
 
-    /// Inserts `value` at unit `index`
-    /// ([`TextValue::splice`](text_value.rs):48-51`, `:87-90`, `:125-128`, `:163-166`).
-    ///
-    /// `value` must be valid UTF-8. An index past the end appends; an index
-    /// splitting a UTF-8 scalar or UTF-16 surrogate pair returns
-    /// `error.InvalidCharacter`. Grapheme indices use the current segmentation.
-    ///
-    /// **The buffer it replaces is not freed.** The new text is allocated
-    /// whole and `bytes` is pointed at it, so the old buffer is released only
-    /// where its allocator releases it — the [`Patches`] arena, at
-    /// [`Patches.deinit`]. An owning caller on an ordinary allocator must free
-    /// the old `bytes` itself after this returns:
-    ///
-    /// ```zig
-    /// const old = v.bytes;
-    /// try v.splice(index, value);
-    /// gpa.free(old);
-    /// ```
-    ///
-    /// Doing that inside an arena is harmless and doing nothing outside one
-    /// leaks the old buffer on every call. On error nothing is written and
-    /// `bytes` still names the old buffer.
+    /// Native units remain independently editable, including split scalars.
+    /// Reserved node capacity makes removal of an inserted prefix infallible.
+    /// Past-end indices append. Invalid input or allocation refusal leaves
+    /// the original units unchanged. Grapheme boundaries are stored at insertion
+    /// and are not recomputed after adjoining edits.
     pub fn splice(self: *ConcreteTextValue, index: usize, value: []const u8) Error!void {
-        const at = try byteOffset(self.enc, self.bytes, index);
-        const out = try self.gpa.alloc(u8, self.bytes.len + value.len);
-        @memcpy(out[0..at], self.bytes[0..at]);
-        @memcpy(out[at..][0..value.len], value);
-        @memcpy(out[at + value.len ..], self.bytes[at..]);
-        self.bytes = out;
+        const at = @min(index, self.len());
+        if (value.len == 0) return;
+        if (self.encoding() != .utf8_code_unit and !std.unicode.utf8ValidateSlice(value))
+            return error.InvalidCharacter;
+        var inserted: usize = 0;
+        errdefer self.removeRange(at, inserted) catch unreachable;
+        switch (self.units) {
+            .utf8_code_unit => |*tree| {
+                for (value) |byte| {
+                    try tree.insert(at + inserted, byte);
+                    inserted += 1;
+                }
+            },
+            .utf16_code_unit => |*tree| {
+                var it = (std.unicode.Utf8View.initUnchecked(value)).iterator();
+                while (it.nextCodepoint()) |cp| {
+                    if (cp <= 0xffff) {
+                        try tree.insert(at + inserted, @intCast(cp));
+                        inserted += 1;
+                    } else {
+                        const scalar: u32 = @as(u32, cp) - 0x10000;
+                        try tree.insert(at + inserted, @intCast(0xd800 + (scalar >> 10)));
+                        inserted += 1;
+                        try tree.insert(at + inserted, @intCast(0xdc00 + (scalar & 0x3ff)));
+                        inserted += 1;
+                    }
+                }
+            },
+            .unicode_code_point => |*tree| {
+                var it = (std.unicode.Utf8View.initUnchecked(value)).iterator();
+                while (it.nextCodepoint()) |cp| {
+                    try tree.insert(at + inserted, cp);
+                    inserted += 1;
+                }
+            },
+            .grapheme_cluster => |*tree| {
+                var boundaries = unicode.graphemeBoundaries(value);
+                var start: usize = 0;
+                while (start < value.len) {
+                    const end = (boundaries.next() catch unreachable) orelse value.len;
+                    const owned = try self.gpa.dupe(u8, value[start..end]);
+                    tree.insert(at + inserted, owned) catch |e| {
+                        self.gpa.free(owned);
+                        return e;
+                    };
+                    inserted += 1;
+                    start = end;
+                }
+            },
+        }
     }
 
-    /// Removes one unit of `enc` at `index`, using `removeRange(index, 1)`.
-    /// Upstream's native-unit `remove` (`text_value.rs`:69-71`, `:146-148`)
-    /// can split scalars; this UTF-8-backed value returns
-    /// `error.InvalidCharacter` instead, without mutation.
-    ///
-    /// An index at or past the end is a no-op. The old-buffer release and
-    /// error contracts are those of `ConcreteTextValue.removeRange`.
+    pub fn push(self: *ConcreteTextValue, value: []const u8) Error!void {
+        try self.splice(self.len(), value);
+    }
+
+    pub fn spliceTextValue(self: *ConcreteTextValue, index: usize, other: *const ConcreteTextValue) Error!void {
+        if (self.encoding() != other.encoding()) return error.InvalidCharacter;
+        if (self == other) {
+            var snapshot = try self.dup(self.gpa);
+            defer snapshot.deinit();
+            return self.spliceTextValue(index, &snapshot);
+        }
+        const at = @min(index, self.len());
+        var inserted: usize = 0;
+        errdefer self.removeRange(at, inserted) catch unreachable;
+        switch (self.units) {
+            inline else => |*tree, tag| {
+                const source = &@field(other.units, @tagName(tag));
+                var it = source.iter();
+                while (it.next()) |v| {
+                    const owned = if (tag == .grapheme_cluster)
+                        try self.gpa.dupe(u8, v.*)
+                    else
+                        v.*;
+                    tree.insert(at + inserted, owned) catch |e| {
+                        if (tag == .grapheme_cluster) self.gpa.free(owned);
+                        return e;
+                    };
+                    inserted += 1;
+                }
+            },
+        }
+    }
+
     pub fn remove(self: *ConcreteTextValue, index: usize) Error!void {
         try self.removeRange(index, 1);
     }
 
-    /// Removes `length` units of `enc` starting at `index`, clamping the end
-    /// to the text's length even when `index + length` would overflow.
-    ///
-    /// Both ends must be scalar boundaries for UTF-8, UTF-16 and code-point
-    /// indexing, or current grapheme boundaries for grapheme indexing.
-    /// A split scalar returns `error.InvalidCharacter`; `error.OutOfMemory`
-    /// can occur while allocating the one replacement buffer. Both errors
-    /// leave `bytes` and its contents unchanged.
-    ///
-    /// Zero length or an index at/past the end allocates nothing and retains
-    /// the original buffer. A nonempty removal publishes a new buffer but
-    /// does not free the old one, which the patch arena reclaims. An owning
-    /// caller using an ordinary allocator must release the old buffer only
-    /// if the pointer changed after success:
-    ///
-    /// ```zig
-    /// const old = v.bytes;
-    /// try v.removeRange(index, length);
-    /// if (v.bytes.ptr != old.ptr) gpa.free(old);
-    /// ```
+    /// Removes native units without allocation, clamping at the end. An index
+    /// at or beyond the end and a zero length are no-ops.
     pub fn removeRange(self: *ConcreteTextValue, index: usize, length: usize) Error!void {
-        if (length == 0) return;
-        const at = try byteOffset(self.enc, self.bytes, index);
-        if (at == self.bytes.len) return;
-        const end_index = index +| length;
-        // Start from a known boundary rather than decoding the prefix twice.
-        const end = at + try byteOffset(self.enc, self.bytes[at..], end_index - index);
-        const out = try self.gpa.alloc(u8, self.bytes.len - (end - at));
-        @memcpy(out[0..at], self.bytes[0..at]);
-        @memcpy(out[at..], self.bytes[end..]);
-        self.bytes = out;
+        if (index >= self.len()) return;
+        const count = @min(length, self.len() - index);
+        switch (self.units) {
+            inline else => |*tree, tag| {
+                for (0..count) |_| {
+                    const removed = tree.remove(index) catch unreachable;
+                    if (tag == .grapheme_cluster) self.gpa.free(removed);
+                }
+            },
+        }
     }
 
-    /// A second, independent copy, with its own `bytes` allocated through
-    /// `gpa`. The receiver is untouched.
     pub fn dup(self: ConcreteTextValue, gpa: Allocator) Error!ConcreteTextValue {
-        return .{ .gpa = gpa, .enc = self.enc, .bytes = try gpa.dupe(u8, self.bytes) };
+        var out = try init(gpa, "", self.encoding());
+        errdefer out.deinit();
+        try out.spliceTextValue(0, &self);
+        return out;
     }
 
-    /// Two texts, by content (`#[derive(PartialEq)]`, `text_value.rs`:35`).
     pub fn eql(a: ConcreteTextValue, b: ConcreteTextValue) bool {
-        return a.enc == b.enc and std.mem.eql(u8, a.bytes, b.bytes);
+        if (a.encoding() != b.encoding() or a.len() != b.len()) return false;
+        switch (a.units) {
+            inline else => |*tree, tag| {
+                const other = &@field(b.units, @tagName(tag));
+                var it = tree.iter();
+                var index: usize = 0;
+                while (it.next()) |v| : (index += 1) {
+                    const rhs = other.get(index).?.*;
+                    if (tag == .grapheme_cluster) {
+                        if (!std.mem.eql(u8, v.*, rhs)) return false;
+                    } else if (v.* != rhs) return false;
+                }
+            },
+        }
+        return true;
+    }
+
+    fn appendCodepoint(out: *std.ArrayList(u8), gpa: Allocator, cp: u21) Error!void {
+        var bytes: [4]u8 = undefined;
+        const width = std.unicode.utf8Encode(cp, &bytes) catch unreachable;
+        try out.appendSlice(gpa, bytes[0..width]);
+    }
+
+    /// Returns an independent, lossy UTF-8 rendering; caller frees it.
+    pub fn makeString(self: *const ConcreteTextValue, gpa: Allocator) Error![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(gpa);
+        switch (self.units) {
+            .grapheme_cluster => |*tree| {
+                var it = tree.iter();
+                while (it.next()) |s| try out.appendSlice(gpa, s.*);
+            },
+            .unicode_code_point => |*tree| {
+                var it = tree.iter();
+                while (it.next()) |cp| try appendCodepoint(&out, gpa, cp.*);
+            },
+            .utf16_code_unit => |*tree| {
+                var i: usize = 0;
+                while (i < tree.len()) : (i += 1) {
+                    const unit = tree.get(i).?.*;
+                    var cp: u21 = unit;
+                    if (unit >= 0xd800 and unit <= 0xdbff) {
+                        if (tree.get(i + 1)) |next| {
+                            if (next.* >= 0xdc00 and next.* <= 0xdfff) {
+                                cp = @intCast(0x10000 + ((@as(u32, unit) - 0xd800) << 10) + next.* - 0xdc00);
+                                i += 1;
+                            } else cp = 0xfffd;
+                        } else cp = 0xfffd;
+                    } else if (unit >= 0xdc00 and unit <= 0xdfff) cp = 0xfffd;
+                    try appendCodepoint(&out, gpa, cp);
+                }
+            },
+            .utf8_code_unit => |*tree| {
+                var i: usize = 0;
+                while (i < tree.len()) {
+                    var bytes: [4]u8 = undefined;
+                    bytes[0] = tree.get(i).?.*;
+                    const width = std.unicode.utf8ByteSequenceLength(bytes[0]) catch {
+                        try appendCodepoint(&out, gpa, 0xfffd);
+                        i += 1;
+                        continue;
+                    };
+                    var available: usize = 1;
+                    while (available < width and i + available < tree.len()) : (available += 1) {
+                        const byte = tree.get(i + available).?.*;
+                        if (byte & 0xc0 != 0x80) break;
+                        if (available == 1 and ((bytes[0] == 0xe0 and byte < 0xa0) or
+                            (bytes[0] == 0xed and byte >= 0xa0) or
+                            (bytes[0] == 0xf0 and byte < 0x90) or
+                            (bytes[0] == 0xf4 and byte >= 0x90))) break;
+                        bytes[available] = byte;
+                    }
+                    if (available == width) {
+                        _ = std.unicode.utf8Decode(bytes[0..width]) catch {
+                            try appendCodepoint(&out, gpa, 0xfffd);
+                            i += 1;
+                            continue;
+                        };
+                        try out.appendSlice(gpa, bytes[0..width]);
+                    } else try appendCodepoint(&out, gpa, 0xfffd);
+                    i += available;
+                }
+            },
+        }
+        return out.toOwnedSlice(gpa);
     }
 };
-
-/// Maps an encoded index to a byte boundary, clamping past the end.
-/// UTF-8 and UTF-16 unit indices inside a scalar return `InvalidCharacter`;
-/// code-point and grapheme indices already count complete boundaries.
-/// Only the prefix needed to find the boundary is scanned.
-fn byteOffset(enc: TextEncoding, bytes: []const u8, index: usize) Error!usize {
-    switch (enc) {
-        .utf8_code_unit => {
-            const at = @min(index, bytes.len);
-            if (at < bytes.len and (bytes[at] & 0xC0) == 0x80) return error.InvalidCharacter;
-            return at;
-        },
-        .unicode_code_point => {
-            var n: usize = 0;
-            var i: usize = 0;
-            while (i < bytes.len) {
-                if (n == index) return i;
-                const width = std.unicode.utf8ByteSequenceLength(bytes[i]) catch
-                    return error.InvalidCharacter;
-                if (width > bytes.len - i) return error.InvalidCharacter;
-                i += width;
-                n += 1;
-            }
-            return bytes.len;
-        },
-        .utf16_code_unit => {
-            var n: usize = 0;
-            var i: usize = 0;
-            while (i < bytes.len) {
-                if (n == index) return i;
-                const width = std.unicode.utf8ByteSequenceLength(bytes[i]) catch
-                    return error.InvalidCharacter;
-                if (width > bytes.len - i) return error.InvalidCharacter;
-                const cp = std.unicode.utf8Decode(bytes[i..][0..width]) catch
-                    return error.InvalidCharacter;
-                i += width;
-                n += if (cp > 0xFFFF) @as(usize, 2) else 1;
-                if (n > index) return error.InvalidCharacter;
-            }
-            return bytes.len;
-        },
-        .grapheme_cluster => return unicode.graphemeOffset(bytes, index) catch
-            error.InvalidCharacter,
-    }
-}
 
 // ── MarkRuns ────────────────────────────────────────────────────────────────
 
@@ -951,8 +1036,10 @@ pub const PatchAction = union(enum) {
                 try out.appendSlice(gpa, "] }");
             },
             .splice_text => |a| {
+                const rendered = try a.value.makeString(gpa);
+                defer gpa.free(rendered);
                 try out.print(gpa, "SpliceText {{ index: {d}, value: \"{s}\", marks: ", .{
-                    a.index, a.value.asStr(),
+                    a.index, rendered,
                 });
                 if (a.marks) |m| {
                     try out.appendSlice(gpa, "{");
@@ -1032,11 +1119,13 @@ fn printProp(gpa: Allocator, out: *std.ArrayList(u8), prop: Prop) Error!void {
 }
 
 fn printExId(gpa: Allocator, out: *std.ArrayList(u8), id: ExId) Error!void {
-    const op = id.opId() orelse {
-        try out.appendSlice(gpa, "root");
-        return;
-    };
-    try out.print(gpa, "{d}@{d}", .{ op.counter, op.actor });
+    switch (id) {
+        .root => try out.appendSlice(gpa, "root"),
+        .id => |op| try out.print(gpa, "{d}@{d}", .{ op.counter, op.actor }),
+        .named => |named| try out.print(gpa, "{d}@{d}", .{
+            named.op.counter, named.op.actor,
+        }),
+    }
 }
 
 fn printValue(gpa: Allocator, out: *std.ArrayList(u8), v: Value) Error!void {
@@ -1085,6 +1174,87 @@ pub fn markSetEql(a: ?*const MarkSet, b: ?*const MarkSet) bool {
 
 // ── Patches ─────────────────────────────────────────────────────────────────
 
+test "Patches clone owns native text and named actor bytes independently" {
+    const gpa = testing.allocator;
+    var source = Patches.init(gpa);
+    defer source.deinit();
+    const id = ExId.withActor(OpId.init(1, 0), ActorId.init("actor"));
+    var marks = MarkSet.init(gpa);
+    defer marks.deinit();
+    try marks.put("bold", .{ .str = "strong" });
+    const text = try ConcreteTextValue.init(source.arena.child_allocator, "a", .grapheme_cluster);
+    try source.items.append(source.allocator(), .{
+        .obj = try ownExId(source.allocator(), id),
+        .path = &.{},
+        .action = .{ .splice_text = .{
+            .index = 0,
+            .value = text,
+            .marks = try copyMarkSet(source.allocator(), &marks),
+        } },
+    });
+    var cloned = try source.clone(gpa);
+    defer cloned.deinit();
+    source.clear();
+    try testing.expect(ExId.eql(id, cloned.slice()[0].obj));
+    const cloned_marks = cloned.slice()[0].action.splice_text.marks.?;
+    try testing.expectEqualStrings("bold", cloned_marks.entries.items[0].name);
+    try testing.expectEqualStrings("strong", cloned_marks.entries.items[0].value.str);
+    try cloned.items.items[0].action.splice_text.value.splice(1, "\u{301}");
+    try testing.expectEqual(@as(usize, 2), cloned.slice()[0].action.splice_text.value.len());
+    const rendered = try cloned.slice()[0].action.splice_text.value.makeString(gpa);
+    defer gpa.free(rendered);
+    try testing.expectEqualStrings("a\u{301}", rendered);
+}
+
+test "Patches append and checkpoint allocation failures release native trees" {
+    try testing.checkAllAllocationFailures(testing.allocator, patchesCopyAllocationFailure, .{false});
+    try testing.checkAllAllocationFailures(testing.allocator, patchesCopyAllocationFailure, .{true});
+}
+
+fn patchesCopyAllocationFailure(gpa: Allocator, checkpoint: bool) !void {
+    var source = Patches.init(testing.allocator);
+    defer source.deinit();
+    var marks = MarkSet.init(testing.allocator);
+    defer marks.deinit();
+    try marks.put("bold", .{ .str = "strong" });
+    try source.items.ensureTotalCapacity(source.allocator(), 2);
+    for (0..2) |_| {
+        const text = try ConcreteTextValue.init(source.arena.child_allocator, "abcdef", .utf16_code_unit);
+        source.items.appendAssumeCapacity(.{
+            .obj = .root,
+            .path = &.{},
+            .action = .{ .splice_text = .{
+                .index = 0,
+                .value = text,
+                .marks = try copyMarkSet(source.allocator(), &marks),
+            } },
+        });
+    }
+    var target = Patches.init(gpa);
+    defer target.deinit();
+    try target.items.append(target.allocator(), .{
+        .obj = .root,
+        .path = &.{},
+        .action = .{ .delete_seq = .{ .index = 3, .length = 1 } },
+    });
+    if (checkpoint) {
+        target.checkpointFrom(&source) catch |failure| {
+            try testing.expectEqual(@as(usize, 1), target.len());
+            try testing.expectEqual(@as(usize, 3), target.slice()[0].action.delete_seq.index);
+            return failure;
+        };
+        try testing.expectEqual(@as(usize, 2), target.len());
+    } else {
+        target.appendFrom(&source) catch |failure| {
+            try testing.expectEqual(@as(usize, 1), target.len());
+            return failure;
+        };
+        try testing.expectEqual(@as(usize, 3), target.len());
+    }
+    target.clear();
+    try testing.expectEqual(@as(usize, 0), target.len());
+}
+
 /// An ordered list of patches, and the storage every byte in it names.
 ///
 /// Upstream's `Vec<Patch>` (`patch_log.rs`:505-509`) owns each patch's payload
@@ -1116,6 +1286,7 @@ pub const Patches = struct {
     /// the memory taken from it. The batch is `undefined` afterward and a
     /// second call is a double free.
     pub fn deinit(self: *Patches) void {
+        for (self.items.items) |*patch| deinitPatchText(patch);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -1150,66 +1321,52 @@ pub const Patches = struct {
     /// [`Patches.clear`] and [`Patches.deinit`] release with the rest.
     pub fn appendFrom(self: *Patches, other: *const Patches) Error!void {
         const mark = self.items.items.len;
-        errdefer self.items.shrinkRetainingCapacity(mark);
-        for (other.items.items) |p| {
-            try self.items.append(self.allocator(), try copyPatch(self.allocator(), p));
+        const count = other.items.items.len;
+        errdefer {
+            for (self.items.items[mark..]) |*patch| deinitPatchText(patch);
+            self.items.shrinkRetainingCapacity(mark);
+        }
+        // Reserve before copying: a completed native tree must always have
+        // a reachable owner, even if growing the patch array is refused.
+        try self.items.ensureUnusedCapacity(self.allocator(), count);
+        for (0..count) |i| {
+            const copied = try copyPatch(self.allocator(), self.arena.child_allocator, other.items.items[i]);
+            self.items.appendAssumeCapacity(copied);
         }
     }
 
-    /// Drops every patch and frees every byte it named.
-    ///
-    /// **A patch owns nothing outside this batch's arena** — `copyPatch`
-    /// allocates the path and the action's payload with
-    /// [`Patches.allocator`], which *is* the arena — so resetting the arena is
-    /// what actually releases them, and `items` has to go with it: its own
-    /// buffer is arena memory too, and `reset` keeps at most one block, so
-    /// keeping the list while resetting the arena would leave it pointing into
-    /// a freed block. **`.free_all`, not `.retain_capacity`**, and the list is
-    /// dropped rather than deinitialised for the same reason — the arena frees
-    /// it, so there is nothing to free twice and nothing to leak.
+    /// An independent batch; moving it never invalidates a text allocator.
+    pub fn clone(self: *const Patches, gpa: Allocator) Error!Patches {
+        var out = Patches.init(gpa);
+        errdefer out.deinit();
+        try out.appendFrom(self);
+        return out;
+    }
+
+    /// Replaces this batch only after the full independent copy succeeds.
+    pub fn checkpointFrom(self: *Patches, other: *const Patches) Error!void {
+        var checkpoint = try other.clone(self.arena.child_allocator);
+        std.mem.swap(Patches, self, &checkpoint);
+        checkpoint.deinit();
+    }
+
+    /// Drops every patch, explicitly releasing native text trees before the
+    /// arena frees paths, scalar payloads, marks and the patch array.
     pub fn clear(self: *Patches) void {
+        for (self.items.items) |*patch| deinitPatchText(patch);
         self.items = .empty;
         _ = self.arena.reset(.free_all);
     }
 };
 
-/// One local change's patches, deep-copied into a [`PatchLog`]'s own storage
-/// and waiting to be attached to it.
-///
-/// **Staging is what makes a local commit failure-atomic.** A commit that has
-/// already inserted the change into the graph cannot report a failure, so the
-/// deep copy — the only part that can be refused — has to happen before that
-/// point, on data the log has not published yet. [`PatchLog.prepareLocal`] is
-/// that copy and [`PatchLog.commitLocal`] is the infallible attachment.
-///
-/// **Every byte is in [`PatchLog.local`]'s arena**, so abandoning a staged batch
-/// releases its array and nothing else, and the arena reclaims the payloads
-/// with the rest. A staged batch is therefore not a value a caller may hold
-/// past its log's [`PatchLog.deinit`], and the two halves are used in pairs:
-/// [`StagedLocal.deinit`] on the abort path, [`PatchLog.commitLocal`] on the
-/// success path, never both.
-pub const StagedLocal = struct {
-    /// The arena allocator every patch here was copied with.
-    gpa: Allocator,
-    /// The staged patches, in stream order. Not yet reachable through
-    /// [`PatchLog.makePatches`] or [`PatchLog.finishCurrentView`].
-    items: std.ArrayList(Patch) = .empty,
-
-    /// Abandons the staged batch without attaching it. Releases `items` and
-    /// nothing else — see the type comment. The staged value is `undefined`
-    /// afterward.
-    pub fn deinit(self: *StagedLocal) void {
-        self.items.deinit(self.gpa);
-        self.* = undefined;
-    }
-};
-
-/// A deep copy of `p` into `gpa`.
-fn copyPatch(gpa: Allocator, p: Patch) Error!Patch {
+/// Copies arena payloads separately from native text trees. `text_gpa` must
+/// remain valid when the owning batch moves; never pass its arena allocator.
+fn copyPatch(gpa: Allocator, text_gpa: Allocator, p: Patch) Error!Patch {
+    const obj = try ownExId(gpa, p.obj);
     var path: std.ArrayList(PathElem) = .empty;
     for (p.path) |step| {
         try path.append(gpa, .{
-            .obj = step.obj,
+            .obj = try ownExId(gpa, step.obj),
             .prop = try ownProp(gpa, step.prop),
         });
     }
@@ -1217,13 +1374,13 @@ fn copyPatch(gpa: Allocator, p: Patch) Error!Patch {
         .put_map => |a| .{ .put_map = .{
             .key = try gpa.dupe(u8, a.key),
             .value = try copyValue(gpa, a.value),
-            .obj = a.obj,
+            .obj = try ownExId(gpa, a.obj),
             .conflict = a.conflict,
         } },
         .put_seq => |a| .{ .put_seq = .{
             .index = a.index,
             .value = try copyValue(gpa, a.value),
-            .obj = a.obj,
+            .obj = try ownExId(gpa, a.obj),
             .conflict = a.conflict,
         } },
         .insert => |a| blk: {
@@ -1233,17 +1390,22 @@ fn copyPatch(gpa: Allocator, p: Patch) Error!Patch {
             while (it.next()) |v| {
                 try values.push(.{
                     .value = try copyValue(gpa, v.value),
-                    .obj = v.obj,
+                    .obj = try ownExId(gpa, v.obj),
                     .conflict = v.conflict,
                 });
             }
             break :blk .{ .insert = .{ .index = a.index, .values = values } };
         },
-        .splice_text => |a| .{ .splice_text = .{
-            .index = a.index,
-            .value = try a.value.dup(gpa),
-            .marks = if (a.marks) |m| try copyMarkSet(gpa, &m) else null,
-        } },
+        .splice_text => |a| blk: {
+            var text = try a.value.dup(text_gpa);
+            errdefer text.deinit();
+            const marks = if (a.marks) |m| try copyMarkSet(gpa, &m) else null;
+            break :blk .{ .splice_text = .{
+                .index = a.index,
+                .value = text,
+                .marks = marks,
+            } };
+        },
         .increment => |a| .{ .increment = .{
             .prop = try ownProp(gpa, a.prop),
             .value = a.value,
@@ -1254,12 +1416,23 @@ fn copyPatch(gpa: Allocator, p: Patch) Error!Patch {
         .mark => |a| blk: {
             const marks = try gpa.alloc(Mark, a.marks.len);
             for (a.marks, 0..) |m, i| {
-                marks[i] = Mark.init(try gpa.dupe(u8, m.name), m.value, m.start, m.end);
+                marks[i] = Mark.init(try gpa.dupe(u8, m.name), try ownScalar(gpa, m.value), m.start, m.end);
             }
             break :blk .{ .mark = .{ .marks = marks } };
         },
     };
-    return .{ .obj = p.obj, .path = path.items, .action = action };
+    return .{ .obj = obj, .path = path.items, .action = action };
+}
+
+fn deinitPatchText(patch: *Patch) void {
+    switch (patch.action) {
+        .splice_text => |*action| action.value.deinit(),
+        else => {},
+    }
+}
+
+fn ownExId(gpa: Allocator, id: ExId) Error!ExId {
+    return id.dup(gpa);
 }
 
 // ── Owning the payload ──────────────────────────────────────────────────────
@@ -1271,27 +1444,13 @@ fn copyPatch(gpa: Allocator, p: Patch) Error!Patch {
 /// and [`copyPatch`] copies out of a log into a [`Patches`] arena on the way
 /// out.
 fn ownScalar(gpa: Allocator, v: ScalarValue) Error!ScalarValue {
-    return switch (v) {
-        .str => |s| .{ .str = try gpa.dupe(u8, s) },
-        .bytes => |s| .{ .bytes = try gpa.dupe(u8, s) },
-        .actor_id => |a| .{ .actor_id = .{ .bytes = try gpa.dupe(u8, a.bytes) } },
-        .unknown => |u| .{ .unknown = .{
-            .type_code = u.type_code,
-            .bytes = try gpa.dupe(u8, u.bytes),
-        } },
-        else => v,
-    };
+    return v.dup(gpa);
 }
 
 /// Frees the byte payload [`ownScalar`] allocated, and nothing else.
 fn freeScalar(gpa: Allocator, v: ScalarValue) void {
-    switch (v) {
-        .str => |s| gpa.free(s),
-        .bytes => |s| gpa.free(s),
-        .actor_id => |a| gpa.free(a.bytes),
-        .unknown => |u| gpa.free(u.bytes),
-        else => {},
-    }
+    var owned = v;
+    owned.deinitOwned(gpa);
 }
 
 /// A copy of a borrowed [`batch.PatchValue`] as an owned [`Value`]: the inside
@@ -1326,33 +1485,14 @@ fn ownProp(gpa: Allocator, prop: Prop) Error!Prop {
     };
 }
 
-/// A copy of `m` whose names `gpa` owns. The mark set's own `gpa` is `gpa`, so
-/// its entries buffer is allocated with it too. The counterpart is
-/// [`freeMarkSet`], and the pair must be used together.
+/// Deep independent mark ownership, including scalar byte payloads.
 fn copyMarkSet(gpa: Allocator, m: *const MarkSet) Error!MarkSet {
-    var out: MarkSet = .init(gpa);
-    errdefer freeMarkSet(gpa, &out);
-    for (m.entries.items) |e| {
-        // **The name is registered with the set before the insert is
-        // attempted.** Passed to `put` inline, it has no owner when the
-        // insert refuses it, and `freeMarkSet` only walks entries that landed.
-        const owned = try gpa.dupe(u8, e.name);
-        errdefer gpa.free(owned);
-        try out.put(owned, e.value);
-    }
-    return out;
+    return m.dup(gpa);
 }
 
-/// Frees a mark set this file allocated: the duped names **and** the entries
-/// buffer.
-///
-/// [`MarkSet.deinit`] frees only the buffer (`marks.zig`:350-353`), because
-/// the port's mark sets borrow their names. Every set this file owns has duped
-/// names, so this is the counterpart of [`copyMarkSet`] and the two must be
-/// used together. On an **arena** allocator both halves are no-ops, which is
-/// why a patch's own copy needs no free at all.
+/// Releases a mark set obtained through `copyMarkSet`.
 fn freeMarkSet(gpa: Allocator, m: *MarkSet) void {
-    for (m.entries.items) |e| gpa.free(e.name);
+    _ = gpa;
     m.deinit();
 }
 
@@ -1595,7 +1735,8 @@ pub fn PatchBuilder(comptime D: type) type {
         /// The batch the patches go into, and the allocator they are built
         /// with.
         out: *Patches,
-        /// `out`'s allocator. **Every byte a patch names comes from here.**
+        /// Arena allocator for patch payloads. Native text nodes instead use
+        /// `out.arena.child_allocator`, whose address remains stable.
         gpa: Allocator,
         /// The document every path and value is read from. **Borrowed**: it
         /// must outlive the builder, and nothing is copied out of it except
@@ -1690,25 +1831,36 @@ pub fn PatchBuilder(comptime D: type) type {
 
         /// Frees the path map with **`path_map_gpa`**, the allocator its array
         /// came from, and the cycle guard with `gpa`, the arena that holds it.
-        /// The patches belong to `out` and are not touched.
+        /// Pending text trees are released unless transferred with `takePatches`.
         ///
         /// The map was **transferred in**, not borrowed, so the caller must not
         /// release it and has no route to after this. The builder is
         /// `undefined` afterward and a second call is a double free.
         pub fn deinit(self: *Self) void {
+            for (self.patches.items) |*patch| deinitPatchText(patch);
             self.path_map.deinit(self.path_map_gpa);
             self.seen.deinit(self.gpa);
             self.* = undefined;
         }
 
+        /// Transfers staged patches after the output has reserved room for them.
+        /// The returned slice remains in the output arena; native trees now
+        /// belong to the caller and are no longer released by this builder.
+        pub fn takePatches(self: *Self) []Patch {
+            const result = self.patches.items;
+            self.patches = .empty;
+            self.last_mark_set = null;
+            return result;
+        }
+
         /// One event, one call ([`PatchBuilder::log_event`](patch_builder.rs):49-110`).
-        pub fn logEvent(self: *Self, doc: *const D, exid: ExId, ev: *const Event) Error!void {
+        pub fn logEvent(self: *Self, doc: *const D, exid: ExId, ev: *const Event) MakeError!void {
             switch (ev.*) {
                 .put_map => |e| try self.put(
                     exid,
                     .{ .key = e.key },
                     e.value,
-                    doc.idToExid(e.id),
+                    try exportPatchId(D, doc, e.id),
                     e.conflict,
                 ),
                 .delete_map => |e| try self.deleteMap(exid, e.key),
@@ -1718,10 +1870,16 @@ pub fn PatchBuilder(comptime D: type) type {
                     exid,
                     .{ .index = e.index },
                     e.value,
-                    doc.idToExid(e.id),
+                    try exportPatchId(D, doc, e.id),
                     e.conflict,
                 ),
-                .insert => |e| try self.insert(exid, e.index, e.value, doc.idToExid(e.id), e.conflict),
+                .insert => |e| try self.insert(
+                    exid,
+                    e.index,
+                    e.value,
+                    try exportPatchId(D, doc, e.id),
+                    e.conflict,
+                ),
                 .delete_seq => |e| try self.deleteSeq(exid, e.index, e.num),
                 .increment_seq => |e| try self.increment(exid, .{ .index = e.index }, e.n),
                 .flag_conflict_seq => |e| try self.flagConflict(exid, .{ .index = e.index }),
@@ -1739,13 +1897,14 @@ pub fn PatchBuilder(comptime D: type) type {
             }
         }
 
-        /// The path from the root to `obj`, or null when the document cannot
-        /// answer it ([`PatchBuilder::get_path`](patch_builder.rs):143-165`).
+        /// The path from the root to `obj`, or null when its ancestry is absent
+        /// ([`PatchBuilder::get_path`](patch_builder.rs):143-165`). Other document
+        /// read errors propagate to the caller.
         ///
         /// **A cycle is a null, not a loop**: the `seen` set is consulted
         /// before a parent is walked a second time
         /// (`patch_builder.rs`:152-155`).
-        pub fn getPath(self: *Self, obj_in: ExId) Error!?[]PathElem {
+        pub fn getPath(self: *Self, obj_in: ExId) MakeError!?[]PathElem {
             var path: std.ArrayList(PathElem) = .empty;
             var cur = obj_in;
             while (!cur.isRoot()) {
@@ -1756,9 +1915,12 @@ pub fn PatchBuilder(comptime D: type) type {
                     parent = found.parent;
                 } else {
                     const parent_id = self.doc.objectParent(cur) orelse return null;
-                    const parent_type = self.doc.objectType(parent_id) orelse return null;
+                    const parent_type = self.doc.objectType(parent_id) catch |e| switch (e) {
+                        error.NotAnObject => return null,
+                        else => return e,
+                    };
                     if (self.seen.contains(cur)) return null;
-                    try self.seen.put(self.gpa, cur, {});
+                    try self.seen.put(self.gpa, try ownExId(self.gpa, cur), {});
                     try self.updatePathMap(parent_id, parent_type);
                     const found = self.path_map.get(cur) orelse return null;
                     prop = found.prop;
@@ -1772,7 +1934,7 @@ pub fn PatchBuilder(comptime D: type) type {
                 // one place every patch's key passes through. An index is a
                 // number, and `ownProp` is the identity for it.
                 try path.append(self.gpa, .{
-                    .obj = exportObj(D, self.doc, cur),
+                    .obj = try ownExId(self.gpa, try exportObj(D, self.doc, cur)),
                     .prop = try ownProp(self.gpa, prop),
                 });
             }
@@ -1805,7 +1967,7 @@ pub fn PatchBuilder(comptime D: type) type {
             value: Value,
             id: ExId,
             conflict: bool,
-        ) Error!void {
+        ) MakeError!void {
             if (self.maybeAppend(obj)) |action| {
                 if (action.* == .insert) {
                     const tail = action.insert.index;
@@ -1814,7 +1976,7 @@ pub fn PatchBuilder(comptime D: type) type {
                         errdefer freeValue(self.gpa, owned);
                         try action.insert.values.insert(
                             index - tail,
-                            .{ .value = owned, .obj = id, .conflict = conflict },
+                            .{ .value = owned, .obj = try ownExId(self.gpa, id), .conflict = conflict },
                         );
                         return;
                     }
@@ -1825,7 +1987,7 @@ pub fn PatchBuilder(comptime D: type) type {
             errdefer freeValue(self.gpa, owned);
             var values: InsertValues = .init(self.gpa);
             errdefer values.deinit();
-            try values.push(.{ .value = owned, .obj = id, .conflict = conflict });
+            try values.push(.{ .value = owned, .obj = try ownExId(self.gpa, id), .conflict = conflict });
             try self.push(obj, path, .{ .insert = .{ .index = index, .values = values } });
         }
 
@@ -1841,7 +2003,12 @@ pub fn PatchBuilder(comptime D: type) type {
             index: usize,
             text: []const u8,
             marks: ?*const MarkSet,
-        ) Error!void {
+        ) MakeError!void {
+            // Segment incoming spans independently, preserving their native-unit
+            // boundaries even when adjacent graphemes would combine as UTF-8.
+            var incoming = try ConcreteTextValue.init(self.out.arena.child_allocator, text, self.text_encoding);
+            var transferred = false;
+            defer if (!transferred) incoming.deinit();
             if (self.maybeAppend(obj)) |action| {
                 if (action.* == .splice_text) {
                     const tail = action.splice_text.index;
@@ -1849,7 +2016,7 @@ pub fn PatchBuilder(comptime D: type) type {
                     if (index >= tail and index <= tail + len and
                         markSetEql(marks, if (self.last_mark_set) |*m| m else null))
                     {
-                        try action.splice_text.value.splice(index - tail, text);
+                        try action.splice_text.value.spliceTextValue(index - tail, &incoming);
                         return;
                     }
                 }
@@ -1862,11 +2029,12 @@ pub fn PatchBuilder(comptime D: type) type {
             };
             try self.push(obj, path, .{ .splice_text = .{
                 .index = index,
-                .value = try ConcreteTextValue.init(self.gpa, text, self.text_encoding),
+                .value = incoming,
                 .marks = owned,
             } });
+            transferred = true;
             // Only a splice leaves this set; `push` clears it.
-            self.last_mark_set = if (marks) |m| m.* else null;
+            self.last_mark_set = owned;
         }
 
         /// One or more indices removed from a sequence
@@ -1877,16 +2045,15 @@ pub fn PatchBuilder(comptime D: type) type {
         /// or the tail splice removes them, and a patch that empties is dropped
         /// rather than pushed.
         ///
-        /// Text is removed as one boundary-valid range: upstream can remove
-        /// individual native units (`patch_builder.rs`:244-246`), whereas
-        /// this UTF-8-backed value cannot retain a partial surrogate pair.
+        /// Text ranges count native units, including individual UTF-16
+        /// surrogate halves and the grapheme boundaries stored in the tree.
         ///
         /// **`length == 0` does nothing, before any arithmetic.** Upstream's
         /// coalescing arms test `index + length - 1` (`patch_builder.rs`:243`,
         /// `:259`), which underflows at zero. A text element whose value is
         /// empty has width zero, and `PatchLog.replaceSeq` logs that width.
         /// Here the guard is explicit, and no patch is emitted.
-        pub fn deleteSeq(self: *Self, obj: ExId, index: usize, length: usize) Error!void {
+        pub fn deleteSeq(self: *Self, obj: ExId, index: usize, length: usize) MakeError!void {
             if (length == 0) return;
             if (self.maybeAppend(obj)) |action| {
                 switch (action.*) {
@@ -1897,7 +2064,11 @@ pub fn PatchBuilder(comptime D: type) type {
                             const offset = index - tail;
                             if (offset < len and length <= len - offset) {
                                 try a.value.removeRange(offset, length);
-                                if (a.value.bytes.len == 0) _ = self.patches.pop();
+                                if (a.value.len() == 0) {
+                                    a.value.deinit();
+                                    _ = self.patches.pop();
+                                    self.last_mark_set = null;
+                                }
                                 return;
                             }
                         }
@@ -1907,7 +2078,11 @@ pub fn PatchBuilder(comptime D: type) type {
                         const len = a.values.len();
                         if (index >= tail and index + length - 1 < tail + len) {
                             for (0..length) |_| _ = try a.values.remove(index - tail);
-                            if (a.values.len() == 0) _ = self.patches.pop();
+                            if (a.values.len() == 0) {
+                                a.values.deinit();
+                                _ = self.patches.pop();
+                                self.last_mark_set = null;
+                            }
                             return;
                         }
                     },
@@ -1926,7 +2101,7 @@ pub fn PatchBuilder(comptime D: type) type {
 
         /// A key removed from a map
         /// ([`PatchBuilder::delete_map`](patch_builder.rs):287-294`).
-        pub fn deleteMap(self: *Self, obj: ExId, key: []const u8) Error!void {
+        pub fn deleteMap(self: *Self, obj: ExId, key: []const u8) MakeError!void {
             const path = (try self.getPath(obj)) orelse return;
             try self.push(obj, path, .{ .delete_map = .{ .key = try self.gpa.dupe(u8, key) } });
         }
@@ -1939,7 +2114,7 @@ pub fn PatchBuilder(comptime D: type) type {
             value: Value,
             id: ExId,
             conflict: bool,
-        ) Error!void {
+        ) MakeError!void {
             const path = (try self.getPath(obj)) orelse return;
             const owned_prop = try ownProp(self.gpa, prop);
             const owned_value = try copyValue(self.gpa, value);
@@ -1947,13 +2122,13 @@ pub fn PatchBuilder(comptime D: type) type {
                 .key => |k| .{ .put_map = .{
                     .key = k,
                     .value = owned_value,
-                    .obj = id,
+                    .obj = try ownExId(self.gpa, id),
                     .conflict = conflict,
                 } },
                 .index => |i| .{ .put_seq = .{
                     .index = i,
                     .value = owned_value,
-                    .obj = id,
+                    .obj = try ownExId(self.gpa, id),
                     .conflict = conflict,
                 } },
             };
@@ -1962,7 +2137,7 @@ pub fn PatchBuilder(comptime D: type) type {
 
         /// A counter incremented
         /// ([`PatchBuilder::increment`](patch_builder.rs):321-327`).
-        pub fn increment(self: *Self, obj: ExId, prop: Prop, n: i64) Error!void {
+        pub fn increment(self: *Self, obj: ExId, prop: Prop, n: i64) MakeError!void {
             const path = (try self.getPath(obj)) orelse return;
             const owned_prop = try ownProp(self.gpa, prop);
             try self.push(obj, path, .{ .increment = .{ .prop = owned_prop, .value = n } });
@@ -1974,7 +2149,7 @@ pub fn PatchBuilder(comptime D: type) type {
         /// the runs and returns without re-testing whether there are any
         /// (`patch_builder.rs`:330-335`). The emptiness test is only on the way
         /// in, so a mark event with no runs opens no patch.
-        pub fn mark(self: *Self, obj: ExId, runs: *const MarkRuns) Error!void {
+        pub fn mark(self: *Self, obj: ExId, runs: *const MarkRuns) MakeError!void {
             if (self.maybeAppend(obj)) |action| {
                 if (action.* == .mark) {
                     try self.appendMarks(action, runs);
@@ -1999,7 +2174,7 @@ pub fn PatchBuilder(comptime D: type) type {
         /// **The first arm is not a merge: a conflict flag raised straight
         /// after the put it belongs to sets that put's `conflict` instead of
         /// opening a second patch** (`patch_builder.rs`:346-358`).
-        pub fn flagConflict(self: *Self, obj: ExId, prop: Prop) Error!void {
+        pub fn flagConflict(self: *Self, obj: ExId, prop: Prop) MakeError!void {
             if (self.maybeAppend(obj)) |action| {
                 switch (action.*) {
                     .put_map => |*a| {
@@ -2097,7 +2272,7 @@ pub fn PatchBuilder(comptime D: type) type {
         /// Appends a patch and clears the mark-set cache
         /// ([`PatchBuilder::push`](patch_builder.rs):199-202`).
         fn push(self: *Self, obj: ExId, path: []PathElem, action: PatchAction) Error!void {
-            try self.patches.append(self.gpa, .{ .obj = obj, .path = path, .action = action });
+            try self.patches.append(self.gpa, .{ .obj = try ownExId(self.gpa, obj), .path = path, .action = action });
             self.last_mark_set = null;
         }
 
@@ -2118,16 +2293,16 @@ pub fn PatchBuilder(comptime D: type) type {
         /// owned resource and must be freed by whoever allocated it; a key is
         /// owned by nobody, so the arena is a free place to leave it. The
         /// index arms write no key at all.
-        fn updatePathMap(self: *Self, parent_id: ExId, parent_type: ObjType) Error!void {
+        fn updatePathMap(self: *Self, parent_id: ExId, parent_type: ObjType) MakeError!void {
             switch (parent_type) {
                 .list => {
                     var it = self.doc.listRangeFor(parent_id, self.clock);
                     while (try it.next()) |item| {
                         if (!item.value.isObject()) continue;
                         try self.path_map.put(self.path_map_gpa, .{
-                            .obj = internalObj(item.id),
+                            .obj = try ownExId(self.gpa, try exportPatchId(D, self.doc, item.id)),
                             .prop = .{ .index = item.index },
-                            .parent = parent_id,
+                            .parent = try ownExId(self.gpa, try exportObj(D, self.doc, parent_id)),
                         });
                     }
                 },
@@ -2136,9 +2311,9 @@ pub fn PatchBuilder(comptime D: type) type {
                     while (try it.next()) |span| {
                         switch (span) {
                             .obj => |o| try self.path_map.put(self.path_map_gpa, .{
-                                .obj = internalObj(o.id),
+                                .obj = try ownExId(self.gpa, try exportPatchId(D, self.doc, o.id)),
                                 .prop = .{ .index = o.index },
-                                .parent = parent_id,
+                                .parent = try ownExId(self.gpa, try exportObj(D, self.doc, parent_id)),
                             }),
                             .text => {},
                         }
@@ -2149,12 +2324,12 @@ pub fn PatchBuilder(comptime D: type) type {
                     while (try it.next()) |item| {
                         if (!item.value.isObject()) continue;
                         try self.path_map.put(self.path_map_gpa, .{
-                            .obj = internalObj(item.id),
+                            .obj = try ownExId(self.gpa, try exportPatchId(D, self.doc, item.id)),
                             // **Copied, so the entry this keeps does not name
                             // the walk's storage.** The arena releases it with
                             // the batch.
                             .prop = try ownProp(self.gpa, .{ .key = item.key }),
-                            .parent = parent_id,
+                            .parent = try ownExId(self.gpa, try exportObj(D, self.doc, parent_id)),
                         });
                     }
                 },
@@ -2191,9 +2366,9 @@ pub const ExposeQueue = struct {
     /// The allocator the array is allocated with, held for the queue's whole
     /// life.
     gpa: Allocator,
-    /// The queued objects, sorted by `ExId` and free of duplicates. The array
-    /// is released by the private `deinit` that only [`PatchLog.buildCurrent`]
-    /// reaches.
+    /// Borrowed authoritative document ids, sorted by public `ExId` order and
+    /// free of duplicates. The document remains unchanged for this queue's
+    /// lifetime; builders copy actor bytes before publishing patches.
     items: std.ArrayList(ExId) = .empty,
 
     fn init(gpa: Allocator) ExposeQueue {
@@ -2224,10 +2399,10 @@ pub const ExposeQueue = struct {
         var hi: usize = self.items.items.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (obj.order(self.items.items[mid]) == .lt) {
-                hi = mid;
-            } else {
-                lo = mid + 1;
+            switch (obj.order(self.items.items[mid])) {
+                .lt => hi = mid,
+                .gt => lo = mid + 1,
+                .eq => return,
             }
         }
         try self.items.insert(self.gpa, lo, obj);
@@ -2295,7 +2470,10 @@ pub const ExposeQueue = struct {
     ) MakeError!void {
         const id = internalObjOf(exid);
         self.remove(exid);
-        const kind = doc.objectType(id) orelse return;
+        const kind = doc.objectType(id) catch |e| switch (e) {
+            error.NotAnObject => return,
+            else => return e,
+        };
         switch (kind) {
             .text => {
                 var it = doc.spans(id, clock);
@@ -2303,7 +2481,7 @@ pub const ExposeQueue = struct {
                     switch (span) {
                         .text => |t| try builder.spliceText(exid, t.index, t.text, t.marks),
                         .obj => |o| {
-                            const child = doc.idToExid(o.id);
+                            const child = try exportPatchId(D, doc, o.id);
                             try self.insert(child);
                             // Upstream hard-codes `ObjType::Map` here
                             // (`patch_log.rs`:747`) and the port keeps it: a
@@ -2316,7 +2494,7 @@ pub const ExposeQueue = struct {
             .list => {
                 var it = doc.listRangeFor(id, clock);
                 while (try it.next()) |item| {
-                    const child = doc.idToExid(item.id);
+                    const child = try exportPatchId(D, doc, item.id);
                     if (item.value.isObject()) try self.insert(child);
                     // The document hands out a borrowed [`batch.PatchValue`]
                     // and the builder takes an owned [`Value`], so the
@@ -2333,7 +2511,7 @@ pub const ExposeQueue = struct {
             .map, .table => {
                 var it = doc.mapRangeFor(id, clock);
                 while (try it.next()) |item| {
-                    const child = doc.idToExid(item.id);
+                    const child = try exportPatchId(D, doc, item.id);
                     if (item.value.isObject()) try self.insert(child);
                     try builder.put(
                         exid,
@@ -2380,54 +2558,6 @@ pub const PatchLog = struct {
     /// The patches of views already left behind
     /// (`completed_patches`, `patch_log.rs`:47`).
     completed: Patches,
-    /// The patches a **local change** contributed to the current view, and a
-    /// port-only field with no upstream counterpart.
-    ///
-    /// **Upstream holds these as events.** `TransactionInner` records one
-    /// [`Event`] per op into its own branch log as it inserts the op
-    /// ([`inner.rs:308-328`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)),
-    /// and `AutoCommit::commit_with` merges that branch into its own before the
-    /// commit returns ([`autocommit.rs:728-739`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)).
-    /// The port's transaction writes its rows with **no log in hand** and hands
-    /// [`Document.commit`](doc.zig) the finished ops, by which time they are
-    /// already rows: there is no insert-time moment left to record against. So
-    /// the patches are built once, by the same walk [`Document.diff`](doc.zig)
-    /// uses, and parked here.
-    ///
-    /// **They belong to the current view, and that is the whole reason this is
-    /// a second list.** Upstream's order is the order events were recorded, and
-    /// a change committed under an isolation is recorded *after* the walk that
-    /// closed the view before it — so [`PatchLog.finishCurrentView`] is what
-    /// turns both into [`PatchLog.completed`], in that order, and the view the
-    /// change belongs to resolves its paths while its own `heads` are still the
-    /// log's. Appending straight to `completed` puts the change's patches
-    /// *ahead* of the transition that preceded it, and a patch stream is
-    /// order-sensitive: the mirror `automerge#951` rebuilds is fed them in
-    /// order.
-    ///
-    /// **Where the stream puts them, and the one order this gets wrong.**
-    /// [`PatchLog.makePatches`] emits `completed`, then `events`, then this, and
-    /// [`PatchLog.finishCurrentView`] closes a view as `events` then this. Both
-    /// are right for a change recorded **after** the view's events, which is the
-    /// isolation case above, and they are **inverted** for a change recorded
-    /// **before** them. Measured on the oracle's `diff` subcommand's
-    /// `localmerge` scenario — a local commit, then a peer's change applied
-    /// after it, read back through one view:
-    ///
-    /// | | the reference | this port |
-    /// |---|---|---|
-    /// | the local commit's `PutMap` | first | **last** |
-    /// | the applied change's `PutMap` | second | **first** |
-    ///
-    /// Upstream gets this right for free because both are *events* in one list,
-    /// so the record order is the stream order
-    /// ([`patch_log.rs`:505-509`](../../github-automerge-automerge/rust/automerge/src/patches/patch_log.rs),
-    /// `:515-516`). Here a local change is a finished batch with no position in
-    /// the event list, and giving it one means carrying a watermark through
-    /// [`PatchLog.buildCurrent`]'s sort — a change to the shape of this list,
-    /// and one every isolation vector depends on. Recorded here rather than
-    /// fixed, because the measurement is the part worth keeping.
-    local: Patches,
     /// Where the objects named by [`PatchLog.pathHint`] live
     /// (`path_map`, `patch_log.rs`:49`).
     path_map: PathMap = .{},
@@ -2451,6 +2581,32 @@ pub const PatchLog = struct {
     /// else. Nothing is silently dropped and nothing is silently wrong: the log
     /// is unusable and says so.
     oom: bool = false,
+    /// Prospective document metadata, never an actor-compatibility capability.
+    /// Binding assigns it only on success; staged publication adopts it last.
+    identity: ?u64 = null,
+    /// A batch is an allocation-provenance capability for this exact owner.
+    /// The target must stay at its address until the stage is destroyed or
+    /// published. A log without a live stage can move by ownership transfer.
+    batch_origin: ?*PatchLog = null,
+    checkpoint: ?*Checkpoint = null,
+    path_storage: std.heap.ArenaAllocator,
+    publish_completed: ?Patches = null,
+
+    const Checkpoint = struct {
+        events_len: usize,
+        expose: std.AutoHashMapUnmanaged(OpId, void),
+        path_map: PathMap,
+        path_storage: std.heap.ArenaAllocator,
+        path_hint: usize,
+        oom: bool,
+
+        fn deinit(self: *Checkpoint, gpa: Allocator) void {
+            self.expose.deinit(gpa);
+            self.path_map.deinit(gpa);
+            self.path_storage.deinit();
+            gpa.destroy(self);
+        }
+    };
 
     /// One event and the object it happened to
     /// ([`Vec<(ObjId, Event)>`](patch_log.rs):45`).
@@ -2466,7 +2622,7 @@ pub const PatchLog = struct {
             .gpa = gpa,
             .recording = recording,
             .completed = .init(gpa),
-            .local = .init(gpa),
+            .path_storage = .init(gpa),
         };
     }
 
@@ -2493,26 +2649,25 @@ pub const PatchLog = struct {
         return init(gpa, false);
     }
 
-    /// Releases everything the log owns: every event and its payload, the event
-    /// list, the expose set, the completed and local patch batches with
-    /// everything in their arenas, the path map, the heads copy, every actor's
-    /// bytes and the speculative actor.
-    ///
-    /// **The allocator given to [`PatchLog.init`] is not released.** Any
-    /// [`Patches`] this log handed out stays the caller's to free, and a
-    /// [`StagedLocal`] still in hand is released with the arena it came from.
-    /// The log is `undefined` afterward and a second call is a double free.
+    /// Releases all events, completed patches, actor mappings, cached paths,
+    /// and transaction or publication checkpoints. Returned Patches remain
+    /// independently owned by their caller.
     pub fn deinit(self: *PatchLog) void {
-        for (self.events.items) |*e| e.event.deinit(self.gpa);
+        for (self.events.items) |*e| {
+            e.obj.deinitOwned(self.gpa);
+            e.event.deinit(self.gpa);
+        }
         self.events.deinit(self.gpa);
         self.expose.deinit(self.gpa);
         self.completed.deinit();
-        self.local.deinit();
         self.path_map.deinit(self.gpa);
         if (self.heads) |h| self.gpa.free(h);
         for (self.actors.items) |a| self.gpa.free(a.bytes);
         self.actors.deinit(self.gpa);
         if (self.speculative_actor) |a| self.gpa.free(a.bytes);
+        self.path_storage.deinit();
+        if (self.checkpoint) |checkpoint| checkpoint.deinit(self.gpa);
+        if (self.publish_completed) |*completed| completed.deinit();
         self.* = undefined;
     }
 
@@ -2700,9 +2855,10 @@ pub const PatchLog = struct {
     /// (`patch_log.rs`:456-459`). The names are copied, because the run
     /// outlives the set it was read from.
     pub fn mark(self: *PatchLog, obj: ObjId, index: usize, len: usize, marks: *const MarkSet) void {
-        if (self.events.items.len > 0) {
+        const floor = if (self.checkpoint) |checkpoint| checkpoint.events_len else 0;
+        if (self.events.items.len > floor) {
             const last = &self.events.items[self.events.items.len - 1];
-            if (last.event == .mark) {
+            if (last.obj.eql(obj) and last.event == .mark) {
                 last.event.mark.marks.add(index, len, marks) catch {
                     self.oom = true;
                 };
@@ -2733,38 +2889,84 @@ pub const PatchLog = struct {
         self.insert(obj, index, v, id, conflict);
     }
 
-    /// Re-aligns the log's actor list, and the ids in its events, with the
-    /// document's ([`PatchLog::migrate_actors`](patch_log.rs):634-659`).
-    ///
-    /// **The merge calls this before it logs anything**:
-    /// `opset/batch.zig` writes `try log.migrateActors(set.actors.items)`
-    /// immediately after inserting the new actors and before the first walk
-    /// (`batch.zig`:2064-2066`), because a new actor shifts the index of every
-    /// actor that sorts after it and the ids already in the log are indices.
-    pub fn migrateActors(self: *PatchLog, others: []const ActorId) Error!void {
-        if (actorsEql(self.actors.items, others)) return;
-        if (self.actors.items.len == 0) {
-            try self.setActors(others);
-            return;
+    /// Checks Rust's sorted insertion/prefix compatibility without allocating
+    /// or changing any log state (patches/patch_log.rs:634-658).
+    /// Missing old trailing actors are compatible and remain in the log.
+    pub fn validateActors(self: *const PatchLog, actors: []const ActorId) Error!void {
+        _ = try self.actorMigration(actors);
+    }
+
+    const ActorMigration = struct {
+        insertions: usize,
+        consumed: usize,
+    };
+
+    // One ordered comparison serves preflight, ownership construction, and
+    // publication. `old` indexes the original table, not the inserted prefix.
+    fn actorInsertion(
+        actors: []const ActorId,
+        actor: ActorId,
+        old: *usize,
+    ) Error!bool {
+        if (old.* == actors.len) return true;
+        switch (ActorId.order(actor, actors[old.*])) {
+            .eq => {
+                old.* += 1;
+                return false;
+            },
+            .lt => return true,
+            .gt => return error.PatchLogMismatch,
         }
-        var i: usize = 0;
-        while (i < others.len) : (i += 1) {
-            const mine = if (i < self.actors.items.len) self.actors.items[i] else null;
-            const theirs = others[i];
-            if (mine) |a| {
-                if (ActorId.eql(a, theirs)) continue;
-                if (ActorId.order(theirs, a) == .lt) {
-                    const copy = try self.dupeActor(theirs);
-                    try self.actors.insert(self.gpa, i, copy);
-                    self.migrateActor(@intCast(i));
-                } else {
-                    return error.PatchLogMismatch;
-                }
-            } else {
-                const copy = try self.dupeActor(theirs);
-                try self.actors.insert(self.gpa, i, copy);
+    }
+
+    fn actorMigration(self: *const PatchLog, others: []const ActorId) Error!ActorMigration {
+        var migration: ActorMigration = .{ .insertions = 0, .consumed = 0 };
+        for (others) |actor| {
+            if (try actorInsertion(self.actors.items, actor, &migration.consumed))
+                migration.insertions += 1;
+        }
+        return migration;
+    }
+
+    /// Inserts compatible actor slots and remaps indexed events and caches.
+    /// Old trailing actors and their owned bytes are retained, as in Rust
+    /// (patches/patch_log.rs:634-658). Mismatch or allocation failure leaves
+    /// all log state unchanged; equal or already matching prefixes allocate nothing.
+    pub fn migrateActors(self: *PatchLog, others: []const ActorId) Error!void {
+        const migration = try self.actorMigration(others);
+        if (migration.insertions == 0) return;
+        var actors: std.ArrayList(ActorId) = .empty;
+        errdefer {
+            // Only inserted slots own new bytes until the no-fail transfer.
+            var old: usize = 0;
+            for (others, 0..) |actor, index| {
+                if (index == actors.items.len) break;
+                if (actorInsertion(self.actors.items, actor, &old) catch unreachable)
+                    self.gpa.free(actors.items[index].bytes);
+            }
+            actors.deinit(self.gpa);
+        }
+        try actors.ensureTotalCapacity(self.gpa, self.actors.items.len + migration.insertions);
+        var old: usize = 0;
+        for (others) |actor| {
+            const previous = old;
+            const inserted = actorInsertion(self.actors.items, actor, &old) catch unreachable;
+            actors.appendAssumeCapacity(if (inserted)
+                try self.dupeActor(actor)
+            else
+                self.actors.items[previous]);
+        }
+        actors.appendSliceAssumeCapacity(self.actors.items[old..]);
+        old = 0;
+        for (others, 0..) |actor, index| {
+            const has_old_actor = old < self.actors.items.len;
+            if (actorInsertion(self.actors.items, actor, &old) catch unreachable) {
+                // Rust does not remap an empty table or an appended suffix.
+                if (has_old_actor) self.migrateActor(@intCast(index));
             }
         }
+        self.actors.deinit(self.gpa);
+        self.actors = actors;
     }
 
     /// Notifies the log that a transaction is beginning
@@ -2773,43 +2975,313 @@ pub const PatchLog = struct {
     /// An actor whose first change this is was just added to the document, and
     /// a transaction that produces no ops takes it out again — so it is flagged
     /// speculative here and settled in [`PatchLog.finishTransaction`].
-    pub fn beginTransaction(
+    pub fn bindBegin(
         self: *PatchLog,
+        identity: u64,
         doc_actors: []const ActorId,
         seq: u64,
         actor_index: ActorIdx,
     ) (Error || InternalError)!void {
-        try self.migrateActors(doc_actors);
-        if (seq == 1) {
-            if (self.speculative_actor != null) return error.Invariant;
-            if (actor_index >= doc_actors.len) return error.InvalidActorIndex;
-            self.speculative_actor = try self.dupeActor(doc_actors[actor_index]);
+        try self.validateActors(doc_actors);
+        if (self.oom) return error.OutOfMemory;
+        if (self.checkpoint != null or self.speculative_actor != null) return error.Invariant;
+        if (actor_index >= doc_actors.len) return error.InvalidActorIndex;
+        const speculative = if (seq == 1) try self.dupeActor(doc_actors[actor_index]) else null;
+        errdefer if (speculative) |actor| self.gpa.free(actor.bytes);
+        const checkpoint = try self.copyCheckpoint();
+        self.checkpoint = checkpoint;
+        errdefer {
+            self.checkpoint = null;
+            checkpoint.deinit(self.gpa);
         }
+        try self.bind(identity, doc_actors);
+        self.speculative_actor = speculative;
+    }
+
+    /// Migrates compatible actor slots, then adopts prospective metadata.
+    /// Failure retains the original metadata, actor bytes, and recorded data.
+    pub fn bind(self: *PatchLog, identity: u64, actors: []const ActorId) Error!void {
+        if (self.oom) return error.OutOfMemory;
+        try self.migrateActors(actors);
+        self.identity = identity;
+    }
+
+    pub fn take(self: *PatchLog) PatchLog {
+        const result = self.*;
+        self.* = .inactive(self.gpa);
+        return result;
+    }
+
+    pub fn rollbackTransaction(self: *PatchLog, actors: []const ActorId) void {
+        const checkpoint = self.checkpoint orelse {
+            self.settleActor(actors);
+            return;
+        };
+        self.checkpoint = null;
+        for (self.events.items[checkpoint.events_len..]) |*entry| {
+            entry.obj.deinitOwned(self.gpa);
+            entry.event.deinit(self.gpa);
+        }
+        self.events.shrinkRetainingCapacity(checkpoint.events_len);
+        self.expose.deinit(self.gpa);
+        self.expose = checkpoint.expose;
+        checkpoint.expose = .empty;
+        self.path_map.deinit(self.gpa);
+        self.path_storage.deinit();
+        self.path_map = checkpoint.path_map;
+        self.path_storage = checkpoint.path_storage;
+        checkpoint.path_map = .{};
+        checkpoint.path_storage = .init(self.gpa);
+        self.path_hint = checkpoint.path_hint;
+        self.oom = checkpoint.oom;
+        checkpoint.deinit(self.gpa);
+        self.settleActor(actors);
+    }
+
+    /// Returns an independently owned deep copy using `gpa` and new metadata.
+    /// Copies transaction checkpoints, but never a batch publication capability.
+    pub fn cloneAndRebind(self: *const PatchLog, gpa: Allocator, identity: u64) Error!PatchLog {
+        var out: PatchLog = .init(gpa, self.recording);
+        errdefer out.deinit();
+        out.identity = identity;
+        // Cloning copies owned data, not the source's publication capability.
+        out.batch_origin = null;
+        try out.setActors(self.actors.items);
+        try out.events.ensureTotalCapacity(gpa, self.events.items.len);
+        for (self.events.items) |entry| {
+            const obj = try entry.obj.dup(gpa);
+            errdefer {
+                var id = obj;
+                id.deinitOwned(gpa);
+            }
+            out.events.appendAssumeCapacity(.{ .obj = obj, .event = try copyEvent(gpa, entry.event) });
+        }
+        out.expose = try self.expose.clone(gpa);
+        try out.completed.appendFrom(&self.completed);
+        out.path_map = try copyPathMap(gpa, out.path_storage.allocator(), &self.path_map);
+        out.path_hint = self.path_hint;
+        if (self.heads) |heads| out.heads = try gpa.dupe(ChangeHash, heads);
+        if (self.speculative_actor) |actor| out.speculative_actor = try out.dupeActor(actor);
+        out.oom = self.oom;
+        if (self.checkpoint) |checkpoint| {
+            out.checkpoint = try cloneCheckpoint(gpa, checkpoint);
+        }
+        if (self.publish_completed) |*completed| {
+            out.publish_completed = .init(gpa);
+            try out.publish_completed.?.appendFrom(completed);
+        }
+        return out;
+    }
+
+    /// Creates an independent tail authorized to publish only to this owner.
+    /// Keep this owner address-stable until the returned stage is consumed.
+    pub fn beginBatch(self: *PatchLog) Error!PatchLog {
+        if (self.oom) return error.OutOfMemory;
+        var stage = try self.branch();
+        stage.batch_origin = self;
+        return stage;
+    }
+
+    /// Reserves publication into the exact owner returned by `beginBatch`.
+    /// Actor mismatch or allocation failure publishes no recorded data.
+    pub fn preparePublish(self: *PatchLog, target: *PatchLog) Error!void {
+        if (self.batch_origin != target) return error.PatchLogMismatch;
+        if (self.oom or target.oom) return error.OutOfMemory;
+        if (self.checkpoint != null or target.checkpoint != null) return error.PatchLogMismatch;
+        const migration = try target.actorMigration(self.actors.items);
+        // A publication table must also contain all retained target slots.
+        // beginBatch inherits them; merge copies any compatible trailing tail.
+        if (migration.consumed != target.actors.items.len) return error.PatchLogMismatch;
+        var completed: Patches = .init(target.gpa);
+        errdefer completed.deinit();
+        try completed.appendFrom(&target.completed);
+        try completed.appendFrom(&self.completed);
+        try target.events.ensureUnusedCapacity(target.gpa, self.events.items.len);
+        try target.expose.ensureUnusedCapacity(target.gpa, self.expose.count());
+        if (self.publish_completed) |*previous| previous.deinit();
+        self.publish_completed = completed;
+    }
+
+    /// Consumes a prepared stage into its exact owner without allocating.
+    /// Adopts the stage's prospective metadata, not a document-owner token.
+    pub fn publish(self: *PatchLog, target: *PatchLog) void {
+        if (self.batch_origin != target) @panic("PatchLog batch publication owner mismatch");
+        std.debug.assert(!self.oom and !target.oom);
+        const completed = self.publish_completed orelse unreachable;
+        self.publish_completed = null;
+        target.completed.deinit();
+        target.completed = completed;
+        // Actor bytes were already copied into the stage. Remapping old IDs
+        // and transferring that table require no allocation after publication.
+        var old: usize = 0;
+        for (self.actors.items, 0..) |actor, index| {
+            const has_old_actor = old < target.actors.items.len;
+            if (actorInsertion(target.actors.items, actor, &old) catch unreachable) {
+                if (has_old_actor) target.migrateActor(@intCast(index));
+            }
+        }
+        for (target.actors.items) |actor| target.gpa.free(actor.bytes);
+        target.actors.deinit(target.gpa);
+        target.actors = self.actors;
+        self.actors = .empty;
+        target.events.appendSliceAssumeCapacity(self.events.items);
+        self.events.clearRetainingCapacity();
+        var iterator = self.expose.iterator();
+        while (iterator.next()) |entry| {
+            target.expose.putAssumeCapacity(entry.key_ptr.*, {});
+        }
+        target.identity = self.identity;
+        target.path_map.deinit(target.gpa);
+        target.path_map = .{};
+        target.path_hint = 0;
+        self.deinit();
+        self.* = .inactive(target.gpa);
+    }
+
+    pub fn markSingle(
+        self: *PatchLog,
+        obj: ObjId,
+        index: usize,
+        len: usize,
+        name: []const u8,
+        value: ScalarValue,
+    ) void {
+        if (self.oom) return;
+        const floor = if (self.checkpoint) |checkpoint| checkpoint.events_len else 0;
+        if (self.events.items.len > floor) {
+            const last = &self.events.items[self.events.items.len - 1];
+            if (last.obj.eql(obj) and last.event == .mark) {
+                appendMarkRun(&last.event.mark.marks, index, len, name, value) catch {
+                    self.oom = true;
+                };
+                return;
+            }
+        }
+        var runs: MarkRuns = .init(self.gpa);
+        appendMarkRun(&runs, index, len, name, value) catch {
+            runs.deinit();
+            self.oom = true;
+            return;
+        };
+        self.appendEvent(obj, .{ .mark = .{ .marks = runs } });
+    }
+
+    fn appendMarkRun(
+        runs: *MarkRuns,
+        index: usize,
+        len: usize,
+        name: []const u8,
+        value: ScalarValue,
+    ) Error!void {
+        var at: usize = 0;
+        while (at < runs.runs.items.len and
+            std.mem.order(u8, runs.runs.items[at].name, name) != .gt) : (at += 1)
+        {}
+        if (at > 0) {
+            const previous = &runs.runs.items[at - 1];
+            if (std.mem.eql(u8, previous.name, name) and previous.value.eql(value) and
+                previous.index + previous.len == index)
+            {
+                previous.len += len;
+                return;
+            }
+        }
+        const owned_name = try runs.gpa.dupe(u8, name);
+        errdefer runs.gpa.free(owned_name);
+        const owned_value = try ownScalar(runs.gpa, value);
+        errdefer freeScalar(runs.gpa, owned_value);
+        try runs.runs.insert(runs.gpa, at, .{
+            .name = owned_name,
+            .index = index,
+            .len = len,
+            .value = owned_value,
+        });
+    }
+
+    fn copyPathMap(gpa: Allocator, arena: Allocator, source: *const PathMap) Error!PathMap {
+        var result: PathMap = .{};
+        errdefer result.deinit(gpa);
+        try result.items.ensureTotalCapacity(gpa, source.items.items.len);
+        for (source.items.items) |entry| {
+            result.items.appendAssumeCapacity(.{
+                .obj = try entry.obj.dup(arena),
+                .parent = try entry.parent.dup(arena),
+                .prop = switch (entry.prop) {
+                    .key => |key| .{ .key = try arena.dupe(u8, key) },
+                    .index => |index| .{ .index = index },
+                },
+            });
+        }
+        return result;
+    }
+
+    fn copyCheckpoint(self: *const PatchLog) Error!*Checkpoint {
+        const checkpoint = try self.gpa.create(Checkpoint);
+        checkpoint.* = .{
+            .events_len = self.events.items.len,
+            .expose = .empty,
+            .path_map = .{},
+            .path_storage = .init(self.gpa),
+            .path_hint = self.path_hint,
+            .oom = self.oom,
+        };
+        errdefer checkpoint.deinit(self.gpa);
+        checkpoint.expose = try self.expose.clone(self.gpa);
+        checkpoint.path_map = try copyPathMap(
+            self.gpa,
+            checkpoint.path_storage.allocator(),
+            &self.path_map,
+        );
+        return checkpoint;
+    }
+
+    fn cloneCheckpoint(gpa: Allocator, source: *const Checkpoint) Error!*Checkpoint {
+        const checkpoint = try gpa.create(Checkpoint);
+        checkpoint.* = .{
+            .events_len = source.events_len,
+            .expose = .empty,
+            .path_map = .{},
+            .path_storage = .init(gpa),
+            .path_hint = source.path_hint,
+            .oom = source.oom,
+        };
+        errdefer checkpoint.deinit(gpa);
+        checkpoint.expose = try source.expose.clone(gpa);
+        checkpoint.path_map = try copyPathMap(
+            gpa,
+            checkpoint.path_storage.allocator(),
+            &source.path_map,
+        );
+        return checkpoint;
     }
 
     /// Notifies the log that a transaction has finished
     /// ([`PatchLog::finish_transaction`](patch_log.rs):616-626`).
     ///
-    /// Settles the speculative actor [`PatchLog.beginTransaction`] took: the
+    /// Settles the speculative actor [`PatchLog.bindBegin`] took: the
     /// document kept it, so it stays, and otherwise it is dropped from the
     /// log's actor list along with every id that named it. **Infallible** —
     /// nothing here allocates and nothing here can fail, which is why a
     /// `defer` at a commit's tail needs no `catch`. `doc_actors` is borrowed
     /// for the call only.
     pub fn finishTransaction(self: *PatchLog, doc_actors: []const ActorId) void {
+        if (self.checkpoint) |checkpoint| {
+            checkpoint.deinit(self.gpa);
+            self.checkpoint = null;
+        }
+        self.settleActor(doc_actors);
+    }
+
+    fn settleActor(self: *PatchLog, doc_actors: []const ActorId) void {
         const speculative = self.speculative_actor orelse return;
         self.speculative_actor = null;
-        // **Freed on every path out.** The port's `ActorId` borrows its bytes
-        // and this is the log's own copy, so it is the log's to free;
-        // upstream's is a refcounted `SmolStr` and drops itself.
         defer self.gpa.free(speculative.bytes);
-        // The document kept the actor, so it was not speculative after all.
-        for (doc_actors) |a| {
-            if (ActorId.eql(a, speculative)) return;
+        for (doc_actors) |actor| {
+            if (ActorId.eql(actor, speculative)) return;
         }
-        for (self.actors.items, 0..) |a, i| {
-            if (ActorId.eql(a, speculative)) {
-                self.removeActor(i);
+        for (self.actors.items, 0..) |actor, index| {
+            if (ActorId.eql(actor, speculative)) {
+                self.removeActor(index);
                 return;
             }
         }
@@ -2830,19 +3302,10 @@ pub const PatchLog = struct {
         doc: *const D,
         heads: []const ChangeHash,
     ) MakeError!void {
+        if (D == @import("doc.zig").Document) return doc.finishCurrentPatchView(self, heads);
+        if (self.checkpoint != null) return error.PatchLogMismatch;
         if (self.oom) return error.OutOfMemory;
-        // **The guard counts `local` too.** Upstream's is
-        // `!self.events.is_empty() || !self.expose.is_empty()`
-        // ([`patch_log.rs:291`](../../github-automerge-automerge/rust/automerge/src/patches/patch_log.rs))
-        // and it holds a change's patches *as events*, so a change committed
-        // under an isolation fails the test on its own. This log keeps those
-        // patches in [`PatchLog.local`] instead, and a view whose only content
-        // is one local change has to be closed as firmly as a view with events
-        // in it — the two are the same thing upstream, which is exactly why
-        // they cannot be closed separately.
-        if (self.events.items.len == 0 and
-            self.expose.count() == 0 and
-            self.local.len() == 0) return;
+        if (self.events.items.len == 0 and self.expose.count() == 0) return;
         try self.migrateActors(doc.actorList());
         const previous = self.heads;
         self.heads = try self.gpa.dupe(ChangeHash, heads);
@@ -2850,15 +3313,11 @@ pub const PatchLog = struct {
             self.gpa.free(self.heads.?);
             self.heads = previous;
         }
-        // **Events first, then the local change, and that order is the
-        // stream's.** A change committed under an isolation is recorded after
-        // the walk that closed the view before it, so the walk's events sort
-        // and emit ahead of it. `appendFrom` is a deep copy, so clearing after
-        // the append is what leaves the change in `completed` exactly once.
         try self.buildCurrent(D, &self.completed, doc);
-        try self.completed.appendFrom(&self.local);
-        self.local.clear();
-        for (self.events.items) |*e| e.event.deinit(self.gpa);
+        for (self.events.items) |*e| {
+            e.obj.deinitOwned(self.gpa);
+            e.event.deinit(self.gpa);
+        }
         self.events.clearRetainingCapacity();
         self.expose.clearRetainingCapacity();
         self.path_hint = 0;
@@ -2869,51 +3328,18 @@ pub const PatchLog = struct {
     /// The patches, in the order a consumer applies them
     /// ([`PatchLog::make_patches`](patch_log.rs):505-509`).
     ///
-    /// **Three lists, where upstream's body has two.**
-    /// `make_patches` is `self.completed_patches.clone()` and then
-    /// `patches.extend(self.make_current_patches(doc))`
-    /// ([`patch_log.rs:505-509`](../../github-automerge-automerge/rust/automerge/src/patches/patch_log.rs)):
-    /// the views already left behind, then the current view's events. A local
-    /// change's patches ride in **one of those two** upstream, because
-    /// `TransactionInner` records them as events and `AutoCommit::commit_with`
-    /// merges that branch log in
-    /// ([`autocommit.rs:728-739`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)).
-    /// The port has no insert-time moment, so they are built once and parked in
-    /// [`PatchLog.local`], and that is what makes it the third:
-    ///
-    /// 1. [`PatchLog.completed`] — the views [`PatchLog.finishCurrentView`]
-    ///    closed, in the order they were closed.
-    /// 2. [`PatchLog.events`] — the current view's, through
-    ///    [`PatchLog.buildCurrent`], sorted by object and built by
-    ///    [`patchesmod.PatchBuilder`].
-    /// 3. [`PatchLog.local`] — the local changes, appended.
-    ///
-    /// **A patch about a change the cursor already covers is in none of them,
-    /// and nothing here can invent one.** Two rules empty the log under a
-    /// change made before this line: `update_diff_cursor` truncates it
-    /// ([`autocommit.rs`:203-204](../../github-automerge-automerge/rust/automerge/src/autocommit.rs),
-    /// [`patch_log.rs`:531-538`), and a commit made while the log was inactive
-    /// records nothing at all. Measured: the oracle's `diff` subcommand's
-    /// `insertopid-cursor` scenario makes a list, runs `update_diff_cursor`,
-    /// fills the list and reads the document's own log back — the reference
-    /// answers one patch, the `Insert`, and no `PutMap` about the list; the
-    /// port answers the same one `Insert`, carrying the same op ids.
-    ///
-    /// The events are **not** consumed: a second call on the same log produces
-    /// the same stream, which is what the determinism test asserts.
+    /// Completed historical views precede the current view's events. Local
+    /// transactions and applied batches share this same event stream.
+    /// The events are not consumed, but the one-use path hint is
+    /// (patch_log.rs:513). Subsequent renders resolve paths from the document.
     pub fn makePatches(self: *PatchLog, comptime D: type, doc: *const D) MakeError!Patches {
+        // Raw documents own the indexed reader adapter and its lifetime.
+        if (D == @import("doc.zig").Document) return doc.makePatches(self);
         if (self.oom) return error.OutOfMemory;
         var out: Patches = .init(self.gpa);
         errdefer out.deinit();
         try out.appendFrom(&self.completed);
         try self.buildCurrent(D, &out, doc);
-        // **After the current events, and not into `completed`.** A local
-        // change's patches are the current view's, so [`PatchLog.local`] sits
-        // beside `events` in the stream and is moved into `completed` by
-        // [`PatchLog.finishCurrentView`] when the view closes — which is what
-        // puts a change committed under an isolation *after* the transition
-        // that preceded it.
-        try out.appendFrom(&self.local);
         return out;
     }
 
@@ -2925,21 +3351,26 @@ pub const PatchLog = struct {
     /// (`autocommit.rs`:203-204`), so nothing survives to be patched with.
     pub fn truncate(self: *PatchLog) void {
         self.recording = true;
-        for (self.events.items) |*e| e.event.deinit(self.gpa);
+        for (self.events.items) |*e| {
+            e.obj.deinitOwned(self.gpa);
+            e.event.deinit(self.gpa);
+        }
         self.events.clearRetainingCapacity();
         self.expose.clearRetainingCapacity();
         self.completed.deinit();
         self.completed = .init(self.gpa);
-        // **A drained cursor takes the local changes with it**, exactly as it
-        // takes the completed patches: `update_diff_cursor` is where a consumer
-        // says "I have everything up to here"
-        // ([`autocommit.rs`:199-206](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)),
-        // and a change committed before that line has already been handed out.
-        self.local.deinit();
-        self.local = .init(self.gpa);
         self.path_hint = 0;
         self.path_map.deinit(self.gpa);
         self.path_map = .{};
+        self.path_storage.deinit();
+        self.path_storage = .init(self.gpa);
+        if (self.checkpoint) |checkpoint| checkpoint.deinit(self.gpa);
+        self.checkpoint = null;
+        if (self.speculative_actor) |actor| self.gpa.free(actor.bytes);
+        self.speculative_actor = null;
+        if (self.publish_completed) |*completed| completed.deinit();
+        self.publish_completed = null;
+        self.oom = false;
     }
 
     /// A fresh log over the same actor list
@@ -2952,141 +3383,49 @@ pub const PatchLog = struct {
     pub fn branch(self: *PatchLog) Error!PatchLog {
         var out: PatchLog = .init(self.gpa, self.recording);
         errdefer out.deinit();
-        for (self.actors.items) |a| try out.actors.append(self.gpa, try self.dupeActor(a));
+        try out.setActors(self.actors.items);
+        out.identity = self.identity;
+        if (self.heads) |heads| out.heads = try self.gpa.dupe(ChangeHash, heads);
         return out;
     }
 
     /// Folds another log's events into this one
     /// ([`PatchLog::merge`](patch_log.rs):661-665`).
+    /// Copies the source through this log's allocator; actor incompatibility
+    /// or allocation failure leaves both logs' recorded data unchanged.
     pub fn merge(self: *PatchLog, other: *PatchLog) Error!void {
-        if (other.oom) {
-            self.oom = true;
-            return error.OutOfMemory;
-        }
-        try self.completed.appendFrom(&other.completed);
-        try self.local.appendFrom(&other.local);
-        for (other.events.items) |*e| {
-            try self.events.append(self.gpa, .{
-                .obj = e.obj,
-                .event = try copyEvent(self.gpa, e.event),
-            });
-        }
-        var it = other.expose.iterator();
-        while (it.next()) |entry| {
-            try self.expose.put(self.gpa, entry.key_ptr.*, {});
-        }
-    }
-
-    /// Records the patches one **local change** contributes to the current
-    /// view.
-    ///
-    /// **This is the port's answer to where a local change's patches come
-    /// from, and it is a port-only method.** Upstream's log is filled with
-    /// *events*, written by `TransactionInner` at the moment it inserts each
-    /// op ([`inner.rs:308-328`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)),
-    /// and `AutoCommit::commit_with` merges that transaction's branch log into
-    /// its own before the commit returns
-    /// ([`autocommit.rs:728-739`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)).
-    /// The port's transaction writes its rows with **no log in hand** and hands
-    /// [`Document.commit`](doc.zig) the finished ops, by which time they are
-    /// already rows; there is no insert-time moment left to record against.
-    /// So [`Document.commit`](doc.zig) builds the change's patches with the
-    /// same walk [`Document.diff`](doc.zig) uses and parks them here.
-    ///
-    /// **Not the same output upstream's local path gives, and that is
-    /// measured.** Upstream's transaction records **one event per op**, and
-    /// [`patchesmod.PatchBuilder`] does not coalesce an insert with a later put
-    /// on the same index — [`PatchBuilder.insert`] extends the tail patch's
-    /// values only when the index falls inside that tail's range
-    /// ([`patch_builder.rs`:171-197](../../github-automerge-automerge/rust/automerge/src/patches/patch_builder.rs)),
-    /// and [`PatchBuilder.put`] pushes its own patch
-    /// ([`:296-319`](../../github-automerge-automerge/rust/automerge/src/patches/patch_builder.rs)) — so
-    /// upstream's *local* path emits a patch per op where its *batch* path emits
-    /// one per row. The oracle's `diff` subcommand measures both for the same
-    /// change, thirty-one elements each inserted and then put, and the two
-    /// answers are not the same stream:
-    ///
-    /// | scenario | what was recorded | the reference's answer |
-    /// |---|---|---|
-    /// | `insertopid-applylog` | both changes through `apply_changes_log_patches` | 2 patches: the `PutMap` that made the list, then one `Insert` of 31 values at `Id(3)`, `Id(5)`, … `Id(63)` |
-    /// | `insertopid-cursor` | the same edits as a local commit, read back through the document's own log | 62 patches: for each `i`, an `Insert { index: i, values: [(Null, Id(2i+2))] }` and a `PutSeq { index: i, value: (Int(i), Id(2i+3)) }` |
-    ///
-    /// **The port takes the batch shape**, because that is the only shape it
-    /// can build. So the values and the op ids agree with upstream either way
-    /// and the patch *count* does not, and a consumer can tell the two apart by
-    /// the count. The upstream case `regression_insert_opid`
-    /// ([`tests/test.rs:2363-2435`](../../github-automerge-automerge/rust/automerge/tests/test.rs))
-    /// pins the batch shape, because it drives `apply_changes_log_patches` —
-    /// and the port reproduces it exactly for that shape.
-    ///
-    /// **Into [`PatchLog.local`] and not into [`PatchLog.completed`],** because
-    /// a change committed under an isolation belongs to the *current* view and
-    /// has to be closed by the next [`PatchLog.finishCurrentView`], after the
-    /// walk events that transition recorded. Measured: the oracle's
-    /// `text-isolate-incremental` emits `DeleteMap color`, `DeleteMap name`,
-    /// `PutMap color`, `SpliceText unset`, `Conflict color`, `PutMap name`,
-    /// `SpliceText 100*"a"` — the second isolated change's two patches sit at
-    /// indices 2 and 3, **after** the two the `isolate` walk recorded and
-    /// **before** the three the `integrate` walk records.
-    ///
-    /// **Appending, not replacing**, because the log holds every change since
-    /// the cursor was last moved and `truncate` is what empties it.
-    ///
-    /// **Two halves, and the split is the point.** The deep copy is the only
-    /// part that can be refused, and a commit that has already put the change
-    /// into the graph has nothing left to report it on, so this is the half a
-    /// caller runs first and [`PatchLog.commitLocal`] is the half it runs
-    /// afterwards. **Nothing observable changes here**: a refusal leaves the
-    /// log exactly as it was.
-    pub fn prepareLocal(self: *PatchLog, patches: *const Patches) MakeError!StagedLocal {
-        if (self.oom) return error.OutOfMemory;
-        const gpa = self.local.allocator();
-        var staged: StagedLocal = .{ .gpa = gpa };
-        errdefer staged.deinit();
-        // **The room is reserved here, while the caller can still give up.**
-        // `commitLocal` appends with `appendSliceAssumeCapacity`, so it has to
-        // be able to; a reservation that fails belongs to this error set, not
-        // to the infallible one. What a refusal leaves behind is arena
-        // capacity, which changes nothing a caller can observe.
-        try self.local.items.ensureUnusedCapacity(gpa, patches.len());
-        try staged.items.ensureTotalCapacity(gpa, patches.len());
-        for (patches.slice()) |p| {
-            staged.items.appendAssumeCapacity(try copyPatch(gpa, p));
-        }
-        return staged;
-    }
-
-    /// Attaches a staged batch to [`PatchLog.local`], at the end.
-    ///
-    /// **Infallible, and this is why it exists.** Every byte the batch names is
-    /// already in the log's own arena and the room for it was reserved by
-    /// [`PatchLog.prepareLocal`], so the append cannot be refused. The staged
-    /// value is consumed: its array is arena memory like everything else here
-    /// and must not be freed, which is also why it must not be handed back to
-    /// [`StagedLocal.deinit`] afterwards.
-    pub fn commitLocal(self: *PatchLog, staged: StagedLocal) void {
-        self.local.items.appendSliceAssumeCapacity(staged.items.items);
+        const migration = try self.actorMigration(other.actors.items);
+        var stage = try other.cloneAndRebind(self.gpa, self.identity orelse
+            other.identity orelse 0);
+        stage.identity = self.identity orelse other.identity;
+        // This copy was allocated through the destination owner, unlike a
+        // detached public clone; it can safely transfer its payloads here.
+        stage.batch_origin = self;
+        defer stage.deinit();
+        // The offered table is the prefix of Rust's insertion result. Its IDs
+        // already use their final slots; retain only the destination's tail.
+        try stage.actors.ensureUnusedCapacity(self.gpa, self.actors.items.len - migration.consumed);
+        for (self.actors.items[migration.consumed..]) |actor|
+            stage.actors.appendAssumeCapacity(try stage.dupeActor(actor));
+        try stage.preparePublish(self);
+        stage.publish(self);
     }
 
     /// Seeds the path cache and records the event count it is good for
     /// ([`PatchLog::path_hint`](patch_log.rs):667-670`).
     ///
-    /// **Infallible, and the log takes ownership of `hint`.** The previous
-    /// cache is released and `hint` becomes this log's; nothing here allocates.
-    ///
-    /// **The map must have been built with this log's own allocator.** Its
-    /// array is freed with `self.gpa` — at [`PatchLog.truncate`], at
-    /// [`PatchLog.finishCurrentView`], at [`PatchLog.deinit`], or by the
-    /// [`PatchBuilder`] the diff walk hands it to, which takes the map **and
-    /// this allocator** over and grows it with neither the arena nor anything
-    /// else. A map from any other allocator is a mismatched free.
-    ///
-    /// **The keys stay the caller's.** A [`PathMap`] owns no keys, and this
-    /// log copies each one into the patch arena when it builds a path; see
-    /// [`PathMap`].
+    /// Consumes the map's array, copying all borrowed keys and object IDs into
+    /// log-owned storage. The array must use this log's allocator. Allocation
+    /// failure sets oom and retains the previous cache.
     pub fn pathHint(self: *PatchLog, hint: PathMap) void {
+        var source = hint;
+        defer source.deinit(self.gpa);
+        const owned = copyPathMap(self.gpa, self.path_storage.allocator(), &source) catch {
+            self.oom = true;
+            return;
+        };
         self.path_map.deinit(self.gpa);
-        self.path_map = hint;
+        self.path_map = owned;
         self.path_hint = self.events.items.len;
     }
 
@@ -3099,7 +3438,12 @@ pub const PatchLog = struct {
         doc: *const D,
     ) MakeError!void {
         assertDoc(D);
-        const clock: ?Clock = if (self.heads) |h| doc.clockAt(h) else null;
+        // Logical read-cache mutation follows Document's canonical scoped
+        // readers. The borrowed clock header never owns its buffers here.
+        const clock: ?Clock = if (self.heads) |h|
+            (try @constCast(doc).clockAtScope(self.gpa, h)).*
+        else
+            null;
         // **The seed is released here, on every path out, until the builder
         // takes it.** `expose.insert` below can be refused and `getPathMap`
         // moved the array out of the log, so in that window nothing else owns
@@ -3109,6 +3453,42 @@ pub const PatchLog = struct {
         // the builder exists empties this, so from there the builder owns it.
         var path_map = self.getPathMap();
         defer path_map.deinit(self.gpa);
+        // Rust's hint and lookup both use internal ObjId (patch_log.rs:513,
+        // patch_builder.rs:145-147). Our walk seeds .id while rendered events
+        // use exported ExIds in the event loop below. Export through this SAME
+        // rendering owner, not the snapshot owner: current-state logging does
+        // not migrate actors (automerge.rs:1048,1077-1079). Keep public named
+        // entries unchanged and own new actor bytes in the output arena.
+        for (path_map.items.items) |*entry| {
+            if (entry.obj == .id)
+                entry.obj = try ownExId(out.allocator(), try exportObj(D, doc, entry.obj));
+            if (entry.parent == .id)
+                entry.parent = try ownExId(out.allocator(), try exportObj(D, doc, entry.parent));
+        }
+        // Mixed internal/public seeds can change ordering after export. Avoid
+        // sorting an already ordered map; stable sorting retains the public
+        // named entry when two representations resolve to the same identity.
+        var index: usize = 1;
+        while (index < path_map.items.items.len) : (index += 1) {
+            if (path_map.items.items[index - 1].obj.order(path_map.items.items[index].obj) == .lt)
+                continue;
+            std.sort.block(PathMapEntry, path_map.items.items, {}, struct {
+                fn less(_: void, a: PathMapEntry, b: PathMapEntry) bool {
+                    return a.obj.order(b.obj) == .lt;
+                }
+            }.less);
+            var count: usize = 0;
+            for (path_map.items.items) |entry| {
+                if (count != 0 and path_map.items.items[count - 1].obj.eql(entry.obj)) {
+                    path_map.items.items[count - 1] = entry;
+                } else {
+                    path_map.items.items[count] = entry;
+                    count += 1;
+                }
+            }
+            path_map.items.shrinkRetainingCapacity(count);
+            break;
+        }
         var expose: ExposeQueue = .init(self.gpa);
         defer expose.deinit();
         // **The queue is built from the log's `expose` set**, which is where
@@ -3117,7 +3497,8 @@ pub const PatchLog = struct {
         // it in one expression (`patch_log.rs`:517`) and the collection is
         // ordered, which is what the pump below compares against.
         var pending = self.expose.iterator();
-        while (pending.next()) |entry| try expose.insert(doc.idToExid(entry.key_ptr.*));
+        while (pending.next()) |entry|
+            try expose.insert(try exportPatchId(D, doc, entry.key_ptr.*));
         // **The builder takes the seed over, allocator and all**, so it is the
         // one that frees it from here on. This local is emptied below the call
         // so the `defer` above cannot free the same array a second time.
@@ -3127,15 +3508,22 @@ pub const PatchLog = struct {
         // **A stable sort, and the output order rests on it**: the events of
         // one object keep the order they were logged in (`patch_log.rs`:515-516`,
         // and `Vec::sort_by` is a stable sort).
-        std.sort.block(EventEntry, self.events.items, {}, eventLess);
-        for (self.events.items) |*e| {
-            const key = exportObj(D, doc, e.obj);
+        const scratch = if (self.checkpoint != null)
+            try self.gpa.dupe(EventEntry, self.events.items)
+        else
+            null;
+        defer if (scratch) |entries| self.gpa.free(entries);
+        const entries = scratch orelse self.events.items;
+        std.sort.block(EventEntry, entries, {}, eventLess);
+        for (entries) |*e| {
+            const key = try exportObj(D, doc, e.obj);
             try expose.pumpQueue(D, key, &builder, doc, clock);
             if (expose.shouldSkip(key)) continue;
             try builder.logEvent(doc, key, &e.event);
         }
         try expose.flushQueue(D, &builder, doc, clock);
-        try out.items.appendSlice(out.allocator(), builder.patches.items);
+        try out.items.ensureUnusedCapacity(out.allocator(), builder.patches.items.len);
+        out.items.appendSliceAssumeCapacity(builder.takePatches());
     }
 
     // ── Internals ───────────────────────────────────────────────────────────
@@ -3143,21 +3531,31 @@ pub const PatchLog = struct {
     /// Re-indexes every id in the log for an actor inserted at `index`
     /// ([`PatchLog::migrate_actor`](patch_log.rs):554-565`).
     fn migrateActor(self: *PatchLog, index: ActorIdx) void {
-        for (self.events.items) |*e| {
-            e.obj = e.obj.withNewActor(index);
-            e.event = e.event.withNewActor(index);
+        for (self.events.items) |*entry| {
+            entry.obj = entry.obj.withNewActor(index);
+            entry.event = entry.event.withNewActor(index);
         }
-        var it = self.expose.iterator();
-        var moved: std.AutoHashMapUnmanaged(OpId, void) = .empty;
-        defer moved.deinit(self.gpa);
-        while (it.next()) |entry| {
-            moved.put(self.gpa, entry.key_ptr.*.withNewActor(index), {}) catch {
-                self.oom = true;
-                return;
-            };
+        var iterator = self.expose.iterator();
+        while (iterator.next()) |entry| {
+            entry.key_ptr.* = entry.key_ptr.*.withNewActor(index);
         }
-        self.expose.deinit(self.gpa);
-        self.expose = moved;
+        if (self.expose.count() != 0) self.expose.rehash(std.hash_map.AutoContext(OpId){});
+        for (self.path_map.items.items) |*entry| {
+            entry.obj = entry.obj.withNewActor(index);
+            entry.parent = entry.parent.withNewActor(index);
+        }
+        if (self.checkpoint) |checkpoint| {
+            var pending = checkpoint.expose.iterator();
+            while (pending.next()) |entry| {
+                entry.key_ptr.* = entry.key_ptr.*.withNewActor(index);
+            }
+            if (checkpoint.expose.count() != 0)
+                checkpoint.expose.rehash(std.hash_map.AutoContext(OpId){});
+            for (checkpoint.path_map.items.items) |*entry| {
+                entry.obj = entry.obj.withNewActor(index);
+                entry.parent = entry.parent.withNewActor(index);
+            }
+        }
     }
 
     /// Drops an actor from the log, and every event that named it
@@ -3166,37 +3564,36 @@ pub const PatchLog = struct {
         const gone = self.actors.orderedRemove(index);
         self.gpa.free(gone.bytes);
         const at: ActorIdx = @intCast(index);
-        var kept: std.ArrayList(EventEntry) = .empty;
-        for (self.events.items) |*e| {
-            const obj = e.obj.withoutActor(at) orelse {
-                e.event.deinit(self.gpa);
-                continue;
-            };
-            const ev = e.event.withoutActor(at) orelse {
-                e.event.deinit(self.gpa);
-                continue;
-            };
-            kept.append(self.gpa, .{ .obj = obj, .event = ev }) catch {
-                self.oom = true;
-                var dropped = ev;
-                dropped.deinit(self.gpa);
-            };
-        }
-        self.events.deinit(self.gpa);
-        self.events = kept;
-        var it = self.expose.iterator();
-        var kept_ids: std.AutoHashMapUnmanaged(OpId, void) = .empty;
-        defer kept_ids.deinit(self.gpa);
-        while (it.next()) |entry| {
-            if (entry.key_ptr.*.withoutActor(at)) |id| {
-                kept_ids.put(self.gpa, id, {}) catch {
-                    self.oom = true;
-                    return;
-                };
+        var count: usize = 0;
+        for (self.events.items) |*entry| {
+            const obj = entry.obj.withoutActor(at);
+            const event = entry.event.withoutActor(at);
+            if (obj != null and event != null) {
+                self.events.items[count] = .{ .obj = obj.?, .event = event.? };
+                count += 1;
+            } else {
+                entry.obj.deinitOwned(self.gpa);
+                entry.event.deinit(self.gpa);
             }
         }
-        self.expose.deinit(self.gpa);
-        self.expose = kept_ids;
+        self.events.shrinkRetainingCapacity(count);
+        var iterator = self.expose.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.key_ptr.*.withoutActor(at)) |id| {
+                entry.key_ptr.* = id;
+            } else {
+                self.expose.removeByPtr(entry.key_ptr);
+            }
+        }
+        if (self.expose.count() != 0) self.expose.rehash(std.hash_map.AutoContext(OpId){});
+        count = 0;
+        for (self.path_map.items.items) |entry| {
+            const obj = entry.obj.withoutActor(at) orelse continue;
+            const parent = entry.parent.withoutActor(at) orelse continue;
+            self.path_map.items.items[count] = .{ .obj = obj, .parent = parent, .prop = entry.prop };
+            count += 1;
+        }
+        self.path_map.items.shrinkRetainingCapacity(count);
     }
 
     /// The path cache, dropped if it was taken at a different event count
@@ -3246,10 +3643,18 @@ pub const PatchLog = struct {
             e.deinit(self.gpa);
             return;
         }
-        self.events.append(self.gpa, .{ .obj = obj, .event = ev }) catch {
+        const owned_obj = obj.dup(self.gpa) catch {
             self.oom = true;
-            var e = ev;
-            e.deinit(self.gpa);
+            var event = ev;
+            event.deinit(self.gpa);
+            return;
+        };
+        self.events.append(self.gpa, .{ .obj = owned_obj, .event = ev }) catch {
+            self.oom = true;
+            var id = owned_obj;
+            id.deinitOwned(self.gpa);
+            var event = ev;
+            event.deinit(self.gpa);
         };
     }
 
@@ -3264,38 +3669,44 @@ pub const PatchLog = struct {
     }
 
     fn setActors(self: *PatchLog, others: []const ActorId) Error!void {
-        for (self.actors.items) |a| self.gpa.free(a.bytes);
-        self.actors.clearRetainingCapacity();
-        try self.actors.ensureTotalCapacity(self.gpa, others.len);
-        for (others) |a| try self.actors.append(self.gpa, try self.dupeActor(a));
+        std.debug.assert(self.actors.items.len == 0);
+        try self.migrateActors(others);
     }
 };
 
 /// A deep copy of `ev` into `gpa` ([`PatchLog::merge`](patch_log.rs):661-665`).
 fn copyEvent(gpa: Allocator, ev: Event) Error!Event {
     return switch (ev) {
-        .put_map => |e| .{ .put_map = .{
-            .key = try gpa.dupe(u8, e.key),
-            .value = try ownValue(gpa, e.value),
-            .id = e.id,
-            .conflict = e.conflict,
-        } },
+        .put_map => |e| blk: {
+            const key = try gpa.dupe(u8, e.key);
+            errdefer gpa.free(key);
+            break :blk .{ .put_map = .{
+                .key = key,
+                .value = try copyValue(gpa, e.value),
+                .id = e.id,
+                .conflict = e.conflict,
+            } };
+        },
         .put_seq => |e| .{ .put_seq = .{
             .index = e.index,
-            .value = try ownValue(gpa, e.value),
+            .value = try copyValue(gpa, e.value),
             .id = e.id,
             .conflict = e.conflict,
         } },
         .delete_seq => |e| .{ .delete_seq = .{ .index = e.index, .num = e.num } },
         .delete_map => |e| .{ .delete_map = .{ .key = try gpa.dupe(u8, e.key) } },
-        .splice => |e| .{ .splice = .{
-            .index = e.index,
-            .text = try gpa.dupe(u8, e.text),
-            .marks = if (e.marks) |m| try copyMarkSet(gpa, m) else null,
-        } },
+        .splice => |e| blk: {
+            const text = try gpa.dupe(u8, e.text);
+            errdefer gpa.free(text);
+            break :blk .{ .splice = .{
+                .index = e.index,
+                .text = text,
+                .marks = if (e.marks) |*marks| try copyMarkSet(gpa, marks) else null,
+            } };
+        },
         .insert => |e| .{ .insert = .{
             .index = e.index,
-            .value = try ownValue(gpa, e.value),
+            .value = try copyValue(gpa, e.value),
             .id = e.id,
             .conflict = e.conflict,
         } },
@@ -3310,12 +3721,16 @@ fn copyEvent(gpa: Allocator, ev: Event) Error!Event {
         .mark => |e| blk: {
             var runs: MarkRuns = .init(gpa);
             errdefer runs.deinit();
+            try runs.runs.ensureTotalCapacity(gpa, e.marks.runs.items.len);
             for (e.marks.runs.items) |run| {
-                try runs.runs.append(gpa, .{
-                    .name = try gpa.dupe(u8, run.name),
+                const name = try gpa.dupe(u8, run.name);
+                errdefer gpa.free(name);
+                const value = try ownScalar(gpa, run.value);
+                runs.runs.appendAssumeCapacity(.{
+                    .name = name,
                     .index = run.index,
                     .len = run.len,
-                    .value = try ownScalar(gpa, run.value),
+                    .value = value,
                 });
             }
             break :blk .{ .mark = .{ .marks = runs } };
@@ -3325,14 +3740,6 @@ fn copyEvent(gpa: Allocator, ev: Event) Error!Event {
 
 fn eventLess(_: void, a: PatchLog.EventEntry, b: PatchLog.EventEntry) bool {
     return a.obj.order(b.obj) == .lt;
-}
-
-fn actorsEql(a: []const ActorId, b: []const ActorId) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (!ActorId.eql(x, y)) return false;
-    }
-    return true;
 }
 
 /// An internal object id from an [`ExId`] ([`ExId::to_internal_obj`],
@@ -3352,34 +3759,41 @@ fn internalObj(id: OpId) ExId {
     return .{ .id = id };
 }
 
+// Actor-table authority belongs to the reader, not the retained log. Real
+// document adapters reject absent resident slots rather than exporting an
+// unresolved ID where Rust doc.id_to_exid would index out of bounds.
+fn exportPatchId(comptime D: type, doc: *const D, id: OpId) MakeError!ExId {
+    return try doc.exportPatchId(id);
+}
+
 /// The exported id of an internal object id ([`doc.id_to_exid`](automerge.rs):794-796`).
-fn exportObj(comptime D: type, doc: *const D, obj: ExId) ExId {
+fn exportObj(comptime D: type, doc: *const D, obj: ExId) MakeError!ExId {
     return switch (obj) {
         .root, .named => obj,
-        .id => |i| doc.idToExid(i),
+        .id => |i| try exportPatchId(D, doc, i),
     };
 }
 
-/// Hashes an [`ExId`] by the operation it names, and compares two by the same.
-///
-/// **`std.hash.autoHash` cannot key this map**, because the port's [`ExId`]
-/// has a variant that carries an [`ActorId`]'s borrowed bytes
-/// ([`ExId.Named`](types.zig)), and `autoHash` refuses a key it cannot hash
-/// unambiguously (`std/hash/auto_hash.zig:187`). Upstream's key is a plain
-/// `ExId` over `Copy` ids, so upstream needs no context and this one is the
-/// price of the port's.
-///
-/// **The operation is the whole identity**: "a `.named` and an `.id` naming
-/// the same operation are the same value to [`ExId.eql`], [`ExId.order`] and
-/// every hash map keyed by an `ExId`" ([`types.zig:267-272`](types.zig)), so a
-/// key that hashes only the operation agrees with `ExId.eql` by construction.
-/// **`.root` has no operation and hashes as zero**, and zero is not a
-/// reachable `(counter, actor)` pair — an operation's counter is one-based
-/// ([`ElemId`](types.zig)) — so the root can never share a bucket with an id.
+/// Public identity hashing matches `ExId.eql`: root, unresolved table-local
+/// ids, and named ids occupy distinct domains. Named identity depends on the
+/// counter and actor bytes, never the cached actor-table index.
 const ExIdContext = struct {
     pub fn hash(_: @This(), key: ExId) u64 {
-        const op = key.opId() orelse return 0;
-        return (@as(u64, op.counter) << 32) | @as(u64, op.actor);
+        var hasher = std.hash.Wyhash.init(0);
+        switch (key) {
+            .root => hasher.update(&.{0}),
+            .id => |id| {
+                hasher.update(&.{1});
+                hasher.update(std.mem.asBytes(&id.counter));
+                hasher.update(std.mem.asBytes(&id.actor));
+            },
+            .named => |named| {
+                hasher.update(&.{2});
+                hasher.update(std.mem.asBytes(&named.op.counter));
+                hasher.update(named.actor.bytes);
+            },
+        }
+        return hasher.final();
     }
 
     pub fn eql(_: @This(), a: ExId, b: ExId) bool {
@@ -3449,6 +3863,7 @@ fn Slice(comptime T: type) type {
 const TestDoc = struct {
     objs: []const Obj = &.{},
     gpa: Allocator = testing.allocator,
+    scope_clock: Clock = .initEmpty(testing.allocator),
 
     pub const Obj = struct {
         id: ExId,
@@ -3475,13 +3890,13 @@ const TestDoc = struct {
         return .unicode_code_point;
     }
 
-    pub fn idToExid(self: *const TestDoc, id: OpId) ExId {
+    pub fn exportPatchId(self: *const TestDoc, id: OpId) Error!ExId {
         _ = self;
         return if (id.eql(OpId.root)) .root else .{ .id = id };
     }
 
-    pub fn objectType(self: *const TestDoc, id: ExId) ?ObjType {
-        const o = self.find(id) orelse return null;
+    pub fn objectType(self: *const TestDoc, id: ExId) Error!ObjType {
+        const o = self.find(id) orelse return error.NotAnObject;
         return o.typ;
     }
 
@@ -3490,16 +3905,12 @@ const TestDoc = struct {
         return o.parent;
     }
 
-    /// An empty clock. Only a log with `heads` set asks for one, and no test
-    /// here sets it; the value is a total function of the input, which is all
-    /// `PatchBuilder` needs of it.
-    pub fn clockAt(self: *const TestDoc, heads: []const ChangeHash) Clock {
-        // The parameter is a **list** of heads because the port's
-        // `ChangeGraph.clockAt` takes one (`change_graph.zig`:464), and
-        // upstream reaches `clock_at` through the same `&Vec<ChangeHash>`
-        // (`patch_log.rs`:512`).
+    /// This fixture has no committed history: every explicit scope is empty.
+    /// Borrow stored clock state so its lifetime matches the fixture owner.
+    pub fn clockAtScope(self: *const TestDoc, gpa: Allocator, heads: []const ChangeHash) Error!*const Clock {
+        _ = gpa;
         _ = heads;
-        return Clock.initEmpty(self.gpa);
+        return &self.scope_clock;
     }
 
     pub fn actorList(self: *const TestDoc) []const ActorId {
@@ -3542,9 +3953,24 @@ const Probe = struct {
         return .{ .log = .active(gpa), .gpa = gpa };
     }
 
-    fn deinit(self: *Probe) void {
+    pub fn deinit(self: *Probe) void {
         self.order.deinit(self.gpa);
         self.log.deinit();
+    }
+
+    pub fn beginBatch(self: *Probe) Error!Probe {
+        return .{ .log = try self.log.beginBatch(), .gpa = self.gpa };
+    }
+
+    pub fn preparePublish(self: *Probe, target: *Probe) Error!void {
+        try self.log.preparePublish(&target.log);
+        try target.order.ensureUnusedCapacity(target.gpa, self.order.items.len);
+    }
+
+    pub fn publish(self: *Probe, target: *Probe) void {
+        self.log.publish(&target.log);
+        target.order.appendSliceAssumeCapacity(self.order.items);
+        self.order.items.len = 0;
     }
 
     fn reset(self: *Probe) void {
@@ -4441,6 +4867,7 @@ test "n mark events on one object coalesce into one patch holding every run, in 
     // **And the batch carries both, in order**, which is what the arena's copy
     // out of the builder is for.
     try out.items.appendSlice(out.allocator(), builder.patches.items);
+    _ = builder.takePatches();
     try testing.expectEqual(@as(usize, 2), out.len());
     try testing.expectEqual(@as(usize, 2 * n), out.slice()[0].action.mark.marks.len);
 }
@@ -4500,116 +4927,113 @@ test "PatchBuilder coalesced text deletion preserves supplementary scalar suffix
         const action = builder.patches.items[0].action;
         try testing.expect(action == .splice_text);
         try testing.expectEqual(@as(usize, 7), action.splice_text.index);
-        try testing.expectEqualStrings("prefixsuffix", action.splice_text.value.asStr());
+        const rendered = try action.splice_text.value.makeString(testing.allocator);
+        defer testing.allocator.free(rendered);
+        try testing.expectEqualStrings("prefixsuffix", rendered);
     }
 }
 
-test "ConcreteTextValue single UTF16 unit deletion refuses a split surrogate atomically" {
-    // UTF-8 storage cannot represent one remaining half of a surrogate pair.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var value = try ConcreteTextValue.init(arena.allocator(), "prefix😀suffix", .utf16_code_unit);
-    const original = value.bytes;
-    try testing.expectError(error.InvalidCharacter, value.remove(6));
-    try testing.expect(value.bytes.ptr == original.ptr);
-    try testing.expectEqualStrings("prefix😀suffix", value.asStr());
-    try testing.expectError(error.InvalidCharacter, value.remove(7));
-    try testing.expect(value.bytes.ptr == original.ptr);
-    try testing.expectEqualStrings("prefix😀suffix", value.asStr());
+test "ConcreteTextValue single UTF16 unit deletion retains a split surrogate" {
+    for ([_]usize{ 6, 7 }) |index| {
+        var value = try ConcreteTextValue.init(testing.allocator, "prefix😀suffix", .utf16_code_unit);
+        defer value.deinit();
+        try value.remove(index);
+        try testing.expectEqual(@as(usize, 13), value.len());
+        const rendered = try value.makeString(testing.allocator);
+        defer testing.allocator.free(rendered);
+        try testing.expectEqualStrings("prefix�suffix", rendered);
+    }
 }
 
 test "ConcreteTextValue removeRange deletes complete scalar and grapheme spans in every encoding" {
-    // The encoded span includes both a supplementary scalar and a combining cluster.
     for ([_]TextEncoding{
         .utf8_code_unit, .utf16_code_unit, .unicode_code_point, .grapheme_cluster,
     }) |enc| {
         var value = try ConcreteTextValue.init(testing.allocator, "a😀e\u{301}z", enc);
         defer value.deinit();
-        const old = value.bytes;
         try value.removeRange(1, enc.width("😀e\u{301}"));
-        testing.allocator.free(old);
-        try testing.expectEqualStrings("az", value.asStr());
+        const rendered = try value.makeString(testing.allocator);
+        defer testing.allocator.free(rendered);
+        try testing.expectEqualStrings("az", rendered);
     }
 }
 
-test "ConcreteTextValue removeRange refuses split encoded boundaries without mutation" {
-    // Refuse a split at either endpoint before publishing a replacement.
+test "ConcreteTextValue removeRange retains split encoded boundaries" {
     for ([_]TextEncoding{ .utf8_code_unit, .utf16_code_unit }) |enc| {
-        var value = try ConcreteTextValue.init(testing.allocator, "prefix😀suffix", enc);
+        var value = try ConcreteTextValue.init(
+            testing.allocator,
+            if (enc == .utf8_code_unit) "prefixésuffix" else "prefix😀suffix",
+            enc,
+        );
         defer value.deinit();
-        const original = value.bytes;
-        try testing.expectError(error.InvalidCharacter, value.removeRange(6, 1));
-        try testing.expect(value.bytes.ptr == original.ptr);
-        try testing.expectEqualStrings("prefix😀suffix", value.asStr());
-        try testing.expectError(error.InvalidCharacter, value.removeRange(7, enc.width("😀")));
-        try testing.expect(value.bytes.ptr == original.ptr);
-        try testing.expectEqualStrings("prefix😀suffix", value.asStr());
+        try value.removeRange(6, 1);
+        const rendered = try value.makeString(testing.allocator);
+        defer testing.allocator.free(rendered);
+        try testing.expectEqualStrings("prefix�suffix", rendered);
+        try value.removeRange(6, 2);
+        const remainder = try value.makeString(testing.allocator);
+        defer testing.allocator.free(remainder);
+        try testing.expectEqualStrings("prefixuffix", remainder);
     }
 }
 
-test "ConcreteTextValue removeRange allocation failure retains original bytes" {
-    // Fail exactly the replacement allocation, then prove one allocation suffices.
+test "ConcreteTextValue removeRange does not allocate" {
     for ([_]TextEncoding{
         .utf8_code_unit, .utf16_code_unit, .unicode_code_point, .grapheme_cluster,
     }) |enc| {
         var failing: testing.FailingAllocator = .init(testing.allocator, .{});
-        const gpa = failing.allocator();
-        var value = try ConcreteTextValue.init(gpa, "prefix😀suffix", enc);
+        var value = try ConcreteTextValue.init(failing.allocator(), "prefix😀suffix", enc);
         defer value.deinit();
-        const original = value.bytes;
-        failing.fail_index = failing.alloc_index;
-        try testing.expectError(
-            error.OutOfMemory,
-            value.removeRange(6, enc.width("😀")),
-        );
-        try testing.expect(value.bytes.ptr == original.ptr);
-        try testing.expectEqualStrings("prefix😀suffix", value.asStr());
-        failing.fail_index = std.math.maxInt(usize);
         const allocation_index = failing.alloc_index;
+        failing.fail_index = allocation_index;
         try value.removeRange(6, enc.width("😀"));
-        gpa.free(original);
-        try testing.expectEqual(allocation_index + 1, failing.alloc_index);
-        try testing.expectEqualStrings("prefixsuffix", value.asStr());
+        try testing.expectEqual(allocation_index, failing.alloc_index);
+        const rendered = try value.makeString(testing.allocator);
+        defer testing.allocator.free(rendered);
+        try testing.expectEqualStrings("prefixsuffix", rendered);
     }
 }
 
 test "ConcreteTextValue removeRange no-ops retain ownership and overshooting ends clamp" {
-    // A no-op must not allocate or hand the owning caller a buffer to free.
     for ([_]TextEncoding{
         .utf8_code_unit, .utf16_code_unit, .unicode_code_point, .grapheme_cluster,
     }) |enc| {
         var failing: testing.FailingAllocator = .init(testing.allocator, .{});
-        const gpa = failing.allocator();
-        var value = try ConcreteTextValue.init(gpa, "prefix😀suffix", enc);
+        var value = try ConcreteTextValue.init(failing.allocator(), "prefix😀suffix", enc);
         defer value.deinit();
-        const original = value.bytes;
-        failing.fail_index = failing.alloc_index;
+        const allocation_index = failing.alloc_index;
+        failing.fail_index = allocation_index;
         try value.removeRange(7, 0);
         try value.removeRange(value.len(), 1);
         try value.removeRange(std.math.maxInt(usize), std.math.maxInt(usize));
         try value.remove(std.math.maxInt(usize));
-        try testing.expect(value.bytes.ptr == original.ptr);
-        try testing.expectEqualStrings("prefix😀suffix", value.asStr());
-        failing.fail_index = std.math.maxInt(usize);
+        const unchanged = try value.makeString(testing.allocator);
+        defer testing.allocator.free(unchanged);
+        try testing.expectEqualStrings("prefix😀suffix", unchanged);
         try value.removeRange(6, std.math.maxInt(usize));
-        gpa.free(original);
-        try testing.expectEqualStrings("prefix", value.asStr());
-        const last = value.bytes;
+        const prefix = try value.makeString(testing.allocator);
+        defer testing.allocator.free(prefix);
+        try testing.expectEqualStrings("prefix", prefix);
         try value.removeRange(0, std.math.maxInt(usize));
-        gpa.free(last);
-        try testing.expectEqualStrings("", value.asStr());
-        const empty = value.bytes;
-        failing.fail_index = failing.alloc_index;
+        const empty = try value.makeString(testing.allocator);
+        defer testing.allocator.free(empty);
+        try testing.expectEqualStrings("", empty);
         try value.removeRange(0, 1);
-        try testing.expect(value.bytes.ptr == empty.ptr);
+        try testing.expectEqual(@as(usize, 0), value.len());
+        try testing.expectEqual(allocation_index, failing.alloc_index);
     }
 }
 
-test "ConcreteTextValue boundary decoder refuses truncated scalars without overreading" {
-    // Traversal must bound the exact decode slice, including code-point indexing.
+test "ConcreteTextValue initialization refuses truncated UTF8 outside byte encoding" {
     for ([_]TextEncoding{ .unicode_code_point, .utf16_code_unit, .grapheme_cluster }) |enc| {
-        try testing.expectError(error.InvalidCharacter, byteOffset(enc, "\xF0\x9F", 1));
+        try testing.expectError(error.InvalidCharacter, ConcreteTextValue.init(testing.allocator, "\xF0\x9F", enc));
     }
+    var bytes = try ConcreteTextValue.init(testing.allocator, "\xF0\x9F", .utf8_code_unit);
+    defer bytes.deinit();
+    try testing.expectEqual(@as(usize, 2), bytes.len());
+    const rendered = try bytes.makeString(testing.allocator);
+    defer testing.allocator.free(rendered);
+    try testing.expectEqualStrings("�", rendered);
 }
 
 // ── 7. Determinism, and 8. nothing to say ───────────────────────────────────
@@ -5107,7 +5531,7 @@ test "a transaction that made no ops takes its speculative actor back out" {
     // This is the actor's first change, so the actor was just added to the
     // document and a transaction producing no ops takes it out again
     // (`patch_log.rs`:589-609`).
-    try log.beginTransaction(&two_actors, 1, 1);
+    try log.bindBegin(1, &two_actors, 1, 1);
     // An event that names it, which `remove_actor` must then drop: an
     // operation that named the removed actor cannot exist
     // (`patch_log.rs`:567-581`).
@@ -5127,7 +5551,7 @@ test "a transaction that made no ops takes its speculative actor back out" {
 
     // A transaction that **did** produce ops keeps its actor, and so keeps the
     // event (`patch_log.rs`:620-624`).
-    try log.beginTransaction(&two_actors, 2, 1);
+    try log.bindBegin(1, &two_actors, 2, 1);
     log.putMap(.root, "b", .{ .scalar = sval("w") }, opId(3, 1), false, false);
     log.finishTransaction(&two_actors);
     var kept = try log.makePatches(TestDoc, &doc);
@@ -5158,55 +5582,6 @@ test "the patches of a view already left behind come first, in the order they we
     try expectPatches(gpa, &patches, &.{
         "root path=[] PutMap { key: \"a\", value: Str(\"first\"), obj: 1@0, conflict: false }",
         "root path=[] PutMap { key: \"b\", value: Str(\"second\"), obj: 2@0, conflict: false }",
-    });
-}
-
-// The port's [`PatchLog.makePatches`] is **three** lists where upstream's is
-// two, and the third is the one a local change's patches ride in. This is the
-// order, pinned end to end: the patches of views already left behind, then the
-// current view's events, then the local changes recorded on top of them.
-//
-// **A local change recorded after the view's events is last**, which is the
-// order the upstream case `incorrect_patches_produced_when_isolating_and_
-// integrating` needs (`text.rs:868-921`): its isolated commit happens after the
-// `isolate` walk, so the commit's patches follow the walk's. Measured on the
-// oracle's `diff`/`insertopid-cursor` and `text-isolate-incremental`.
-test "makePatches reads completed, then the current view's events, then the local changes" {
-    const gpa = testing.allocator;
-    const doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
-    const heads = [_]ChangeHash{.{ .bytes = [_]u8{0x11} ** 32 }};
-
-    var log: PatchLog = .active(gpa);
-    defer log.deinit();
-
-    // A view already left behind, closed into `completed`.
-    log.putMap(.root, "a", .{ .scalar = sval("first") }, opId(1, 0), false, false);
-    try log.finishCurrentView(TestDoc, &doc, &heads);
-
-    // The current view's own event.
-    log.putMap(.root, "b", .{ .scalar = sval("second") }, opId(2, 0), false, false);
-
-    // And a local change on top of it, which is what `Document.commit` records.
-    var local: Patches = .init(gpa);
-    defer local.deinit();
-    try local.items.append(local.allocator(), .{
-        .obj = .root,
-        .path = &.{},
-        .action = .{ .put_map = .{
-            .key = "c",
-            .value = .{ .scalar = sval("third") },
-            .obj = ExId.fromParts(3, 0).?,
-            .conflict = false,
-        } },
-    });
-    log.commitLocal(try log.prepareLocal(&local));
-
-    var patches = try log.makePatches(TestDoc, &doc);
-    defer patches.deinit();
-    try expectPatches(gpa, &patches, &.{
-        "root path=[] PutMap { key: \"a\", value: Str(\"first\"), obj: 1@0, conflict: false }",
-        "root path=[] PutMap { key: \"b\", value: Str(\"second\"), obj: 2@0, conflict: false }",
-        "root path=[] PutMap { key: \"c\", value: Str(\"third\"), obj: 3@0, conflict: false }",
     });
 }
 
@@ -5352,41 +5727,174 @@ test "a seed taken at an older event count is dropped, and released" {
     try testing.checkAllAllocationFailures(testing.allocator, staleSeedThenFree, .{});
 }
 
-/// Records a local batch on a log that already holds one, and frees it. The
-/// staged half has to survive a refusal without publishing anything, and the
-/// infallible half has to attach what the fallible half copied.
-fn stageTwoLocalBatchesThenFree(gpa: Allocator) !void {
-    const doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
+test "snapshot hints render first against an old owner through a cloned borrowed log" {
+    // Rust keeps indexed snapshot paths, then exports through the rendering
+    // owner (automerge.rs:1048,1078-1079; patch_builder.rs:143-165). The source's
+    // actor differs deliberately: neither its actor bytes nor its children may
+    // be substituted for the selected owner's IDs and ancestry.
+    const Document = @import("doc.zig").Document;
+    const Transaction = @import("transact.zig").Transaction;
+    const gpa = testing.allocator;
+    var owner = try Document.init(gpa, testing.io);
+    defer owner.deinit();
+    owner.setActorId(.{ .bytes = "a" });
+    var initial = PatchLog.active(gpa);
+    defer initial.deinit();
+    var owner_tx = try Transaction.openWithPatchLog(gpa, &owner, &initial, null);
+    defer owner_tx.deinitClosed();
+    _ = try owner_tx.put(.root, .{ .key = "owned" }, .{ .bool_value = true });
+    var owned = try owner_tx.commitWith(.{ .time = 0 });
+    defer owned.deinit(gpa);
 
-    var first: Patches = .init(gpa);
-    defer first.deinit();
-    try first.items.append(first.allocator(), .{
-        .obj = .root,
-        .path = &.{},
-        .action = .{ .put_map = .{
-            .key = "a",
-            .value = .{ .scalar = sval("first") },
-            .obj = ExId.fromParts(1, 0).?,
-            .conflict = false,
-        } },
+    var source = try Document.init(gpa, testing.io);
+    defer source.deinit();
+    source.setActorId(.{ .bytes = "b" });
+    var tx = try Transaction.open(gpa, &source);
+    defer tx.deinitClosed();
+    const map = try tx.putObject(.root, .{ .key = "map" }, .map);
+    const list = try tx.putObject(map, .{ .key = "list" }, .list);
+    _ = try tx.insert(list, 0, .{ .int = 7 });
+    var committed = try tx.commitWith(.{ .time = 0 });
+    defer committed.deinit(gpa);
+    const bytes = try source.save(gpa);
+    defer gpa.free(bytes);
+
+    var foreign = try Document.init(gpa, testing.io);
+    defer foreign.deinit();
+    var offered = try owned.patch_log.cloneAndRebind(gpa, owner.patchIdentity());
+    defer offered.deinit();
+    _ = try foreign.loadIncrementalWithPatchLog(gpa, bytes, &offered);
+    var cloned = try offered.cloneAndRebind(gpa, owner.patchIdentity());
+    defer cloned.deinit();
+    offered.deinit();
+    offered = PatchLog.inactive(gpa);
+    try testing.expect(owner.objectParent(map) == null);
+    try testing.expect(owner.objectParent(list) == null);
+    var rendered = try owner.makePatches(&cloned);
+    defer rendered.deinit();
+    try expectPatches(gpa, &rendered, &.{
+        "root path=[] PutMap { key: \"owned\", value: Bool(true), obj: 1@0, conflict: false }",
+        "root path=[] PutMap { key: \"map\", value: Object(map), obj: 1@0, conflict: false }",
+        "1@0 path=[root.Map(\"map\")] PutMap { key: \"list\", value: Object(list), obj: 2@0, conflict: false }",
+        "2@0 path=[root.Map(\"map\"), 1@0.Map(\"list\")] Insert { index: 0, values: [{ value: Int(7), obj: 3@0, conflict: false }] }",
     });
-
-    var log: PatchLog = .active(gpa);
-    defer log.deinit();
-    log.commitLocal(try log.prepareLocal(&first));
-
-    // A second batch, staged and abandoned: **nothing observable changes**, and
-    // the first batch is still the only one the stream carries.
-    var abandoned = try log.prepareLocal(&first);
-    abandoned.deinit();
-
-    var patches = try log.makePatches(TestDoc, &doc);
-    defer patches.deinit();
-    try testing.expectEqual(@as(usize, 1), patches.len());
+    const patches = rendered.slice();
+    try testing.expect(owner.idToExid(OpId.init(1, 0)).eql(patches[1].action.put_map.obj));
+    try testing.expect(owner.idToExid(OpId.init(1, 0)).eql(patches[2].obj));
+    try testing.expect(owner.idToExid(OpId.init(2, 0)).eql(patches[2].action.put_map.obj));
+    try testing.expect(owner.idToExid(OpId.init(2, 0)).eql(patches[3].obj));
+    try testing.expect(owner.idToExid(OpId.init(1, 0)).eql(patches[3].path[1].obj));
+    const first_insert = patches[3].action.insert.values.get(0).?;
+    try testing.expect(owner.idToExid(OpId.init(3, 0)).eql(first_insert.obj));
 }
 
-test "a staged local batch that is abandoned publishes nothing" {
-    try testing.checkAllAllocationFailures(testing.allocator, stageTwoLocalBatchesThenFree, .{});
+fn clonedIndexedSeedThenFree(gpa: Allocator, owner: *const @import("doc.zig").Document) !void {
+    var log = PatchLog.active(gpa);
+    defer log.deinit();
+    log.putMap(
+        internalObj(OpId.init(2, 0)),
+        "k",
+        .{ .scalar = sval("v") },
+        OpId.init(3, 0),
+        false,
+        false,
+    );
+    var hint: PathMap = .{};
+    try hint.put(gpa, .{
+        .obj = internalObj(OpId.init(2, 0)),
+        .prop = .{ .key = "child" },
+        .parent = .root,
+    });
+    log.pathHint(hint);
+    var cloned = try log.cloneAndRebind(gpa, owner.patchIdentity());
+    defer cloned.deinit();
+    log.deinit();
+    log = PatchLog.inactive(gpa);
+    var rendered = try owner.makePatches(&cloned);
+    defer rendered.deinit();
+    try expectPatches(testing.allocator, &rendered, &.{
+        "2@0 path=[root.Map(\"child\")] PutMap { key: \"k\", value: Str(\"v\"), obj: 3@0, conflict: false }",
+    });
+    try testing.expect(owner.idToExid(OpId.init(2, 0)).eql(rendered.slice()[0].obj));
+}
+
+test "indexed seed export owns cloned paths under allocation refusals and rejects absent actors" {
+    // A real owner's actor table is valid, but it has no child to reconstruct
+    // the supplied path. Sweep copying and rendering, not fixture-only .id IDs.
+    const Document = @import("doc.zig").Document;
+    const Transaction = @import("transact.zig").Transaction;
+    const gpa = testing.allocator;
+    var owner = try Document.init(gpa, testing.io);
+    defer owner.deinit();
+    owner.setActorId(.{ .bytes = "a" });
+    var tx = try Transaction.open(gpa, &owner);
+    defer tx.deinitClosed();
+    _ = try tx.put(.root, .{ .key = "owned" }, .{ .bool_value = true });
+    var committed = try tx.commitWith(.{ .time = 0 });
+    defer committed.deinit(gpa);
+    try testing.checkAllAllocationFailures(gpa, clonedIndexedSeedThenFree, .{&owner});
+
+    // Canonicalization must restore ordering for mixed seeds and preserve the
+    // already-public entry when an indexed entry names that same object.
+    var mixed = PatchLog.active(gpa);
+    defer mixed.deinit();
+    mixed.putMap(
+        internalObj(OpId.init(3, 0)),
+        "k",
+        .{ .scalar = sval("v") },
+        OpId.init(4, 0),
+        false,
+        false,
+    );
+    var mixed_hint: PathMap = .{};
+    errdefer mixed_hint.deinit(gpa);
+    try mixed_hint.put(gpa, .{
+        .obj = internalObj(OpId.init(2, 0)),
+        .prop = .{ .key = "shadow" },
+        .parent = .root,
+    });
+    try mixed_hint.put(gpa, .{
+        .obj = internalObj(OpId.init(3, 0)),
+        .prop = .{ .key = "leaf" },
+        .parent = internalObj(OpId.init(2, 0)),
+    });
+    try mixed_hint.put(gpa, .{
+        .obj = owner.idToExid(OpId.init(1, 0)),
+        .prop = .{ .key = "earlier" },
+        .parent = .root,
+    });
+    try mixed_hint.put(gpa, .{
+        .obj = owner.idToExid(OpId.init(2, 0)),
+        .prop = .{ .key = "child" },
+        .parent = .root,
+    });
+    mixed.pathHint(mixed_hint);
+    mixed_hint = .{};
+    var mixed_rendered = try owner.makePatches(&mixed);
+    defer mixed_rendered.deinit();
+    try expectPatches(gpa, &mixed_rendered, &.{
+        "3@0 path=[root.Map(\"child\"), 2@0.Map(\"leaf\")] PutMap { key: \"k\", value: Str(\"v\"), obj: 4@0, conflict: false }",
+    });
+
+    var invalid = PatchLog.active(gpa);
+    defer invalid.deinit();
+    var hint: PathMap = .{};
+    try hint.put(gpa, .{
+        .obj = internalObj(OpId.init(2, 1)),
+        .prop = .{ .key = "absent" },
+        .parent = .root,
+    });
+    invalid.pathHint(hint);
+    try testing.expectError(error.InvalidActorIndex, owner.makePatches(&invalid));
+    hint = .{};
+    try hint.put(gpa, .{
+        .obj = internalObj(OpId.init(2, 0)),
+        .prop = .{ .key = "absent-parent" },
+        .parent = internalObj(OpId.init(3, 1)),
+    });
+    invalid.pathHint(hint);
+    try testing.expectError(error.InvalidActorIndex, owner.makePatches(&invalid));
+    try testing.expectEqual(@as(usize, 1), owner.ops.actors.items.len);
 }
 
 // ── test_mark_patches.rs ──────────────────────────────────────────────────────
@@ -5399,29 +5907,28 @@ test "a staged local batch that is abandoned publishes nothing" {
 //
 // The port's [`TestDoc`] cannot answer it — it has no marks and no text — so
 // this drives a real document and reads the stream through
-// [`Document.diffIncremental`](doc.zig).
+// [`AutoCommit.diffIncremental`](autocommit.zig).
 
-const docmod = @import("doc.zig");
-const transmod = @import("transact.zig");
+const automod = @import("autocommit.zig");
 
 test "mark_patches: a mark over the last character of a text object arrives as one mark patch" {
     const gpa = testing.allocator;
 
-    var doc1 = try docmod.Document.init(gpa, std.testing.io, .auto);
+    var doc1 = try automod.AutoCommit.init(gpa, std.testing.io);
     defer doc1.deinit();
-    doc1.setActorId(.{ .bytes = "0123456789abcdef" });
-    const text = try transmod.putObject(&doc1, .root, .{ .key = "text" }, .text);
-    try transmod.spliceText(&doc1, text, 0, 0, "sample");
+    try doc1.setActorId(.{ .bytes = "0123456789abcdef" });
+    const text = try doc1.putObject(.root, .{ .key = "text" }, .text);
+    try doc1.spliceText(text, 0, 0, "sample");
     const heads_before = try doc1.getHeads(gpa);
     defer gpa.free(heads_before);
 
     const saved = try doc1.save(gpa);
     defer gpa.free(saved);
-    var doc2 = try docmod.Document.load(gpa, std.testing.io, saved, doc1.textEncoding(), .auto);
+    var doc2 = try automod.AutoCommit.load(gpa, std.testing.io, saved, doc1.textEncoding());
     defer doc2.deinit();
 
     // `ExpandMark::After` upstream (`test_mark_patches.rs`:19`).
-    try transmod.mark(&doc1, text, 5, 6, "bold", .after, .{ .bool_value = true });
+    try doc1.mark(text, 5, 6, "bold", .after, .{ .bool_value = true });
 
     // Pop the patches, so the second read is about the mark alone
     // (`test_mark_patches.rs`:24`). The first read is the whole document, and it
@@ -5477,50 +5984,812 @@ test "mark_patches: a mark over the last character of a text object arrives as o
 //   (`test_mark_patches.rs`:14`, `:27`) that makes the second document's patch
 //   stream come from *recorded* events rather than from a walk over two heads
 //   — the only path that answers "what did this document just learn", and what
-//   [`Document.diffIncremental`](doc.zig) reaches through `batch.zig`'s
+//   [`AutoCommit.diffIncremental`](autocommit.zig) reaches through `batch.zig`'s
 //   `applyChangesBatchToSink`.
-//
-// * **`PatchLog.prepareLocal` is a port-only method, and the one place the port
-//   and upstream disagree about *where a local change's patches come from*.**
-//   Upstream's log holds *events*, written by `TransactionInner` at the moment
-//   it inserts each op
-//   ([`inner.rs:308-328`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs))
-//   and merged into `AutoCommit`'s own log by `commit_with`
-//   ([`autocommit.rs:728-739`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)).
-//   **The port's transaction writes its rows with no log in hand**, so by the
-//   time [`Document.commit`](doc.zig) is called the ops are rows and there is
-//   no insert-time moment left. [`PatchLog.local`](patches.zig) is the port's
-//   answer: the change's patches are built once, by the walk
-//   [`Document.diff`](doc.zig) uses, and parked there.
-//
-// * **That is what makes `makePatches` three lists where upstream's body is
-//   two** ([`patch_log.rs`:505-509](../../github-automerge-automerge/rust/automerge/src/patches/patch_log.rs)):
-//   `completed_patches`, then `make_current_patches`, and here
-//   `completed`, `events`, `local`. **It was `prepareLocal` that replaced an
-//   earlier `appendCompleted`, and the earlier one appended straight to
-//   `completed`** — which put a change committed under an isolation *ahead* of
-//   the transition that preceded it. `finishCurrentView` is not that door
-//   either, and is not one now: its guard counts `local` as well as `events`
-//   and `expose` (`patches.zig`, [`PatchLog.finishCurrentView`]), so a view
-//   whose only content is one local change closes as firmly as a view with
-//   events in it.
-//
-// * **The upstream case this area is measured against is
-//   `regression_insert_opid`** (`tests/test.rs:2363-2435`), which drives
-//   `apply_changes_log_patches` and so pins the **batch** shape. The port
-//   reproduces it exactly: two patches, the `PutMap` that made the list and
-//   one `Insert` of 31 values at `Id(3)`, `Id(5)`, … `Id(63)`. The **local**
-//   shape is a different stream — measured, 62 patches for the same change,
-//   one per op — and the port does not produce it. See
-//   [`PatchLog.prepareLocal`].
 //
 // * **`PatchBuilder.seen` is keyed by `ExId` and `std.hash.autoHash` can no
 //   longer key it**, because the port's `ExId` has a variant that borrows an
 //   actor's bytes and `autoHash` refuses a key it cannot hash unambiguously
 //   (`std/hash/auto_hash.zig`:187). `ExIdContext` is the replacement, and it
-//   hashes the **operation** alone because that is the whole identity: a
-//   `.named` and an `.id` naming the same operation are the same value to
-//   [`ExId.eql`] and to every `ExId`-keyed map ([`types.zig`:267-272).
-//   Upstream's key is a plain `ExId` over `Copy` ids
-//   ([`exid.rs`:15-18`) and needs no context, so this is the price of the
-//   port's borrowed actor bytes and nothing more.
+//   hashes each identity domain separately. Named keys use the full public
+//   counter and actor bytes; cached actor indices do not identify actors.
+//   Table-local `.id` keys are distinct from exported `.named` keys.
+//   The builder exports cache inputs using the document's authoritative
+//   actor table before matching them.
+
+test "native text units retain split UTF8 and UTF16 sequences" {
+    // Each encoded unit remains independently editable, even inside a scalar.
+    for ([_]TextEncoding{ .utf8_code_unit, .utf16_code_unit }) |enc| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var text = try ConcreteTextValue.init(arena.allocator(), if (enc == .utf8_code_unit) "é" else "😀", enc);
+        try text.splice(1, "X");
+        try testing.expectEqual(@as(usize, 3), text.len());
+        const rendered = try text.makeString(testing.allocator);
+        defer testing.allocator.free(rendered);
+        try testing.expectEqualStrings("�X�", rendered);
+        try text.remove(1);
+        try testing.expectEqual(@as(usize, 2), text.len());
+        try text.remove(0);
+        const remainder = try text.makeString(testing.allocator);
+        defer testing.allocator.free(remainder);
+        try testing.expectEqualStrings("�", remainder);
+    }
+}
+
+test "native text units preserve stored grapheme boundaries after splice" {
+    // Appending a combining cluster must not resegment the existing element.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var text = try ConcreteTextValue.init(arena.allocator(), "a", .grapheme_cluster);
+    try text.splice(1, "\u{301}");
+    try testing.expectEqual(@as(usize, 2), text.len());
+    try text.remove(0);
+    const rendered = try text.makeString(testing.allocator);
+    defer testing.allocator.free(rendered);
+    try testing.expectEqualStrings("\u{301}", rendered);
+}
+
+test "native text units failed splice retains editable owned state" {
+    // Observe with a nonfailing allocator, then reuse the same owner after OOM.
+    for ([_]TextEncoding{
+        .utf8_code_unit, .utf16_code_unit, .unicode_code_point, .grapheme_cluster,
+    }) |enc| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var text = try ConcreteTextValue.init(gpa, "a", enc);
+        defer text.deinit();
+        failing.fail_index = failing.alloc_index;
+        try testing.expectError(error.OutOfMemory, text.splice(0, "😀" ** 64));
+        try testing.expectEqual(@as(usize, 1), text.len());
+        const observed = try text.makeString(testing.allocator);
+        defer testing.allocator.free(observed);
+        try testing.expectEqualStrings("a", observed);
+        failing.fail_index = std.math.maxInt(usize);
+        try text.splice(0, "b");
+        const reused = try text.makeString(testing.allocator);
+        defer testing.allocator.free(reused);
+        try testing.expectEqualStrings("ba", reused);
+    }
+}
+
+test "external patch log compatibility uses actors rather than document identity" {
+    // Independently allocated documents can offer the same actor table.
+    const a = [_]ActorId{ActorId.init("a")};
+    const b = [_]ActorId{ActorId.init("b")};
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var log = PatchLog.active(failing.allocator());
+    defer log.deinit();
+    try log.bind(1, &a);
+    log.putMap(.root, "owned", .{ .scalar = .{ .bool_value = true } }, opId(1, 0), false, false);
+    const actor_bytes = log.actors.items[0].bytes.ptr;
+    const allocation_index = failing.alloc_index;
+    failing.fail_index = allocation_index;
+    try log.validateActors(&a);
+    try log.bind(2, &a);
+    try testing.expectEqual(@as(?u64, 2), log.identity);
+    try testing.expectEqual(actor_bytes, log.actors.items[0].bytes.ptr);
+    try testing.expectEqual(allocation_index, failing.alloc_index);
+    try testing.expectError(error.PatchLogMismatch, log.validateActors(&b));
+    try testing.expectError(error.PatchLogMismatch, log.bind(3, &b));
+    try testing.expectEqual(@as(?u64, 2), log.identity);
+    try testing.expectEqual(@as(usize, 1), log.events.items.len);
+    try testing.expectEqual(actor_bytes, log.actors.items[0].bytes.ptr);
+    try testing.expect(!failing.has_induced_failure);
+}
+
+test "actor mismatch after a prospective insertion refuses before allocation or mutation" {
+    // A scan can accept an insertion before encountering a later mismatch.
+    // Neither the insertion nor its ID shifts may escape a refused preflight.
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var log = try publishHandshakeTarget(failing.allocator());
+    defer log.deinit();
+    const offered = [_]ActorId{ ActorId.init("@"), ActorId.init("d") };
+    const allocation_index = failing.alloc_index;
+    const resize_index = failing.resize_index;
+    const actors_ptr = log.actors.items.ptr;
+    failing.fail_index = allocation_index;
+    failing.resize_fail_index = resize_index;
+    try testing.expectError(error.PatchLogMismatch, log.validateActors(&offered));
+    try testing.expectError(error.PatchLogMismatch, log.bind(74, &offered));
+    try testing.expectError(error.PatchLogMismatch, log.bindBegin(74, &offered, 1, 0));
+    try testing.expectEqual(allocation_index, failing.alloc_index);
+    try testing.expectEqual(resize_index, failing.resize_index);
+    try testing.expect(!failing.has_induced_failure);
+    try testing.expectEqual(@as(?u64, 73), log.identity);
+    try testing.expectEqual(actors_ptr, log.actors.items.ptr);
+    try testing.expect(log.checkpoint == null);
+    try testing.expect(log.speculative_actor == null);
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try publishHandshakeOriginal(&log);
+}
+
+test "actor migration retains trailing actors and replays both root producers" {
+    // Rust's loop stops at the offered prefix, not at the old table's end
+    // (patches/patch_log.rs:634-658). The retained producer still names B.
+    const b = [_]ActorId{ActorId.init("b")};
+    const a = [_]ActorId{ActorId.init("a")};
+    var log = PatchLog.active(testing.allocator);
+    defer log.deinit();
+    try log.bind(1, &b);
+    const b_bytes = log.actors.items[0].bytes.ptr;
+    log.putMap(.root, "owned", .{ .scalar = .{ .bool_value = true } }, opId(1, 0), false, false);
+    var stage = try log.beginBatch();
+    defer stage.deinit();
+    try stage.bind(2, &a);
+    stage.putMap(.root, "added", .{ .scalar = .{ .int = 7 } }, opId(2, 0), false, false);
+    try stage.preparePublish(&log);
+    stage.publish(&log);
+    try testing.expectEqual(@as(?u64, 2), log.identity);
+    try testing.expectEqual(@as(usize, 2), log.actors.items.len);
+    try testing.expectEqualStrings("a", log.actors.items[0].bytes);
+    try testing.expectEqualStrings("b", log.actors.items[1].bytes);
+    const doc = TestDoc{};
+    var patches = try log.makePatches(TestDoc, &doc);
+    defer patches.deinit();
+    try expectPatches(testing.allocator, &patches, &.{
+        "root path=[] PutMap { key: \"owned\", value: Bool(true), obj: 1@1, conflict: false }",
+        "root path=[] PutMap { key: \"added\", value: Int(7), obj: 2@0, conflict: false }",
+    });
+    // Prefix-only reuses do not allocate or replace even the retained bytes.
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var direct = PatchLog.active(failing.allocator());
+    defer direct.deinit();
+    try direct.bind(1, &b);
+    const direct_b = direct.actors.items[0].bytes.ptr;
+    try direct.migrateActors(&a);
+    try testing.expectEqual(direct_b, direct.actors.items[1].bytes.ptr);
+    const allocation_index = failing.alloc_index;
+    failing.fail_index = allocation_index;
+    try direct.validateActors(&a);
+    try direct.bind(2, &a);
+    try direct.migrateActors(&.{});
+    try testing.expectEqual(allocation_index, failing.alloc_index);
+    try testing.expect(!failing.has_induced_failure);
+    // The staged publication owns its copied actor bytes independently.
+    try testing.expect(log.actors.items[1].bytes.ptr != b_bytes);
+}
+test "actor migration and transaction opening allocation refusals retain caller log" {
+    // Exercise checkpoint copies and insertion buffers without touching the
+    // original event, expose, completed-view, or path-cache ownership.
+    for ([_]bool{ false, true }) |transaction| {
+        var refusal_index: usize = 0;
+        while (true) : (refusal_index += 1) {
+            var failing = testing.FailingAllocator.init(testing.allocator, .{});
+            var log = try publishHandshakeTarget(failing.allocator());
+            defer log.deinit();
+            const actors_ptr = log.actors.items.ptr;
+            const a_bytes = log.actors.items[0].bytes.ptr;
+            const c_bytes = log.actors.items[1].bytes.ptr;
+            failing.fail_index = failing.alloc_index + refusal_index;
+            failing.resize_fail_index = 0;
+            const result = if (transaction)
+                log.bindBegin(74, &publish_handshake_new_actors, 1, 1)
+            else
+                log.bind(74, &publish_handshake_new_actors);
+            failing.fail_index = std.math.maxInt(usize);
+            failing.resize_fail_index = std.math.maxInt(usize);
+            if (result) |_| {
+                try testing.expect(refusal_index > 0);
+                try testing.expectEqual(@as(?u64, 74), log.identity);
+                try testing.expectEqual(a_bytes, log.actors.items[0].bytes.ptr);
+                try testing.expectEqual(c_bytes, log.actors.items[2].bytes.ptr);
+                if (transaction) {
+                    log.rollbackTransaction(&publish_handshake_old_actors);
+                    try testing.expectEqual(@as(?u64, 74), log.identity);
+                    try publishHandshakeOriginal(&log);
+                }
+                break;
+            } else |failure| {
+                try testing.expectEqual(error.OutOfMemory, failure);
+                try testing.expect(log.checkpoint == null);
+                try testing.expect(log.speculative_actor == null);
+                try testing.expectEqual(@as(?u64, 73), log.identity);
+                try testing.expectEqual(actors_ptr, log.actors.items.ptr);
+                try testing.expectEqual(a_bytes, log.actors.items[0].bytes.ptr);
+                try testing.expectEqual(c_bytes, log.actors.items[1].bytes.ptr);
+                try publishHandshakeOriginal(&log);
+            }
+        }
+    }
+}
+
+test "PatchLog merge accepts foreign metadata and retains the compatible actor tail" {
+    const a = [_]ActorId{ActorId.init("a")};
+    const ac = [_]ActorId{ ActorId.init("a"), ActorId.init("c") };
+    var target = PatchLog.active(testing.allocator);
+    defer target.deinit();
+    try target.bind(1, &ac);
+    target.putMap(.root, "old", .{ .scalar = sval("c") }, opId(1, 1), false, false);
+    var other = PatchLog.active(testing.allocator);
+    defer other.deinit();
+    try other.bind(2, &a);
+    other.putMap(.root, "new", .{ .scalar = sval("a") }, opId(2, 0), false, false);
+    try target.merge(&other);
+    try testing.expectEqual(@as(usize, 2), target.actors.items.len);
+    try testing.expectEqualStrings("c", target.actors.items[1].bytes);
+    try testing.expectEqual(@as(?u64, 2), other.identity);
+    try testing.expectEqual(@as(usize, 1), other.events.items.len);
+    const doc = TestDoc{};
+    var patches = try target.makePatches(TestDoc, &doc);
+    defer patches.deinit();
+    try expectPatches(testing.allocator, &patches, &.{
+        "root path=[] PutMap { key: \"old\", value: Str(\"c\"), obj: 1@1, conflict: false }",
+        "root path=[] PutMap { key: \"new\", value: Str(\"a\"), obj: 2@0, conflict: false }",
+    });
+    const b = [_]ActorId{ActorId.init("b")};
+    var incompatible = PatchLog.active(testing.allocator);
+    defer incompatible.deinit();
+    try incompatible.bind(1, &b);
+    try testing.expectError(error.PatchLogMismatch, target.merge(&incompatible));
+    try testing.expectEqual(@as(usize, 2), target.events.items.len);
+    try testing.expectEqual(@as(usize, 0), incompatible.events.items.len);
+}
+
+test "native text units patch coalescing retains incomplete encoded units" {
+    // A consumer's patch must preserve a one-unit deletion inside a scalar.
+    const doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
+    for ([_]TextEncoding{ .utf8_code_unit, .utf16_code_unit }) |enc| {
+        var out = Patches.init(testing.allocator);
+        defer out.deinit();
+        var builder = PatchBuilder(TestDoc).init(
+            &out,
+            &doc,
+            .{},
+            testing.allocator,
+            null,
+            enc,
+        );
+        defer builder.deinit();
+        try builder.spliceText(.root, 0, if (enc == .utf8_code_unit) "é" else "😀", null);
+        try builder.deleteSeq(.root, 0, 1);
+        try testing.expectEqual(@as(usize, 1), builder.patches.items.len);
+        const text = builder.patches.items[0].action.splice_text.value;
+        try testing.expectEqual(@as(usize, 1), text.len());
+        const rendered = try text.makeString(testing.allocator);
+        defer testing.allocator.free(rendered);
+        try testing.expectEqualStrings("�", rendered);
+    }
+}
+
+test "native text units every splice allocation failure preserves original text" {
+    // Cover conversion, node splitting, and rollback rather than one allocation.
+    const Consumer = struct {
+        fn run(gpa: Allocator, enc: TextEncoding) !void {
+            var text = try ConcreteTextValue.init(gpa, "prefix😀suffix", enc);
+            defer text.deinit();
+            text.splice(3, "😀x" ** 64) catch |failure| {
+                const observed = try text.makeString(testing.allocator);
+                defer testing.allocator.free(observed);
+                try testing.expectEqualStrings("prefix😀suffix", observed);
+                try testing.expectEqual(enc.width("prefix😀suffix"), text.len());
+                return failure;
+            };
+            try testing.expectEqual(
+                enc.width("prefix😀suffix") + enc.width("😀x" ** 64),
+                text.len(),
+            );
+        }
+    };
+    for ([_]TextEncoding{
+        .utf8_code_unit, .utf16_code_unit, .unicode_code_point, .grapheme_cluster,
+    }) |enc| {
+        try testing.checkAllAllocationFailures(testing.allocator, Consumer.run, .{enc});
+    }
+}
+
+test "native text units self splice retains the original source" {
+    for ([_]TextEncoding{
+        .utf8_code_unit, .utf16_code_unit, .unicode_code_point, .grapheme_cluster,
+    }) |enc| {
+        var text = try ConcreteTextValue.init(testing.allocator, "ab", enc);
+        defer text.deinit();
+        try text.spliceTextValue(1, &text);
+        try testing.expectEqual(@as(usize, 4), text.len());
+        try testing.expectEqual(enc, text.encoding());
+        const rendered = try text.makeString(testing.allocator);
+        defer testing.allocator.free(rendered);
+        try testing.expectEqualStrings("aabb", rendered);
+    }
+}
+
+test "native text units duplicate and compare split sequences without rendering" {
+    for ([_]TextEncoding{ .utf8_code_unit, .utf16_code_unit }) |enc| {
+        var text = try ConcreteTextValue.init(
+            testing.allocator,
+            if (enc == .utf8_code_unit) "é" else "😀",
+            enc,
+        );
+        defer text.deinit();
+        try text.remove(0);
+        var copy = try text.dup(testing.allocator);
+        defer copy.deinit();
+        try testing.expect(ConcreteTextValue.eql(text, copy));
+        try testing.expectEqual(enc, copy.encoding());
+        try testing.expect(copy.get(0) != null);
+        try testing.expect(copy.get(1) == null);
+        const unit = copy.get(0).?;
+        switch (enc) {
+            .utf8_code_unit => try testing.expectEqual(@as(u8, 0xa9), unit.utf8_code_unit),
+            .utf16_code_unit => try testing.expectEqual(@as(u16, 0xde00), unit.utf16_code_unit),
+            else => unreachable,
+        }
+        try text.splice(0, "X");
+        try testing.expect(!ConcreteTextValue.eql(text, copy));
+        const rendered = try copy.makeString(testing.allocator);
+        defer testing.allocator.free(rendered);
+        try testing.expectEqualStrings("�", rendered);
+    }
+}
+
+test "native text units copying preserves stored grapheme segmentation" {
+    var source = try ConcreteTextValue.init(testing.allocator, "a", .grapheme_cluster);
+    defer source.deinit();
+    try source.splice(1, "\u{301}");
+    var copy = try source.dup(testing.allocator);
+    defer copy.deinit();
+    var target = try ConcreteTextValue.init(testing.allocator, "z", .grapheme_cluster);
+    defer target.deinit();
+    try target.spliceTextValue(1, &source);
+    try testing.expectEqual(@as(usize, 2), copy.len());
+    try testing.expectEqual(@as(usize, 3), target.len());
+    try testing.expect(ConcreteTextValue.eql(source, copy));
+    try source.remove(0);
+    try testing.expectEqualStrings("a", copy.get(0).?.grapheme_cluster);
+    try testing.expectEqualStrings("\u{301}", copy.get(1).?.grapheme_cluster);
+    try target.remove(1);
+    const rendered = try target.makeString(testing.allocator);
+    defer testing.allocator.free(rendered);
+    try testing.expectEqualStrings("z\u{301}", rendered);
+}
+
+const publish_handshake_old_actors = [_]ActorId{ ActorId.init("a"), ActorId.init("c") };
+const publish_handshake_new_actors = [_]ActorId{
+    ActorId.init("a"), ActorId.init("b"), ActorId.init("c"),
+};
+const publish_handshake_heads = [_]ChangeHash{.{ .bytes = [_]u8{0x63} ** 32 }};
+
+fn publishHandshakeDoc(comptime actor: ActorIdx) TestDoc {
+    const empty_objects = comptime blk: {
+        var objects: [16]TestDoc.Obj = undefined;
+        for (&objects, 0..) |*object, index| {
+            object.* = .{
+                .id = .{ .id = opId(@intCast(40 + index), 1) },
+                .typ = .map,
+                .parent = .root,
+            };
+        }
+        break :blk objects;
+    };
+    // The returned document borrows this fixture, so every object and nested
+    // item array must have static storage rather than this call's stack.
+    const objects = comptime ([_]TestDoc.Obj{
+        .{ .id = .root, .typ = .map, .map_items = &.{
+            .{
+                .key = "child",
+                .value = .{ .object = .map },
+                .id = opId(10, actor),
+                .conflict = false,
+            },
+            .{
+                .key = "cached",
+                .value = .{ .object = .map },
+                .id = opId(20, actor),
+                .conflict = false,
+            },
+        } },
+        .{
+            .id = .{ .id = opId(10, actor) },
+            .typ = .map,
+            .parent = .root,
+            .map_items = &.{.{
+                .key = "inner",
+                .value = .{ .scalar = sval("exposed") },
+                .id = opId(11, actor),
+                .conflict = false,
+            }},
+        },
+        .{ .id = .{ .id = opId(20, actor) }, .typ = .map, .parent = .root },
+    } ++ empty_objects);
+    return .{ .objs = &objects };
+}
+
+fn publishHandshakeCompleted(log: *PatchLog, text: []const u8) !void {
+    const doc = TestDoc{};
+    var source = PatchLog.active(log.gpa);
+    defer source.deinit();
+    source.splice(.root, 0, text, null);
+    var patches = try source.makePatches(TestDoc, &doc);
+    defer patches.deinit();
+    try log.completed.appendFrom(&patches);
+}
+
+fn publishHandshakeTarget(gpa: Allocator) !PatchLog {
+    var target = PatchLog.active(gpa);
+    errdefer target.deinit();
+    try target.bind(73, &publish_handshake_old_actors);
+    target.heads = try gpa.dupe(ChangeHash, &publish_handshake_heads);
+    try publishHandshakeCompleted(&target, "old😀");
+    target.putMap(.root, "old", .{ .scalar = sval("original") }, opId(1, 1), false, false);
+    target.putMap(.root, "child", .{ .object = .map }, opId(10, 1), false, true);
+    target.putMap(
+        internalObj(opId(20, 1)),
+        "value",
+        .{ .scalar = sval("cached") },
+        opId(21, 1),
+        false,
+        false,
+    );
+    var hint: PathMap = .{};
+    errdefer hint.deinit(gpa);
+    try hint.put(gpa, .{
+        .obj = internalObj(opId(20, 1)),
+        .parent = .root,
+        .prop = .{ .key = "cached-path" },
+    });
+    try hint.put(gpa, .{
+        .obj = internalObj(opId(10, 1)),
+        .parent = .root,
+        .prop = .{ .key = "child" },
+    });
+    target.pathHint(hint);
+    return target;
+}
+
+fn publishHandshakeStage(target: *PatchLog) !PatchLog {
+    var stage = try target.beginBatch();
+    errdefer stage.deinit();
+    try stage.bind(73, &publish_handshake_new_actors);
+    try publishHandshakeCompleted(&stage, "new😀");
+    stage.putMap(.root, "new", .{ .scalar = sval("published") }, opId(2, 1), false, false);
+    // Enough real object events also exercise both publication reservations.
+    for (0..16) |index| {
+        stage.putMap(
+            .root,
+            "object",
+            .{ .object = .map },
+            opId(@intCast(40 + index), 1),
+            false,
+            true,
+        );
+    }
+    return stage;
+}
+
+fn publishHandshakeOwner(log: *const PatchLog, actors: []const ActorId) !void {
+    try log.validateActors(actors);
+    try testing.expectEqual(actors.len, log.actors.items.len);
+    for (actors, log.actors.items) |expected, actual| {
+        try testing.expectEqualStrings(expected.bytes, actual.bytes);
+    }
+    const heads = log.heads orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), heads.len);
+    try testing.expectEqualSlices(u8, &publish_handshake_heads[0].bytes, &heads[0].bytes);
+}
+
+fn publishHandshakeOriginal(target: *PatchLog) !void {
+    try publishHandshakeOwner(target, &publish_handshake_old_actors);
+    // Rendering consumes the one-use path seed (patch_log.rs:513). Observe
+    // a deep copy so repeated atomicity checks do not mutate either owner.
+    var observed = try target.cloneAndRebind(target.gpa, target.identity.?);
+    defer observed.deinit();
+    const doc = publishHandshakeDoc(1);
+    var patches = try observed.makePatches(TestDoc, &doc);
+    defer patches.deinit();
+    try expectPatches(testing.allocator, &patches, &.{
+        "root path=[] SpliceText { index: 0, value: \"old😀\", marks: none }",
+        "root path=[] PutMap { key: \"old\", value: Str(\"original\"), obj: 1@1, conflict: false }",
+        "root path=[] PutMap { key: \"child\", value: Object(map), obj: 10@1, conflict: false }",
+        "10@1 path=[root.Map(\"child\")] PutMap { key: \"inner\", value: Str(\"exposed\"), obj: 11@1, conflict: false }",
+        "20@1 path=[root.Map(\"cached-path\")] PutMap { key: \"value\", value: Str(\"cached\"), obj: 21@1, conflict: false }",
+    });
+    // These public operation IDs still resolve to the original actor bytes.
+    try testing.expectEqualStrings(
+        "c",
+        target.actors.items[patches.slice()[1].action.put_map.obj.id.actor].bytes,
+    );
+}
+
+fn publishHandshakeStageOwned(stage: *PatchLog) !void {
+    try testing.expect(stage.isActive());
+    try publishHandshakeOwner(stage, &publish_handshake_new_actors);
+    const doc = publishHandshakeDoc(2);
+    var patches = try stage.makePatches(TestDoc, &doc);
+    defer patches.deinit();
+    try testing.expectEqual(@as(usize, 18), patches.len());
+    const text = try patches.slice()[0].action.splice_text.value.makeString(testing.allocator);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("new😀", text);
+    try testing.expectEqualStrings("new", patches.slice()[1].action.put_map.key);
+    try testing.expect(patches.slice()[1].action.put_map.obj.eql(.{ .id = opId(2, 1) }));
+    for (patches.slice()[2..], 0..) |patch, index| {
+        try testing.expectEqualStrings("object", patch.action.put_map.key);
+        try testing.expect(patch.action.put_map.obj.eql(.{ .id = opId(@intCast(40 + index), 1) }));
+    }
+}
+
+test "canonical PatchLog handshake abandoned preflight preserves original consumer state" {
+    // Preparing a middle actor insertion must not publish any part of it.
+    var target = try publishHandshakeTarget(testing.allocator);
+    defer target.deinit();
+    {
+        var stage = try publishHandshakeStage(&target);
+        defer stage.deinit();
+        try stage.preparePublish(&target);
+        try publishHandshakeStageOwned(&stage);
+    }
+    try publishHandshakeOriginal(&target);
+}
+
+test "canonical PatchLog handshake every preflight allocation refusal preserves both owners" {
+    // Refuse only preflight allocations, then disarm before observing each owner.
+    var refusal_index: usize = 0;
+    while (true) : (refusal_index += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var target = try publishHandshakeTarget(gpa);
+        defer target.deinit();
+        var stage = try publishHandshakeStage(&target);
+        defer stage.deinit();
+        failing.fail_index = failing.alloc_index + refusal_index;
+        failing.resize_fail_index = 0;
+        const result = stage.preparePublish(&target);
+        failing.fail_index = std.math.maxInt(usize);
+        failing.resize_fail_index = std.math.maxInt(usize);
+        if (result) |_| {
+            try testing.expect(refusal_index > 0);
+            try publishHandshakeOriginal(&target);
+            try publishHandshakeStageOwned(&stage);
+            break;
+        } else |allocation_error| {
+            try testing.expectEqual(error.OutOfMemory, allocation_error);
+            try publishHandshakeOriginal(&target);
+            try publishHandshakeStageOwned(&stage);
+        }
+    }
+}
+
+test "canonical PatchLog handshake publication allocates nothing and preserves mapped event order" {
+    // Arm both refusal channels only after the fallible handshake has succeeded.
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var target = try publishHandshakeTarget(failing.allocator());
+    defer target.deinit();
+    var stage = try publishHandshakeStage(&target);
+    defer stage.deinit();
+    try stage.preparePublish(&target);
+    const allocation_index = failing.alloc_index;
+    const resize_index = failing.resize_index;
+    failing.fail_index = allocation_index;
+    failing.resize_fail_index = resize_index;
+    stage.publish(&target);
+    try testing.expectEqual(allocation_index, failing.alloc_index);
+    try testing.expectEqual(resize_index, failing.resize_index);
+    try testing.expect(!failing.has_induced_failure);
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try testing.expect(!stage.isActive());
+    try publishHandshakeOwner(&target, &publish_handshake_new_actors);
+    const doc = publishHandshakeDoc(2);
+    var patches = try target.makePatches(TestDoc, &doc);
+    defer patches.deinit();
+    try testing.expectEqual(@as(usize, 23), patches.len());
+    try expectPatches(testing.allocator, &target.completed, &.{
+        "root path=[] SpliceText { index: 0, value: \"old😀\", marks: none }",
+        "root path=[] SpliceText { index: 0, value: \"new😀\", marks: none }",
+    });
+    try testing.expectEqualStrings("old", patches.slice()[2].action.put_map.key);
+    try testing.expect(patches.slice()[2].action.put_map.obj.eql(.{ .id = opId(1, 2) }));
+    try testing.expectEqualStrings("child", patches.slice()[3].action.put_map.key);
+    try testing.expect(patches.slice()[3].action.put_map.obj.eql(.{ .id = opId(10, 2) }));
+    try testing.expectEqualStrings("new", patches.slice()[4].action.put_map.key);
+    try testing.expect(patches.slice()[4].action.put_map.obj.eql(.{ .id = opId(2, 1) }));
+    for (patches.slice()[5..21], 0..) |patch, index| {
+        try testing.expectEqualStrings("object", patch.action.put_map.key);
+        try testing.expect(patch.action.put_map.obj.eql(.{ .id = opId(@intCast(40 + index), 1) }));
+    }
+    const exposed = patches.slice()[21];
+    try testing.expect(exposed.obj.eql(.{ .id = opId(10, 2) }));
+    try testing.expectEqualStrings("exposed", exposed.action.put_map.value.scalar.str);
+    try testing.expect(exposed.action.put_map.obj.eql(.{ .id = opId(11, 2) }));
+    const cached = patches.slice()[22];
+    try testing.expect(cached.obj.eql(.{ .id = opId(20, 2) }));
+    try testing.expectEqualStrings("cached", cached.path[0].prop.key);
+    try testing.expect(cached.action.put_map.obj.eql(.{ .id = opId(21, 2) }));
+    try testing.expectEqualStrings("c", target.actors.items[2].bytes);
+    try testing.expectEqualStrings("b", target.actors.items[1].bytes);
+}
+
+fn publishHandshakeCloneCheckpoint(gpa: Allocator) !void {
+    var original = try publishHandshakeTarget(gpa);
+    defer original.deinit();
+    try original.bindBegin(73, &publish_handshake_new_actors, 1, 1);
+    original.splice(internalObj(opId(20, 2)), 0, "discard😀", null);
+    if (original.oom) return error.OutOfMemory;
+    var cloned = try original.cloneAndRebind(gpa, 74);
+    defer cloned.deinit();
+    original.rollbackTransaction(&publish_handshake_old_actors);
+    cloned.rollbackTransaction(&publish_handshake_old_actors);
+    original.deinit();
+    original = PatchLog.inactive(gpa);
+    try cloned.validateActors(&publish_handshake_old_actors);
+    try testing.expectEqual(@as(?u64, 74), cloned.identity);
+    const doc = publishHandshakeDoc(1);
+    var patches = try cloned.makePatches(TestDoc, &doc);
+    defer patches.deinit();
+    cloned.deinit();
+    cloned = PatchLog.inactive(gpa);
+    try testing.expectEqual(@as(usize, 5), patches.len());
+    var text = &patches.items.items[0].action.splice_text.value;
+    try testing.expectEqual(@as(usize, 4), text.len());
+    try text.splice(text.len(), "!");
+    const rendered = try text.makeString(gpa);
+    defer gpa.free(rendered);
+    try testing.expectEqualStrings("old😀!", rendered);
+    try testing.expectEqualStrings("cached-path", patches.slice()[4].path[0].prop.key);
+    try testing.expect(patches.slice()[4].action.put_map.obj.eql(.{ .id = opId(21, 1) }));
+}
+
+test "canonical PatchLog handshake cloned checkpoint owns completed native text through rollback" {
+    // Sweep construction and cleanup as well as reading after both logs are freed.
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        publishHandshakeCloneCheckpoint,
+        .{},
+    );
+}
+
+test "patch formatting retains full width named counters without resident conversion" {
+    const named: ExId = .{ .named = .{
+        .op = .{ .counter = std.math.maxInt(u64), .actor = 7 },
+        .actor = .{ .bytes = "actor" },
+    } };
+    const rendered = try formatPatch(testing.allocator, .{
+        .obj = named,
+        .path = &.{},
+        .action = .{ .delete_seq = .{ .index = 0, .length = 1 } },
+    });
+    defer testing.allocator.free(rendered);
+    try testing.expectEqualStrings(
+        "18446744073709551615@7 path=[] DeleteSeq { index: 0, length: 1 }",
+        rendered,
+    );
+}
+
+test "patch values read high unsigned scalars with wrapping integer semantics" {
+    const value: Value = .{ .scalar = .{ .uint = std.math.maxInt(u64) } };
+    try testing.expectEqual(@as(i64, -1), value.asI64());
+}
+
+fn publishOriginPublished(target: *PatchLog) !void {
+    try publishHandshakeOwner(target, &publish_handshake_new_actors);
+    const doc = publishHandshakeDoc(2);
+    var patches = try target.makePatches(TestDoc, &doc);
+    defer patches.deinit();
+    try testing.expectEqual(@as(usize, 23), patches.len());
+    for ([_][]const u8{ "old😀", "new😀" }, patches.slice()[0..2]) |expected, patch| {
+        const text = try patch.action.splice_text.value.makeString(testing.allocator);
+        defer testing.allocator.free(text);
+        try testing.expectEqualStrings(expected, text);
+    }
+    try testing.expectEqualStrings("old", patches.slice()[2].action.put_map.key);
+    try testing.expectEqualStrings("original", patches.slice()[2].action.put_map.value.scalar.str);
+    try testing.expect(patches.slice()[2].action.put_map.obj.eql(.{ .id = opId(1, 2) }));
+    try testing.expectEqualStrings("child", patches.slice()[3].action.put_map.key);
+    try testing.expect(patches.slice()[3].action.put_map.obj.eql(.{ .id = opId(10, 2) }));
+    try testing.expectEqualStrings("new", patches.slice()[4].action.put_map.key);
+    try testing.expectEqualStrings("published", patches.slice()[4].action.put_map.value.scalar.str);
+    try testing.expect(patches.slice()[4].action.put_map.obj.eql(.{ .id = opId(2, 1) }));
+    for (patches.slice()[5..21], 0..) |patch, index| {
+        try testing.expectEqualStrings("object", patch.action.put_map.key);
+        try testing.expect(patch.action.put_map.obj.eql(.{ .id = opId(@intCast(40 + index), 1) }));
+    }
+    const exposed = patches.slice()[21];
+    try testing.expect(exposed.obj.eql(.{ .id = opId(10, 2) }));
+    try testing.expectEqualStrings("child", exposed.path[0].prop.key);
+    try testing.expectEqualStrings("exposed", exposed.action.put_map.value.scalar.str);
+    try testing.expect(exposed.action.put_map.obj.eql(.{ .id = opId(11, 2) }));
+    const cached = patches.slice()[22];
+    try testing.expect(cached.obj.eql(.{ .id = opId(20, 2) }));
+    try testing.expectEqualStrings("cached", cached.path[0].prop.key);
+    try testing.expectEqualStrings("cached", cached.action.put_map.value.scalar.str);
+    try testing.expect(cached.action.put_map.obj.eql(.{ .id = opId(21, 2) }));
+    try testing.expectEqualStrings(
+        "c",
+        target.actors.items[patches.slice()[2].action.put_map.obj.id.actor].bytes,
+    );
+    try testing.expectEqualStrings(
+        "b",
+        target.actors.items[patches.slice()[4].action.put_map.obj.id.actor].bytes,
+    );
+}
+
+test "PatchLog origin handshake publishes with actual stateless c allocator" {
+    // The real stateless allocator has no context value that publication may inspect.
+    var target = try publishHandshakeTarget(std.heap.c_allocator);
+    defer target.deinit();
+    var stage = try publishHandshakeStage(&target);
+    defer stage.deinit();
+    try stage.preparePublish(&target);
+    try publishHandshakeOriginal(&target);
+    try publishHandshakeStageOwned(&stage);
+    stage.publish(&target);
+    try testing.expect(!stage.isActive());
+    try publishOriginPublished(&target);
+}
+
+test "PatchLog origin handshake refuses same identity foreign owner without changing either log" {
+    // Same actors, metadata, and even a stateless allocator do not confer origin.
+    var origin_allocator = testing.FailingAllocator.init(testing.allocator, .{});
+    var foreign_allocator = testing.FailingAllocator.init(testing.allocator, .{});
+    try publishForeignOriginGuard(origin_allocator.allocator(), foreign_allocator.allocator());
+    try testing.expect(!origin_allocator.has_induced_failure);
+    try testing.expect(!foreign_allocator.has_induced_failure);
+    try publishForeignOriginGuard(std.heap.c_allocator, std.heap.c_allocator);
+}
+
+fn publishForeignOriginGuard(origin_gpa: Allocator, foreign_gpa: Allocator) !void {
+    var origin = try publishHandshakeTarget(origin_gpa);
+    defer origin.deinit();
+    var foreign = try publishHandshakeTarget(foreign_gpa);
+    defer foreign.deinit();
+    var stage = try publishHandshakeStage(&origin);
+    defer stage.deinit();
+    try testing.expectEqual(origin.identity, foreign.identity);
+    try testing.expectError(error.PatchLogMismatch, stage.preparePublish(&foreign));
+    try testing.expect(stage.batch_origin == &origin);
+    try testing.expect(stage.publish_completed == null);
+    try publishHandshakeOriginal(&origin);
+    try publishHandshakeOriginal(&foreign);
+    try publishHandshakeStageOwned(&stage);
+    try stage.preparePublish(&origin);
+    const prepared = stage.publish_completed.?.items.items;
+    // Refusal after a successful preflight preserves the original capability.
+    try testing.expectError(error.PatchLogMismatch, stage.preparePublish(&foreign));
+    try testing.expect(stage.batch_origin == &origin);
+    try testing.expect(prepared.ptr == stage.publish_completed.?.items.items.ptr);
+    try expectPatches(testing.allocator, &stage.publish_completed.?, &.{
+        "root path=[] SpliceText { index: 0, value: \"old😀\", marks: none }",
+        "root path=[] SpliceText { index: 0, value: \"new😀\", marks: none }",
+    });
+    try publishHandshakeOriginal(&origin);
+    try publishHandshakeOriginal(&foreign);
+    try publishHandshakeStageOwned(&stage);
+    stage.publish(&origin);
+    try testing.expect(!stage.isActive());
+    try publishOriginPublished(&origin);
+    try publishHandshakeOriginal(&foreign);
+}
+
+test "PatchLog cloned prepared batch owns data but cannot publish to original owner" {
+    // Payload copies do not copy the exact-origin publication capability.
+    var origin_allocator = testing.FailingAllocator.init(testing.allocator, .{});
+    var clone_allocator = testing.FailingAllocator.init(testing.allocator, .{});
+    try publishClonedOriginGuard(origin_allocator.allocator(), clone_allocator.allocator());
+    try testing.expect(!origin_allocator.has_induced_failure);
+    try testing.expect(!clone_allocator.has_induced_failure);
+    try publishClonedOriginGuard(std.heap.c_allocator, std.heap.c_allocator);
+}
+
+fn publishClonedOriginGuard(origin_gpa: Allocator, clone_gpa: Allocator) !void {
+    var origin = try publishHandshakeTarget(origin_gpa);
+    defer origin.deinit();
+    var stage = try publishHandshakeStage(&origin);
+    defer stage.deinit();
+    try stage.preparePublish(&origin);
+    {
+        var cloned = try stage.cloneAndRebind(clone_gpa, 73);
+        defer cloned.deinit();
+        try testing.expectError(error.PatchLogMismatch, cloned.preparePublish(&origin));
+        try publishHandshakeOriginal(&origin);
+        try publishHandshakeStageOwned(&stage);
+        try publishHandshakeStageOwned(&cloned);
+        stage.publish(&origin);
+        // Both copies remain readable after the original stage is consumed.
+        try publishHandshakeStageOwned(&cloned);
+        try publishOriginPublished(&origin);
+    }
+    // Freeing the clone must not release the published payloads.
+    try testing.expect(!stage.isActive());
+    try publishOriginPublished(&origin);
+}

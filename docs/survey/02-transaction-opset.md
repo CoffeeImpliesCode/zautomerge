@@ -1171,7 +1171,27 @@ Actor indices in a change are **remapped to change-local indices** by `ActorMapp
 
 ## Zig mapping notes
 
-**Trait → interface.** `Transactable` (`transactable.rs:9-181`) is a pure in-out interface: `pub const Transactable = interface { fn pending_ops(self: *const Self) usize; fn put(...) TransactableError!void; … }`. Zig has no GATs, so `OpLike` (`op.rs:1327-1372`) **cannot** be expressed directly — `type SuccIter<'b>: ExactSizeIterator<Item = OpId> + 'b` is a GAT. The port must either (a) return an erased iterator pointer, (b) split `OpLike` into a static-arity function table (`fn succCount(op: *const T) usize; fn succAt(op: *const T, i: usize) OpId;`), or (c) use a runtime vtable. Given the hot paths (`OpIter`, `ChangeOp`, `TxOp`, `OpBuilder` all implement it), the pragmatic Zig shape is a comptime-duplicated function set via an `anyopaque`+`*const fn` table per concrete type, or `inline fn` generated per type. Similarly `AsChangeOp` (`op.rs:1208-1225`) and `AsBuilder` (`op.rs:16`) are object-safe and port cleanly.
+**Native transaction ownership.** `Document` has no public mode switch.
+`transaction.Transaction` borrows it. `OwnedTransaction` embeds the same journal engine and owns the document at its final address.
+`AutoCommit` owns one raw document and one optional transaction.
+Writes reuse that transaction until commit or rollback (`src/transaction.zig:156-159`, `src/autocommit.zig:30-39`, `:114-173`).
+
+Ordinary reads do not publish pending operations.
+Explicit historical reads select the transaction's clock rather than the raw current-head shortcut.
+Raw hydration retains its separate scope exception (`src/read.zig:942-963`, `:2261-2447`).
+`cloneInto` copies both document state and the open journal without closing the source (`src/autocommit.zig:193-215`).
+
+Commit returns an owned `{ hash, patch_log }` result, including a no-write result.
+`CommitResult.deinit(gpa)` releases the log (`src/transaction.zig:110-122`).
+Closure outcomes preserve generic user errors, separate rollback errors, and any retained recovery owner (`src/transaction.zig:124-153`).
+`Transaction.deinit` is fallible and rolls back open work.
+`deinitClosed` is resource-only disposal after a terminal transition or whole-document destruction (`src/transact.zig:321-344`).
+
+
+**Trait mapping.** Rust `Transactable` and `OpLike` describe operations over several concrete owners and rows.
+`OpLike::SuccIter<'b>` is a GAT (`op.rs:1327-1372`).
+Native rows expose `succCount`, `succAt`, `succIncCount`, and `succIncAt`.
+Compile-time generic callers select those accessors without a vtable (`src/opset/op.zig:34-52`).
 
 **Enum → tagged union.** `Action` (`op_set2/types.rs:61-82`) → `const Action = enum { make_map, make_list, make_text, set, delete, increment, make_table, mark };` with `@intFromEnum`/`@enumFromInt` for the durable codes, but note the durable codes are *not* in declaration order (`MakeMap=0, Set=1, MakeList=2, …`), so the `From<Action> for u64` table must be transcribed, not `@intFromEnum`. Same for `ResolvedAction` (`op_set.rs:1525`), `Top` (`batch.rs:363`), `ClockRange` (`clock.rs:69`), `ValueType` (`meta.rs:4`), `MarkIdx`/`MarkIndexBuilder` (`mark_index.rs:12`, `:18`), `Adjust` (`batch.rs:355`), `TopIterInner` (`top_op.rs:165`), `VisIter` (`visible.rs:44`), `Actor` (`automerge.rs:47`), `OnPartialLoad`/`StringMigration` (`automerge.rs:74`, `:83`).
 
@@ -1183,11 +1203,18 @@ Actor indices in a change are **remapped to change-local indices** by `ActorMapp
 
 **`Cow<'a, str>` / `Cow<'a, [u8]>` → pointer + length + ownership flag.** `ScalarValue` (`op_set2/types.rs:177-189`) is the worst case: every variant can be borrowed or owned, and `as_raw`/`to_raw`/`into_owned`/`to_owned`/`into_legacy` produce different ownership on each path (`op_set2/types.rs:226-417`). A faithful Zig port needs either a tagged union with a `[]const u8` + `owned: ?[]u8` pair, or a small string-type with explicit `deinit`. There is no zero-cost equivalent; every design here costs either a copy or a manual refcount.
 
-**`HashMap` → `std.StringHashMap` / `std.AutoHashMap`.** Hot maps: `nodes_by_hash: HashMap<ChangeHash, NodeIdx>` (`change_graph.rs:42`) — the key is a 32-byte array, so a `std.AutoHashMap([32]u8, u32)`; `clock_cache: HashMap<NodeIdx, SeqClock>` (`change_graph.rs:43`); `counters: HashMap<OpId, Vec<(usize, usize)>>` (`index.rs:10`); `begins: HashMap<OpId, ObjId>` (`index.rs:24`); `ObjIndex(HashMap<OpId, ObjInfo>)` (`index.rs:78`); `MarkIndexColumn.cache: HashMap<OpId, MarkData<'static>>` (`mark_index.rs:236`); `MarkAcc { opens: FxHashSet<OpId>, closes: FxHashSet<OpId> }` (`mark_index.rs:99-103`) — this one explicitly uses `rustc_hash::FxHashSet` for a 3-5× per-hash speedup on 8-byte keys, which Zig's `AutoHashMap` (wyhash) will not reproduce; expect a measurable regression in mark-heavy documents. `deps: HashSet<ChangeHash>` (`automerge.rs:255`) and `heads: BTreeSet<ChangeHash>` (`change_graph.rs:41`) need different maps: the first only needs membership, the second needs *sorted* iteration and set equality (`heads_are_current` compares `BTreeSet`s, `change_graph.rs:137`) — in Zig that is a `std.ArrayList([32]u8)` kept sorted, or a `std.StringHashMap` plus a sort per comparison. `SequenceType`-keyed `BTreeMap<ColumnSpec, Range<usize>>` (`columns.rs:253`) maps to a `std.AutoArrayHashMap(ColumnSpec, Range)` since `ColumnSpec` is `Copy` + `Ord`.
+**Hash maps and ordered sets.** Rust's maps cover graph hashes and clocks (`change_graph.rs:42-43`),
+counter and object indexes (`index.rs:10`, `:24`, `:78`), and mark caches (`mark_index.rs:236`).
+`MarkAcc` uses `FxHashSet` (`mark_index.rs:99-103`). Its upstream performance comment does not measure native hashers.
+`deps` needs membership (`automerge.rs:255`). Graph heads need sorted iteration and set equality (`change_graph.rs:41`, `:137`).
+The column-spec map also has ordered keys (`columns.rs:253`).
+Native container selection must preserve those ordering contracts. This survey reports no native performance comparison.
 
 **Borrowing → slices/pointers.** `Op<'a>` (`op.rs:831-844`) is a *borrowed* view: `key: KeyRef<'a>` and `value: ScalarValue<'a>` borrow from the column blobs, and `mark_name: Option<&'a str>` borrows from the `key_str`/`mark_name` column. In Zig the equivalent is a struct of `[*]const u8` + `usize` with the lifetime erased and the backing `Columns` kept alive by the caller. `Success<O>` / `Failure<E>` (`result.rs`) and `Transactable`'s `O: AsRef<ExId>` / `P: Into<Prop>` / `V: Into<ScalarValue>` generic parameters are the main porting friction: `Into<Prop>` means `put(ROOT, "k", 1)` and `put(&obj, 0, "v")` are the same method. In Zig, resolve at comptime with a tagged-union parameter: `put(obj: ExId, prop: Prop, value: ScalarValue)`, and make callers construct `Prop` explicitly, or add comptime-generic wrappers.
 
-**`impl Trait` / opaque.** `Automerge::sync(&mut self) -> impl SyncDoc + '_` (`autocommit.rs:779`) hides `SyncWrapper<'_>` (`autocommit.rs:1306-1344`), whose sole job is to call `ensure_transaction_closed()` before delegating. In Zig: a concrete `SyncWrapper` struct with a `vtable` or, better, an explicit `ensureTransactionClosed(self)` call at each call site.
+**`impl Trait` / opaque.** `AutoCommit::sync() -> impl SyncDoc + '_` (`autocommit.rs:779`) hides Rust's `SyncWrapper`.
+Native `AutoCommit.sync()` closes and returns a concrete borrowed `Sync`.
+Receive selects an inactive log during isolation (`src/autocommit.zig:375-430`).
 
 **`Arc` → refcount, `Rc` → `Rc`, interior mutability → raw pointers.** `Arc<MarkSet>` is the only `Arc` in the covered surface (`inner.rs:311`, `op_set.rs:1442`, `op.rs:1507`, `top_op.rs:68`). Interior mutability is absent — `Automerge`, `OpSet`, `ChangeGraph` are all `&mut self`-mutated. The one exception is `hexane`'s column API itself, which is out of this slice.
 
@@ -1195,12 +1222,21 @@ Actor indices in a change are **remapped to change-local indices** by `ActorMapp
 
 **No clean Zig equivalent — flagged:**
 
-1. **GATs.** `OpLike::SuccIter<'b>` (`op.rs:1329-1332`) is a genuine GAT. This is the single hardest blocker in the whole slice.
-2. **`dyn` + associated types.** `Box<dyn Iterator<Item = Option<i64>> + '_>` is returned by `OpLike::succ_inc` in *all four* impls (`op.rs:511`, `:590`, `:677`, `:810`) — a boxed trait object combined with a lifetime, on a hot path. Zig: return a small concrete `{ ptr, len }` span of `?i64` and read `inc_values` directly; this is a behaviour-preserving change but it changes the shape of the interface.
+1. **GATs.** Rust `OpLike::SuccIter<'b>` has no direct Zig lifetime equivalent (`op.rs:1329-1332`).
+   The native static-arity accessor contract above replaces it.
+2. **`dyn` + associated types.** Rust `OpLike::succ_inc` returns a boxed iterator (`op.rs:511`, `:590`, `:677`, `:810`).
+   Native successor windows use caller-owned buffers and checked cursors (`src/opset/op.zig:484-502`).
 3. **`#[cfg]`-gated surface.** `slow_path_assertions` adds `assert_matches_slow` (`top_op.rs:77`), `SlowTopOpIter` (`top_op.rs:110-153`), a `seek_ops_by_index_slow` cross-check (`op_set.rs:645-650`), a `succ`-sort cross-check (`batch.rs:924-935`), and indexed-vs-walked marks cross-checks (`automerge.rs:1587`, `:1939`). These are *assertions about the fast path*, so the Zig port should keep them behind a build option and, better, make them a test target rather than a build flag. The `wasm` feature changes `CAN_OOM` (`collector.rs:997-1001`) and adds `From` impls into `wasm_bindgen::JsValue` — no Zig analogue, and a direct port must decide what "OOM during load" means (`VecEncoder::try_new` uses `try_reserve` and returns `OutOfMemory`, `collector.rs:286-292`).
-4. **Macros that expand into public API.** `impl_read_doc_for_tx!` (`transaction.rs:37-315`) and `impl_transactable_for_tx!` (`transaction.rs:317-526`) *are* the `ReadDoc` and `Transactable` implementations for `Transaction<'a>` and `OwnedTransaction`. Every method they generate is public API. In Zig the two types must implement the interface twice by hand, or the interface must be defined over a common embedded struct. The macro's own contract — the type must have `inner: Option<TransactionInner>`, a `doc` field, and a `get_scope` method (`transaction.rs:35-36`, `transaction.rs:315-317`) — is an informal structural-typing contract with no Zig equivalent.
-5. **`Send`/`Sync` bounds.** `OwnedTransaction` carries a compile-time `Send` assertion (`owned_transaction.rs:27-32`) and `AutoCommit` is asserted `Send` in a test (`autocommit.rs:1378-1383`). `Arc<MarkSet>` and `PatchLog` propagate `Send` requirements. Zig has no thread-safety type system; these assertions become documentation plus a manual audit.
-6. **Allocator-generic (`impl Allocator`) plumbing.** The Rust code is *not* allocator-generic: it uses the global allocator, `try_reserve` only in `VecEncoder::try_new`/`ProgressiveEncoder::try_new` (`collector.rs:286-292`, `:149-158`), `Vec::with_capacity` sizing off `size_of::<Option<OpBuilder>>()` (`collector.rs:140-142`), and `hexane` columns. A Zig port will *want* to add an `Allocator` parameter, which means threading one through `OpSet`, `ChangeGraph`, `ChangeQueue`, `Clock`, `MarkIndexColumn`, `SkipList`, every iterator, and `BatchApply`. That is a large, mechanical surface with real risk of missing a `toOwned`/`clone` path.
+4. **Macros that expand into public API.** Rust's `impl_read_doc_for_tx!` and `impl_transactable_for_tx!` implement both transaction forms (`transaction.rs:37-526`).
+   Native borrowed and owned transactions use the same journal engine.
+   Compile-time `ReadDoc(R)` dispatch borrows the corresponding owner (`src/transaction.zig:156-159`, `src/read.zig:2261-2274`).
+5. **`Send`/`Sync` bounds.** Rust asserts `OwnedTransaction` and `AutoCommit` are `Send` (`owned_transaction.rs:27-32`, `autocommit.rs:1378-1383`).
+   Zig has no equivalent type-system check.
+   Open native owners keep stable addresses. Closed `AutoCommit` owners can transfer ownership (`src/autocommit.zig:30-39`).
+   C callers additionally use one global serialization boundary (`src/c/result.zig:94-113`).
+6. **Allocator plumbing.** Rust uses the global allocator throughout.
+   Native loaders and savers take explicit allocators (`src/doc.zig:3794-3832`).
+   Native columns retain their allocator for owned storage (`src/hexane/column.zig:3303-3308`).
 7. **`serde` derive surface.** `ExId: Serialize` is hand-written (serialises to a string, `exid.rs:170-175`); `ActorId` has `#[derive(…)]` plus a manual `Debug` (`types.rs:44-48`); `ChangeMetadata`, `SaveOptions`, `LoadOptions`, `Value`, `Prop` all have derive surface. `LoadOptions` has private fields and a builder API (`automerge.rs:91-171`) — in Zig, an options struct with a public builder function chain.
 8. **`no_std`.** Not applicable as written — the crate uses `std` throughout (`std::collections`, `std::time`, `getrandom`, `sha2`). A `no_std` port is a separate project.
 
@@ -1226,8 +1262,13 @@ Actor indices in a change are **remapped to change-local indices** by `ActorMapp
 
 **Counter increments and `normalize_increment_successors` are applied at two different points with two different sources of truth.** In `BatchApply`, incoming change ops are normalised against the *op's own declared value* (`batch.rs:274-278`, `:432-437`) while document ops are normalised against the *document op's* value (`batch.rs:70-74`, `:492-504`). Getting these backwards silently changes counter merge results.
 
-**`FxHashSet` in `MarkAcc` is load-bearing for performance.** `mark_index.rs:101-102` documents a 3-5× per-hash speedup from `rustc_hash` on 8-byte `OpId` keys. Zig's default hasher will regress mark-heavy workloads; the comment implies this was measured. A port that uses `std.AutoHashMap`-backed sets will pass correctness tests and be measurably slower — which matters because mark index code is on the text-rendering hot path.
+**Hasher performance requires measurement.** Rust's `mark_index.rs:101-102` comment reports a 3-5× per-hash `rustc_hash` improvement.
+That comment does not measure native mark-heavy workloads or compare native hashers.
+No native speedup or regression follows from the comment alone.
 
-**`hexane` is a separate 33k-line crate.** Every column type used here — `Column`, `DeltaColumn`, `PrefixColumn`, `RawColumn`, `RleEncoding`, `PrefixValue`, `PackError`, `Run`, `BoolColumnSkipper`, `Iter`, `DeltaIter`, `PrefixIter` — is external. The `OpSet` is not a `std`-data-structure design at all; it is a run-length-encoded column store with prefix sums, and a Zig port that models it as `[]struct { … }` will be an order of magnitude slower and will not reproduce the `save()` bytes. The port plan must budget for `hexane` as a first-class sub-project.
+**`hexane` is the upstream column-storage engine, not an optional row-array replacement.**
+Its codecs, prefix sums, and edit indexes define the wire format.
+The native repository implements those column interfaces under `src/hexane/`.
+This source mapping makes no claim about an unmeasured performance ratio or identical compressed save bytes.
 
 **Unverifiable without running the code.** The following claims in this survey are read off the source and not executed: that `OpSet::splice`'s 19-column lockstep splice is correct for all prefix columns; that `Untangler::finish`'s `assert!(entry.is_empty())` and `assert_eq!(self.top, Top::Nothing)` never fire in production; that `BatchApply::insert_runs_of_ops`'s `shift` arithmetic is right for interleaved object runs; that `MarkOrderValidator` is the complete set of mark-order invariants the loader enforces; that `ChangeGraph::add_changes`' `debug_assert_eq!(seq_index[actor].len() + 1, change.seq())` cannot be violated by a hostile change stream that arrives topologically sorted but with a *gap* (it can — a change with `seq = 3` arriving before `seq = 2` for a brand-new actor passes the queue's Kahn test only if `seq = 2` is present as a dep, which `add_change` checks, so the gap case is caught by `MissingDep` rather than the assert; this reasoning is `[INFERENCE]`). Each of these is a place where a Zig port that "looks right" can be wrong in a way no signature-level review catches.

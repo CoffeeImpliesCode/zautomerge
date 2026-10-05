@@ -669,6 +669,7 @@ pub fn MergeIter(comptime I: type, comptime J: type) type {
 pub fn SkipIter(comptime Item: type, comptime Q: type, comptime S: type) type {
     return struct {
         const Self = @This();
+        const ShiftCursorError = if (@hasDecl(Q, "shift")) errSetOf(Q, "shift") else error{};
 
         /// The rows, thinned (`iter/tools.rs:141-142`).
         iter: Q,
@@ -765,7 +766,7 @@ pub fn SkipIter(comptime Item: type, comptime Q: type, comptime S: type) type {
         /// So the pair is repositioned only by [`shiftNext`](SkipIter.shiftNext)
         /// below, and this one is a reposition of the row cursor alone:
         /// `pos()` afterwards is the kernel's.
-        pub fn shift(self: *Self, rows: RowRange) !void {
+        pub fn shift(self: *Self, rows: RowRange) ShiftCursorError!void {
             return self.iter.shift(rows);
         }
 
@@ -985,6 +986,7 @@ pub fn DiffSkipper(comptime S: type) type {
 pub fn DiffKernel(comptime Item: type, comptime Q: type, comptime S: type) type {
     return struct {
         const Self = @This();
+        const ShiftCursorError = if (@hasDecl(Q, "shift")) errSetOf(Q, "shift") else error{};
 
         /// One row of the diff: what happened, and the row
         /// (`(Diff, I::Item)`, `iter/tools.rs:596-608`).
@@ -1080,11 +1082,11 @@ pub fn DiffKernel(comptime Item: type, comptime Q: type, comptime S: type) type 
             return self.iter.advanceBy(amount);
         }
 
-        /// Moves the walk's **window** to `rows` and nothing else; the skipper
-        /// is repositioned by [`shiftNext`], which is the pairing
-        /// [`SkipIter.shift`] documents.
-        pub fn shift(self: *Self, rows: RowRange) void {
-            self.iter.shift(rows);
+        /// Moves the row cursor onto `rows`, propagating its exact shift
+        /// error set. The skipper is untouched until [`shiftNext`], which
+        /// is the pairing [`SkipIter.shift`] documents.
+        pub fn shift(self: *Self, rows: RowRange) ShiftCursorError!void {
+            return self.iter.shift(rows);
         }
 
         /// Repositions the walk onto `rows` and reads the first changed row in
@@ -2323,9 +2325,13 @@ const PairWalk = struct {
     pub fn advanceBy(self: *PairWalk, amount: usize) ParseError!void {
         return self.advanceTo(self.pos() +| amount);
     }
-    pub fn shift(self: *PairWalk, rows: RowRange) void {
-        self.values.shift(rows);
-        self.actions.shift(rows);
+    pub fn shift(self: *PairWalk, rows: RowRange) ParseError!void {
+        var values = self.values;
+        var actions = self.actions;
+        try values.shift(rows);
+        try actions.shift(rows);
+        self.values = values;
+        self.actions = actions;
     }
     pub fn seekTo(self: *PairWalk, at: usize) ParseError!?Pair {
         const row = (try self.values.seekTo(at)) orelse return null;
@@ -2348,6 +2354,27 @@ const PairWalk = struct {
         return .{ .row = row, .action = action % 2 == 0 };
     }
 };
+
+test "a shifted multi-column diff yields the requested row tuple" {
+    // Ordinary reads after a shift must observe both columns on the new row.
+    const gpa = testing.allocator;
+    const flags = [_]bool{true} ** 4;
+    var values = try buildValues(gpa, flags.len);
+    defer values.deinit();
+    var kept = try buildFlags(gpa, &flags);
+    defer kept.deinit();
+    var it = DiffKernel(Pair, PairWalk, BoolSkipper).initCurrent(
+        PairWalk.init(try values.iterator(), try values.iterator()),
+        try skipperOver(&kept, flags.len),
+    );
+    try it.shift(.{ .start = 2, .end = 4 });
+    const first = (try it.next()).?;
+    try testing.expectEqual(Diff.add, first.diff);
+    try testing.expectEqual(Pair{ .row = 2, .action = true }, first.item);
+    const second = (try it.next()).?;
+    try testing.expectEqual(Pair{ .row = 3, .action = false }, second.item);
+    try testing.expect((try it.next()) == null);
+}
 
 test "a diff over a multi-column walk is the same type as one over a single column" {
     // Upstream instantiates the kernel over both a single-column walk

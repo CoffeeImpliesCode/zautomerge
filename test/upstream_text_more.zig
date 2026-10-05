@@ -80,6 +80,7 @@ const io = std.testing.io;
 const Allocator = std.mem.Allocator;
 
 const Document = am.doc.Document;
+const AutoCommit = am.AutoCommit;
 const Change = am.change_record.Change;
 const ExId = am.ExId;
 const ObjType = am.ObjType;
@@ -91,8 +92,7 @@ const TextEncoding = am.TextEncoding;
 const Patch = am.patches.Patch;
 const Mirror = am.hydrate.Value;
 const Span = am.iter.spans.Span;
-const Tx = am.manual_transaction.Transaction;
-const trans = am.transaction;
+const SpanInput = am.iter.spans.SpanInput;
 
 /// The document root, [`automerge::ROOT`](../src/root.zig).
 const root: ExId = am.root;
@@ -180,10 +180,11 @@ fn blockWidth(enc: TextEncoding) usize {
 /// renumbered every actor index at and above it — and the text object's id,
 /// read out before the transaction was opened, then named a different actor
 /// and [`Document.objectType`](doc.zig:4306-4310) answered `error.NotAnObject`.
-fn newDoc(enc: TextEncoding, actor: []const u8, mode: am.doc.Mode) !Document {
-    var doc = try Document.initWithEncoding(gpa, io, enc, mode);
+/// Returns a closed owner, which can move into its fixture's final address.
+fn newDoc(enc: TextEncoding, actor: []const u8) !AutoCommit {
+    var doc = try AutoCommit.initWithEncoding(gpa, io, enc);
     errdefer doc.deinit();
-    doc.setActorId(.{ .bytes = actor });
+    try doc.setActorId(.{ .bytes = actor });
     return doc;
 }
 
@@ -230,127 +231,34 @@ const legacy_weird_actor = HexActor("bbbbbb");
 /// `text.rs:877`'s `ActorId::from_str("aaaaaa")`, the three bytes `aa aa aa`.
 const ACTOR_SIX = HexActor("aaaaaa");
 
-/// Writes `key` → a text object holding `body`, in **one** transaction, and
-/// commits it.
-///
-/// **One transaction, because upstream's `AutoCommit` holds one open
-/// transaction** ([`automerge.rs`:307-317](../github-automerge-automerge/rust/automerge/src/automerge.rs))
-/// and `text.rs:892-893` relies on it: `put_object` then `splice_text` into
-/// the object it just made, with `isolate` in force. That object is not in any
-/// change yet, so `exid_to_obj` reaches for its escape hatch —
-/// [`inner.rs`:107-122](../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)
-/// and its `created_in_transaction` test — which only a **still-open**
-/// transaction can satisfy. This port's [`transact`](src/transact.zig) free
-/// functions **commit each call** ([`openAuto`](src/transact.zig)), so
-/// `put_object` is already a change by the time `splice_text` opens its own
-/// transaction and the escape hatch is closed: [`Transaction.exidToObj`](../src/transact.zig)
-/// answers `error.InvalidObjId`, because the isolated clock at `beginning` —
-/// the empty head list of an empty document — contains nothing at all.
-///
-/// **The transaction is opened at the document's isolation, and that is what
-/// makes the port's document the reference's document.** Upstream has one
-/// door: `AutoCommit` *is* the isolation
-/// ([`autocommit.rs`:433-443](../github-automerge-automerge/rust/automerge/src/autocommit.rs)),
-/// and every operation reaches `Automerge::transaction_args` through
-/// `AutoCommit::ensure_transaction_open`, which passes
-/// `self.isolation.as_deref()` (`:447`). That function's `Some(heads)` arm sets
-/// `deps = heads.to_vec()`
-/// ([`automerge.rs`:539-540](../github-automerge-automerge/rust/automerge/src/automerge.rs))
-/// **and** picks the transaction's actor through `isolate_actor`
-/// ([`:1259-1281`](../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-/// which mints a `with_concurrency` fork of the actor
-/// ([`types.rs:78-85`](../github-automerge-automerge/rust/automerge/src/types.rs))
-/// whenever the clock at `heads` does not cover what that actor has already
-/// written. **The isolated heads are the change's dependencies and choose its
-/// actor, and nothing else supplies them.**
-///
-/// The port has two doors and both are faithful to a *different* upstream one.
-/// [`openAuto`](src/transact.zig) and [`openAutoHeld`](src/transact.zig) read
-/// `doc.isolationHeads()` and are `AutoCommit`'s;
-/// [`Transaction.open`](../src/transact.zig) and
-/// [`Transaction.openAt`](../src/transact.zig) are `Automerge::transaction`
-/// and `Automerge::transaction_at`
-/// ([`automerge.rs`:476-480](../github-automerge-automerge/rust/automerge/src/automerge.rs) and
-/// [`:501-509`](../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-/// the low-level pair, and their `heads` argument is **only** the scope clock.
-/// A `null` there means "unscoped, the present document", which is exactly what
-/// it says — and it is the right answer for [`Automerge::transaction`], which
-/// is reached on a document that has no isolation to read.
-///
-/// **This helper passed `null` under an isolation in force, and that was the
-/// defect — three patches short of the reference's seven, and every one of them
-/// a patch that mentions `color`.** An unscoped transaction takes the base
-/// actor and the current heads as its dependencies, so the second `"color"`
-/// change came out *depending on* the first one instead of beside it, the
-/// document never held the concurrent pair the case is about, and
-/// `isolate_actor` never ran at all. The recorded stream says the same thing
-/// from the other end: the oracle's `text-isolate-incremental` `actions`
-/// re-emit `name` and its hundred-character splice (patches 5 and 6), which a
-/// diff between the mirror and the integrated document cannot contain, because
-/// `name` is identical at both ends. Only a patch *log*, fed by a change
-/// concurrent with the `name` change, produces them.
-///
-/// `integrate` is [`Document.integrate`](../src/doc.zig), upstream's
-/// [`autocommit.rs`:439-443](../github-automerge-automerge/rust/automerge/src/autocommit.rs),
-/// and it runs on every path out because upstream's `isolate`/`integrate` are
-/// a pair around the writes (`text.rs:891`, `:894`, `:906`, `:910`).
-///
-/// **The integration is an explicit `try` on the way out and an `errdefer` on
-/// the way back, and never a `defer`** — and that is the one place in this
-/// file where the port's signature forces a shape upstream does not have.
-/// Upstream's `AutoCommit::integrate` returns `()` because upstream's
-/// `PatchLog` reports failure by panicking
-/// ([`patch_log.rs`:293](../github-automerge-automerge/rust/automerge/src/patches/patch_log.rs)
-/// carries the `.expect`); this port's is `DiffError!void` because
-/// [`Document.integrate`](../src/doc.zig) replays a view transition, and a
-/// `defer` cannot take a `try`.
-///
-/// **So the error is returned wherever a return is still open** — the
-/// succeeding path, and the failing path whenever the body itself succeeded —
-/// and is **printed, not dropped**, on the one path where the caller is already
-/// receiving a different error. A swallowed refusal here is a document left
-/// isolated with no transition recorded, which is the defect this helper
-/// exists to exercise, so it is named rather than hidden.
+/// Writes the reference's held automatic text group. Initial writes stay
+/// pending; isolated groups close before integration (`text.rs`:886-910).
 fn putTextIn(
-    doc: *Document,
+    doc: *AutoCommit,
     heads: ?[]const ChangeHash,
     key: []const u8,
     body: []const u8,
 ) !ExId {
     if (heads) |at| try doc.isolate(gpa, at);
-    errdefer doc.integrate() catch |e| std.debug.print(
-        "putTextIn: the body failed and the view transition out of the isolation failed as well: {s}\n",
-        .{@errorName(e)},
-    );
-    var tx = try Tx.openAt(gpa, doc, doc.isolationHeads());
-    defer tx.deinit();
-    const id = try tx.putObject(root, .{ .key = key }, .text);
-    try tx.spliceText(id, 0, 0, body);
-    _ = try tx.commit(null, null);
-    try doc.integrate();
+    const id = try doc.putObject(root, .{ .key = key }, .text);
+    try doc.spliceText(id, 0, 0, body);
+    if (heads != null) {
+        _ = try doc.commit();
+        try doc.integrate();
+    }
     return id;
 }
 
 /// The heads of `doc`. **The caller frees the result**
 /// ([`Document.getHeads`](../src/doc.zig) returns a copy, because the graph's
 /// own list moves under the next change).
-fn headsOf(doc: *const Document) ![]ChangeHash {
+fn headsOf(doc: anytype) ![]ChangeHash {
     return doc.getHeads(gpa);
 }
 
-/// The materialized root at `heads`, or at the present when `heads` is null.
-///
-/// The port reaches [`Automerge::hydrate`](../src/doc.zig) through
-/// [`hydrate.hydrateMap`](../src/hydrate.zig), which takes the op set and an
-/// optional clock rather than a document. A historical read needs the clock its
-/// heads name ([`Document.clockAtHeads`](../src/doc.zig)).
-fn hydrateAt(doc: *Document, heads: ?[]const ChangeHash) !Mirror {
-    if (heads) |h| {
-        var clock = try doc.graph.clockAt(gpa, h);
-        defer clock.deinit();
-        return am.hydrate.hydrateMap(am.doc.Set, &doc.ops, gpa, root, clock);
-    }
-    return am.hydrate.hydrateMap(am.doc.Set, &doc.ops, gpa, root, null);
+/// The materialized root at `heads`, or the raw current view for null heads.
+fn hydrateAt(doc: *AutoCommit, heads: ?[]const ChangeHash) !Mirror {
+    return doc.hydrate(root, heads, gpa);
 }
 
 /// Applies a patch stream to a mirror and requires the whole stream to apply:
@@ -371,47 +279,29 @@ fn applyPatches(mirror: *Mirror, enc: TextEncoding, patches: []const Patch) !voi
     }
 }
 
-/// Fills a block marker with the three keys upstream's `hydrate_map!` writes,
-/// in the operations that method writes (`text.rs`:355-364, `:367-376`).
-///
-/// **Three explicit operations and not [`transact.updateObject`], and the
-/// reason is a port gap rather than a preference.** Upstream's
-/// `update_object` dispatches on the *kind* of every nested value —
-/// [`inner.rs`:1213-1245](../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)
-/// sends a `List` to `update_list` and a `Text` to `myers_diff` — while this
-/// port's `Transaction.updateValue`
-/// ([`transact.zig`](../src/transact.zig)) has arms for **`.map` only** and
-/// answers `error.NotAnObject` for a list or a text value. Upstream's own
-/// block literal here carries `"parents" => hydrate_list![]`, so the faithful
-/// call is refused.
-///
-/// **`parents` is an empty map and not upstream's empty list, and that is a
-/// port gap rather than a choice.** Upstream's literal is
-/// `"parents" => hydrate_list![]` (`text.rs`:359, `:370`), and this port
-/// refuses it: [`Transaction.updateValue`](../src/transact.zig) has arms for
-/// **`.map` only** and answers `error.NotAnObject` for a list or a text value,
-/// where upstream dispatches on the kind of every nested value —
-/// [`inner.rs`:1213-1245](../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)
-/// sends a `List` to `update_list` and a `Text` to `myers_diff`.
-///
-/// **The gap is not confined to a call this test chooses to make.** It is also
-/// reached from *inside* `updateSpans`, on the path
-/// `myersBlockDiff` → `insert` → `splitBlock` → `sink.updateMap` →
-/// `updateMapValue` → `updateValue`
-/// ([`textdiff.zig`:961, :884](../src/textdiff.zig)), which is the failure this
-/// test first produced: `error.NotAnObject` out of
-/// [`transact.zig`:1636](../src/transact.zig). **So no spelling of this
-/// fixture escapes it while a block holds a list**, and the fix is three arms
-/// in `updateValue`, not anything here.
-///
-/// An empty map carries no entries for a block diff to lose, and **none of the
-/// assertions below reads a block's contents**: the span walk is asked for its
-/// shape, the length for a number, the mark runs for a count and the patch for
-/// its marks. The rest of the fixture is upstream's, operation for operation.
-fn blockShape(doc: *Document, block: ExId, kind: []const u8) !void {
-    _ = try trans.put(doc, block, .{ .key = "type" }, .{ .str = kind });
-    _ = try trans.putObject(doc, block, .{ .key = "parents" }, .map);
-    _ = try trans.putObject(doc, block, .{ .key = "attrs" }, .map);
+/// A fresh caller-owned block literal matching `text.rs`:355-376.
+fn blockMap(kind: []const u8) !am.hydrate.Map {
+    var map = am.hydrate.Map.init(gpa, root);
+    errdefer map.deinit();
+    try map.putOwned("type", .init(.{ .str = kind }, false));
+    {
+        var parents = Mirror.list(gpa);
+        errdefer parents.deinit();
+        try map.putOwned("parents", .init(parents, false));
+    }
+    {
+        var attrs = Mirror.map(gpa);
+        errdefer attrs.deinit();
+        try map.putOwned("attrs", .init(attrs, false));
+    }
+    return map;
+}
+
+/// Borrows the hydrated literal only for the write.
+fn blockShape(doc: *AutoCommit, block: ExId, kind: []const u8) !void {
+    var value: Mirror = .{ .object = .{ .map = try blockMap(kind) } };
+    defer value.deinit();
+    try doc.updateObject(block, &value);
 }
 
 /// Asserts that `got` is exactly `want`, printing both on a mismatch so a
@@ -446,13 +336,17 @@ fn expectLen(got: usize, want: usize, enc: TextEncoding) !void {
 /// and this does not, so what a consumer compares is the *content* of each
 /// line — the object, the index, the value and the marks — which is the same
 /// question either format answers.
-fn showPatches(patches: []const Patch) void {
+fn showPatches(patches: []const Patch) !void {
     for (patches, 0..) |p, i| {
         switch (p.action) {
-            .splice_text => |s| std.debug.print(
-                "    patch {d}: SpliceText {{ index: {d}, value: \"{s}\", marks: {s} }}\n",
-                .{ i, s.index, s.value.asStr(), if (s.marks == null) "none" else "some" },
-            ),
+            .splice_text => |s| {
+                const text = try s.value.makeString(gpa);
+                defer gpa.free(text);
+                std.debug.print(
+                    "    patch {d}: SpliceText {{ index: {d}, value: \"{s}\", marks: {s} }}\n",
+                    .{ i, s.index, text, if (s.marks == null) "none" else "some" },
+                );
+            },
             .put_map => |m| std.debug.print(
                 "    patch {d}: PutMap {{ key: \"{s}\", conflict: {} }}\n",
                 .{ i, m.key, m.conflict },
@@ -552,24 +446,23 @@ test "text: a zero-width noexpand mark leaves the splices after it unmarked in e
             .grapheme_cluster = 9,
         };
 
-        var doc = try newDoc(enc, &ACTOR_A.bytes, .auto);
+        var doc = try newDoc(enc, &ACTOR_A.bytes);
         defer doc.deinit();
-        const text = try trans.putObject(&doc, root, .{ .key = "text" }, .text);
+        const text = try doc.putObject(root, .{ .key = "text" }, .text);
         try checkShape(&doc, text, enc);
 
         // **The first block, cut at zero and filled in** (`text.rs:354-364`).
-        const block1 = try trans.splitBlock(&doc, text, 0);
+        const block1 = try doc.splitBlock(text, 0);
         try blockShape(&doc, block1, "heading");
 
-        try trans.spliceText(&doc, text, first.pick(enc), 0, "Heading");
-        const block2 = try trans.splitBlock(&doc, text, second.pick(enc));
+        try doc.spliceText(text, first.pick(enc), 0, "Heading");
+        const block2 = try doc.splitBlock(text, second.pick(enc));
         try blockShape(&doc, block2, "paragraph");
-        try trans.spliceText(&doc, text, para.pick(enc), 0, "a");
+        try doc.spliceText(text, para.pick(enc), 0, "a");
 
         // **The mark covers nothing** (`text.rs:378-383`): `ExpandMark::None`
         // with `start == end`.
-        try trans.mark(
-            &doc,
+        try doc.mark(
             text,
             para.pick(enc),
             para.pick(enc),
@@ -589,10 +482,12 @@ test "text: a zero-width noexpand mark leaves the splices after it unmarked in e
                 for (walked.items) |*s| s.deinit(gpa);
                 walked.deinit(gpa);
             }
-            var span_walk = try am.read.spans(&doc, text, gpa);
+            var span_walk = try doc.spans(text, gpa);
             defer span_walk.deinit();
             while (try span_walk.next()) |found| {
-                try walked.append(gpa, found);
+                var owned = found;
+                errdefer owned.deinit(gpa);
+                try walked.append(gpa, owned);
             }
             try expectSpanShape(enc, walked.items, &.{
                 .{ .block = true },
@@ -601,34 +496,31 @@ test "text: a zero-width noexpand mark leaves the splices after it unmarked in e
                 .{ .text = "a" },
             });
 
-            // **`update_spans` over the walk plus one more block**
-            // (`text.rs:385-394`). The port's [`Span`] carries the block's
-            // `ExId` rather than a hydrated map
-            // ([`iter/spans.zig`](src/iter/spans.zig): `block: ExId`), so the
-            // appended block is an object the document already holds — which
-            // is the document the reference reaches too, because
-            // `text_diff.rs` compares blocks **by content**
-            // ([`transact.zig`](src/transact.zig): `Block.eql`) and the
-            // appended paragraph is content-equal to `block2`.
-            //
-            // **The spans are copied into a second list, by value, and that
-            // list owns nothing.** `updateSpans` takes `[]const Span` and
-            // reads `text` and `marks` out of each element without taking
-            // ownership ([`transact.zig`](../src/transact.zig)), so a shallow
-            // copy is a borrow and the one owner — `walked` — frees once.
-            var shapes: std.ArrayList(Span) = .empty;
+            // Borrow detached output maps and text for this call, then append
+            // a fresh paragraph literal (`text.rs`:385-394), not an object ID.
+            var paragraph = try blockMap("paragraph");
+            defer paragraph.deinit();
+            var shapes: std.ArrayList(SpanInput) = .empty;
             defer shapes.deinit(gpa);
-            for (walked.items) |s| try shapes.append(gpa, s);
-            try shapes.append(gpa, .{ .block = block2 });
-            try trans.updateSpans(&doc, text, shapes.items);
+            for (walked.items) |*s| {
+                try shapes.append(gpa, switch (s.*) {
+                    .block => |*map| .{ .block = map },
+                    .text => |*t| .{ .text = .{
+                        .text = t.text,
+                        .marks = if (t.marks) |*set| set else null,
+                    } },
+                });
+            }
+            try shapes.append(gpa, .{ .block = &paragraph });
+            try doc.updateSpans(text, shapes.items);
         }
 
-        try expectLen(try am.read.length(&doc, text), after_spans.pick(enc), enc);
+        try expectLen(try doc.length(text), after_spans.pick(enc), enc);
 
         // **The mark covers nothing after the rewrite either.** This is the
         // property, read back from the document rather than inferred from the
         // patch that follows.
-        const runs = try am.read.marks(&doc, text, gpa);
+        const runs = try doc.marks(text, gpa);
         defer gpa.free(runs);
         if (runs.len != 0) {
             std.debug.print("encoding {s}: {d} mark run(s) after the rewrite, want none\n", .{
@@ -644,7 +536,7 @@ test "text: a zero-width noexpand mark leaves the splices after it unmarked in e
         // **The single patch, and its marks** (`text.rs:400-414`).
         const before = try headsOf(&doc);
         defer gpa.free(before);
-        try trans.spliceText(&doc, text, after_spans.pick(enc), 0, "a");
+        try doc.spliceText(text, after_spans.pick(enc), 0, "a");
         const after = try headsOf(&doc);
         defer gpa.free(after);
         var patches = try doc.diff(gpa, before, after);
@@ -654,7 +546,7 @@ test "text: a zero-width noexpand mark leaves the splices after it unmarked in e
                 @tagName(enc),
                 patches.len(),
             });
-            showPatches(patches.slice());
+            try showPatches(patches.slice());
             return error.TestExpectedEqual;
         }
         const one = patches.slice()[0];
@@ -665,7 +557,7 @@ test "text: a zero-width noexpand mark leaves the splices after it unmarked in e
                     @tagName(enc),
                     @tagName(one.action),
                 });
-                showPatches(patches.slice());
+                try showPatches(patches.slice());
                 return error.TestExpectedEqual;
             },
         };
@@ -675,13 +567,15 @@ test "text: a zero-width noexpand mark leaves the splices after it unmarked in e
                 splice.index,
                 after_spans.pick(enc),
             });
-            showPatches(patches.slice());
+            try showPatches(patches.slice());
             return error.TestExpectedEqual;
         }
-        try expectText(splice.value.asStr(), "a", enc);
+        const splice_text = try splice.value.makeString(gpa);
+        defer gpa.free(splice_text);
+        try expectText(splice_text, "a", enc);
         if (splice.marks != null) {
             std.debug.print("encoding {s}: the splice carries marks, want none\n", .{@tagName(enc)});
-            showPatches(patches.slice());
+            try showPatches(patches.slice());
             return error.TestExpectedEqual;
         }
     }
@@ -738,7 +632,7 @@ fn shapeName(s: Shape) []const u8 {
 /// argument is [`src/read.zig`](../src/read.zig)'s `checkPremises` makes, and
 /// for the same reason — a mark fixture that is one row out of order is green
 /// and meaningless — with the row-order invariant on top of these three.
-fn checkShape(doc: *const Document, obj: ?ExId, enc: TextEncoding) !void {
+fn checkShape(doc: anytype, obj: ?ExId, enc: TextEncoding) !void {
     const got = doc.textEncoding();
     if (got != enc) {
         std.debug.print("encoding {s}: the document answers {s}\n", .{ @tagName(enc), @tagName(got) });
@@ -808,7 +702,7 @@ test "text: a patch stream over an isolate round trip reconstructs the integrate
     const num_chars_in_new_name = 100;
 
     for (all_encodings) |enc| {
-        var doc = try newDoc(enc, &ACTOR_SIX.bytes, .manual);
+        var doc = try newDoc(enc, &ACTOR_SIX.bytes);
         defer doc.deinit();
         try checkShape(&doc, null, enc);
 
@@ -833,25 +727,15 @@ test "text: a patch stream over an isolate round trip reconstructs the integrate
 
         // **The drain** (`text.rs:897-901`).
         //
-        // **Upstream's `doc.commit()` at `text.rs:901` is an *empty* commit
-        // and this test has no step for it, because the port cannot make one.**
-        // Upstream's `commit_with` opens a transaction if there is none
-        // ("ensure that even no changes triggers a change",
-        // [`autocommit.rs`:728-731](../github-automerge-automerge/rust/automerge/src/autocommit.rs)),
-        // so `commit()` after a drained log writes a change with no ops; this
-        // port's [`Transaction.commit`](src/transact.zig) answers `null` and
-        // drops the actor when `pending` is empty instead. It carries no
-        // patches, so it moves the heads and the actor chain and nothing else;
-        // the oracle runs it (`tools/oracle/src/main.rs:1631`,
-        // `commit_with(commit_options("isolate"))`) and reports the same **7**
-        // actions without it being one of them.
-        //
+        // Preserve the oracle's explicit clean-log commit after the drain
+        // (`tools/oracle/src/main.rs`:2371-2372).
         // The patches are popped, which is what "necessary to make the test
         // work" (`text.rs:897`) means: [`Document.diffIncremental`] finishes
         // by moving the cursor to the present, so the second stream starts
         // from the mirror's heads rather than from the beginning of history.
         var drained = try doc.diffIncremental(gpa);
         drained.deinit();
+        _ = try doc.commitWith(.{ .message = "isolate", .time = 0 });
 
         // **The mirror, taken before the second change** (`text.rs:903`), and
         // the heads it was taken at, which is the range the stream below runs
@@ -916,14 +800,10 @@ test "text: a patch stream over an isolate round trip reconstructs the integrate
         // **`integrate()` is not a no-op, and the reason is one hash.** After
         // `commit_with` the isolation is `Some([that change])`
         // ([`autocommit.rs`:735-736](../github-automerge-automerge/rust/automerge/src/autocommit.rs))
-        // while the graph holds three heads — the `color=red` change, the
-        // empty commit and the `color=unset` change, none of which depends on
-        // another — so `patch_to`'s `before != after` test fires
-        // ([`:819`](../github-automerge-automerge/rust/automerge/src/autocommit.rs)) and the walk from
-        // one head to three brings the other two in. **It is that walk which
-        // sees `color` twice over and raises the conflict at index 4**; nothing
-        // else in the run can, because no other read of `color` is over a
-        // clock that covers both of its `put`s.
+        // while the integrated graph also contains the concurrent name and
+        // earlier color branches. The transition back to that full view
+        // (`autocommit.rs`:819) sees both color values and emits the conflict
+        // at index 4, followed by the name object and its text.
         //
         // **What the port emitted before, and why it was three short.** With
         // [`Document.patchTo`] already wired into both
@@ -966,7 +846,7 @@ test "text: a patch stream over an isolate round trip reconstructs the integrate
             std.debug.print("encoding {s}: the stream did not reconstruct the document\n", .{
                 @tagName(enc),
             });
-            showPatches(patches.slice());
+            try showPatches(patches.slice());
             return error.TestExpectedEqual;
         }
 
@@ -1034,7 +914,7 @@ fn expectIsolateStream(enc: TextEncoding, got: []const Patch) !void {
 
     if (got.len != want.len) {
         std.debug.print("encoding {s}: {d} patches, want {d}\n", .{ @tagName(enc), got.len, want.len });
-        showPatches(got);
+        try showPatches(got);
         return error.TestExpectedEqual;
     }
     for (got, want, 0..) |p, w, i| {
@@ -1054,7 +934,11 @@ fn expectIsolateStream(enc: TextEncoding, got: []const Patch) !void {
                 else => false,
             },
             .splice_text => |s| switch (w) {
-                .splice => |sp| std.mem.eql(u8, s.value.asStr(), sp.text) and (s.marks != null) == sp.marks,
+                .splice => |sp| blk: {
+                    const text = try s.value.makeString(gpa);
+                    defer gpa.free(text);
+                    break :blk std.mem.eql(u8, text, sp.text) and (s.marks != null) == sp.marks;
+                },
                 else => false,
             },
             .conflict => |c| switch (w) {
@@ -1070,7 +954,7 @@ fn expectIsolateStream(enc: TextEncoding, got: []const Patch) !void {
                 @tagName(p.action),
                 stepName(w),
             });
-            showPatches(got);
+            try showPatches(got);
             return error.TestExpectedEqual;
         }
     }
@@ -1168,7 +1052,7 @@ const legacy_weird_hex =
 
 /// A document holding `ABBBBB￼C` — the state `text.rs`:1004 asserts.
 const LegacyDoc = struct {
-    doc: Document,
+    doc: AutoCommit,
     text: ExId,
 
     fn deinit(self: *LegacyDoc) void {
@@ -1190,7 +1074,7 @@ const LegacyDoc = struct {
 /// actor as the ops they land next to. A different actor would renumber the op
 /// ids and change the conflict order.
 fn legacyFixture(enc: TextEncoding) !LegacyDoc {
-    var doc = try newDoc(enc, &ACTOR_A.bytes, .auto);
+    var doc = try newDoc(enc, &ACTOR_A.bytes);
     errdefer doc.deinit();
     var parent = try parseHex(legacy_parent_hex);
     defer parent.deinit();
@@ -1211,7 +1095,7 @@ fn legacyFixture(enc: TextEncoding) !LegacyDoc {
 
     // The text object the parent change created, named the way the reference
     // names it: `put_object(ROOT, "text", Text)` (`text.rs:953`).
-    const item = (try am.read.get(&doc, root, .{ .key = "text" })) orelse
+    const item = (try doc.get(root, .{ .key = "text" })) orelse
         return error.NoSuchKey;
     const text = switch (item.value) {
         // **The object's id is `DocItem.id`, not the object arm's payload**:
@@ -1223,6 +1107,7 @@ fn legacyFixture(enc: TextEncoding) !LegacyDoc {
         .scalar => return error.NotAnObject,
     };
     try checkShape(&doc, text, enc);
+    // applyChanges closed the owner; ordinary inspection did not open it.
     return .{ .doc = doc, .text = text };
 }
 
@@ -1465,7 +1350,7 @@ fn legacyCase(which: LegacyCase, del: isize, insert: []const u8, want: []const u
         // **The state the fixture must be in**, before the splice, so a
         // failure in the fixture itself is not reported as a failure of the
         // rounding.
-        const before = try am.read.text(&f.doc, f.text, gpa);
+        const before = try f.doc.text(f.text, gpa);
         defer gpa.free(before);
         if (!std.mem.eql(u8, before, "ABBBBB\u{fffc}C")) {
             std.debug.print("encoding {s}: the {s} fixture holds \"{s}\", want \"ABBBBB￼C\"\n", .{
@@ -1484,14 +1369,14 @@ fn legacyCase(which: LegacyCase, del: isize, insert: []const u8, want: []const u
         // bytes — the oracle's `text-legacy-multibyte` records report the same
         // numbers, and [`blockWidth`] is where the rule is written down.
         try expectLen(
-            try am.read.length(&f.doc, f.text),
+            try f.doc.length(f.text),
             unitWidth(enc, "ABBBBB\u{fffc}C"),
             enc,
         );
 
-        try trans.spliceText(&f.doc, f.text, legacy_index, del, insert);
+        try f.doc.spliceText(f.text, legacy_index, del, insert);
 
-        const got = try am.read.text(&f.doc, f.text, gpa);
+        const got = try f.doc.text(f.text, gpa);
         defer gpa.free(got);
         if (!std.mem.eql(u8, got, want)) {
             std.debug.print("encoding {s}: the {s} case read \"{s}\", want \"{s}\"\n", .{
@@ -1512,7 +1397,7 @@ fn legacyCase(which: LegacyCase, del: isize, insert: []const u8, want: []const u
         // and seven elements**; eleven units under UTF-8 code units for the
         // insert, where the block marker survives and is three bytes wide.
         try expectLen(
-            try am.read.length(&f.doc, f.text),
+            try f.doc.length(f.text),
             unitWidth(enc, want),
             enc,
         );
@@ -1559,13 +1444,10 @@ fn unitWidth(enc: TextEncoding, s: []const u8) usize {
 //   `'￼Headi￼￼ang'`, the heading split in two, which is a question about a
 //   mid-block-byte index rather than about marks.
 //
-// * **The block in an appended span is an `ExId`, and that is a spelling.**
-//   Upstream's `Span::Block` carries a hydrated map (`spans.rs:410-417`); the
-//   port's carries the id (`iter/spans.zig`: `block: ExId`) and
-//   `Transaction.hydrateBlock` hydrates it when the diff reads it. The appended
-//   paragraph here is therefore `block2` rather than a fresh map, and the two
-//   are indistinguishable to the diff, which compares blocks **by content**
-//   (`text_diff.rs:260`, `Block.eql`).
+// * **Span outputs own hydrated maps; update inputs borrow them.** The appended
+//   paragraph is a fresh caller-owned literal, matching upstream's
+//   `Span::Block` (`spans.rs:410-417`). The diff compares blocks by content
+//   (`text_diff.rs:260`, `Block.eql`), and `parents` is an empty list.
 //
 // * **`Document.isolate` takes an allocator and `integrate` does not.**
 //   Upstream's `AutoCommit::isolate` takes `&[ChangeHash]`
@@ -1651,28 +1533,13 @@ fn unitWidth(enc: TextEncoding, s: []const u8) usize {
 //   numbers of elements — and it is now read in the document's own units
 //   under all four encodings, before and after each splice.
 //
-// * **`putTextIn` isolates with [`Document.isolate`], not with
-//   `Transaction.openAt`.** Upstream's isolate is a field on the document read
-//   back by `ensure_transaction_open` (`autocommit.rs:447`) and turned into the
-//   change's `deps` by `transaction_args`' `Some(heads)` arm
-//   (`automerge.rs:539-540`). This port splits the same way: `Document.commit`
-//   reads `self.isolation` (`doc.zig:3770`), and `openAt`'s `heads` reaches
-//   only the scope clock. Passing them to `openAt` left the isolation null, so
-//   the second `"color"` change **depended on** the `"name"` change and the
-//   document held one head where the reference holds two — and the stream a
-//   state diff cannot produce, re-emitting `name`, is what the oracle records.
+// * **`putTextIn` uses the real automatic owner.** `AutoCommit.isolate`
+//   closes the initial held group; committing the isolated group advances its
+//   view to the committed branch before `integrate` enters the full history
+//   (`autocommit.rs`:728-741). Raw transaction commit does not perform that
+//   facade transition, so it is not an equivalent route for this case.
 //
 // * **`diff_incremental` is the stream, and it is the reference's seven.**
-//   This file used to carry a bullet saying the port answered two of the seven
-//   and was **left failing on purpose**; that is no longer true and the
-//   expectation never moved — [`putTextIn`] opening the isolated transaction
-//   with [`Transaction.openAt`] on the document's *isolation heads* is what
-//   closed the gap, because that is what makes the second `"color"` change
-//   concurrent rather than sequential and gives `isolate_actor` a clock that
-//   does not cover the `"name"` change. `AutoCommit::isolate` and
-//   `AutoCommit::integrate` both call `patch_to` (`autocommit.rs:436`, `:441`),
-//   which closes the view being left and replays the one being entered
-//   (`autocommit.rs:816-824`); [`expectIsolateStream`] names all seven in
-//   order, by key and by value, because a count alone would be blind to
-//   `DeleteMap { key: "color" }` and `PutMap { key: "color", … }` having
-//   swapped.
+//   [`expectIsolateStream`] names all seven in order, by key and by value,
+//   including intermediate conflict updates. Reconstruction and final text
+//   checks remain independent assertions; matching only the count is not enough.

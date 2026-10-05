@@ -114,27 +114,14 @@
 //! with **RSS flat**, and an O(n²) shows RSS *and* a quadratic profile, which a
 //! timeout alone cannot tell apart from either.
 //!
-//! ## Change boundaries: where this file's documents differ from upstream's
+//! ## Change boundaries
 //!
-//! Upstream's `AutoCommit` opens on the first mutating call and holds it across
-//! the rest ([`autocommit.rs`:445-457](../github-automerge-automerge/rust/automerge/src/autocommit.rs));
-//! the port's [`transact.*`](../src/transact.zig) free functions each open, apply
-//! and commit. So a case whose upstream `put_object` shares a change with the
-//! write after it produces **one more change here**. **No case in this file
-//! asserts a change count, a change hash or a patch stream**, and in the two
-//! cases where upstream's comment names the change structure — `:96-97` ("This
-//! needs two committed changes") and `:195-202` — the property named survives,
-//! because the two mark operations still land in two separate changes. The
-//! diff block at the bottom says this per case.
+//! Each write below opens an explicit raw transaction and commits it. These
+//! per-operation boundaries preserve this suite's original change structure:
+//! the two mark operations in cases 4 and 7 remain separate changes.
 //!
-//! ## One gap, recorded at its own upstream line
-//!
-//! [`rescue_recovers_snapshot_from_historical_zero_width_mark_order`] is **not
-//! ported**: the port has neither [`Automerge::rescue`](../API.md) (a load that
-//! skips mark-order validation) nor a document-level `hydrate`
-//! (`API.md` § Known gaps item 5), and `src/storage/document.zig` — the
-//! reconstruct path `rescue` reaches through — is not exported by
-//! [`src/root.zig`](../src/root.zig). The gap is written out at the case.
+//! Rescue is tested through the public value-only API, alongside the strict
+//! snapshot and incremental load refusals for the same historical fixture.
 //!
 //! The leak arbiter is [`gpa`], and every owned value in this file comes out of
 //! it: every head list, every `save()` byte string, every hydrated mirror, every
@@ -226,24 +213,17 @@ const Actors = struct {
     }
 };
 
-/// [`commit_as`](https://github.com/automerge/automerge/blob/main/rust/automerge/tests/rich_text_fuzz_crash.rs)
-/// `:10-13`: set the actor, then commit.
-///
-/// **There is no `commit` here to call.** The port's autocommit door opens,
-/// writes and commits on every call ([`transact.zig`](../src/transact.zig):2581-2596),
-/// so a call to `commit_as` between two writes is exactly `setActorId` — the
-/// actor takes effect for the change the *next* write opens. This is upstream's
-/// shape and not a port decision; see the module doc on change boundaries.
+/// Sets the actor for the next explicit transaction; preceding writes have
+/// already committed and released their owned commit logs.
 fn commitAs(doc: *Document, actors: *Actors, bytes: []const u8) !void {
     doc.setActorId(try actors.intern(bytes));
 }
 
 // ── Documents ────────────────────────────────────────────────────────────────
 
-/// A document in the autocommit flavour, which is upstream's `AutoCommit` and
-/// which [`transact.*`](../src/transact.zig) requires.
+/// A raw document whose writes below use explicit transactions.
 fn newDoc(actors: *Actors) !Document {
-    var doc = try Document.init(gpa, io, .auto);
+    var doc = try Document.init(gpa, io);
     errdefer doc.deinit();
     doc.setActorId(try actors.mint());
     return doc;
@@ -259,10 +239,39 @@ fn newDoc(actors: *Actors) !Document {
 fn forkDoc(actors: *Actors, src: *Document) !Document {
     const heads = try src.getHeads(gpa);
     defer gpa.free(heads);
-    var out = try src.forkAt(gpa, heads, .auto);
+    var out = try src.forkAt(gpa, heads);
     errdefer out.deinit();
     out.setActorId(try actors.mint());
     return out;
+}
+
+const Tx = am.Transaction;
+
+fn WriteResult(comptime method: []const u8) type {
+    const return_type = @typeInfo(@TypeOf(@field(Tx, method))).@"fn".return_type.?;
+    return @typeInfo(return_type).error_union.payload;
+}
+
+/// Each operation retains the suite's original explicit change boundary.
+fn committedWrite(
+    doc: *Document,
+    comptime method: []const u8,
+    args: anytype,
+) !WriteResult(method) {
+    var tx = try Tx.open(gpa, doc);
+    defer tx.deinit() catch @panic("testing allocator cannot refuse rollback");
+    const value = try @call(.auto, @field(Tx, method), .{&tx} ++ args);
+    var committed = try tx.commit();
+    defer committed.deinit(gpa);
+    return value;
+}
+
+fn committedSplice(doc: *Document, obj: ExId, index: usize, del: isize, values: []const Mirror) !void {
+    var tx = try Tx.open(gpa, doc);
+    defer tx.deinit() catch @panic("testing allocator cannot refuse rollback");
+    try tx.splice(obj, index, del, values);
+    var committed = try tx.commit();
+    defer committed.deinit(gpa);
 }
 
 // ── Reading ──────────────────────────────────────────────────────────────────
@@ -287,9 +296,9 @@ fn spanText(doc: *const Document, obj: ExId) ![]u8 {
     var walk = try am.read.spans(doc, obj, gpa);
     defer walk.deinit();
     while (try walk.next()) |item| {
-        try out.appendSlice(gpa, item.asStr());
         var owned = item;
-        owned.deinit(gpa);
+        defer owned.deinit(gpa);
+        try out.appendSlice(gpa, owned.asStr());
     }
     return out.toOwnedSlice(gpa);
 }
@@ -333,7 +342,7 @@ fn saveLoad(doc: *Document) !Document {
 
     const bytes = try doc.save(gpa);
     defer gpa.free(bytes);
-    var loaded = try Document.load(gpa, io, bytes, .unicode_code_point, .auto);
+    var loaded = try Document.load(gpa, io, bytes, .unicode_code_point);
     errdefer loaded.deinit();
 
     var after = try am.hydrate.hydrateMap(am.doc.Set, &loaded.ops, gpa, root, null);
@@ -356,7 +365,7 @@ fn saveLoad(doc: *Document) !Document {
 fn expectReloadable(doc: *Document) !void {
     const bytes = try doc.save(gpa);
     defer gpa.free(bytes);
-    var reloaded = try Document.load(gpa, io, bytes, .unicode_code_point, .auto);
+    var reloaded = try Document.load(gpa, io, bytes, .unicode_code_point);
     reloaded.deinit();
 }
 
@@ -393,9 +402,9 @@ test "splice a scalar into a marked text object is refused by name" {
     var doc = try newDoc(&actors);
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    try am.transaction.updateText(&doc, text, "abcd");
-    try am.transaction.mark(&doc, text, 0, 4, "m", .none, .{ .bool_value = true });
+    const text = try committedWrite(&doc, "putObject", .{ root, Prop{ .key = "text" }, ObjType.text });
+    try committedWrite(&doc, "updateText", .{ text, "abcd" });
+    try committedWrite(&doc, "mark", .{ text, 0, 4, "m", ExpandMark.none, ScalarValue{ .bool_value = true } });
 
     // **A heap-allocated mirror value, not a literal**, so the refusal is
     // reached through the same door a consumer reaches it through.
@@ -404,7 +413,7 @@ test "splice a scalar into a marked text object is refused by name" {
     values[0] = .{ .int = 1 };
     try testing.expectError(
         error.InvalidValueType,
-        am.transaction.splice(&doc, text, 2, 0, gpa, values),
+        committedSplice(&doc, text, 2, 0, values),
     );
 
     const after = try readText(&doc, text);
@@ -433,14 +442,14 @@ test "splice a string into a marked text object rewrites the text" {
     var doc = try newDoc(&actors);
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    try am.transaction.updateText(&doc, text, "abcd");
-    try am.transaction.mark(&doc, text, 0, 4, "m", .none, .{ .bool_value = true });
+    const text = try committedWrite(&doc, "putObject", .{ root, Prop{ .key = "text" }, ObjType.text });
+    try committedWrite(&doc, "updateText", .{ text, "abcd" });
+    try committedWrite(&doc, "mark", .{ text, 0, 4, "m", ExpandMark.none, ScalarValue{ .bool_value = true } });
 
     const values = try gpa.alloc(Mirror, 1);
     defer gpa.free(values);
     values[0] = .{ .str = "x" };
-    try am.transaction.splice(&doc, text, 2, 0, gpa, values);
+    try committedSplice(&doc, text, 2, 0, values);
 
     const after = try readText(&doc, text);
     defer gpa.free(after);
@@ -479,12 +488,12 @@ test "a zero width unmark on an empty text object survives a sync both ways" {
     var left = try newDoc(&actors);
     defer left.deinit();
 
-    const text = try am.transaction.putObject(&left, root, .{ .key = "text" }, .text);
-    try am.transaction.unmark(&left, text, 0, 0, .after, "color", null);
+    const text = try committedWrite(&left, "putObject", .{ root, Prop{ .key = "text" }, ObjType.text });
+    try committedWrite(&left, "unmark", .{ text, 0, 0, ExpandMark.after, "color", null });
 
     var right = try forkDoc(&actors, &left);
     defer right.deinit();
-    _ = try am.transaction.put(&right, root, .{ .key = "x" }, .{ .int = 1 });
+    _ = try committedWrite(&right, "put", .{ root, Prop{ .key = "x" }, ScalarValue{ .int = 1 } });
 
     // **One exchange, in upstream's direction order**: left generates and right
     // receives, then right generates and left receives. Upstream asserts nothing
@@ -535,7 +544,7 @@ test "a zero width unmark on an empty text object survives a sync both ways" {
     // `MarkOrderValidator` accepts, which is exactly what used to panic.
     const saved = try left.save(gpa);
     defer gpa.free(saved);
-    var reloaded = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
+    var reloaded = try Document.load(gpa, io, saved, .unicode_code_point);
     reloaded.deinit();
 }
 
@@ -544,20 +553,18 @@ test "a zero width mark on an empty text object round trips through save and loa
     // `rich_text_fuzz_crash.rs:95-115`
     //
     // "This needs two committed changes: a zero-width unmark on an empty text
-    // object, then a zero-width mark on the same text" (`:96-97`). The port's
-    // autocommit door writes one change per call, so the two mark operations
-    // still land in two separate changes — see the module doc on change
-    // boundaries. Upstream's assertion is [`save_load`]: hydrate, save, load,
-    // hydrate, equal.
+    // object, then a zero-width mark on the same text" (`:96-97`). The explicit
+    // transactions below keep those operations in separate changes.
+    // Upstream's assertion is save_load: hydrate, save, load, hydrate, equal.
     var actors = Actors.init();
     defer actors.deinit();
     var doc = try newDoc(&actors);
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    try am.transaction.unmark(&doc, text, 0, 0, .after, "italic", null);
+    const text = try committedWrite(&doc, "putObject", .{ root, Prop{ .key = "text" }, ObjType.text });
+    try committedWrite(&doc, "unmark", .{ text, 0, 0, ExpandMark.after, "italic", null });
     try commitAs(&doc, &actors, &.{1});
-    try am.transaction.mark(&doc, text, 0, 0, "link", .before, .{ .bool_value = true });
+    try committedWrite(&doc, "mark", .{ text, 0, 0, "link", ExpandMark.before, ScalarValue{ .bool_value = true } });
     try commitAs(&doc, &actors, &.{1});
 
     // The oracle measured the reference reading this document back as two
@@ -596,15 +603,15 @@ test "a zero width mark does not leak into a later text object" {
     var doc = try newDoc(&actors);
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
+    const text = try committedWrite(&doc, "putObject", .{ root, Prop{ .key = "text" }, ObjType.text });
     try commitAs(&doc, &actors, &.{0});
-    try am.transaction.mark(&doc, text, 0, 0, "italic", .after, .{ .bool_value = true });
+    try committedWrite(&doc, "mark", .{ text, 0, 0, "italic", ExpandMark.after, ScalarValue{ .bool_value = true } });
     try commitAs(&doc, &actors, &.{0});
-    const other = try am.transaction.putObject(&doc, root, .{ .key = "o1" }, .text);
+    const other = try committedWrite(&doc, "putObject", .{ root, Prop{ .key = "o1" }, ObjType.text });
     try commitAs(&doc, &actors, &.{0});
-    try am.transaction.spliceText(&doc, other, 0, 0, "tsxs");
+    try committedWrite(&doc, "spliceText", .{ other, 0, 0, "tsxs" });
     try commitAs(&doc, &actors, &.{1});
-    try am.transaction.spliceText(&doc, other, 2, 0, "bbqiolaf");
+    try committedWrite(&doc, "spliceText", .{ other, 2, 0, "bbqiolaf" });
 
     // **The span list, element by element**, not the reassembled text: a leak
     // that added a mark would leave the text identical and only the marks
@@ -613,14 +620,14 @@ test "a zero width mark does not leak into a later text object" {
     defer walk.deinit();
     var spans: usize = 0;
     while (try walk.next()) |item| {
+        var owned = item;
+        defer owned.deinit(gpa);
         spans += 1;
-        switch (item) {
+        switch (owned) {
             .text => |t| try testing.expect(t.marks == null),
             .block => return error.ExpectedATextSpan,
         }
-        try testing.expectEqualStrings("tsbbqiolafxs", item.asStr());
-        var owned = item;
-        owned.deinit(gpa);
+        try testing.expectEqualStrings("tsbbqiolafxs", owned.asStr());
     }
     try testing.expectEqual(@as(usize, 1), spans);
 
@@ -654,16 +661,16 @@ test "splice text at the object's own length over a conflicted element" {
     var doc = try newDoc(&actors);
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    try am.transaction.spliceText(&doc, text, 0, 0, "a");
+    const text = try committedWrite(&doc, "putObject", .{ root, Prop{ .key = "text" }, ObjType.text });
+    try committedWrite(&doc, "spliceText", .{ text, 0, 0, "a" });
     try commitAs(&doc, &actors, &.{0});
 
     var fork = try forkDoc(&actors, &doc);
     defer fork.deinit();
-    _ = try am.transaction.put(&fork, text, .{ .index = 0 }, .{ .int = 1 });
+    _ = try committedWrite(&fork, "put", .{ text, Prop{ .index = 0 }, ScalarValue{ .int = 1 } });
     try commitAs(&fork, &actors, &.{1});
 
-    _ = try am.transaction.put(&doc, text, .{ .index = 0 }, .{ .int = 2 });
+    _ = try committedWrite(&doc, "put", .{ text, Prop{ .index = 0 }, ScalarValue{ .int = 2 } });
     try commitAs(&doc, &actors, &.{0});
 
     const heads = try doc.merge(gpa, &fork);
@@ -689,7 +696,7 @@ test "splice text at the object's own length over a conflicted element" {
 
     // **Appending at the object's own reported length must not be out of
     // bounds.** `:185-186`.
-    try am.transaction.spliceText(&doc, text, length, 0, "b");
+    try committedWrite(&doc, "spliceText", .{ text, length, 0, "b" });
     try commitAs(&doc, &actors, &.{0});
     try testing.expectEqual(@as(usize, 2), try am.read.length(&doc, text));
 
@@ -720,10 +727,10 @@ test "a mark inside one multi width element round trips through save and load" {
     var doc = try newDoc(&actors);
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    _ = try am.transaction.insert(&doc, text, 0, .{ .str = "hello world" });
+    const text = try committedWrite(&doc, "putObject", .{ root, Prop{ .key = "text" }, ObjType.text });
+    _ = try committedWrite(&doc, "insert", .{ text, 0, ScalarValue{ .str = "hello world" } });
     try commitAs(&doc, &actors, &.{0});
-    try am.transaction.mark(&doc, text, 3, 8, "bold", .none, .{ .bool_value = true });
+    try committedWrite(&doc, "mark", .{ text, 3, 8, "bold", ExpandMark.none, ScalarValue{ .bool_value = true } });
     try commitAs(&doc, &actors, &.{0});
 
     // **The element really is one element of width 11.** The oracle measured
@@ -734,10 +741,10 @@ test "a mark inside one multi width element round trips through save and load" {
     defer walk.deinit();
     var spans: usize = 0;
     while (try walk.next()) |item| {
-        spans += 1;
-        try testing.expectEqualStrings("hello world", item.asStr());
         var owned = item;
-        owned.deinit(gpa);
+        defer owned.deinit(gpa);
+        spans += 1;
+        try testing.expectEqualStrings("hello world", owned.asStr());
     }
     try testing.expectEqual(@as(usize, 1), spans);
 
@@ -784,7 +791,6 @@ test "load refuses the historical zero width mark end before begin fixture" {
         io,
         broken_mark_bytes[0..],
         .unicode_code_point,
-        .auto,
     );
     if (result) |doc| {
         // **Leak-safe on the unexpected path**: the load *succeeded*, so the
@@ -806,7 +812,7 @@ test "load refuses the historical zero width mark end before begin fixture" {
     // `loadIncremental`, `c/doc.zig:356-359`, and the strict path is
     // `Document.load`). A loader that refused the snapshot but accepted the
     // same bytes as an incremental stream would be half a fix.
-    var doc = try Document.init(gpa, io, .auto);
+    var doc = try Document.init(gpa, io);
     defer doc.deinit();
     const incremental = doc.loadIncremental(gpa, broken_mark_bytes[0..]);
     try testing.expectError(error.InvalidMarkOrder, incremental);
@@ -814,52 +820,9 @@ test "load refuses the historical zero width mark end before begin fixture" {
 
 // ── 9. rescue_recovers_snapshot_from_historical_zero_width_mark_order ────────
 //
-// **Not ported, and this is the gap.** `rich_text_fuzz_crash.rs:232-243`:
-//
-// ```rust
-// let bytes = include_bytes!("fixtures/broken_zero_width_mark.automerge");
-// let value = Automerge::rescue(bytes).unwrap();
-// assert_eq!(value, hydrate::Value::Map(hydrate_map! {
-//     "text" => hydrate_text! {""},
-//     "o1" => hydrate_text! {"tsxs"},
-// }));
-// ```
-//
-// `Automerge::rescue` (`automerge.rs:894-904`) is **load with
-// `MarkOrderValidation::AllowInvalid`, then `hydrate(None)`** — one flag and one
-// method. The port has **neither**:
-//
-// * **No way to skip the mark-order check.** [`Document.load`](../src/doc.zig)
-//   and [`Document.loadInto`](../src/doc.zig) are the only public load doors and
-//   both validate unconditionally: `OpSet.rebuildIndex` calls `checkMarkOrder`
-//   and returns the error (`op_set.zig:1586`). Upstream's escape hatch is
-//   `MarkOrderValidation::AllowInvalid`, reachable **only** from `rescue`
-//   (`storage/load.rs:18-28`, `automerge.rs:890-899`, `:917-921`).
-// * **No document-level `hydrate`.** `API.md` § Known gaps item 5:
-//   `src/hydrate.zig` owns the value types and the applier, but there is no
-//   `Document.hydrate(heads)` and no `ReadDoc::hydrate` (`read.rs:273-277`).
-//
-// **The gap is not closed by writing the reconstruction by hand.** The
-// reconstruct path that `AllowInvalid` reaches through is
-// `src/storage/document.zig`, and `src/root.zig` exports
-// `storage.{parse, chunk, change_chunk, document_chunk, bundle, column_spec}`
-// and **not** `document` — so a consumer cannot build an op set from a document
-// chunk at all, validated or not. The only door is [`Document.load`](../src/doc.zig),
-// and it validates.
-//
-// **What the reference answers, measured by the oracle's `richfuzz`**, so the
-// gap is recorded against a known answer rather than an assumption:
-//
-// ```text
-// Map(Map({"text": MapValue { value: Text(Text { value: "", marks: {} }), conflict: false },
-//          "o1":  MapValue { value: Text(Text { value: "tsxs", marks: {} }), conflict: false }}))
-// ```
-//
-// Note what that says and does not say. The **rescue path is lossy by design**
-// — it "returns only the current hydrated value and does not preserve the
-// original change graph" (`automerge.rs:896`) — so the value above is what the
-// document's *content* is, independent of the mark index. The refusal half of
-// the pair is case 8, and it is ported and green.
+// `rich_text_fuzz_crash.rs:232-243` expects a detached hydrated root with
+// text = "" and o1 = "tsxs". The public rescue regression below checks that
+// content, deep ownership and refusal of corruption unrelated to mark order.
 
 // ── Zig 0.16.0 / upstream / Rust / port ───────────────────────────────────────
 //
@@ -867,29 +830,9 @@ test "load refuses the historical zero width mark end before begin fixture" {
 //
 // ## The counts, established by diffing rather than by counting
 //
-// Upstream's file is 243 lines with **9** `#[test]` functions. This file
-// declares **8** `test` blocks, and the ninth upstream case is **recorded as a
-// gap at its own line** (`:232-243`, above) with the reason: the port has
-// neither `MarkOrderValidation::AllowInvalid` nor a document-level `hydrate`.
-// **8 tests, 8 upstream cases ported, 1 gap, 0 silently dropped.**
-//
-// ## `commit_as` is `setActorId`, because there is no `commit` to call
-//
-// Upstream's `commit_as` is `doc.set_actor(ActorId::from(actor.to_vec()));
-// doc.commit()` (`:10-13`). The port's autocommit door opens, applies and
-// commits on **every** call ([`transact.zig`](../src/transact.zig):2581-2596), so
-// the port's `commitAs` is `setActorId` alone: the actor takes effect for the
-// change the *next* write opens. This is the port's own autocommit semantics and
-// not a decision made here; see the module doc.
-//
-// **Where the change boundaries differ, and why no assertion notices:**
-//
-// | case | upstream's changes | this file's | named property, and whether it survives |
-// |---|---|---|---|
-// | `:95` | 2 | 3 | "This needs two committed changes: a zero-width unmark … then a zero-width mark" (`:96-97`) — **survives**: the two mark operations are still in two separate changes |
-// | `:194` | 2 | 3 | the mark's anchors resolve inside one multi-width element — **survives**: the element is still one element of width 11 |
-// | `:118` | 5 | 5 | identical: upstream's `commit_as` calls already separate every step |
-// | `:25`, `:47`, `:64`, `:164` | 1, 1, 2, 3 | 2, 2, 3, 4 | **no case in this file asserts a change count, a change hash or a patch stream** |
+// All nine upstream cases are represented, including value-only rescue.
+// Writes use raw transactions and release each named CommitResult's log.
+// Per-operation boundaries retain this suite's original mark/change structure.
 //
 // ## Every actor is a heap allocation, on purpose
 //
@@ -907,15 +850,6 @@ test "load refuses the historical zero width mark end before begin fixture" {
 // happens when the actor is interned. Heap bytes with an arena behind them are
 // the only shape in which that borrow is sound *and* the bytes can die.
 //
-// ## `AutoCommit::new` is a `.auto` document
-//
-// Upstream has two document types and one transaction type; the port has one
-// document type with a [`Mode`](../src/doc.zig) flag. Every case here is
-// upstream's `AutoCommit`, so every case uses a `.auto` document and the
-// [`transact.*`](../src/transact.zig) free functions — the `Transactable` door.
-// Upstream's `splice` is **not** a `Transaction` method in the port either: the
-// bulk insert takes an allocator and a `[]hydrate.Value`
-// ([`transact.spliceHeld`](../src/transact.zig)).
 //
 // ## `insert`, not `splice_text`, in case 7 — and it is the case
 //
@@ -984,3 +918,44 @@ test "load refuses the historical zero width mark end before begin fixture" {
 // * [`sync.receiveSyncMessage`](../src/sync/protocol.zig) takes the message
 //   **and frees it** (`:546-550`), so the two sync messages in case 3 are not
 //   freed by the caller and must not be.
+
+fn expectRescuedSnapshot(value: *const Mirror) !void {
+    try testing.expect(value.* == .object and value.object == .map);
+    const map = &value.object.map;
+    try testing.expectEqual(@as(usize, 2), map.count());
+    const fields = [_]struct { key: []const u8, text: []const u8 }{
+        .{ .key = "text", .text = "" },
+        .{ .key = "o1", .text = "tsxs" },
+    };
+    for (fields) |field| {
+        const item = map.get(field.key) orelse return error.NoSuchKey;
+        try testing.expect(item.* == .object and item.object == .text);
+        const rendered = try item.object.text.makeString(gpa);
+        defer gpa.free(rendered);
+        try testing.expectEqualStrings(field.text, rendered);
+    }
+}
+
+test "rescue returns detached value for invalid mark order only" {
+    var copied = blk: {
+        var rescued = try Document.rescue(gpa, io, broken_mark_bytes[0..]);
+        defer rescued.deinit();
+        // The temporary reconstruction document has already been destroyed.
+        try expectRescuedSnapshot(&rescued.value);
+        break :blk try rescued.value.dup(gpa);
+    };
+    defer copied.deinit();
+    // A deep copy remains readable after the original rescued value is freed.
+    try expectRescuedSnapshot(&copied.value);
+
+    var damaged = broken_mark_bytes.*;
+    damaged[damaged.len - 1] ^= 0x01;
+    const result = Document.rescue(gpa, io, damaged[0..]);
+    if (result) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.ExpectedRefusal;
+    } else |err| {
+        try testing.expect(err != error.InvalidMarkOrder);
+    }
+}

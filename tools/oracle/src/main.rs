@@ -19,6 +19,8 @@
 //! * `doc` — one record, the `save()` bytes of a scripted document.
 //! * `change` — one record per change: hash, start op, sequence, dependencies,
 //!   timestamp and the change chunk as hex.
+//! * `metadata` — owned-reader expectations from the public metadata APIs,
+//!   including empty changes, authors, opaque extras and causal frontiers.
 //! * `sync` — one record per direction per round (`kind` `sync`) followed by
 //!   one `sync-final` record per side.
 //! * `fixtures` — one record per file in [`FIXTURE_DIR`] with the result of
@@ -113,6 +115,7 @@ mod third;
 mod richfuzz;
 mod save_interop;
 mod hexane_regression;
+mod api_parity;
 
 /// The actor which writes the scripted document and the left sync peer.
 const ACTOR_A: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
@@ -139,6 +142,7 @@ usage: zautomerge-oracle <command> [output-file]
 
   doc        build a scripted document and print its save() bytes as hex
   change     build a scripted document and print every change with its metadata
+  metadata   print public change metadata and causal-query expectations
   sync       run two documents through the sync protocol and print every message
   fixtures   load every file in test/fixtures and print ok or err
   diff       script three patch-stream scenarios and print them in the reference's Debug
@@ -217,6 +221,9 @@ usage: zautomerge-oracle <command> [output-file]
              (hexane/src/tests.rs:2711-2743) on the reference's own `SmallRng`, and print the
              reference column's rows and its canonical `save()` bytes after every splice
 
+  api-parity
+             probe complete public API edge semantics against the pinned reference
+
 The output file defaults to stdout, and `-` also means stdout. Output is
 newline delimited JSON.
 ";
@@ -254,6 +261,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     match command.as_str() {
         "doc" => doc_command(&mut out),
         "change" => change_command(&mut out),
+        "metadata" => metadata_command(&mut out),
         "sync" => sync_command(&mut out),
         "fixtures" => fixtures_command(&mut out),
         "marks" => marks_command(&mut out),
@@ -278,6 +286,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             save_interop::verify_save_interop_command(&mut out, &mut io::stdin().lock())
         }
         "hexane-regression" => hexane_regression::hexane_regression_command(&mut out),
+        "api-parity" => api_parity::api_parity_command(&mut out),
         other => Err(usage_error(format!("unknown command `{other}`"))),
     }
 }
@@ -390,6 +399,144 @@ fn change_command(out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
                 "deps": deps,
                 "bytes": bytes.len(),
                 "hex": hex_encode(&bytes),
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn metadata_command(out: &mut dyn Write) -> Result<(), Box<dyn Error>> {
+    let mut left = AutoCommit::new().with_actor(actor(ACTOR_A)?);
+    left.put(ROOT, "base", "metadata")?;
+    left.put(ROOT, "count", 2u64)?;
+    let base = left
+        .commit_with(CommitOptions::default().with_time(-17))
+        .ok_or("metadata base did not commit")?;
+    let mut right = left.fork().with_actor(actor(ACTOR_B)?);
+
+    left.put(ROOT, "left", true)?;
+    let left_hash = left
+        .commit_with(CommitOptions::default().with_time(23).with_message(""))
+        .ok_or("metadata left did not commit")?;
+    // An explicit empty change advances seq but has max_op = start_op - 1:
+    // autocommit.rs:753-772 and change.rs:74-75. It must not disappear from
+    // metadata queries merely because it contributes no operations.
+    let empty = left.empty_change(
+        CommitOptions::default().with_time(-31).with_message("empty"),
+    );
+
+    // Generate the typed author footer through the public author API, then
+    // use ExpandedChange to append opaque bytes without inventing its encoding.
+    // with_author allocates an actor (automerge.rs:389-394); replacing that
+    // unused actor before any operations makes this one-assignment fixture
+    // deterministic. No document ever reassigns an authored actor.
+    let mut authored = right
+        .fork()
+        .with_author(Some(automerge::Author::from("Méta 🦀".as_bytes().to_vec())))
+        .with_actor(actor(ACTOR_B)?);
+    authored.put(ROOT, "right", 7i64)?;
+    let authored_hash = authored
+        .commit_with(CommitOptions::default().with_time(41).with_message("right"))
+        .ok_or("metadata authored change did not commit")?;
+    let mut expanded = authored
+        .get_change_by_hash(&authored_hash)
+        .ok_or("metadata authored change missing")?
+        .decode();
+    // ExpandedChange::author is not consumed by From<ExpandedChange>:
+    // change.rs:206-216 encodes extra_bytes verbatim. The lawful footer
+    // generated above remains first; decode_author_footer reads its declared
+    // length and tolerates a trailing opaque payload (change.rs:395-402).
+    expanded.extra_bytes.extend_from_slice(&[0x00, 0xff, 0x80, 0x42]);
+    let right_change: automerge::Change = expanded.into();
+    let right_hash = right_change.hash();
+    right.apply_changes([right_change])?;
+    right.put(ROOT, "right-next", "inherited author")?;
+    let right_next = right
+        .commit_with(CommitOptions::default().with_time(-47))
+        .ok_or("metadata right-next did not commit")?;
+    left.merge(&mut right)?;
+    left.put(ROOT, "joined", "both branches")?;
+    let joined = left
+        .commit_with(CommitOptions::default().with_time(59).with_message("joined"))
+        .ok_or("metadata joined did not commit")?;
+
+    // Parse and apply the exact uncompressed inputs the Zig consumer receives.
+    // This also measures encoded-empty-message normalization, not the options
+    // passed to commit: storage/change.rs:144-148 maps zero UTF8 length to None.
+    let labels = [
+        ("base", base),
+        ("left", left_hash),
+        ("empty", empty),
+        ("right", right_hash),
+        ("right-next", right_next),
+        ("joined", joined),
+    ];
+    let mut decoded = automerge::Automerge::new();
+    for (label, hash) in labels {
+        let change = left.get_change_by_hash(&hash).ok_or("metadata change missing")?;
+        let bytes = change.raw_bytes();
+        decoded.apply_changes([automerge::Change::from_bytes(bytes.to_vec())?])?;
+        let meta = decoded
+            .get_change_meta_by_hash(&hash)
+            .ok_or("applied metadata missing")?;
+        // Both public collectors source author from the document's actor
+        // assignment and preserve ALL extra bytes (footer included):
+        // op_set2/change/collector.rs:665-720. Thus right-next has an author
+        // even though its own extra bytes contain no author footer.
+        let author = meta
+            .author
+            .as_ref()
+            .map(|a| std::str::from_utf8(a.as_bytes()))
+            .transpose()?;
+        emit(
+            out,
+            &json!({
+                "kind": "change",
+                "label": label,
+                "bytes": hex_encode(bytes),
+                "hash": meta.hash.to_string(),
+                "actor": hex_encode(meta.actor.as_ref().to_bytes()),
+                "author": author,
+                "seq": meta.seq,
+                "start_op": meta.start_op,
+                "max_op": meta.max_op,
+                "timestamp": meta.timestamp,
+                "message": meta.message.as_deref(),
+                "deps": meta.deps.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "extra": hex_encode(meta.extra.as_ref()),
+            }),
+        )?;
+    }
+
+    let unknown = automerge::ChangeHash([0x55; 32]);
+    if decoded.get_change_meta_by_hash(&unknown).is_some() {
+        return Err("metadata unknown hash unexpectedly exists".into());
+    }
+    // get_changes_meta goes through get_build_metadata_clock, rather than
+    // subtracting literal hashes: collector.rs:665-671. Ask about causal
+    // closure, two concurrent frontiers, unknown hashes and duplicate heads.
+    let queries = [
+        ("empty-have", vec![]),
+        ("base-frontier", vec![base]),
+        ("combined-frontier", vec![empty, right_next]),
+        ("unknown-have", vec![unknown]),
+        ("duplicate-have", vec![base, base]),
+        ("unknown-and-base", vec![unknown, base]),
+        ("fully-known", vec![joined]),
+    ];
+    for (label, have) in queries {
+        let hashes = decoded
+            .get_changes_meta(&have)
+            .into_iter()
+            .map(|meta| meta.hash.to_string())
+            .collect::<Vec<_>>();
+        emit(
+            out,
+            &json!({
+                "kind": "query",
+                "label": label,
+                "have": have.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "hashes": hashes,
             }),
         )?;
     }

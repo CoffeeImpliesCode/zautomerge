@@ -62,6 +62,9 @@
 //! `storage/document.rs:332-344` does: flush at every `(obj, elemid_or_key)`
 //! change, then `processOp`, then one `processSucc` per successor edge, in that
 //! order (`change/collector.rs:39-53`, `:61-72`).
+//! Physical row order is also checked during this existing rebuild walk.
+//! Reconstructed change hashes cannot prove it: the collector restores counter
+//! order independently of the authoritative rows used by binary lookup.
 //!
 //! # Two invariant checkers, and both are the point of this file
 //!
@@ -272,6 +275,14 @@ pub const ObjIndex = indexmod.ObjIndex;
 /// The class a document whose marks are out of order is refused with, which
 /// [`OpSet.load`] can raise (`index.zig:234`).
 pub const MarkOrderError = indexmod.MarkOrderError;
+
+/// Whether reconstructed mark order must be valid.
+pub const MarkOrderValidation = enum {
+    /// Strict default for normal document loading.
+    check,
+    /// Recovery-only: retain invalid mark order while checking every other index.
+    allow_invalid,
+};
 /// What [`OpSet.rebuildIndex`] produces, re-exported with the builder that
 /// makes it (`index.zig:753`).
 pub const Rebuilt = indexmod.Rebuilt;
@@ -783,10 +794,10 @@ pub const checkpoint_column_names = [_][]const u8{
 /// is written once, which is the same split `op_iter.zig` and `insert.zig`
 /// make.
 ///
-/// `O` needs the seventeen accessors [`columns.Columns`] calls, plus
-/// `objInfo` for [`OpSet.spliceObjects`]. `opmod.Op`, `opmod.OpBuilder`,
-/// `opmod.TxOp` and `opmod.ChangeOp` all qualify; a test fixture declares
-/// seventeen methods and that is all.
+/// `O` needs the accessors [`columns.Columns`] calls, plus `objId` for stable
+/// actor-byte normalization and `objInfo` for [`OpSet.spliceObjects`].
+/// `opmod.Op`, `opmod.OpBuilder`, `opmod.TxOp` and `opmod.ChangeOp` all qualify;
+/// fixture wrappers retain their own visibility, width and top semantics.
 pub fn OpSet(comptime O: type) type {
     return struct {
         const Self = @This();
@@ -1002,9 +1013,22 @@ pub fn OpSet(comptime O: type) type {
             text_encoding: TextEncoding,
             strings: StringTable,
         ) LoadError!Self {
+            return loadWithMarkValidation(gpa, cols, actors, text_encoding, strings, .check);
+        }
+
+        /// Loads columns and rebuilds derived indices under the mark-order policy.
+        /// `allow_invalid` skips only mark-order validation, never physical row order.
+        pub fn loadWithMarkValidation(
+            gpa: Allocator,
+            cols: RawColumns,
+            actors: []const ActorId,
+            text_encoding: TextEncoding,
+            strings: StringTable,
+            validation: MarkOrderValidation,
+        ) LoadError!Self {
             var set = try fromParts(gpa, cols, actors, text_encoding, strings);
             errdefer set.deinit();
-            try set.rebuildIndex();
+            try set.rebuildIndexWithMarkValidation(validation);
             return set;
         }
 
@@ -1529,6 +1553,128 @@ pub fn OpSet(comptime O: type) type {
 
         // ── The actor table ─────────────────────────────────────────────
 
+        /// An unpublished batch view over selective column overlays.
+        /// Initialize in place; this value and its view must not move while bound.
+        /// Actor bytes and strings borrow the source; no actor insertion is allowed.
+        pub const PreparedBatch = struct {
+            source: *Self,
+            view: Self,
+            cols: Ops.Overlay,
+            bound: bool = false,
+            spent: bool = false,
+
+            /// Captures bound columns and disposes only provisional state.
+            pub fn deinit(self: *PreparedBatch) void {
+                if (self.spent) return;
+                if (self.bound) self.cols.capture(&self.view.cols);
+                self.cols.deinit();
+                self.view.obj_info.deinit();
+                self.view.succ_scratch.deinit(self.view.gpa);
+                self.bound = false;
+                self.spent = true;
+            }
+
+            /// Publishes all prepared column/object/scratch state without allocation.
+            /// The source must not have changed since preparation.
+            pub fn publish(self: *PreparedBatch, source: *Self) void {
+                std.debug.assert(!self.spent);
+                std.debug.assert(source == self.source);
+                std.debug.assert(self.bound);
+                self.cols.capture(&self.view.cols);
+                self.bound = false;
+                self.cols.publish(&source.cols);
+                source.obj_info.deinit();
+                source.obj_info = self.view.obj_info;
+                source.succ_scratch.deinit(source.gpa);
+                source.succ_scratch = self.view.succ_scratch;
+                source.succ_scratch_width = self.view.succ_scratch_width;
+                self.spent = true;
+            }
+        };
+
+        /// Prepares a projected batch view in final stable caller storage.
+        /// Takes ownership of `objects` only on success. Source actor indices
+        /// must already be canonical for every decoded operation.
+        pub fn beginPreparedBatch(
+            self: *Self,
+            out: *PreparedBatch,
+            objects: ObjIndex,
+            options: opcols.OverlayOptions,
+        ) ParseError!void {
+            out.* = .{ .source = self, .view = self.*, .cols = undefined };
+            out.view.succ_scratch = .empty;
+            errdefer out.view.succ_scratch.deinit(self.gpa);
+            try out.view.succ_scratch.resize(self.gpa, self.succ_scratch_width);
+            try self.cols.beginOverlay(&out.cols, options);
+            out.view.obj_info = objects;
+            out.cols.bind(&out.view.cols);
+            out.bound = true;
+        }
+
+        /// A prepared canonical actor table and all op-set index remaps.
+        /// Actor bytes are borrowed and must outlive the published op set.
+        /// One owner publishes or disposes this value; copies are not owners.
+        pub const PreparedActorInsert = struct {
+            gpa: Allocator,
+            actors: std.ArrayList(ActorId),
+            obj_info: ?ObjIndex = null,
+            cols: ?Ops.PreparedActorRemap = null,
+            mark: ?markidx.MarkIndexColumn.StagedRemap = null,
+            spent: bool = false,
+
+            /// Disposes unpublished storage without changing the source.
+            pub fn deinit(self: *PreparedActorInsert) void {
+                if (self.spent) return;
+                self.actors.deinit(self.gpa);
+                if (self.obj_info) |*objects| objects.deinit();
+                if (self.cols) |*cols| cols.deinit();
+                if (self.mark) |*mark| mark.deinit();
+                self.spent = true;
+            }
+
+            /// Publishes the table and every index remap without allocating.
+            /// The source must not have changed since preparation.
+            pub fn publish(self: *PreparedActorInsert, set: *Self) void {
+                std.debug.assert(!self.spent);
+                if (self.cols) |*cols| cols.publish(&set.cols);
+                if (self.mark) |*mark| mark.publish(&set.cols.index.mark);
+                if (self.obj_info) |objects| {
+                    set.obj_info.deinit();
+                    set.obj_info = objects;
+                }
+                set.actors.deinit(set.gpa);
+                set.actors = self.actors;
+                self.spent = true;
+            }
+        };
+
+        /// Prepares insertion into the sorted actor table without publishing.
+        /// `idx` must be the actor's lower-bound slot and the actor must be absent.
+        /// Refusal leaves every source column, table and cache unchanged.
+        pub fn prepareActorInsert(
+            self: *Self,
+            idx: usize,
+            actor: ActorId,
+        ) ParseError!PreparedActorInsert {
+            std.debug.assert(idx <= self.actors.items.len);
+            assertSortedSlot(self.actors.items, idx, actor);
+            var prepared = PreparedActorInsert{ .gpa = self.gpa, .actors = .empty };
+            errdefer prepared.deinit();
+            const actor_count = std.math.add(usize, self.actors.items.len, 1) catch
+                return error.Overflow;
+            try prepared.actors.ensureTotalCapacity(self.gpa, actor_count);
+            prepared.actors.appendSliceAssumeCapacity(self.actors.items[0..idx]);
+            prepared.actors.appendAssumeCapacity(actor);
+            prepared.actors.appendSliceAssumeCapacity(self.actors.items[idx..]);
+            if (idx != self.actors.items.len) {
+                const actor_idx = std.math.cast(ActorIdx, idx) orelse return error.Overflow;
+                prepared.obj_info = try self.stagedObjInfo(actor_idx, .up);
+                prepared.mark = try self.cols.index.mark.stageRemap(actor_idx, .up);
+                prepared.cols = try self.cols.prepareActorInsertion(self.gpa, actor_idx);
+            }
+            return prepared;
+        }
+
         /// Interns `actor` at index `idx` (`OpSet::insert_actor`,
         /// `op_set.rs:1400-1405`).
         ///
@@ -1564,13 +1710,10 @@ pub fn OpSet(comptime O: type) type {
         pub fn insertActor(self: *Self, idx: usize, actor: ActorId) ParseError!void {
             std.debug.assert(idx <= self.actors.items.len);
             assertSortedSlot(self.actors.items, idx, actor);
-            // **Before the rewrite, and that is the whole point.**
             try self.actors.ensureUnusedCapacity(self.gpa, 1);
             if (self.actors.items.len != idx) {
-                // Upstream's index is a `usize` (`op_set.rs:1400`) and an
-                // actor index is a `u32` here, so the rewrite's argument is
-                // the checked narrowing rather than a silent one.
-                try self.rewriteWithNewActor(std.math.cast(ActorIdx, idx) orelse return error.Overflow);
+                try self.rewriteWithNewActor(std.math.cast(ActorIdx, idx) orelse
+                    return error.Overflow);
             }
             self.actors.insertAssumeCapacity(idx, actor);
         }
@@ -1889,21 +2032,34 @@ pub fn OpSet(comptime O: type) type {
         /// `ReconstructError::InvalidMarkOrderDoc`
         /// (`storage/document.rs:355-359`).
         pub fn rebuildIndex(self: *Self) LoadError!void {
+            return self.rebuildIndexWithMarkValidation(.check);
+        }
+
+        /// Rebuilds derived indices, optionally retaining malformed mark order
+        /// for the explicit recovery loader. All other index checks stay strict.
+        pub fn rebuildIndexWithMarkValidation(
+            self: *Self,
+            validation: MarkOrderValidation,
+        ) LoadError!void {
             // **A column set that arrives from a load has an empty index**
             // (`columns.rs:314`) and the port's walk refuses to be built over
             // one, so the five are sized first. `sizeIndexForWalk` says why
             // and why none of it survives.
             try self.sizeIndexForWalk();
-            // The builder is consumed by `finish`, so its `errdefer` is scoped
-            // to this block: a `break` out of it is a normal exit and runs no
-            // cleanup, which is right because `finish` has already moved every
-            // buffer into its result.
+            // The caller owns the builder on every error, including a refused
+            // finish. A successful finish consumes it before the normal block
+            // exit, so the error cleanup never sees moved storage.
             var rebuilt = blk: {
                 var builder = try self.indexBuilder();
                 errdefer builder.deinit();
                 var walk = try self.iter();
                 var last: ?Group = null;
+                var stepper = opmod.OpStepper.initial();
                 while (try walk.next()) |row| {
+                    // Reject before indexing or publication, including recovery
+                    // loads. The existing Op.step rules cover map registers,
+                    // conflicts, objects and sequence insertion tie-breaks.
+                    if (!row.step(&stepper)) return error.InvalidValue;
                     // change/collector.rs:62-66, over the object and the
                     // register key.
                     const here: Group = .{ .obj = row.objId(), .key = row.elemidOrKey() };
@@ -1922,11 +2078,13 @@ pub fn OpSet(comptime O: type) type {
             // (`storage/document.rs:343`, `:355-362`). This file *is* the
             // loader — `load` is `fromParts` plus this call — so the check
             // happens here, at the same point in the same order.
-            indexmod.checkMarkOrder(&rebuilt.mark_order) catch |e| {
-                var doomed = rebuilt;
-                doomed.deinit();
-                return e;
-            };
+            if (validation == .check) {
+                indexmod.checkMarkOrder(&rebuilt.mark_order) catch |e| {
+                    var doomed = rebuilt;
+                    doomed.deinit();
+                    return e;
+                };
+            }
             rebuilt.mark_order.deinit();
             errdefer rebuilt.indexes.deinit();
             try self.setIndexes(rebuilt.indexes);
@@ -2064,8 +2222,93 @@ pub fn OpSet(comptime O: type) type {
         /// had already written in place.
         pub fn spliceObjects(self: *Self, ops: []const O) ParseError!void {
             for (ops) |op| {
-                if (op.objInfo()) |info| try self.obj_info.insert(op.id(), info);
+                if (op.objInfo()) |original| {
+                    var info = original;
+                    info.parent = self.resolveIdentity(info.parent) orelse return error.InvalidValue;
+                    try self.obj_info.insert(op.id(), info);
+                }
             }
+        }
+
+        // Borrows one input row; only its object ID changes. The column
+        // collector owns these small adapters instead of copying source rows.
+        const ResolvedRow = struct {
+            row: *const O,
+            object: ObjId,
+
+            pub fn id(self: *const @This()) OpId {
+                return self.row.id();
+            }
+            pub fn obj(self: *const @This()) ?OpId {
+                return self.object.opId();
+            }
+            pub fn objId(self: *const @This()) ObjId {
+                return self.object;
+            }
+            pub fn action(self: *const @This()) Action {
+                return self.row.action();
+            }
+            pub fn key(self: *const @This()) KeyRef {
+                return self.row.key();
+            }
+            pub fn insert(self: *const @This()) bool {
+                return self.row.insert();
+            }
+            pub fn expand(self: *const @This()) bool {
+                return self.row.expand();
+            }
+            pub fn markName(self: *const @This()) ?[]const u8 {
+                return self.row.markName();
+            }
+            pub fn metaValue(self: *const @This()) ValueMeta {
+                return self.row.metaValue();
+            }
+            pub fn value(self: *const @This()) ScalarValue {
+                return self.row.value();
+            }
+            pub fn top(self: *const @This()) bool {
+                return self.row.top();
+            }
+            pub fn visible(self: *const @This()) bool {
+                return self.row.visible();
+            }
+            pub fn width(self: *const @This(), sequence: SequenceType, text_encoding: TextEncoding) i64 {
+                return self.row.width(sequence, text_encoding);
+            }
+            pub fn markIndex(self: *const @This()) ?i64 {
+                return self.row.markIndex();
+            }
+            pub fn succCount(self: *const @This()) usize {
+                return self.row.succCount();
+            }
+            pub fn succAt(self: *const @This(), at: usize) OpId {
+                return self.row.succAt(at);
+            }
+            pub fn succIncCount(self: *const @This()) usize {
+                return self.row.succIncCount();
+            }
+            pub fn succIncAt(self: *const @This(), at: usize) ?i64 {
+                return self.row.succIncAt(at);
+            }
+        };
+
+        const ResolveRows = struct { set: *const Self, ops: []const O };
+
+        fn resolveRowObject(self: *const Self, ops: []const O, input: ObjId) ParseError!ObjId {
+            const object = self.resolveIdentity(input) orelse return error.InvalidValue;
+            if (input == .named and self.obj_info.objectType(object) == null) {
+                const parent = object.opId() orelse return error.InvalidValue;
+                for (ops) |candidate| {
+                    if (candidate.id().eql(parent) and candidate.objInfo() != null)
+                        return object;
+                }
+                return error.InvalidValue;
+            }
+            return object;
+        }
+
+        fn resolveRow(ctx: ResolveRows, row: *const O) ParseError!ResolvedRow {
+            return .{ .row = row, .object = try ctx.set.resolveRowObject(ctx.ops, row.objId()) };
         }
 
         /// Inserts `ops` before row `pos` and returns how many **rows** were
@@ -2117,9 +2360,29 @@ pub fn OpSet(comptime O: type) type {
         /// So the rule for a caller is the ordinary one: **an error from here
         /// changes nothing, and the op set stays usable.**
         pub fn splice(self: *Self, pos: usize, ops: []const O) ParseError!usize {
+            var stable_objects = false;
+            for (ops) |op| {
+                if (self.getActor(op.id().actor) == null) return error.InvalidValue;
+                if (op.key().actor()) |actor| {
+                    if (self.getActor(actor) == null) return error.InvalidValue;
+                }
+                if (self.resolveIdentity(op.objId()) == null) return error.InvalidValue;
+                // OpLike wrappers may supply independent parent metadata.
+                // Check that parent before columns publish, not afterward.
+                if (op.objInfo()) |info| {
+                    _ = try self.resolveRowObject(ops, info.parent);
+                }
+                stable_objects = stable_objects or op.objId() == .named;
+                for (0..op.succCount()) |at| {
+                    if (self.getActor(op.succAt(at).actor) == null) return error.InvalidValue;
+                }
+            }
             try self.reserveScratchFor(ops);
-            try self.obj_info.reserve(self.gpa, objectMakingCount(O, ops));
-            const added = try self.cols.splice(self.gpa, pos, ops, self.text_encoding, self.strings);
+            try self.obj_info.reserve(self.gpa, objectMakingCount(O, ops, &self.obj_info));
+            const added = if (stable_objects)
+                try self.cols.spliceMapped(ResolvedRow, self.gpa, pos, ops, self.text_encoding, self.strings, ResolveRows{ .set = self, .ops = ops }, resolveRow)
+            else
+                try self.cols.splice(self.gpa, pos, ops, self.text_encoding, self.strings);
             try self.spliceObjects(ops);
             return added;
         }
@@ -2141,6 +2404,8 @@ pub fn OpSet(comptime O: type) type {
         ///
         /// **`actors` must be sorted ascending**, for the reason
         /// [`OpSet.fromActors`] gives.
+        /// Stable named object IDs pass through `splice`'s actor-byte resolution
+        /// before entering object columns or the object-index parent table.
         pub fn fromDocOps(
             gpa: Allocator,
             actors: []const ActorId,
@@ -2855,6 +3120,50 @@ pub fn OpSet(comptime O: type) type {
 
         // ── Queries ─────────────────────────────────────────────────────
 
+        /// Resolves actor bytes to this table without trusting a cached index.
+        /// Returns only `.root` or `.id`; unknown/out-of-range actors return null.
+        /// Identity-only: permits unpublished objects whose actor is already
+        /// interned. Public object reads/writes use `resolveObjId` for existence.
+        pub fn resolveIdentity(self: *const Self, id: ExId) ?ObjId {
+            return switch (id) {
+                .root => .root,
+                .id => |op_id| if (self.getActor(op_id.actor) != null)
+                    .{ .id = op_id }
+                else
+                    null,
+                .named => |named| blk: {
+                    const resident_counter = std.math.cast(u32, named.op.counter) orelse break :blk null;
+                    const actor_idx: ActorIdx = if (self.getActor(named.op.actor)) |cached|
+                        if (cached.eql(named.actor)) named.op.actor else std.math.cast(ActorIdx, self.lookupActor(named.actor) orelse
+                            break :blk null) orelse break :blk null
+                    else
+                        std.math.cast(ActorIdx, self.lookupActor(named.actor) orelse
+                            break :blk null) orelse break :blk null;
+                    break :blk .{ .id = OpId.init(resident_counter, actor_idx) };
+                },
+            };
+        }
+
+        /// Resolves a stable public object ID against the authoritative actor
+        /// and object tables. Cached actor indices are only checked hints.
+        /// Unknown actors, out-of-range internal IDs and non-objects return null.
+        pub fn resolveObjId(self: *const Self, id: ExId) ?ObjId {
+            const internal = self.resolveIdentity(id) orelse return null;
+            if (self.obj_info.objectType(internal) == null) return null;
+            return internal;
+        }
+
+        /// Scopes a canonical internal ID, including an object being introduced
+        /// by an unpublished batch. Does not require an existing object entry.
+        pub fn scopeToInternalObj(self: *const Self, obj: ObjId) ParseError!RowRange {
+            if (obj == .named) return error.InvalidValue;
+            const internal = self.resolveIdentity(obj) orelse return error.InvalidValue;
+            const op_id = internal.opId();
+            const all: RowRange = .{ .start = 0, .end = self.cols.len() };
+            const by_ctr = try self.cols.obj_ctr.scopeToValue(if (op_id) |op| op.counter else null, all);
+            return self.cols.obj_actor.scopeToValue(if (op_id) |op| op.actor else null, by_ctr);
+        }
+
         /// The rows that belong to `obj` (`OpSet::scope_to_obj`,
         /// `op_set.rs:1246-1252`).
         ///
@@ -2869,77 +3178,49 @@ pub fn OpSet(comptime O: type) type {
         /// The root is both halves absent, so both `scopeToValue` calls look for
         /// null and find the root's rows.
         pub fn scopeToObj(self: *const Self, obj: ObjId) ParseError!RowRange {
-            const all: RowRange = .{ .start = 0, .end = self.cols.len() };
-            const by_ctr = try self.cols.obj_ctr.scopeToValue(obj.counter(), all);
-            return self.cols.obj_actor.scopeToValue(obj.actor(), by_ctr);
+            const internal = self.resolveObjId(obj) orelse return error.InvalidValue;
+            return self.scopeToInternalObj(internal);
         }
 
         /// The rows of one map key of `obj` (`OpSet::prop_range`,
-        /// `op_set.rs:1268-1271`).
+        /// `op_set.rs:1268-1271`), or its sorted insertion point when absent.
         ///
-        /// Upstream is `key_str.scope_to_value(Some(prop), obj_range)`, one
-        /// B-tree descent. **This is a walk, and it has to be**, because the
-        /// port's `key_str` holds interned ids ([plan §5.3](../../docs/plan.md))
-        /// and a `scopeToValue` needs its values *sorted* — which interned ids
-        /// are not: a table interns each string once, in the order the strings
-        /// are first seen, so id order is insertion order and not the
-        /// lexicographic order the row-order invariant sorts map registers by
-        /// (rule **R2**, `op.rs:1055-1059`). Descent would find the wrong
-        /// register, or none.
-        ///
-        /// So the walk compares the *resolved* strings, and the row order is
-        /// what makes the walk short: a register's rows are contiguous (rules
-        /// **R2** and **R3**), so the first row after a match that does not
-        /// match ends the register.
-        ///
-        /// **A key the object does not hold answers the row it would sort at,
-        /// not the object's end.** `scope_to_value` is
-        /// [`column.sortedScanToValue`](../../src/hexane/column.zig), whose
-        /// three arms are upstream's: equal is the run, greater is the cursor
-        /// where it stands, and smaller accumulates — so a value the column
-        /// does not hold answers `at..at` with `at` one past the last row
-        /// below it (`column.rs:958-1000`, ported at
-        /// [column.zig:3939-3977](../../src/hexane/column.zig)). Hexane's own
-        /// test says it: over `aaa aaa bbb bbb bbb ccc`, `"aab"` is `2..2` and
-        /// `"ddd"` is `6..6`
-        /// ([`hexane/src/tests.rs:3464-3476`](../../github-automerge-automerge/rust/hexane/src/tests.rs)).
-        /// **This walk cannot inherit that for free** — it has no descent to
-        /// fall out of — so it counts the rows it steps over, which is the same
-        /// accumulation and O(rows of the object) either way. The answer was
-        /// the object's end until this was fixed, which is *right by luck* for
-        /// a key greater than every key the object holds and wrong for every
-        /// other absent key: a range bounded by one landed past the end of the
-        /// object instead of where the key sorts.
+        /// Rows are byte-lexically ordered, but intern IDs are not. Positional
+        /// lower/upper bounds therefore compare resolved immutable key bytes
+        /// inside the object's range, never the numeric IDs. Retained deleted
+        /// and conflicting rows participate in both bounds.
         pub fn propRange(self: *const Self, obj: ObjId, prop: []const u8) ParseError!RowRange {
             const range = try self.scopeToObj(obj);
-            var it = try self.cols.key_str.iterRange(range);
-            var start: ?usize = null;
-            var at = range.start;
-            // `column.rs:971` — one past the last row whose key sorts below
-            // `prop`, which is where `prop` itself would go.
-            var point = range.start;
-            while (try it.next()) |id| {
-                const key = if (id) |i| self.strings.resolve(self.strings.ctx, i) else null;
-                if (key) |resolved| {
-                    if (std.mem.eql(u8, resolved, prop)) {
-                        if (start == null) start = at;
-                    } else if (start) |s| {
-                        return .{ .start = s, .end = at };
-                    } else if (std.mem.order(u8, resolved, prop) == .lt) {
-                        point = at + 1;
-                    }
-                } else if (start) |s| {
-                    // A sequence anchor cannot be inside a map register
-                    // ([`tryLoadKeyRef`](op_iter.zig),
-                    // `op_iter.rs:251-265`), so a null key either ends the
-                    // register or was never in one. Neither moves `point`: a
-                    // row with no key is not a place a map key could sort.
-                    return .{ .start = s, .end = at };
+            const start = try self.propBound(range, prop, false);
+            const end = try self.propBound(.{ .start = start, .end = range.end }, prop, true);
+            return .{ .start = start, .end = end };
+        }
+
+        fn propBound(
+            self: *const Self,
+            range: RowRange,
+            prop: []const u8,
+            comptime upper: bool,
+        ) ParseError!usize {
+            var low = range.start;
+            var high = range.end;
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                const key = (try self.cols.key_str.get(mid)) orelse return error.InvalidValue;
+                // Sequence anchors are not map registers. They cannot occur
+                // within a valid map, and an all-anchor object answers its
+                // start rather than letting a map insertion escape its scope.
+                const order = if (key) |id|
+                    std.mem.order(u8, self.strings.resolve(self.strings.ctx, id), prop)
+                else
+                    std.math.Order.gt;
+                if (order == .lt or (upper and order == .eq)) {
+                    low = mid + 1;
+                } else {
+                    high = mid;
                 }
-                at += 1;
             }
-            if (start) |s| return .{ .start = s, .end = range.end };
-            return .{ .start = point, .end = point };
+            return low;
         }
 
         /// A walk over `rows` (`OpSet::iter_range`, `op_set.rs:1318-1342`).
@@ -2985,6 +3266,13 @@ pub fn OpSet(comptime O: type) type {
         pub fn get(self: *Self, pos: usize) ReadOpError!?Op {
             var walk = try self.iterRange(.{ .start = pos, .end = pos + 1 });
             return walk.next();
+        }
+
+        // A later row read reuses successor scratch. Saved single-row results
+        // must refresh only that borrow after scanning, retaining scoped values.
+        fn refreshReturnedSucc(self: *Self, op: *Op) ReadOpError!void {
+            const resident = (try self.get(op.pos)) orelse return error.InvalidValue;
+            op._succ = resident.succ();
         }
 
         /// The row at `pos` that named an object, over both object columns
@@ -3144,7 +3432,7 @@ pub fn OpSet(comptime O: type) type {
         pub fn getOpIdPos(self: *const Self, id: OpId) SearchError!?usize {
             var find = try self.cols.id_ctr.findByValue(id.counter);
             defer find.deinit();
-            while (find.next()) |hit| {
+            while (try find.next()) |hit| {
                 const slab = self.cols.id_ctr.slabAt(hit.slab) orelse return error.InvalidValue;
                 const start = hit.items_before;
                 const rows: RowRange = .{ .start = start, .end = start + slab.len };
@@ -3204,6 +3492,7 @@ pub fn OpSet(comptime O: type) type {
                     break;
                 }
             }
+            try self.refreshReturnedSucc(&first);
             return .{ .op = first, .visible = in_view };
         }
 
@@ -3242,7 +3531,8 @@ pub fn OpSet(comptime O: type) type {
         /// port does not trap on bytes
         /// ([error.zig:6-12](../error.zig)).
         pub fn parentObject(self: *Self, child: ObjId, c: ?Clock) (ReadOpError || SearchError || InternalError)!?Parent {
-            const id = child.opId() orelse return null;
+            const internal = self.resolveObjId(child) orelse return null;
+            const id = internal.opId() orelse return null;
             const found = (try self.findOpByIdAndVis(id, c)) orelse return null;
             const obj = found.op.objId();
             const typ = self.objectType(obj) orelse return null;
@@ -3267,13 +3557,16 @@ pub fn OpSet(comptime O: type) type {
         /// What kind of object `obj` is (`OpSet::object_type`,
         /// `op_set.rs:1171-1173`).
         pub fn objectType(self: *const Self, obj: ObjId) ?ObjType {
-            return self.obj_info.objectType(obj);
+            const internal = self.resolveIdentity(obj) orelse return null;
+            return self.obj_info.objectType(internal);
         }
 
         /// Which object `obj` hangs in (`OpSet::object_parent`,
         /// `op_set.rs:1175-1177`).
         pub fn objectParent(self: *const Self, obj: ObjId) ?ObjId {
-            return self.obj_info.objectParent(obj);
+            const internal = self.resolveObjId(obj) orelse return null;
+            const parent = self.obj_info.objectParent(internal) orelse return null;
+            return self.resolveObjId(parent);
         }
 
         /// The export id of `id` ([`OpSet::id_to_exid`](
@@ -3319,7 +3612,7 @@ pub fn OpSet(comptime O: type) type {
         pub fn opIdText(self: *const Self, gpa: Allocator, id: OpId) Error![]u8 {
             if (id.eql(OpId.root)) return gpa.dupe(u8, "root");
             const actor = self.getActor(id.actor) orelse return error.InvalidActorIndex;
-            return std.fmt.allocPrint(gpa, "{}@{s}", .{ id.counter, actor.bytes });
+            return std.fmt.allocPrint(gpa, "{}@{f}", .{ id.counter, actor });
         }
 
         // ── The object boundary walk ────────────────────────────────────
@@ -3370,8 +3663,13 @@ pub fn OpSet(comptime O: type) type {
         /// [`Self.Winners`] holds three walks alive at once and each needs its
         /// own (see [`top_op.TopScratch`]), so one is built here and freed by
         /// [`Winners.deinit`].
+        /// Unknown objects yield the same empty winner walk as upstream reads.
+        /// Mutation callers retain strict object checks through `scopeToObj`.
         pub fn topOps(self: *Self, obj: ObjId, c: ?Clock) TopError!Self.Winners {
-            const range = try self.scopeToObj(obj);
+            const range: RowRange = if (self.resolveObjId(obj)) |internal|
+                try self.scopeToInternalObj(internal)
+            else
+                .{ .start = 0, .end = 0 };
             var scratch = try topop.topScratch(O, self.gpa, &self.cols, range);
             errdefer scratch.deinit(self.gpa);
             return .{
@@ -3681,11 +3979,10 @@ pub fn OpSet(comptime O: type) type {
         /// The rows of one map key of `obj` that a clock has in view
         /// (`OpSet::seek_ops_by_map_key`, `op_set.rs:611-628`).
         ///
-        /// `propRange` → `iterRange` → the visible walk, collected. Upstream
-        /// asserts that the walk ended where the register does (`:621`); the
-        /// port reports it as `error.Invariant`, because a walk that ended
-        /// early would otherwise hand back a short register and read as a
-        /// document with fewer rows than it has.
+        /// `propRange` supplies the complete register bounds, independently
+        /// of clock visibility. Validate that its end is inside the row
+        /// window before collecting; constructing another `iterRange` merely
+        /// to obtain that already-known end would duplicate column positioning.
         ///
         /// The caller owns `found` and frees it with
         /// [`OpsFound.deinit`](found_op.zig).
@@ -3697,15 +3994,14 @@ pub fn OpSet(comptime O: type) type {
             c: ?Clock,
         ) (ReadOpError || InternalError)!OpsFound {
             const range = try self.propRange(obj, key);
-            var walk = try self.iterRange(range);
-            const end_pos = walk.endPos();
+            if (range.end > self.cols.len()) return error.Invariant;
             var found = OpsFound.init(gpa);
             errdefer found.deinit(gpa);
             var rows = try self.visible(range, c);
-            while (try rows.next()) |row| try found.ops.append(gpa, row);
-            if (end_pos != range.end) return error.Invariant;
+            while (try rows.next()) |row| try found.appendRetained(gpa, row);
             found.range = range;
-            found.end_pos = end_pos;
+            found.end_pos = range.end;
+            found.finishRetained();
             return found;
         }
 
@@ -3835,11 +4131,12 @@ pub fn OpSet(comptime O: type) type {
             errdefer found.deinit(gpa);
             const walk = try self.iterRange(register);
             var rows = try self.visible(register, null);
-            while (try rows.next()) |row| try found.ops.append(gpa, row);
+            while (try rows.next()) |row| try found.appendRetained(gpa, row);
             found.index = index;
             found.range = register;
             found.end_pos = register.end;
             _ = walk;
+            found.finishRetained();
             return found;
         }
 
@@ -3890,12 +4187,13 @@ pub fn OpSet(comptime O: type) type {
                 end_pos = row.pos + 1;
                 range.end = row.pos + 1;
                 if (row.succCount() == 0 and row.action() != .mark) {
-                    try found.ops.append(gpa, row);
+                    try found.appendRetained(gpa, row);
                 }
             }
             found.index = at;
             found.range = range;
             found.end_pos = end_pos;
+            found.finishRetained();
             return found;
         }
 
@@ -4068,7 +4366,7 @@ pub fn OpSet(comptime O: type) type {
             seq_type: SequenceType,
             c: ?Clock,
         ) (ReadOpError || SearchError || InternalError)!?FoundOpId {
-            const row = (try self.iterObjAndFind(obj, opid)) orelse return null;
+            var row = (try self.iterObjAndFind(obj, opid)) orelse return null;
             const sub = try self.iterObj(obj);
             var grouper = Self.Grouped.init(self.gpa, opmarks.NoMarkIter(Row).init(sub), c);
             defer grouper.deinit();
@@ -4077,10 +4375,12 @@ pub fn OpSet(comptime O: type) type {
                 var owned = group;
                 defer owned.deinit(self.gpa);
                 if (owned.end_pos > row.pos) {
+                    const row_is_visible = try self.rowVisibleIn(row.pos, owned.ops.items, c);
+                    try self.refreshReturnedSucc(&row);
                     return .{
                         .op = row,
                         .index = index,
-                        .visible = try self.rowVisibleIn(row.pos, owned.ops.items, c),
+                        .visible = row_is_visible,
                     };
                 }
                 index += owned.width(seq_type, self.text_encoding);
@@ -4095,10 +4395,12 @@ pub fn OpSet(comptime O: type) type {
             // not a mark), so a cursor on the **last value element** of a text
             // that ends inside a mark reaches here, and `false` would be a lie
             // about a row that is there.
+            const row_is_visible = try self.rowVisibleIn(row.pos, &.{}, c);
+            try self.refreshReturnedSucc(&row);
             return .{
                 .op = row,
                 .index = index,
-                .visible = try self.rowVisibleIn(row.pos, &.{}, c),
+                .visible = row_is_visible,
             };
         }
 
@@ -5265,16 +5567,12 @@ pub fn OpSet(comptime O: type) type {
         /// [`opmod.Op.step`] over [`OpSet.iter`], from
         /// [`opmod.OpStepper.initial`] — the root object, the empty map key and
         /// the root op id, which is a state every first row passes
-        /// ([op.zig](op.zig) `OpStepper`). **This is the gate for the whole
-        /// port**: upstream calls it from exactly one place in the crate, the
-        /// `debug_assert!` at the end of every apply ([`batch.rs:949`](../../github-automerge-automerge/rust/automerge/src/op_set2/change/batch.rs)),
-        /// and the port runs it always. **The load path does not call it** —
-        /// it asserts `validate_top_index` instead
-        /// ([`storage/document.rs:351`](../../github-automerge-automerge/rust/automerge/src/storage/document.rs)) —
-        /// so upstream never checks the row order of a document it read from
-        /// bytes, only of one it just applied to. That is a gap, and it is why
-        /// this file's comparison checks it on both sides rather than only the
-        /// half upstream reaches.
+        /// ([op.zig](op.zig) `OpStepper`). Load reconstruction also advances
+        /// this validator during its one row walk before deriving indices
+        /// (`rebuildIndexWithMarkValidation`); a rejected row is
+        /// `error.InvalidValue`. Upstream's load path documents index
+        /// reconstruction at `storage/document.rs:332-344`, while the port
+        /// checks the row-order invariant there as well.
         ///
         /// It answers `false` rather than asserting, so it can be *tested* —
         /// and the test that matters is the one that makes it answer `false`.
@@ -5597,18 +5895,13 @@ fn assertSortedSlot(table: []const ActorId, idx: usize, actor: ActorId) void {
     if (idx != table.len) std.debug.assert(ActorId.order(table[idx], actor) != .lt);
 }
 
-/// How many of `ops` make an object, which is how many entries
-/// [`OpSet.spliceObjects`] can add and therefore how much room
-/// [`ObjIndex.reserve`] has to find first.
-///
-/// Only an op that *makes* something has an entry (`op_set.rs:232-238`), so
-/// this is the count of ops whose [`objInfo`] is not null. A `set` op names
-/// nothing and is not counted, so the reservation is never larger than the
-/// writes it covers.
-fn objectMakingCount(comptime O: type, ops: []const O) usize {
+/// Counts object entries a splice has not already staged in its index.
+/// A prepared batch already records incoming objects for its walk, so reserving
+/// those entries again would allocate unused map capacity for every run.
+fn objectMakingCount(comptime O: type, ops: []const O, objects: *const ObjIndex) usize {
     var n: usize = 0;
     for (ops) |op| {
-        if (op.objInfo() != null) n += 1;
+        if (op.objInfo() != null and !objects.map.contains(op.id())) n += 1;
     }
     return n;
 }
@@ -5780,12 +6073,11 @@ pub const ElemPos = struct {
 /// so a loop over one object's elements **moves** them instead of rebuilding
 /// them.
 ///
-/// **This is upstream's `elemid_at` with the five `iter_range` calls hoisted
-/// out of the loop, and nothing else.** [`ElemWalk.at`] reads the same rows in
-/// the same order and answers the same [`ElemPos`], and every refusal a
-/// column's decoder raises is raised on the same rows. What changes is how
-/// often a row's bytes are read — once for a whole ascending walk rather than
-/// once per call.
+/// This retains upstream's five-column identity decoding and register ends
+/// (`op_set.rs:793-828`). The first row of the following register is held after
+/// decoding, so an adjacent request uses it without repositioning five
+/// cursors. No visibility filtering participates: invisible rows still extend
+/// the complete register, and consumers read width at its last row.
 ///
 /// # Why five, and why five and not three
 ///
@@ -5872,7 +6164,12 @@ pub fn ElemWalk(comptime O: type) type {
         /// what a fresh [`OpSet.elemidAt`](op_set.zig) would have been.
         placed: bool = false,
 
-        /// The row the next read lands on, which is where all five stand.
+        /// The already-decoded first row of the following register. The five
+        /// cursors stand one row beyond it. It shares their mutation-invalid
+        /// borrow and is discarded on a refused or incompatible seek.
+        lookahead: ?struct { pos: usize, elemid: ElemId } = null,
+
+        /// The physical next-row position of all five, one past any lookahead.
         pub fn pos(self: *const Self) usize {
             return self.insert.pos();
         }
@@ -5908,39 +6205,57 @@ pub fn ElemWalk(comptime O: type) type {
         /// repositioned: `ListIter` and `ValueIter` shift the very same
         /// columns the very same way.
         pub fn at(self: *Self, at_pos: usize, end: usize) ReadOpError!?ElemPos {
-            // The one place that can say "these five are out of step". Every
-            // refusal below — in `seek` and in the walk alike — lands here.
-            errdefer self.placed = false;
+            errdefer {
+                self.placed = false;
+                self.lookahead = null;
+            }
             try self.seek(at_pos, end);
+            const elemid = if (self.lookahead) |held| blk: {
+                self.lookahead = null;
+                break :blk held.elemid;
+            } else (try self.next()) orelse return null;
+            var last_pos = at_pos;
+            var at_row = at_pos + 1;
+            while (at_row < end) : (at_row += 1) {
+                const next_elemid = (try self.next()) orelse break;
+                if (!next_elemid.eql(elemid)) {
+                    self.lookahead = .{ .pos = at_row, .elemid = next_elemid };
+                    break;
+                }
+                last_pos = at_row;
+            }
+            return .{ .elemid = elemid, .last_pos = last_pos };
+        }
+
+        fn next(self: *Self) ReadOpError!?ElemId {
             const elemid = try nextElemid(
                 &self.insert,
                 &self.id_ctr,
                 &self.id_actor,
                 &self.key_ctr,
                 &self.key_actor,
-            ) orelse return null;
-            var last_pos = at_pos;
-            var at_row = at_pos + 1;
-            while (at_row < end) : (at_row += 1) {
-                const next = try nextElemid(
-                    &self.insert,
-                    &self.id_ctr,
-                    &self.id_actor,
-                    &self.key_ctr,
-                    &self.key_actor,
-                ) orelse break;
-                if (!next.eql(elemid)) break;
-                last_pos = at_row;
+            );
+            if (elemid == null) {
+                // EOF in a shorter column can leave the five out of step
+                // without raising an error. A later seek must then rebuild.
+                const at_pos = self.insert.pos();
+                self.placed = self.id_ctr.pos() == at_pos and
+                    self.id_actor.pos() == at_pos and
+                    self.key_ctr.pos() == at_pos and self.key_actor.pos() == at_pos;
             }
-            return .{ .elemid = elemid, .last_pos = last_pos };
+            return elemid;
         }
 
         /// Puts the five on `pos`, with the window ending at `end`. Move when
         /// the row is ahead, rebuild when it is behind; see the type's second
         /// section.
         fn seek(self: *Self, at_pos: usize, end: usize) ParseError!void {
-            const rows: RowRange = .{ .start = at_pos, .end = end };
-            if (self.placed and at_pos >= self.insert.pos()) {
+            const reuse = self.placed and at_pos < end and
+                (if (self.lookahead) |held| held.pos == at_pos else false);
+            const next_pos = if (reuse) at_pos + 1 else at_pos;
+            if (!reuse) self.lookahead = null;
+            const rows: RowRange = .{ .start = next_pos, .end = end };
+            if (self.placed and next_pos >= self.insert.pos()) {
                 try self.insert.shift(rows);
                 try self.id_ctr.shift(rows);
                 try self.id_actor.shift(rows);
@@ -5953,6 +6268,7 @@ pub fn ElemWalk(comptime O: type) type {
             // holding four fresh cursors and one stale one, and `placed` is
             // what says not to move a cursor in that state.
             self.placed = false;
+            self.lookahead = null;
             self.insert = try self.set.cols.insert.iterRange(rows);
             self.id_ctr = try self.set.cols.id_ctr.iterRange(rows);
             self.id_actor = try self.set.cols.id_actor.iterRange(rows);
@@ -6550,9 +6866,9 @@ fn documentSet(gpa: Allocator, table: *Table) !Set {
     return set;
 }
 
-/// The same, with no rows.
+/// The document's actor table, with no rows.
 fn emptySet(gpa: Allocator, table: *Table) !Set {
-    return Set.init(gpa, encoding, table.asTable());
+    return Set.fromActors(gpa, &fixture_actors, encoding, table.asTable());
 }
 
 /// A document's op set and the table it borrows, built together.
@@ -6592,7 +6908,7 @@ fn Empty(gpa: Allocator) !*DocumentHandle {
     const self = try gpa.create(DocumentHandle);
     errdefer gpa.destroy(self);
     self.* = .{ .gpa = gpa, .table = Table.init(gpa), .set = undefined };
-    self.set = try emptySet(gpa, &self.table);
+    self.set = try Set.init(gpa, encoding, self.table.asTable());
     return self;
 }
 
@@ -6798,6 +7114,7 @@ test "the row-order checker accepts the document and rejects each of R1 to R4" {
     {
         const doc = try Empty(gpa);
         defer doc.destroy();
+        try doc.set.insertActor(0, actor0);
         const rows = [_]TestRow{
             rowAt(opId(1, 0), .root, .{ .map = "a" }, false, .set, counter(1), null, &.{}, true, true),
             rowAt(opId(2, 0), made(2, 0), .{ .map = "k" }, false, .set, counter(1), null, &.{}, true, true),
@@ -6812,6 +7129,7 @@ test "the row-order checker accepts the document and rejects each of R1 to R4" {
     {
         const doc = try Empty(gpa);
         defer doc.destroy();
+        try doc.set.insertActor(0, actor0);
         const rows = [_]TestRow{
             rowAt(opId(1, 0), .root, .{ .map = "a" }, false, .set, counter(1), null, &.{}, true, true),
             rowAt(opId(2, 0), .root, .{ .seq = head }, true, .set, .{ .str = "x" }, null, &.{}, true, true),
@@ -6826,6 +7144,7 @@ test "the row-order checker accepts the document and rejects each of R1 to R4" {
     {
         const doc = try Empty(gpa);
         defer doc.destroy();
+        try doc.set.insertActor(0, actor0);
         const descending = [_]TestRow{
             rowAt(opId(2, 0), .root, .{ .map = "a" }, false, .set, counter(1), null, &.{}, false, true),
             rowAt(opId(1, 0), .root, .{ .map = "a" }, false, .set, counter(2), null, &.{}, true, true),
@@ -6836,6 +7155,7 @@ test "the row-order checker accepts the document and rejects each of R1 to R4" {
     {
         const doc = try Empty(gpa);
         defer doc.destroy();
+        try doc.set.insertActor(0, actor0);
         const tied = [_]TestRow{
             rowAt(opId(1, 0), .root, .{ .map = "a" }, false, .set, counter(1), null, &.{}, false, true),
             rowAt(opId(1, 0), .root, .{ .map = "a" }, false, .set, counter(2), null, &.{}, true, true),
@@ -6851,6 +7171,7 @@ test "the row-order checker accepts the document and rejects each of R1 to R4" {
     {
         const doc = try Empty(gpa);
         defer doc.destroy();
+        try doc.set.insertActor(0, actor0);
         const legal = [_]TestRow{
             rowAt(opId(2, 0), made(1, 0), .{ .seq = head }, true, .set, .{ .str = "y" }, null, &.{}, true, true),
             rowAt(opId(1, 0), made(1, 0), .{ .seq = head }, true, .set, .{ .str = "x" }, null, &.{}, true, true),
@@ -6861,6 +7182,7 @@ test "the row-order checker accepts the document and rejects each of R1 to R4" {
     {
         const doc = try Empty(gpa);
         defer doc.destroy();
+        try doc.set.insertActor(0, actor0);
         const forward = [_]TestRow{
             rowAt(opId(1, 0), made(1, 0), .{ .seq = head }, true, .set, .{ .str = "x" }, null, &.{}, true, true),
             rowAt(opId(2, 0), made(1, 0), .{ .seq = head }, true, .set, .{ .str = "y" }, null, &.{}, true, true),
@@ -6879,6 +7201,7 @@ test "the row-order checker rejects a register whose rows are not contiguous" {
     const gpa = testing.allocator;
     const doc = try Empty(gpa);
     defer doc.destroy();
+    try doc.set.insertActor(0, actor0);
     const rows = [_]TestRow{
         rowAt(opId(1, 0), .root, .{ .map = "a" }, false, .set, counter(1), null, &.{}, true, true),
         rowAt(opId(2, 0), .root, .{ .map = "b" }, false, .set, counter(1), null, &.{}, true, true),
@@ -8560,6 +8883,50 @@ test "the element cursor answers an empty window, a window behind itself and a r
     try testing.expectEqual(@as(?ElemPos, null), try cursor.at(0, 0));
 }
 
+test "element lookahead respects repeated, shrinking and extending register windows" {
+    // Row 5 is a singleton; rows 6..8 share one element. The window may
+    // exclude a decoded following row, then extend to include it again.
+    const doc = try Document(testing.allocator);
+    defer doc.destroy();
+    var cursor = try doc.set.elemCursor();
+    const cases = [_]struct { pos: usize, end: usize, want: ?ElemPos }{
+        .{ .pos = 5, .end = 8, .want = .{ .elemid = anchor(opId(7, 0)), .last_pos = 5 } },
+        .{ .pos = 6, .end = 6, .want = null },
+        .{ .pos = 6, .end = 7, .want = .{ .elemid = anchor(opId(6, 0)), .last_pos = 6 } },
+        .{ .pos = 6, .end = 8, .want = .{ .elemid = anchor(opId(6, 0)), .last_pos = 7 } },
+        .{ .pos = 7, .end = 8, .want = .{ .elemid = anchor(opId(6, 0)), .last_pos = 7 } },
+        .{ .pos = 5, .end = 8, .want = .{ .elemid = anchor(opId(7, 0)), .last_pos = 5 } },
+        .{ .pos = 6, .end = 8, .want = .{ .elemid = anchor(opId(6, 0)), .last_pos = 7 } },
+        .{ .pos = 8, .end = 7, .want = null },
+        .{ .pos = 8, .end = 12, .want = .{ .elemid = anchor(opId(12, 0)), .last_pos = 8 } },
+        .{ .pos = 9, .end = 12, .want = .{ .elemid = anchor(opId(10, 0)), .last_pos = 9 } },
+        .{ .pos = 10, .end = 12, .want = .{ .elemid = anchor(opId(11, 0)), .last_pos = 10 } },
+        .{ .pos = 11, .end = 12, .want = .{ .elemid = anchor(opId(9, 0)), .last_pos = 11 } },
+    };
+    for (cases) |case| {
+        try testing.expectEqual(case.want, try cursor.at(case.pos, case.end));
+    }
+}
+
+test "element lookahead is discarded after a register read refuses" {
+    // Make the trailing overwrite's key invalid before opening the borrow.
+    // A refusal after consuming held row 6 must not reuse it for row 5.
+    const gpa = testing.allocator;
+    const doc = try Document(gpa);
+    defer doc.destroy();
+    try doc.set.cols.key_ctr.set(gpa, 7, null);
+    var cursor = try doc.set.elemCursor();
+    const first: ?ElemPos = .{ .elemid = anchor(opId(7, 0)), .last_pos = 5 };
+    try testing.expectEqual(first, try cursor.at(5, 8));
+    try testing.expectError(error.InvalidKey, cursor.at(6, 8));
+    try testing.expectEqual(first, try cursor.at(5, 6));
+    try testing.expectError(error.InvalidKey, cursor.at(6, 8));
+    try testing.expectEqual(
+        @as(?ElemPos, .{ .elemid = anchor(opId(6, 0)), .last_pos = 6 }),
+        try cursor.at(6, 7),
+    );
+}
+
 // ── The empty op set ───────────────────────────────────────────────────────
 
 test "every entry point answers on an op set with no rows" {
@@ -8724,8 +9091,8 @@ test "the four bound arms are four row ranges, and a key the map does not hold s
     // [`hexane/src/tests.rs:3464-3476`](../../github-automerge-automerge/rust/hexane/src/tests.rs)
     // gives `2..2` for `"aab"` over `aaa aaa bbb bbb bbb ccc`). `"aa"` sorts
     // between `"a"` and `"b"`, `"cc"` between `"c"` and `"d"`, and neither
-    // register moves: this is a walk of the key column, so the answer is one
-    // past the last row whose key sorts **below** the probe.
+    // register moves: the bound is one past the last row whose resolved key
+    // sorts **below** the probe, regardless of its intern ID.
     //
     // **`"z"` and `"zz"` are the case that hides the defect**, and they are
     // here for that reason: both answer `5..5`, which is right, because the
@@ -9155,6 +9522,7 @@ test "a register the fast index seek finds stays inside the object it is in" {
     const gpa = testing.allocator;
     const doc = try Empty(gpa);
     defer doc.destroy();
+    try doc.set.insertActor(0, actor0);
     const list = made(1, 0);
     const rows = [_]TestRow{
         rowAt(opId(1, 0), .root, .{ .map = "l" }, false, .make_list, .null_value, null, &.{}, true, true),
@@ -11112,6 +11480,7 @@ test "a put that overwrites the register is the register's only row, and its val
     const gpa = testing.allocator;
     const doc = try Empty(gpa);
     defer doc.destroy();
+    try doc.set.insertActor(0, actor0);
     const set = &doc.set;
 
     try localPut(gpa, set, "k", .{ .int = 1 }, opId(1, 0), &.{});
@@ -11159,6 +11528,7 @@ test "a third put on one register demotes the second, and the index names the on
     const gpa = testing.allocator;
     const doc = try Empty(gpa);
     defer doc.destroy();
+    try doc.set.insertActor(0, actor0);
     const set = &doc.set;
 
     // Three ordinary puts, each finding the register the last one left. This
@@ -11207,6 +11577,7 @@ test "an overwrite leaves the register one winner and one visible row" {
     const gpa = testing.allocator;
     const doc = try Empty(gpa);
     defer doc.destroy();
+    try doc.set.insertActor(0, actor0);
     const set = &doc.set;
 
     try localPut(gpa, set, "k", .{ .int = 1 }, opId(1, 0), &.{});
@@ -11525,7 +11896,7 @@ test "a register with two winners is a broken index, and the cross-check still s
 // | the row where the order first breaks is a **value** on the fault | `validate_op_order` returns a `bool` ([`op_set.rs:167-175`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)) | a fault has nowhere to put a row, and "the order is wrong, **where**" is the question a reader of the fault has |
 // | [`DebugCmpFault`], [`DebugSide`] | no such type | the same rule as [`TopIndexFault`]: a failure is a value naming what failed, so a test can make the checker fire and a caller can act on it |
 // | [`OpSet.mapRange`] takes `?KeyBound` at each end, and so reaches all four of upstream's arms | `map_range` takes a `RangeBounds<String>` and matches four ways ([`op_set.rs:406-416`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)) | Zig has no range-bounds protocol, so [`KeyBound`] is `RangeBounds`' spelling the way [iter/list_range.zig](iter/list_range.zig)'s `IndexRange` is `RangeBounds<usize>`'s. `Included` and `Excluded` at the same end name **different** row ranges one register apart, so a pair of `?[]const u8` could reach only the two `Included` arms — and the two a C `AMmapRange` needs, because its `end` is one past the last key ([`automerge-c/src/doc/map.rs:482-483`](../../github-automerge-automerge/rust/automerge-c/src/doc/map.rs)) |
-// | [`OpSet.propRange`] **walks** the key column and counts the rows below the key to answer an absent key's sorted point | `prop_range` is `key_str.scope_to_value(Some(prop), obj_range)`, one descent ([`op_set.rs:1268-1271`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)) | this port's `key_str` holds interned ids ([plan §5.3](../../docs/plan.md)), which are in first-seen order and not key order, so `scopeToValue` needs sorted values and cannot be used. A walk that finds nothing has no descent to fall out of, so the accumulation is written out: one past the last row whose key sorts below the probe, which is what the descent answers ([`column.rs:958-1000`](../../github-automerge-automerge/rust/automerge/src/op_set2/columns.rs), [hexane/src/tests.rs:3464-3476](../../github-automerge-automerge/rust/hexane/src/tests.rs)). Without it the answer was the object's end, which is right **only** for a key above every key the object holds |
+// | [`OpSet.propRange`] uses positional lexical lower/upper bounds over resolved key bytes | `prop_range` is `key_str.scope_to_value(Some(prop), obj_range)`, one descent ([`op_set.rs:1268-1271`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)) | Intern IDs are in first-seen order, not key order, so numerical `scopeToValue` is invalid. Byte comparisons preserve the register and absent-key insertion-point contract without a second key table. |
 // | `OpSet.mapRange` takes **no clock** | `map_range` takes one and passes it to `MapRange::new` ([`op_set.rs:396-419`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)) | upstream's four arms are row arithmetic over `key_str` and `obj_range` and never mention the clock; the narrowing happens in the walk. The port puts the clock where it goes — on the walk's constructor ([`OpSet.keys`], [`OpSet.listRange`]) — rather than on the bounds, where nothing would read it |
 // | [`OpSet.idToExid`] answers an [`ExId.id`](../types.zig) — the operation alone — for an index the actor table does not have, and an [`ExId.named`](../types.zig) — the operation **plus the actor's bytes** — for every index it does | `OpSet::id_to_exid` reads `self.actors[id.actor()].clone()` and has no arm that does not ([`op_set.rs:1054-1060`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)); the third field of `ExId::Id` is the actor's bytes precisely so an id survives a renumbering ([`exid.rs:15-18`](../../github-automerge-automerge/rust/automerge/src/exid.rs), read back at [`automerge.rs:744-758`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)) | an index out of range is a row the set should not hold ([`OpSet.splice`] rejects it), and there is no actor to record for one. The bare id is the old behaviour and is what a caller with only an index gets; it is **not** the answer for an index the table *does* have, because that answer used to drop the one field that makes an id mean the same thing in two documents. The actor table is sorted, so interning an actor that sorts first — which is what `isolate` does, with a concurrency actor whose magic bytes are `0x13 b2 23 09` ([`types.rs:23`](../../github-automerge-automerge/rust/automerge/src/types.rs)) — renumbers every index at or above it ([`op_set.rs:1400-1405`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)) |
 // | [`OpSet.queryInsertAt`] **computes the general answer and returns `error.Invariant`** when the two disagree — **behind [`check_slow_paths`]**, where upstream's `debug_assert_eq!` is compiled out rather than gated — and [`OpSet.queryInsertAtText`] answers `null` — falling through to the general walk — where `elemid_at` finds no element at the corrected position | `query_insert_at` compares the fast answer with `InsertQuery`'s under a `debug_assert_eq!` and returns `Ok(q)` either way ([`op_set.rs:583-598`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)); `elemid_at(..)?` propagates `None` out of `query_insert_at_text`, which is the same fall-through, and unwrapping there instead is a panic | **the gate keeps upstream's cost, which is nothing**: the general answer is a whole-object walk, so an always-on comparison is O(rows in the object) on every list and text insert at a non-zero index, and 50 000 ascending inserts in one transaction measured about 1011 s and ~4.69e12 instructions. With the gate on the disagreement is still a **value** — `error.Invariant` reaches the caller and a test can assert it — rather than a message on stderr, and `zig build slow-path` runs the arm; **a default-build test calls [`OpSet.queryInsertAtSlow`] and compares both answers itself** (`:8078-8122`), so the comparison is made in every build and the write path does not pay for it. **The extra call is not optional when it runs**: the fast path's [`QueryNth`] owns a [`MarkSet`](insert.zig), so the disagreement has to hand it back before the error leaves or every failure leaks and `std.testing.allocator` aborts the run |

@@ -879,8 +879,8 @@ fn expectPrefixSearch(
     for (targets, answers) |target, answer| {
         const t = std.math.cast(i64, std.fmt.parseInt(i128, target, 10) catch return error.CorpusValueTooLarge) orelse return error.CorpusValueTooLarge;
         const want_index = std.fmt.parseInt(usize, answer, 10) catch return error.CorpusValueTooLarge;
-        const hit = tree.findByPrefixSum(prefixIncrement, t);
-        const by_fn = btree.findSlabAtPrefix(&tree, t);
+        const hit = try tree.findByPrefixSum(prefixIncrement, t);
+        const by_fn = try btree.findSlabAtPrefix(&tree, t);
         try testing.expectEqual(hit.slab, by_fn.index);
         try testing.expectEqual(hit.items_before, by_fn.items_before);
         try testing.expectEqual(hit.prefix_before, by_fn.prefix);

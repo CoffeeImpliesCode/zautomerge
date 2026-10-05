@@ -498,7 +498,12 @@ Invariants and rules provable from the artefacts above.
 8. **Mark-end-before-mark-start is a load error with a documented recovery path.** `tests/rich_text_fuzz_crash.rs:222-229` asserts the error string contains `"invalid mark operation order"`; `:232-235` asserts `Automerge::rescue` returns the value. This is a **format-level** rule, added in 0.11.0, meaning a Zig port must reject the same documents.
 9. **A batch containing a duplicate actor sequence number is rejected atomically.** Changelog 0.12.0 plus `tests/test.rs:3528-3663` (four tests) and `tests/test.rs:3664` (queued orphan variant). A partial apply must not corrupt the in-memory index or the saved document.
 10. **A failed merge that already applied some changes must not corrupt save/load.** `tests/test.rs:3528-3557`.
-11. **A `PatchLog` may only be used with the document that produced it; otherwise `PatchLogMismatch`, never a panic.** `tests/test.rs:37-78`, all four entry points.
+11. **External `PatchLog` compatibility follows actor-table migration, not document identity.**
+    The four mismatch tests (`tests/test.rs:37-78`) cover incompatible actor tables.
+    Rust's sorted-prefix algorithm can retain trailing actors when the new table is shorter (`patches/patch_log.rs:634-658`).
+    Native logs keep that behavior (`src/patches.zig:2889-2934`).
+    If an event names an absent resident actor, rendering returns `InvalidActorIndex` instead of Rust's indexed-access panic.
+    These tests do not prove that every cross-document log use fails before rendering.
 12. **Patches are the change-propagation contract, and the round-trip law is `hydrate → patch → hydrate == hydrate`.** This exact assertion (`apply_patches` then `assert_eq!(actual, expected)`) is the shape of at least 20 tests across `test.rs`, `block_tests.rs`, `batch_insert.rs` and `rich_text_fuzz_crash.rs`. It is the single most important invariant in the suite and the most useful conformance harness for a port.
 13. **Text index units must be consistent across `length`, `get`, `marks` and `get_marks`.** `tests/text.rs:1091-1120` (`get_marks_index_counts_the_same_units_as_marks`) and `tests/text.rs:1045-1089` (`get_marks_agrees_with_marks_at_every_index`); the changelog's Unreleased entry says these previously disagreed under some encodings.
 14. **A multi-unit text element is one sequence element.** `tests/test.rs:249-330` and `tests/rich_text_fuzz_crash.rs:194-219`: a string inserted as a single op has text width > 1; replacing it must remove its entire rendered width, and a mark fully inside it has zero-width start and end.
@@ -537,7 +542,10 @@ Per construct, in the order they appear above.
 
 **`automerge_test` assertions (`assert_doc!`, `assert_obj!`, `list!`, `map!`, `mk_counter!`, `new_doc!`, `realize!`, …, `tests/test.rs:81-88`).** A dev-dependency crate of assertion macros. A Zig port should fold these into the test file as plain helper functions returning a runtime error union.
 
-**`is_send::<AutoCommit>()` (`src/autocommit.rs:1376-1383`).** **No clean Zig equivalent.** Zig has no `Send`/`Sync` bound; the type system will not reject a type that captures thread-local state. The test's *intent* — "`AutoCommit` may be moved to another thread" — is enforceable in Zig only by an explicit audit that the struct contains no thread-affine pointers, or by writing the actual test: construct a doc, move it into a freshly spawned `std.Thread`, and mutate it there. That is the honest port.
+**`is_send::<AutoCommit>()` (`src/autocommit.rs:1376-1383`).** Zig has no `Send`/`Sync` bound.
+Native open owners must remain at a stable address. Closed owners can transfer ownership (`src/autocommit.zig:30-34`).
+The C bridge separately requires a caller-owned global serialization boundary.
+Rust's compile-time thread-safety assertion does not certify either native contract.
 
 **`debug_cmp` / `save_checkpoint` (`src/op_set2/columns.rs:82-99`, `src/op_set2/op_set.rs:68-81`, `src/automerge.rs:580-582`, `:1164-1166`).** `#[cfg(test)]`-only introspection used by `reproduce_clock_cache_bug` (`tests/test.rs:3258-3403`) to compare two documents column-by-column. Zig has no `cfg(test)`. Two options: expose them unconditionally and document as internal, or gate on a build option. A `pub` function Zig-idiomatically has no "internal" visibility other than the `@import` boundary, so a separate `testsupport` module imported only by the test root is the cleanest structure.
 
@@ -545,19 +553,30 @@ Per construct, in the order they appear above.
 
 **`make_rng() -> SmallRng` (`src/lib.rs:322-325`)** → a comptime-seeded PRNG. Zig's `std.Random.DefaultPrng` is a good fit; the Rust code uses `rand 0.10`'s `SmallRng` for reproducibility across runs, which a port must reproduce by pinning an algorithm, not a seed alone.
 
-**`#[cfg(not(any(feature = "utf16-indexing", feature = "utf8-indexing")))]` (`tests/test.rs:420`)** → a build option. In Zig this becomes a comptime boolean threaded through `builtin` or a module-level constant. **The hazard**: the Rust idiom is a *per-test* gate; the Zig idiom is a *whole-build* switch. If a port makes text encoding a build option, `current_state_diff_with_block_applies_to_hydrated_value_from_fuzz_trace` disappears from every configuration instead of from two. Recommendation: make `TextEncoding` a **runtime value threaded through the document**, which is what `AutoCommit::new_with_encoding` already does, and only keep a compile-time constant for the hot width-table. Then all four encodings are testable in one binary and the gate is unnecessary.
+**Indexing feature gates** (`tests/test.rs:420`). Rust can exclude individual tests under UTF-8 or UTF-16 indexing features.
+Native documents retain an explicit runtime encoding.
+`TextEncoding.platformDefault()` selects a declared build default, with code points for a featureless build (`src/types.zig:958-970`).
+All four encodings remain available through explicit constructors.
+Source support does not certify the current four-mode test matrix.
 
 **Cargo features → build options.** The five `automerge` features and five `hexane` features have no Cargo analogue. In `build.zig`: `b.standardTargetOptions` plus explicit `options` enum, and `const Options = struct { wasm: bool, utf8_indexing: bool, utf16_indexing: bool, slow_path_assertions: bool, deep_fuzz: bool, bijou64: bool }`. Every feature gate in the source becomes `if (opts.slow_path_assertions)` inside a `comptime` branch. `slow_path_assertions` matters for a port: the Rust default is *off* even in debug, so a naive Zig port that enables debug assertions unconditionally will be measurably slower than the reference and will trip `scripts/ci/build-test`-equivalent budgets. See `rust/CHANGELOG.md` 0.8.0.
 
 **Workspace members → build modules.** The eight workspace crates become `b.addModule` + a `lib`/`exe` per member. Nothing needs versions. `[profile.release] lto = true, codegen-units = 1` maps to `b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSmall })` — Zig has no LTO knob and never splits codegen units, so this is closer to ReleaseSmall than ReleaseFast.
 
-**`resolver = "2"`** → no analogue; Zig has one global dependency set per build. The one place it matters: `flate2` is declared with `default-features = false, features = ["zlib-rs"]` (pure-Rust DEFLATE) precisely so it works on wasm. In Zig, a DEFLATE implementation is a real choice: `std.compress.flate` is the obvious candidate but is *decoding-only*; a port needs an **inflate + deflate** pair that is byte-compatible with the fixtures. This is the highest-risk single dependency decision and the fixtures in §2 are the acceptance test.
+**`resolver = "2"`** has no direct Zig analogue.
+Rust selects `flate2` with the pure-Rust `zlib-rs` backend for wasm-compatible DEFLATE.
+Native raw compression and decompression use Zig 0.16 `std.compress.flate` (`src/storage/chunk.zig:363-383`, `:424-438`).
+Save-byte identity is not required. Reference loadability remains a separate gate.
 
 **`rand ^0.10` declared `optional = false`** — a real, non-optional runtime dependency of the core crate (used for default actor ids and for `anonymize`'s seeded PRNG). Zig's `std.crypto.random` covers the unseeded case; the seeded case needs a ported PRNG.
 
 **`sha2 ^0.11.0-rc.5`** — a release-candidate dependency in a library that claims MSRV pinning. `std.crypto.hash.sha2.Sha256` is available in Zig; the chunk checksum is `SHA-256(...)[0..4]` (`fuzz/fuzz_targets/load.rs:16-22`), so only the truncated-prefix use is needed.
 
-**`unicode-segmentation 1.10.1`** — grapheme clustering. **No stdlib equivalent.** `std.unicode` provides UTF-8/UTF-16/UTF-32 iteration and `utf8Validate`, but not UAX #29 grapheme clusters. `TextEncoding::GraphemeCluster` is one of the four encodings exercised by all 15 `text_encoding.rs` scenarios and by `test.rs:399`. A port must either implement UAX #29 or drop that encoding — dropping it silently changes `length()` results for every document containing emoji, which is exactly the class of bug `test.rs:1108-1120` catches. [INFERENCE] on effort; the test surface is proven.
+**`unicode-segmentation 1.10.1`** supplies Rust's grapheme clustering.
+Zig's standard library does not supply UAX #29 segmentation.
+The native repository implements grapheme counting and segmentation (`src/unicode.zig:1-11`, `:44-55`).
+It exposes grapheme clusters as one of four native encodings (`src/types.zig:955-980`).
+The upstream tests remain compatibility targets, not evidence of a newly passed native matrix.
 
 **`tinyvec` / `smallvec`-style `Vec` variants** → `std.ArrayList` plus explicit capacity heuristics, or a fixed-capacity inline array for the hot op columns. Not a blocker.
 
@@ -620,9 +639,15 @@ Ordered by how likely a Zig port is to get it wrong silently.
 
 9. **`getrandom` 0.4 + the Node-18 WebCrypto polyfill** is a live, cross-project contract documented only in `javascript/HACKING.md:192-219` and enforced by a dedicated CI job plus a conditional script that silently `exit 0`s when `fnm` is unavailable (`scripts/ci/node_18_packaging_test:19-22`). Any port that keeps the JS layer inherits this maintenance burden; any port that drops it loses the JS conformance suite for free.
 
-10. **DEFLATE is not solved by the standard library.** `flate2` with `zlib-rs` is a deliberate, recent (0.11.0) choice, and `tests/test.rs:2046-2069` (`test_compressed_doc_cols`) asserts **per-column** deflate bit behaviour, and `:2031-2045` (`test_compressed_changes`) depends on `DEFLATE_MIN_SIZE = 250`. `std.compress.flate` decodes but does not encode. A port must supply a deflate whose output the reference `automerge` can still read, or the three `two_change_chunks*` fixtures and the `save()` output stop being byte-compatible. The compression *level* is not specified anywhere in the repo, so bit-identical `save()` output is **not** a stated requirement — only round-trip compatibility is. [INFERENCE] from the absence of any golden `save()` byte assertion.
+10. **Compression boundaries remain compatibility requirements.**
+    Rust tests check compressed columns and changes (`tests/test.rs:2046-2069`, `:2031-2045`).
+    Native code implements both DEFLATE directions through Zig's standard library (`src/storage/chunk.zig:363-383`, `:424-438`).
+    Flags, wrappers, and decoded content must interoperate. Compressed save bytes need not be identical.
+    A source implementation is not a new live reference-interop result.
 
-11. **Unicode grapheme clustering has no stdlib path**, yet `TextEncoding::GraphemeCluster` is one of the four encodings under test and is used by `tests/test.rs:399`. Dropping it changes `length()` for every emoji-bearing document. Implementing UAX #29 correctly is a project in itself.
+11. **Grapheme segmentation remains a separate native implementation.**
+    The repository implements UAX #29 rules rather than dropping that encoding (`src/unicode.zig:8-11`, `:44-55`).
+    Source support alone does not certify all upstream grapheme scenarios.
 
 12. **The changelog lags the code in two places**: `automerge` is at Cargo version `0.12.0` with an unreleased section on top, and `hexane` is at `1.0.0-alpha.5` with changelog entries only through `alpha.2`. A port that treats the changelog as exhaustive will miss the alpha.3–alpha.5 changes to the storage engine — precisely the component that owns the wire format.
 
@@ -632,4 +657,8 @@ Ordered by how likely a Zig port is to get it wrong silently.
 
 15. **Runtime-path fixture loading will break under `zig test`.** `tests/test.rs:2211` and `:2223` and `src/automerge/current_state.rs:522` all use `fs::read("./tests/fixtures/…")` relative to the process cwd. Under `zig build test` the cwd is the build root, not the package root. This is a known, mechanical breakage with a mechanical fix (`@embedFile`), but it is the *first* thing that will fail and, if the fixtures are simply deleted to make the build green, the wire-format regression coverage is gone with no signal.
 
-16. **Nothing in this repo is a differential test against another implementation.** The only cross-implementation artefact is `interop/exemplar` (406 B) plus its pinned export JSON. There is no second-implementation oracle, so a Zig port can only be validated against itself and against 1.1 KB of fixtures. Anything beyond that requires an external conformance corpus.
+16. **The pinned upstream repository has no second-implementation oracle in this survey.**
+    Its cross-implementation artifact is `interop/exemplar` and the pinned export JSON.
+    The native repository separately provides golden-vector oracle conformance and live save interoperability (`build.zig:814-828`, `:918-927`).
+    Those explicit gates need Cargo and the reference checkout.
+    They do not run through ordinary `zig build test`, and this documentation update did not execute them.

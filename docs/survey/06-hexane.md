@@ -1518,7 +1518,7 @@ transliterated. Three options, in descending order of fidelity:
 | `#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]` | hand-written; `Default` → `init`/`empty`; `Debug` → `std.debug.print` |
 | `dyn ColumnRef<T>` (`column.rs:361`) | `*const anyopaque` + a small vtable of 3 fn ptrs |
 | `unsafe` | raw pointers plus a documented invariant; `String::unpack`'s invariant (validate-on-load) must be enforced at every `unpack` call site |
-| allocator-generic (`impl Allocator`) | **hexane never parameterises on an allocator** — every `Vec` is the global allocator's. A Zig port should thread an `Allocator` anyway, but note that this is *added* genericity, not a translation |
+| allocator-generic (`impl Allocator`) | Rust hexane uses the global allocator. Native columns retain an explicit allocator (`src/hexane/column.zig:3303-3308`). |
 
 #### GATs — `type Get<'a>` (lib.rs:218)
 
@@ -1650,19 +1650,16 @@ even without a borrow checker.
 
 The doc says plainly: "Treat the public type as `Column<T>`. The `WF` and `Idx`
 parameters are internal plumbing with the right defaults" (`column.rs:1016-1021`).
-A Zig port should hard-code `LenWeight` + `SlabBTree` and expose exactly two
-entry points: `Column(comptime T, comptime C)` and
-`PrefixColumn(comptime T)`. Anything more re-creates the genericity the crate
-deliberately hides.
+Native `Column(comptime T, comptime E)` selects its codec and weight at compile time.
+`E.Weight` determines the `btree.Tree(Weight)` index (`src/hexane/column.zig:3279-3305`).
+Prefix encoding is a codec choice, not a second prescribed `PrefixColumn` API.
 
 #### B-tree / Fenwick
 
-Both index backends share `ColumnIndex<W>` (`index.rs:27`). A Zig port needs
-one. `BitIndex` (`index.rs:67`) is a Fenwick tree over `W` with
-`AddAssign`/`SubAssign`; `SlabBTree` (`btree.rs:237`) is the default because
-`SlabAgg`'s min/max is not invertible. The Zig version of `BitIndex` is a
-straightforward `[]W` with `W.len()` arithmetic — note that `items_before`
-(`index.rs:96-106`) only ever reads the **`len` component**, not the prefix.
+Rust's two backends share `ColumnIndex<W>` (`index.rs:27`).
+Native backends are concrete types with matching operations, not a vtable.
+Columns instantiate the B-tree. Raw byte storage instantiates the Fenwick index (`src/hexane/index.zig:12-28`).
+The native implementation does not collapse all weights to `LenWeight`.
 
 `SlabBTree` is 2459 lines of arena bookkeeping, split/merge/underflow logic and
 a 700-line `#[cfg(test)]` block (from `:1674`). The portable part is roughly
@@ -1700,11 +1697,10 @@ parameter directly and drop them.
   non-scalar prefix avoids a per-level clone (`btree.rs:66-73`). Zig's
   `@TypeOf`/`anytype` on the `+=` operand covers the same call shape, but the
   "borrow to avoid a clone" *motivation* disappears: Zig copies are explicit.
-- **`#[cfg]` / feature-gated surface** — the `bijou64` gate removes
-  `pub struct Bijou64`, `pub mod bijou`, and seven `pub type` aliases
-  (`lib.rs:84-100`, `codec.rs:359-360`). A Zig build must either always
-  compile bijou64 (pulling a dependency hexane does not otherwise need) or use
-  a build option. `wasm` and `deep_fuzz` affect only logging and test gating.
+- **`#[cfg]` / feature-gated surface** — upstream's `bijou64` gate removes
+  `pub struct Bijou64`, `pub mod bijou`, and seven aliases (`lib.rs:84-100`, `codec.rs:359-360`).
+  The native port intentionally omits this optional feature (`AGENTS.md:50-52`).
+  Rust `wasm` and `deep_fuzz` affect logging and test gating.
 - **Proc macros** — none. `thiserror` is the only derive-like macro; the
   six-variant `PackError` becomes an error set plus, where the payload matters,
   explicit formatting.
@@ -1723,14 +1719,11 @@ parameter directly and drop them.
 
 ### What is hard
 
-1. **The type-level encoding dispatch is the port's whole difficulty.** Twelve
-   traits participate in `Column<T>`'s type identity
-   (`ColumnValueRef`, `ColumnValue`, `RleValue`, `AsColumnRef`, `WeightFn`,
-   `ColumnIndex`, `SlabEdit`, `EditSlab`, `ColumnEncoding`, `PrefixValue`,
-   `DeltaValue`, `DeltaInner`). Getting this wrong produces a column that
-   compiles and silently writes the wrong bytes. The safest route is route (1)
-   above: explicit comptime encoding tag, `Column(comptime T, comptime C)` as
-   the *only* public shape, `LenWeight`/`SlabBTree` hard-coded.
+1. **Type-level encoding dispatch remains a wire-format boundary.**
+   Rust uses twelve traits for `Column<T>` identity, including its codec, weight, and index.
+   Native `Column(T, E)` resolves the codec and `E.Weight` at compile time (`src/hexane/column.zig:3279-3305`).
+   This is implemented source, not an open choice between index or vtable designs.
+   It still requires the final storage and conformance gates.
 
 2. **`RleTail` correctness.** The two-field tail (`bytes`, `lit_tail`) is the
    single mechanism that makes O(1) in-place splice possible, and it is

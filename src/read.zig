@@ -7,12 +7,13 @@
 //! and everything else. The bodies are in
 //! [`impl ReadDoc for Automerge`](../github-automerge-automerge/rust/automerge/src/automerge.rs)
 //! (`:2073-2320`) and in the `*_for` helpers it calls
-//! (`:1569-1971`). **In this port the trait and the implementation are one
-//! file**, because there is one concrete
-//! [`Document`](doc.zig) rather than a trait with two implementors
-//! ([plan §3.2](../../docs/plan.md)); upstream's `Automerge` and `AutoCommit`
-//! are one type with a `mode` flag here, so the thirty methods become free
-//! functions over `*const Document`.
+//! (`:1569-1971`). Raw readers and shared scoped kernels live here.
+//! `ReadDoc` adapts raw `Document`, `Transaction`, and `AutoCommit` readers at
+//! compile time; transaction and automatic-owner wrappers select their scope.
+//! Public free readers accept pointers to all three owners, including const
+//! pointers, and dispatch through `ReadDoc`. Ordinary automatic-owner reads do
+//! not open or close a transaction. Trait metadata reads use the raw document,
+//! unlike the owner's inherent history close barriers.
 //!
 //! # Every method here is a surface over something that already answers it
 //!
@@ -42,11 +43,9 @@
 //!
 //! **Every `*At` reader has the shape its unsuffixed sibling has, and says so
 //! by naming it** — [`getAt`] is [`get`], [`keysAt`] is [`keys`] — because
-//! they are the same body with one argument changed. **The six that hand back
-//! a walk carry one obligation the unsuffixed ones do not: the clock they
-//! read is the document's, so the walk is over before the next `_at` read at
-//! other heads.** The *Historical reads* section below is where that is
-//! argued.
+//! they share one kernel with a different clock. Historical clocks are retained
+//! by the document until mutation or destruction, so selecting other heads
+//! does not invalidate an existing walk.
 //!
 //! **A `Cursor` is a value, and that is the whole point of the type**: it names
 //! an element by its operation id, not by an index, so it survives every
@@ -97,17 +96,9 @@
 //! heads arrive in the name or as an argument — and upstream's own wrappers are
 //! two lines that say exactly that: `let clock = self.clock_at(heads);` then
 //! `self.*_for(.., clock)`
-//! **Nothing else in this file needed new machinery**, because every walk it
-//! hands back already took `?Clock` and every [`OpSet`](opset/op_set.zig) entry
-//! point it calls already took one; the single exception is [`getAllAt`],
-//! where the twenty-line dispatch under [`getAll`] is now shared with
-//! [`getAllAtScope`] rather than written twice, and [`parentsAt`], which
-//! shares the empty-walk branch for the same reason. The one thing that *did*
-//! need building is [`Document.clockAtScope`](doc.zig) — upstream's
-//! `Automerge::clock_at` with its heads-are-current shortcut, which this file
-//! needed as a *sibling* of [`Document.readScope`](doc.zig) rather than as a
-//! new field: a walk copies the clock by value, so the clock's `slots` have
-//! to outlive the walk, and both readers share the document's one cache.
+//! Returned walks borrow document-owned clocks. `historicalScope` retains each
+//! clock's heap slots in a pool; growing the pool moves Clock values but not
+//! the slots they own. Document mutation invalidates these borrowed views.
 //!
 //! ## `heads` that are the present
 //!
@@ -291,8 +282,7 @@ pub const Values = itervalues.Values(ChangeOp, ValueTerm);
 /// which takes no allocator because the fold remembers the one
 /// [`Spans.init`](iter/spans.zig) was given. **The spans it hands out are the
 /// caller's**, and each carries owned text and an owned mark set:
-/// [`Span.deinit`](iter/spans.zig) frees both. The mark *names* inside a span
-/// are the document's and are not freed.
+/// `Span.deinit` frees text, mark names and values, or an owned block map.
 pub const Spans = iterspans.Spans(ChangeOp);
 
 /// A map object's visible keys, one at a time
@@ -569,54 +559,27 @@ fn liveObjOrSelf(doc: *const Document, obj: ExId) ExId {
 /// an owned clock: `scope` is a value the op set stores, and its `slots`
 /// belong to the document.
 ///
-/// **[`atScope`] is this function with the caller's heads in place of the
-/// isolation's**, and it is what every `*At` reader below calls; the two share
-/// the document's one cached clock ([`Document.clockAtScope`](doc.zig)).
+/// Explicit historical clocks use a separate document-owned pool, so selecting
+/// another head set does not invalidate this isolation's clock.
 fn readScope(doc: *const Document) Error!?Clock {
     const scope = try mutableDoc(doc).readScope(doc.gpa) orelse return null;
     return scope.*;
 }
 
-/// The clock a historical read at caller-named `heads` runs at, or null when
-/// `heads` name the present
-/// ([`Document.clockAtScope`](doc.zig), upstream's `Automerge::clock_at` at
-/// [`automerge.rs`:1236-1247](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
-///
-/// **This is [`readScope`] with the caller's heads in place of the
-/// isolation's, and it is upstream's own shape rather than a port
-/// convenience.** Every `*_at` on `Automerge` is `let clock =
-/// self.clock_at(heads);` followed by the unsuffixed body with that clock
-/// ([`automerge.rs`:2078-2280](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-/// and **`clock_at` and not `change_graph::clock_at` is the name those
-/// wrappers use, because it carries the heads-are-current shortcut** — which
-/// is what makes `*_at(get_heads())` answer as the present does. Every `*At`
-/// reader below is exactly that two-line wrapper.
-///
-/// **`heads` here is never optional**, matching upstream's
-/// `heads: &[ChangeHash]` on the ten `_at` methods
-/// ([`read.rs`:40-55, 99-104, 118-123, 137, 149, 158-162, 180-184, 190-194, 266-271, 293-298](../../github-automerge-automerge/rust/automerge/src/read.rs))
-/// — a caller that wants the present writes the unsuffixed name. **The three
-/// cursor methods and [`hydrate`] are the exceptions upstream itself makes**
-/// (`at: Option<&[ChangeHash]>`, [`read.rs`:172, 203, 228, 241, 276](../../github-automerge-automerge/rust/automerge/src/read.rs)),
-/// and the port reaches this through the same door, with `null` meaning **the
-/// document's own read scope** rather than "no scope" — the reading
-/// [`hydrate`] argues at length and [`markSetAtIndex`] already applies.
-/// **Those three carry the heads as an argument rather than under a second
-/// name, because upstream carries them as an argument**
-/// ([`read.rs`:203, 228, 241](../../github-automerge-automerge/rust/automerge/src/read.rs));
-/// the eleven above are still a second name, because upstream gives those a
-/// second name too.
-///
-/// **Nothing here frees the answer, and the reason is the one
-/// [`Document.clockAtScope`](doc.zig) gives.** A walk copies the [`Clock`] by
-/// value and borrows only its `slots` ([`TopOps`](opset/top_op.zig):250), so
-/// the slots have to outlive the walk the reader hands back; the document
-/// caches them and frees the previous pair when the heads change. **A borrowed
-/// clock is therefore valid until the next scoped read at *other* heads**,
-/// which on a document that is neither isolated nor mutated is never.
-fn atScope(doc: *const Document, heads: []const ChangeHash) Error!?Clock {
-    const scope = try mutableDoc(doc).clockAtScope(doc.gpa, heads) orelse return null;
-    return scope.*;
+/// Raw historical reads use Rust's current-head shortcut
+/// (`automerge.rs:1236-1247`); other heads borrow retained historical slots.
+/// Transaction wrappers instead call `historicalScope` for every explicit head
+/// set, excluding pending operations even when graph heads match.
+fn atScope(doc: *const Document, heads: []const ChangeHash) ReadError!?Clock {
+    if (doc.graph.headsAreCurrent(heads)) return null;
+    return try historicalScope(doc, heads);
+}
+
+/// Retains a historical clock until document mutation or destruction.
+/// Returned copies borrow heap slots, so selecting other heads preserves walks.
+pub fn historicalScope(doc: *const Document, heads: []const ChangeHash) ReadError!Clock {
+    const owner = mutableDoc(doc);
+    return (try owner.clockAtScope(doc.gpa, heads)).*;
 }
 
 /// The document as a **mutable** pointer, for a [`Document`](doc.zig) method
@@ -721,7 +684,9 @@ fn winner(found: *opsetmod.OpsFound) ?Op {
 /// Upstream returns "a single arbitrarily chosen value" for a conflicted key
 /// ([read.rs:255-257](../../github-automerge-automerge/rust/automerge/src/read.rs))
 /// and the choice is deterministic: [`winner`] takes the register's last row.
-pub fn get(doc: *const Document, obj: ExId, prop: Prop) ReadError!?DocItem {
+pub fn get(doc: anytype, obj: ExId, prop: Prop) ReadError!?DocItem {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).get(doc, obj, prop);
     return getAtScope(doc, obj, prop, try readScope(doc));
 }
 
@@ -818,11 +783,13 @@ pub fn getAtScope(
 /// historical read resolves against the same actor table as the present is
 /// argued.
 pub fn getAt(
-    doc: *const Document,
+    doc: anytype,
     obj: ExId,
     prop: Prop,
     heads: []const ChangeHash,
 ) ReadError!?DocItem {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).getAt(doc, obj, prop, heads);
     return getAtScope(doc, obj, prop, try atScope(doc, heads));
 }
 
@@ -846,11 +813,13 @@ pub fn getAt(
 /// the ids ascend too. The assert is upstream's and it is in a debug build
 /// only, which is upstream's only.
 pub fn getAll(
-    doc: *const Document,
+    doc: anytype,
     obj: ExId,
     prop: Prop,
     gpa: Allocator,
 ) ReadError![]DocItem {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).getAll(doc, obj, prop, gpa);
     return getAllAtScope(doc, obj, prop, try readScope(doc), gpa);
 }
 
@@ -882,19 +851,21 @@ pub fn getAll(
 /// — the values' *bytes* are the document's and are valid until the next
 /// mutation, exactly as [`get`]'s are.
 pub fn getAllAt(
-    doc: *const Document,
+    doc: anytype,
     obj: ExId,
     prop: Prop,
     heads: []const ChangeHash,
     gpa: Allocator,
 ) ReadError![]DocItem {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).getAllAt(doc, obj, prop, heads, gpa);
     return getAllAtScope(doc, obj, prop, try atScope(doc, heads), gpa);
 }
 
 /// [`getAll`] and [`getAllAt`] under the clock the caller supplies — upstream's
 /// `Automerge::get_all_for(obj, prop, clock)`
 /// ([`automerge.rs`:1891-1927](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
-fn getAllAtScope(
+pub fn getAllAtScope(
     doc: *const Document,
     obj: ExId,
     prop: Prop,
@@ -968,100 +939,23 @@ fn getAllAtScope(
 /// a list and a text are the other two — **and `error.NotAnObject` for an id
 /// that names none**, which is upstream's `exid_to_obj` (`:1643`, `:788-792`).
 ///
-/// ## `heads`, and what `null` is
-///
-/// | `heads` | the clock the mirror is built at |
-/// |---|---|
-/// | `Some(h)` | a full [`Clock`](clock.zig) from [`ChangeGraph.clockAt`](change_graph.zig), **whatever `h` is** — the document's own heads included, because this arm does not take the shortcut; upstream's arm is `heads.and_then(|h| self.clock_at(h))` and **`clock_at` does shortcut** ([`automerge.rs`:1236-1247](../../github-automerge-automerge/rust/automerge/src/automerge.rs)); **the answers agree and the work does not** ([`markSetAtIndex`] is the same shape) |
-/// | `null` | **the document's read scope** — [`readScope`], so the isolation's clock, and no clock at all when the document is not isolated |
-///
-/// **The `null` row is upstream's answer on an un-isolated document and the
-/// port's on an isolated one, and that is a deliberate departure.**
-/// `Automerge::hydrate` resolves its clock with
-/// `heads.and_then(|h| self.clock_at(h))`
-/// ([`automerge.rs:2228`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-/// so upstream's `None` is *no clock* — and it is the same for both of
-/// upstream's `ReadDoc` implementors, because `AutoCommit::hydrate`
-/// ([`autocommit.rs:1011`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs))
-/// and `Transaction::hydrate`
-/// ([`transaction.rs:228`](../../github-automerge-automerge/rust/automerge/src/transaction.rs))
-/// forward `heads` to `hydrate_obj` **without passing `get_scope(..)`** — where
-/// every sibling on the same two types does (`autocommit.rs:1020`, `:1003`,
-/// `transaction.rs:238`, `autocommit.rs:920-921`). So **upstream's `hydrate`
-/// reads the present even while the document is isolated.** Upstream pins
-/// nothing here: its `hydrate` tests all pass `Some(..)` or run on an
-/// un-isolated document (`test.rs:207`, `:385-386`, `:3910-3914`,
-/// `:3936-3937`, `batch_insert.rs:451`, `:612-613`, `:812-813`).
-///
-/// The port takes the scope instead, and the reason is
-/// [AGENTS.md](../AGENTS.md)'s: **a reader that answers for an isolated
-/// document what the rest of the surface refuses is a reader lying.** Every
-/// other reader here reaches its clock through [`readScope`]
-/// ([`top_op.zig`:250, :728](../opset/top_op.zig),
-/// [`parents.zig`](../opset/parents.zig),
-/// [`map_range.zig`:846](../iter/map_range.zig),
-/// [`list_range.zig`:731](../iter/list_range.zig),
-/// [`spans.zig`:1176](../iter/spans.zig)), and a mirror built from the
-/// present's rows is a false statement about the isolation rather than a stale
-/// copy. **The two spellings are the same answer for every document that is
-/// not isolated** — [`readScope`] reports no clock for those, so the clock is
-/// null either way — so this changes nothing a caller can observe without
-/// isolating first, and the test `test "hydrate at null heads is the
-/// document's own scope"` is what holds the difference down.
-///
-/// ## `null` heads means the present, and other cases rest on that
-///
-/// **The paragraph above is the whole argument, and the argument has a
-/// consequence worth stating on its own: `heads = null` and
-/// `heads = getHeads()` are the same read on every document that is not
-/// isolated.** Upstream's reason is one function, and it is the *same*
-/// function both of this method's arms go through:
-/// [`Automerge::clock_at`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):1236-1247
-/// returns `None` — "an unscoped read of the present document" — "when `heads`
-/// is exactly the current heads, so `*_at(doc.get_heads())` takes the same
-/// indexed fast paths as the un-suffixed methods", and `heads.and_then(|h|
-/// self.clock_at(h))` is the line in both [`hydrate`]
-/// ([`:2228`](../../github-automerge-automerge/rust/automerge/src/automerge.rs))
-/// and upstream's `hydrate_obj` (`:1644`). **So upstream builds no clock for
-/// `Some(h)` at the present's own heads and this method builds one**, because
-/// the `Some` arm below reaches [`ChangeGraph.clockAt`](change_graph.zig)
-/// rather than [`Document.clockAtScope`](doc.zig), which is the door that
-/// carries the shortcut. **The two spellings still agree, for a second and
-/// independent reason: a full clock over the present's own heads *is* the
-/// present**, so what separates them is the work and not the answer.
-///
-/// **Cases are written against that agreement, and a change to the `null` arm
-/// breaks them.** The upstream `batch_insert` cases that end in
-/// `doc.hydrate(ROOT, None)` (`batch_insert.rs:451`, `:612-613`, `:812-813`)
-/// build un-isolated documents, so they exercise `null` as *the present*
-/// rather than as *a clock*: **a `hydrate` that is correct under an isolation
-/// and wrong without one fails every one of them, and fails it silently** —
-/// a mirror that is merely plausible passes an equality between two documents
-/// that are both unscoped and both wrong. The failure this file has produced
-/// most often is two structures that must agree computing one answer by
-/// different rules, and `null` heads is exactly such a pair: this method's arm
-/// and [`readScope`]'s. **They are one rule here, and that is a thing a reader
-/// of this comment needs, not a thing to be re-derived at the next change.**
+/// `null` heads deliberately bypass isolation and transaction scope, matching
+/// Rust's `heads.and_then(|h| self.clock_at(h))` (`automerge.rs:2228`).
+/// Explicit raw heads use the current-head shortcut; other heads select a
+/// historical clock. The owned mirror is independent of all borrowed clocks.
 pub fn hydrate(
-    doc: *const Document,
+    doc: anytype,
     obj: ExId,
     heads: ?[]const ChangeHash,
     gpa: Allocator,
 ) HydrateError!hydmod.Value {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).hydrate(doc, obj, heads, gpa);
     const set = mutableOps(doc);
     const live = try liveObj(doc, obj);
     const typ = try doc.objectType(live);
-    // **`heads.and_then(|h| self.clock_at(h))`** (`automerge.rs:2228`), with
-    // the `null` arm resolved through `readScope` as the doc above says.
-    // **The `Some` arm owns its clock and the `null` arm does not**, so the
-    // owned one is held in a slot the `defer` can free: a `?Clock` handed back
-    // by value could not say which arm built it.
-    var owned: ?Clock = null;
-    defer if (owned) |*c| c.deinit();
-    const scope: ?Clock = if (heads) |h| blk: {
-        owned = try mutableDoc(doc).graph.clockAt(doc.gpa, h);
-        break :blk owned;
-    } else try readScope(doc);
+    // Rust hydrate bypasses isolation when heads are absent (automerge.rs:2228).
+    const scope: ?Clock = if (heads) |h| try atScope(doc, h) else null;
     return switch (typ) {
         .list => try hydmod.hydrateList(Set, set, gpa, live, scope),
         .text => try hydmod.hydrateText(Set, set, gpa, live, scope),
@@ -1080,7 +974,9 @@ pub fn hydrate(
 /// always answers — upstream's `ObjMeta::root()`
 /// ([automerge.rs:760-768](../../github-automerge-automerge/rust/automerge/src/automerge.rs))
 /// reached through [`Document.objectType`](doc.zig).
-pub fn objectType(doc: *const Document, obj: ExId) Error!ObjType {
+pub fn objectType(doc: anytype, obj: ExId) Error!ObjType {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).objectType(doc, obj);
     return doc.objectType(obj);
 }
 
@@ -1104,11 +1000,10 @@ pub fn objectType(doc: *const Document, obj: ExId) Error!ObjType {
 /// ([`OpSet.seqLength`](opset/op_set.zig), `op_set.rs:429-461`). A map is not
 /// special-cased: `:437` is an `unwrap_or(ObjType::Map)`, so an id the index
 /// does not know takes the map arm.
-pub fn length(doc: *const Document, obj: ExId) ReadError!usize {
-    const scope = try readScope(doc);
-    const live = liveObjOrSelf(doc, obj);
-    if (doc.ops.objectType(live) == null) return 0;
-    return mutableOps(doc).seqLength(live, doc.textEncoding(), scope);
+pub fn length(doc: anytype, obj: ExId) ReadError!usize {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).length(doc, obj);
+    return lengthAtScope(doc, obj, try readScope(doc));
 }
 
 /// [`length`] as at `heads`
@@ -1130,11 +1025,10 @@ pub fn length(doc: *const Document, obj: ExId) ReadError!usize {
 /// **`heads` is a list and never null** ([`read.rs`:149](../../github-automerge-automerge/rust/automerge/src/read.rs)),
 /// and **naming the document's own heads reads the present**
 /// ([`automerge.rs`:1241-1246](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
-pub fn lengthAt(doc: *const Document, obj: ExId, heads: []const ChangeHash) ReadError!usize {
-    const scope = try atScope(doc, heads);
-    const live = liveObjOrSelf(doc, obj);
-    if (doc.ops.objectType(live) == null) return 0;
-    return mutableOps(doc).seqLength(live, doc.textEncoding(), scope);
+pub fn lengthAt(doc: anytype, obj: ExId, heads: []const ChangeHash) ReadError!usize {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).lengthAt(doc, obj, heads);
+    return lengthAtScope(doc, obj, try atScope(doc, heads));
 }
 
 /// The string a text object reads as
@@ -1157,11 +1051,10 @@ pub fn lengthAt(doc: *const Document, obj: ExId, heads: []const ChangeHash) Read
 /// its visible string values and over a list is its elements' — whatever
 /// [`OpSet.text`](opset/op_set.zig) walks, which appends `U+FFFC` for
 /// anything that is not a string (`:1046-1050`).
-pub fn text(doc: *const Document, obj: ExId, gpa: Allocator) ReadError![]u8 {
-    const scope = try readScope(doc);
-    const live = try liveObj(doc, obj);
-    _ = try doc.objectType(live);
-    return mutableOps(doc).text(gpa, live, scope);
+pub fn text(doc: anytype, obj: ExId, gpa: Allocator) ReadError![]u8 {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).text(doc, obj, gpa);
+    return textAtScope(doc, obj, try readScope(doc), gpa);
 }
 
 /// [`text`] as at `heads`
@@ -1182,15 +1075,14 @@ pub fn text(doc: *const Document, obj: ExId, gpa: Allocator) ReadError![]u8 {
 /// answer out before it returns**, so there is nothing for the caller to keep
 /// alive: the bytes are the only thing that outlives the call.
 pub fn textAt(
-    doc: *const Document,
+    doc: anytype,
     obj: ExId,
     heads: []const ChangeHash,
     gpa: Allocator,
 ) ReadError![]u8 {
-    const scope = try atScope(doc, heads);
-    const live = try liveObj(doc, obj);
-    _ = try doc.objectType(live);
-    return mutableOps(doc).text(gpa, live, scope);
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).textAt(doc, obj, heads, gpa);
+    return textAtScope(doc, obj, try atScope(doc, heads), gpa);
 }
 
 /// The keys of `obj`, one per visible register
@@ -1227,8 +1119,10 @@ pub fn textAt(
 /// successor edge and not a row
 /// ([opset/columns.zig:81-85](../opset/columns.zig)), so a shadowed register
 /// has no winner to hand out.
-pub fn keys(doc: *const Document, obj: ExId) ReadError!Keys {
-    return Keys.ofObj(mutableOps(doc), liveObjOrSelf(doc, obj), try readScope(doc));
+pub fn keys(doc: anytype, obj: ExId) ReadError!Keys {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).keys(doc, obj);
+    return keysAtScope(doc, obj, try readScope(doc));
 }
 
 /// [`keys`] as at `heads`
@@ -1253,10 +1147,12 @@ pub fn keys(doc: *const Document, obj: ExId) ReadError!Keys {
 /// and **naming the document's own heads reads the present**
 /// ([`automerge.rs`:1241-1246](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
 ///
-/// **The clock is borrowed from the document**, so free the walk with
-/// [`Document.allocator`](doc.zig) before the next `_at` read at other heads.
-pub fn keysAt(doc: *const Document, obj: ExId, heads: []const ChangeHash) ReadError!Keys {
-    return Keys.ofObj(mutableOps(doc), liveObjOrSelf(doc, obj), try atScope(doc, heads));
+/// The clock borrows the document until mutation; selecting other heads is safe.
+/// Free the walk with `Document.allocator`.
+pub fn keysAt(doc: anytype, obj: ExId, heads: []const ChangeHash) ReadError!Keys {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).keysAt(doc, obj, heads);
+    return keysAtScope(doc, obj, try atScope(doc, heads));
 }
 
 /// The values of `obj`, one per visible register, each with the id it came from
@@ -1296,10 +1192,10 @@ pub fn keysAt(doc: *const Document, obj: ExId, heads: []const ChangeHash) ReadEr
 ///
 /// **An id that names no object yields an empty walk**, which is upstream's
 /// `.ok().map(..).unwrap_or_default()` (`:1701-1704`).
-pub fn values(doc: *const Document, obj: ExId, term: *ValueTerm) ReadError!Values {
-    const scope = try readScope(doc);
-    term.* = try ValueTerm.ofObj(mutableOps(doc), liveObjOrSelf(doc, obj), scope);
-    return Values.init(mutableOps(doc), term, scope);
+pub fn values(doc: anytype, obj: ExId, term: *ValueTerm) ReadError!Values {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).values(doc, obj, term);
+    return valuesAtScope(doc, obj, term, try readScope(doc));
 }
 
 /// [`values`] as at `heads`
@@ -1309,8 +1205,8 @@ pub fn values(doc: *const Document, obj: ExId, term: *ValueTerm) ReadError!Value
 /// **Everything [`values`] says about ownership, the out-slot and the
 /// one-walk-per-document rule is this method's too** — `term` is the caller's
 /// and is filled here and freed with [`Document.allocator`](doc.zig), and
-/// **the clock is borrowed from the document**, so free the walk and the term
-/// before the next `_at` read at other heads. The body is the one upstream
+/// **the clock is borrowed from the document** until mutation. The body is the
+/// one upstream
 /// hands to both spellings
 /// ([`automerge.rs`:2139-2140](../../github-automerge-automerge/rust/automerge/src/automerge.rs)):
 /// `let clock = self.clock_at(heads); self.values_for(obj.as_ref(), clock)`.
@@ -1319,14 +1215,14 @@ pub fn values(doc: *const Document, obj: ExId, term: *ValueTerm) ReadError!Value
 /// and **naming the document's own heads reads the present**
 /// ([`automerge.rs`:1241-1246](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
 pub fn valuesAt(
-    doc: *const Document,
+    doc: anytype,
     obj: ExId,
     heads: []const ChangeHash,
     term: *ValueTerm,
 ) ReadError!Values {
-    const scope = try atScope(doc, heads);
-    term.* = try ValueTerm.ofObj(mutableOps(doc), liveObjOrSelf(doc, obj), scope);
-    return Values.init(mutableOps(doc), term, scope);
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).valuesAt(doc, obj, heads, term);
+    return valuesAtScope(doc, obj, term, try atScope(doc, heads));
 }
 
 /// The block markers and text spans of `obj`
@@ -1336,17 +1232,15 @@ pub fn valuesAt(
 /// **Ownership: three answers and they are all different.** The reader owns
 /// its fold and gives it back with [`Spans.deinit`](iter/spans.zig), which
 /// takes no allocator. **Each span is the caller's** and carries owned text and
-/// an owned mark set, so [`Span.deinit`](iter/spans.zig) frees it with `gpa`;
-/// the mark *names* inside it are the document's and are not freed.
+/// an owned mark set or block map, so `Span.deinit` frees it with `gpa`.
 ///
 /// **The two are independent and the order between them is the caller's
 /// business.** A span **shares no storage with the fold** — the run buffer is
 /// handed over rather than borrowed, and the mark set is exported afresh (the
 /// module doc of [iter/spans.zig](iter/spans.zig) is where both are argued) —
 /// so a span may be read *after* the reader is freed, and freeing the reader
-/// does not touch it. What a reader *does* expire is the reader: it reads the
-/// document's borrowed scope clock lazily, so free it before the next scoped
-/// read ([`spansAt`]).
+/// does not touch it. The reader borrows the document and its clock until
+/// mutation; selecting another historical head set preserves its clock.
 ///
 /// [API.md](../API.md) gives this method no allocator; the fold allocates and
 /// upstream's `Spans` owns `Arc<MarkSet>`s and a `String`
@@ -1357,11 +1251,10 @@ pub fn valuesAt(
 /// `exid_to_obj` (`:1728`). **A map is not refused** — upstream only checks
 /// that the id names an object, and a map's rows are not inserts, so the walk
 /// yields nothing.
-pub fn spans(doc: *const Document, obj: ExId, gpa: Allocator) ReadError!Spans {
-    const scope = try readScope(doc);
-    const live = try liveObj(doc, obj);
-    _ = try doc.objectType(live);
-    return Spans.init(gpa, mutableOps(doc), try doc.ops.spans(live), scope, doc.textEncoding());
+pub fn spans(doc: anytype, obj: ExId, gpa: Allocator) ReadError!Spans {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).spans(doc, obj, gpa);
+    return spansAtScope(doc, obj, try readScope(doc), gpa);
 }
 
 /// [`spans`] as at `heads`
@@ -1379,21 +1272,17 @@ pub fn spans(doc: *const Document, obj: ExId, gpa: Allocator) ReadError!Spans {
 /// and **naming the document's own heads reads the present**
 /// ([`automerge.rs`:1241-1246](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
 ///
-/// **The clock is borrowed from the document** and the walk reads it lazily, so
-/// free the reader before the next `_at` read at other heads. **The spans it
-/// has already handed out are not part of that rule** — they are detached, and
-/// the only thing about them that expires is their mark *names*, which are the
-/// document's interned bytes and last until the next mutation.
+/// The clock borrows the document until mutation; selecting other heads is safe.
+/// Returned spans own their text, marks, and block payloads independently.
 pub fn spansAt(
-    doc: *const Document,
+    doc: anytype,
     obj: ExId,
     heads: []const ChangeHash,
     gpa: Allocator,
 ) ReadError!Spans {
-    const scope = try atScope(doc, heads);
-    const live = try liveObj(doc, obj);
-    _ = try doc.objectType(live);
-    return Spans.init(gpa, mutableOps(doc), try doc.ops.spans(live), scope, doc.textEncoding());
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).spansAt(doc, obj, heads, gpa);
+    return spansAtScope(doc, obj, try atScope(doc, heads), gpa);
 }
 
 /// Every mark on `obj`, coalesced into runs and with the unmarks dropped
@@ -1434,20 +1323,10 @@ pub fn spansAt(
 /// ([automerge.rs:1576-1580](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
 /// An **unmark** — a mark whose value is `null` — is dropped
 /// ([op_set.rs:1023](../opset/op_set.zig)), because a tombstone is not a mark.
-pub fn marks(doc: *const Document, obj: ExId, gpa: Allocator) ReadError![]Mark {
-    // **Two resolutions in upstream's order** (`AutoCommit::marks` is
-    // `marks_for(obj, self.get_scope(None))`,
-    // [`autocommit.rs`:919-921](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)):
-    // the id first and the clock second: the clock is built from the document,
-    // and building it can intern an actor, which renumbers the actor table an
-    // id was resolved against. **`readScope` is not optional here and not a
-    // detail** — a clock is what turns
-    // [`OpSet.calculateMarksAt`](opset/op_set.zig) from the two indexes into
-    // the walk of the rows the clock sees
-    // ([`automerge.rs`:1582-1595](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-    // and the walk is the only arm that can answer a read at an isolation.
-    const live = try liveObj(doc, obj);
-    return mutableOps(doc).calculateMarksAt(gpa, live, try readScope(doc));
+pub fn marks(doc: anytype, obj: ExId, gpa: Allocator) ReadError![]Mark {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).marks(doc, obj, gpa);
+    return marksAtScope(doc, obj, try readScope(doc), gpa);
 }
 
 /// [`marks`] as at `heads`
@@ -1482,13 +1361,14 @@ pub fn marks(doc: *const Document, obj: ExId, gpa: Allocator) ReadError![]Mark {
 /// `error.NotAnObject` for an id that names no object, from [`liveObj`], on
 /// the same first line as [`marks`]'s and for the same reason.
 pub fn marksAt(
-    doc: *const Document,
+    doc: anytype,
     obj: ExId,
     heads: []const ChangeHash,
     gpa: Allocator,
 ) ReadError![]Mark {
-    const live = try liveObj(doc, obj);
-    return mutableOps(doc).calculateMarksAt(gpa, live, try atScope(doc, heads));
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).marksAt(doc, obj, heads, gpa);
+    return marksAtScope(doc, obj, try atScope(doc, heads), gpa);
 }
 
 /// The marks of `obj` that cover any index in the half-open window
@@ -1540,24 +1420,36 @@ pub fn marksAt(
 /// — asking it twice would build it twice, and the second build could be a
 /// different clock.
 pub fn getMarks(
-    doc: *const Document,
+    doc: anytype,
     obj: ExId,
     from: usize,
     max: usize,
     gpa: Allocator,
 ) ReadError![]Mark {
-    const all = try marks(doc, obj, gpa);
-    if (from >= max) {
-        gpa.free(all);
-        return &.{};
-    }
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).getMarks(doc, obj, from, max, gpa);
+    return getMarksAtScope(doc, obj, from, max, try readScope(doc), gpa);
+}
+
+/// Returns caller-owned mark runs intersecting a half-open window.
+/// Mark payloads borrow the document; the supplied clock remains caller-owned.
+pub fn getMarksAtScope(
+    doc: *const Document,
+    obj: ExId,
+    from: usize,
+    max: usize,
+    scope: ?Clock,
+    gpa: Allocator,
+) ReadError![]Mark {
+    const all = try marksAtScope(doc, obj, scope, gpa);
+    defer gpa.free(all);
+    if (from >= max) return &.{};
     var out: std.ArrayList(Mark) = .empty;
     errdefer out.deinit(gpa);
     for (all) |m| {
         if (m.start >= max or m.end <= from) continue;
         try out.append(gpa, m);
     }
-    gpa.free(all);
     return out.toOwnedSlice(gpa);
 }
 
@@ -1576,33 +1468,10 @@ pub fn getMarks(
 /// — a mark whose value is `Null` — is gone from it, while `getMarks` reports
 /// runs and [`marks`] drops the tombstone only at the end of its own fold.
 ///
-/// **`heads` is a clock, and `null` is not "no scope".** Upstream resolves it
-/// through `get_scope(heads)` ([`autocommit.rs:794-814`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)),
-/// and that match is the whole rule:
-///
-/// | `heads` | the clock the read runs at |
-/// |---|---|
-/// | `Some(h)` | a full [`Clock`](clock.zig) from [`ChangeGraph.clockAt`](change_graph.zig), **whatever `h` is** — the document's own heads included, because this arm does not take the shortcut |
-/// | `None` | the isolation's clock, or none at all when the document is not isolated |
-///
-/// **The second row is upstream's own shortcut, and upstream's `Some` arm
-/// takes it too.** [`Automerge::get_marks`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):2236-2244
-/// is `let clock = heads.and_then(|h| self.clock_at(h));` (`:2242`), and
-/// `clock_at` answers `None` for the present's own heads (`:1236-1247`);
-/// through an `AutoCommit`,
-/// [`get_scope`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs):794-805
-/// calls that same `clock_at` from its first arm whenever no transaction is in
-/// flight (`:800-804`). So **upstream's `Some(heads)` and `None` are the same
-/// call at the present's own heads**, and this method's are not — and **what
-/// differs is which arm of [`markSetAtScope`] runs and not what it answers**:
-/// upstream's `clock` is `None` for those heads and takes `get_marks_fast`
-/// (`:1937-1938`), while the `Some` arm below hands it a clock and so takes
-/// the walk, which is the general arm and answers the same thing. The test
-/// `test "markSetAtIndex answers the set at one index, and the heads decide
-/// which path reads it"` reads both arms and is what holds the difference down.
-/// Through a transaction the `None` arm is the transaction's own clock
-/// ([`manual_transaction.rs:113-122`](../../github-automerge-automerge/rust/automerge/src/transaction/manual_transaction.rs)),
-/// which is [`Transaction.markSetAtIndex`](transact.zig) and not this function.
+/// Explicit heads use the raw current-head shortcut (`automerge.rs:2242`,
+/// `:1236-1247`); other heads select a historical clock. Null heads use the
+/// document's isolation scope. Transaction wrappers select their own scope
+/// separately and pass it to `markSetAtScope`.
 ///
 /// **Which arm of upstream's dispatch runs is decided by `clock.is_none()`
 /// and the object type** ([`automerge.rs:1937`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)) —
@@ -1611,32 +1480,16 @@ pub fn getMarks(
 /// **Ownership: the set is the caller's** — `MarkSet.deinit` it — and its names
 /// are the document's, valid until the next mutation.
 pub fn markSetAtIndex(
-    doc: *const Document,
+    doc: anytype,
     obj: ExId,
     index: usize,
     heads: ?[]const ChangeHash,
     gpa: Allocator,
 ) ReadError!MarkSet {
-    if (heads) |h| {
-        // **Upstream's arm is `heads.and_then(|h| self.clock_at(h))`**
-        // (`automerge.rs:2242`, and `autocommit.rs:800-804` through an
-        // `AutoCommit`), and **`clock_at` shortcuts the present**
-        // (`:1241-1247`): it answers `None` when `h` is the document's own
-        // heads. This arm reaches the graph's clock directly instead —
-        // [`ChangeGraph.clockAt`](change_graph.zig), which is the call
-        // `Automerge::clock_at` itself makes (`automerge.rs:1245`) and the one
-        // [`Transaction.scopeClock`](transact.zig) makes for its own scope —
-        // so **the clock is built even when `h` is the present's own heads,
-        // which is not what upstream does.** The answers agree and the doc
-        // above says on what.
-        var clock = try mutableDoc(doc).graph.clockAt(doc.gpa, h);
-        defer clock.deinit();
-        return markSetAtScope(doc, obj, index, clock, gpa);
-    }
-    // The `None` arm: the isolation's clock, or none (`get_scope(None)`,
-    // `:813`). **An unscoped document gets `null` and takes the indexed
-    // path**, which is the whole of the `clock.is_none()` rule below.
-    return markSetAtScope(doc, obj, index, try readScope(doc), gpa);
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).markSetAtIndex(doc, obj, index, heads, gpa);
+    const scope = if (heads) |h| try atScope(doc, h) else try readScope(doc);
+    return markSetAtScope(doc, obj, index, scope, gpa);
 }
 
 /// [`markSetAtIndex`] under the clock the caller supplies — upstream's
@@ -1713,7 +1566,9 @@ pub fn markSetAtScope(
 /// own doc comment anticipates and declines (`read.rs:31-34`). The type check
 /// is what declines it, and it is why this method cannot be
 /// `Parents.init(opset, obj, null)` and nothing else.
-pub fn parents(doc: *const Document, obj: ExId) ReadError!Parents {
+pub fn parents(doc: anytype, obj: ExId) ReadError!Parents {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).parents(doc, obj);
     return parentsAtScope(doc, obj, try readScope(doc));
 }
 
@@ -1734,21 +1589,23 @@ pub fn parents(doc: *const Document, obj: ExId) ReadError!Parents {
 /// [`Automerge::clock_at`] reports no clock for them
 /// ([`automerge.rs`:1241-1246](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
 ///
-/// **The clock is borrowed from the document**, so the walk reads it long
-/// after this returns: drop it before the next `_at` read at other heads.
+/// The walk borrows the document and clock until mutation. Selecting another
+/// historical head set does not invalidate its clock.
 /// **An object those heads do not contain answers the empty walk**, because
 /// the object index is clock-independent (see the module doc's *Historical
 /// reads* section) and only its *rows* are scoped — so the walk finds no
 /// parent row to spend. That is the same refusal an id that names no object
 /// gets, and it is the right one: those heads say nothing about that object.
-pub fn parentsAt(doc: *const Document, obj: ExId, heads: []const ChangeHash) ReadError!Parents {
+pub fn parentsAt(doc: anytype, obj: ExId, heads: []const ChangeHash) ReadError!Parents {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).parentsAt(doc, obj, heads);
     return parentsAtScope(doc, obj, try atScope(doc, heads));
 }
 
 /// [`parents`] and [`parentsAt`] under the clock the caller supplies —
 /// upstream's `Automerge::parents_for(obj, clock)`
 /// ([`automerge.rs`:1652-1660](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
-fn parentsAtScope(doc: *const Document, obj: ExId, scope: ?Clock) ReadError!Parents {
+pub fn parentsAtScope(doc: *const Document, obj: ExId, scope: ?Clock) ReadError!Parents {
     // `get_obj_meta` (`automerge.rs:760-768`) is the check; upstream spells it
     // `self.exid_to_obj(obj)?` (`:1657`).
     // An id the actor table can no longer name is the same refusal as one that
@@ -1798,7 +1655,9 @@ fn parentsAtScope(doc: *const Document, obj: ExId, scope: ?Clock) ReadError!Pare
 /// and is freed with [`deinit`](iterdoc.DocObjItem.deinit) and the `gpa` this
 /// was given. **The clock is the document's**, borrowed for the walk's life
 /// ([`readScope`]).
-pub fn iter(doc: *const Document, gpa: Allocator) DiffError!DocIter {
+pub fn iter(doc: anytype, gpa: Allocator) DiffError!DocIter {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).iter(doc, gpa);
     return iterAt(doc, .root, null, gpa);
 }
 
@@ -1816,8 +1675,8 @@ pub fn iter(doc: *const Document, gpa: Allocator) DiffError!DocIter {
 /// itself** ([`read.rs`:60](../../github-automerge-automerge/rust/automerge/src/read.rs)),
 /// so the port carries it here too. **`heads = null` is this document's read
 /// scope, not "no scope"** — the isolation's clock, and no clock at all when
-/// the document is not isolated ([`readScope`]) — which is the reading
-/// [`hydrate`] and [`markSetAtIndex`] argue at length, and which is
+/// the document is not isolated (`readScope`) — unlike the deliberate
+/// `hydrate(null)` raw-view exception. This is
 /// upstream's `AutoCommit::iter_at` (`autocommit.rs`:856) rather than
 /// upstream's `Automerge::iter_at`. **It agrees with upstream on every
 /// document that is not isolated**, the only case in which upstream's
@@ -1831,28 +1690,20 @@ pub fn iter(doc: *const Document, gpa: Allocator) DiffError!DocIter {
 /// walk built over an object with no rows, which answers nothing for the same
 /// reason.
 pub fn iterAt(
-    doc: *const Document,
+    doc: anytype,
     obj: ExId,
     heads: ?[]const ChangeHash,
     gpa: Allocator,
 ) DiffError!DocIter {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).iterAt(doc, obj, heads, gpa);
     // Compute the clock before resolving the object, as in `iter_at`
     // (`automerge.rs:2097-2099`) followed by `iter_for` (`:1669-1674`).
     const scope = if (heads) |h|
         try atScope(doc, h)
     else
         try readScope(doc);
-    // **The root is a map whether or not a row created it**, which is
-    // [`Document.objectType`](doc.zig)'s own answer and upstream's
-    // `ObjMeta::root()` ([`automerge.rs`:760-768](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
-    const live = if (obj.eql(.root)) obj else liveObjOrSelf(doc, obj);
-    const typ = doc.ops.objectType(live) orelse .map;
-    // **The handle is a local, and nothing keeps it.** [`DocIter.init`] copies
-    // the op-set pointer and the encoding out of it and retains neither the
-    // handle nor anything inside it, so this two-field value lives for the
-    // length of the call and the walk borrows the *document*.
-    const view = handle(doc);
-    return DocIter.init(gpa, &view, live, typ, scope);
+    return iterAtScope(doc, obj, scope, gpa);
 }
 
 /// The handle the recursive walk is built over ([`Doc.init`](iter/doc.zig),
@@ -1888,8 +1739,8 @@ fn handle(doc: *const Document) iterdoc.Doc(ChangeOp) {
 ///
 /// **`heads = null` is this document's read scope, not "no scope"**: the
 /// isolation's clock, and no clock at all when the document is not isolated.
-/// That is the reading [`markSetAtIndex`] argues at length and the reading
-/// [`hydrate`] argues at length, and **it agrees with upstream on every
+/// This matches the scope used by ordinary readers, unlike the `hydrate(null)`
+/// exception, and **it agrees with upstream on every
 /// document that is not isolated** — the only case in which upstream's
 /// `and_then` produces a clock at all.
 ///
@@ -1922,12 +1773,14 @@ fn handle(doc: *const Document) iterdoc.Doc(ChangeOp) {
 /// position can never be removed, so `bias` does not affect them
 /// ([read.rs:221](../../github-automerge-automerge/rust/automerge/src/read.rs)).
 pub fn getCursor(
-    doc: *const Document,
+    doc: anytype,
     obj: ExId,
     pos: CursorPosition,
     heads: ?[]const ChangeHash,
     gpa: Allocator,
 ) ReadError!Cursor {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).getCursor(doc, obj, pos, heads, gpa);
     return getCursorMoving(doc, obj, pos, heads, .after, gpa);
 }
 
@@ -1960,15 +1813,17 @@ pub fn getCursor(
 /// [`getCursor`] gives: a start or an end position can never be removed
 /// ([`read.rs`:221](../../github-automerge-automerge/rust/automerge/src/read.rs)).
 pub fn getCursorMoving(
-    doc: *const Document,
+    doc: anytype,
     obj: ExId,
     pos: CursorPosition,
     heads: ?[]const ChangeHash,
     bias: Bias,
     gpa: Allocator,
 ) ReadError!Cursor {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).getCursorMoving(doc, obj, pos, heads, bias, gpa);
     const scope = if (heads) |h| try atScope(doc, h) else try readScope(doc);
-    return cursormod.getCursor(gpa, mutableOps(doc), try liveObj(doc, obj), pos, scope, bias);
+    return getCursorMovingAtScope(doc, obj, pos, bias, scope, gpa);
 }
 
 /// Where `cursor` sits in `obj` under the clock `heads` names
@@ -2008,11 +1863,13 @@ pub fn getCursorMoving(
 /// `.start` answers `0` and `.end` answers the sequence's length, both
 /// infallibly (`:1767-1768`).
 pub fn getCursorPosition(
-    doc: *const Document,
+    doc: anytype,
     obj: ExId,
     cursor: Cursor,
     heads: ?[]const ChangeHash,
 ) ReadError!usize {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).getCursorPosition(doc, obj, cursor, heads);
     const scope = if (heads) |h| try atScope(doc, h) else try readScope(doc);
     return getCursorPositionFor(doc, obj, cursor, scope);
 }
@@ -2112,10 +1969,12 @@ pub fn getCursorPositionFor(
 /// waiting, and the answer a sync peer needs is the first hash on each path
 /// back that is neither applied nor queued.
 pub fn getMissingDeps(
-    doc: *const Document,
+    doc: anytype,
     heads: []const ChangeHash,
     gpa: Allocator,
 ) Error![]ChangeHash {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).getMissingDeps(doc, heads, gpa);
     return doc.getMissingDeps(gpa, heads);
 }
 
@@ -2140,7 +1999,9 @@ pub fn getMissingDeps(
 /// upstream's `Option` — **but a change the graph *does* hold and the op set
 /// cannot rebuild is an error**, because the alternative is a change with the
 /// wrong bytes in it and a peer that would reject it.
-pub fn getChangeByHash(doc: *const Document, hash: ChangeHash, gpa: Allocator) ChangeError!?docmod.Built {
+pub fn getChangeByHash(doc: anytype, hash: ChangeHash, gpa: Allocator) ChangeError!?docmod.Built {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).getChangeByHash(doc, hash, gpa);
     return mutableDoc(doc).getChangeByHash(gpa, hash);
 }
 
@@ -2153,7 +2014,9 @@ pub fn getChangeByHash(doc: *const Document, hash: ChangeHash, gpa: Allocator) C
 /// Upstream's struct also carries the crate name, the crate version and the
 /// `rustc` version, which are facts about the build and not about the
 /// document, so [`Stats`](doc.zig) has three fields and the report says so.
-pub fn stats(doc: *const Document) Stats {
+pub fn stats(doc: anytype) Stats {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).stats(doc);
     return doc.stats();
 }
 
@@ -2165,7 +2028,9 @@ pub fn stats(doc: *const Document) Stats {
 /// cannot change after the document is built, because every text-width entry
 /// in the op set is measured in it
 /// ([doc.zig:2119-2122](../doc.zig)).
-pub fn textEncoding(doc: *const Document) TextEncoding {
+pub fn textEncoding(doc: anytype) TextEncoding {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).textEncoding(doc);
     return doc.textEncoding();
 }
 
@@ -2216,12 +2081,10 @@ pub fn textEncoding(doc: *const Document) TextEncoding {
 ///
 /// **A range whose `start` is at or past its `end` is empty**, for the reason
 /// [`OpSet.mapRange`](opset/op_set.zig) gives.
-pub fn mapRange(doc: *const Document, obj: ExId, range: KeyRange) ReadError!MapRange {
-    return MapRange.init(
-        mutableOps(doc),
-        try doc.ops.mapRange(liveObjOrSelf(doc, obj), range.start, range.end),
-        try readScope(doc),
-    );
+pub fn mapRange(doc: anytype, obj: ExId, range: KeyRange) ReadError!MapRange {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).mapRange(doc, obj, range);
+    return mapRangeAtScope(doc, obj, range, try readScope(doc));
 }
 
 /// [`mapRange`] as at `heads`
@@ -2241,19 +2104,17 @@ pub fn mapRange(doc: *const Document, obj: ExId, range: KeyRange) ReadError!MapR
 /// and **naming the document's own heads reads the present**
 /// ([`automerge.rs`:1241-1246](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
 ///
-/// **The clock is borrowed from the document, not owned by this call**: free
-/// or drop the walk before the next `_at` read at other heads.
+/// The walk borrows the document and clock until mutation. Selecting another
+/// historical head set does not invalidate its clock.
 pub fn mapRangeAt(
-    doc: *const Document,
+    doc: anytype,
     obj: ExId,
     range: KeyRange,
     heads: []const ChangeHash,
 ) ReadError!MapRange {
-    return MapRange.init(
-        mutableOps(doc),
-        try doc.ops.mapRange(liveObjOrSelf(doc, obj), range.start, range.end),
-        try atScope(doc, heads),
-    );
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).mapRangeAt(doc, obj, range, heads);
+    return mapRangeAtScope(doc, obj, range, try atScope(doc, heads));
 }
 
 /// The elements and values of the list or text `obj` whose index falls in
@@ -2277,13 +2138,10 @@ pub fn mapRangeAt(
 /// starts past the end of the object still walks every row and answers nothing
 /// ([iter/list_range.zig:740-746](../iter/list_range.zig), `list_range.rs:345-357`).
 /// **A map or an unknown id therefore yields an empty walk**, and not an error.
-pub fn listRange(doc: *const Document, obj: ExId, range: IndexRange) ReadError!ListRange {
-    return ListRange.init(
-        mutableOps(doc),
-        try doc.ops.listRange(liveObjOrSelf(doc, obj)),
-        try readScope(doc),
-        range,
-    );
+pub fn listRange(doc: anytype, obj: ExId, range: IndexRange) ReadError!ListRange {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).listRange(doc, obj, range);
+    return listRangeAtScope(doc, obj, range, try readScope(doc));
 }
 
 /// [`listRange`] as at `heads`
@@ -2303,21 +2161,300 @@ pub fn listRange(doc: *const Document, obj: ExId, range: IndexRange) ReadError!L
 /// — so `listRangeAt(.., doc.getHeads())` is `listRange`. The module doc's
 /// *Historical reads* section is where that shortcut is argued.
 ///
-/// **The clock is borrowed from the document, not owned by this call**, and
-/// the walk reads it long after this function returns: free or drop the walk
-/// before the next `_at` read at other heads.
+/// The walk borrows the document and clock until mutation. Selecting another
+/// historical head set does not invalidate its clock.
 pub fn listRangeAt(
-    doc: *const Document,
+    doc: anytype,
     obj: ExId,
     range: IndexRange,
     heads: []const ChangeHash,
 ) ReadError!ListRange {
+    if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
+        return ReadDoc(@TypeOf(doc)).listRangeAt(doc, obj, range, heads);
+    return listRangeAtScope(doc, obj, range, try atScope(doc, heads));
+}
+
+/// Length in the document's encoding under the supplied borrowed clock.
+pub fn lengthAtScope(doc: *const Document, obj: ExId, scope: ?Clock) ReadError!usize {
+    const live = liveObjOrSelf(doc, obj);
+    if (doc.ops.objectType(live) == null) return 0;
+    return mutableOps(doc).seqLength(live, doc.textEncoding(), scope);
+}
+
+/// Returns caller-owned UTF-8 under the supplied borrowed clock.
+pub fn textAtScope(doc: *const Document, obj: ExId, scope: ?Clock, gpa: Allocator) ReadError![]u8 {
+    const live = try liveObj(doc, obj);
+    _ = try doc.objectType(live);
+    return mutableOps(doc).text(gpa, live, scope);
+}
+
+/// Keys borrowing the document and supplied clock until mutation.
+pub fn keysAtScope(doc: *const Document, obj: ExId, scope: ?Clock) ReadError!Keys {
+    return Keys.ofObj(mutableOps(doc), liveObjOrSelf(doc, obj), scope);
+}
+
+/// Fills the caller's term; both outputs borrow the document and clock.
+pub fn valuesAtScope(doc: *const Document, obj: ExId, term: *ValueTerm, scope: ?Clock) ReadError!Values {
+    term.* = try ValueTerm.ofObj(mutableOps(doc), liveObjOrSelf(doc, obj), scope);
+    return Values.init(mutableOps(doc), term, scope);
+}
+
+/// Builds a span fold borrowing the document and clock; spans own their output.
+pub fn spansAtScope(doc: *const Document, obj: ExId, scope: ?Clock, gpa: Allocator) ReadError!Spans {
+    const live = try liveObj(doc, obj);
+    _ = try doc.objectType(live);
+    return Spans.init(gpa, mutableOps(doc), try doc.ops.spans(live), scope, doc.textEncoding());
+}
+
+/// Returns a caller-owned run slice whose mark payloads borrow the document.
+pub fn marksAtScope(doc: *const Document, obj: ExId, scope: ?Clock, gpa: Allocator) ReadError![]Mark {
+    return mutableOps(doc).calculateMarksAt(gpa, try liveObj(doc, obj), scope);
+}
+
+/// Recursive walk borrowing the document and clock until mutation.
+pub fn iterAtScope(doc: *const Document, obj: ExId, scope: ?Clock, gpa: Allocator) DiffError!DocIter {
+    const live = if (obj.eql(.root)) obj else liveObjOrSelf(doc, obj);
+    const typ = doc.ops.objectType(live) orelse .map;
+    const view = handle(doc);
+    return DocIter.init(gpa, &view, live, typ, scope);
+}
+
+/// Returns an owned stable cursor under the supplied borrowed clock.
+pub fn getCursorMovingAtScope(
+    doc: *const Document,
+    obj: ExId,
+    pos: CursorPosition,
+    bias: Bias,
+    scope: ?Clock,
+    gpa: Allocator,
+) ReadError!Cursor {
+    return cursormod.getCursor(gpa, mutableOps(doc), try liveObj(doc, obj), pos, scope, bias);
+}
+
+/// Map walk borrowing the document and clock until mutation.
+pub fn mapRangeAtScope(doc: *const Document, obj: ExId, range: KeyRange, scope: ?Clock) ReadError!MapRange {
+    const live = liveObjOrSelf(doc, obj);
+    return MapRange.init(
+        mutableOps(doc),
+        if (doc.ops.objectType(live) == null)
+            .{ .start = 0, .end = 0 }
+        else
+            try doc.ops.mapRange(live, range.start, range.end),
+        scope,
+    );
+}
+
+/// Sequence walk borrowing the document and clock until mutation.
+pub fn listRangeAtScope(doc: *const Document, obj: ExId, range: IndexRange, scope: ?Clock) ReadError!ListRange {
+    const live = liveObjOrSelf(doc, obj);
     return ListRange.init(
         mutableOps(doc),
-        try doc.ops.listRange(liveObjOrSelf(doc, obj)),
-        try atScope(doc, heads),
+        if (doc.ops.objectType(live) == null)
+            .{ .start = 0, .end = 0 }
+        else
+            try doc.ops.listRange(live),
+        scope,
         range,
     );
+}
+
+/// Compile-time reader adapter. Bare owners are borrowed, never copied.
+/// Explicit pointer types retain their caller-selected constness.
+pub fn ReadDoc(comptime R: type) type {
+    const Base = switch (@typeInfo(R)) {
+        .pointer => |p| p.child,
+        else => R,
+    };
+    const Ptr = switch (@typeInfo(R)) {
+        .pointer => R,
+        else => if (R == Document) *const R else *R,
+    };
+    return struct {
+        pub const ReaderPtr = Ptr;
+
+        pub fn allocator(reader: Ptr) Allocator {
+            return reader.allocator();
+        }
+
+        pub fn keys(reader: Ptr, obj: ExId) ReadError!Keys {
+            if (Base == Document) return @import("read.zig").keys(reader, obj);
+            return owner(reader).keys(obj);
+        }
+
+        pub fn get(reader: Ptr, obj: ExId, prop: Prop) ReadError!?DocItem {
+            if (Base == Document) return @import("read.zig").get(reader, obj, prop);
+            return owner(reader).get(obj, prop);
+        }
+
+        pub fn length(reader: Ptr, obj: ExId) ReadError!usize {
+            if (Base == Document) return @import("read.zig").length(reader, obj);
+            return owner(reader).length(obj);
+        }
+
+        pub fn text(reader: Ptr, obj: ExId, gpa: Allocator) ReadError![]u8 {
+            if (Base == Document) return @import("read.zig").text(reader, obj, gpa);
+            return owner(reader).text(obj, gpa);
+        }
+
+        fn raw(reader: Ptr) *const Document {
+            if (Base == Document) return reader;
+            if (@typeInfo(@TypeOf(reader.doc)) == .pointer) return reader.doc;
+            return &reader.doc;
+        }
+
+        fn owner(reader: Ptr) *Base {
+            return @constCast(reader);
+        }
+
+        pub fn getAt(reader: Ptr, obj: ExId, prop: Prop, heads: []const ChangeHash) ReadError!?DocItem {
+            if (Base == Document) return @import("read.zig").getAt(reader, obj, prop, heads);
+            return owner(reader).getAt(obj, prop, heads);
+        }
+
+        pub fn getAll(reader: Ptr, obj: ExId, prop: Prop, gpa: Allocator) ReadError![]DocItem {
+            if (Base == Document) return @import("read.zig").getAll(reader, obj, prop, gpa);
+            return owner(reader).getAll(obj, prop, gpa);
+        }
+
+        pub fn getAllAt(reader: Ptr, obj: ExId, prop: Prop, heads: []const ChangeHash, gpa: Allocator) ReadError![]DocItem {
+            if (Base == Document) return @import("read.zig").getAllAt(reader, obj, prop, heads, gpa);
+            return owner(reader).getAllAt(obj, prop, heads, gpa);
+        }
+
+        pub fn keysAt(reader: Ptr, obj: ExId, heads: []const ChangeHash) ReadError!Keys {
+            if (Base == Document) return @import("read.zig").keysAt(reader, obj, heads);
+            return owner(reader).keysAt(obj, heads);
+        }
+
+        pub fn values(reader: Ptr, obj: ExId, term: *ValueTerm) ReadError!Values {
+            if (Base == Document) return @import("read.zig").values(reader, obj, term);
+            return owner(reader).values(obj, term);
+        }
+
+        pub fn valuesAt(reader: Ptr, obj: ExId, heads: []const ChangeHash, term: *ValueTerm) ReadError!Values {
+            if (Base == Document) return @import("read.zig").valuesAt(reader, obj, heads, term);
+            return owner(reader).valuesAt(obj, heads, term);
+        }
+
+        pub fn lengthAt(reader: Ptr, obj: ExId, heads: []const ChangeHash) ReadError!usize {
+            if (Base == Document) return @import("read.zig").lengthAt(reader, obj, heads);
+            return owner(reader).lengthAt(obj, heads);
+        }
+
+        pub fn textAt(reader: Ptr, obj: ExId, heads: []const ChangeHash, gpa: Allocator) ReadError![]u8 {
+            if (Base == Document) return @import("read.zig").textAt(reader, obj, heads, gpa);
+            return owner(reader).textAt(obj, heads, gpa);
+        }
+
+        pub fn spans(reader: Ptr, obj: ExId, gpa: Allocator) ReadError!Spans {
+            if (Base == Document) return @import("read.zig").spans(reader, obj, gpa);
+            return owner(reader).spans(obj, gpa);
+        }
+
+        pub fn spansAt(reader: Ptr, obj: ExId, heads: []const ChangeHash, gpa: Allocator) ReadError!Spans {
+            if (Base == Document) return @import("read.zig").spansAt(reader, obj, heads, gpa);
+            return owner(reader).spansAt(obj, heads, gpa);
+        }
+
+        pub fn marks(reader: Ptr, obj: ExId, gpa: Allocator) ReadError![]Mark {
+            if (Base == Document) return @import("read.zig").marks(reader, obj, gpa);
+            return owner(reader).marks(obj, gpa);
+        }
+
+        pub fn marksAt(reader: Ptr, obj: ExId, heads: []const ChangeHash, gpa: Allocator) ReadError![]Mark {
+            if (Base == Document) return @import("read.zig").marksAt(reader, obj, heads, gpa);
+            return owner(reader).marksAt(obj, heads, gpa);
+        }
+
+        pub fn getMarks(reader: Ptr, obj: ExId, from: usize, max: usize, gpa: Allocator) ReadError![]Mark {
+            if (Base == Document) return @import("read.zig").getMarks(reader, obj, from, max, gpa);
+            return owner(reader).getMarks(obj, from, max, gpa);
+        }
+
+        pub fn markSetAtIndex(reader: Ptr, obj: ExId, index: usize, heads: ?[]const ChangeHash, gpa: Allocator) ReadError!MarkSet {
+            if (Base == Document) return @import("read.zig").markSetAtIndex(reader, obj, index, heads, gpa);
+            return owner(reader).markSetAtIndex(obj, index, heads, gpa);
+        }
+
+        pub fn parents(reader: Ptr, obj: ExId) ReadError!Parents {
+            if (Base == Document) return @import("read.zig").parents(reader, obj);
+            return owner(reader).parents(obj);
+        }
+
+        pub fn parentsAt(reader: Ptr, obj: ExId, heads: []const ChangeHash) ReadError!Parents {
+            if (Base == Document) return @import("read.zig").parentsAt(reader, obj, heads);
+            return owner(reader).parentsAt(obj, heads);
+        }
+
+        pub fn iter(reader: Ptr, gpa: Allocator) DiffError!DocIter {
+            if (Base == Document) return @import("read.zig").iter(reader, gpa);
+            return owner(reader).iter(gpa);
+        }
+
+        pub fn iterAt(reader: Ptr, obj: ExId, heads: ?[]const ChangeHash, gpa: Allocator) DiffError!DocIter {
+            if (Base == Document) return @import("read.zig").iterAt(reader, obj, heads, gpa);
+            return owner(reader).iterAt(obj, heads, gpa);
+        }
+
+        pub fn getCursor(reader: Ptr, obj: ExId, pos: CursorPosition, heads: ?[]const ChangeHash, gpa: Allocator) ReadError!Cursor {
+            if (Base == Document) return @import("read.zig").getCursor(reader, obj, pos, heads, gpa);
+            return owner(reader).getCursor(obj, pos, heads, gpa);
+        }
+
+        pub fn getCursorMoving(reader: Ptr, obj: ExId, pos: CursorPosition, heads: ?[]const ChangeHash, bias: Bias, gpa: Allocator) ReadError!Cursor {
+            if (Base == Document) return @import("read.zig").getCursorMoving(reader, obj, pos, heads, bias, gpa);
+            return owner(reader).getCursorMoving(obj, pos, heads, bias, gpa);
+        }
+
+        pub fn getCursorPosition(reader: Ptr, obj: ExId, cursor: Cursor, heads: ?[]const ChangeHash) ReadError!usize {
+            if (Base == Document) return @import("read.zig").getCursorPosition(reader, obj, cursor, heads);
+            return owner(reader).getCursorPosition(obj, cursor, heads);
+        }
+
+        pub fn mapRange(reader: Ptr, obj: ExId, range: KeyRange) ReadError!MapRange {
+            if (Base == Document) return @import("read.zig").mapRange(reader, obj, range);
+            return owner(reader).mapRange(obj, range);
+        }
+
+        pub fn mapRangeAt(reader: Ptr, obj: ExId, range: KeyRange, heads: []const ChangeHash) ReadError!MapRange {
+            if (Base == Document) return @import("read.zig").mapRangeAt(reader, obj, range, heads);
+            return owner(reader).mapRangeAt(obj, range, heads);
+        }
+
+        pub fn listRange(reader: Ptr, obj: ExId, range: IndexRange) ReadError!ListRange {
+            if (Base == Document) return @import("read.zig").listRange(reader, obj, range);
+            return owner(reader).listRange(obj, range);
+        }
+
+        pub fn listRangeAt(reader: Ptr, obj: ExId, range: IndexRange, heads: []const ChangeHash) ReadError!ListRange {
+            if (Base == Document) return @import("read.zig").listRangeAt(reader, obj, range, heads);
+            return owner(reader).listRangeAt(obj, range, heads);
+        }
+
+        pub fn hydrate(reader: Ptr, obj: ExId, heads: ?[]const ChangeHash, gpa: Allocator) HydrateError!hydmod.Value {
+            return @import("read.zig").hydrate(raw(reader), obj, heads, gpa);
+        }
+
+        pub fn objectType(reader: Ptr, obj: ExId) Error!ObjType {
+            return @import("read.zig").objectType(raw(reader), obj);
+        }
+
+        pub fn getMissingDeps(reader: Ptr, heads: []const ChangeHash, gpa: Allocator) Error![]ChangeHash {
+            return @import("read.zig").getMissingDeps(raw(reader), heads, gpa);
+        }
+
+        pub fn getChangeByHash(reader: Ptr, hash: ChangeHash, gpa: Allocator) ChangeError!?docmod.Built {
+            return @import("read.zig").getChangeByHash(raw(reader), hash, gpa);
+        }
+
+        pub fn stats(reader: Ptr) Stats {
+            return @import("read.zig").stats(raw(reader));
+        }
+
+        pub fn textEncoding(reader: Ptr) TextEncoding {
+            return @import("read.zig").textEncoding(raw(reader));
+        }
+    };
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -2325,7 +2462,7 @@ pub fn listRangeAt(
 /// The document's one actor, as the test fixtures name it. An actor index is a
 /// position in a sorted table ([types.zig:20-21](../src/types.zig)), so with
 /// one actor every index in the columns is `0`.
-const actor_a: types.ActorId = .{ .bytes = "aaaaaaaa" };
+const actor_a: types.ActorId = .{ .bytes = "\xaa\xaa\xaa\xaa" };
 
 /// An id no row and no object index holds. **Both halves are past the end** so
 /// the object columns' descents miss rather than finding the first object's
@@ -2531,9 +2668,12 @@ const sample_specs = [_]OpSpec{
 /// leaves every row a winner ([`OpSet.visible`](opset/op_set.zig) is
 /// `Op.visible`).
 fn sample(gpa: Allocator) !Document {
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
-    const a = try doc.putActorRef(gpa, actor_a);
+    const parsed_actor = try types.ActorId.fromHex(gpa, "aaaaaaaa");
+    defer gpa.free(parsed_actor.bytes);
+    try testing.expect(parsed_actor.eql(actor_a));
+    const a = try doc.putActorRef(gpa, parsed_actor);
     try testing.expectEqual(@as(types.ActorIdx, 0), a);
 
     const ops = try buildOps(gpa, a, &sample_specs);
@@ -2568,7 +2708,7 @@ fn sample(gpa: Allocator) !Document {
 /// rather than read back as answers in an order the op set does not hold them
 /// in.
 fn rootMap(gpa: Allocator, specs: []const OpSpec) !Document {
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     const a = try doc.putActorRef(gpa, actor_a);
     const ops = try buildOps(gpa, a, specs);
@@ -2690,7 +2830,10 @@ fn keyList(gpa: Allocator, doc: *const Document, obj: ExId) ![][]const u8 {
     }
     // **Copied, and that is the contract**: a sequence anchor is the walk's own
     // buffer and is valid only until the next `next()` ([`keys`]).
-    while (try walk.next()) |k| try out.append(gpa, try gpa.dupe(u8, k));
+    while (try walk.next()) |k| {
+        try out.ensureUnusedCapacity(gpa, 1);
+        out.appendAssumeCapacity(try gpa.dupe(u8, k));
+    }
     return out.toOwnedSlice(gpa);
 }
 
@@ -2718,7 +2861,10 @@ fn mapItems(gpa: Allocator, doc: *const Document, obj: ExId, range: KeyRange) ![
         for (out.items) |*it| it.deinit(gpa);
         out.deinit(gpa);
     }
-    while (try walk.next()) |item| try out.append(gpa, try item.intoOwned(gpa));
+    while (try walk.next()) |item| {
+        try out.ensureUnusedCapacity(gpa, 1);
+        out.appendAssumeCapacity(try item.intoOwned(gpa));
+    }
     return out.toOwnedSlice(gpa);
 }
 
@@ -2756,7 +2902,8 @@ fn listItems(
         out.deinit(gpa);
     }
     while (try walk.next()) |item| {
-        try out.append(gpa, .{
+        try out.ensureUnusedCapacity(gpa, 1);
+        out.appendAssumeCapacity(.{
             .index = item.index,
             .text = try gpa.dupe(u8, switch (item.value) {
                 .object => return error.TestUnexpectedResult,
@@ -3053,12 +3200,10 @@ test "values walks an object and resolves every value's id" {
     try testing.expectEqual(ObjType.text, vals[3].value.object);
     // **The id is the value's own when it is an object** — a make action's id
     // *is* the object's id — and the operation's id when it is a scalar.
-    // **Identity, not shape.** An [`ExId`] carries the operation and, when the
-    // reader had the actor table to hand, the actor's **bytes**
-    // ([`types.zig`](types.zig)) — and identity is the operation alone, so the
-    // comparison is [`ExId.eql`](types.zig) and not `expectEqual`.
-    try testing.expect(vals[1].id.eql(list_id));
-    try testing.expect(vals[3].id.eql(text_id));
+    // Table-local fixture IDs acquire their canonical actor bytes before
+    // comparison with public IDs (`exid.rs:15-18`).
+    try testing.expect(vals[1].id.eql(doc.idToExid(list_id.opId().?)));
+    try testing.expect(vals[3].id.eql(doc.idToExid(text_id.opId().?)));
     try testing.expectEqual(OpId.init(4, 0), vals[0].id.opId().?);
 }
 
@@ -3177,7 +3322,13 @@ test "markSetAtIndex answers the set at one index, and the heads decide which pa
     const enc: TextEncoding = .unicode_code_point;
     var f = try textFixture(gpa, enc, "hi!");
     defer f.deinit();
-    try trans.mark(&f.doc, f.text, 0, 3, "bold", .after, .{ .bool_value = true });
+    {
+        var tx = try trans.Transaction.open(gpa, &f.doc);
+        defer tx.deinit() catch @panic("transaction cleanup failed");
+        try tx.mark(f.text, 0, 3, "bold", .after, .{ .bool_value = true });
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+    }
     try checkPremises(&f.doc, f.text, enc);
 
     // **The heads from before the unmark.** The read turns them into a clock
@@ -3219,7 +3370,13 @@ test "markSetAtIndex answers the set at one index, and the heads decide which pa
     // **The unmark, and the two reads stop agreeing** — which is the whole
     // reason [`markSetAtIndex`] takes heads at all, and upstream's own case
     // ([`test.rs:2681-2713`](../github-automerge-automerge/rust/automerge/tests/test.rs)).
-    try trans.unmark(&f.doc, f.text, 0, 3, .none, "bold", null);
+    {
+        var tx = try trans.Transaction.open(gpa, &f.doc);
+        defer tx.deinit() catch @panic("transaction cleanup failed");
+        try tx.unmark(f.text, 0, 3, .none, "bold", null);
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+    }
     try checkPremises(&f.doc, f.text, enc);
 
     // **At the present it is gone**: the mark index names the present, and an
@@ -3272,12 +3429,8 @@ test "parents walks up to the root, and refuses a scalar's id by answering nothi
     // hangs by, so the first step's `obj` is the map and its `prop` is `"deep"`.
     var walk = try parents(&doc, deep_id);
     const first = (try walk.next()).?;
-    // **Identity, not shape.** The walk's `obj` comes from
-    // [`OpSet.idToExid`](opset/op_set.zig), which records the actor's bytes
-    // beside the operation ([`op_set.rs:1054-1060`](../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)),
-    // and an [`ExId`] that names the same operation either way is one value
-    // ([`types.zig`](types.zig)). So the comparison is [`ExId.eql`](types.zig).
-    try testing.expect(first.obj.eql(map_id));
+    // A public parent ID is compared with the fixture's canonical actor identity.
+    try testing.expect(first.obj.eql(doc.idToExid(map_id.opId().?)));
     try testing.expectEqualStrings("deep", first.prop.key);
     try testing.expectEqual(ObjType.map, first.typ);
     const second = (try walk.next()).?;
@@ -3425,7 +3578,7 @@ test "a cursor taken before a mutation still names the same element after it" {
     // second half of the value claim: the document's arena owns the actor
     // table ([doc.zig:91-92](../doc.zig)) and adding a row does not move it.
     switch (at_b) {
-        .op => |o| try testing.expectEqualStrings("aaaaaaaa", o.actor.bytes),
+        .op => |o| try testing.expect(o.actor.eql(actor_a)),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -3768,7 +3921,7 @@ test "a list and an unknown id are empty map ranges, and a map reads as a one-el
 
 test "an empty document answers every method rather than trapping" {
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
 
     // **The premise**: a document with no changes, no rows and no actors.
@@ -3994,7 +4147,7 @@ test "getChangeByHash answers null for a hash the document does not hold" {
 
 test "getMissingDeps answers the hashes the document lacks, and none of the ones it holds" {
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
 
     // **Two empty commits, so the graph has two nodes and the second depends
@@ -4270,15 +4423,19 @@ const TextDoc = struct {
 };
 
 fn textFixture(gpa: Allocator, encoding: TextEncoding, body: []const u8) !TextDoc {
-    var doc = try Document.initWithEncoding(gpa, std.testing.io, encoding, .auto);
+    var doc = try Document.initWithEncoding(gpa, std.testing.io, encoding);
     errdefer doc.deinit();
     // **A named actor, because a random one would make a failure
     // unreproducible.** Upstream draws one (`automerge.rs`:307-317); the
     // port's `Document.init` draws none at all (`doc.zig`:2194-2199), so
     // naming one here is what makes every fixture below deterministic.
     doc.setActorId(.{ .bytes = "aaaaaaaa" });
-    const obj = try trans.putObject(&doc, .root, .{ .key = "text" }, .text);
-    try trans.spliceText(&doc, obj, 0, 0, body);
+    var tx = try trans.Transaction.open(gpa, &doc);
+    defer tx.deinit() catch @panic("transaction cleanup failed");
+    const obj = try tx.putObject(.root, .{ .key = "text" }, .text);
+    try tx.spliceText(obj, 0, 0, body);
+    var committed = try tx.commit();
+    defer committed.deinit(gpa);
     try checkPremises(&doc, obj, encoding);
     return .{ .doc = doc, .text = obj };
 }
@@ -4520,20 +4677,15 @@ fn readShapes(gpa: Allocator, doc: *const Document, obj: ExId) ![]Shape {
         for (out.items) |s| gpa.free(s.text);
         out.deinit(gpa);
     }
-    while (try walk.next()) |span| {
+    while (try walk.next()) |payload| {
+        var span = payload;
+        defer span.deinit(gpa);
+        try out.ensureUnusedCapacity(gpa, 1);
         switch (span) {
-            .block => try out.append(gpa, .{ .block = true }),
+            .block => out.appendAssumeCapacity(.{ .block = true }),
             .text => |t| {
                 const bytes = try gpa.dupe(u8, t.text);
-                // **The mark set is read and dropped, not freed field by
-                // field.** [`spans`]'s contract is that each span is the
-                // caller's and [`Span.deinit`](../iter/spans.zig) frees the
-                // text and the set together, and the set's names are the
-                // document's.
-                const marked = t.marks != null;
-                var owned: iterspans.Span = span;
-                owned.deinit(gpa);
-                try out.append(gpa, .{ .text = bytes, .marked = marked });
+                out.appendAssumeCapacity(.{ .text = bytes, .marked = t.marks != null });
             },
         }
     }
@@ -4543,6 +4695,32 @@ fn readShapes(gpa: Allocator, doc: *const Document, obj: ExId) ![]Shape {
 fn freeShapes(gpa: Allocator, list: []Shape) void {
     for (list) |s| gpa.free(s.text);
     gpa.free(list);
+}
+
+test "owned span shape collection releases text marks and block maps on allocation failure" {
+    var f = try textFixture(testing.allocator, .unicode_code_point, "ab");
+    defer f.deinit();
+    {
+        var tx = try trans.Transaction.open(testing.allocator, &f.doc);
+        defer tx.deinit() catch @panic("transaction cleanup failed");
+        const block = try tx.splitBlock(f.text, 1);
+        _ = try tx.put(block, .{ .key = "kind" }, .{ .str = "paragraph" });
+        try tx.mark(f.text, 0, 3, "bold", .both, .{ .bool_value = true });
+        var committed = try tx.commit();
+        defer committed.deinit(testing.allocator);
+    }
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn exercise(gpa: Allocator, doc: *const Document, obj: ExId) !void {
+            const shapes = try readShapes(gpa, doc, obj);
+            defer freeShapes(gpa, shapes);
+            try testing.expectEqual(@as(usize, 3), shapes.len);
+            try testing.expectEqualStrings("a", shapes[0].text);
+            try testing.expect(shapes[0].marked);
+            try testing.expect(shapes[1].block);
+            try testing.expectEqualStrings("b", shapes[2].text);
+            try testing.expect(shapes[2].marked);
+        }
+    }.exercise, .{ &f.doc, f.text });
 }
 
 /// Prints every shape, so a failure names the spans the port produced rather
@@ -4623,7 +4801,13 @@ test "text_encoding: spliceText inserts at the same place in each encoding (text
         const index = index_of.pick(enc);
         try expectCharAt(&f.doc, f.text, index, "w", enc);
 
-        try trans.spliceText(&f.doc, f.text, index, 0, "beautiful ");
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.spliceText(f.text, index, 0, "beautiful ");
+            var committed = try tx.commit();
+            defer committed.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
         const got = try text(&f.doc, f.text, gpa);
         defer gpa.free(got);
@@ -4668,7 +4852,13 @@ test "text_encoding: a mark written in each encoding reads back over the same sp
         try expectLen(try length(&f.doc, f.text), len.pick(enc), enc);
         try expectCharAt(&f.doc, f.text, last, end_char.pick(enc), enc);
 
-        try trans.mark(&f.doc, f.text, 1, last, "bold", .both, .{ .bool_value = true });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.mark(f.text, 1, last, "bold", .both, .{ .bool_value = true });
+            var committed = try tx.commit();
+            defer committed.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
         const got = try marks(&f.doc, f.text, gpa);
         defer gpa.free(got);
@@ -4707,7 +4897,13 @@ test "text_encoding: unmark removes the run a mark wrote, in each encoding (text
         const last = end.pick(enc);
         try expectLen(try length(&f.doc, f.text), len.pick(enc), enc);
         try expectCharAt(&f.doc, f.text, last, end_char.pick(enc), enc);
-        try trans.mark(&f.doc, f.text, 1, last, "bold", .both, .{ .bool_value = true });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.mark(f.text, 1, last, "bold", .both, .{ .bool_value = true });
+            var committed = try tx.commit();
+            defer committed.deinit(gpa);
+        }
         // **The mark is there before the unmark removes it**, or an unmark of
         // nothing would pass this test.
         const before = try marks(&f.doc, f.text, gpa);
@@ -4723,7 +4919,13 @@ test "text_encoding: unmark removes the run a mark wrote, in each encoding (text
         // (`transactable.rs`:91-101) and the port's `value: ?ScalarValue` is
         // the same choice written down: "null is upstream's
         // `Mark::new(name, ScalarValue::Null, ..)`" (transact.zig:936).
-        try trans.unmark(&f.doc, f.text, 1, last, .both, "bold", null);
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.unmark(f.text, 1, last, .both, "bold", null);
+            var committed = try tx.commit();
+            defer committed.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
         const after = try marks(&f.doc, f.text, gpa);
         defer gpa.free(after);
@@ -4775,7 +4977,13 @@ test "text_encoding: a cursor taken before an insert still names the same charac
             .grapheme_cluster => "👩‍👩‍👧‍👦",
         };
         try expectCharAt(&f.doc, f.text, 2, first_unit, enc);
-        try trans.spliceText(&f.doc, f.text, 2, 0, "👩‍👩‍👧‍👦");
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.spliceText(f.text, 2, 0, "👩‍👩‍👧‍👦");
+            var committed = try tx.commit();
+            defer committed.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
 
         try expectLen(try getCursorPosition(&f.doc, f.text, cursor, null), moved.pick(enc), enc);
@@ -4823,7 +5031,13 @@ test "text_encoding: put replaces the element each encoding's index names (text_
         const index = index_of.pick(enc);
         try expectCharAt(&f.doc, f.text, index, "l", enc);
 
-        _ = try trans.put(&f.doc, f.text, .{ .index = index }, .{ .str = "L" });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            _ = try tx.put(f.text, .{ .index = index }, .{ .str = "L" });
+            var committed = try tx.commit();
+            defer committed.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
         const got = try text(&f.doc, f.text, gpa);
         defer gpa.free(got);
@@ -4845,7 +5059,13 @@ test "text_encoding: insert puts a character before the one each encoding's inde
         const index = index_of.pick(enc);
         try expectCharAt(&f.doc, f.text, index, "l", enc);
 
-        _ = try trans.insert(&f.doc, f.text, index, .{ .str = "L" });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            _ = try tx.insert(f.text, index, .{ .str = "L" });
+            var committed = try tx.commit();
+            defer committed.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
         const got = try text(&f.doc, f.text, gpa);
         defer gpa.free(got);
@@ -4867,7 +5087,13 @@ test "text_encoding: delete removes the character each encoding's index names (t
         const index = index_of.pick(enc);
         try expectCharAt(&f.doc, f.text, index, "l", enc);
 
-        _ = try trans.delete(&f.doc, f.text, .{ .index = index });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            _ = try tx.delete(f.text, .{ .index = index });
+            var committed = try tx.commit();
+            defer committed.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
         const got = try text(&f.doc, f.text, gpa);
         defer gpa.free(got);
@@ -4889,7 +5115,13 @@ test "text_encoding: splitBlock cuts at the place each encoding's index names (t
         const index = index_of.pick(enc);
         try expectCharAt(&f.doc, f.text, index, "l", enc);
 
-        _ = try trans.splitBlock(&f.doc, f.text, index);
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            _ = try tx.splitBlock(f.text, index);
+            var committed = try tx.commit();
+            defer committed.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
 
         // **Three spans, and the block sits between the two halves**: a block
@@ -5222,12 +5454,24 @@ test "text: updateText over a fork converges on the fork's text (text.rs:16-30)"
         // (`doc.zig`:2295-2301), which `std.testing.allocator` will not let
         // pass. **`clone` and `setActorId`**: the same document with a
         // different actor, which is all a fork is.
-        var other = try f.doc.clone(gpa, .auto);
+        var other = try f.doc.clone(gpa);
         defer other.deinit();
         other.setActorId(.{ .bytes = "bbbbbbbb" });
 
-        try trans.updateText(&other, f.text, "Goodbye, world!");
-        try trans.updateText(&f.doc, f.text, "Hello, friends!");
+        {
+            var tx = try trans.Transaction.open(gpa, &other);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.updateText(f.text, "Goodbye, world!");
+            var committed = try tx.commit();
+            defer committed.deinit(gpa);
+        }
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.updateText(f.text, "Hello, friends!");
+            var committed = try tx.commit();
+            defer committed.deinit(gpa);
+        }
         const heads = try f.doc.merge(gpa, &other);
         defer gpa.free(heads);
         try checkPremises(&f.doc, f.text, enc);
@@ -5246,14 +5490,26 @@ test "text: updateText with ZWJ grapheme families converges across a merge (text
     for (all_encodings) |enc| {
         var f = try textFixture(gpa, enc, "left👨‍👩‍👦right");
         defer f.deinit();
-        var other = try f.doc.clone(gpa, .auto);
+        var other = try f.doc.clone(gpa);
         defer other.deinit();
         other.setActorId(.{ .bytes = "bbbbbbbb" });
 
         // man, woman, girl — a different family of three.
-        try trans.updateText(&other, f.text, "left👨‍👩‍👧right");
+        {
+            var tx = try trans.Transaction.open(gpa, &other);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.updateText(f.text, "left👨‍👩‍👧right");
+            var committed = try tx.commit();
+            defer committed.deinit(gpa);
+        }
         // man, woman, boy, boy — a family of four.
-        try trans.updateText(&f.doc, f.text, "left👨‍👩‍👦‍👦right");
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.updateText(f.text, "left👨‍👩‍👦‍👦right");
+            var committed = try tx.commit();
+            defer committed.deinit(gpa);
+        }
         const heads = try f.doc.merge(gpa, &other);
         defer gpa.free(heads);
         try checkPremises(&f.doc, f.text, enc);
@@ -5278,8 +5534,14 @@ test "text: two marks written after an insertion are two runs (text.rs:143-161)"
     for (all_encodings) |enc| {
         var f = try textFixture(gpa, enc, "12345");
         defer f.deinit();
-        try trans.mark(&f.doc, f.text, 1, 2, "strong", .both, .{ .bool_value = true });
-        try trans.mark(&f.doc, f.text, 3, 4, "strong", .both, .{ .bool_value = true });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.mark(f.text, 1, 2, "strong", .both, .{ .bool_value = true });
+            try tx.mark(f.text, 3, 4, "strong", .both, .{ .bool_value = true });
+            var committed = try tx.commit();
+            defer committed.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
 
         const got = try marks(&f.doc, f.text, gpa);
@@ -5296,8 +5558,14 @@ test "text: zero-width marks do not split a span run (text.rs:297-319)" {
     for (all_encodings) |enc| {
         var f = try textFixture(gpa, enc, "1234");
         defer f.deinit();
-        try trans.mark(&f.doc, f.text, 1, 1, "strong", .both, .{ .bool_value = true });
-        try trans.mark(&f.doc, f.text, 2, 2, "strong", .both, .{ .bool_value = true });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.mark(f.text, 1, 1, "strong", .both, .{ .bool_value = true });
+            try tx.mark(f.text, 2, 2, "strong", .both, .{ .bool_value = true });
+            var committed = try tx.commit();
+            defer committed.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
 
         // **One run, not four.** A zero-width mark covers nothing, so the four
@@ -5342,10 +5610,16 @@ test "text: an empty mark before a block marker does not repeat the text (text.r
     for (one_wide_block_encodings) |enc| {
         var f = try textFixture(gpa, enc, "");
         defer f.deinit();
-        _ = try trans.splitBlock(&f.doc, f.text, 0);
-        _ = try trans.splitBlock(&f.doc, f.text, 0);
-        try trans.mark(&f.doc, f.text, 1, 1, "strong", .both, .{ .bool_value = true });
-        try trans.spliceText(&f.doc, f.text, 2, 0, "a");
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            _ = try tx.splitBlock(f.text, 0);
+            _ = try tx.splitBlock(f.text, 0);
+            try tx.mark(f.text, 1, 1, "strong", .both, .{ .bool_value = true });
+            try tx.spliceText(f.text, 2, 0, "a");
+            var committed = try tx.commit();
+            defer committed.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
 
         // **Two blocks and one unmarked `a`, and the `a` appears once.** The
@@ -5402,25 +5676,26 @@ test "text: updateText inside an isolation keeps both sides (text.rs:644-656)" {
     const after_isolated = [_][]const u8{ "a", "\n", "c", "\n" };
 
     for (all_encodings) |enc| {
-        var f = try textFixture(gpa, enc, "");
-        defer f.deinit();
-        try trans.updateText(&f.doc, f.text, "a\n");
+        const f = try textFixture(gpa, enc, "");
+        var owner = @import("autocommit.zig").AutoCommit.fromDocument(f.doc);
+        defer owner.deinit();
+        try owner.updateText(f.text, "a\n");
         // **The state the isolation is taken at**, so the test is not
         // isolating an empty document and passing for that reason.
-        try expectChars(&f.doc, f.text, &after_first, enc);
+        try expectChars(try owner.document(), f.text, &after_first, enc);
 
-        const initial = try f.doc.getHeads(gpa);
+        const initial = try owner.getHeads(gpa);
         defer gpa.free(initial);
-        try trans.updateText(&f.doc, f.text, "a\nb\n");
-        try checkPremises(&f.doc, f.text, enc);
-        try expectChars(&f.doc, f.text, &after_second, enc);
+        try owner.updateText(f.text, "a\nb\n");
+        try checkPremises(try owner.document(), f.text, enc);
+        try expectChars(try owner.document(), f.text, &after_second, enc);
 
         // **The second `update_text` is made against the first change alone**,
         // so it is concurrent with the `b` rather than after it. Integrating
         // then has to keep both, and the concurrent one wins its line: the `c`
         // lands between the `a` and the `b` rather than after the `b`.
-        try f.doc.isolate(gpa, initial);
-        try trans.updateText(&f.doc, f.text, "a\nc\n");
+        try owner.isolate(gpa, initial);
+        try owner.updateText(f.text, "a\nc\n");
 
         // **Read with the isolation still in place, and it reads the
         // isolated write's own state — `"a\nc\n"` — not the merge and not the
@@ -5436,7 +5711,7 @@ test "text: updateText inside an isolation keeps both sides (text.rs:644-656)" {
         //   under an isolation advances it. Upstream runs
         //   `self.isolation = ...` on both ends of a commit
         //   ([`autocommit.rs`:464-466, `:735-736](../github-automerge-automerge/rust/automerge/src/autocommit.rs)),
-        //   and this port's [`Document.commit`](doc.zig) is that line.
+        //   and this port's [`AutoCommit.ensureTransactionClosed`](autocommit.zig) is that line.
         //   Without it the second write under one isolation could not see the
         //   object the first made, and the concurrency walk would fork a third
         //   actor.
@@ -5449,21 +5724,21 @@ test "text: updateText inside an isolation keeps both sides (text.rs:644-656)" {
         // asserts **after** `integrate`, so it has no answer for the read in
         // between — this is the port's own line, and before the readers were
         // scoped it was asserting the unscoped read.
-        try expectChars(&f.doc, f.text, &after_isolated, enc);
+        try expectChars(try owner.document(), f.text, &after_isolated, enc);
         {
-            const seen = try text(&f.doc, f.text, gpa);
+            const seen = try text(try owner.document(), f.text, gpa);
             defer gpa.free(seen);
             try expectText(seen, "a\nc\n", enc);
         }
 
-        try f.doc.integrate();
-        try checkPremises(&f.doc, f.text, enc);
-        try expectChars(&f.doc, f.text, &after_both, enc);
+        try owner.integrate();
+        try checkPremises(try owner.document(), f.text, enc);
+        try expectChars(try owner.document(), f.text, &after_both, enc);
 
         // **Upstream's own assertion, read the other way round**
         // ([`tests/text.rs`:655](../../../github-automerge-automerge/rust/automerge/tests/text.rs)):
         // the same six elements as one string.
-        const got = try text(&f.doc, f.text, gpa);
+        const got = try text(try owner.document(), f.text, gpa);
         defer gpa.free(got);
         try expectText(got, "a\nc\nb\n", enc);
     }
@@ -5471,14 +5746,10 @@ test "text: updateText inside an isolation keeps both sides (text.rs:644-656)" {
 
 // ── The isolation reaches every reader ──────────────────────────────────────
 
-/// A root map with a **list**, a **marked text object** and a scalar, built
-/// through manual transactions so a `Transaction` can be opened on it after.
+/// A raw root map with a list, marked text and scalar, built in one explicit
+/// transaction. Subsequent transactions borrow the same raw document.
 ///
-/// **Manual and not `textFixture`'s auto**, because one of the three tests
-/// below opens a `Transaction` and that is the only door a transaction opens
-/// ([`transact.zig`](transact.zig)'s "the wrong door" case,
-/// `autocommit.rs`:447-452). The shape is chosen so that **each of the
-/// fourteen readers has something the later write changes**: a key that is
+/// The shape makes every reader sensitive to a later write: a key that is
 /// overwritten (`get`, `getAll`), a key that is *added* (`keys`, `values`,
 /// `mapRange`, `length`), text that grows (`text`, `length`, `spans`,
 /// `listRange` over the list), a mark that appears (`marks`, `getMarks`), and
@@ -5497,13 +5768,13 @@ const ScopedDoc = struct {
 };
 
 fn scopedFixture(gpa: Allocator) !ScopedDoc {
-    var doc = try Document.init(gpa, std.testing.io, .manual);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     // **A named actor, because a random one would make a failure
     // unreproducible** — [`textFixture`] gives the reason.
     doc.setActorId(.{ .bytes = "aaaaaaaa" });
     var tx = try trans.Transaction.open(gpa, &doc);
-    defer tx.deinit();
+    defer tx.deinit() catch @panic("transaction cleanup failed");
     const txt = try tx.putObject(.root, .{ .key = "text" }, .text);
     const list = try tx.putObject(.root, .{ .key = "list" }, .list);
     _ = try tx.put(.root, .{ .key = "size" }, .{ .int = 100 });
@@ -5512,7 +5783,8 @@ fn scopedFixture(gpa: Allocator) !ScopedDoc {
     for ([_][]const u8{ "a", "b", "c" }, 0..) |s, i| {
         _ = try tx.insert(list, i, .{ .str = s });
     }
-    _ = try tx.commit(null, null);
+    var result = try tx.commit();
+    defer result.deinit(gpa);
     const heads = try doc.getHeads(gpa);
     return .{ .doc = doc, .text = txt, .list = list, .heads = heads };
 }
@@ -5520,14 +5792,69 @@ fn scopedFixture(gpa: Allocator) !ScopedDoc {
 /// The four writes a test makes **under** an isolation, one per kind of thing
 /// a reader can be wrong about.
 fn writeAfterIsolate(f: *ScopedDoc, gpa: Allocator) !void {
-    var tx = try trans.Transaction.open(gpa, &f.doc);
-    defer tx.deinit();
+    var tx = try trans.Transaction.openAt(gpa, &f.doc, f.heads);
+    defer tx.deinit() catch @panic("transaction cleanup failed");
     _ = try tx.put(.root, .{ .key = "size" }, .{ .int = 150 });
     _ = try tx.put(.root, .{ .key = "other" }, .{ .int = 999 });
     try tx.spliceText(f.text, 3, 0, "QQQ");
     try tx.mark(f.text, 3, 6, "italic", .both, .{ .bool_value = true });
     _ = try tx.insert(f.list, 0, .{ .str = "z" });
-    _ = try tx.commit(null, null);
+    var result = try tx.commit();
+    defer result.deinit(gpa);
+}
+
+test "historical walks retain their clocks across another historical read" {
+    // Both requested clocks are older than the present. A later read must not
+    // replace the clock borrowed by an already-open historical iterator.
+    const gpa = testing.allocator;
+    var f = try scopedFixture(gpa);
+    defer f.deinit(gpa);
+    try writeAfterIsolate(&f, gpa);
+    const second = try f.doc.getHeads(gpa);
+    defer gpa.free(second);
+    {
+        var tx = try trans.Transaction.open(gpa, &f.doc);
+        defer tx.deinit() catch @panic("transaction cleanup failed");
+        _ = try tx.delete(.root, .{ .key = "text" });
+        var result = try tx.commit();
+        defer result.deinit(gpa);
+    }
+
+    var list_walk = try listRangeAt(&f.doc, f.list, .all(), f.heads);
+    try testing.expectEqualStrings("a", (try list_walk.next()).?.value.scalar.str);
+    var map_walk = try mapRangeAt(&f.doc, .root, .all(), f.heads);
+    try testing.expectEqualStrings("list", (try map_walk.next()).?.key);
+    var parent_walk = try parentsAt(&f.doc, f.text, f.heads);
+    var recursive_walk = try iterAt(&f.doc, f.list, f.heads, gpa);
+    defer recursive_walk.deinit();
+    {
+        var first = (try recursive_walk.next()).?;
+        defer first.deinit(gpa);
+        try testing.expectEqualStrings("a", first.value().scalar.str);
+    }
+
+    const other_text = try textAt(&f.doc, f.text, second, gpa);
+    defer gpa.free(other_text);
+    try testing.expectEqualStrings("aaaQQQbbbccc", other_text);
+
+    for ([_][]const u8{ "b", "c" }) |want| {
+        try testing.expectEqualStrings(want, (try list_walk.next()).?.value.scalar.str);
+        var item = (try recursive_walk.next()).?;
+        defer item.deinit(gpa);
+        try testing.expectEqualStrings(want, item.value().scalar.str);
+    }
+    try testing.expect((try list_walk.next()) == null);
+    try testing.expect((try recursive_walk.next()) == null);
+    const size = (try map_walk.next()).?;
+    try testing.expectEqualStrings("size", size.key);
+    try testing.expectEqual(@as(i64, 100), size.value.scalar.int);
+    try testing.expectEqualStrings("text", (try map_walk.next()).?.key);
+    try testing.expect((try map_walk.next()) == null);
+    const parent = (try parent_walk.next()).?;
+    try testing.expectEqual(.root, parent.obj);
+    try testing.expectEqualStrings("text", parent.prop.key);
+    try testing.expect(parent.visible);
+    try testing.expect((try parent_walk.next()) == null);
 }
 
 test "a read scoped to the current heads is the unscoped read" {
@@ -5580,14 +5907,9 @@ test "every reader on an isolated document cannot see a write made after the iso
     // so it survives the insert that follows; what changes is where it sits.
     const first_elem = try getCursor(&f.doc, f.list, .{ .index = 0 }, null, gpa);
 
-    // The two isolations are what upstream's `can_isolate`
-    // ([`test.rs`:2557, `:2579](../github-automerge-automerge/rust/automerge/tests/test.rs))
-    // does, and **the second one is load-bearing**: a commit made under an
-    // isolation advances it ([`Document.commit`](doc.zig),
-    // [`autocommit.rs`:735-736](../github-automerge-automerge/rust/automerge/src/autocommit.rs)),
-    // so without it the isolation would name the later head and the read would
-    // see the write it is supposed to hide. A test that isolated once and read
-    // would pass on a port with no scoping at all.
+    // Keep the two isolation calls in the upstream `can_isolate` script.
+    // Raw transactions name their write scope explicitly with `openAt`;
+    // unlike AutoCommit, a raw commit does not advance the reader isolation.
     try f.doc.isolate(gpa, f.heads);
     try writeAfterIsolate(&f, gpa);
     try f.doc.isolate(gpa, f.heads);
@@ -5791,30 +6113,35 @@ const AtHeads = struct {
 };
 
 fn atHeadsFixture(gpa: Allocator) !AtHeads {
-    var doc = try Document.init(gpa, std.testing.io, .manual);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = "aaaaaaaa" });
     var tx = try trans.Transaction.open(gpa, &doc);
+    defer tx.deinit() catch @panic("transaction cleanup failed");
     const txt = try tx.putObject(.root, .{ .key = "text" }, .text);
     try tx.spliceText(txt, 0, 0, "aaabbbccc");
     try tx.mark(txt, 0, 3, "bold", .both, .{ .bool_value = true });
-    _ = try tx.commit(null, null);
-    tx.deinit();
+    var first_result = try tx.commit();
+    defer first_result.deinit(gpa);
     const first = try doc.getHeads(gpa);
+    errdefer gpa.free(first);
 
     var second_tx = try trans.Transaction.open(gpa, &doc);
-    defer second_tx.deinit();
+    defer second_tx.deinit() catch @panic("transaction cleanup failed");
     try second_tx.spliceText(txt, 3, 0, "QQQ");
     try second_tx.mark(txt, 3, 6, "italic", .both, .{ .bool_value = true });
-    _ = try second_tx.commit(null, null);
+    var second_result = try second_tx.commit();
+    defer second_result.deinit(gpa);
     const second = try doc.getHeads(gpa);
+    errdefer gpa.free(second);
 
     var third_tx = try trans.Transaction.open(gpa, &doc);
-    defer third_tx.deinit();
+    defer third_tx.deinit() catch @panic("transaction cleanup failed");
     // **`null` is the tombstone**, which is how an unmark is spelled here and
     // how `Transaction.unmark` reaches `Transaction.mark` (transact.zig:1170-1180).
     try third_tx.unmark(txt, 3, 6, .none, "italic", null);
-    _ = try third_tx.commit(null, null);
+    var third_result = try third_tx.commit();
+    defer third_result.deinit(gpa);
     const third = try doc.getHeads(gpa);
 
     return .{ .doc = doc, .text = txt, .first = first, .second = second, .third = third };
@@ -5931,8 +6258,8 @@ test "a transaction's scope is the transaction's, and a document's is the isolat
     // ([`Clock.isolate`](clock.zig):128-136, upstream's `isolate_actor`,
     // `automerge.rs`:1276-1280), so the transaction sees the ops it has
     // written and is about to write — which the document's clock does not.
-    var tx = try trans.Transaction.open(gpa, &f.doc);
-    defer tx.deinit();
+    var tx = try trans.Transaction.openAt(gpa, &f.doc, f.heads);
+    defer tx.deinit() catch @panic("transaction cleanup failed");
     try tx.spliceText(f.text, 3, 0, "QQQ");
     // **The transaction's read is not the document's read, and that is the
     // claim** — so this asserts the *relation* between the two answers and
@@ -5957,15 +6284,8 @@ test "a transaction's scope is the transaction's, and a document's is the isolat
         try expectText(got, "aaabbbccc", enc);
     }
 
-    // **Committing closes the transaction and advances the isolation**, so the
-    // two agree again — and only because of the advance, not because either
-    // arm fell back to the present.
-    // **The transaction is spent**, so its own reads are refused and the only
-    // reader left is the document's. What the committed document reads is
-    // [`can_isolate`](../../github-automerge-automerge/rust/automerge/tests/test.rs)'s
-    // question and [`test "text: updateText inside an isolation keeps both
-    // sides (text.rs:644-656)"`] above is its answer; this test is about which
-    // clock each of the two arms reaches, and that is settled above.
+    // Leaving this transaction uncommitted rolls back its pending splice.
+    // The committed write made earlier remains hidden by the raw isolation.
 }
 
 /// The scalar an item carries, and a refusal rather than a silent null
@@ -6011,7 +6331,13 @@ test "text: a splice that lands inside a multi-unit character deletes after it (
             // for.
             if (enc == .utf16_code_unit) try expectText(want, step.want, enc);
 
-            try trans.spliceText(&f.doc, f.text, step.pos, @intCast(step.del), step.ins);
+            {
+                var tx = try trans.Transaction.open(gpa, &f.doc);
+                defer tx.deinit() catch @panic("transaction cleanup failed");
+                try tx.spliceText(f.text, step.pos, @intCast(step.del), step.ins);
+                var result = try tx.commit();
+                defer result.deinit(gpa);
+            }
             try checkPremises(&f.doc, f.text, enc);
             const got = try text(&f.doc, f.text, gpa);
             gpa.free(before);
@@ -6030,7 +6356,13 @@ test "text: a mark removed by a null value is not a mark (text.rs:835-866)" {
     for (all_encodings) |enc| {
         var f = try textFixture(gpa, enc, "abcdefg");
         defer f.deinit();
-        try trans.mark(&f.doc, f.text, 0, 1, "name1", .none, .{ .int = 1 });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.mark(f.text, 0, 1, "name1", .none, .{ .int = 1 });
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
         // **The mark is there before it is removed**, or a document that never
         // wrote it would pass this.
@@ -6040,7 +6372,13 @@ test "text: a mark removed by a null value is not a mark (text.rs:835-866)" {
             .{ .start = 0, .end = 1, .name = "name1", .value = .{ .int = 1 } },
         }, enc);
 
-        try trans.mark(&f.doc, f.text, 0, 1, "name1", .none, .null_value);
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.mark(f.text, 0, 1, "name1", .none, .null_value);
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
 
         // **Empty, not one mark with a null value.** A tombstone is not a mark
@@ -6267,24 +6605,25 @@ test "text: a generated edit history leaves consolidated marks and the right tex
             defer model.deinit(gpa);
 
             for (actions.items, 0..) |action, step| {
+                var tx = try trans.Transaction.open(gpa, &f.doc);
+                defer tx.deinit() catch @panic("transaction cleanup failed");
                 switch (action) {
                     .insert => |v| {
-                        try trans.spliceText(&f.doc, f.text, v.index, 0, v.value.slice());
+                        try tx.spliceText(f.text, v.index, 0, v.value.slice());
                         try model.insertSlice(gpa, v.index, v.value.slice());
                     },
                     .del => |v| {
-                        try trans.spliceText(&f.doc, f.text, v.index, @intCast(v.len), "");
+                        try tx.spliceText(f.text, v.index, @intCast(v.len), "");
                         const end = v.index + v.len;
                         if (end > model.items.len) return error.TestUnexpectedResult;
                         model.replaceRange(gpa, v.index, end, &.{}) catch return error.OutOfMemory;
                     },
                     .split_block => |v| {
-                        _ = try trans.splitBlock(&f.doc, f.text, v.index);
+                        _ = try tx.splitBlock(f.text, v.index);
                         try model.insert(gpa, v.index, '\n');
                     },
                     .add_mark => |v| {
-                        try trans.mark(
-                            &f.doc,
+                        try tx.mark(
                             f.text,
                             v.index,
                             v.index + v.len,
@@ -6294,6 +6633,8 @@ test "text: a generated edit history leaves consolidated marks and the right tex
                         );
                     },
                 }
+                var result = try tx.commit();
+                defer result.deinit(gpa);
                 // **The rendered text against the model, after every action.**
                 // That is the check that names the action which went wrong: a
                 // check only at the end says the two disagree, and this
@@ -6377,9 +6718,8 @@ test "text: every index agrees with the marks the operations describe (text.rs:1
     //
     // **The historical half runs on a fork.** Upstream reads the same document
     // at `heads` through `length_at` / `marks_at` / `get_marks(.., Some(&heads))`
-    // (`:1079-1087`); this port has no `_at` variants
-    // ([`read`]'s module doc, "The `_at` variants"), and
-    // [`Document.forkAt`](doc.zig) builds the same state.
+    // (`:1079-1087`). A raw `Document.forkAt` materializes that same historical
+    // state, so the shared current-view index checker can assert both views.
     const applied = [_]MarkOp{
         .{ .name = "bold", .start = 0, .end = 9, .value = .{ .bool_value = true } },
         .{ .name = "italic", .start = 4, .end = 15, .value = .{ .bool_value = true } },
@@ -6389,15 +6729,27 @@ test "text: every index agrees with the marks the operations describe (text.rs:1
     for (all_encodings) |enc| {
         var f = try textFixture(gpa, enc, "the quick brown fox");
         defer f.deinit();
-        for (applied) |op| {
-            try trans.mark(&f.doc, f.text, op.start, op.end, op.name, .none, op.value);
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            for (applied) |op| {
+                try tx.mark(f.text, op.start, op.end, op.name, .none, op.value);
+            }
+            var result = try tx.commit();
+            defer result.deinit(gpa);
         }
         try checkPremises(&f.doc, f.text, enc);
 
         const heads = try f.doc.getHeads(gpa);
         defer gpa.free(heads);
-        try trans.mark(&f.doc, f.text, 2, 5, "bold", .none, .null_value);
-        try trans.spliceText(&f.doc, f.text, 19, 0, " jumps over");
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.mark(f.text, 2, 5, "bold", .none, .null_value);
+            try tx.spliceText(f.text, 19, 0, " jumps over");
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
 
         // **The fifth operation is a tombstone and not a deletion**, so the
@@ -6413,7 +6765,7 @@ test "text: every index agrees with the marks the operations describe (text.rs:1
             .value = .null_value,
         });
 
-        var at_heads = try f.doc.forkAt(gpa, heads, .auto);
+        var at_heads = try f.doc.forkAt(gpa, heads);
         defer at_heads.deinit();
         try checkAllIndices(gpa, &f.doc, f.text, with_removal.items, enc, "current");
         try checkAllIndices(gpa, &at_heads, f.text, &applied, enc, "at heads");
@@ -6517,7 +6869,13 @@ test "text: a mark's end is counted in the document's own units (text.rs:1090-11
         try expectLen(try length(&f.doc, f.text), want_len, enc);
         try expectCharAt(&f.doc, f.text, 1, "\u{1f600}", enc);
 
-        try trans.mark(&f.doc, f.text, 1, want_len, "bold", .none, .{ .bool_value = true });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.mark(f.text, 1, want_len, "bold", .none, .{ .bool_value = true });
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
 
         const applied = [_]MarkOp{
@@ -6554,7 +6912,13 @@ test "text: a mark at the end of a long text is found at the end (text.rs:1121-1
         defer f.deinit();
         const len = try length(&f.doc, f.text);
         try expectLen(len, 210_000, enc);
-        try trans.mark(&f.doc, f.text, len - 4, len, "bold", .none, .{ .bool_value = true });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.mark(f.text, len - 4, len, "bold", .none, .{ .bool_value = true });
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
 
         // **Names and values only, and that is upstream's assertion.** Upstream
@@ -6596,32 +6960,9 @@ test "text: a mark at the end of a long text is found at the end (text.rs:1121-1
 // The tests below are the ones whose subject is not a document but the **patch
 // stream** a document produces: `Automerge::diff` and `AutoCommit::
 // diff_incremental` (`automerge.rs:1419-1457`, `autocommit.rs:255-305`,
-// `:340-355`). The port's four methods are [`Document.diff`],
-// [`Document.diffObj`], [`Document.diffIncremental`] and
-// [`Document.makePatches`] (doc.zig:3976-4123), which is the same surface, and
-// every one of them answers with a [`patchesmod.Patches`] the caller frees.
-//
-// **Every test below asks for the stream through [`Document.diff`] and not
-// through [`Document.diffIncremental`], and that is a gap in the port rather
-// than a choice.** Upstream's incremental diff reads the events the document
-// recorded as it moved (`autocommit.rs:340-355`), and for a **local** edit
-// those events come from the branch log the transaction built and the commit
-// merged into the document's log (`autocommit.rs:732`). The port's
-// `Transaction` has no patch log at all — `transaction.zig:240` says "There
-// is no `patch_log` field, because there is no patch log to carry", and
-// `transaction.zig:1517` says the same of the `Document`'s own — and the only
-// writer of [`Document.patch_log`] is [`Document.applyChanges`]
-// (doc.zig:3372-3380). So `updateDiffCursor` followed by a local edit followed
-// by `diffIncremental` answers **"nothing changed"**: the log is active, it is
-// empty, and [`Document.diffIncremental`]'s first case returns it verbatim
-// (doc.zig:4195-4202). All five of the `text_encoding.rs` patch tests measured
-// it, and all five read zero patches.
-//
-// [`Document.diff`] is the same function over the same two points in history,
-// so what these tests assert — the shape and the content of the stream a
-// reader is handed — is unchanged. What is not exercised is the
-// *incremental* code path itself, and that is the gap to close, not something
-// a test here can paper over.
+// `:340-355`). These raw-document tests compare committed history through
+// [`Document.diff`]; the returned [`patchesmod.Patches`] are caller-owned.
+// Each local edit is committed explicitly before capturing its after heads.
 
 /// The index every `tests/text_encoding.rs` patch scenario writes at
 /// (`text_encoding.rs:414-419`, `:461-466`, `:507-512`, `:552-557`,
@@ -6738,7 +7079,13 @@ test "text_encoding: a put arrives as a delete and a splice at the same index (t
 
         const before = try f.doc.getHeads(gpa);
         defer gpa.free(before);
-        _ = try trans.put(&f.doc, f.text, .{ .index = index }, .{ .str = "L" });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            _ = try tx.put(f.text, .{ .index = index }, .{ .str = "L" });
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
         const after = try f.doc.getHeads(gpa);
         defer gpa.free(after);
@@ -6797,7 +7144,9 @@ test "text_encoding: a put arrives as a delete and a splice at the same index (t
             showPatches(patches.slice());
             return error.TestExpectedEqual;
         }
-        try expectText(ins.value.asStr(), "L", enc);
+        const inserted = try ins.value.makeString(gpa);
+        defer gpa.free(inserted);
+        try expectText(inserted, "L", enc);
     }
 }
 
@@ -6811,7 +7160,13 @@ test "text_encoding: an insert arrives as one splice at the index it was made at
 
         const before = try f.doc.getHeads(gpa);
         defer gpa.free(before);
-        _ = try trans.insert(&f.doc, f.text, index, .{ .str = "L" });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            _ = try tx.insert(f.text, index, .{ .str = "L" });
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
         const after = try f.doc.getHeads(gpa);
         defer gpa.free(after);
@@ -6838,7 +7193,9 @@ test "text_encoding: an insert arrives as one splice at the index it was made at
                 return error.TestExpectedEqual;
             },
         };
-        try expectText(one.value.asStr(), "L", enc);
+        const inserted = try one.value.makeString(gpa);
+        defer gpa.free(inserted);
+        try expectText(inserted, "L", enc);
         if (one.index != index) {
             std.debug.print("encoding {s}: the splice is at {d}, want the index it was made at {d}\n", .{
                 @tagName(enc),
@@ -6864,7 +7221,13 @@ test "text_encoding: a splice arrives as one splice at the index it was made at 
 
         const before = try f.doc.getHeads(gpa);
         defer gpa.free(before);
-        try trans.spliceText(&f.doc, f.text, index, 0, "L");
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.spliceText(f.text, index, 0, "L");
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
         const after = try f.doc.getHeads(gpa);
         defer gpa.free(after);
@@ -6889,7 +7252,9 @@ test "text_encoding: a splice arrives as one splice at the index it was made at 
                 return error.TestExpectedEqual;
             },
         };
-        try expectText(one.value.asStr(), "L", enc);
+        const inserted = try one.value.makeString(gpa);
+        defer gpa.free(inserted);
+        try expectText(inserted, "L", enc);
         if (one.index != index) {
             std.debug.print("encoding {s}: the splice is at {d}, want the index it was made at {d}\n", .{
                 @tagName(enc),
@@ -6911,7 +7276,13 @@ test "text_encoding: a delete arrives as one delete of one element (text_encodin
 
         const before = try f.doc.getHeads(gpa);
         defer gpa.free(before);
-        _ = try trans.delete(&f.doc, f.text, .{ .index = index });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            _ = try tx.delete(f.text, .{ .index = index });
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
         const after = try f.doc.getHeads(gpa);
         defer gpa.free(after);
@@ -6967,7 +7338,13 @@ test "text_encoding: a mark arrives as one mark patch spanning the range (text_e
 
         const before = try f.doc.getHeads(gpa);
         defer gpa.free(before);
-        try trans.mark(&f.doc, f.text, 1, end_index, "bold", .both, .{ .bool_value = true });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.mark(f.text, 1, end_index, "bold", .both, .{ .bool_value = true });
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
         const after = try f.doc.getHeads(gpa);
         defer gpa.free(after);
@@ -7045,7 +7422,13 @@ test "text: a splice inside a mark carries that mark in its patch (text.rs:84-14
     for (all_encodings) |enc| {
         var f = try textFixture(gpa, enc, "12345");
         defer f.deinit();
-        try trans.mark(&f.doc, f.text, 1, 2, "strong", .both, .{ .bool_value = true });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.mark(f.text, 1, 2, "strong", .both, .{ .bool_value = true });
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
 
         const want = [_]MarkName{.{ .name = "strong", .value = .{ .bool_value = true } }};
@@ -7065,34 +7448,21 @@ test "text: a splice inside a mark carries that mark in its patch (text.rs:84-14
             try expectCharAt(&f.doc, f.text, index + 1, "3", enc);
             const before = try f.doc.getHeads(gpa);
             defer gpa.free(before);
-            try trans.spliceText(&f.doc, f.text, index, 0, "-");
+            {
+                var tx = try trans.Transaction.open(gpa, &f.doc);
+                defer tx.deinit() catch @panic("transaction cleanup failed");
+                try tx.spliceText(f.text, index, 0, "-");
+                var result = try tx.commit();
+                defer result.deinit(gpa);
+            }
             try checkPremises(&f.doc, f.text, enc);
             const after = try f.doc.getHeads(gpa);
             defer gpa.free(after);
 
             var patches = try f.doc.diff(gpa, before, after);
             defer patches.deinit();
-            // **Upstream asserts one patch; a heads diff answers two, and the
-            // difference is the `diffIncremental` gap this section's header
-            // names — not a mark that went missing.** Upstream reads the
-            // *recorded* events, so it sees the splice and nothing else; a
-            // walk over two heads recomputes the marks for the whole object
-            // and also reports that the mark's range moved from `[1, 2)` to
-            // `[2, 3)`, because the `-` landed at its start. The port answers:
-            //
-            // ```
-            // patch 0: SpliceText { index: 1, value: "-", marks: {strong=Bool(true)} }
-            // patch 1: Mark { marks: [{ name: "strong", value: Bool(true), start: 2, end: 3 }] }
-            // ```
-            //
-            // **The splice patch carries `strong`, which is the whole point of
-            // upstream's test** (`text.rs:85-87`: the shortcut dropped the
-            // marks). So the mark assertion below is the one with teeth, and
-            // the patch **count** is the assertion that cannot be met until
-            // `Document.diffIncremental` reads a local edit. **Left red on
-            // purpose**: the fix is the missing patch log, not this test, and
-            // the reference's own stream for this fixture is the oracle's
-            // business to settle once that log exists.
+            // The splice must carry `strong`: upstream's shortcut regression
+            // dropped the marks (`text.rs:85-87`).
             if (patches.slice().len != 1) {
                 std.debug.print("encoding {s}, index {d}: {d} patch(es), want 1\n", .{
                     @tagName(enc),
@@ -7121,7 +7491,9 @@ test "text: a splice inside a mark carries that mark in its patch (text.rs:84-14
                 });
                 return error.TestExpectedEqual;
             }
-            try expectText(one.value.asStr(), "-", enc);
+            const inserted = try one.value.makeString(gpa);
+            defer gpa.free(inserted);
+            try expectText(inserted, "-", enc);
             try expectPatchMarks(one.marks, &want, enc, "the splice patch");
         }
     }
@@ -7136,7 +7508,13 @@ test "text: a mark that expands is reported on the inserts that expand it (text.
     for (all_encodings) |enc| {
         var f = try textFixture(gpa, enc, "aaabbbccc");
         defer f.deinit();
-        try trans.mark(&f.doc, f.text, 3, 6, "strong", .both, .{ .bool_value = true });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.mark(f.text, 3, 6, "strong", .both, .{ .bool_value = true });
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
 
         const want = [_]MarkName{.{ .name = "strong", .value = .{ .bool_value = true } }};
@@ -7147,7 +7525,13 @@ test "text: a mark that expands is reported on the inserts that expand it (text.
         for (steps) |step| {
             const before = try f.doc.getHeads(gpa);
             defer gpa.free(before);
-            try trans.spliceText(&f.doc, f.text, step.index, 0, step.text);
+            {
+                var tx = try trans.Transaction.open(gpa, &f.doc);
+                defer tx.deinit() catch @panic("transaction cleanup failed");
+                try tx.spliceText(f.text, step.index, 0, step.text);
+                var result = try tx.commit();
+                defer result.deinit(gpa);
+            }
             try checkPremises(&f.doc, f.text, enc);
             const after = try f.doc.getHeads(gpa);
             defer gpa.free(after);
@@ -7182,7 +7566,9 @@ test "text: a mark that expands is reported on the inserts that expand it (text.
                 });
                 return error.TestExpectedEqual;
             }
-            try expectText(one.value.asStr(), step.text, enc);
+            const inserted = try one.value.makeString(gpa);
+            defer gpa.free(inserted);
+            try expectText(inserted, step.text, enc);
             try expectPatchMarks(one.marks, &want, enc, "the splice patch");
         }
     }
@@ -7197,7 +7583,13 @@ test "text: a noexpand mark at the end does not mark a later insertion (text.rs:
     for (all_encodings) |enc| {
         var f = try textFixture(gpa, enc, "Hello world");
         defer f.deinit();
-        try trans.mark(&f.doc, f.text, 10, 11, "strong", .none, .{ .bool_value = true });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.mark(f.text, 10, 11, "strong", .none, .{ .bool_value = true });
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
         // **The mark really is where it says it is**, so the insertion below is
         // not passing by accident.
@@ -7209,7 +7601,13 @@ test "text: a noexpand mark at the end does not mark a later insertion (text.rs:
 
         const before = try f.doc.getHeads(gpa);
         defer gpa.free(before);
-        try trans.spliceText(&f.doc, f.text, 11, 0, "a");
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.spliceText(f.text, 11, 0, "a");
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
         const after = try f.doc.getHeads(gpa);
         defer gpa.free(after);
@@ -7264,18 +7662,36 @@ test "text: a mark that crosses an op-tree page is not counted twice (text.rs:41
         var one_page: std.ArrayList(u8) = .empty;
         defer one_page.deinit(gpa);
         for (0..32) |_| try one_page.append(gpa, 'a');
-        try trans.spliceText(&f.doc, f.text, 0, 0, one_page.items);
-        try trans.mark(&f.doc, f.text, 15, 17, "strong", .none, .{ .bool_value = true });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.spliceText(f.text, 0, 0, one_page.items);
+            try tx.mark(f.text, 15, 17, "strong", .none, .{ .bool_value = true });
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
 
         for (0..100) |round| {
             const len = try length(&f.doc, f.text);
-            _ = try trans.splitBlock(&f.doc, f.text, len);
+            {
+                var tx = try trans.Transaction.open(gpa, &f.doc);
+                defer tx.deinit() catch @panic("transaction cleanup failed");
+                _ = try tx.splitBlock(f.text, len);
+                var result = try tx.commit();
+                defer result.deinit(gpa);
+            }
             try checkPremises(&f.doc, f.text, enc);
             const grown = try length(&f.doc, f.text);
             const before = try f.doc.getHeads(gpa);
             defer gpa.free(before);
-            try trans.spliceText(&f.doc, f.text, grown, 0, "a");
+            {
+                var tx = try trans.Transaction.open(gpa, &f.doc);
+                defer tx.deinit() catch @panic("transaction cleanup failed");
+                try tx.spliceText(f.text, grown, 0, "a");
+                var result = try tx.commit();
+                defer result.deinit(gpa);
+            }
             try checkPremises(&f.doc, f.text, enc);
             const after = try f.doc.getHeads(gpa);
             defer gpa.free(after);
@@ -7326,19 +7742,31 @@ test "text: a remote mark with expand-after arrives as the same patches as the l
     for (all_encodings) |enc| {
         var f = try textFixture(gpa, enc, "fox");
         defer f.deinit();
-        try trans.mark(&f.doc, f.text, 0, 3, "strong", .after, .{ .bool_value = true });
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.mark(f.text, 0, 3, "strong", .after, .{ .bool_value = true });
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
 
         // **A fork, not a clone of the bytes**: the merge has to be a real
         // merge, and `clone` plus a named actor is the port's `fork` — see
         // `test "text: updateText over a fork converges on the fork's text"`.
-        var other = try f.doc.clone(gpa, .auto);
+        var other = try f.doc.clone(gpa);
         defer other.deinit();
         other.setActorId(.{ .bytes = "bbbbbbbb" });
 
         const before_a = try f.doc.getHeads(gpa);
         defer gpa.free(before_a);
-        try trans.spliceText(&f.doc, f.text, 3, 0, "a");
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            try tx.spliceText(f.text, 3, 0, "a");
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+        }
         try checkPremises(&f.doc, f.text, enc);
         const after_a = try f.doc.getHeads(gpa);
         defer gpa.free(after_a);
@@ -7388,8 +7816,14 @@ test "text: three marks over one sentence come back as five splices with their m
     for (all_encodings) |enc| {
         var f = try textFixture(gpa, enc, "the quick fox jumps over the lazy dog");
         defer f.deinit();
-        for (applied) |m| {
-            try trans.mark(&f.doc, f.text, m.start, m.end, m.name, .both, m.value);
+        {
+            var tx = try trans.Transaction.open(gpa, &f.doc);
+            defer tx.deinit() catch @panic("transaction cleanup failed");
+            for (applied) |m| {
+                try tx.mark(f.text, m.start, m.end, m.name, .both, m.value);
+            }
+            var result = try tx.commit();
+            defer result.deinit(gpa);
         }
         try checkPremises(&f.doc, f.text, enc);
 
@@ -7397,7 +7831,7 @@ test "text: three marks over one sentence come back as five splices with their m
         defer gpa.free(heads);
         // **From nothing to the present**, which is what an incremental diff
         // on a document whose cursor was never set answers
-        // ([`Document.diffIncremental`]'s second case, `autocommit.rs:288-296`).
+        // (`autocommit.rs:288-296`).
         var patches = try f.doc.diff(gpa, &.{}, heads);
         defer patches.deinit();
         if (patches.slice().len != 6) {
@@ -7505,7 +7939,9 @@ test "text: three marks over one sentence come back as five splices with their m
                 showPatches(patches.slice());
                 return error.TestExpectedEqual;
             }
-            try expectText(one.value.asStr(), w.text, enc);
+            const inserted = try one.value.makeString(gpa);
+            defer gpa.free(inserted);
+            try expectText(inserted, w.text, enc);
             try expectPatchMarks(
                 one.marks,
                 w.marks,
@@ -7667,7 +8103,9 @@ fn expectMirroredText(
 ) MirrorError!void {
     const got = try text(doc, obj, gpa);
     defer gpa.free(got);
-    try testing.expectEqualStrings(got, t.asStr());
+    const mirrored = try t.makeString(gpa);
+    defer gpa.free(mirrored);
+    try testing.expectEqualStrings(got, mirrored);
     // **The count is in the document's own encoding**, which is the encoding
     // the mirror was built in, so the two must agree unit for unit.
     try testing.expectEqual(try length(doc, obj), t.count());
@@ -7728,8 +8166,8 @@ fn expectMirroredValue(
             // `DocItem` doc), so the two answers are compared rather than
             // assumed — and the mirror keeps that id on the container
             // ([`Value.objId`], hydrate.zig).
-            try testing.expectEqual(got.id, want.objId() orelse
-                return error.TestUnexpectedResult);
+            try testing.expect(got.id.eql(want.objId() orelse
+                return error.TestUnexpectedResult));
             switch (typ) {
                 .map, .table => try expectMirroredMap(gpa, doc, got.id, try mirrorMap(want)),
                 .list => try expectMirroredList(gpa, doc, got.id, try mirrorList(want)),
@@ -7743,54 +8181,71 @@ fn expectMirroredValue(
 /// two things a naive walk gets wrong: **a deleted key** and **a conflicted
 /// key**.
 fn mirrorFixture(gpa: Allocator) !Document {
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
-    doc.setActorId(.{ .bytes = "aaaaaaaa" });
+    const actor = try types.ActorId.fromHex(gpa, "aaaaaaaa");
+    defer gpa.free(actor.bytes);
+    doc.setActorId(actor);
+    var tx = try trans.Transaction.open(gpa, &doc);
+    defer tx.deinit() catch @panic("transaction cleanup failed");
 
-    const map = try trans.putObject(&doc, .root, .{ .key = "map" }, .map);
-    const list = try trans.putObject(&doc, .root, .{ .key = "list" }, .list);
-    const txt = try trans.putObject(&doc, .root, .{ .key = "text" }, .text);
-    const child = try trans.putObject(&doc, map, .{ .key = "child" }, .map);
+    const map = try tx.putObject(.root, .{ .key = "map" }, .map);
+    const list = try tx.putObject(.root, .{ .key = "list" }, .list);
+    const txt = try tx.putObject(.root, .{ .key = "text" }, .text);
+    const child = try tx.putObject(map, .{ .key = "child" }, .map);
 
-    _ = try trans.put(&doc, child, .{ .key = "leaf" }, .{ .str = "green" });
-    _ = try trans.put(&doc, map, .{ .key = "deep" }, .{ .uint = 7 });
+    _ = try tx.put(child, .{ .key = "leaf" }, .{ .str = "green" });
+    _ = try tx.put(map, .{ .key = "deep" }, .{ .uint = 7 });
 
-    // **Nine scalars and one null, one per arm of `ScalarValue`** that a
-    // mirror can hold, so a `Value.eql` that compared only the bytes would pass
-    // an `int` for a `uint` here.
-    _ = try trans.put(&doc, .root, .{ .key = "bool" }, .{ .bool_value = true });
-    _ = try trans.put(&doc, .root, .{ .key = "bytes" }, .{ .bytes = &.{ 1, 2, 3 } });
-    _ = try trans.put(&doc, .root, .{ .key = "counter" }, .{ .counter = .{ .current = 5 } });
-    _ = try trans.put(&doc, .root, .{ .key = "float" }, .{ .float = 1.5 });
-    _ = try trans.put(&doc, .root, .{ .key = "int" }, .{ .int = -7 });
-    _ = try trans.put(&doc, .root, .{ .key = "null" }, .null_value);
-    _ = try trans.put(&doc, .root, .{ .key = "str" }, .{ .str = "hello" });
-    _ = try trans.put(&doc, .root, .{ .key = "uint" }, .{ .uint = 42 });
+    // Scalar tags and payloads are all exercised. Hydration normalizes uint
+    // through wrapping asI64, and fromScalar supplies that canonical value.
+    _ = try tx.put(.root, .{ .key = "bool" }, .{ .bool_value = true });
+    _ = try tx.put(.root, .{ .key = "bytes" }, .{ .bytes = &.{ 1, 2, 3 } });
+    _ = try tx.put(.root, .{ .key = "counter" }, .{ .counter = .{ .current = 5 } });
+    _ = try tx.put(.root, .{ .key = "float" }, .{ .float = 1.5 });
+    _ = try tx.put(.root, .{ .key = "int" }, .{ .int = -7 });
+    _ = try tx.put(.root, .{ .key = "null" }, .null_value);
+    _ = try tx.put(.root, .{ .key = "str" }, .{ .str = "hello" });
+    _ = try tx.put(.root, .{ .key = "uint" }, .{ .uint = 42 });
 
-    _ = try trans.insert(&doc, list, 0, .{ .str = "first" });
-    _ = try trans.insert(&doc, list, 1, .{ .counter = .{ .current = 3 } });
-    const boxed = try trans.insertObject(&doc, list, 2, .map);
-    _ = try trans.put(&doc, boxed, .{ .key = "k" }, .{ .str = "v" });
+    _ = try tx.insert(list, 0, .{ .str = "first" });
+    _ = try tx.insert(list, 1, .{ .counter = .{ .current = 3 } });
+    const boxed = try tx.insertObject(list, 2, .map);
+    _ = try tx.put(boxed, .{ .key = "k" }, .{ .str = "v" });
 
-    try trans.spliceText(&doc, txt, 0, 0, "hello world");
-    try trans.mark(&doc, txt, 0, 5, "bold", .both, .{ .bool_value = true });
-    try trans.mark(&doc, txt, 6, 11, "link", .none, .{ .str = "u" });
+    try tx.spliceText(txt, 0, 0, "hello world");
+    try tx.mark(txt, 0, 5, "bold", .both, .{ .bool_value = true });
+    try tx.mark(txt, 6, 11, "link", .none, .{ .str = "u" });
 
     // **A deleted key.** `delete` drops the register's rows and leaves a
     // successor edge, so a mirror is wrong to show it ([`keys`]'s doc).
-    _ = try trans.put(&doc, .root, .{ .key = "doomed" }, .{ .str = "bye" });
-    _ = try trans.delete(&doc, .root, .{ .key = "doomed" });
+    _ = try tx.put(.root, .{ .key = "doomed" }, .{ .str = "bye" });
+    _ = try tx.delete(.root, .{ .key = "doomed" });
+    var base_commit = try tx.commit();
+    defer base_commit.deinit(gpa);
 
     // **A conflicted key, from a second actor.** A second `put` through the
     // same transaction would shadow the first and leave one visible row; two
     // actors with no successor edge between their rows is what `top.conflict`
     // reports (`op_set.rs`), so this is a real merge.
-    var other = try doc.clone(gpa, .auto);
+    var other = try doc.clone(gpa);
     defer other.deinit();
-    other.setActorId(.{ .bytes = "bbbbbbbb" });
-    _ = try trans.put(&other, .root, .{ .key = "clash" }, .{ .str = "theirs" });
-    _ = try trans.put(&doc, .root, .{ .key = "clash" }, .{ .str = "ours" });
-    const merged = try other.merge(gpa, &doc);
+    // Equal counters resolve to our higher actor. This insertion also shifts
+    // the original actor index, exercising the retained IDs' actor-byte hints.
+    const other_actor = try types.ActorId.fromHex(gpa, "00000000");
+    defer gpa.free(other_actor.bytes);
+    other.setActorId(other_actor);
+    var other_tx = try trans.Transaction.open(gpa, &other);
+    defer other_tx.deinit() catch @panic("transaction cleanup failed");
+    _ = try other_tx.put(.root, .{ .key = "clash" }, .{ .str = "theirs" });
+    var other_commit = try other_tx.commit();
+    defer other_commit.deinit(gpa);
+    var clash_tx = try trans.Transaction.open(gpa, &doc);
+    defer clash_tx.deinit() catch @panic("transaction cleanup failed");
+    _ = try clash_tx.put(.root, .{ .key = "clash" }, .{ .str = "ours" });
+    var clash_commit = try clash_tx.commit();
+    defer clash_commit.deinit(gpa);
+    const merged = try doc.merge(gpa, &other);
     defer gpa.free(merged);
     return doc;
 }
@@ -7821,6 +8276,10 @@ test "hydrate at null heads mirrors the document, element by element" {
     // the winner by op id — `getAll`'s last row ([`winner`]).
     {
         const clash = m.get("clash") orelse return error.TestUnexpectedResult;
+        try testing.expect(m.entries.get("clash").?.conflict);
+        const conflicts = try getAll(&doc, .root, .{ .key = "clash" }, gpa);
+        defer gpa.free(conflicts);
+        try testing.expectEqual(@as(usize, 2), conflicts.len);
         try testing.expect(clash.eql(&hydmod.Value.fromScalar(.{ .str = "ours" })));
     }
     // **The nested map and list are mirrors of their own**, and this is where
@@ -7849,7 +8308,9 @@ test "hydrate at null heads mirrors the document, element by element" {
     // the names and the values; the reader holds the spans; both are asserted
     // literally.
     const t = try mirrorText(m.get("text") orelse return error.TestUnexpectedResult);
-    try testing.expectEqualStrings("hello world", t.asStr());
+    const mirrored_text = try t.makeString(gpa);
+    defer gpa.free(mirrored_text);
+    try testing.expectEqualStrings("hello world", mirrored_text);
     try testing.expectEqual(@as(usize, 11), t.count());
     try expectMarkSetNames(&t.marks, &.{
         .{ .name = "bold", .value = .{ .bool_value = true } },
@@ -7873,7 +8334,7 @@ test "hydrate at null heads mirrors the document, element by element" {
     // mirror against rather than the readers above.
     const heads = try doc.getHeads(gpa);
     defer gpa.free(heads);
-    var fork = try doc.forkAt(gpa, heads, .auto);
+    var fork = try doc.forkAt(gpa, heads);
     defer fork.deinit();
     var forked = try hydrate(&fork, .root, null, gpa);
     defer forked.deinit();
@@ -7884,11 +8345,15 @@ test "hydrate at null heads mirrors the document, element by element" {
     // mirror that borrowed either would read the document's storage after the
     // mutation — and the port has produced a wrong *value* rather than a crash
     // that way already, which is why this is asserted and not assumed.
-    _ = try trans.put(&doc, .root, .{ .key = "str" }, .{
+    var tx = try trans.Transaction.open(gpa, &doc);
+    defer tx.deinit() catch @panic("transaction cleanup failed");
+    _ = try tx.put(.root, .{ .key = "str" }, .{
         .str = "a value long enough to move the raw column's block",
     });
-    _ = try trans.put(&doc, .root, .{ .key = "bool" }, .{ .bool_value = false });
-    try trans.spliceText(&doc, text_obj, 0, 0, "XX");
+    _ = try tx.put(.root, .{ .key = "bool" }, .{ .bool_value = false });
+    try tx.spliceText(text_obj, 0, 0, "XX");
+    var result = try tx.commit();
+    defer result.deinit(gpa);
     try testing.expect(forked.eql(&root));
     // **And a fresh mirror of the mutated document is a different tree**, so
     // the equality above is not two empty mirrors agreeing.
@@ -7900,19 +8365,27 @@ test "hydrate at null heads mirrors the document, element by element" {
 test "hydrate at heads does not see the writes the heads exclude" {
     const gpa = testing.allocator;
     const enc: TextEncoding = .unicode_code_point;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = "aaaaaaaa" });
 
-    const txt = try trans.putObject(&doc, .root, .{ .key = "text" }, .text);
-    try trans.spliceText(&doc, txt, 0, 0, "aaabbbccc");
-    try trans.mark(&doc, txt, 0, 3, "bold", .both, .{ .bool_value = true });
+    var first_tx = try trans.Transaction.open(gpa, &doc);
+    defer first_tx.deinit() catch @panic("transaction cleanup failed");
+    const txt = try first_tx.putObject(.root, .{ .key = "text" }, .text);
+    try first_tx.spliceText(txt, 0, 0, "aaabbbccc");
+    try first_tx.mark(txt, 0, 3, "bold", .both, .{ .bool_value = true });
+    var first_commit = try first_tx.commit();
+    defer first_commit.deinit(gpa);
     const first = try doc.getHeads(gpa);
     defer gpa.free(first);
 
-    try trans.spliceText(&doc, txt, 3, 0, "QQQ");
-    _ = try trans.put(&doc, .root, .{ .key = "late" }, .{ .str = "later" });
-    try trans.mark(&doc, txt, 3, 6, "italic", .both, .{ .bool_value = true });
+    var second_tx = try trans.Transaction.open(gpa, &doc);
+    defer second_tx.deinit() catch @panic("transaction cleanup failed");
+    try second_tx.spliceText(txt, 3, 0, "QQQ");
+    _ = try second_tx.put(.root, .{ .key = "late" }, .{ .str = "later" });
+    try second_tx.mark(txt, 3, 6, "italic", .both, .{ .bool_value = true });
+    var second_commit = try second_tx.commit();
+    defer second_commit.deinit(gpa);
     const second = try doc.getHeads(gpa);
     defer gpa.free(second);
 
@@ -7926,8 +8399,8 @@ test "hydrate at heads does not see the writes the heads exclude" {
     // three.
     //
     // **The mark set is asserted literally and not through `Value.eql`, and
-    // that is load-bearing.** [`Text.eql`](hydrate.zig) is `asStr()` alone
-    // (hydrate.zig:1525-1527) — upstream's derive compares the `String` and
+    // that is load-bearing.** `Text.eql` compares native text content alone;
+    // upstream's derive compares the `String` and
     // leaves the `marks` field out — so two mirrors that differ only in their
     // text marks compare **equal**, and a `Value.eql` proof of this test would
     // pass on a mirror holding the present's `italic`.
@@ -7937,8 +8410,10 @@ test "hydrate at heads does not see the writes the heads exclude" {
         const m = try mirrorMap(&at_first);
         try testing.expectEqual(@as(usize, 1), m.count());
         const t = try mirrorText(m.get("text") orelse return error.TestUnexpectedResult);
-        try testing.expectEqual(txt, t.id);
-        try testing.expectEqualStrings("aaabbbccc", t.asStr());
+        try testing.expect(txt.eql(t.id));
+        const mirrored_text = try t.makeString(gpa);
+        defer gpa.free(mirrored_text);
+        try testing.expectEqualStrings("aaabbbccc", mirrored_text);
         try testing.expectEqual(@as(usize, 9), t.count());
         try expectMarkSetNames(&t.marks, &.{
             .{ .name = "bold", .value = .{ .bool_value = true } },
@@ -7949,7 +8424,7 @@ test "hydrate at heads does not see the writes the heads exclude" {
     // at `first` *is* the document as it was, so hydrating it unscoped and
     // hydrating `doc` at `first` must be the same tree — and a scoped walk
     // that leaked the present's rows produces a different one.
-    var fork = try doc.forkAt(gpa, first, .auto);
+    var fork = try doc.forkAt(gpa, first);
     defer fork.deinit();
     var forked = try hydrate(&fork, .root, null, gpa);
     defer forked.deinit();
@@ -7971,8 +8446,10 @@ test "hydrate at heads does not see the writes the heads exclude" {
             (m.get("late") orelse return error.TestUnexpectedResult).str,
         );
         const t = try mirrorText(m.get("text") orelse return error.TestUnexpectedResult);
-        try testing.expectEqual(txt, t.id);
-        try testing.expectEqualStrings("aaaQQQbbbccc", t.asStr());
+        try testing.expect(txt.eql(t.id));
+        const mirrored_text = try t.makeString(gpa);
+        defer gpa.free(mirrored_text);
+        try testing.expectEqualStrings("aaaQQQbbbccc", mirrored_text);
         try testing.expectEqual(@as(usize, 12), t.count());
         try expectMarkSetNames(&t.marks, &.{
             .{ .name = "bold", .value = .{ .bool_value = true } },
@@ -7980,8 +8457,8 @@ test "hydrate at heads does not see the writes the heads exclude" {
         });
     }
 
-    // **The readers under the same heads say the same thing**, which is the
-    // property all the other readers on this file were pinned for.
+    // Ordinary readers follow isolation and reproduce the historical marks.
+    // Hydration without heads is the exception: it still reads the raw present.
     try doc.isolate(gpa, first);
     {
         const runs = try marks(&doc, txt, gpa);
@@ -7989,18 +8466,16 @@ test "hydrate at heads does not see the writes the heads exclude" {
         try expectMarkRuns(runs, &.{
             .{ .start = 0, .end = 3, .name = "bold", .value = .{ .bool_value = true } },
         }, enc);
-        // **And the isolation's own answer is the mirror's.** `readScope`
-        // hands [`hydrate`] the isolation's clock for a `null` `heads`, so a
-        // mirror built under this isolation equals the one built at `first`
-        // over an un-isolated document.
+        // Hydration without heads is Rust's raw-view exception, even isolated.
         var scoped = try hydrate(&doc, .root, null, gpa);
         defer scoped.deinit();
-        try testing.expect(scoped.eql(&at_first));
+        try testing.expect(scoped.eql(&at_present));
+        try testing.expect(!scoped.eql(&at_first));
     }
 
-    // **`integrate` drops the isolation**, so the present answers again and
-    // the two mirrors differ — which is what holds the line above down rather
-    // than leaving it resting on a single comparison.
+    // `integrate` restores ordinary readers to the present. Hydration without
+    // heads was already reading the raw present while isolated, so its mirror
+    // stays equal to `at_present` and different from the historical mirror.
     try doc.integrate();
     var after = try hydrate(&doc, .root, null, gpa);
     defer after.deinit();
@@ -8020,24 +8495,28 @@ test "hydrate reads a list and a text object as themselves" {
     // mutating this method's `.text` arm to build an empty text left all three
     // of them green. This test closes it.
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = "aaaaaaaa" });
 
-    const list = try trans.putObject(&doc, .root, .{ .key = "list" }, .list);
-    const txt = try trans.putObject(&doc, .root, .{ .key = "text" }, .text);
-    _ = try trans.insert(&doc, list, 0, .{ .str = "alpha" });
-    _ = try trans.insert(&doc, list, 1, .{ .counter = .{ .current = 4 } });
-    try trans.spliceText(&doc, txt, 0, 0, "hello world");
-    try trans.mark(&doc, txt, 0, 5, "bold", .both, .{ .bool_value = true });
+    var tx = try trans.Transaction.open(gpa, &doc);
+    defer tx.deinit() catch @panic("transaction cleanup failed");
+    const list = try tx.putObject(.root, .{ .key = "list" }, .list);
+    const txt = try tx.putObject(.root, .{ .key = "text" }, .text);
+    _ = try tx.insert(list, 0, .{ .str = "alpha" });
+    _ = try tx.insert(list, 1, .{ .counter = .{ .current = 4 } });
+    try tx.spliceText(txt, 0, 0, "hello world");
+    try tx.mark(txt, 0, 5, "bold", .both, .{ .bool_value = true });
+    var result = try tx.commit();
+    defer result.deinit(gpa);
 
     // **The list arm**, compared element by element against the reader and then
     // against literals — the same two cross-checks the root gets.
+    var list_mirror = try hydrate(&doc, list, null, gpa);
+    defer list_mirror.deinit();
     {
-        var list_mirror = try hydrate(&doc, list, null, gpa);
-        defer list_mirror.deinit();
         const l = try mirrorList(&list_mirror);
-        try testing.expectEqual(list, l.id);
+        try testing.expect(list.eql(l.id));
         try expectMirroredList(gpa, &doc, list, l);
         try testing.expectEqual(@as(usize, 2), l.count());
         try testing.expect((l.get(0) orelse return error.TestUnexpectedResult).eql(
@@ -8052,13 +8531,15 @@ test "hydrate reads a list and a text object as themselves" {
     // shape-valid wrong answer this is here for, so the characters are
     // asserted twice and the marks are asserted by hand — `Text.eql` would not
     // see them.
+    var text_mirror = try hydrate(&doc, txt, null, gpa);
+    defer text_mirror.deinit();
     {
-        var text_mirror = try hydrate(&doc, txt, null, gpa);
-        defer text_mirror.deinit();
         const t = try mirrorText(&text_mirror);
-        try testing.expectEqual(txt, t.id);
+        try testing.expect(txt.eql(t.id));
         try expectMirroredText(gpa, &doc, txt, t);
-        try testing.expectEqualStrings("hello world", t.asStr());
+        const mirrored_text = try t.makeString(gpa);
+        defer gpa.free(mirrored_text);
+        try testing.expectEqualStrings("hello world", mirrored_text);
         try testing.expectEqual(@as(usize, 11), t.count());
         try expectMarkSetNames(&t.marks, &.{
             .{ .name = "bold", .value = .{ .bool_value = true } },
@@ -8070,8 +8551,26 @@ test "hydrate reads a list and a text object as themselves" {
     // at all would pass every assertion above.
     const heads = try doc.getHeads(gpa);
     defer gpa.free(heads);
-    _ = try trans.insert(&doc, list, 2, .{ .str = "later" });
-    try trans.spliceText(&doc, txt, 0, 0, "ZZ");
+    var later_tx = try trans.Transaction.open(gpa, &doc);
+    defer later_tx.deinit() catch @panic("transaction cleanup failed");
+    _ = try later_tx.insert(list, 2, .{ .str = "later" });
+    try later_tx.spliceText(txt, 0, 0, "ZZ");
+    var later_commit = try later_tx.commit();
+    defer later_commit.deinit(gpa);
+    // The earlier owned mirrors keep their contents after the source changes.
+    const held_list = try mirrorList(&list_mirror);
+    try testing.expect(list.eql(held_list.id));
+    try testing.expectEqual(@as(usize, 2), held_list.count());
+    try testing.expectEqualStrings("alpha", held_list.get(0).?.str);
+    try testing.expectEqual(@as(i64, 4), held_list.get(1).?.counter.current);
+    const held_text = try mirrorText(&text_mirror);
+    try testing.expect(txt.eql(held_text.id));
+    const held_string = try held_text.makeString(gpa);
+    defer gpa.free(held_string);
+    try testing.expectEqualStrings("hello world", held_string);
+    try expectMarkSetNames(&held_text.marks, &.{
+        .{ .name = "bold", .value = .{ .bool_value = true } },
+    });
     {
         var list_at = try hydrate(&doc, list, heads, gpa);
         defer list_at.deinit();
@@ -8081,7 +8580,9 @@ test "hydrate reads a list and a text object as themselves" {
         var text_at = try hydrate(&doc, txt, heads, gpa);
         defer text_at.deinit();
         const t = try mirrorText(&text_at);
-        try testing.expectEqualStrings("hello world", t.asStr());
+        const mirrored_text = try t.makeString(gpa);
+        defer gpa.free(mirrored_text);
+        try testing.expectEqualStrings("hello world", mirrored_text);
         try expectMarkSetNames(&t.marks, &.{
             .{ .name = "bold", .value = .{ .bool_value = true } },
         });
@@ -8090,7 +8591,9 @@ test "hydrate reads a list and a text object as themselves" {
         var now = try hydrate(&doc, txt, null, gpa);
         defer now.deinit();
         try testing.expect(!now.eql(&text_at));
-        try testing.expectEqualStrings("ZZhello world", (try mirrorText(&now)).asStr());
+        const present_text = try (try mirrorText(&now)).makeString(gpa);
+        defer gpa.free(present_text);
+        try testing.expectEqualStrings("ZZhello world", present_text);
     }
     {
         // **The present's list has the element the clock excluded**, which is
@@ -8102,15 +8605,23 @@ test "hydrate reads a list and a text object as themselves" {
     }
 }
 
-test "hydrate at null heads is the document's own scope" {
+test "hydrate at null heads bypasses the document's isolation" {
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = "aaaaaaaa" });
-    _ = try trans.put(&doc, .root, .{ .key = "kept" }, .{ .str = "yes" });
+    var first_tx = try trans.Transaction.open(gpa, &doc);
+    defer first_tx.deinit() catch @panic("transaction cleanup failed");
+    _ = try first_tx.put(.root, .{ .key = "kept" }, .{ .str = "yes" });
+    var first_commit = try first_tx.commit();
+    defer first_commit.deinit(gpa);
     const heads = try doc.getHeads(gpa);
     defer gpa.free(heads);
-    _ = try trans.put(&doc, .root, .{ .key = "late" }, .{ .str = "no" });
+    var late_tx = try trans.Transaction.open(gpa, &doc);
+    defer late_tx.deinit() catch @panic("transaction cleanup failed");
+    _ = try late_tx.put(.root, .{ .key = "late" }, .{ .str = "no" });
+    var late_commit = try late_tx.commit();
+    defer late_commit.deinit(gpa);
 
     // **Upstream's answer and the port's are the same here** — this document
     // has no isolation, so [`readScope`] reports no clock and a `null` `heads`
@@ -8121,12 +8632,8 @@ test "hydrate at null heads is the document's own scope" {
     defer plain.deinit();
     try testing.expectEqual(@as(usize, 2), (try mirrorMap(&plain)).count());
 
-    // **Under an isolation the two differ, and the port answers the
-    // isolation.** `hydrate_obj` (`automerge.rs:1644`) is what upstream calls,
-    // and it does not consult the document's isolation at all — see [`hydrate`]'s
-    // doc. **The claim being pinned is that the mirror does not report a write
-    // the rest of this file's readers refuse to report**: `keys` under the same
-    // isolation reports one key, and so does the mirror.
+    // Ordinary readers use isolation; hydrate(null) still exposes raw rows
+    // (`automerge.rs:2228`, `autocommit.rs:1011`, `transaction.rs:228`).
     try doc.isolate(gpa, heads);
     {
         var walk = try keys(&doc, .root);
@@ -8137,9 +8644,9 @@ test "hydrate at null heads is the document's own scope" {
     }
     var isolated = try hydrate(&doc, .root, null, gpa);
     defer isolated.deinit();
-    try testing.expectEqual(@as(usize, 1), (try mirrorMap(&isolated)).count());
-    try testing.expect((try mirrorMap(&isolated)).get("late") == null);
-    try testing.expect(!isolated.eql(&plain));
+    try testing.expectEqual(@as(usize, 2), (try mirrorMap(&isolated)).count());
+    try testing.expect((try mirrorMap(&isolated)).get("late") != null);
+    try testing.expect(isolated.eql(&plain));
 }
 
 // Zig 0.16.0 / upstream / Rust / port
@@ -8262,20 +8769,8 @@ test "hydrate at null heads is the document's own scope" {
 //   type. `pub const KeyBound = opsetmod.KeyBound;` is the same type under the
 //   name this file's API has always used.
 //
-// * **`hydrate` is the composition it claims to be, and `null` heads is the
-//   one place it is not a straight port.** The recursion is
-//   [`hydmod.hydrateMap`] / `hydrateList` / `hydrateText` over `OpSet.topOps`
-//   (`hydrate.rs:244-302`) and this file adds the entry point, the type
-//   dispatch (`automerge.rs:1645-1649`) and the clock. **The clock is the
-//   departure**: upstream's `heads.and_then(|h| self.clock_at(h))`
-//   (`automerge.rs:2228`) makes `None` mean *no clock*, and both of upstream's
-//   other `ReadDoc` implementors forward `heads` to `hydrate_obj` without
-//   `get_scope(..)` (`autocommit.rs:1011`, `transaction.rs:228`) where every
-//   sibling does — so upstream's `hydrate` reads the present under an
-//   isolation. The port's `null` is [`readScope`], the isolation's clock, which
-//   is the same null on every un-isolated document. Upstream pins nothing
-//   either way, and `test "hydrate at null heads is the document's own scope"`
-//   is what holds the difference down.
+// * Hydration with null heads bypasses isolation, matching all Rust ReadDoc
+//   implementors (`automerge.rs:2228`, `autocommit.rs:1011`, `transaction.rs:228`).
 //
 // * **The mirror tests assert contents against the readers and then against
 //   literals, because the two cross-checks fail differently.** Every key,
@@ -8383,11 +8878,12 @@ const Fix = struct {
 ///    actor through the merge renumbers `aaaaaaaa` to 1 and leaves those ids
 ///    carrying a stale index. Only [`Document.resolve`] repairs them.
 fn fix(gpa: Allocator) !Fix {
-    var doc = try Document.init(gpa, std.testing.io, .manual);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = "aaaaaaaa" });
 
     var tx = try trans.Transaction.open(gpa, &doc);
+    defer tx.deinit() catch @panic("transaction cleanup failed");
     const txt = try tx.putObject(.root, .{ .key = "text" }, .text);
     try tx.spliceText(txt, 0, 0, "abc");
     const lst = try tx.putObject(.root, .{ .key = "list" }, .list);
@@ -8395,30 +8891,32 @@ fn fix(gpa: Allocator) !Fix {
     const sub = try tx.putObject(.root, .{ .key = "sub" }, .map);
     _ = try tx.put(sub, .{ .key = "inner" }, .{ .str = "in1" });
     _ = try tx.put(.root, .{ .key = "k" }, .{ .str = "v1" });
-    _ = try tx.commit(null, null);
-    tx.deinit();
+    var first_commit = try tx.commit();
+    defer first_commit.deinit(gpa);
     const heads1 = try doc.getHeads(gpa);
     errdefer gpa.free(heads1);
 
     var tx2 = try trans.Transaction.open(gpa, &doc);
+    defer tx2.deinit() catch @panic("transaction cleanup failed");
     _ = try tx2.put(.root, .{ .key = "k" }, .{ .str = "v2" });
     _ = try tx2.delete(lst, .{ .index = 0 });
     try tx2.spliceText(txt, 0, 0, "Z");
     try tx2.mark(txt, 0, 3, "bold", .both, .{ .bool_value = true });
     const late = try tx2.putObject(.root, .{ .key = "late" }, .map);
-    _ = try tx2.commit(null, null);
-    tx2.deinit();
+    var second_commit = try tx2.commit();
+    defer second_commit.deinit(gpa);
     const heads2 = try doc.getHeads(gpa);
     errdefer gpa.free(heads2);
 
-    var fork = try doc.fork(gpa, .manual);
+    var fork = try doc.fork(gpa);
     defer fork.deinit();
     fork.setActorId(.{ .bytes = "00000000" });
     {
         var ftx = try trans.Transaction.open(gpa, &fork);
+        defer ftx.deinit() catch @panic("transaction cleanup failed");
         _ = try ftx.put(.root, .{ .key = "forked" }, .{ .int = 1 });
-        _ = try ftx.commit(null, null);
-        ftx.deinit();
+        var fork_commit = try ftx.commit();
+        defer fork_commit.deinit(gpa);
     }
     const now = try doc.merge(gpa, &fork);
     defer gpa.free(now);
@@ -8448,7 +8946,10 @@ fn keysWant(gpa: Allocator, walk: *Keys, want: []const u8) !usize {
         for (held.items) |s| gpa.free(s);
         held.deinit(gpa);
     }
-    while (try walk.next()) |k| try held.append(gpa, try gpa.dupe(u8, k));
+    while (try walk.next()) |k| {
+        try held.ensureUnusedCapacity(gpa, 1);
+        held.appendAssumeCapacity(try gpa.dupe(u8, k));
+    }
     var seen = false;
     for (held.items) |k| {
         if (std.mem.eql(u8, k, want)) seen = true;
@@ -9166,7 +9667,8 @@ test "iter reads every object in causal order, parents before children" {
         var found = false;
         for (items) |got| {
             if (found) break;
-            found = want.obj.eql(got.obj) and sameWalkKey(want.key, got.key) and
+            const expected_obj = if (want.obj == .root) ExId.root else doc.idToExid(want.obj.opId().?);
+            found = expected_obj.eql(got.obj) and sameWalkKey(want.key, got.key) and
                 std.mem.eql(u8, want.value, got.value);
         }
         try testing.expect(found);
@@ -9193,7 +9695,8 @@ test "iter reads every object in causal order, parents before children" {
     for (items, 0..) |item, i| {
         if (i != 0 and items[i - 1].obj.eql(item.obj)) continue;
         try testing.expect(run < runs.len);
-        try testing.expect(runs[run].eql(item.obj));
+        const expected_obj = if (runs[run] == .root) ExId.root else doc.idToExid(runs[run].opId().?);
+        try testing.expect(expected_obj.eql(item.obj));
         run += 1;
     }
     try testing.expectEqual(runs.len, run);
@@ -9236,7 +9739,7 @@ test "iterAt reads the subtree under the object it was given, and nothing else" 
     const items = try walkTo(gpa, &doc, walk_list, null);
     defer freeWalk(gpa, items);
     try testing.expectEqual(@as(usize, 2), items.len);
-    for (items) |item| try testing.expect(item.obj.eql(walk_list));
+    for (items) |item| try testing.expect(item.obj.eql(doc.idToExid(walk_list.opId().?)));
     try testing.expectEqualStrings("x", items[0].value);
     try testing.expectEqualStrings("y", items[1].value);
     try testing.expect(items[0].key == null);
@@ -9313,3 +9816,202 @@ test "iterAt at heads the present has moved past reports the state then" {
 // | `hydrate(doc, obj, heads, gpa)` | `Automerge::hydrate_obj` (`automerge.rs:1638-1650`) | `let clock = heads.and_then(\|h\| self.clock_at(h));` (`:1644`, and `:2228` for `ReadDoc::hydrate`) | `heads: ?[]const ChangeHash` | **builds** the clock through `ChangeGraph.clockAt` where upstream **shortcuts** through `Automerge::clock_at`, which answers no clock for the present's own heads (`:1236-1247`); **the answers agree** — a full clock over the present is the present — **and the work does not** |
 // | `markSetAtIndex(doc, obj, index, heads, gpa)` | `Automerge::get_marks` / `AutoCommit::get_scope` (`automerge.rs:2236-2244`, `autocommit.rs:794-805`) | `heads.and_then(\|h\| self.clock_at(h))` (`:2242`), and `clock_at` from `get_scope`'s first arm when no transaction is in flight (`autocommit.rs:800-804`) | the same `heads: ?[]const ChangeHash` | **as** `hydrate`: the `Some` arm keeps a full clock upstream does not build, so it takes `markSetAtScope`'s walk where upstream takes `get_marks_fast` (`:1937-1938`); **the answer is the same** and the test `markSetAtIndex answers the set at one index, and the heads decide which path reads it` reads both arms |
 // | `Document.clockAtScope(gpa, heads)` | `Automerge::clock_at` (`automerge.rs:1236-1247`) | `pub(crate) fn clock_at(&self, heads: &[ChangeHash]) -> Option<Clock>` | `pub fn clockAtScope(self: *Document, gpa: Allocator, heads: []const ChangeHash) Error!?*const clockmod.Clock` | **is** upstream's resolution for every `*_at`, heads-are-current shortcut included; **borrows** where upstream moves, and the document caches the one clock and frees the previous pair |
+
+fn generalizedReaderSmoke(
+    reader: anytype,
+    text_obj: ExId,
+    list_obj: ExId,
+    heads: []const ChangeHash,
+    present_version: i64,
+) !void {
+    const gpa = testing.allocator;
+    try testing.expectEqual(ObjType.text, try objectType(reader, text_obj));
+    try testing.expectEqual(TextEncoding.unicode_code_point, textEncoding(reader));
+    try testing.expectEqual(@as(u64, 2), stats(reader).num_changes);
+    const adapter_gpa = ReadDoc(@TypeOf(reader)).allocator(reader);
+    try testing.expectEqual(gpa.ptr, adapter_gpa.ptr);
+
+    // Both branches call the public free functions, not a test-only reader.
+    inline for (.{ false, true }) |historical| {
+        const selected_heads: ?[]const ChangeHash = if (historical) heads else null;
+        const version: i64 = if (historical) 1 else present_version;
+        const found = (try if (historical)
+            getAt(reader, .root, .{ .key = "version" }, heads)
+        else
+            get(reader, .root, .{ .key = "version" })).?;
+        try testing.expectEqual(version, found.value.scalar.int);
+        const all = try if (historical)
+            getAllAt(reader, .root, .{ .key = "version" }, heads, gpa)
+        else
+            getAll(reader, .root, .{ .key = "version" }, gpa);
+        defer gpa.free(all);
+        try testing.expectEqual(@as(usize, 1), all.len);
+        try testing.expectEqual(version, all[0].value.scalar.int);
+
+        var key_walk = try if (historical) keysAt(reader, .root, heads) else keys(reader, .root);
+        defer key_walk.deinit(gpa);
+        try testing.expectEqualStrings("list", (try key_walk.next()).?);
+        var term: ValueTerm = undefined;
+        var value_walk = try if (historical) valuesAt(reader, list_obj, heads, &term) else values(reader, list_obj, &term);
+        defer term.deinit(gpa);
+        try testing.expectEqualStrings("item", (try value_walk.next()).?.value.scalar.str);
+        try testing.expect((try value_walk.next()) == null);
+        const size = try if (historical) lengthAt(reader, text_obj, heads) else length(reader, text_obj);
+        try testing.expectEqual(@as(usize, 3), size);
+        const rendered = try if (historical) textAt(reader, text_obj, heads, gpa) else text(reader, text_obj, gpa);
+        defer gpa.free(rendered);
+        try testing.expectEqualStrings("abc", rendered);
+        var span_walk = try if (historical) spansAt(reader, text_obj, heads, gpa) else spans(reader, text_obj, gpa);
+        defer span_walk.deinit();
+        var span = (try span_walk.next()).?;
+        defer span.deinit(gpa);
+        try testing.expectEqualStrings("abc", span.asStr());
+        try testing.expectEqual(@as(usize, 1), span.text.marks.?.len());
+        try testing.expect((try span_walk.next()) == null);
+        const runs = try if (historical) marksAt(reader, text_obj, heads, gpa) else marks(reader, text_obj, gpa);
+        defer gpa.free(runs);
+        try testing.expectEqual(@as(usize, 1), runs.len);
+        try testing.expectEqualStrings("bold", runs[0].name);
+        var mark_set = try markSetAtIndex(reader, text_obj, 1, selected_heads, gpa);
+        defer mark_set.deinit();
+        try testing.expectEqual(@as(usize, 1), mark_set.len());
+
+        var parent_walk = try if (historical) parentsAt(reader, text_obj, heads) else parents(reader, text_obj);
+        try testing.expectEqualStrings("text", (try parent_walk.next()).?.prop.key);
+        try testing.expect((try parent_walk.next()) == null);
+        var map_walk = try if (historical)
+            mapRangeAt(reader, .root, .between("version", null), heads)
+        else
+            mapRange(reader, .root, .between("version", null));
+        try testing.expectEqual(version, (try map_walk.next()).?.value.scalar.int);
+        try testing.expect((try map_walk.next()) == null);
+        var list_walk = try if (historical) listRangeAt(reader, list_obj, .all(), heads) else listRange(reader, list_obj, .all());
+        try testing.expectEqualStrings("item", (try list_walk.next()).?.value.scalar.str);
+        try testing.expect((try list_walk.next()) == null);
+        var recursive = try if (historical) iterAt(reader, list_obj, heads, gpa) else iter(reader, gpa);
+        defer recursive.deinit();
+        var first_item = (try recursive.next()).?;
+        defer first_item.deinit(gpa);
+        if (historical) {
+            try testing.expectEqualStrings("item", first_item.value().scalar.str);
+        } else {
+            try testing.expectEqualStrings("list", first_item.key().?);
+        }
+        const cursor = try getCursor(reader, list_obj, .{ .index = 0 }, selected_heads, gpa);
+        try testing.expectEqual(@as(usize, 0), try getCursorPosition(reader, list_obj, cursor, selected_heads));
+        const moving = try getCursorMoving(reader, text_obj, .{ .index = 1 }, selected_heads, .before, gpa);
+        try testing.expectEqual(@as(usize, 1), try getCursorPosition(reader, text_obj, moving, selected_heads));
+    }
+    const window = try getMarks(reader, text_obj, 0, 3, gpa);
+    defer gpa.free(window);
+    try testing.expectEqual(@as(usize, 1), window.len);
+    try testing.expectEqualStrings("bold", window[0].name);
+    var historical_mirror = try hydrate(reader, .root, heads, gpa);
+    defer historical_mirror.deinit();
+    try testing.expectEqual(@as(i64, 1), historical_mirror.object.map.get("version").?.int);
+    const missing_hashes = try getMissingDeps(reader, heads, gpa);
+    defer gpa.free(missing_hashes);
+    try testing.expectEqual(@as(usize, 0), missing_hashes.len);
+    var change = (try getChangeByHash(reader, heads[0], gpa)).?;
+    defer change.deinit(gpa);
+    try testing.expect(heads[0].eql(change.change.hash));
+}
+
+test "generalized free readers preserve raw held scoped and const receiver behavior" {
+    // Real consumers instantiate every adapter reader against all three owners.
+    // Scope and hydrate differ deliberately (transaction.rs:228; autocommit.rs:1011).
+    const AutoCommit = @import("autocommit.zig").AutoCommit;
+    const gpa = testing.allocator;
+    var owner = try AutoCommit.initWithEncoding(gpa, testing.io, .unicode_code_point);
+    defer owner.deinit();
+    const const_owner: *const AutoCommit = &owner;
+    try testing.expect((try get(const_owner, .root, .{ .key = "version" })) == null);
+    try testing.expect(owner.transaction == null);
+    _ = try owner.put(.root, .{ .key = "version" }, .{ .int = 1 });
+    const text_obj = try owner.putObject(.root, .{ .key = "text" }, .text);
+    try owner.spliceText(text_obj, 0, 0, "abc");
+    try owner.mark(text_obj, 0, 3, "bold", .both, .{ .bool_value = true });
+    const list_obj = try owner.putObject(.root, .{ .key = "list" }, .list);
+    _ = try owner.insert(list_obj, 0, .{ .str = "item" });
+    const first = (try owner.commit()).?;
+    const heads = [_]ChangeHash{first};
+    _ = try owner.put(.root, .{ .key = "version" }, .{ .int = 2 });
+    const second = (try owner.commit()).?;
+    try testing.expect(owner.transaction == null);
+
+    try generalizedReaderSmoke(&owner.doc, text_obj, list_obj, &heads, 2);
+    const const_doc: *const Document = &owner.doc;
+    try generalizedReaderSmoke(const_doc, text_obj, list_obj, &heads, 2);
+    try generalizedReaderSmoke(&owner, text_obj, list_obj, &heads, 2);
+    try generalizedReaderSmoke(const_owner, text_obj, list_obj, &heads, 2);
+    try testing.expect(owner.transaction == null);
+    {
+        var tx = try trans.Transaction.openAt(gpa, &owner.doc, &heads);
+        defer tx.deinit() catch @panic("transaction cleanup failed");
+        try generalizedReaderSmoke(&tx, text_obj, list_obj, &heads, 1);
+        const const_tx: *const trans.Transaction = &tx;
+        try generalizedReaderSmoke(const_tx, text_obj, list_obj, &heads, 1);
+        // Explicit newer heads override the transaction's historical scope.
+        try testing.expectEqual(@as(i64, 2), (try getAt(const_tx, .root, .{ .key = "version" }, &.{second})).?.value.scalar.int);
+        var raw_mirror = try hydrate(const_tx, .root, null, gpa);
+        defer raw_mirror.deinit();
+        try testing.expectEqual(@as(i64, 2), raw_mirror.object.map.get("version").?.int);
+        _ = try tx.put(.root, .{ .key = "pending" }, .{ .int = 9 });
+        try testing.expectEqual(@as(i64, 9), (try get(const_tx, .root, .{ .key = "pending" })).?.value.scalar.int);
+        try testing.expect((try getAt(const_tx, .root, .{ .key = "pending" }, &heads)) == null);
+        try testing.expectEqual(@as(usize, 1), tx.count());
+        try testing.expect(!tx.closed);
+        _ = try tx.rollback();
+    }
+
+    _ = try owner.put(.root, .{ .key = "version" }, .{ .int = 3 });
+    try generalizedReaderSmoke(&owner, text_obj, list_obj, &heads, 3);
+    try generalizedReaderSmoke(const_owner, text_obj, list_obj, &heads, 3);
+    try testing.expectEqual(@as(usize, 1), owner.pendingOps());
+    try testing.expect(owner.transaction != null);
+    try testing.expectEqual(@as(u64, 2), stats(const_owner).num_changes);
+    // Trait graph reads bypass the identically named AutoCommit closing barriers.
+    const unknown: ChangeHash = .{ .bytes = [_]u8{0xab} ** 32 };
+    const missing_hashes = try getMissingDeps(const_owner, &.{unknown}, gpa);
+    defer gpa.free(missing_hashes);
+    try testing.expectEqual(@as(usize, 1), missing_hashes.len);
+    try testing.expect(unknown.eql(missing_hashes[0]));
+    try testing.expect((try getChangeByHash(const_owner, unknown, gpa)) == null);
+    try testing.expectEqual(@as(usize, 1), owner.pendingOps());
+    try testing.expectEqual(@as(u64, 2), stats(const_owner).num_changes);
+    try owner.isolate(gpa, &heads);
+    // Isolation closes pending work; null hydrate still reads the full raw state.
+    try testing.expectEqual(@as(i64, 1), (try get(const_owner, .root, .{ .key = "version" })).?.value.scalar.int);
+    var raw_mirror = try hydrate(const_owner, .root, null, gpa);
+    defer raw_mirror.deinit();
+    try testing.expectEqual(@as(i64, 3), raw_mirror.object.map.get("version").?.int);
+}
+
+test "wide public object IDs yield empty read walks without aliasing the root" {
+    const AutoCommit = @import("autocommit.zig").AutoCommit;
+    const gpa = testing.allocator;
+    var owner = try AutoCommit.init(gpa, testing.io);
+    defer owner.deinit();
+    const resident = try owner.putObject(.root, .{ .key = "child" }, .map);
+    _ = try owner.put(resident, .{ .key = "value" }, .{ .int = 1 });
+    var wide_id = owner.doc.idToExid(resident.opId().?);
+    wide_id.named.op.counter = @as(u64, std.math.maxInt(u32)) + 1;
+    inline for (.{ &owner.doc, &owner.transaction.? }) |reader| {
+        try testing.expectEqual(@as(usize, 0), try length(reader, wide_id));
+        var key_walk = try keys(reader, wide_id);
+        defer key_walk.deinit(gpa);
+        try testing.expect((try key_walk.next()) == null);
+        var term: ValueTerm = undefined;
+        var value_walk = try values(reader, wide_id, &term);
+        defer term.deinit(gpa);
+        try testing.expect((try value_walk.next()) == null);
+        var map_walk = try mapRange(reader, wide_id, .{});
+        try testing.expect((try map_walk.next()) == null);
+        var list_walk = try listRange(reader, wide_id, .{});
+        try testing.expect((try list_walk.next()) == null);
+        var tree_walk = try iterAt(reader, wide_id, null, gpa);
+        defer tree_walk.deinit();
+        try testing.expect((try tree_walk.next()) == null);
+    }
+    try testing.expectError(error.NotAnObject, owner.transaction.?.put(wide_id, .{ .key = "bad" }, .{ .int = 2 }));
+}

@@ -117,12 +117,12 @@ pub fn main(init: std.process.Init) !u8 {
 
     // ── the fixture ──
     //
-    // A `.manual` document, one transaction and one commit per change, so the
+    // A raw document, one transaction and one commit per change, so the
     // change count is exactly `changes` (plus the one that makes the list).
     // **Committed changes and not one transaction**: the arena under test is
     // reset once per *change*, so a fixture that packed every operation into
     // one change would never enter the loop this program is measuring.
-    var src = try Document.init(gpa, init.io, .manual);
+    var src = try Document.init(gpa, init.io);
     defer src.deinit();
     src.setActorId(.{ .bytes = source_actor });
 
@@ -130,24 +130,23 @@ pub fn main(init: std.process.Init) !u8 {
     var val_buf: [32]u8 = undefined;
 
     {
-        var setup = try am.manual_transaction.Transaction.open(gpa, &src);
-        defer setup.deinit();
+        var setup = try am.Transaction.open(gpa, &src);
+        defer setup.deinitClosed(); // The entire source document dies on error.
         _ = try setup.putObject(am.root, .{ .key = "items" }, .list);
-        _ = try am.manual_transaction.commitWith(
-            &setup,
-            am.manual_transaction.CommitOptions.none,
-        );
+        var result = try setup.commitWith(.none);
+        defer result.deinit(gpa);
     }
 
     for (0..changes) |c| {
-        var tx = try am.manual_transaction.Transaction.open(gpa, &src);
-        defer tx.deinit();
+        var tx = try am.Transaction.open(gpa, &src);
+        defer tx.deinitClosed(); // The entire source document dies on error.
         for (0..ops_per_change) |k| {
             const key = try std.fmt.bufPrint(&key_buf, "k{d}-{d}", .{ c, k });
             const value = try std.fmt.bufPrint(&val_buf, "v{d}-{d}", .{ c, k });
             _ = try tx.put(am.root, .{ .key = key }, .{ .str = value });
         }
-        _ = try am.manual_transaction.commitWith(&tx, am.manual_transaction.CommitOptions.none);
+        var result = try tx.commitWith(.none);
+        defer result.deinit(gpa);
     }
 
     const registers = changes * ops_per_change;

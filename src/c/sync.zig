@@ -865,3 +865,33 @@ test "a null out-parameter is an error result, and a null handle writes false" {
 //   `actor_id.rs:19`) and this port keeps both ([doc.zig](doc.zig),
 //   `AMcursor.bytes` / `fmt_str`, `AMactorId.hex`); `AMsyncMessage` does not, so
 //   there is nothing to cache and the handle is two fields wide.
+
+test "API parity C sync generation publishes the same pending native owner" {
+    const created = docmod.AMcreate(null) orelse return error.Unexpected;
+    defer dropResult(created);
+    const doc_item = docmod.abi.AMresultItem(created) orelse return error.Unexpected;
+    var document: ?*docmod.AMdoc = null;
+    try testing.expect(docmod.AMitemToDoc(doc_item, &document));
+    const inserted = docmod.AMmapPutInt(document, null, AMbyteSpan.of("pending"), 7) orelse
+        return error.Unexpected;
+    defer dropResult(inserted);
+    try testing.expectEqual(docmod.AMstatus.ok, AMresult.status(inserted));
+    try testing.expectEqual(@as(usize, 1), docmod.AMpendingOps(document));
+    const initialized = AMsyncStateInit() orelse return error.Unexpected;
+    defer dropResult(initialized);
+    const state_item = docmod.abi.AMresultItem(initialized) orelse return error.Unexpected;
+    var state: ?*AMsyncState = null;
+    try testing.expect(docmod.AMitemToSyncState(state_item, &state));
+    const generated = docmod.AMgenerateSyncMessage(document, state) orelse return error.Unexpected;
+    defer dropResult(generated);
+    try testing.expectEqual(docmod.AMstatus.ok, AMresult.status(generated));
+    try testing.expectEqual(@as(usize, 0), docmod.AMpendingOps(document));
+    try testing.expectEqual(@as(usize, 0), docmod.AMrollback(document));
+    const loaded = docmod.AMmapGet(document, null, AMbyteSpan.of("pending"), null) orelse
+        return error.Unexpected;
+    defer dropResult(loaded);
+    const value_item = docmod.abi.AMresultItem(loaded) orelse return error.Unexpected;
+    var value: i64 = 0;
+    try testing.expect(docmod.AMitemToInt(value_item, &value));
+    try testing.expectEqual(@as(i64, 7), value);
+}

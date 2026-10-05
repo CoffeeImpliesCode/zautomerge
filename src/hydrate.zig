@@ -15,32 +15,9 @@
 //! | [`hydrateMap`], [`hydrateList`], [`hydrateText`], [`hydrateOp`] | `hydrate.rs`:244-302` |
 //! | the `hydrate_map!` / `hydrate_list!` / `hydrate_text!` macros | `hydrate.rs`:305-327` |
 //!
-//! # Refuse, do not invent
-//!
-//! **A patch whose path names an object the mirror does not have is a stream
-//! that cannot be applied**, and this file says so instead of making one up.
-//! Upstream cannot express that distinction: it walks the **properties** of
-//! `p.path` and throws the object ids away (`hydrate.rs`:84`,
-//! `p.path.iter().map(|(_, prop)| prop)`), so a patch about an object the
-//! mirror has never heard of arrives as a `get_mut` miss and comes back as
-//! `ApplyInvalidProp` (`hydrate.rs`:98`). That is one error for two different
-//! faults, and the second one is the interesting one: a stream whose first
-//! patch is `obj = 1@0, path = [root."list"]` applied to an empty mirror means
-//! the [`ExposeQueue`](patches.zig) failed to introduce the list, and a
-//! hydrate that quietly applied the action to the nearest match would hide it.
-//! Upstream's `_ => Err(HydrateError::Fail)` arm (`hydrate.rs`:111`) is the
-//! same refusal with no diagnosis attached; here the refusal is
-//! [`Failure.unknown_object`], and it carries **the whole path, the object the
-//! patch asked for, the object the mirror holds there, and the step it stopped
-//! at**.
-//!
-//! That check needs the mirror to know which object each of its values is, so
-//! [`Map`], [`List`] and [`Text`] carry an [`ExId`]. Upstream's equivalents
-//! compute exactly that id and drop it — `MapValue::new(value, _id, conflict)`
-//! (`hydrate/map.rs`:81`) and `List::push(value, _id, conflict)`
-//! (`hydrate/list.rs`:104`) — so keeping it is the one addition this file makes
-//! to the data model, and it is the whole of the addition: eight bytes per
-//! object, read on every path step, never compared by [`Value.eql`].
+//! Patches are portable by property path, as in upstream `hydrate.rs:84`.
+//! Object IDs are retained as detached metadata, not path-validation keys.
+//! A missing property or wrong object kind is a checked refusal.
 //!
 //! # What a mirror owns
 //!
@@ -209,9 +186,8 @@ pub const OpHydrateError = ApplyError || opiter.ReadOpError || InternalError || 
 /// refused, and its `InsertValues` tree and `MarkSet` still point into the
 /// arena. Nothing frees them — the batch's `deinit` is the one free.
 pub const Failure = union(enum) {
-    /// A patch named an object the mirror does not have, or named one it holds
-    /// under a different id, or put a patch on something that is not an object
-    /// at all.
+    /// The property path reached a scalar where an object was required.
+    /// Object identities are diagnostic metadata, not path-validation keys.
     ///
     /// Upstream reaches the same refusal through three different arms and
     /// reports none of them: the catch-all `Err(HydrateError::Fail)`
@@ -414,6 +390,7 @@ fn ownMark(
     name: []const u8,
     v: ScalarValue,
 ) ApplyError!void {
+    if (set.owns_payloads) return set.put(name, v);
     const kept_name = if (markNameHeld(set, name)) name else try owned.keep(name);
     var kept_value = v;
     try ownScalar(owned, &kept_value);
@@ -458,6 +435,11 @@ fn markNameHeld(set: *const MarkSet, name: []const u8) bool {
 /// it are its caller's until some [`Map.putOwned`] or [`List.push`] takes it —
 /// so it frees nothing and needs no allocator.
 ///
+/// For an independent standalone value, `init` and `dup` return `OwnedValue`.
+/// Read or mutate its `.value`, but release the wrapper with `deinit()` rather
+/// than separately releasing that payload. Scalar bytes then have an explicit
+/// owner too. Container `dup` methods instead return the native container owner.
+///
 /// **A by-value copy is a move, and not a second owner.** [`Value.applyOne`]
 /// takes a `*Value`, [`Map.putOwned`] and [`List.push`] take a `Value` by
 /// value, and the `object` arm holds a [`Map`], a [`List`] or a [`Text`] by
@@ -495,6 +477,53 @@ pub const Value = union(enum) {
     unknown: valmod.ScalarValue.UnknownValue,
     /// An object. See the module doc's "what a mirror owns".
     object: Object,
+
+    /// An independent owned copy. The caller releases the wrapper once.
+    /// Scalar bytes are copied; object trees retain no source storage.
+    pub fn dup(self: *const Value, gpa: Allocator) ApplyError!OwnedValue {
+        if (self.toScalar()) |scalar_value| {
+            const owner = try scalar_value.intoOwned(gpa);
+            return .{
+                .gpa = gpa,
+                .value = Value.fromScalar(owner.value),
+                .scalar_owner = owner,
+            };
+        }
+        return .{ .gpa = gpa, .value = try dupStructure(self, gpa) };
+    }
+
+    /// Constructs an owned materialized value from a borrowed public value.
+    /// Object values become empty containers; scalar payloads are copied.
+    pub fn init(gpa: Allocator, input: valmod.Value, enc: TextEncoding) ApplyError!OwnedValue {
+        const initial = try Value.fromPatch(gpa, switch (input) {
+            .object => |kind| .{ .object = kind },
+            .scalar => |scalar_value| .{ .scalar = scalar_value },
+        }, .root, enc);
+        if (initial == .object) return .{ .gpa = gpa, .value = initial };
+        return initial.dup(gpa);
+    }
+
+    /// The map payload, borrowed from this value, or null for another kind.
+    pub fn asMap(self: *Value) ?*Map {
+        return switch (self.*) {
+            .object => |*object_value| switch (object_value.*) {
+                .map => |*map_value| map_value,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    /// The list payload, borrowed from this value, or null for another kind.
+    pub fn asList(self: *Value) ?*List {
+        return switch (self.*) {
+            .object => |*object_value| switch (object_value.*) {
+                .list => |*list_value| list_value,
+                else => null,
+            },
+            else => null,
+        };
+    }
 
     /// An empty map ([`Value::map`](hydrate.rs):40-42`).
     pub fn map(gpa: Allocator) Value {
@@ -536,7 +565,7 @@ pub const Value = union(enum) {
         id: ExId,
         enc: TextEncoding,
     ) ApplyError!Value {
-        return switch (v) {
+        var out: Value = switch (v) {
             .scalar => |s| fromScalar(s),
             .object => |t| .{
                 .object = switch (t) {
@@ -554,6 +583,22 @@ pub const Value = union(enum) {
                 },
             },
         };
+        errdefer out.deinit();
+        if (out == .object) switch (out.object) {
+            .map => |*map_value| {
+                map_value.id = try id.dup(gpa);
+                map_value.owned_id = true;
+            },
+            .list => |*list_value| {
+                list_value.id = try id.dup(gpa);
+                list_value.owned_id = true;
+            },
+            .text => |*text_value| {
+                text_value.id = try id.dup(gpa);
+                text_value.owned_id = true;
+            },
+        };
+        return out;
     }
 
     /// The eleven [`ScalarValue`] cases, one for one
@@ -634,15 +679,15 @@ pub const Value = union(enum) {
     pub fn asI64(self: Value) i64 {
         return switch (self) {
             .int => |i| i,
-            .uint => |u| std.math.cast(i64, u) orelse 0,
+            .uint => |u| @bitCast(u),
             .counter => |c| c.current,
             .timestamp => |t| t,
             else => 0,
         };
     }
 
-    /// The object this value is, or null for a scalar. See the module doc's
-    /// "refuse, do not invent" for why the mirror keeps the id at all.
+    /// The object's diagnostic identity, or null for a scalar.
+    /// Patch application resolves properties independently of this metadata.
     pub fn objId(self: *const Value) ?ExId {
         const o = switch (self.*) {
             .object => |*o| o,
@@ -733,10 +778,8 @@ pub const Value = union(enum) {
 
     /// Applies `stream` in order ([`Value::apply_patches`](hydrate.rs):78-87`).
     ///
-    /// The order is the contract, and it is `patches.zig`'s to keep: a patch
-    /// whose path names an object the mirror has not been told about is a
-    /// refusal ([`Failure.unknown_object`]), and the [`ExposeQueue`] is what
-    /// guarantees the object was introduced first. See the module doc.
+    /// Apply patches in order. A missing property or a scalar where an object
+    /// is required refuses the stream; foreign object IDs alone do not.
     ///
     /// **No allocator, and here is why**: the walk allocates only inside a
     /// container it has already reached, and every container records the
@@ -776,23 +819,17 @@ pub const Value = union(enum) {
     ///   reached (`hydrate.rs`:108-110`);
     /// * anything else is a refusal (`hydrate.rs`:111`).
     ///
-    /// The two new checks are before all four: the object the step *leaves* is
-    /// the one the mirror must be holding, and the object the action *names*
-    /// is the one the path must have ended in. Both are what make the refusal
-    /// of a missing object distinguishable from a missing key.
+    /// IDs in the patch are metadata only; properties select the target.
     pub fn applyOne(self: *Value, enc: TextEncoding, patch: Patch) ApplyError!Applied {
         var cur: *Value = self;
         for (patch.path, 0..) |step, i| {
-            const here = cur.objId() orelse
-                return refusedObject(patch, i, step.obj, null);
-            if (!sameObject(here, step.obj)) return refusedObject(patch, i, step.obj, here);
+            if (cur.objId() == null) return refusedObject(patch, i, step.obj, null);
             if (textIndexed(cur, step.prop)) return .ok;
             cur = cur.child(step.prop) orelse
                 return .{ .refused = .{ .invalid_prop = .{ .at = i, .path = patch.path } } };
         }
         const end = patch.path.len;
-        const here = cur.objId() orelse return refusedObject(patch, end, patch.obj, null);
-        if (!sameObject(here, patch.obj)) return refusedObject(patch, end, patch.obj, here);
+        if (cur.objId() == null) return refusedObject(patch, end, patch.obj, null);
         const o = switch (cur.*) {
             .object => |*o| o,
             // **Unreachable, and kept as a refusal rather than as a trap.**
@@ -846,6 +883,35 @@ pub const Value = union(enum) {
         };
     }
 };
+
+/// A detached materialized value with one cleanup owner.
+/// Assignment transfers ownership by convention; use `value.dup` for a copy.
+pub const OwnedValue = struct {
+    gpa: Allocator,
+    value: Value,
+    scalar_owner: ?valmod.OwnedScalarValue = null,
+
+    /// Releases scalar backing or the complete object tree once.
+    pub fn deinit(self: *OwnedValue) void {
+        self.value.deinit();
+        if (self.scalar_owner) |*owner| owner.deinit(self.gpa);
+        self.* = undefined;
+    }
+};
+
+// Byte-bearing scalars remain borrowed here: register ownership copies them.
+fn dupStructure(source: *const Value, gpa: Allocator) ApplyError!Value {
+    return switch (source.*) {
+        .object => |*object_value| .{
+            .object = switch (object_value.*) {
+                .map => |*map_value| .{ .map = try map_value.dup(gpa) },
+                .list => |*list_value| .{ .list = try list_value.dup(gpa) },
+                .text => |*text_value| .{ .text = try text_value.dup(gpa) },
+            },
+        },
+        else => source.*,
+    };
+}
 
 /// The refusal for a step that found the wrong object, or no object.
 fn refusedObject(patch: Patch, at: usize, want: ExId, got: ?ExId) Applied {
@@ -920,10 +986,8 @@ pub const MapValue = struct {
 
     /// A register holding `v` ([`MapValue::new`](hydrate/map.rs):81`).
     ///
-    /// **Upstream's takes the operation's `ExId` as its second argument and
-    /// discards it** (`_id`); this file records the id on the [`Map`] instead,
-    /// which is what [`Value.applyOne`] checks a path against — see the module
-    /// doc's "refuse, do not invent".
+    /// Upstream discards its operation-ID argument (`_id`). The object
+    /// container stores diagnostic identity; properties resolve patch paths.
     ///
     /// **The value's bytes are still the caller's.** Upstream's
     /// `MapValue::new` takes a `Value` by value and a Rust `Value` owns its
@@ -933,6 +997,14 @@ pub const MapValue = struct {
     /// function that takes this record over.
     pub fn init(v: Value, conflict: bool) MapValue {
         return .{ .value = v, .conflict = conflict };
+    }
+
+    /// Deeply copies the register, including scalar bytes and child objects.
+    pub fn dup(self: *const MapValue, gpa: Allocator) ApplyError!MapValue {
+        var out = MapValue.init(try dupStructure(&self.value, gpa), self.conflict);
+        errdefer out.deinit();
+        out.owned = try ownValue(gpa, &out.value);
+        return out;
     }
 
     /// Frees the bytes this register owns and then the structure its value
@@ -991,9 +1063,11 @@ pub const Map = struct {
     /// The allocator itself is borrowed, never released: it is an interface
     /// value the caller keeps.
     gpa: Allocator,
-    /// Which object of the document this is the mirror of. See the module doc's
-    /// "refuse, do not invent".
+    /// Diagnostic object metadata. `init` borrows its actor hint; hydrated
+    /// results and `dup` retain their own copied hint.
     id: ExId,
+    /// True only when this container owns a copied actor hint in `id`.
+    owned_id: bool = false,
     /// The registers, in the hash's own order.
     entries: std.StringHashMapUnmanaged(MapValue) = .empty,
 
@@ -1004,6 +1078,22 @@ pub const Map = struct {
     /// [`Map.putOwned`] from here on.
     pub fn init(gpa: Allocator, id: ExId) Map {
         return .{ .gpa = gpa, .id = id };
+    }
+
+    /// Deeply copies keys, registers and the object's actor bytes.
+    pub fn dup(self: *const Map, gpa: Allocator) ApplyError!Map {
+        var out = Map.init(gpa, try self.id.dup(gpa));
+        out.owned_id = true;
+        errdefer out.deinit();
+        var entries = self.entries.iterator();
+        while (entries.next()) |entry| {
+            const key = try gpa.dupe(u8, entry.key_ptr.*);
+            errdefer gpa.free(key);
+            var register = try entry.value_ptr.dup(gpa);
+            errdefer register.deinit();
+            try out.entries.put(gpa, key, register);
+        }
+        return out;
     }
 
     /// Frees every register — **the bytes it owns and every key this map
@@ -1036,6 +1126,7 @@ pub const Map = struct {
         var keys = self.entries.keyIterator();
         while (keys.next()) |k| self.gpa.free(k.*);
         self.entries.deinit(self.gpa);
+        if (self.owned_id) self.id.deinitOwned(self.gpa);
         self.* = undefined;
     }
 
@@ -1076,8 +1167,9 @@ pub const Map = struct {
     /// is released and none of the value's own structure is freed.
     pub fn putOwned(self: *Map, key: []const u8, mv: MapValue) Error!void {
         var held = mv;
-        errdefer if (held.owned) |*o| o.deinit();
-        held.owned = try ownValue(self.gpa, &held.value);
+        const copies_payload = held.owned == null;
+        errdefer if (copies_payload) releaseOwned(held.owned);
+        if (copies_payload) held.owned = try ownValue(self.gpa, &held.value);
         if (self.entries.getPtr(key)) |old| {
             old.deinit();
             old.* = held;
@@ -1203,6 +1295,15 @@ pub const ListValue = struct {
         return .{ .value = v, .marks = .init(gpa), .conflict = conflict };
     }
 
+    /// Deeply copies the element, its marks and its scalar or object payload.
+    pub fn dup(self: *const ListValue, gpa: Allocator) ApplyError!ListValue {
+        var out = ListValue.init(gpa, try dupStructure(&self.value, gpa), self.conflict);
+        errdefer out.deinit();
+        out.owned = try ownValue(gpa, &out.value);
+        out.marks = try self.marks.dup(gpa);
+        return out;
+    }
+
     /// Frees the marks and the value's own structure, in that order, and the
     /// bytes this element owns.
     ///
@@ -1264,9 +1365,11 @@ pub const List = struct {
     ///
     /// The allocator itself is borrowed, never released.
     gpa: Allocator,
-    /// Which object of the document this is the mirror of. See the module doc's
-    /// "refuse, do not invent".
+    /// Diagnostic object metadata. `init` borrows its actor hint; hydrated
+    /// results and `dup` retain their own copied hint.
     id: ExId,
+    /// True only when this container owns a copied actor hint in `id`.
+    owned_id: bool = false,
     /// The elements, in sequence order.
     items: seqtree.SequenceTree(ListValue),
 
@@ -1276,6 +1379,20 @@ pub const List = struct {
     /// builds, and is not released by [`List.deinit`] — the caller keeps it.
     pub fn init(gpa: Allocator, id: ExId) List {
         return .{ .gpa = gpa, .id = id, .items = .init(gpa) };
+    }
+
+    /// Deeply copies elements, their marks and the object's actor bytes.
+    pub fn dup(self: *const List, gpa: Allocator) ApplyError!List {
+        var out = List.init(gpa, try self.id.dup(gpa));
+        out.owned_id = true;
+        errdefer out.deinit();
+        var elements = self.items.iter();
+        while (elements.next()) |element| {
+            var copied = try element.dup(gpa);
+            errdefer copied.deinit();
+            try out.items.push(copied);
+        }
+        return out;
     }
 
     /// Frees every element and the tree that holds them.
@@ -1295,6 +1412,7 @@ pub const List = struct {
             owned.deinit();
         }
         self.items.deinit();
+        if (self.owned_id) self.id.deinitOwned(self.gpa);
         self.* = undefined;
     }
 
@@ -1396,26 +1514,10 @@ pub const List = struct {
                 break :blk .ok;
             },
             .delete_seq => |a| blk: {
-                // Upstream ignores the result of each remove
-                // (`hydrate/list.rs`:63-67`); a delete past the end of the
-                // sequence is a stream that cannot be applied and is refused
-                // here.
-                //
-                // **Element by element, and no rollback.** Every element this
-                // loop got through is removed and freed before the miss, which
-                // is the residue `List.apply`'s doc and `Applied.refused` both
-                // promise. Upstream has the same shape and hides it by
-                // dropping the result and answering `Ok` — the port refuses
-                // instead, and says what the refusal cost.
-                //
-                // **`error.InvalidIndex` is the miss and nothing else.**
-                // `SequenceTree.remove` can also fail on allocation, after it
-                // has begun restructuring a node, and that is a different
-                // fault with a different residue: the list is not readable
-                // afterwards. Reporting it as `invalid_index` would tell the
-                // caller the patch is wrong when the list is, so it is
-                // propagated instead. Both error tags are already in
-                // `ApplyError`, so nothing about the signature widens.
+                // Rust repeatedly removes one element and panics after a
+                // malformed oversized DeleteSeq (`hydrate/list.rs:63-67`,
+                // `sequence_tree.rs:109-136`). Keep the valid removed prefix,
+                // but return a checked invalid-index refusal in every mode.
                 for (0..a.length) |_| {
                     var gone = self.items.remove(a.index) catch |e| switch (e) {
                         error.InvalidIndex => break :blk .{ .refused = .{ .invalid_index = a.index } },
@@ -1461,11 +1563,9 @@ pub const List = struct {
     /// A list's positions are elements, so a run is a range of elements and a
     /// run past the end stops at the end.
     ///
-    /// Upstream's field is `HashMap<String, ScalarValue>` — **an owned name and
-    /// an owned value** — so a mark there needs no lifetime. A
-    /// [`MarkSet`](marks.zig) borrows, because the op set's does, so
-    /// [`ownMark`] makes the copy and records it on the element's
-    /// [`ListValue.owned`].
+    /// Mark names and values are owned. Fresh containers copy them into the
+    /// element's byte registry; duplicated containers use their deeply owned
+    /// `MarkSet`. `ownMark` preserves the appropriate ownership boundary.
     fn applyMarks(self: *List, marks: []const Mark) ApplyError!Applied {
         for (marks) |m| {
             const stop = @min(m.end, self.items.len());
@@ -1501,12 +1601,8 @@ pub const List = struct {
 
 /// A text mirror ([`hydrate::Text`](hydrate/text.rs):8-11`).
 ///
-/// The text is a [`patches.ConcreteTextValue`] over the document's own encoding,
-/// so `len`, `asStr`, `splice` and `remove` are the port's already-tested
-/// arithmetic. **The discipline differs in one place**: a patch's copy is arena
-/// memory and the tree never frees an intermediate buffer, while a mirror owns
-/// one buffer at a time, so [`Text.splice`] and [`Text.removeAt`] free the
-/// buffer they replace.
+/// Owns native text units and copied mark payloads. Rendering is explicit and
+/// allocator-taking; mutations preserve incomplete UTF-8/UTF-16 native units.
 pub const Text = struct {
     /// The allocator the text buffer, the mark set and every byte in
     /// `owned` are taken with.
@@ -1515,18 +1611,16 @@ pub const Text = struct {
     /// be replaced once the text has allocated** — see [`Map.gpa`], which
     /// states the rule and why nothing catches a breach of it.
     ///
-    /// **This field and `value.gpa` are two records of one allocator, and both
-    /// must stay the one the constructor was given.** [`Text.splice`] and
-    /// [`Text.removeAt`] free the buffer they replace through *this* field
-    /// while [`ConcreteTextValue.splice`] takes the next one from *its* own, so
-    /// a pair that disagreed would free a block with an allocator that never
-    /// lent it. Nothing compares them.
+    /// The native value and mark storage retain this allocator too.
+    /// It must remain usable until this text is released.
     ///
     /// The allocator itself is borrowed, never released.
     gpa: Allocator,
-    /// Which object of the document this is the mirror of. See the module doc's
-    /// "refuse, do not invent".
+    /// Diagnostic object metadata. Constructors borrow its actor hint;
+    /// hydrated results and `dup` retain their own copied hint.
     id: ExId,
+    /// True only when this container owns a copied actor hint in `id`.
+    owned_id: bool = false,
     /// The text, owned.
     value: patches.ConcreteTextValue,
     /// The marks this text carries, by name. Upstream's field is
@@ -1537,19 +1631,16 @@ pub const Text = struct {
     /// over `marks.rs`:170-171`), and a name held at null is a removal
     /// tombstone, not an active mark.
     marks: MarkSet,
-    /// The bytes this text owns: the name and the payload of each of its
-    /// marks. The text's own characters were never at risk — a
-    /// [`ConcreteTextValue`] copies its buffer on every splice — so this is
-    /// the marks and nothing else.
+    /// Mark payloads copied into a fresh container. Duplicated texts instead
+    /// carry a deeply owned `MarkSet`; native text storage owns its own units.
     owned: ?Owned = null,
 
     /// A text object holding `s` ([`Text::new`](hydrate/text.rs):64-69`).
     ///
-    /// **This is the constructor that copies**, one buffer for `s`; a failure
-    /// leaves nothing to release. [`take`] is the other one and copies nothing.
-    /// `gpa` is recorded on the text, on its [`patches.ConcreteTextValue`] and
-    /// on its mark set, and the caller keeps it — [`Text.deinit`] frees the
-    /// three with it and never with anything else.
+    /// This constructor copies borrowed UTF-8 into owned native units.
+    /// `take` consumes an owned input buffer on success, but also converts to
+    /// native units; neither constructor promises byte-buffer identity.
+    /// `gpa` is recorded on the text, native storage and mark set.
     pub fn init(gpa: Allocator, id: ExId, enc: TextEncoding, s: []const u8) Error!Text {
         return .{
             .gpa = gpa,
@@ -1559,27 +1650,29 @@ pub const Text = struct {
         };
     }
 
-    /// A text object holding `bytes`, **which this takes over**
-    /// ([`OpSet::hydrate_text`](hydrate.rs):278-286`).
-    ///
-    /// **This constructor allocates nothing**, and that is the whole of why it
-    /// exists. [`OpSet.text`](opset/op_set.zig) has already built the object's
-    /// characters into a buffer the caller owns, so [`Text.init`] copied it
-    /// only for [`hydrateText`] to free the first — an allocation and a memcpy
-    /// of the entire text, per text object, spent before the walk looked at it
-    /// again. Here the buffer moves instead, and this text is its only owner
-    /// from this line on.
-    ///
-    /// **The bytes must have come from `gpa`, and they are freed exactly as
-    /// `init`'s are**: [`Text.deinit`] frees them through the value's own
-    /// `gpa`, and [`Text.splice`] and [`Text.removeAt`] free the buffer each
-    /// replaces. A caller holding bytes it does not own must use
-    /// [`Text.init`], which is the copy.
-    pub fn take(gpa: Allocator, id: ExId, enc: TextEncoding, bytes: []u8) Text {
+    /// Deeply copies native text units, marks and the object's actor bytes.
+    pub fn dup(self: *const Text, gpa: Allocator) ApplyError!Text {
+        var out: Text = .{
+            .gpa = gpa,
+            .id = try self.id.dup(gpa),
+            .owned_id = true,
+            .value = undefined,
+            .marks = .init(gpa),
+        };
+        errdefer out.id.deinitOwned(gpa);
+        out.value = try self.value.dup(gpa);
+        errdefer out.value.deinit();
+        out.marks = try self.marks.dup(gpa);
+        return out;
+    }
+
+    /// Adopts UTF-8 bytes into native text storage, consuming them on success.
+    /// On allocation failure the caller still owns `bytes` unchanged.
+    pub fn take(gpa: Allocator, id: ExId, enc: TextEncoding, bytes: []u8) Error!Text {
         return .{
             .gpa = gpa,
             .id = id,
-            .value = .{ .gpa = gpa, .enc = enc, .bytes = bytes },
+            .value = try patches.ConcreteTextValue.initOwned(gpa, bytes, enc),
             .marks = .init(gpa),
         };
     }
@@ -1595,12 +1688,14 @@ pub const Text = struct {
         self.marks.deinit();
         self.value.deinit();
         if (self.owned) |*o| o.deinit();
+        if (self.owned_id) self.id.deinitOwned(self.gpa);
         self.* = undefined;
     }
 
-    /// The text as a string ([`impl From<&Text> for String`](hydrate/text.rs):72-76`).
-    pub fn asStr(self: *const Text) []const u8 {
-        return self.value.asStr();
+    /// Renders native units lossily as caller-owned UTF-8.
+    /// The caller frees the result with `gpa`; no source storage is retained.
+    pub fn makeString(self: *const Text, gpa: Allocator) Error![]u8 {
+        return self.value.makeString(gpa);
     }
 
     /// The text's length in the document's encoding
@@ -1609,55 +1704,20 @@ pub const Text = struct {
         return self.value.len();
     }
 
-    /// Inserts `text` at unit `index` ([`TextValue::splice`](hydrate/text.rs):40`).
-    ///
-    /// **This frees the buffer it replaces, and the free is not optional.**
-    /// `ConcreteTextValue.splice` drops its old reference without freeing, which
-    /// is right for a patch inside an arena and wrong for an owning mirror: an
-    /// ordinary allocator reports the old buffer as leaked on every call that
-    /// skips this line. The `old` local is what makes it a free of the
-    /// *previous* block and not of the one `splice` just installed, and it is
-    /// freed with [`Text.gpa`].
-    ///
-    /// **`error.InvalidCharacter` is upstream's `InvalidEncoding`**
-    /// (`hydrate/text.rs`:32`): `byteOffset` reached a byte that is not valid
-    /// UTF-8. The refusal is made by [`Text.apply`], which is where an
-    /// [`Applied`] exists.
-    ///
-    /// **On either error the text is unchanged and nothing was allocated.**
-    /// `ConcreteTextValue.splice` resolves the index before it allocates, so
-    /// neither `error.InvalidCharacter` nor `error.OutOfMemory` reaches the
-    /// free below, and `value.bytes` still names the buffer it named before the
-    /// call.
+    /// Inserts UTF-8 at a native-unit index. Failure leaves text unchanged.
     pub fn splice(self: *Text, index: usize, text: []const u8) Error!void {
-        const old = self.value.bytes;
         try self.value.splice(index, text);
-        self.gpa.free(old);
     }
 
-    /// Removes the one unit at `index`
-    /// ([`TextValue::remove`](hydrate/text.rs):51-56`).
-    ///
-    /// Out of range is a no-op. This UTF-8-backed value cannot retain a partial
-    /// scalar: deleting one UTF-8 byte or UTF-16 unit that splits a scalar
-    /// returns `error.InvalidCharacter` without changing the text.
-    ///
-    /// A replacement buffer is freed with [`Text.gpa`] only after success;
-    /// no-ops retain their buffer. Allocation and encoding errors leave the
-    /// text unchanged.
+    /// Removes one native unit; an out-of-range index changes nothing.
+    /// UTF-8/UTF-16 edits can retain partial scalars until lossy rendering.
     pub fn removeAt(self: *Text, index: usize) Error!void {
-        const old = self.value.bytes;
         try self.value.remove(index);
-        if (self.value.bytes.ptr != old.ptr) self.gpa.free(old);
     }
 
-    /// Removes a bounded span in one mutation. Overshoot clamps to the end;
-    /// zero length and out-of-range starts retain the original buffer.
-    /// Both boundaries must be valid for the text's encoding.
+    /// Removes a bounded native-unit span, clamping overshoot to the end.
     fn removeRange(self: *Text, index: usize, length: usize) Error!void {
-        const old = self.value.bytes;
         try self.value.removeRange(index, length);
-        if (self.value.bytes.ptr != old.ptr) self.gpa.free(old);
     }
 
     /// Applies one action to this text ([`Text::apply`](hydrate/text.rs):23-62`).
@@ -1677,16 +1737,12 @@ pub const Text = struct {
     /// A caller that needs to know what the mirror holds after a non-`.ok`
     /// answer needs the following rules:
     ///
-    /// * `delete_seq` **removes the bounded span in one mutation**. Lengths
-    ///   past the end remove only what is there and report success; zero
-    ///   length and out-of-range starts change nothing. This UTF-8-backed
-    ///   mirror refuses boundaries that split a scalar (or a grapheme in
-    ///   grapheme mode) as [`Failure.invalid_encoding`]. Allocation failure
-    ///   and encoding refusal leave the whole action's text unchanged.
-    /// * `insert` splices **one value at a time**, so a refusal on the third
-    ///   value leaves the first two in the text. Invalid text encountered
-    ///   while resolving the insertion index is refused as
-    ///   [`Failure.invalid_encoding`].
+    /// * `delete_seq` removes a bounded native-unit span. Overshoot clamps to
+    ///   the end; zero length and out-of-range starts change nothing. Partial
+    ///   UTF-8/UTF-16 scalars remain native units and render lossily later.
+    ///   Allocation failure leaves the whole deletion unchanged.
+    /// * `insert` splices one value at a time, so a failure on the third
+    ///   value leaves the first two in the text.
     /// * `put_seq` removes the unit at `a.index` **before** it splices the
     ///   replacement, so a refusal from the splice leaves the text one unit
     ///   shorter with nothing in its place. `splice_text` commits its splice
@@ -1697,9 +1753,11 @@ pub const Text = struct {
     ///   before it stores either, so a failure leaves the marks already stored
     ///   and the one that failed absent.
     pub fn apply(self: *Text, enc: TextEncoding, action: PatchAction) ApplyError!Applied {
+        if (enc != self.value.encoding()) return .{ .refused = .invalid_encoding };
         const out: Applied = switch (action) {
             .splice_text => |a| blk: {
-                self.splice(a.index, a.value.asStr()) catch |e| break :blk encodingRefusal(e) orelse return e;
+                self.value.spliceTextValue(a.index, &a.value) catch |e|
+                    break :blk encodingRefusal(e) orelse return e;
                 if (a.marks) |*m| try self.putMarks(m);
                 break :blk .ok;
             },
@@ -1711,7 +1769,7 @@ pub const Text = struct {
                 var it = a.values.iter();
                 while (it.next()) |iv| {
                     var v = try Value.fromPatch(self.gpa, iv.value, iv.obj, enc);
-                    errdefer v.deinit();
+                    defer v.deinit();
                     const s = v.asStr();
                     self.splice(index, s) catch |e| break :blk encodingRefusal(e) orelse return e;
                     index += enc.width(s);
@@ -1721,7 +1779,7 @@ pub const Text = struct {
             .put_seq => |a| blk: {
                 self.removeAt(a.index) catch |e| break :blk encodingRefusal(e) orelse return e;
                 var v = try Value.fromPatch(self.gpa, a.value, a.obj, enc);
-                errdefer v.deinit();
+                defer v.deinit();
                 self.splice(a.index, v.asStr()) catch |e| break :blk encodingRefusal(e) orelse return e;
                 break :blk .ok;
             },
@@ -1782,7 +1840,7 @@ pub const Text = struct {
     /// [`ListValue.eql`] **does** compare marks, because there they are
     /// per-element and so can say where.
     pub fn eql(a: *const Text, b: *const Text) bool {
-        return std.mem.eql(u8, a.asStr(), b.asStr());
+        return a.value.eql(b.value);
     }
 };
 
@@ -1916,6 +1974,11 @@ const WinnerKey = struct {
     }
 };
 
+// Retain the generic key helper's tested ownership distinction conservatively.
+// Valid hydrateMap walks use map keys; hydrateList does not call winnerKey.
+// The direct winnerKey test exercises sequence formatting and owned-buffer
+// cleanup, not reachability from production map hydration. Removing that arm
+// would refactor an existing tested helper contract without a map-path benefit.
 fn winnerKey(comptime Set: type, set: *const Set, gpa: Allocator, key: KeyRef) Error!WinnerKey {
     if (key.keyStr()) |s| return .{ .bytes = s };
     const text = try set.opIdText(gpa, key.seq.id);
@@ -1953,7 +2016,8 @@ pub fn hydrateMap(
     clock: ?Clock,
 ) OpHydrateError!Value {
     assertSet(Set);
-    var map = Map.init(gpa, obj);
+    var map = Map.init(gpa, try obj.dup(gpa));
+    map.owned_id = true;
     errdefer map.deinit();
     var tops = try set.topOps(obj, clock);
     defer tops.deinit(gpa);
@@ -1999,7 +2063,8 @@ pub fn hydrateList(
     clock: ?Clock,
 ) OpHydrateError!Value {
     assertSet(Set);
-    var list = List.init(gpa, obj);
+    var list = List.init(gpa, try obj.dup(gpa));
+    list.owned_id = true;
     errdefer list.deinit();
     var tops = try set.topOps(obj, clock);
     defer tops.deinit(gpa);
@@ -2041,22 +2106,15 @@ pub fn hydrateList(
 /// (opset/op_set.zig) is upstream's own dispatch over that clock, so this is
 /// upstream's rule applied to a fold the port added, not a second fold.
 ///
-/// **The caller owns the result, and `set` is borrowed for the call only.**
-/// The text itself is **one** copy — [`Text.take`] takes over the buffer
-/// [`set.text`] built instead of duping it — and every mark's name and payload
-/// is a copy too, through [`Text.putMark`], so the mirror outlives the next
-/// mutation of `set` and nothing in it points into the op set. Release
-/// it with **one** [`Value.deinit`], which frees the text buffer, the mark set
-/// and the mark bytes; [`Value`] says why a copy of the result is a move and
-/// not a second owner. `gpa` is recorded on the text and is never released
-/// here — the caller keeps it — and `clock` is borrowed for the call.
+/// The caller owns the result, and `set` is borrowed for the call only.
+/// `Text.take` converts the UTF-8 from `set.text` to native units and consumes
+/// that buffer on success. Each mark's name and payload is copied through
+/// `Text.putMark`, so no result storage depends on the op set.
+/// Release the complete result once with `Value.deinit`.
 ///
-/// **On an error the caller owns nothing.** The text and the marks built so far
-/// are released by the one `errdefer`, and the buffer [`set.text`] built is
-/// taken by [`Text.take`] before anything after it can fail, so a failure after
-/// three marks and a failure after none are the same thing to the caller: no
-/// value. [`Text.take`] allocates nothing and registers nothing, so it has no
-/// failure of its own that could leave a residue.
+/// On an error the caller owns nothing. If `Text.take` fails, its unchanged
+/// input is freed here. After a successful take, `out` owns the native units
+/// and all subsequently copied metadata and marks, including on failure.
 ///
 /// `Set` must carry [`set_decls`]; [`assertSet`] says what that means and
 /// fails the build naming what is missing.
@@ -2069,8 +2127,13 @@ pub fn hydrateText(
 ) OpHydrateError!Value {
     assertSet(Set);
     const text = try set.text(gpa, obj, clock);
-    var out = Text.take(gpa, obj, set.textEncoding(), text);
+    var out = Text.take(gpa, obj, set.textEncoding(), text) catch |failure| {
+        gpa.free(text);
+        return failure;
+    };
     errdefer out.deinit();
+    out.id = try obj.dup(gpa);
+    out.owned_id = true;
     // **`:1585` — the clock picks the arm**, the two indexes for the present
     // and the walk of the rows it sees for anything else. Unscoped, this is
     // the very call it was before, and an isolation now reports the marks the
@@ -2166,8 +2229,21 @@ fn Slice(comptime T: type) type {
 /// expectations hand-derived: what the expose queue does is a function of what
 /// this says the document holds.
 const TestDoc = struct {
-    objs: []const Obj = &.{},
-    gpa: Allocator = testing.allocator,
+    objs: []const Obj,
+    gpa: Allocator,
+    scope_clock: *Clock,
+
+    fn init(gpa: Allocator, objs: []const Obj) Error!TestDoc {
+        const scope_clock = try gpa.create(Clock);
+        scope_clock.* = Clock.initEmpty(gpa);
+        return .{ .objs = objs, .gpa = gpa, .scope_clock = scope_clock };
+    }
+
+    fn deinit(self: *TestDoc) void {
+        self.scope_clock.deinit();
+        self.gpa.destroy(self.scope_clock);
+        self.* = undefined;
+    }
 
     pub const Obj = struct {
         id: ExId,
@@ -2194,13 +2270,13 @@ const TestDoc = struct {
         return .unicode_code_point;
     }
 
-    pub fn idToExid(self: *const TestDoc, id: OpId) ExId {
+    pub fn exportPatchId(self: *const TestDoc, id: OpId) Error!ExId {
         _ = self;
         return if (id.eql(OpId.root)) .root else .{ .id = id };
     }
 
-    pub fn objectType(self: *const TestDoc, id: ExId) ?ObjType {
-        const o = self.find(id) orelse return null;
+    pub fn objectType(self: *const TestDoc, id: ExId) Error!ObjType {
+        const o = self.find(id) orelse return error.NotAnObject;
         return o.typ;
     }
 
@@ -2209,12 +2285,12 @@ const TestDoc = struct {
         return o.parent;
     }
 
-    /// An empty clock. Only a log with `heads` set asks for one, and no test
-    /// here sets it; the value is a total function of the input, which is all
-    /// [`PatchLog`] needs of it.
-    pub fn clockAt(self: *const TestDoc, heads: []const types.ChangeHash) Clock {
-        _ = heads;
-        return Clock.initEmpty(self.gpa);
+    /// This single-snapshot fixture has no history or nonempty heads.
+    /// Retain the scope clock at a stable address until fixture teardown.
+    pub fn clockAtScope(self: *const TestDoc, gpa: Allocator, heads: []const types.ChangeHash) Error!*const Clock {
+        _ = gpa;
+        if (heads.len != 0) return error.MissingHash;
+        return self.scope_clock;
     }
 
     pub fn actorList(self: *const TestDoc) []const ActorId {
@@ -2240,6 +2316,12 @@ const TestDoc = struct {
         return .{ .items = o.span_items };
     }
 };
+
+fn fixturePatches(log: *patches.PatchLog, objs: []const TestDoc.Obj) !patches.Patches {
+    var doc = try TestDoc.init(log.gpa, objs);
+    defer doc.deinit();
+    return log.makePatches(TestDoc, &doc);
+}
 
 /// Every action names one encoding, so every test that says "the document" means
 /// this one. **Named `doc_enc`, not `enc`**, because the public API takes an
@@ -2274,7 +2356,7 @@ fn ival(v: i64) ScalarValue {
 // ── 1. The round trip ───────────────────────────────────────────────────────
 
 /// The one actor the round-trip document is built by.
-const rt_actor: ActorId = ActorId.init("aaaaaaaaaaaaaaaa");
+const rt_actor: ActorId = ActorId.init("\xaa" ** 8);
 
 /// The three objects the round-trip change makes, which are the ids of the ops
 /// that make them.
@@ -2525,7 +2607,8 @@ test "a patch stream replayed into a mirror equals the document it came from" {
     const f = try Fixture.init(gpa, &.{rt_actor});
     defer f.destroy();
 
-    const doc: TestDoc = .{ .objs = &rt_objs };
+    var doc = try TestDoc.init(gpa, &rt_objs);
+    defer doc.deinit();
 
     // **One stream, read straight out of the log, and the log is gone before
     // the mirror is built.** A [`Patches`](patches.zig) owns its payload, so a
@@ -2845,7 +2928,9 @@ fn renderTree(gpa: Allocator, out: *std.ArrayList(u8), v: *const Value) Error!vo
                 try out.append(gpa, ']');
             },
             .text => |t| {
-                try out.print(gpa, "text(\"{s}\"", .{t.asStr()});
+                const rendered = try t.makeString(gpa);
+                defer gpa.free(rendered);
+                try out.print(gpa, "text(\"{s}\"", .{rendered});
                 if (t.marks.len() > 0) {
                     try out.appendSlice(gpa, " marks=");
                     try renderMarks(gpa, out, &t.marks);
@@ -2896,8 +2981,6 @@ const sk_objs = [_]TestDoc.Obj{
     .{ .id = sk_text, .typ = .text, .parent = .root },
 };
 
-const sk_doc: TestDoc = .{ .objs = &sk_objs };
-
 /// The skeleton: a root map holding a list of two, a nested map with one
 /// counter, and a text of two characters.
 fn seedLog(log: *patches.PatchLog) void {
@@ -2941,7 +3024,7 @@ fn seeded(gpa: Allocator) !Seed {
         var log: patches.PatchLog = .active(gpa);
         defer log.deinit();
         seedLog(&log);
-        break :blk log.makePatches(TestDoc, &sk_doc);
+        break :blk fixturePatches(&log, &sk_objs);
     };
     errdefer ps.deinit();
     var v = Value.map(gpa);
@@ -3060,7 +3143,7 @@ test "every patch action applies, and each one changes the mirror" {
             var log: patches.PatchLog = .active(gpa);
             defer log.deinit();
             a.write(&log);
-            break :blk log.makePatches(TestDoc, &sk_doc);
+            break :blk fixturePatches(&log, &sk_objs);
         };
         defer ps.deinit();
         try testing.expectEqual(@as(usize, 1), ps.len());
@@ -3189,12 +3272,12 @@ test "a mark applies to text, and an unmark tombstones it" {
             defer unmark.deinit();
             log.mark(sk_text, 0, 1, &live);
             log.mark(sk_text, 1, 1, &unmark);
-            break :blk log.makePatches(TestDoc, &sk_doc);
+            break :blk fixturePatches(&log, &sk_objs);
         };
         defer ps.deinit();
         try applyAll(gpa, &seed.value, &ps, "text marks");
 
-        try testing.expectEqualStrings("ab", t.asStr());
+        try expectTextString("ab", t);
         try testing.expectEqual(@as(usize, 3), t.marks.len());
         {
             // Name order, so the entries are the ones below whatever order the
@@ -3236,7 +3319,7 @@ test "a mark applies to text, and an unmark tombstones it" {
         defer ps.deinit();
         try applyAll(gpa, &seed.value, &ps, "a mark then an unmark");
         const t = &seed.value.object.map.get("text").?.object.text;
-        try testing.expectEqualStrings("ab", t.asStr());
+        try expectTextString("ab", t);
         try testing.expectEqual(@as(usize, 1), t.marks.len());
         try testing.expectEqualStrings("bold", t.marks.entries.items[0].name);
         try testing.expect(t.marks.entries.items[0].value == .null_value);
@@ -3270,8 +3353,9 @@ test "a mark applies to text, and an unmark tombstones it" {
 
 // ── 3. The refusals ─────────────────────────────────────────────────────────
 
-/// One hand-made patch, with a path the log never had to resolve. Everything
-/// the patch names is a string literal, so the batch owns only the path slice.
+/// One hand-made patch with a borrowed path and action. Native splice storage
+/// is copied because `Patches.deinit` releases it; the input remains owned by
+/// the fixture. Other payloads are borrowed for the lifetime of this batch.
 fn onePatch(
     gpa: Allocator,
     obj: ExId,
@@ -3281,66 +3365,77 @@ fn onePatch(
     var ps: patches.Patches = .init(gpa);
     errdefer ps.deinit();
     const a = ps.allocator();
+    var held = action;
+    if (held == .splice_text) {
+        held.splice_text.value = try action.splice_text.value.dup(gpa);
+    }
+    errdefer if (held == .splice_text) held.splice_text.value.deinit();
     try ps.items.append(a, .{
         .obj = obj,
         .path = try a.dupe(PathElem, path),
-        .action = action,
+        .action = held,
     });
     return ps;
 }
 
-test "a patch naming an unknown object is refused, and the refusal names the path" {
-    const gpa = testing.allocator;
-
-    // **Arm one: a step names an object the mirror holds under a different id.**
-    // The path resolves as far as the first step, and the second step says the
-    // mirror should be inside an object it is not.
-    {
-        const path = [_]PathElem{
-            .{ .obj = .root, .prop = .{ .key = "nested" } },
-            .{ .obj = other_obj, .prop = .{ .key = "c" } },
-        };
-        var ps = try onePatch(gpa, other_obj, &path, .{
-            .increment = .{ .prop = .{ .key = "c" }, .value = 1 },
-        });
-        defer ps.deinit();
-
-        var seed = try seeded(gpa);
-        defer seed.deinit();
-        const before = try renderTop(gpa, &seed.value);
-        defer gpa.free(before);
-
-        const f = try expectRefusal(&seed.value, &ps, "a step naming another object");
-        const u = switch (f) {
-            .unknown_object => |u| u,
-            else => {
-                std.debug.print("expected unknown_object, got {s}\n", .{@tagName(f)});
-                return error.TestUnexpectedResult;
-            },
-        };
-        try testing.expect(u.at == 1);
-        try testing.expect(u.want.eql(other_obj));
-        // The mirror *does* hold an object there; it is simply not this one.
-        try testing.expect(u.got.?.eql(sk_nested));
-        // **The refusal names the path**: the same two steps, element for
-        // element. `expectEqual` on the slices would compare their pointers, so
-        // this compares the contents.
-        try testing.expectEqual(@as(usize, 2), u.path.len);
-        try testing.expect(u.path[0].obj.eql(.root));
-        try testing.expectEqualStrings("nested", propKey(u.path[0].prop));
-        try testing.expect(u.path[1].obj.eql(other_obj));
-        try testing.expectEqualStrings("c", propKey(u.path[1].prop));
-
-        const after = try renderTop(gpa, &seed.value);
-        defer gpa.free(after);
-        try testing.expectEqualStrings(before, after);
+test "hand-made native splice batches retain independent ownership on allocation failure" {
+    const Probe = struct {
+        fn run(gpa: Allocator, enc: TextEncoding) !void {
+            var source = try patches.ConcreteTextValue.init(testing.allocator, "😀", enc);
+            defer source.deinit();
+            // Preserve an incomplete native scalar, not only valid UTF-8 text.
+            try source.removeRange(0, 1);
+            var snapshot = try source.dup(testing.allocator);
+            defer snapshot.deinit();
+            {
+                var batch = onePatch(gpa, .root, &.{}, .{ .splice_text = .{
+                    .index = 0,
+                    .value = source,
+                    .marks = null,
+                } }) catch |failure| {
+                    try testing.expect(source.eql(snapshot));
+                    return failure;
+                };
+                defer batch.deinit();
+                try testing.expect(batch.slice()[0].action.splice_text.value.eql(source));
+            }
+            // Batch teardown cannot consume the borrowed source's native tree.
+            try testing.expect(source.eql(snapshot));
+        }
+    };
+    for ([_]TextEncoding{ .utf8_code_unit, .utf16_code_unit }) |enc| {
+        try testing.checkAllAllocationFailures(testing.allocator, Probe.run, .{enc});
     }
+}
 
-    // **Arm two: the path resolves, and the patch's own object is not the one it
-    // ended in.** This is the check upstream cannot make — it throws the
-    // `obj` away (`hydrate.rs`:84) — and it is what stops a patch for `7@0` from
-    // being applied to `2@0` just because the properties happen to line up.
+test "patch paths and target objects remain portable across foreign ids" {
+    const gpa = testing.allocator;
+    // Rust hydrate.rs:84-108 discards object IDs and walks properties.
+    // Exercise both a foreign intermediate ID and a foreign final target.
     {
+        var seed = try seeded(gpa);
+        defer seed.deinit();
+        {
+            var child = Value.map(gpa);
+            errdefer child.deinit();
+            try child.object.map.putOwned("c", MapValue.init(.{ .counter = .init(5) }, false));
+            try seed.value.object.map.getPtr("nested").?.object.map.putOwned("child", MapValue.init(child, false));
+        }
+        const path = [_]PathElem{
+            .{ .obj = ex(900, 0), .prop = .{ .key = "nested" } },
+            .{ .obj = other_obj, .prop = .{ .key = "child" } },
+        };
+        var ps = try onePatch(gpa, ex(901, 0), &path, .{
+            .increment = .{ .prop = .{ .key = "c" }, .value = 1 },
+        });
+        defer ps.deinit();
+        try applyAll(gpa, &seed.value, &ps, "foreign intermediate and target ids");
+        try testing.expectEqual(@as(i64, 6), rootMap(&seed.value).get("nested").?.object.map.get("child").?.object.map.get("c").?.asI64());
+        try testing.expectEqual(@as(i64, 5), rootMap(&seed.value).get("nested").?.object.map.get("c").?.asI64());
+    }
+    {
+        var seed = try seeded(gpa);
+        defer seed.deinit();
         const path = [_]PathElem{
             .{ .obj = .root, .prop = .{ .key = "nested" } },
         };
@@ -3348,21 +3443,9 @@ test "a patch naming an unknown object is refused, and the refusal names the pat
             .increment = .{ .prop = .{ .key = "c" }, .value = 1 },
         });
         defer ps.deinit();
-        var seed = try seeded(gpa);
-        defer seed.deinit();
-        const f = try expectRefusal(&seed.value, &ps, "a patch whose object is not the path's end");
-        const u = switch (f) {
-            .unknown_object => |u| u,
-            else => {
-                std.debug.print("expected unknown_object, got {s}\n", .{@tagName(f)});
-                return error.TestUnexpectedResult;
-            },
-        };
-        // The check is past the last step, so `at` is the path length.
-        try testing.expect(u.at == u.path.len);
-        try testing.expect(u.path.len == 1);
-        try testing.expect(u.want.eql(other_obj));
-        try testing.expect(u.got.?.eql(sk_nested));
+        try applyAll(gpa, &seed.value, &ps, "a foreign target at the path's end");
+        try testing.expectEqual(@as(i64, 6), rootMap(&seed.value).get("nested").?.object.map.get("c").?.asI64());
+        try testing.expect(rootMap(&seed.value).get("nested").?.objId().?.eql(sk_nested));
     }
 }
 
@@ -3448,9 +3531,8 @@ test "an action the object cannot take is refused, naming the action" {
             .action = .{
                 .splice_text = .{
                     .index = 0,
-                    // **Owned here and freed after the loop**: a `splice_text`
-                    // action carries its text by value, and this one is a copy, so
-                    // only this binding owns the buffer.
+                    // Borrowed by the helper, which copies native storage into
+                    // the batch. This binding remains its input's sole owner.
                     .value = spliced,
                     .marks = null,
                 },
@@ -3608,8 +3690,6 @@ const ex_objs = [_]TestDoc.Obj{
     .{ .id = ex_list, .typ = .list, .parent = .root, .list_items = &ex_list_items },
 };
 
-const ex_doc: TestDoc = .{ .objs = &ex_objs };
-
 test "a patch about an object the log never saw created is refused" {
     const gpa = testing.allocator;
     // A diff of a document that already had the list writes patches **about**
@@ -3618,7 +3698,7 @@ test "a patch about an object the log never saw created is refused" {
         var log: patches.PatchLog = .active(gpa);
         defer log.deinit();
         log.insert(ex_list, 1, .{ .scalar = sval("two") }, opId(11, 0), false);
-        break :blk log.makePatches(TestDoc, &ex_doc);
+        break :blk fixturePatches(&log, &ex_objs);
     };
     defer ps.deinit();
     try testing.expectEqual(@as(usize, 1), ps.len());
@@ -3653,7 +3733,7 @@ test "with the expose queue in play the same content applies" {
         defer log.deinit();
         log.putMap(.root, "list", .{ .object = .list }, opId(1, 0), false, true);
         log.insert(ex_list, 1, .{ .scalar = sval("two") }, opId(11, 0), false);
-        break :blk log.makePatches(TestDoc, &ex_doc);
+        break :blk fixturePatches(&log, &ex_objs);
     };
     defer ps.deinit();
     try testing.expect(ps.len() >= 2);
@@ -3687,7 +3767,7 @@ test "a delete removes the key or the element, and later indices shift down" {
             var log: patches.PatchLog = .active(gpa);
             defer log.deinit();
             log.deleteMap(.root, "nested");
-            break :blk log.makePatches(TestDoc, &sk_doc);
+            break :blk fixturePatches(&log, &sk_objs);
         };
         defer ps.deinit();
         var seed = try seeded(gpa);
@@ -3706,7 +3786,7 @@ test "a delete removes the key or the element, and later indices shift down" {
             var log: patches.PatchLog = .active(gpa);
             defer log.deinit();
             log.deleteMap(.root, "never-there");
-            break :blk log.makePatches(TestDoc, &sk_doc);
+            break :blk fixturePatches(&log, &sk_objs);
         };
         defer ps.deinit();
         var seed = try seeded(gpa);
@@ -3722,7 +3802,7 @@ test "a delete removes the key or the element, and later indices shift down" {
             var log: patches.PatchLog = .active(gpa);
             defer log.deinit();
             log.deleteSeq(sk_list, 0, 1);
-            break :blk log.makePatches(TestDoc, &sk_doc);
+            break :blk fixturePatches(&log, &sk_objs);
         };
         defer ps.deinit();
         var seed = try seeded(gpa);
@@ -3741,7 +3821,7 @@ test "a delete removes the key or the element, and later indices shift down" {
             defer log.deinit();
             log.insert(sk_list, 1, .{ .scalar = ival(3) }, opId(52, 0), false);
             log.deleteSeq(sk_list, 0, 2);
-            break :blk log.makePatches(TestDoc, &sk_doc);
+            break :blk fixturePatches(&log, &sk_objs);
         };
         defer ps.deinit();
         var seed = try seeded(gpa);
@@ -3758,14 +3838,14 @@ test "a delete removes the key or the element, and later indices shift down" {
             var log: patches.PatchLog = .active(gpa);
             defer log.deinit();
             log.deleteSeq(sk_text, 0, 1);
-            break :blk log.makePatches(TestDoc, &sk_doc);
+            break :blk fixturePatches(&log, &sk_objs);
         };
         defer ps.deinit();
         var seed = try seeded(gpa);
         defer seed.deinit();
         try applyAll(gpa, &seed.value, &ps, "a delete_seq on a text");
         const t = &seed.value.object.map.get("text").?.object.text;
-        try testing.expectEqualStrings("b", t.asStr());
+        try expectTextString("b", t);
         try testing.expectEqual(@as(usize, 1), t.count());
     }
 }
@@ -3800,7 +3880,7 @@ test "an empty stream builds an empty mirror, and empty map, list and text stay 
     try testing.expect(!l.eql(&t));
     try testing.expect(!m.eql(&t));
     try testing.expect(m.eql(&Value.map(gpa)));
-    try testing.expectEqualStrings("", t.object.text.asStr());
+    try expectTextString("", &t.object.text);
     try testing.expectEqual(@as(usize, 0), m.object.map.count());
     try testing.expectEqual(@as(usize, 0), l.object.list.count());
     try testing.expectEqual(@as(usize, 0), t.object.text.marks.len());
@@ -3835,7 +3915,7 @@ test "every value variant round-trips through the mirror" {
             var log: patches.PatchLog = .active(gpa);
             defer log.deinit();
             log.putMap(.root, "k", .{ .scalar = c.v }, opId(70, 0), false, false);
-            break :blk log.makePatches(TestDoc, &sk_doc);
+            break :blk fixturePatches(&log, &sk_objs);
         };
         defer ps.deinit();
 
@@ -3880,7 +3960,7 @@ test "every value variant round-trips through the mirror" {
             // checks what it is holding.
             log.putMap(.root, "nested", .{ .object = .map }, opId(2, 0), false, false);
             log.putMap(sk_nested, "in", .{ .scalar = ival(5) }, opId(72, 0), false, false);
-            break :blk log.makePatches(TestDoc, &sk_doc);
+            break :blk fixturePatches(&log, &sk_objs);
         };
         defer ps.deinit();
         var mirror = Value.map(gpa);
@@ -3914,10 +3994,9 @@ test "every value variant round-trips through the mirror" {
     // fits, and a timestamp, which is an `i64` with a name.
     try testing.expectEqual(@as(i64, 9), Value.fromScalar(.{ .uint = 9 }).asI64());
     try testing.expectEqual(@as(i64, 1234), Value.fromScalar(.{ .timestamp = 1234 }).asI64());
-    // **A `uint` too large for an `i64` is zero, not a trap** — the same
-    // `orelse 0` the `cast` falls back to, and the reason the port spells the
-    // arm as a cast rather than an `@intCast`.
-    try testing.expectEqual(@as(i64, 0), Value.fromScalar(.{ .uint = std.math.maxInt(u64) }).asI64());
+    // Rust `value.rs:807-812` uses `as i64`, which wraps.
+    // Preserve the sign bit instead of rejecting a valid unsigned scalar.
+    try testing.expectEqual(@as(i64, -1), Value.fromScalar(.{ .uint = std.math.maxInt(u64) }).asI64());
     try testing.expectEqual(@as(i64, 0), Value.fromScalar(.{ .str = "hi" }).asI64());
     // An object reads as zero, whatever it is: the object case has no integer
     // ([`hydrate::Value::as_i64`](hydrate.rs):129-134`).
@@ -4114,11 +4193,13 @@ test "hydrateMap reads the op set, and hydrateOp refuses a row that is not a val
     try testing.expectEqualStrings("v", m.get("k").?.asStr());
     // The child objects are hydrated by recursing into their own top ops, and
     // each records the id of the op that made it.
-    try testing.expect(m.get("m").?.objId().?.eql(os_nested));
+    try testing.expect(m.get("m").?.objId().?.eql(
+        ExId.withActor(opId(1, 0), rt_actor),
+    ));
     try testing.expectEqual(@as(i64, 1), m.get("m").?.object.map.get("deep").?.asI64());
     try testing.expectEqual(@as(usize, 2), m.get("list").?.object.list.count());
     try testing.expectEqual(@as(i64, 10), m.get("list").?.object.list.get(0).?.asI64());
-    try testing.expectEqualStrings("hi", m.get("t").?.object.text.asStr());
+    try expectTextString("hi", &m.get("t").?.object.text);
 
     // `hydrate_op` on each make builds the same subtree it would reach by
     // recursing, which is the claim `hydrate.rs`:294-298` makes.
@@ -4178,31 +4259,31 @@ test "hydrateMap reads the op set, and hydrateOp refuses a row that is not a val
 test "a register with two live rows is hydrated with its conflict flag" {
     const gpa = testing.allocator;
     const f = try Fixture.init(gpa, &.{
-        ActorId.init("aaaaaaaaaaaaaaaa"),
-        ActorId.init("bbbbbbbbbbbbbbbb"),
+        rt_actor,
+        ActorId.init("\xbb" ** 8),
     });
     defer f.destroy();
 
     // **Rule two of the merge** (`batch.rs`:814-820, over
     // `transaction/inner.rs`): a lesser change op does not win a register the
-    // document already holds and flags it instead. `7@2` is in the base and
-    // `3@1` arrives from a concurrent actor, so the register holds two live rows
-    // and the winner carries the flag.
+    // document already holds and flags it instead. `7@1` is in the base and
+    // `3@0` arrives from a concurrent actor, so the register holds two live rows
+    // and the winner carries the flag. Actor indices are zero-based.
     try f.build(0, &[_]Rec{
-        .{ .ctr = 7, .actor = 2, .key = .fromStr("a"), .val = sval("a7") },
+        .{ .ctr = 7, .actor = 1, .key = .fromStr("a"), .val = sval("a7") },
     });
     var log: patches.PatchLog = .active(gpa);
     defer log.deinit();
     try f.mergeInto(patches.PatchLog, &log, &[_]Rec{
-        .{ .ctr = 3, .actor = 1, .key = .fromStr("a"), .val = sval("a3") },
-    }, &.{bareChange(ActorId.init("bbbbbbbbbbbbbbbb"), 1, 3, 3, 0x55)});
+        .{ .ctr = 3, .actor = 0, .key = .fromStr("a"), .val = sval("a3") },
+    }, &.{bareChange(rt_actor, 1, 3, 3, 0x55)});
 
     var root = try hydrateMap(Fixture.Set, &f.set, gpa, .root, null);
     defer root.deinit();
     const m = &root.object.map;
     try testing.expectEqual(@as(usize, 1), m.count());
     const got = m.get("a") orelse return error.TestUnexpectedResult;
-    // `7@2` beats `3@1`, so it is the value and the flag is on it.
+    // `7@1` beats `3@0`, so it is the value and the flag is on it.
     try testing.expectEqualStrings("a7", got.asStr());
     const mv = m.entries.getPtr("a").?;
     try testing.expect(mv.conflict);
@@ -4236,14 +4317,14 @@ test "a register with two live rows is hydrated with its conflict flag" {
 // value at each one.
 
 const rtdoc = @import("doc.zig");
-const rttrans = @import("transact.zig");
+const rtowner = @import("autocommit.zig");
 
 /// The op set a [`Document`] holds, for [`hydrateMap`] and [`hydrateList`].
 const RtSet = opsetmod.OpSet(opmod.ChangeOp);
 
 /// The document both tests start from.
 const RtDoc = struct {
-    doc: rtdoc.Document,
+    doc: rtowner.AutoCommit,
     /// The text object, which carries a string mark and a boolean mark over
     /// disjoint spans.
     text: ExId,
@@ -4257,33 +4338,32 @@ const RtDoc = struct {
 /// a list holding a map and a counter, a counter at the root, a text object with
 /// two marks of different types, and a key the second stage deletes.
 fn roundTripDoc(gpa: Allocator) !RtDoc {
-    var d = try rtdoc.Document.init(gpa, std.testing.io, .auto);
+    var d = try rtowner.AutoCommit.init(gpa, std.testing.io);
     errdefer d.deinit();
-    d.setActorId(.{ .bytes = "0123456789abcdef" });
+    try d.setActorId(.{ .bytes = "0123456789abcdef" });
 
-    const nested = try rttrans.putObject(&d, .root, .{ .key = "nested" }, .map);
-    _ = try rttrans.put(&d, nested, .{ .key = "a" }, .{ .str = "A" });
-    _ = try rttrans.put(&d, nested, .{ .key = "b" }, .{ .int = 7 });
-    _ = try rttrans.put(&d, nested, .{ .key = "c" }, .{ .float = 1.5 });
+    const nested = try d.putObject(.root, .{ .key = "nested" }, .map);
+    _ = try d.put(nested, .{ .key = "a" }, .{ .str = "A" });
+    _ = try d.put(nested, .{ .key = "b" }, .{ .int = 7 });
+    _ = try d.put(nested, .{ .key = "c" }, .{ .float = 1.5 });
 
-    const list = try rttrans.putObject(&d, .root, .{ .key = "list" }, .list);
-    _ = try rttrans.insert(&d, list, 0, .{ .str = "one" });
-    _ = try rttrans.insert(&d, list, 1, .{ .counter = Counter.init(5) });
-    const inner = try rttrans.insertObject(&d, list, 2, .map);
-    _ = try rttrans.put(&d, inner, .{ .key = "k" }, .{ .bool_value = true });
+    const list = try d.putObject(.root, .{ .key = "list" }, .list);
+    _ = try d.insert(list, 0, .{ .str = "one" });
+    _ = try d.insert(list, 1, .{ .counter = Counter.init(5) });
+    const inner = try d.insertObject(list, 2, .map);
+    _ = try d.put(inner, .{ .key = "k" }, .{ .bool_value = true });
 
-    _ = try rttrans.put(&d, .root, .{ .key = "n" }, .{ .counter = Counter.init(5) });
-    try rttrans.increment(&d, .root, .{ .key = "n" }, 3);
+    _ = try d.put(.root, .{ .key = "n" }, .{ .counter = Counter.init(5) });
+    try d.increment(.root, .{ .key = "n" }, 3);
 
-    _ = try rttrans.put(&d, .root, .{ .key = "gone" }, .{ .str = "bye" });
+    _ = try d.put(.root, .{ .key = "gone" }, .{ .str = "bye" });
 
-    const text = try rttrans.putObject(&d, .root, .{ .key = "text" }, .text);
-    try rttrans.spliceText(&d, text, 0, 0, "hello world");
-    // Two marks over disjoint spans and of different value types, so a mirror
-    // that keeps one map of name to value for the whole text still has to get
-    // both names and both values right.
-    try rttrans.mark(&d, text, 0, 5, "link", .after, .{ .str = "https://example.com" });
-    try rttrans.mark(&d, text, 6, 11, "bold", .after, .{ .bool_value = true });
+    const text = try d.putObject(.root, .{ .key = "text" }, .text);
+    try d.spliceText(text, 0, 0, "hello world");
+    try d.mark(text, 0, 5, "link", .after, .{ .str = "https://example.com" });
+    try d.mark(text, 6, 11, "bold", .after, .{ .bool_value = true });
+    // A held owner must close its transaction before ownership transfer.
+    _ = try d.commit();
 
     return .{ .doc = d, .text = text };
 }
@@ -4312,7 +4392,7 @@ test "hydrate: a whole-state patch stream replays into a mirror equal to the doc
         },
     }
 
-    try expectMirrorMatches(gpa, &rt.doc, .root, &mirror, "$");
+    try expectMirrorMatches(gpa, &rt.doc.doc, .root, &mirror, "$");
 }
 
 test "hydrate: an incremental stream deletes a key and marks a span, and the mirror follows" {
@@ -4341,8 +4421,8 @@ test "hydrate: an incremental stream deletes a key and marks a span, and the mir
         try testing.expect(m.get("gone") != null);
     }
 
-    _ = try rttrans.delete(&rt.doc, .root, .{ .key = "gone" });
-    try rttrans.mark(&rt.doc, rt.text, 0, 5, "em", .after, .{ .bool_value = true });
+    _ = try rt.doc.delete(.root, .{ .key = "gone" });
+    try rt.doc.mark(rt.text, 0, 5, "em", .after, .{ .bool_value = true });
 
     const heads_b = try rt.doc.getHeads(gpa);
     defer gpa.free(heads_b);
@@ -4387,7 +4467,7 @@ test "hydrate: an incremental stream deletes a key and marks a span, and the mir
     // other reader: [`Document.marks`](doc.zig) folds the mark operations and
     // the patch stream reports what the log recorded. A stream that invented a
     // run, or shifted one, fails here.
-    const runs = try rt.doc.marks(gpa, rt.text);
+    const runs = try rt.doc.marks(rt.text, gpa);
     defer gpa.free(runs);
     for (second.slice()) |p| {
         if (p.action != .mark) continue;
@@ -4438,7 +4518,7 @@ test "hydrate: an incremental stream deletes a key and marks a span, and the mir
     // **The whole tree, after the incremental stream.** This is the same
     // per-key, per-element comparison as the whole-state case, so a stream that
     // fixed the deleted key and broke something else cannot pass.
-    try expectMirrorMatches(gpa, &rt.doc, .root, &mirror, "$");
+    try expectMirrorMatches(gpa, &rt.doc.doc, .root, &mirror, "$");
 }
 
 // ── Across an isolation ──────────────────────────────────────────────────────
@@ -4459,20 +4539,20 @@ test "hydrate: an incremental stream deletes a key and marks a span, and the mir
 
 test "hydrate: a patch stream crosses an isolation the mirror was built before" {
     const gpa = testing.allocator;
-    var doc = try rtdoc.Document.init(gpa, std.testing.io, .auto);
+    var doc = try rtowner.AutoCommit.init(gpa, std.testing.io);
     defer doc.deinit();
-    doc.setActorId(.{ .bytes = "7f" });
+    try doc.setActorId(.{ .bytes = "7f" });
 
-    const list = try rttrans.putObject(&doc, .root, .{ .key = "list" }, .list);
-    _ = try rttrans.insert(&doc, list, 0, .{ .str = "base" });
+    const list = try doc.putObject(.root, .{ .key = "list" }, .list);
+    _ = try doc.insert(list, 0, .{ .str = "base" });
     const beginning = try doc.getHeads(gpa);
     defer gpa.free(beginning);
-    const first = try rttrans.putObject(&doc, list, .{ .index = 0 }, .text);
-    try rttrans.spliceText(&doc, first, 0, 0, "first");
+    const first = try doc.putObject(list, .{ .index = 0 }, .text);
+    try doc.spliceText(first, 0, 0, "first");
 
     // **One actor, at index 0.** Every id the mirror is about to record
     // carries this table, so `first` and the list are both `n@0`.
-    try testing.expectEqual(@as(usize, 1), doc.numActors());
+    try testing.expectEqual(@as(usize, 1), doc.doc.numActors());
 
     // The mirror as a consumer holds it **before** the isolation, built the
     // ordinary way — by replaying the document's own stream — so that the ids
@@ -4499,13 +4579,13 @@ test "hydrate: a patch stream crosses an isolation the mirror was built before" 
     // `"7f"` is pushed from index 0 to index 1 while every id the mirror
     // already holds still says 0.
     try doc.isolate(gpa, beginning);
-    try testing.expectEqual(@as(usize, 1), doc.numActors());
+    try testing.expectEqual(@as(usize, 1), doc.doc.numActors());
 
     // A second object at the same index, on the other side of the isolation,
     // so the merge is a conflict and the stream has real work to do.
-    const second = try rttrans.putObject(&doc, list, .{ .index = 0 }, .text);
-    try rttrans.spliceText(&doc, second, 0, 0, "second");
-    try testing.expectEqual(@as(usize, 2), doc.numActors());
+    const second = try doc.putObject(list, .{ .index = 0 }, .text);
+    try doc.spliceText(second, 0, 0, "second");
+    try testing.expectEqual(@as(usize, 2), doc.doc.numActors());
     try doc.integrate();
 
     var later = try doc.diffIncremental(gpa);
@@ -4536,10 +4616,7 @@ test "hydrate: a patch stream crosses an isolation the mirror was built before" 
     }
     try testing.expect(crossed);
 
-    // **And the stream applies.** This is the assertion that used to be a
-    // refusal: [`Value.applyOne`] walks the path, and the first step leaves the
-    // root and the second leaves the list, so both ids are compared — by the
-    // actor's bytes, which agree, rather than by the index, which does not.
+    // Property paths remain portable across actor-table renumbering.
     switch (try mirror.applyPatches(doc.textEncoding(), later.slice())) {
         .ok => {},
         .refused => |f| {
@@ -4550,7 +4627,7 @@ test "hydrate: a patch stream crosses an isolation the mirror was built before" 
 
     // **The whole tree afterwards**, so a stream that applied to the wrong
     // object and then agreed with it cannot pass.
-    try expectMirrorMatches(gpa, &doc, .root, &mirror, "$");
+    try expectMirrorMatches(gpa, &doc.doc, .root, &mirror, "$");
 }
 
 // ── 11. A mirror owns its bytes ──────────────────────────────────────────────
@@ -4610,24 +4687,24 @@ test "hydrate: a register and an element own the bytes they were handed" {
 
 test "hydrate: two reads of one op set give two mirrors different bytes" {
     const gpa = testing.allocator;
-    var doc = try rtdoc.Document.init(gpa, std.testing.io, .auto);
+    var doc = try rtowner.AutoCommit.init(gpa, std.testing.io);
     defer doc.deinit();
-    doc.setActorId(.{ .bytes = "7f" });
+    try doc.setActorId(.{ .bytes = "7f" });
 
-    const items = try rttrans.putObject(&doc, .root, .{ .key = "items" }, .list);
-    const a = try rttrans.insertObject(&doc, items, 0, .map);
-    _ = try rttrans.put(&doc, a, .{ .key = "id" }, .{ .str = "a" });
-    _ = try rttrans.put(&doc, a, .{ .key = "n" }, .{ .int = 1 });
-    const text = try rttrans.putObject(&doc, .root, .{ .key = "text" }, .text);
-    try rttrans.spliceText(&doc, text, 0, 0, "hello");
-    try rttrans.mark(&doc, text, 0, 5, "link", .after, .{ .str = "https://example.com" });
+    const items = try doc.putObject(.root, .{ .key = "items" }, .list);
+    const a = try doc.insertObject(items, 0, .map);
+    _ = try doc.put(a, .{ .key = "id" }, .{ .str = "a" });
+    _ = try doc.put(a, .{ .key = "n" }, .{ .int = 1 });
+    const text = try doc.putObject(.root, .{ .key = "text" }, .text);
+    try doc.spliceText(text, 0, 0, "hello");
+    try doc.mark(text, 0, 5, "link", .after, .{ .str = "https://example.com" });
 
     const beginning = try doc.getHeads(gpa);
     defer gpa.free(beginning);
 
-    var one = try hydrateMap(RtSet, &doc.ops, gpa, .root, null);
+    var one = try hydrateMap(RtSet, &doc.doc.ops, gpa, .root, null);
     defer one.deinit();
-    var two = try hydrateMap(RtSet, &doc.ops, gpa, .root, null);
+    var two = try hydrateMap(RtSet, &doc.doc.ops, gpa, .root, null);
     defer two.deinit();
 
     // **The aliasing claim, which is the whole of it.** Two reads of one op
@@ -4655,12 +4732,12 @@ test "hydrate: two reads of one op set give two mirrors different bytes" {
     // measured failure was a mirror reading the wrong byte for exactly this,
     // and the mirror is read again afterwards rather than trusted.
     try doc.isolate(gpa, beginning);
-    _ = try rttrans.put(&doc, a, .{ .key = "id" }, .{ .str = "changed" });
-    try rttrans.spliceText(&doc, text, 5, 0, "!");
+    _ = try doc.put(a, .{ .key = "id" }, .{ .str = "changed" });
+    try doc.spliceText(text, 5, 0, "!");
     try doc.integrate();
 
     try testing.expectEqualStrings("a", firstElemId(&one).?);
-    try testing.expectEqualStrings("hello", rootText(&one).?.asStr());
+    try expectTextString("hello", rootText(&one).?);
     {
         const m1 = rootTextMark(&one).?;
         try testing.expectEqualStrings("link", m1.name);
@@ -4670,10 +4747,10 @@ test "hydrate: two reads of one op set give two mirrors different bytes" {
     // **And the document really did move**, so the three assertions above are
     // about a mirror that is a snapshot rather than about one that was never
     // in the way of anything.
-    var three = try hydrateMap(RtSet, &doc.ops, gpa, .root, null);
+    var three = try hydrateMap(RtSet, &doc.doc.ops, gpa, .root, null);
     defer three.deinit();
     try testing.expectEqualStrings("changed", firstElemId(&three).?);
-    try testing.expectEqualStrings("hello!", rootText(&three).?.asStr());
+    try expectTextString("hello!", rootText(&three).?);
 }
 
 /// The bytes the mirror's own hash table holds under `want`, or null. The key
@@ -4690,20 +4767,20 @@ fn mirrorKey(m: *const Map, want: []const u8) ?[]const u8 {
 /// The document's string table's own copy of `want`, or null — the bytes a
 /// borrowing key would be reading.
 fn internedStr(doc: *const rtdoc.Document, want: []const u8) ?[]const u8 {
-    for (doc.strings.items.items) |item| {
-        if (std.mem.eql(u8, item, want)) return item;
+    if (doc.strings.map.getIndex(want)) |idx| {
+        return doc.strings.map.keys()[idx];
     }
     return null;
 }
 
 test "hydrate: a mirror key is the map's own bytes, and outlives the op set's copy" {
     const gpa = testing.allocator;
-    var doc = try rtdoc.Document.init(gpa, std.testing.io, .auto);
+    var doc = try rtowner.AutoCommit.init(gpa, std.testing.io);
     defer doc.deinit();
-    doc.setActorId(.{ .bytes = "7f" });
-    _ = try rttrans.put(&doc, .root, .{ .key = "id" }, .{ .str = "a" });
+    try doc.setActorId(.{ .bytes = "7f" });
+    _ = try doc.put(.root, .{ .key = "id" }, .{ .str = "a" });
 
-    var one = try hydrateMap(RtSet, &doc.ops, gpa, .root, null);
+    var one = try hydrateMap(RtSet, &doc.doc.ops, gpa, .root, null);
     defer one.deinit();
 
     // **The key bytes, and not the value found under them.** The test above
@@ -4715,20 +4792,20 @@ test "hydrate: a mirror key is the map's own bytes, and outlives the op set's co
     // **The premise is asserted, not assumed**: the key column holds an id into
     // the document's string table ([`Columns.splice`](opset/columns.zig):1182),
     // and there is no interned copy to compare against if it ever stops.
-    const interned = internedStr(&doc, "id") orelse return error.TestUnexpectedResult;
+    const interned = internedStr(&doc.doc, "id") orelse return error.TestUnexpectedResult;
     try testing.expect(key.ptr != interned.ptr);
 
     // **And the op set really does take on new strings while `one` is held**,
     // so the read afterwards is about a mirror that was in the way of the
     // document rather than about one nothing ever happened to.
-    const before = doc.strings.count();
+    const before = doc.doc.strings.count();
     var i: usize = 0;
     while (i < 16) : (i += 1) {
         var name: [24]u8 = undefined;
         const fresh = try std.fmt.bufPrint(&name, "fresh-{d}-padding", .{i});
-        _ = try rttrans.put(&doc, .root, .{ .key = fresh }, ival(@intCast(i)));
+        _ = try doc.put(.root, .{ .key = fresh }, ival(@intCast(i)));
     }
-    try testing.expect(doc.strings.count() > before);
+    try testing.expect(doc.doc.strings.count() > before);
 
     try testing.expectEqualStrings("id", key);
     try testing.expectEqualStrings("a", one.object.map.get("id").?.asStr());
@@ -4757,42 +4834,37 @@ test "hydrate: winnerKey borrows a map key and formats a sequence anchor" {
     var anchor = try winnerKey(Fixture.Set, &f.set, gpa, .fromElemId(elem(3, 0)));
     defer anchor.deinit(gpa);
     try testing.expect(anchor.owned != null);
-    try testing.expectEqualStrings("3@" ++ rt_actor.bytes, anchor.bytes);
+    try testing.expectEqualStrings("3@aaaaaaaaaaaaaaaa", anchor.bytes);
     try testing.expectEqual(anchor.owned.?.ptr, anchor.bytes.ptr);
 }
 
-test "hydrate: Text.take adopts the caller's buffer, init copies it, and both free once" {
+test "hydrate: Text.take consumes input, init copies borrowed bytes, and both free once" {
     const gpa = testing.allocator;
 
-    // **The address is the assertion.** Two buffers holding equal bytes is
-    // what a copying text produces too, so the only way to say which
-    // constructor ran is to ask whether the mirror is holding the very buffer
-    // it was handed.
+    // Successful take consumes the input: never read it after this call.
     const mine = try gpa.dupe(u8, "abc");
-    var taken = Text.take(gpa, .root, doc_enc, mine);
+    var taken = Text.take(gpa, .root, doc_enc, mine) catch |failure| {
+        gpa.free(mine);
+        return failure;
+    };
     defer taken.deinit();
-    try testing.expectEqualStrings("abc", taken.asStr());
-    try testing.expectEqual(@intFromPtr(mine.ptr), @intFromPtr(taken.value.bytes.ptr));
+    try expectTextString("abc", &taken);
 
-    var copied = try Text.init(gpa, .root, doc_enc, mine);
+    var scratch = [_]u8{ 'a', 'b', 'c' };
+    var copied = try Text.init(gpa, .root, doc_enc, &scratch);
     defer copied.deinit();
-    try testing.expectEqualStrings("abc", copied.asStr());
-    try testing.expect(copied.value.bytes.ptr != mine.ptr);
-
-    // **And the adopted buffer is released exactly once.** `splice` frees the
-    // one it replaced and `deinit` frees the one it installed, so the
-    // testing allocator reports a leak if either free did not happen.
+    @memset(&scratch, '!');
+    try expectTextString("abc", &copied);
     try taken.splice(0, "ab");
-    try testing.expectEqualStrings("ababc", taken.asStr());
+    try expectTextString("ababc", &taken);
 
-    // **The op-set path still reads the same.** `hydrateText` adopts its
-    // buffer rather than copying it, so the content is compared against what
-    // the copying constructor would have made of the same bytes.
+    // The op-set path still reads the same native content as the copying
+    // constructor. No constructor promises adoption of a byte pointer.
     var rt = try roundTripDoc(gpa);
     defer rt.deinit();
-    var from_set = try hydrateText(RtSet, &rt.doc.ops, gpa, rt.text, null);
+    var from_set = try hydrateText(RtSet, &rt.doc.doc.ops, gpa, rt.text, null);
     defer from_set.deinit();
-    const want = try rt.doc.ops.text(gpa, rt.text, null);
+    const want = try rt.doc.doc.ops.text(gpa, rt.text, null);
     defer gpa.free(want);
     var wanted = try Text.init(gpa, rt.text, doc_enc, want);
     defer wanted.deinit();
@@ -4819,7 +4891,7 @@ test "hydrate: two applications of one stream give two mirrors different bytes" 
         });
         defer set.deinit();
         log.mark(sk_list, 0, 1, &set);
-        break :blk log.makePatches(TestDoc, &sk_doc);
+        break :blk fixturePatches(&log, &sk_objs);
     };
     defer ps.deinit();
 
@@ -4968,9 +5040,11 @@ fn expectMirrorMatches(
             const src = try doc.text(gpa, obj);
             defer gpa.free(src);
             const gt = asText(got) orelse return wrongKind(path, "text");
-            if (!std.mem.eql(u8, src, gt.asStr())) {
+            const rendered = try gt.makeString(gpa);
+            defer gpa.free(rendered);
+            if (!std.mem.eql(u8, src, rendered)) {
                 std.debug.print("{s}: document text \"{s}\", mirror text \"{s}\"\n", .{
-                    path, src, gt.asStr(),
+                    path, src, rendered,
                 });
                 return error.TestUnexpectedResult;
             }
@@ -5249,7 +5323,7 @@ test "a patch that indexes into a text applies and changes nothing" {
     try applyAll(gpa, &m, &ps, "a patch into a text's contents");
 
     const t = asText(m.object.map.get("text").?) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings("ab", t.asStr());
+    try expectTextString("ab", t);
     try testing.expectEqual(@as(usize, 2), t.count());
     // **The same step into a list is not a no-op**, and that is what makes the
     // one a decision about texts rather than a shrug over indices: the
@@ -5296,7 +5370,7 @@ test "a sequence counter increments by index, and a sequence conflict flags the 
         log.insert(sk_list, 2, .{ .scalar = cval(30) }, opId(62, 0), false);
         log.incrementSeq(sk_list, 1, 7, opId(63, 0));
         log.flagConflict(sk_list, .{ .index = 2 });
-        break :blk log.makePatches(TestDoc, &sk_doc);
+        break :blk fixturePatches(&log, &sk_objs);
     };
     defer ps.deinit();
 
@@ -5329,7 +5403,7 @@ test "a sequence counter increments by index, and a sequence conflict flags the 
         defer log.deinit();
         log.incrementMap(sk_nested, "c", 3, opId(64, 0));
         log.flagConflict(sk_nested, .{ .key = "c" });
-        break :blk log.makePatches(TestDoc, &sk_doc);
+        break :blk fixturePatches(&log, &sk_objs);
     };
     defer mps.deinit();
     var seed = try seeded(gpa);
@@ -5415,7 +5489,7 @@ test "an increment or a conflict naming the wrong kind of property is refused, n
     }
 }
 
-test "a text takes an insert, takes a put_seq, and refuses text that is not text in the encoding" {
+test "a text takes an insert and put_seq and renders invalid native UTF8 units lossily" {
     const gpa = testing.allocator;
 
     // **`Text::apply`'s `Insert` arm** (`hydrate/text.rs`:35-44`), which the
@@ -5454,7 +5528,7 @@ test "a text takes an insert, takes a put_seq, and refuses text that is not text
         // index advanced by one unit the "Z" would have landed between the
         // bytes of the U+1F600 and the text would have been left holding
         // invalid UTF-8 — which is a different, and much quieter, fault.
-        try testing.expectEqualStrings("\xf0\x9f\x98\x80Zab", inner.asStr());
+        try expectTextString("\xf0\x9f\x98\x80Zab", inner);
         try testing.expectEqual(@as(usize, 7), inner.count());
     }
 
@@ -5479,32 +5553,19 @@ test "a text takes an insert, takes a put_seq, and refuses text that is not text
                 return error.TestUnexpectedResult;
             },
         }
-        try testing.expectEqualStrings("aZc", inner.asStr());
+        try expectTextString("aZc", inner);
     }
 
-    // **And the encoding refusal** — upstream's `InvalidEncoding`, which is
-    // `splice_text_value`'s error turned into a [`Failure`] (`hydrate/text.rs`:32`,
-    // `hydrate.rs`:174`). This case exercises invalid stored bytes; the
-    // range-deletion regression below also checks unrepresentable boundaries
-    // in otherwise valid UTF-16 text. An index past the end clamps rather
-    // than complaining. Here the mirror starts out holding bytes no text can
-    // hold, and the walk over them is what fails.
+    // Native UTF-8 retains invalid bytes; rendering alone replaces them.
     {
-        var t = try Value.text(gpa, doc_enc, "\xffab");
+        var t = try Value.text(gpa, .utf8_code_unit, "\xffab");
         defer t.deinit();
         const inner = &t.object.text;
+        try expectTextString("\xef\xbf\xbdab", inner);
         var ps = try onePatch(gpa, .root, &.{}, .{ .delete_seq = .{ .index = 0, .length = 1 } });
         defer ps.deinit();
-        const f = try expectRefusal(&t, &ps, "a delete from text that is not text");
-        switch (f) {
-            .invalid_encoding => {},
-            else => {
-                std.debug.print("expected invalid_encoding, got {s}\n", .{@tagName(f)});
-                return error.TestUnexpectedResult;
-            },
-        }
-        // **Nothing was removed**, which a refusal on its own does not say.
-        try testing.expectEqualStrings("\xffab", inner.asStr());
+        try testing.expect((try t.applyOne(.utf8_code_unit, ps.items.items[0])) == .ok);
+        try expectTextString("ab", inner);
     }
 }
 
@@ -5522,7 +5583,7 @@ test "Text.apply delete_seq preserves the suffix after a supplementary scalar in
             .ok => {},
             .refused => return error.TestUnexpectedResult,
         }
-        try testing.expectEqualStrings("abcd", text.asStr());
+        try expectTextString("abcd", &text);
         try testing.expectEqual(enc.width("abcd"), text.count());
     }
 }
@@ -5533,7 +5594,8 @@ test "Text.apply delete_seq leaves the whole action unchanged on allocation refu
         const gpa = failing.allocator();
         var text = try Text.init(gpa, .root, .unicode_code_point, "abcd");
         defer text.deinit();
-        const old = text.value.bytes;
+        var old = try text.value.dup(testing.allocator);
+        defer old.deinit();
         failing.fail_index = failing.alloc_index + offset;
         const applied = text.apply(.unicode_code_point, .{ .delete_seq = .{ .index = 1, .length = 2 } });
         failing.fail_index = std.math.maxInt(usize);
@@ -5542,16 +5604,16 @@ test "Text.apply delete_seq leaves the whole action unchanged on allocation refu
                 .ok => {},
                 .refused => return error.TestUnexpectedResult,
             }
-            try testing.expectEqualStrings("ad", text.asStr());
+            try expectTextString("ad", &text);
         } else |failure| {
             try testing.expectEqual(error.OutOfMemory, failure);
-            try testing.expectEqualStrings("abcd", text.asStr());
-            try testing.expectEqual(old.ptr, text.value.bytes.ptr);
+            try expectTextString("abcd", &text);
+            try testing.expect(text.value.eql(old));
         }
     }
 }
 
-test "Text.apply delete_seq refuses split UTF16 boundaries without changing text" {
+test "Text.apply delete_seq retains split UTF16 units and renders them lossily" {
     const initial = "ab\xf0\x9f\x98\x80cd";
     for ([_]struct { index: usize, length: usize }{
         .{ .index = 2, .length = 1 },
@@ -5559,28 +5621,26 @@ test "Text.apply delete_seq refuses split UTF16 boundaries without changing text
     }) |span| {
         var text = try Text.init(testing.allocator, .root, .utf16_code_unit, initial);
         defer text.deinit();
-        const old = text.value.bytes;
+        try testing.expectEqual(@as(usize, 6), text.count());
         const applied = try text.apply(.utf16_code_unit, .{ .delete_seq = .{
             .index = span.index,
             .length = span.length,
         } });
         switch (applied) {
-            .refused => |failure| switch (failure) {
-                .invalid_encoding => {},
-                else => return error.TestUnexpectedResult,
-            },
-            .ok => return error.TestUnexpectedResult,
+            .refused => return error.TestUnexpectedResult,
+            .ok => {},
         }
-        try testing.expectEqualStrings(initial, text.asStr());
-        try testing.expectEqual(old.ptr, text.value.bytes.ptr);
+        try expectTextString("ab\xef\xbf\xbdcd", &text);
+        try testing.expectEqual(@as(usize, 5), text.count());
     }
 }
 
-test "Text.apply delete_seq clamps overshoot and preserves no-op buffers" {
+test "Text.apply delete_seq clamps overshoot and preserves exact native no-op values" {
     for ([_]TextEncoding{ .unicode_code_point, .utf8_code_unit, .utf16_code_unit, .grapheme_cluster }) |enc| {
         var text = try Text.init(testing.allocator, .root, enc, "ab\xf0\x9f\x98\x80cd");
         defer text.deinit();
-        const old = text.value.bytes;
+        var old = try text.value.dup(testing.allocator);
+        defer old.deinit();
         for ([_]struct { index: usize, length: usize }{
             .{ .index = 1, .length = 0 },
             .{ .index = std.math.maxInt(usize), .length = std.math.maxInt(usize) },
@@ -5589,14 +5649,14 @@ test "Text.apply delete_seq clamps overshoot and preserves no-op buffers" {
                 .ok => {},
                 .refused => return error.TestUnexpectedResult,
             }
-            try testing.expectEqual(old.ptr, text.value.bytes.ptr);
-            try testing.expectEqualStrings("ab\xf0\x9f\x98\x80cd", text.asStr());
+            try testing.expect(text.value.eql(old));
+            try expectTextString("ab\xf0\x9f\x98\x80cd", &text);
         }
         switch (try text.apply(enc, .{ .delete_seq = .{ .index = 2, .length = std.math.maxInt(usize) } })) {
             .ok => {},
             .refused => return error.TestUnexpectedResult,
         }
-        try testing.expectEqualStrings("ab", text.asStr());
+        try expectTextString("ab", &text);
         try testing.expectEqual(enc.width("ab"), text.count());
     }
 }
@@ -5608,16 +5668,16 @@ test "a document in all four encodings hydrates to the same bytes, and its marks
     // code-point document on this host, so a test that only ever calls it
     // reaches [`TextEncoding.width`]'s first arm and no other.
     for ([_]TextEncoding{ .unicode_code_point, .utf8_code_unit, .utf16_code_unit, .grapheme_cluster }) |enc| {
-        var doc = try rtdoc.Document.initWithEncoding(gpa, std.testing.io, enc, .auto);
+        var doc = try rtowner.AutoCommit.initWithEncoding(gpa, std.testing.io, enc);
         defer doc.deinit();
-        doc.setActorId(.{ .bytes = "0123456789abcdef" });
-        const text = try rttrans.putObject(&doc, .root, .{ .key = "text" }, .text);
+        try doc.setActorId(.{ .bytes = "0123456789abcdef" });
+        const text = try doc.putObject(.root, .{ .key = "text" }, .text);
         // **A character that is not one unit in any of the three that count
         // code points, code units or UTF-16 units**: U+1F600 is one code point,
         // four UTF-8 code units and two UTF-16 code units, so every encoding
         // puts this text at a different length.
-        try rttrans.spliceText(&doc, text, 0, 0, "a\xf0\x9f\x98\x80b");
-        try rttrans.mark(&doc, text, 1, 3, "bold", .after, .{ .bool_value = true });
+        try doc.spliceText(text, 0, 0, "a\xf0\x9f\x98\x80b");
+        try doc.mark(text, 1, 3, "bold", .after, .{ .bool_value = true });
 
         const heads = try doc.getHeads(gpa);
         defer gpa.free(heads);
@@ -5637,18 +5697,13 @@ test "a document in all four encodings hydrates to the same bytes, and its marks
         // **The bytes are the document's, whatever the encoding measured them
         // in.**
         const t = asText(rootMap(&mirror).get("text") orelse return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
-        try testing.expectEqualStrings("a\xf0\x9f\x98\x80b", t.asStr());
+        try expectTextString("a\xf0\x9f\x98\x80b", t);
         // **And the length is the encoding's**, read back off the mirror's own
         // text and not off the string: this is the assertion that says the
         // mirror spliced in *its* encoding rather than the default one.
         try testing.expectEqual(enc.width("a\xf0\x9f\x98\x80b"), t.count());
 
-        // **The mark set, compared by hand and not with [`Text.eql`].** That
-        // helper is `asStr()` alone (see its doc), so a document whose marks
-        // were dropped entirely would pass a comparison written with it; the
-        // round trip above is the reason that is acceptable there and the
-        // reason it is not acceptable here. Every name, every value, and no
-        // name the document does not have.
+        // Native text equality ignores marks; compare every name and value.
         try testing.expectEqual(@as(usize, 1), t.marks.len());
         try testing.expectEqualStrings("bold", t.marks.entries.items[0].name);
         try testing.expect(t.marks.entries.items[0].value.eql(.{ .bool_value = true }));
@@ -5674,7 +5729,7 @@ test "a conflict flag on a put, a put_seq and an insert reaches the mirror" {
         log.putMap(.root, "c", .{ .scalar = ival(2) }, opId(61, 0), true, false);
         log.putSeq(sk_list, 0, .{ .scalar = sval("Z") }, opId(62, 0), true, false);
         log.insert(sk_list, 1, .{ .scalar = ival(9) }, opId(63, 0), true);
-        break :blk log.makePatches(TestDoc, &sk_doc);
+        break :blk fixturePatches(&log, &sk_objs);
     };
     defer ps.deinit();
 
@@ -5711,7 +5766,7 @@ test "a table is a map, in a patch and in the op set" {
             var log: patches.PatchLog = .active(gpa);
             defer log.deinit();
             log.putMap(.root, "tbl", .{ .object = .table }, opId(60, 0), false, false);
-            break :blk log.makePatches(TestDoc, &sk_doc);
+            break :blk fixturePatches(&log, &sk_objs);
         };
         defer ps.deinit();
         var m = Value.map(gpa);
@@ -5758,7 +5813,7 @@ test "a table is a map, in a patch and in the op set" {
         // the wrong one the walk above reads the root's registers and finds
         // nothing there, which is a crash rather than a wrong answer — so this
         // assertion is the one that says which of the two it was.
-        try testing.expect(got.objId().?.eql(ex(1, 0)));
+        try testing.expect(got.objId().?.eql(ExId.withActor(opId(1, 0), rt_actor)));
     }
 }
 
@@ -6010,8 +6065,325 @@ test "two marks on one element, and the second one does not lose the first" {
 //   refusal costs one branch and its removal would turn a future refactor of
 //   the guard into a crash.
 //
-// * **`Text.eql` is `asStr()` alone, and §12 does not use it.** Every mark
-//   assertion in the new tests is made against the name and the value by
+// * **`Text.eql` compares exact native units, not marks, and §12 does not use it.**
+//   Every mark assertion in the new tests is made against the name and value by
 //   hand, and the four-encoding loop says so in as many words: a mirror whose
 //   marks were dropped entirely passes a comparison written with that helper,
 //   which is why the round trip may use it and this section may not.
+
+test "parity rich hydrate unsigned integers wrap to signed values" {
+    // Rust's `as i64` preserves the low 64 bits, including the sign bit.
+    try testing.expectEqual(std.math.maxInt(i64), (Value{ .uint = 0x7fffffffffffffff }).asI64());
+    try testing.expectEqual(std.math.minInt(i64), (Value{ .uint = 0x8000000000000000 }).asI64());
+    try testing.expectEqual(@as(i64, -1), (Value{ .uint = std.math.maxInt(u64) }).asI64());
+}
+
+test "parity rich hydrate deep duplication survives source teardown" {
+    // A copied nested mirror must own keys, scalar bytes and child containers.
+    var source = Value.map(testing.allocator);
+    {
+        var child = Value.list(testing.allocator);
+        errdefer child.deinit();
+        try child.object.list.push(.{ .str = "nested bytes" }, true);
+        try child.object.list.items.getMut(0).?.marks.put("link", .{ .str = "target" });
+        try source.object.map.putOwned("nested key", MapValue.init(child, true));
+    }
+    var copied = try source.dup(testing.allocator);
+    defer copied.deinit();
+    source.deinit();
+    const nested = copied.value.asMap().?.get("nested key").?;
+    try testing.expectEqualStrings("nested bytes", nested.object.list.get(0).?.str);
+    const element = nested.object.list.items.get(0).?;
+    try testing.expect(element.conflict);
+    try testing.expect(copied.value.object.map.entries.get("nested key").?.conflict);
+    try testing.expectEqualStrings("link", element.marks.entries.items[0].name);
+    try testing.expectEqualStrings("target", element.marks.entries.items[0].value.str);
+}
+
+test "parity rich hydrate patches follow properties across foreign object ids" {
+    // Rust walks path properties and does not require ID identity in mirrors.
+    var mirror = Value.map(testing.allocator);
+    defer mirror.deinit();
+    try mirror.object.map.putOwned("child", MapValue.init(Value.map(testing.allocator), false));
+    const path = [_]PathElem{.{ .obj = ex(400, 0), .prop = .{ .key = "child" } }};
+    var stream = try onePatch(testing.allocator, ex(401, 0), &path, .{
+        .put_map = .{
+            .key = "answer",
+            .value = .{ .scalar = .{ .int = 42 } },
+            .obj = ex(402, 0),
+            .conflict = false,
+        },
+    });
+    defer stream.deinit();
+    const applied = try mirror.applyPatches(.unicode_code_point, stream.slice());
+    try testing.expect(applied == .ok);
+    try testing.expectEqual(@as(i64, 42), mirror.object.map.get("child").?.object.map.get("answer").?.int);
+}
+
+test "parity rich hydrate cloning allocation failure preserves source" {
+    // Every failed copy must leave the source usable and own no leaked payloads.
+    const Probe = struct {
+        fn run(gpa: Allocator) !void {
+            var source = Value.map(testing.allocator);
+            defer source.deinit();
+            var child = Value.list(testing.allocator);
+            try child.object.list.push(.{ .bytes = &.{ 0, 255, 1 } }, false);
+            try source.object.map.putOwned("payload", MapValue.init(child, false));
+            var copied = source.dup(gpa) catch |failure| {
+                try testing.expectEqualSlices(u8, &.{ 0, 255, 1 }, source.object.map.get("payload").?.object.list.get(0).?.bytes);
+                return failure;
+            };
+            defer copied.deinit();
+            try testing.expect(source.eql(&copied.value));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Probe.run, .{});
+}
+
+fn expectTextString(expected: []const u8, text: *const Text) !void {
+    const rendered = try text.makeString(testing.allocator);
+    defer testing.allocator.free(rendered);
+    try testing.expectEqualStrings(expected, rendered);
+}
+
+test "hydrate owned scalar initialization and duplication detach all byte-bearing arms" {
+    for (0..4) |kind| {
+        var backing = [_]u8{ 0, 255, 7 };
+        const scalar: ScalarValue = switch (kind) {
+            0 => .{ .str = &backing },
+            1 => .{ .bytes = &backing },
+            2 => .{ .actor_id = .init(&backing) },
+            else => .{ .unknown = .{ .type_code = 14, .bytes = &backing } },
+        };
+        var initialized = try Value.init(testing.allocator, .{ .scalar = scalar }, doc_enc);
+        defer initialized.deinit();
+        var copied = try initialized.value.dup(testing.allocator);
+        defer copied.deinit();
+        @memset(&backing, 42);
+        const expected: Value = Value.fromScalar(switch (kind) {
+            0 => .{ .str = &.{ 0, 255, 7 } },
+            1 => .{ .bytes = &.{ 0, 255, 7 } },
+            2 => .{ .actor_id = .init(&.{ 0, 255, 7 }) },
+            else => .{ .unknown = .{ .type_code = 14, .bytes = &.{ 0, 255, 7 } } },
+        });
+        try testing.expect(initialized.value.eql(&expected));
+        try testing.expect(copied.value.eql(&expected));
+    }
+}
+
+test "hydrate marked element and register copies survive independent mutation and teardown" {
+    var name = [_]u8{ 'l', 'i', 'n', 'k' };
+    var bytes = [_]u8{ 0, 255, 7 };
+    var actor = [_]u8{ 9, 0, 255 };
+    var element = ListValue.init(testing.allocator, .{ .bytes = &bytes }, true);
+    try element.marks.put(&name, .{ .actor_id = .init(&actor) });
+    var copied = try element.dup(testing.allocator);
+    defer copied.deinit();
+    element.deinit();
+    @memset(&name, '!');
+    @memset(&bytes, 42);
+    @memset(&actor, 42);
+    try testing.expect(copied.conflict);
+    try testing.expectEqualSlices(u8, &.{ 0, 255, 7 }, copied.value.bytes);
+    try testing.expectEqualStrings("link", copied.marks.entries.items[0].name);
+    try testing.expectEqualSlices(u8, &.{ 9, 0, 255 }, copied.marks.entries.items[0].value.actor_id.bytes);
+    try copied.marks.put("link", .{ .str = "changed" });
+
+    var register = MapValue.init(.{ .str = "original" }, true);
+    var cloned = try register.dup(testing.allocator);
+    defer cloned.deinit();
+    register.deinit();
+    try testing.expect(cloned.conflict);
+    try testing.expectEqualStrings("original", cloned.value.str);
+}
+
+test "hydrate container copies and patch construction own actor identity beyond its source" {
+    for ([_]ObjType{ .map, .list, .text }) |kind| {
+        var actor = [_]u8{ 9, 0, 255 };
+        const id = ExId.withActor(opId(17, 4), .init(&actor));
+        var source: Value = switch (kind) {
+            .map => .{ .object = .{ .map = Map.init(testing.allocator, id) } },
+            .list => .{ .object = .{ .list = List.init(testing.allocator, id) } },
+            .text => .{ .object = .{ .text = try Text.init(testing.allocator, id, .utf16_code_unit, "😀") } },
+            .table => unreachable,
+        };
+        var copied = try source.dup(testing.allocator);
+        defer copied.deinit();
+        var patched = try Value.fromPatch(testing.allocator, .{ .object = kind }, id, doc_enc);
+        defer patched.deinit();
+        source.deinit();
+        @memset(&actor, 42);
+        for ([_]ExId{ copied.value.objId().?, patched.objId().? }) |held| {
+            try testing.expectEqual(@as(u32, 17), held.opId().?.counter);
+            try testing.expectEqualSlices(u8, &.{ 9, 0, 255 }, held.actorBytes().?.bytes);
+        }
+        if (kind == .text) try expectTextString("😀", &copied.value.object.text);
+    }
+}
+
+test "hydrate native patch splice and duplication preserve incomplete encoding units" {
+    for ([_]TextEncoding{ .utf8_code_unit, .utf16_code_unit }) |enc| {
+        var patch_text = try patches.ConcreteTextValue.init(testing.allocator, "😀", enc);
+        defer patch_text.deinit();
+        try patch_text.removeRange(0, 1);
+        var target = try Text.init(testing.allocator, .root, enc, "");
+        defer target.deinit();
+        try testing.expect((try target.apply(enc, .{ .splice_text = .{
+            .index = 0,
+            .value = patch_text,
+            .marks = null,
+        } })) == .ok);
+        try testing.expect(target.value.eql(patch_text));
+        var copied = try target.dup(testing.allocator);
+        defer copied.deinit();
+        try target.splice(0, "x");
+        try testing.expect(copied.value.eql(patch_text));
+        try testing.expectEqual(patch_text.len(), copied.count());
+    }
+}
+
+test "hydrate Text.take allocation failure retains caller bytes and success consumes once" {
+    const Probe = struct {
+        fn run(gpa: Allocator) !void {
+            // The input and native storage must share the same allocator.
+            const bytes = try gpa.dupe(u8, "a😀b");
+            var text = Text.take(gpa, .root, .utf16_code_unit, bytes) catch |failure| {
+                defer gpa.free(bytes);
+                try testing.expectEqualStrings("a😀b", bytes);
+                return failure;
+            };
+            defer text.deinit();
+            try expectTextString("a😀b", &text);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Probe.run, .{});
+}
+
+test "hydrate marked native deep copies preserve source on every allocation failure" {
+    const Probe = struct {
+        fn run(gpa: Allocator) !void {
+            const actor = [_]u8{ 9, 0, 255 };
+            var source = try Text.init(testing.allocator, ExId.withActor(opId(17, 4), .init(&actor)), .utf16_code_unit, "a😀b");
+            defer source.deinit();
+            try source.value.removeRange(1, 1);
+            try source.marks.put("link", .{ .bytes = &.{ 0, 255, 7 } });
+            var snapshot = try source.value.dup(testing.allocator);
+            defer snapshot.deinit();
+            var copied = source.dup(gpa) catch |failure| {
+                try testing.expect(source.value.eql(snapshot));
+                try testing.expectEqualSlices(u8, &.{ 0, 255, 7 }, source.marks.entries.items[0].value.bytes);
+                try testing.expectEqualSlices(u8, &actor, source.id.actorBytes().?.bytes);
+                return failure;
+            };
+            defer copied.deinit();
+            try testing.expect(copied.value.eql(snapshot));
+            try testing.expect(copied.marks.eql(&source.marks));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Probe.run, .{});
+}
+
+test "hydrate scalar register element and object construction failures preserve borrowed inputs" {
+    const Probe = struct {
+        fn run(gpa: Allocator, route: usize) !void {
+            const actor = [_]u8{ 9, 0, 255 };
+            const scalar = ScalarValue{ .actor_id = .init(&actor) };
+            const borrowed = Value.fromScalar(scalar);
+            switch (route) {
+                0 => {
+                    var copied = try borrowed.dup(gpa);
+                    defer copied.deinit();
+                    try testing.expect(copied.value.eql(&borrowed));
+                },
+                1 => {
+                    var initialized = try Value.init(gpa, .{ .scalar = scalar }, doc_enc);
+                    defer initialized.deinit();
+                    try testing.expect(initialized.value.eql(&borrowed));
+                },
+                2 => {
+                    var source = MapValue.init(borrowed, true);
+                    defer source.deinit();
+                    var copied = source.dup(gpa) catch |failure| {
+                        try testing.expect(source.conflict);
+                        try testing.expect(source.value.eql(&borrowed));
+                        return failure;
+                    };
+                    defer copied.deinit();
+                    try testing.expect(copied.eql(&source));
+                },
+                3 => {
+                    var source = ListValue.init(testing.allocator, borrowed, true);
+                    defer source.deinit();
+                    try source.marks.put("bytes", .{ .bytes = &.{ 0, 255, 7 } });
+                    var copied = source.dup(gpa) catch |failure| {
+                        try testing.expect(source.value.eql(&borrowed));
+                        try testing.expectEqualSlices(u8, &.{ 0, 255, 7 }, source.marks.entries.items[0].value.bytes);
+                        return failure;
+                    };
+                    defer copied.deinit();
+                    try testing.expect(copied.eql(&source));
+                },
+                else => {
+                    const kind: ObjType = switch (route) {
+                        4 => .map,
+                        5 => .list,
+                        else => .text,
+                    };
+                    const id = ExId.withActor(opId(17, 4), .init(&actor));
+                    var created = try Value.fromPatch(gpa, .{ .object = kind }, id, doc_enc);
+                    defer created.deinit();
+                    try testing.expect(created.objId().?.eql(id));
+                },
+            }
+            try testing.expectEqualSlices(u8, &.{ 9, 0, 255 }, &actor);
+        }
+    };
+    for (0..7) |route| {
+        try testing.checkAllAllocationFailures(testing.allocator, Probe.run, .{route});
+    }
+}
+
+test "hydrate op set outputs retain object ids marks and values after document teardown" {
+    var map: Value = undefined;
+    var list: Value = undefined;
+    var text: Value = undefined;
+    {
+        var fixture = try roundTripDoc(testing.allocator);
+        defer fixture.deinit();
+        map = try hydrateMap(RtSet, &fixture.doc.doc.ops, testing.allocator, .root, null);
+        errdefer map.deinit();
+        const list_id = rootMap(&map).get("list").?.objId().?;
+        list = try hydrateList(RtSet, &fixture.doc.doc.ops, testing.allocator, list_id, null);
+        errdefer list.deinit();
+        text = try hydrateText(RtSet, &fixture.doc.doc.ops, testing.allocator, fixture.text, null);
+    }
+    defer map.deinit();
+    defer list.deinit();
+    defer text.deinit();
+    for ([_]ExId{
+        rootMap(&map).get("nested").?.objId().?,
+        rootMap(&map).get("list").?.objId().?,
+        rootMap(&map).get("text").?.objId().?,
+        list.objId().?,
+        text.objId().?,
+    }) |id| {
+        try testing.expectEqualStrings("0123456789abcdef", id.actorBytes().?.bytes);
+    }
+    try testing.expectEqualStrings("one", list.object.list.get(0).?.str);
+    try expectTextString("hello world", &text.object.text);
+    try testing.expectEqual(@as(usize, 2), text.object.text.marks.len());
+    try testing.expectEqualStrings("A", rootMap(&map).get("nested").?.object.map.get("a").?.str);
+    var saw_link = false;
+    var saw_bold = false;
+    var marks = text.object.text.marks.iter();
+    while (marks.next()) |mark| {
+        if (std.mem.eql(u8, mark.name, "link")) {
+            try testing.expectEqualStrings("https://example.com", mark.value.str);
+            saw_link = true;
+        } else if (std.mem.eql(u8, mark.name, "bold")) {
+            try testing.expect(mark.value.eql(.{ .bool_value = true }));
+            saw_bold = true;
+        } else return error.TestUnexpectedResult;
+    }
+    try testing.expect(saw_link and saw_bold);
+}

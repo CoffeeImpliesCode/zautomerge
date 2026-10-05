@@ -220,7 +220,17 @@ fn checkOneObject(
     if (window.end <= window.start) return;
     const first = try objectAt(C, cols, window, window.start);
     const last = try objectAt(C, cols, window, window.end - 1);
-    if (!last.eql(first)) return error.InvalidIndex;
+    if (!sameRowObject(last, first)) return error.InvalidIndex;
+}
+
+// These objects come from columns, whose IDs are already table-local.
+// A named public ID needs authoritative actor resolution before this kernel.
+fn sameRowObject(a: ObjId, b: ObjId) bool {
+    return switch (a) {
+        .root => b == .root,
+        .id => |id| b == .id and id.eql(b.id),
+        .named => false,
+    };
 }
 
 /// The six cheap columns [`TopIter`]'s scan flavour reads, one row at a
@@ -460,8 +470,9 @@ pub fn ScanTopIter(comptime O: type) type {
         /// (`op_set.rs:1085-1087`, `:1246-1250`), so a multi-object range is
         /// a caller's mistake about a range, not a property of the bytes.
         fn checkOwner(self: *Self, obj: ObjId) err.Error!void {
+            if (obj == .named) return error.InvalidIndex;
             if (self.owner) |want| {
-                if (!obj.eql(want)) return error.InvalidIndex;
+                if (!sameRowObject(obj, want)) return error.InvalidIndex;
                 return;
             }
             self.owner = obj;
@@ -1126,6 +1137,19 @@ const doc = [_]Row{
 const root_rows: RowRange = .{ .start = 0, .end = 12 };
 /// Object L's rows.
 const list_rows: RowRange = .{ .start = 12, .end = doc.len };
+
+test "top row ownership rejects unresolved public actor hints" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, &.{});
+    defer fx.deinit();
+    var clock = try Clock.init(gpa, 1);
+    defer clock.deinit();
+    var scan = try ScanTopIter(Row).init(&fx.cols, .{ .start = 0, .end = 0 }, clock, &.{});
+    try testing.expectError(error.InvalidIndex, scan.checkOwner(ObjId.withActor(OpId.init(1, 999), .{ .bytes = "actor" })));
+    try scan.checkOwner(.{ .id = OpId.init(1, 0) });
+    try scan.checkOwner(.{ .id = OpId.init(1, 0) });
+    try testing.expectError(error.InvalidIndex, scan.checkOwner(.{ .id = OpId.init(1, 1) }));
+}
 
 /// A clock that covers every op in `rows` — every row *and* every successor
 /// id any of them names, since a delete op is never stored as a row

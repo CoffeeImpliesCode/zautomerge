@@ -1,166 +1,23 @@
-//! The write surface: the bodies behind every method in `API.md`'s
-//! [`## Write`](../API.md) section, and the pending-operation machinery they
-//! all share.
+//! The single native transaction engine over a raw Document.
 //!
-//! Upstream has no file like this. The twenty methods are
-//! [`Transactable`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs)'s
-//! declarations (`transaction/transactable.rs:9-181`) and the bodies live in
-//! [`TransactionInner`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs),
-//! which
-//! `impl_read_doc_for_tx!` (`transaction.rs:37-315`) and
-//! `impl_transactable_for_tx!` (`:317-526`) generate for
-//! [`Transaction<'a>`](../../github-automerge-automerge/rust/automerge/src/transaction/manual_transaction.rs)
-//! and [`OwnedTransaction`](../../github-automerge-automerge/rust/automerge/src/transaction/owned_transaction.rs).
-//! **That macro output is public API and this port has no equivalent**, so
-//! [plan §3.2](../../docs/plan.md) answers it the way this file implements: one
-//! concrete [`Document`](doc.zig) plus a [`Mode`](doc.zig) flag, and a vtable
-//! only where a caller genuinely holds either flavour polymorphically. This
-//! file is where the **bodies** live, taking `*Document` and applying the
-//! pending operations. It is not where a trait is declared, and it declares
-//! none.
+//! AutoCommit and the C owner hold this same journal across writes. Native
+//! callers keep the document and transaction addresses stable until terminal
+//! commit/rollback. Commit returns a hash and the transaction-owned PatchLog;
+//! callers dispose or transfer that log, including inactive results.
 //!
-//! # The two decisions this file had to make
+//! Every queued operation owns its slice payloads through the journal. Pending
+//! stores the TxOp undo view and ChangeOp encoding view of the same operation.
+//! Batches queue builders, then publish one op-set splice; unpublished entries
+//! are discarded rather than undone when a producer refuses before publication.
 //!
-//! **1. A pending operation is [`opmod.TxOp`] and nothing else.**
-//! [`TransactionInner.pending`] is a `Vec<TxOp>`
-//! ([`inner.rs:22-33`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs))
-//! and so is this file's, because a rollback needs three things a `ChangeOp`
-//! does not carry: the row the operation landed at (`TxOp.pos`), the successor
-//! edges to take back (`TxOp.undo`) and the register range a scoped
-//! transaction captured (`TxOp.reset_range`,
-//! [`inner.rs:246-257`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)).
-//! `src/opset/op.zig` already has the type and its six constructors
-//! ([`op.rs:261-449`](../../github-automerge-automerge/rust/automerge/src/op_set2/op.rs)),
-//! and this file uses those; there is no second representation of an operation
-//! here.
+//! Ordinary readers use the transaction write clock, including its pending
+//! operations. Explicit-head readers borrow retained historical clocks that
+//! survive selecting another read view. Hydration deliberately follows raw
+//! Document semantics instead of the write scope.
 //!
-//! **2. Commit means "hand [`Document.commit`] the change's own operations",
-//! and the transaction's `TxOp`s are converted at that moment.**
-//! [`Document.commit`](doc.zig) takes `ops: []const opmod.ChangeOp`, so the
-//! other two answers were available: carry `ChangeOp`s from the start, or
-//! convert. **This file converts, and it carries both.** Every operation is
-//! built as a `TxOp` (decision 1) and *at once* as the `ChangeOp` that the op
-//! set and the change encoder are both typed to, and the pair is what
-//! [`Pending`] holds. The reason is in the op set: a document holds
-//! `OpSet(ChangeOp)` and is not generic over the op type
-//! ([`batchmod.BatchApply`](opset/batch.zig) splices `ChangeOp`s and
-//! [`Columns.splice`](opset/columns.zig) is typed to `O`), so
-//! [`OpSet.splice`](opset/op_set.zig) cannot be handed a `TxOp` at all. The
-//! duplication is one predecessor-list copy per operation, and it is paid once
-//! rather than at every splice *and* every commit.
-//!
-//! The consequence worth writing down: **an operation's `TxOp` and its
-//! `ChangeOp` are built from the same nine fields, so they cannot disagree**,
-//! and [`Pending`] frees both. Upstream reaches the same place from the other
-//! side — `export` calls `build_change(&self.pending, ...)`
-//! ([`inner.rs:197-207`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)),
-//! which encodes the `TxOp`s it has been carrying.
-//!
-//! # The two flavours, and what the wrong door costs
-//!
-//! Upstream's `Transactable` is implemented for two *types*, and reaching the
-//! wrong one does not compile. Here the two are one type and a flag, so the
-//! door has to be checked at runtime: **every module-level function in this
-//! file refuses a document that is not in [`Mode.auto`], and
-//! [`Transaction.open`] refuses one that is, both with
-//! `error.InvalidOp`.** That is the whole of the substitution, and it is a
-//! refusal rather than a trap because Rust's answer was a compile error and the
-//! closest honest runtime answer is an error, not a silent success.
-//!
-//! Native automatic refusal retains published or queued work in
-//! `Document.auto_recovery` without allocating. A validation refusal with no
-//! pending producer or rollback work disposes only the empty transaction;
-//! valid unused actor metadata remains owned by the document. The primary error
-//! is returned unchanged. Retained rollback is explicit through
-//! `Document.recoverAuto` or retried before the next native automatic write.
-//! Until recovery succeeds, held/manual entry is refused and retained operations
-//! cannot be committed.
-//!
-//! [`Mode.auto`]: doc.zig
-//! [`Mode.manual`]: doc.zig
-//!
-//! # The transaction's lifetime, and the one contract this file breaks
-//!
-//! **Every module-level function here opens a transaction, writes, and commits
-//! it, so two calls are two transactions and two changes.** Upstream's
-//! `AutoCommit` does not work that way: it opens a transaction lazily
-//! (`ensure_transaction_open`,
-//! [`autocommit.rs:445-457`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs))
-//! and leaves it open **across calls**, closing it only on `commit_with`
-//! (`:728-739`), `rollback` (`:742-750`) or one of the methods that needs the
-//! change history to be current — `ensure_transaction_closed` (`:459-468`),
-//! which `get_heads` (`:695`), `get_changes` (`:621`), `save` (`:530-533`),
-//! `apply_changes`, `merge`, `load_incremental` and `dump` all call. **The
-//! plain `ReadDoc` accessors do not close it**, so a write is visible to a read
-//! before it is in any change.
-//!
-//! **Executed against the reference, this is one change and not two.**
-//! `put_object(ROOT, "first", Text)` then `splice_text(&first, 0, 0, "hello")`
-//! with no `commit()` between them leaves **one** change of six operations in
-//! `get_changes()`, and `text(&first)` already answers `"hello"` before
-//! anything commits. The same two calls with a `commit()` between them are two
-//! changes.
-//!
-//! **The consequence is not a change count, and it is not a preference.**
-//! Upstream's `incremental_list_conflict_survives_isolate_integrate_roundtrip`
-//! (`tests/test.rs:4179-4208`) puts `put_object` and then `splice_text` inside
-//! one isolation with no commit between, so `isolate_actor`
-//! ([`automerge.rs:1259-1281`](../../github-automerge-automerge/rust/automerge/src/automerge.rs))
-//! is chosen **once** and the pair is one change on the level-1 concurrency
-//! actor. Here the pair is two transactions: the second opens at the same
-//! isolation heads, finds `max_op_for_actor(fork) != 0`, forks **again** to the
-//! next concurrency level — and the object the first transaction created is
-//! outside the second transaction's scope clock, so [`Transaction.exidToObj`]
-//! refuses it. **The reference's own test does not merely answer differently
-//! here; the second call is `error.InvalidObjId`.** The two tests at the
-//! bottom of this file pin both halves: the refusal, and the fact that
-//! advancing the isolation heads by hand does not restore one change.
-//!
-//! **The two doors therefore disagree today.** `AMdoc` *is* a held transaction
-//! ([`src/c/doc.zig`](c/doc.zig)): it opens through [`openAutoHeld`] and
-//! commits only on `AMcommit` or a closing read. **The decision recorded here
-//! is that this surface must hold one too**, because the alternative is a
-//! document that depends on which door edited it. That is a wrapper type and
-//! not a flag — a [`Transaction`] borrows its `Document`, so a `Document`
-//! cannot own one — and the diff block at the bottom of this file carries the
-//! blast radius and the sequencing.
-//!
-//! # Where the bulk paths go
-//!
-//! [`splice`] and [`spliceText`] are the two methods that write many
-//! operations, and both go through [`Batch`], upstream's `BatchInsertion`
-//! ([`inner.rs:1435-1520`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)):
-//! the operations are appended to `pending` **without being spliced**, and
-//! [`Batch.finish`] performs **one** [`OpSet.splice`] for the whole batch. That
-//! one call is where the batch's cost is paid — one partition, one byte splice
-//! and one index update per column, which is the whole reason
-//! [`hexane/edit.zig`](hexane/edit.zig) exists. A bulk insert written any other
-//! way would be a second implementation of a thing that is already here.
-//!
-//! `BatchInsertion::next_pos` assumes every queued operation lands contiguously
-//! at the insert position
-//! ([`inner.rs:1460-1462`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)),
-//! and that assumption is *checked* by the test that reads a ten-character
-//! splice back and walks every consecutive pair of rows through
-//! [`Op.step`](opset/op.zig).
-//!
-//! # Ownership
-//!
-//! * Every entry point that allocates takes a `std.mem.Allocator`; the
-//!   module-level functions take it from the document
-//!   ([`Document.allocator`](doc.zig)) because `API.md`'s signatures name no
-//!   allocator for them, and pass the document's own.
-//! * A **borrowed slice is valid only while its owner is**
-//!   ([plan §5.4](../../docs/plan.md)). [`put`]'s `value` and [`mark`]'s
-//!   `name` and `value` are borrowed from the caller and are copied into the
-//!   op set's own columns by the splice; the caller keeps them alive across the
-//!   call and no longer.
-//! * [`baseHeads`] returns a **borrow** from the document's change graph and
-//!   [`Transaction.baseHeads`] a borrow from the transaction. Neither is owned
-//!   by the caller and neither is freed by one.
-//! * [`Transaction.deinit`] frees the pending list, the transaction's
-//!   dependencies and the scope clock, and nothing else. The operations'
-//!   borrowed payloads belong to the caller.
+//! deinit is fallible: it rolls back an open journal, retaining the journal and
+//! its sole patch owner on refusal. deinitClosed is resource-only disposal after
+//! a terminal transition, or when the entire raw document is being destroyed.
 
 const std = @import("std");
 const err = @import("error.zig");
@@ -179,6 +36,9 @@ const spansmod = @import("iter/spans.zig");
 const changerec = @import("change.zig");
 const readmod = @import("read.zig");
 const textdiff = @import("textdiff.zig");
+const patchesmod = @import("patches.zig");
+const batchmod = @import("opset/batch.zig");
+const transactionmod = @import("transaction.zig");
 
 const Allocator = std.mem.Allocator;
 const Action = valuemod.Action;
@@ -220,6 +80,8 @@ const testing = std.testing;
 /// block marker. Re-exported from [iter/spans.zig](iter/spans.zig), which owns
 /// the walk that produces one and the ownership rule for its payloads.
 pub const Span = spansmod.Span;
+/// Borrowed rich-span input; block maps are copied into this journal owner.
+pub const SpanInput = spansmod.SpanInput;
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -235,7 +97,8 @@ pub const Span = spansmod.Span;
 /// impossible raises [`err.InternalError`]. [`asError`] is the one place the
 /// narrow set is produced, so a caller never has to match two error sets.
 pub const WriteError = Error || ParseError || InternalError ||
-    opitermod.ReadOpError || opsetmod.SearchError || docmod.LoadError;
+    opitermod.ReadOpError || opsetmod.SearchError || docmod.LoadError ||
+    readmod.DiffError || readmod.HydrateError || readmod.ChangeError || error{ChangeType};
 
 /// The document [`Error`] an internal refusal becomes.
 ///
@@ -271,38 +134,30 @@ fn asError(e: WriteError) Error {
 /// split is the module doc's second decision: the document's op set is
 /// `OpSet(ChangeOp)` and its `splice` is typed to that, while
 /// [`OpSet.undoOp`](opset/op_set.zig) takes a `TxOp` and reads `pos`, `undo`
-/// and `reset_range` off it. One operation, two views, built once from the same
-/// nine fields and freed together.
+/// and `reset_range` off it. `tx` owns the predecessor storage; `op` borrows
+/// it and never escapes the pending transaction. Callers must not mutate that
+/// storage while the view lives. Dispose `op` before its owner `tx`.
 pub const Pending = struct {
-    /// The operation, as a transaction carries it.
+    /// The operation and owner of its predecessor storage.
     tx: TxOp,
-    /// The same operation, as the op set and the change encoder take it.
+    /// The op set and change encoder view, borrowing `tx`'s predecessors.
     op: ChangeOp,
+    /// False while a batch owns queued builders not yet published as rows.
+    published: bool = true,
 
-    /// Frees both views. The borrowed payloads — a string value, a map key, a
-    /// mark name — belong to the caller and are not touched
-    /// ([op.zig](opset/op.zig), `OpBuilder.deinit`).
+    /// Frees the borrowing view before its predecessor owner. Other slice
+    /// payloads belong to the journal's `owned` buffers, released separately.
     pub fn deinit(self: *Pending, gpa: Allocator) void {
-        self.tx.deinit(gpa);
         self.op.deinit(gpa);
+        self.tx.deinit(gpa);
         self.* = undefined;
     }
 };
 
-/// The same operation as a [`ChangeOp`] ([`change_op_from`], one call).
-fn changeOpOf(gpa: Allocator, op: *const TxOp) Allocator.Error!ChangeOp {
-    return ChangeOp.init(
-        gpa,
-        op.id(),
-        op.objId(),
-        op.action(),
-        op.key(),
-        op.value(),
-        op.insert(),
-        op.expand(),
-        op.markName(),
-        op.pred(),
-    );
+/// A transaction-only change view borrowing the paired `TxOp`'s predecessors.
+/// The caller transfers both into `Pending`; the view must not escape it.
+fn changeOpOf(op: *const TxOp) ChangeOp {
+    return ChangeOp.initBorrowingTxPred(op);
 }
 
 /// The one operation an insert produced ([`InsertedOp`],
@@ -406,7 +261,7 @@ pub const Transaction = struct {
     /// an operation that borrowed it would be reading freed bytes by the time
     /// [`commit`] encodes the change.
     owned: std.ArrayList([]u8),
-    /// The hydrated maps [`hydrateBlock`] built, freed by [`deinit`].
+    /// Deep-owned maps held at stable addresses for rich-span diff descriptors.
     ///
     /// **Each map is its own allocation, not a slot in this list**, and that is
     /// the whole point: a [`Block`] hands the diff a `*const hydmod.Map`, and
@@ -422,6 +277,10 @@ pub const Transaction = struct {
     /// This is the same debt [`ownText`] pays for a spliced character, on the
     /// other side of the same diff.
     blocks: std.ArrayList(*hydmod.Map),
+    /// The sole patch owner for this transaction, moved out on successful commit.
+    patch_log: patchesmod.PatchLog,
+    /// Clone-only ownership for a scope that otherwise borrows constructor heads.
+    scope_heads_owned: ?[]ChangeHash = null,
 
     /// A transaction over `args`, which it takes ownership of
     /// ([`TransactionInner::new`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):68-91).
@@ -445,16 +304,20 @@ pub const Transaction = struct {
             .pending = .empty,
             .blocks = .empty,
             .owned = .empty,
+            .patch_log = patchesmod.PatchLog.inactive(gpa),
         };
     }
 
-    /// Frees the pending operations, the dependencies, the scope clock, the
-    /// cached text, the bytes the operations borrowed (`owned`) and the block
-    /// maps the diff borrowed (`blocks`), and nothing else. It does **not**
-    /// roll back: upstream's `Transaction` does that in `Drop`
-    /// ([`manual_transaction.rs:135-145`](../../github-automerge-automerge/rust/automerge/src/transaction/manual_transaction.rs))
-    /// and this port puts the same rule on the caller, who must say which.
-    pub fn deinit(self: *Transaction) void {
+    /// Close an open journal by rollback, then release its resources.
+    /// On refusal the exact journal and patch owner remain available for retry.
+    pub fn deinit(self: *Transaction) WriteError!void {
+        if (!self.closed) _ = try self.rollback();
+        self.deinitClosed();
+    }
+
+    /// Resource-only disposal after commit/rollback, or while destroying the
+    /// entire owning document. Never use this to abandon rows in a live document.
+    pub fn deinitClosed(self: *Transaction) void {
         if (self.text_cache) |bytes| self.gpa.free(bytes);
         for (self.owned.items) |bytes| self.gpa.free(bytes);
         self.owned.deinit(self.gpa);
@@ -467,32 +330,127 @@ pub const Transaction = struct {
         for (self.pending.items) |*item| item.deinit(self.gpa);
         self.pending.deinit(self.gpa);
         self.gpa.free(self.deps);
+        if (self.scope_heads_owned) |heads| self.gpa.free(heads);
+        self.patch_log.deinit();
         self.* = undefined;
     }
 
-    /// Opens a transaction on a document in [`Mode.manual`]
-    /// ([`Automerge::transaction`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
-    ///
-    /// `error.InvalidOp` for a document in autocommit mode: upstream's
-    /// `Transaction::new` takes an `Automerge`, so the two flavours cannot be
-    /// confused, and here they can.
-    /// Pending native automatic recovery also refuses entry with `error.InvalidOp`.
+    /// Open a journal over the raw document. Constructor refusal leaves the
+    /// document unchanged; the dependency/scope owner moves only on success.
     pub fn open(gpa: Allocator, doc: *Document) WriteError!Transaction {
-        if (doc.documentMode() != .manual) return error.InvalidOp;
-        const args = try doc.transactionArgs(gpa, null);
-        return Transaction.init(gpa, doc, args);
+        return openAt(gpa, doc, null);
     }
 
-    /// Opens a transaction scoped to `heads`
-    /// ([`Automerge::transaction_at`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
-    ///
-    /// **`heads` is borrowed** and must outlive the transaction: the scope
-    /// clock is built from it on first use, which may be after this returns.
-    /// Pending native automatic recovery refuses entry with `error.InvalidOp`.
+    /// `heads` is borrowed for the journal lifetime.
     pub fn openAt(gpa: Allocator, doc: *Document, heads: ?[]const ChangeHash) WriteError!Transaction {
-        if (doc.documentMode() != .manual) return error.InvalidOp;
-        const args = try doc.transactionArgs(gpa, heads);
-        return Transaction.init(gpa, doc, args);
+        var prepared = try doc.prepareTransactionArgs(gpa, heads);
+        defer prepared.deinit();
+        return Transaction.init(gpa, doc, doc.publishTransactionArgs(&prepared));
+    }
+
+    /// Consume an actor-compatible external log only after constructor preflight.
+    /// Current/scoped actor insertion is included; refusal preserves both owners.
+    pub fn openWithPatchLog(
+        gpa: Allocator,
+        doc: *Document,
+        log: *patchesmod.PatchLog,
+        heads: ?[]const ChangeHash,
+    ) WriteError!Transaction {
+        var prepared = try doc.prepareTransactionArgs(gpa, heads);
+        defer prepared.deinit();
+        // Prepared actors include a newly selected current or concurrency actor,
+        // but neither actor insertion nor queue pruning has been published.
+        try log.validateActors(prepared.actors);
+        try log.bindBegin(doc.patchIdentity(), prepared.actors, prepared.args.seq, prepared.args.actor_index);
+        var out = Transaction.init(gpa, doc, doc.publishTransactionArgs(&prepared));
+        out.patch_log.deinit();
+        out.patch_log = log.take();
+        return out;
+    }
+
+    /// Duplicate a journal against an exact pending-row clone of its raw
+    /// document. The source remains open; all payloads, undo records and patch
+    /// checkpoint storage are independent. `target_doc` must stay at this address.
+    pub fn cloneInto(self: *const Transaction, gpa: Allocator, target_doc: *Document) WriteError!Transaction {
+        var out = self.*;
+        out.gpa = gpa;
+        out.doc = target_doc;
+        out.deps = try gpa.dupe(ChangeHash, self.deps);
+        out.scope_heads_owned = null;
+        out.scope = null;
+        out.pending = .empty;
+        out.owned = .empty;
+        out.blocks = .empty;
+        out.text_cache = null;
+        out.patch_log = patchesmod.PatchLog.inactive(gpa);
+        errdefer out.deinitClosed();
+        if (self.scope_heads) |heads| {
+            const copied = try gpa.dupe(ChangeHash, heads);
+            out.scope_heads_owned = copied;
+            out.scope_heads = copied;
+        }
+        if (self.scope) |scope| {
+            out.scope = .{
+                .gpa = gpa,
+                .len = scope.len,
+                .slots = try gpa.dupe(u32, scope.slots),
+            };
+        }
+        if (self.message) |message| out.message = try out.ownText(message);
+        out.patch_log = try self.patch_log.cloneAndRebind(gpa, target_doc.patchIdentity());
+        try out.pending.ensureTotalCapacity(gpa, self.pending.items.len);
+        for (self.pending.items) |*item| {
+            var tx = item.tx;
+            tx.bld = try out.cloneBuilder(&item.tx.bld);
+            tx.undo = .empty;
+            errdefer tx.deinit(gpa);
+            try tx.undo.appendSlice(gpa, item.tx.undo.items);
+            // Borrow the cloned builder's predecessor storage, never the source's.
+            var change = changeOpOf(&tx);
+            errdefer change.deinit(gpa);
+            change.pos = item.op.pos;
+            change.subsort = item.op.subsort;
+            change.conflicted = item.op.conflicted;
+            try change.succs.appendSlice(gpa, item.op.succs.items);
+            out.pending.appendAssumeCapacity(.{ .tx = tx, .op = change, .published = item.published });
+        }
+        return out;
+    }
+
+    fn cloneBuilder(self: *Transaction, source: *const opmod.OpBuilder) WriteError!opmod.OpBuilder {
+        var out = source.*;
+        out._pred = .empty;
+        errdefer out._pred.deinit(self.gpa);
+        try out._pred.appendSlice(self.gpa, source._pred.items);
+        try self.ownBuilderPayload(&out);
+        return out;
+    }
+
+    /// Intern every slice carried by a queued builder in this journal owner.
+    fn ownBuilderPayload(self: *Transaction, builder: *opmod.OpBuilder) WriteError!void {
+        // Actor bytes are authoritative after transaction actor insertion.
+        // A batch parent may not have a resident make row yet. Resolve its
+        // identity without rechecking object existence already validated by
+        // the public writer or established by the batch's own make operation.
+        builder._obj = switch (builder._obj) {
+            .named => self.doc.ops.resolveIdentity(builder._obj) orelse return error.NotAnObject,
+            else => builder._obj,
+        };
+        switch (builder._key) {
+            .map => |key| builder._key = .{ .map = try self.ownText(key) },
+            else => {},
+        }
+        builder._value = switch (builder._value) {
+            .str => |value| .{ .str = try self.ownText(value) },
+            .bytes => |value| .{ .bytes = try self.ownText(value) },
+            .actor_id => |actor| .{ .actor_id = .{ .bytes = try self.ownText(actor.bytes) } },
+            .unknown => |value| .{ .unknown = .{
+                .type_code = value.type_code,
+                .bytes = try self.ownText(value.bytes),
+            } },
+            else => builder._value,
+        };
+        if (builder._mark_name) |name| builder._mark_name = try self.ownText(name);
     }
 
     /// How many operations this transaction has made
@@ -532,7 +490,7 @@ pub const Transaction = struct {
     /// the clock a read through this transaction runs at. That method takes the
     /// transaction's own scope and **not** the document's, which is the whole
     /// difference between a read here and a read through the document.
-    pub fn scopeClock(self: *Transaction) WriteError!?Clock {
+    pub fn scopeClock(self: *Transaction) readmod.ReadError!?Clock {
         if (!self.scope_built) {
             if (self.scope_heads) |heads| {
                 var clock = try self.doc.graph.clockAt(self.gpa, heads);
@@ -579,8 +537,8 @@ pub const Transaction = struct {
     /// what the write is anchored to.
     fn exidToObj(self: *Transaction, id: ExId) WriteError!ObjMeta {
         try self.requireOpen();
-        const live = self.doc.resolve(id) orelse return error.NotAnObject;
-        const obj = ObjMeta{ .id = live, .typ = try self.doc.objectType(live) };
+        const live = self.doc.ops.resolveObjId(id) orelse return error.NotAnObject;
+        const obj = ObjMeta{ .id = live, .typ = self.doc.ops.objectType(live) orelse return error.NotAnObject };
         const oid = live.opId() orelse return obj; // the root is always in scope
         const ctr = @as(u64, oid.counter);
         const made_here = oid.actor == self.actor and
@@ -616,7 +574,7 @@ pub const Transaction = struct {
     /// on an op id the document already holds — the same collision that a
     /// `max_op` of zero produces.
     fn requireOpen(self: *const Transaction) WriteError!void {
-        if (self.closed or self.rolling_back or self.doc.auto_recovery != null)
+        if (self.closed or self.rolling_back)
             return error.InvalidOp;
     }
 
@@ -640,11 +598,13 @@ pub const Transaction = struct {
         var transferred = false;
         errdefer if (!transferred) op.deinit(self.gpa);
         if (self.start_op + self.pending.items.len > std.math.maxInt(u32)) return error.Overflow;
+        try self.ownBuilderPayload(&op.bld);
 
-        var change = try changeOpOf(self.gpa, &op);
+        var change = changeOpOf(&op);
         errdefer if (!transferred) change.deinit(self.gpa);
         try self.pending.ensureUnusedCapacity(self.gpa, 1);
         const added = try self.doc.ops.splice(op.pos, &.{change});
+        self.doc.invalidateHistoricalScopes();
         // Publication transfers undo ownership before any successor or index
         // mutation can refuse. A partially produced operation is rollback-only.
         self.pending.appendAssumeCapacity(.{ .tx = op, .op = change });
@@ -659,6 +619,65 @@ pub const Transaction = struct {
                 .end = range.end + added,
             });
         }
+    }
+
+    fn patchValue(action: Action, scalar: ScalarValue) batchmod.PatchValue {
+        if (action.objType()) |typ| return .{ .object = typ };
+        return .{ .scalar = scalar };
+    }
+
+    fn incrementReplacement(rows: []const Op, resolved: ResolvedAction) ?batchmod.PatchValue {
+        if (!resolved.isIncrement() or rows.len <= 1) return null;
+        for (rows) |row| if (row.value() == .counter) {
+            return .{ .scalar = row.value() };
+        };
+        return null;
+    }
+
+    fn checkPatchLog(self: *Transaction) WriteError!void {
+        if (self.patch_log.oom) {
+            self.rolling_back = true;
+            return error.OutOfMemory;
+        }
+    }
+
+    /// Record each producer event, not a final-state reconstruction at commit.
+    fn finalizeOp(self: *Transaction, op: *const TxOp, marks_set: ?*const MarkSet, replaced: ?batchmod.PatchValue) WriteError!void {
+        if (!self.patch_log.recording or op.noop or op.isMark()) return;
+        const obj = op.objId();
+        const id = op.id();
+        const prop = op.prop();
+        const value = patchValue(op.bld._action, op.value());
+        if (op.bld._insert) {
+            if (op.obj_type == .text) {
+                self.patch_log.splice(obj, op.index, op.asStr(), marks_set);
+            } else {
+                self.patch_log.insert(obj, op.index, value, id, false);
+            }
+        } else if (op.isDelete()) {
+            switch (prop) {
+                .key => |key| self.patch_log.deleteMap(obj, key),
+                .index => |index| self.patch_log.deleteSeq(obj, index, 1),
+            }
+        } else if (op.getIncrementValue()) |delta| {
+            if (replaced) |old| {
+                var materialized = old;
+                materialized.scalar.counter.current +%= delta;
+                switch (prop) {
+                    .key => |key| self.patch_log.putMap(obj, key, materialized, id, false, false),
+                    .index => |index| self.patch_log.putSeq(obj, index, materialized, id, false, false),
+                }
+            } else switch (prop) {
+                .key => |key| self.patch_log.incrementMap(obj, key, delta, id),
+                .index => |index| self.patch_log.incrementSeq(obj, index, delta, id),
+            }
+        } else if (op.obj_type == .text and prop == .index and replaced != null) {
+            self.patch_log.replaceSeq(obj, op.index, replaced.?, value, id, false, false, .text, self.doc.textEncoding(), marks_set);
+        } else switch (prop) {
+            .key => |key| self.patch_log.putMap(obj, key, value, id, false, false),
+            .index => |index| self.patch_log.putSeq(obj, index, value, id, false, false),
+        }
+        try self.checkPatchLog();
     }
 
     /// An operation on a map key ([`local_map_op`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):446-493).
@@ -689,101 +708,31 @@ pub const Transaction = struct {
             return error.MissingCounter;
         }
 
-        const pred = try self.gpa.alloc(OpId, query.ops.items.len);
-        defer self.gpa.free(pred);
+        const pred_len = query.ops.items.len;
+        var pred_inline: [1]OpId = undefined;
+        const pred = if (pred_len <= pred_inline.len)
+            pred_inline[0..pred_len]
+        else
+            try self.gpa.alloc(OpId, pred_len);
+        defer if (pred_len > pred_inline.len) self.gpa.free(pred);
         for (query.ops.items, pred) |row, *slot| slot.* = row.id();
 
-        const pos = try mapKeyRow(
-            &self.doc.ops,
-            obj.id,
-            key,
-            query.range,
-            query.end_pos,
-        );
-        const succ = try self.gpa.alloc(SuccInsert, query.ops.items.len);
-        defer self.gpa.free(succ);
+        // Both existing registers and absent keys supply their exact sorted
+        // end through the query (`transaction/inner.rs:473`).
+        const pos = query.end_pos;
+        var succ_inline: [1]SuccInsert = undefined;
+        const succ = if (pred_len <= succ_inline.len)
+            succ_inline[0..pred_len]
+        else
+            try self.gpa.alloc(SuccInsert, pred_len);
+        defer if (pred_len > succ_inline.len) self.gpa.free(succ);
         const tx = try TxOp.map(self.gpa, id, obj, pos, resolved, key, pred);
         const inc = tx.getIncrementValue();
         for (query.ops.items, succ) |row, *slot| slot.* = row.addSucc(id, inc);
 
         try self.insertLocalOp(tx, succ, query.range);
+        try self.finalizeOp(&self.pending.items[self.pending.items.len - 1].tx, null, incrementReplacement(query.ops.items, resolved));
         return id;
-    }
-
-    /// The row a new operation on the map key `key` of `obj` takes
-    /// ([`inner.rs:473`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs),
-    /// `TxOp::map(id, *obj, query.end_pos, ..)`).
-    ///
-    /// **There are two answers and the register's own rows pick between them.**
-    ///
-    /// A register with rows takes the row **one past its last**. Rule **R3** makes
-    /// ids ascend within a register ([`Op.step`](opset/op.zig),
-    /// `op.rs:1056-1057`), and a local operation's id is above every counter in
-    /// the document: `start_op` is `change_graph.max_op() + 1`
-    /// ([`automerge.rs:567`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-    /// not this actor's own next counter, and [`TransactionInner::next_id`] adds
-    /// the pending count ([`inner.rs:294-296`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)).
-    /// So the new id is greater than the register's last one whichever actor
-    /// wrote that one, and appending at `end_pos` keeps **R3**. That is why
-    /// upstream writes `query.end_pos` with no check at all.
-    ///
-    /// A register with **no** rows takes the row its key *sorts at*, and not the
-    /// object's end. Upstream's `query.end_pos` is `prop_range(obj, prop).end`
-    /// ([`op_set.rs:611-628`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)),
-    /// `prop_range` is `key_str.scope_to_value(Some(prop), obj_range)`
-    /// ([`op_set.rs:1268-1271`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)),
-    /// and **hexane's `scope_to_value` answers the sorted insertion point for a
-    /// value the column does not hold**: over `aaa aaa bbb bbb bbb ccc` it answers
-    /// `2..2` for `"aab"` — which sorts between `"aaa"` and `"bbb"` — and `6..6`
-    /// for `"ddd"`
-    /// ([`hexane/src/tests.rs:3464-3476`](../../github-automerge-automerge/rust/hexane/src/tests.rs)).
-    /// That is rule **R2** (`op.rs:1059-1060`) and the only order a map can be read
-    /// in, because the reader does not sort
-    /// ([`map_range.zig:1486-1490`](iter/map_range.zig)).
-    ///
-    /// **So the position supplied here is the one `propRange` cannot answer.** The
-    /// port's `propRange` walks the key column rather than descending it — the
-    /// column holds interned ids, which are in insertion order and not key order
-    /// ([op_set.zig:2056-2064](opset/op_set.zig)) — and a walk that finds nothing
-    /// has no sorted place to stop at, so it answers the object's end
-    /// ([op_set.zig:2069-2091](opset/op_set.zig)). **That answer is right only for
-    /// a key greater than every key the object holds**, which is the one case that
-    /// needs no answer at all: a document whose rows are in order can be read
-    /// back differently by a map reader, and this is where it goes wrong.
-    ///
-    /// The walk is over the object's own rows, and the row order is what makes it
-    /// short: the first key that sorts above `key` ends it, because **R2** puts
-    /// every register's rows together and in key order.
-    fn mapKeyRow(
-        ops: *Set,
-        obj: ExId,
-        key: []const u8,
-        register_rows: RowRange,
-        end_pos: usize,
-    ) WriteError!usize {
-        if (register_rows.start < register_rows.end) return end_pos;
-        const rows = try ops.scopeToObj(obj);
-        var walk = try ops.iterRange(rows);
-        var at = rows.start;
-        while (try walk.next()) |row| {
-            switch (row.elemidOrKey()) {
-                // `Op::step`'s map arm compares two `KeyRef::Map` and requires the
-                // *previous* key to be the greater one (`op.rs:1059-1060`), so the
-                // row the new register takes is the **first row whose key sorts
-                // above `key`** — the register goes in front of it.
-                .map => |text| if (std.mem.order(u8, key, text) == .lt) return at,
-                // **A sequence anchor cannot be in a map object**: an object is
-                // made a map or a sequence and never both, and a row carries
-                // exactly one of the two or the walk refuses it
-                // ([`tryLoadKeyRef`](opset/op_iter.zig), `op_iter.rs:251-265`).
-                // It sorts above every string, which is the one answer that cannot
-                // put the new register behind a row it does not belong behind.
-                .seq => return at,
-            }
-            at += 1;
-        }
-        // Every key in the object sorts below `key`, so the register goes last.
-        return end_pos;
     }
 
     /// An operation on a sequence element
@@ -840,6 +789,11 @@ pub const Transaction = struct {
         for (query.ops.items, succ) |row, *slot| slot.* = row.addSucc(id, inc);
 
         try self.insertLocalOp(tx, succ, query.range);
+        const replacement: ?batchmod.PatchValue = incrementReplacement(query.ops.items, resolved) orelse if (seq == .text and query.ops.items.len != 0)
+            patchValue(query.ops.items[0].action(), query.ops.items[0].value())
+        else
+            null;
+        try self.finalizeOp(&self.pending.items[self.pending.items.len - 1].tx, null, replacement);
         return id;
     }
 
@@ -893,6 +847,7 @@ pub const Transaction = struct {
         // `inner.rs:396-399` — an insert has no predecessors, so no successor
         // edges and no `reset_top`, and the row goes in on its own.
         try self.insertLocalOp(tx, &.{}, .{ .start = 0, .end = 0 });
+        try self.finalizeOp(&self.pending.items[self.pending.items.len - 1].tx, if (query.marks) |*set| set else null, null);
         return .{ .id = id, .pos = query.pos, .index = query.index };
     }
 
@@ -1063,14 +1018,18 @@ pub const Transaction = struct {
             query.elemid,
         );
         try self.insertLocalOp(tx, &.{}, .{ .start = 0, .end = 0 });
+        if (self.patch_log.recording) {
+            self.patch_log.insert(meta.id, query.index, .{ .object = .map }, id, false);
+            try self.checkPatchLog();
+        }
         return self.doc.idToExid(id);
     }
 
     /// Removes the block at `index`, joining its text back together
     /// ([`join_block`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):931-982).
-    pub fn joinBlock(self: *Transaction, text: ExId, index: usize) WriteError!void {
+    pub fn joinBlock(self: *Transaction, text_obj: ExId, index: usize) WriteError!void {
         try self.requireOpen();
-        const meta = try self.exidToObj(text);
+        const meta = try self.exidToObj(text_obj);
         try requireType(meta, .text);
 
         var query = try self.doc.ops.seekOpsByIndex(
@@ -1112,7 +1071,8 @@ pub const Transaction = struct {
         var transferred = false;
         errdefer if (!transferred) op.deinit(self.gpa);
         const succ = [_]SuccInsert{found.op.addSucc(id, null)};
-        var change = try changeOpOf(self.gpa, &op);
+        try self.ownBuilderPayload(&op.bld);
+        var change = changeOpOf(&op);
         errdefer if (!transferred) change.deinit(self.gpa);
         try self.pending.append(self.gpa, .{ .tx = op, .op = change });
         transferred = true;
@@ -1121,13 +1081,19 @@ pub const Transaction = struct {
             &succ,
             &self.pending.items[self.pending.items.len - 1].tx.undo,
         );
+        self.doc.invalidateHistoricalScopes();
+        try self.finalizeOp(&self.pending.items[self.pending.items.len - 1].tx, null, null);
     }
 
     /// Replaces the block at `index` with a fresh empty one
     /// ([`replace_block`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):984-993).
-    pub fn replaceBlock(self: *Transaction, text: ExId, index: usize) WriteError!ExId {
-        try self.joinBlock(text, index);
-        return self.splitBlock(text, index);
+    pub fn replaceBlock(self: *Transaction, text_obj: ExId, index: usize) WriteError!ExId {
+        const pending_start = self.pending.items.len;
+        errdefer if (self.pending.items.len > pending_start) {
+            self.rolling_back = true;
+        };
+        try self.joinBlock(text_obj, index);
+        return self.splitBlock(text_obj, index);
     }
 
     /// Writes a mark over `[from, to)` ([`mark`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):801-876).
@@ -1144,6 +1110,10 @@ pub const Transaction = struct {
         expand: ExpandMark,
         value: ?ScalarValue,
     ) WriteError!void {
+        const pending_start = self.pending.items.len;
+        errdefer if (self.pending.items.len > pending_start) {
+            self.rolling_back = true;
+        };
         const meta = try self.exidToObj(obj);
         try requireType(meta, .text);
         // `inner.rs:813-825` — a zero-width mark with no expansion is a begin
@@ -1186,6 +1156,10 @@ pub const Transaction = struct {
         // `error.Invariant`, because a mark end before its begin is a document
         // that will not reload and a debug build is not where that is found.
         if (end.pos <= begin.pos) return error.Invariant;
+        if (self.patch_log.recording) {
+            self.patch_log.markSingle(meta.id, begin.index, end.index - begin.index, name, value orelse .null_value);
+            try self.checkPatchLog();
+        }
     }
 
     /// Removes a mark over `[from, to)`
@@ -1206,6 +1180,20 @@ pub const Transaction = struct {
         return self.mark(obj, from, to, name, expand, value);
     }
 
+    /// Splice hydrated scalar/object values using this journal's allocator.
+    pub fn splice(self: *Transaction, obj: ExId, pos: usize, del: isize, values_input: []const hydmod.Value) WriteError!void {
+        const meta = try self.exidToObj(obj);
+        switch (meta.typ) {
+            .list => try self.innerSplice(meta, pos, del, .{ .list = values_input }),
+            .text => {
+                const joined = try joinTextValues(self.gpa, values_input);
+                defer self.gpa.free(joined);
+                try self.innerSplice(meta, pos, del, .{ .text = joined });
+            },
+            else => return error.InvalidOp,
+        }
+    }
+
     // ── Splices ──────────────────────────────────────────────────────────
 
     /// Inserts `values` and removes `del` units at `pos`
@@ -1222,14 +1210,18 @@ pub const Transaction = struct {
         what: SpliceKind,
     ) WriteError!void {
         try self.requireOpen();
+        const pending_start = self.pending.items.len;
+        errdefer if (self.pending.items.len > pending_start) {
+            self.rolling_back = true;
+        };
         var index = pos;
         var del = del_in;
         if (del < 0) {
-            const back: usize = std.math.cast(usize, -del) orelse
+            const back: usize = std.math.cast(usize, @abs(del)) orelse
                 return error.InvalidIndex;
             if (back > index) return error.InvalidIndex;
             index -= back;
-            del = @intCast(back);
+            del = std.math.cast(isize, back) orelse return error.InvalidIndex;
         }
         const want: usize = @intCast(@max(del, 0));
         const seq = switch (what) {
@@ -1251,11 +1243,11 @@ pub const Transaction = struct {
             inserted_width = switch (what) {
                 .text => |t| blk: {
                     var batch = Batch.init(self, query.pos);
-                    const w = try batch.spliceText(obj, query.elemid, t);
+                    const w = try batch.spliceText(obj, query.elemid, t, query.index, if (query.marks) |*set| set else null);
                     try batch.finish();
                     break :blk w;
                 },
-                .list => |values| try self.spliceListValues(obj, query.pos, query.elemid, values),
+                .list => |values_input| try self.spliceListValues(obj, query.pos, query.elemid, query.index, values_input),
             };
         }
 
@@ -1284,6 +1276,10 @@ pub const Transaction = struct {
             try self.deleteOne(obj, delete_index, elem, query.ops.items);
             deleted += step;
         }
+        if (self.patch_log.recording and deleted != 0) {
+            self.patch_log.deleteSeq(obj.id, delete_index, deleted);
+            try self.checkPatchLog();
+        }
     }
 
     /// One delete operation over a register, with its successor edges
@@ -1307,7 +1303,8 @@ pub const Transaction = struct {
         var transferred = false;
         errdefer if (!transferred) op.deinit(self.gpa);
         for (rows, succ) |row, *slot| slot.* = row.addSucc(id, null);
-        var change = try changeOpOf(self.gpa, &op);
+        try self.ownBuilderPayload(&op.bld);
+        var change = changeOpOf(&op);
         errdefer if (!transferred) change.deinit(self.gpa);
         try self.pending.append(self.gpa, .{ .tx = op, .op = change });
         transferred = true;
@@ -1330,7 +1327,8 @@ pub const Transaction = struct {
         obj: ObjMeta,
         pos: usize,
         after: ElemId,
-        values: []const hydmod.Value,
+        index: usize,
+        values_input: []const hydmod.Value,
     ) WriteError!usize {
         const pending_start = self.pending.items.len;
         errdefer if (self.pending.items.len > pending_start) {
@@ -1342,7 +1340,7 @@ pub const Transaction = struct {
         {
             var batch = Batch.init(self, pos);
             var elem = after;
-            for (values, 0..) |_, i| {
+            for (values_input, 0..) |_, i| {
                 // **The queue borrows `values`, not the loop's copy.**
                 // Upstream walks `values.iter().enumerate()`
                 // ([`inner.rs:719`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)),
@@ -1352,7 +1350,7 @@ pub const Transaction = struct {
                 // the *last* element happened to be — which is why a splice
                 // of `[1, [7], "three"]` walked the scalar `"three"` as if it
                 // were the nested list and answered `error.InvalidOp`.
-                const value = &values[i];
+                const value = &values_input[i];
                 const made = valueObjectType(value.*);
                 const action: OpType = if (made) |t|
                     .{ .make = t }
@@ -1363,7 +1361,7 @@ pub const Transaction = struct {
                     self.nextId(),
                     obj,
                     batch.nextPos(),
-                    i,
+                    index + i,
                     action,
                     elem,
                 ));
@@ -1377,7 +1375,7 @@ pub const Transaction = struct {
             try batch.bfs(&queue);
             try batch.finish();
         }
-        return values.len;
+        return values_input.len;
     }
 
     // ── Commit and rollback ──────────────────────────────────────────────
@@ -1409,19 +1407,21 @@ pub const Transaction = struct {
     /// retry or rollback. A partial producer refusal is instead rollback-only.
     /// Metadata overrides apply only on success. Do not dispose an open
     /// transaction without undoing its rows.
-    pub fn commit(
-        self: *Transaction,
-        message: ?[]const u8,
-        time: ?i64,
-    ) WriteError!?ChangeHash {
+    pub fn commit(self: *Transaction) WriteError!transactionmod.CommitResult {
+        return self.commitWith(transactionmod.CommitOptions.none);
+    }
+
+    pub fn commitWith(self: *Transaction, options: transactionmod.CommitOptions) WriteError!transactionmod.CommitResult {
         try self.requireOpen();
+        if (self.patch_log.oom) return error.OutOfMemory;
         if (self.pending.items.len == 0) {
             try self.doc.removeUnusedActors(self.gpa);
+            self.patch_log.finishTransaction(self.doc.ops.actors.items);
             self.closed = true;
-            return null;
+            return .{ .hash = null, .patch_log = self.patch_log.take() };
         }
-        const commit_message = message orelse self.message;
-        const commit_time = time orelse self.time;
+        const commit_message = options.message orelse self.message;
+        const commit_time = options.time orelse self.time;
         const ops = try self.changeOps(self.gpa);
         defer self.gpa.free(ops);
         // **The change's metadata is this transaction's, and it is handed over
@@ -1465,7 +1465,8 @@ pub const Transaction = struct {
         self.message = commit_message;
         self.time = commit_time;
         self.closed = true;
-        return hash;
+        self.patch_log.finishTransaction(self.doc.ops.actors.items);
+        return .{ .hash = hash, .patch_log = self.patch_log.take() };
     }
 
     /// Takes back everything this transaction did, and returns how many
@@ -1480,14 +1481,25 @@ pub const Transaction = struct {
         self.rolling_back = true;
         while (self.pending.items.len != 0) {
             const last = self.pending.items.len - 1;
-            try self.doc.ops.undoOp(&self.pending.items[last].tx);
+            if (self.pending.items[last].published) {
+                try self.doc.ops.undoOp(&self.pending.items[last].tx);
+            }
+            self.doc.invalidateHistoricalScopes();
             var item = self.pending.pop().?;
             item.deinit(self.gpa);
             self.cancelled += 1;
         }
         try self.doc.removeUnusedActors(self.gpa);
+        self.patch_log.rollbackTransaction(self.doc.ops.actors.items);
         self.closed = true;
         return self.cancelled;
+    }
+
+    /// Move the retained log after terminal rollback. Calling before closure
+    /// would split the sole transaction owner and is not permitted.
+    pub fn takePatchLog(self: *Transaction) patchesmod.PatchLog {
+        std.debug.assert(self.closed);
+        return self.patch_log.take();
     }
 
     // ── The read side ──────────────────────────────────────────────────
@@ -1500,12 +1512,8 @@ pub const Transaction = struct {
     /// self.doc.get_for(obj, prop.into(), self.get_scope(None))
     /// ```
     ///
-    /// **This is upstream's `ReadDoc::get` on a transaction.** The macro at
-    /// `transaction.rs:36-311` hands the whole of `ReadDoc` to
-    /// [`Transaction`](../../github-automerge-automerge/rust/automerge/src/transaction/manual_transaction.rs):21-27
-    /// — every reader, not this one alone — and this is the **one** read the
-    /// port gives a transaction, because it is the one whose scope the caller
-    /// cannot reach any other way.
+    /// The complete ReadDoc surface below shares this transaction's write clock;
+    /// each explicit-head variant instead borrows a retained historical clock.
     ///
     /// **`get_scope(None)` is not `get_scope(heads)`, and `None` is not "no
     /// scope".** [`manual_transaction.rs:113-122`](../../github-automerge-automerge/rust/automerge/src/transaction/manual_transaction.rs)
@@ -1535,8 +1543,147 @@ pub const Transaction = struct {
     /// **Ownership and refusals are [`readmod.getAtScope`](read.zig)'s**: a
     /// borrowed [`readmod.DocItem`](read.zig) valid until the next mutation, and
     /// `NotAnObject` / `InvalidOp` / `null` for the three cases its table names.
-    pub fn get(self: *Transaction, obj: ExId, prop: Prop) WriteError!?readmod.DocItem {
+    pub fn get(self: *Transaction, obj: ExId, prop: Prop) readmod.ReadError!?readmod.DocItem {
         return readmod.getAtScope(self.doc, obj, prop, try self.scopeClock());
+    }
+
+    pub fn allocator(self: *const Transaction) Allocator {
+        return self.gpa;
+    }
+
+    fn readClock(self: *Transaction, heads: ?[]const ChangeHash) readmod.ReadError!?Clock {
+        if (heads) |at| return try readmod.historicalScope(self.doc, at);
+        return self.scopeClock();
+    }
+
+    pub fn getAt(self: *Transaction, obj: ExId, prop: Prop, heads: []const ChangeHash) readmod.ReadError!?readmod.DocItem {
+        return readmod.getAtScope(self.doc, obj, prop, try self.readClock(heads));
+    }
+
+    pub fn getAll(self: *Transaction, obj: ExId, prop: Prop, gpa: Allocator) readmod.ReadError![]readmod.DocItem {
+        return readmod.getAllAtScope(self.doc, obj, prop, try self.scopeClock(), gpa);
+    }
+
+    pub fn getAllAt(self: *Transaction, obj: ExId, prop: Prop, heads: []const ChangeHash, gpa: Allocator) readmod.ReadError![]readmod.DocItem {
+        return readmod.getAllAtScope(self.doc, obj, prop, try self.readClock(heads), gpa);
+    }
+
+    pub fn keys(self: *Transaction, obj: ExId) readmod.ReadError!readmod.Keys {
+        return readmod.keysAtScope(self.doc, obj, try self.scopeClock());
+    }
+
+    pub fn keysAt(self: *Transaction, obj: ExId, heads: []const ChangeHash) readmod.ReadError!readmod.Keys {
+        return readmod.keysAtScope(self.doc, obj, try self.readClock(heads));
+    }
+
+    pub fn mapRange(self: *Transaction, obj: ExId, range: readmod.KeyRange) readmod.ReadError!readmod.MapRange {
+        return readmod.mapRangeAtScope(self.doc, obj, range, try self.scopeClock());
+    }
+
+    pub fn mapRangeAt(self: *Transaction, obj: ExId, range: readmod.KeyRange, heads: []const ChangeHash) readmod.ReadError!readmod.MapRange {
+        return readmod.mapRangeAtScope(self.doc, obj, range, try self.readClock(heads));
+    }
+
+    pub fn listRange(self: *Transaction, obj: ExId, range: readmod.IndexRange) readmod.ReadError!readmod.ListRange {
+        return readmod.listRangeAtScope(self.doc, obj, range, try self.scopeClock());
+    }
+
+    pub fn listRangeAt(self: *Transaction, obj: ExId, range: readmod.IndexRange, heads: []const ChangeHash) readmod.ReadError!readmod.ListRange {
+        return readmod.listRangeAtScope(self.doc, obj, range, try self.readClock(heads));
+    }
+
+    pub fn values(self: *Transaction, obj: ExId, term: *readmod.ValueTerm) readmod.ReadError!readmod.Values {
+        return readmod.valuesAtScope(self.doc, obj, term, try self.scopeClock());
+    }
+
+    pub fn valuesAt(self: *Transaction, obj: ExId, heads: []const ChangeHash, term: *readmod.ValueTerm) readmod.ReadError!readmod.Values {
+        return readmod.valuesAtScope(self.doc, obj, term, try self.readClock(heads));
+    }
+
+    pub fn length(self: *Transaction, obj: ExId) readmod.ReadError!usize {
+        return readmod.lengthAtScope(self.doc, obj, try self.scopeClock());
+    }
+
+    pub fn lengthAt(self: *Transaction, obj: ExId, heads: []const ChangeHash) readmod.ReadError!usize {
+        return readmod.lengthAtScope(self.doc, obj, try self.readClock(heads));
+    }
+
+    pub fn objectType(self: *const Transaction, obj: ExId) Error!ObjType {
+        return self.doc.objectType(obj);
+    }
+
+    pub fn text(self: *Transaction, obj: ExId, gpa: Allocator) readmod.ReadError![]u8 {
+        return readmod.textAtScope(self.doc, obj, try self.scopeClock(), gpa);
+    }
+
+    pub fn textAt(self: *Transaction, obj: ExId, heads: []const ChangeHash, gpa: Allocator) readmod.ReadError![]u8 {
+        return readmod.textAtScope(self.doc, obj, try self.readClock(heads), gpa);
+    }
+
+    pub fn spans(self: *Transaction, obj: ExId, gpa: Allocator) readmod.ReadError!readmod.Spans {
+        return readmod.spansAtScope(self.doc, obj, try self.scopeClock(), gpa);
+    }
+
+    pub fn spansAt(self: *Transaction, obj: ExId, heads: []const ChangeHash, gpa: Allocator) readmod.ReadError!readmod.Spans {
+        return readmod.spansAtScope(self.doc, obj, try self.readClock(heads), gpa);
+    }
+
+    pub fn marks(self: *Transaction, obj: ExId, gpa: Allocator) readmod.ReadError![]Mark {
+        return readmod.marksAtScope(self.doc, obj, try self.scopeClock(), gpa);
+    }
+
+    pub fn marksAt(self: *Transaction, obj: ExId, heads: []const ChangeHash, gpa: Allocator) readmod.ReadError![]Mark {
+        return readmod.marksAtScope(self.doc, obj, try self.readClock(heads), gpa);
+    }
+
+    pub fn getMarks(self: *Transaction, obj: ExId, from: usize, max: usize, gpa: Allocator) readmod.ReadError![]Mark {
+        return readmod.getMarksAtScope(self.doc, obj, from, max, try self.scopeClock(), gpa);
+    }
+
+    pub fn parents(self: *Transaction, obj: ExId) readmod.ReadError!readmod.Parents {
+        return readmod.parentsAtScope(self.doc, obj, try self.scopeClock());
+    }
+
+    pub fn parentsAt(self: *Transaction, obj: ExId, heads: []const ChangeHash) readmod.ReadError!readmod.Parents {
+        return readmod.parentsAtScope(self.doc, obj, try self.readClock(heads));
+    }
+
+    pub fn iter(self: *Transaction, gpa: Allocator) readmod.DiffError!readmod.DocIter {
+        return readmod.iterAtScope(self.doc, .root, try self.scopeClock(), gpa);
+    }
+
+    pub fn iterAt(self: *Transaction, obj: ExId, heads: ?[]const ChangeHash, gpa: Allocator) readmod.DiffError!readmod.DocIter {
+        return readmod.iterAtScope(self.doc, obj, try self.readClock(heads), gpa);
+    }
+
+    pub fn getCursor(self: *Transaction, obj: ExId, pos: readmod.CursorPosition, heads: ?[]const ChangeHash, gpa: Allocator) readmod.ReadError!readmod.Cursor {
+        return self.getCursorMoving(obj, pos, heads, .after, gpa);
+    }
+
+    pub fn getCursorMoving(self: *Transaction, obj: ExId, pos: readmod.CursorPosition, heads: ?[]const ChangeHash, bias: readmod.Bias, gpa: Allocator) readmod.ReadError!readmod.Cursor {
+        return readmod.getCursorMovingAtScope(self.doc, obj, pos, bias, try self.readClock(heads), gpa);
+    }
+
+    pub fn getCursorPosition(self: *Transaction, obj: ExId, cursor: readmod.Cursor, heads: ?[]const ChangeHash) readmod.ReadError!usize {
+        return readmod.getCursorPositionFor(self.doc, obj, cursor, try self.readClock(heads));
+    }
+
+    /// Hydration is the ReadDoc exception: it resolves the raw document view,
+    /// not this transaction's write scope.
+    pub fn hydrate(self: *Transaction, obj: ExId, heads: ?[]const ChangeHash, gpa: Allocator) readmod.HydrateError!hydmod.Value {
+        return readmod.hydrate(self.doc, obj, heads, gpa);
+    }
+
+    pub fn getMissingDeps(self: *const Transaction, heads: []const ChangeHash, gpa: Allocator) readmod.ChangeError![]ChangeHash {
+        return readmod.getMissingDeps(self.doc, heads, gpa);
+    }
+
+    pub fn getChangeByHash(self: *const Transaction, hash: ChangeHash, gpa: Allocator) readmod.ChangeError!?docmod.Built {
+        return readmod.getChangeByHash(self.doc, hash, gpa);
+    }
+
+    pub fn stats(self: *const Transaction) docmod.Stats {
+        return self.doc.stats();
     }
 
     /// The marks covering `index` of the sequence `obj`, at `heads` or at this
@@ -1569,21 +1716,8 @@ pub const Transaction = struct {
         index: usize,
         heads: ?[]const ChangeHash,
         gpa: Allocator,
-    ) WriteError!marksmod.MarkSet {
-        if (heads) |h| {
-            // `Some(h) => self.doc.change_graph.clock_at(h)`
-            // (`manual_transaction.rs:113-118`). **And not `clock.isolate(..)`**,
-            // which [`scopeClock`](transact.zig) does apply: upstream builds the
-            // marked clock once in `isolate_actor` and hands it over marked
-            // (`automerge.rs:1276-1280`), so the two arms differ in the
-            // *source* of the clock and not in what is done to it. Marking this
-            // one would make a heads-taking read see this transaction's own
-            // pending operations, which is exactly what upstream's does not.
-            var clock = try self.doc.graph.clockAt(self.gpa, h);
-            defer clock.deinit();
-            return readmod.markSetAtScope(self.doc, obj, index, clock, gpa);
-        }
-        return readmod.markSetAtScope(self.doc, obj, index, try self.scopeClock(), gpa);
+    ) readmod.ReadError!marksmod.MarkSet {
+        return readmod.markSetAtScope(self.doc, obj, index, try self.readClock(heads), gpa);
     }
 
     // ── The diff sinks ───────────────────────────────────────────────────
@@ -1621,8 +1755,8 @@ pub const Transaction = struct {
     /// Upstream needs no such function because its `TxOp` holds an
     /// `OpBuilder<'static>` ([`op.rs:164-170`](../../github-automerge-automerge/rust/automerge/src/op_set2/op.rs)),
     /// which a borrow of a local cannot satisfy.
-    fn ownText(self: *Transaction, text: []const u8) WriteError![]const u8 {
-        const copy = try self.gpa.dupe(u8, text);
+    fn ownText(self: *Transaction, text_input: []const u8) WriteError![]const u8 {
+        const copy = try self.gpa.dupe(u8, text_input);
         errdefer self.gpa.free(copy);
         try self.owned.append(self.gpa, copy);
         return copy;
@@ -1643,11 +1777,11 @@ pub const Transaction = struct {
         obj: ExId,
         index: usize,
         del: isize,
-        text: []const u8,
+        text_input: []const u8,
     ) WriteError!void {
         const meta = try self.exidToObj(obj);
         try requireType(meta, .text);
-        try self.innerSplice(meta, index, del, .{ .text = text });
+        try self.innerSplice(meta, index, del, .{ .text = text_input });
     }
 
     /// The block at `index`, for [`textdiff.updateBlock`]
@@ -1679,6 +1813,10 @@ pub const Transaction = struct {
     /// resolution has to have happened once, here, and the resolved value is
     /// what the diff anchors its splices on.
     pub fn updateText(self: *Transaction, obj: ExId, new_text: []const u8) WriteError!void {
+        const pending_start = self.pending.items.len;
+        errdefer if (self.pending.items.len > pending_start) {
+            self.rolling_back = true;
+        };
         const meta = try self.exidToObj(obj);
         try requireType(meta, .text);
         var sink = TextSink{ .tx = self };
@@ -1714,6 +1852,10 @@ pub const Transaction = struct {
     /// end of a column and answered `error.Fail` from the middle of
     /// `updateObject`. The copies are what upstream's borrow checker asks for.
     pub fn updateMapValue(self: *Transaction, id: ExId, value: *const hydmod.Map) WriteError!void {
+        const pending_start = self.pending.items.len;
+        errdefer if (self.pending.items.len > pending_start) {
+            self.rolling_back = true;
+        };
         const meta = try self.exidToObj(id);
         if (meta.typ != .map and meta.typ != .table) return error.InvalidOp;
 
@@ -1782,6 +1924,10 @@ pub const Transaction = struct {
     /// set's successor scratch, and a write inside the walk splices new rows
     /// under it.
     pub fn updateListValue(self: *Transaction, id: ExId, value: *const hydmod.List) WriteError!void {
+        const pending_start = self.pending.items.len;
+        errdefer if (self.pending.items.len > pending_start) {
+            self.rolling_back = true;
+        };
         const meta = try self.exidToObj(id);
         if (meta.typ != .list) return error.InvalidOp;
 
@@ -1828,8 +1974,29 @@ pub const Transaction = struct {
     /// (`inner.rs:1219-1221`), so this is [`updateText`] with the hydrated
     /// text's own bytes: a diff against the current text, which is what
     /// `myers_diff` takes.
+    /// Update an existing object without changing its type.
+    pub fn updateObject(self: *Transaction, id: ExId, value: *const hydmod.Value) WriteError!void {
+        try self.requireOpen();
+        const before = self.pending.items.len;
+        errdefer if (self.pending.items.len != before) {
+            self.rolling_back = true;
+        };
+        const meta = try self.exidToObj(id);
+        switch (value.*) {
+            .object => |object| switch (object) {
+                .map => |*map| if (meta.typ == .map) return self.updateMapValue(id, map),
+                .list => |*list| if (meta.typ == .list) return self.updateListValue(id, list),
+                .text => |*text_value| if (meta.typ == .text) return self.updateTextValue(id, text_value),
+            },
+            else => {},
+        }
+        return error.ChangeType;
+    }
+
     pub fn updateTextValue(self: *Transaction, id: ExId, value: *const hydmod.Text) WriteError!void {
-        return self.updateText(id, value.asStr());
+        const rendered = try value.makeString(self.gpa);
+        defer self.gpa.free(rendered);
+        return self.updateText(id, rendered);
     }
 
     /// The value `key` holds in `value`, borrowed from it, or null.
@@ -1891,7 +2058,9 @@ pub const Transaction = struct {
                     // `inner.rs:1242-1245`: a new text object is filled by
                     // splicing the whole string in at zero, not by a diff
                     // against an empty one.
-                    return self.spliceText(id, 0, 0, t.asStr());
+                    const rendered = try t.makeString(self.gpa);
+                    defer self.gpa.free(rendered);
+                    return self.spliceText(id, 0, 0, rendered);
                 },
             },
             else => {},
@@ -1947,6 +2116,10 @@ pub const Transaction = struct {
         value: hydmod.Value,
         as_insert: bool,
     ) WriteError!ExId {
+        const pending_start = self.pending.items.len;
+        errdefer if (self.pending.items.len > pending_start) {
+            self.rolling_back = true;
+        };
         const meta = try self.exidToObj(obj);
         const root_type = valueObjectType(value) orelse return error.NotAnObject;
         // `inner.rs:1280-1285`. **A sequence property on a list is allowed
@@ -1991,6 +2164,11 @@ pub const Transaction = struct {
     /// **Keys are sorted before anything is written** (`inner.rs:1350`), which
     /// is what makes the operation ids — and so the change hash — the same on
     /// every run over the same value.
+    ///
+    /// Fresh documents use the reference's single contiguous splice. A retained
+    /// root cannot: its registers and earlier child objects already occupy the
+    /// physical order. Publish those root rows at their full register ends,
+    /// preserving sorted creation order, then batch only the fresh BFS children.
     pub fn initRootFromHydrate(self: *Transaction, value: *const hydmod.Map) WriteError!void {
         try self.requireOpen();
         const pending_start = self.pending.items.len;
@@ -1998,30 +2176,57 @@ pub const Transaction = struct {
             self.rolling_back = true;
         };
         const root = ObjMeta.root();
+        const fresh_document = self.doc.ops.len() == 0;
         var batch = Batch.init(self, self.doc.ops.len());
         var queue: Queue = .init(self.gpa);
         defer queue.deinit();
 
-        var keys: std.ArrayList([]const u8) = .empty;
-        defer keys.deinit(self.gpa);
+        var key_names: std.ArrayList([]const u8) = .empty;
+        defer key_names.deinit(self.gpa);
         var it = value.entries.iterator();
-        while (it.next()) |entry| try keys.append(self.gpa, entry.key_ptr.*);
-        std.mem.sort([]const u8, keys.items, {}, strLessThan);
+        while (it.next()) |entry| try key_names.append(self.gpa, entry.key_ptr.*);
+        std.mem.sort([]const u8, key_names.items, {}, strLessThan);
 
-        for (keys.items) |key| {
+        for (key_names.items) |key| {
             const child = Transaction.entryValue(value, key) orelse continue;
             const made = valueObjectType(child.*);
             const action: OpType = if (made) |t|
                 .{ .make = t }
             else
                 .{ .put = child.toScalar() orelse return error.NotAnObject };
-            const id = try batch.appendRoot(root, key, action);
+            const id = if (fresh_document)
+                try batch.appendRoot(root, key, action)
+            else
+                try self.insertHydratedRoot(key, action);
             if (made) |t| {
                 try queue.push(ObjMeta{ .id = self.doc.idToExid(id), .typ = t }, child);
             }
         }
+        if (!fresh_document) batch = Batch.init(self, self.doc.ops.len());
         try batch.bfs(&queue);
         try batch.finish();
+    }
+
+    /// Publishes the reference initializer's no-predecessor operation, not an
+    /// ordinary map overwrite/no-op (`inner.rs:1356-1364`). Only placement and
+    /// derived winner indexes differ from the fresh-object batch path.
+    fn insertHydratedRoot(self: *Transaction, key: []const u8, action: OpType) WriteError!OpId {
+        const rows = try self.doc.ops.propRange(.root, key);
+        const id = self.nextId();
+        var op = try TxOp.map(self.gpa, id, ObjMeta.root(), rows.end, .{
+            .visible_update = action,
+        }, key, &.{});
+        // Empty predecessors retain existing conflicts/history. The newest
+        // root row wins, but earlier visible rows must lose their top bit.
+        // Undo owns this range before publication or winner updates can refuse.
+        if (rows.start != rows.end) op.reset_range = .{ .start = rows.start, .end = rows.end };
+        try self.insertLocalOp(op, &.{}, rows);
+        errdefer self.rolling_back = true;
+        if (self.scope_heads == null and rows.start != rows.end) {
+            try self.doc.ops.resetTop(.{ .start = rows.start, .end = rows.end + 1 });
+        }
+        try self.finalizeOp(&self.pending.items[self.pending.items.len - 1].tx, null, null);
+        return id;
     }
 
     /// Brings a text object in line with `spans`, marks and all
@@ -2032,10 +2237,10 @@ pub const Transaction = struct {
     /// first brings the text and the block structure in line; the second
     /// re-derives every mark from the spans, because a mark is not part of the
     /// text's bytes and a diff over graphemes cannot see one.
-    pub fn updateSpans(self: *Transaction, obj: ExId, spans: []const Span) WriteError!void {
+    pub fn updateSpans(self: *Transaction, obj: ExId, spans_input: []const SpanInput) WriteError!void {
         var config = UpdateSpansConfig.init(self.gpa);
         defer config.deinit();
-        return self.updateSpansWithConfig(obj, &config, spans);
+        return self.updateSpansWithConfig(obj, &config, spans_input);
     }
 
     /// [`updateSpans`] with the expand flags in `config`
@@ -2050,16 +2255,15 @@ pub const Transaction = struct {
         self: *Transaction,
         obj: ExId,
         config: *const UpdateSpansConfig,
-        spans: []const Span,
+        spans_input: []const SpanInput,
     ) WriteError!void {
+        const before = self.pending.items.len;
+        errdefer if (self.pending.items.len != before) {
+            self.rolling_back = true;
+        };
         const meta = try self.exidToObj(obj);
         try requireType(meta, .text);
 
-        var owned: std.ArrayList(Span) = .empty;
-        defer {
-            for (owned.items) |*s| s.deinit(self.gpa);
-            owned.deinit(self.gpa);
-        }
         var old: std.ArrayList(textdiff.BlockOrGrapheme(Block)) = .empty;
         // **Every grapheme in `old` is a copy this function made.**
         // [`textdiff.graphemes`](textdiff.zig) returns slices into the span's
@@ -2102,22 +2306,28 @@ pub const Transaction = struct {
                         const gs = try textdiff.graphemes(self.gpa, t.text);
                         defer self.gpa.free(gs);
                         for (gs) |g| {
-                            try old.append(self.gpa, .{ .grapheme = try self.gpa.dupe(u8, g) });
+                            const copied = try self.gpa.dupe(u8, g);
+                            errdefer self.gpa.free(copied);
+                            try old.append(self.gpa, .{ .grapheme = copied });
                         }
                     },
-                    .block => |id| {
-                        try old.append(self.gpa, .{ .block = try self.hydrateBlock(id) });
+                    .block => |map| {
+                        var transferred = false;
+                        defer if (!transferred) span.deinit(self.gpa);
+                        const block = try self.ownBlock(map);
+                        transferred = true;
+                        try old.append(self.gpa, .{ .block = block });
                     },
                 }
             }
         }
 
-        const new_spans = try self.gpa.alloc(textdiff.BlockOrText(Block), spans.len);
+        const new_spans = try self.gpa.alloc(textdiff.BlockOrText(Block), spans_input.len);
         defer self.gpa.free(new_spans);
-        for (spans, new_spans) |span, *slot| {
+        for (spans_input, new_spans) |span, *slot| {
             slot.* = switch (span) {
                 .text => |t| .{ .text = t.text },
-                .block => |id| .{ .block = try self.hydrateBlock(id) },
+                .block => |map| .{ .block = try self.dupBlock(map) },
             };
         }
 
@@ -2131,7 +2341,7 @@ pub const Transaction = struct {
             old.items,
             new_spans,
         );
-        try self.applyMarkDiff(meta.id, config, spans);
+        try self.applyMarkDiff(meta.id, config, spans_input);
     }
 
     /// The second pass of [`updateSpansWithConfig`]
@@ -2160,13 +2370,13 @@ pub const Transaction = struct {
         self: *Transaction,
         obj: ExId,
         config: *const UpdateSpansConfig,
-        spans: []const Span,
+        spans_input: []const SpanInput,
     ) WriteError!void {
         var wanted: std.ArrayList(Mark) = .empty;
         defer wanted.deinit(self.gpa);
         var idx: usize = 0;
         const enc = self.doc.textEncoding();
-        for (spans) |span| switch (span) {
+        for (spans_input) |span| switch (span) {
             .block => idx += 1, // a block is one position (`text_diff.rs:172-175`)
             .text => |t| {
                 const width = enc.width(t.text);
@@ -2185,7 +2395,7 @@ pub const Transaction = struct {
             },
         };
 
-        const current = try self.doc.ops.calculateMarks(self.gpa, obj);
+        const current = try self.doc.ops.calculateMarksAt(self.gpa, obj, try self.scopeClock());
         defer self.gpa.free(current);
         for (current) |have| {
             const keep = blk: {
@@ -2215,37 +2425,20 @@ pub const Transaction = struct {
         }
     }
 
-    /// The hydrated map for a block, owned by [`Transaction.blocks`] and at a
-    /// fixed address for as long as the transaction lives.
-    fn hydrateBlock(self: *Transaction, id: ExId) WriteError!Block {
-        const value = try hydmod.hydrateMap(
-            Set,
-            &self.doc.ops,
-            self.gpa,
-            id,
-            try self.scopeClock(),
-        );
-        const map = switch (value) {
-            .object => |o| switch (o) {
-                .map => |m| m,
-                // `text_diff.rs:452-457` — a non-map object in a text is a
-                // block marker with no contents, and upstream warns and uses an
-                // empty map rather than refusing.
-                else => hydmod.Map.init(self.gpa, id),
-            },
-            else => hydmod.Map.init(self.gpa, id),
-        };
-        // **The map is its own allocation.** A `Block` carries a
-        // `*const hydmod.Map` into this list, and a diff holds those pointers
-        // for its whole run while the operations it writes borrow the map's
-        // keys and values, so nothing here may move: not when the list grows,
-        // and not when the transaction is deinitialised.
+    /// Consume a map only after its stable owner slot is fully reserved.
+    fn ownBlock(self: *Transaction, map: hydmod.Map) WriteError!Block {
         const slot = try self.gpa.create(hydmod.Map);
         errdefer self.gpa.destroy(slot);
+        try self.blocks.ensureUnusedCapacity(self.gpa, 1);
         slot.* = map;
-        errdefer slot.deinit();
-        try self.blocks.append(self.gpa, slot);
-        return .{ .id = id, .map = slot };
+        self.blocks.appendAssumeCapacity(slot);
+        return .{ .id = map.id, .map = slot };
+    }
+
+    fn dupBlock(self: *Transaction, map: *const hydmod.Map) WriteError!Block {
+        var copy = try map.dup(self.gpa);
+        errdefer copy.deinit();
+        return self.ownBlock(copy);
     }
 };
 
@@ -2408,28 +2601,33 @@ const SpliceKind = union(enum) {
     }
 };
 
-/// One unit of text as the document's encoding splits it
-/// ([`inner.rs:1481-1491`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)):
-/// a grapheme cluster under `grapheme_cluster`, a code point otherwise.
+/// Borrowed codepoint units for the three non-grapheme encodings
+/// ([`inner.rs:1481-1491`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)).
 ///
 /// **The other three encodings split by code point, not by cluster**, and that
 /// is upstream's own comment rather than an accident
 /// (`inner.rs:1482-1486`): the grapheme encoding arrived after the others and
 /// they were not changed.
-fn textUnits(gpa: Allocator, s: []const u8, enc: TextEncoding) WriteError![][]const u8 {
-    if (s.len == 0) return gpa.alloc([]const u8, 0);
-    if (enc == .grapheme_cluster) return textdiff.graphemes(gpa, s);
-    var out: std.ArrayList([]const u8) = .empty;
-    errdefer out.deinit(gpa);
-    var i: usize = 0;
-    while (i < s.len) {
-        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch return error.InvalidUtf8;
-        const end = @min(i + n, s.len);
-        try out.append(gpa, s[i..end]);
-        i = end;
+const CodepointIterator = struct {
+    bytes: []const u8,
+    offset: usize = 0,
+
+    fn next(self: *CodepointIterator) error{InvalidUtf8}!?[]const u8 {
+        if (self.offset == self.bytes.len) return null;
+        const n = std.unicode.utf8ByteSequenceLength(self.bytes[self.offset]) catch return error.InvalidUtf8;
+        const end = @min(self.offset + n, self.bytes.len);
+        const unit = self.bytes[self.offset..end];
+        self.offset = end;
+        return unit;
     }
-    return out.toOwnedSlice(gpa);
-}
+
+    /// Check every lead byte before any operation is appended. Continuations
+    /// and truncated units retain their existing downstream handling.
+    fn preflight(bytes: []const u8) error{InvalidUtf8}!void {
+        var units: CodepointIterator = .{ .bytes = bytes };
+        while (try units.next() != null) {}
+    }
+};
 
 /// A queue of `(container, value)` pairs, breadth first
 /// ([`batch_bfs`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):1539-1603).
@@ -2474,6 +2672,21 @@ const Queue = struct {
     }
 };
 
+/// `values_to_splice_text`
+/// ([`inner.rs:1391-1405`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)):
+/// a splice of values into a text object is a splice of the strings, and
+/// anything that is not a string is `error.InvalidValueType`.
+fn joinTextValues(gpa: Allocator, values: []const hydmod.Value) Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (values) |v| {
+        switch (v) {
+            .str => |s| try out.appendSlice(gpa, s),
+            else => return error.InvalidValueType,
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
 /// The batch: operations appended to `pending` and written in **one** splice
 /// ([`BatchInsertion`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):1435-1520).
 ///
@@ -2510,17 +2723,26 @@ const Batch = struct {
             self.tx.rolling_back = true;
         };
         var tx_op = op;
-        errdefer tx_op.deinit(self.tx.gpa);
+        var transferred = false;
+        errdefer if (!transferred) tx_op.deinit(self.tx.gpa);
         try self.tx.requireOpen();
+        try self.tx.ownBuilderPayload(&tx_op.bld);
         const id = tx_op.id();
-        var change = try changeOpOf(self.tx.gpa, &tx_op);
-        errdefer change.deinit(self.tx.gpa);
-        try self.tx.pending.append(self.tx.gpa, .{ .tx = tx_op, .op = change });
+        var change = changeOpOf(&tx_op);
+        errdefer if (!transferred) change.deinit(self.tx.gpa);
+        try self.tx.pending.append(self.tx.gpa, .{ .tx = tx_op, .op = change, .published = false });
+        transferred = true;
+        if (tx_op.obj_type != .text) {
+            try self.tx.finalizeOp(&self.tx.pending.items[self.tx.pending.items.len - 1].tx, null, null);
+        }
         return id;
     }
 
     /// Queues one map operation with no predecessors, the shape every root of a
     /// batch has ([`batch_bfs`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):1553-1562).
+    /// Requires a fresh map run contiguous at the batch's insertion point.
+    /// Retained document roots use `Transaction.insertHydratedRoot` instead;
+    /// sorting only the input cannot join existing physical registers.
     ///
     /// **An object is `make` and a scalar is `put`.** A hydrated register holds
     /// either, and upstream's `value_to_op_type`
@@ -2558,27 +2780,46 @@ const Batch = struct {
     /// `textdiff` hook frees the buffer it splices from before this
     /// transaction commits, and the value column reads these units again at
     /// that point.
-    fn spliceText(self: *Batch, container: ObjMeta, after: ElemId, text: []const u8) WriteError!usize {
+    fn spliceText(self: *Batch, container: ObjMeta, after: ElemId, text_input: []const u8, index: usize, marks_set: ?*const MarkSet) WriteError!usize {
         errdefer if (self.tx.pending.items.len > self.start) {
             self.tx.rolling_back = true;
         };
-        const units = try textUnits(self.tx.gpa, text, self.tx.doc.textEncoding());
-        defer self.tx.gpa.free(units);
+        const graphemes: ?[][]const u8 = if (self.tx.doc.textEncoding() == .grapheme_cluster)
+            if (text_input.len == 0)
+                try self.tx.gpa.alloc([]const u8, 0)
+            else
+                try textdiff.graphemes(self.tx.gpa, text_input)
+        else
+            null;
+        defer if (graphemes) |units| self.tx.gpa.free(units);
+        if (graphemes == null) try CodepointIterator.preflight(text_input);
+        var codepoints: CodepointIterator = .{ .bytes = text_input };
+        var unit_index: usize = 0;
         var inserted_width: usize = 0;
         var elem = after;
-        for (units) |unit| {
+        while (true) {
+            const unit = if (graphemes) |units| blk: {
+                if (unit_index == units.len) break;
+                const cluster = units[unit_index];
+                unit_index += 1;
+                break :blk cluster;
+            } else (try codepoints.next()) orelse break;
             const id = self.tx.nextId();
             const op = try TxOp.insertVal(
                 self.tx.gpa,
                 id,
                 container,
                 self.nextPos(),
-                .{ .str = try self.tx.ownText(unit) },
+                .{ .str = unit },
                 elem,
             );
             inserted_width += @intCast(op.width(.text, self.tx.doc.textEncoding()));
             elem = ElemId.fromOpId(id);
             _ = try self.append(op);
+        }
+        if (self.tx.patch_log.recording) {
+            self.tx.patch_log.splice(container.id, index, text_input, marks_set);
+            try self.tx.checkPatchLog();
         }
         return inserted_width;
     }
@@ -2641,7 +2882,9 @@ const Batch = struct {
                         }
                     },
                     .text => |t| {
-                        _ = try self.spliceText(container, ElemId.head(), t.asStr());
+                        const rendered = try t.makeString(self.tx.gpa);
+                        defer self.tx.gpa.free(rendered);
+                        _ = try self.spliceText(container, ElemId.head(), rendered, 0, null);
                     },
                 },
                 // `inner.rs:1597-1599` — a container that is not the kind its
@@ -2660,540 +2903,25 @@ const Batch = struct {
         };
         const queued = self.tx.pending.items[self.start..];
         if (queued.len == 0) return;
-        const ops = try self.tx.gpa.alloc(ChangeOp, queued.len);
-        defer self.tx.gpa.free(ops);
-        for (queued, ops) |*item, *slot| slot.* = item.op;
-        _ = try self.tx.doc.ops.splice(self.insert_pos, ops);
+        if (queued.len == 1) {
+            const one = [1]ChangeOp{queued[0].op};
+            _ = try self.tx.doc.ops.splice(self.insert_pos, one[0..]);
+        } else {
+            const ops = try self.tx.gpa.alloc(ChangeOp, queued.len);
+            defer self.tx.gpa.free(ops);
+            for (queued, ops) |*item, *slot| slot.* = item.op;
+            _ = try self.tx.doc.ops.splice(self.insert_pos, ops);
+        }
+        self.tx.doc.invalidateHistoricalScopes();
+        for (queued) |*item| item.published = true;
     }
 };
 
-// ── The document-level surface ──────────────────────────────────────────────
-
-/// Refuses a document that is not in autocommit mode.
-///
-/// **This is the whole of the two-flavours check.** Upstream's `Transactable`
-/// is implemented for two types, so calling the wrong one does not compile; here
-/// the two are one type and a [`Mode`](doc.zig) flag, so the door has to be
-/// checked where the caller walks through it. `error.InvalidOp` is
-/// [`Error`]'s word for "this operation does not belong here", and it is the
-/// closest honest runtime answer to a compile error.
-fn requireAuto(doc: *Document) Error!void {
-    if (doc.documentMode() != .auto) return error.InvalidOp;
-    _ = doc.recoverAuto() catch |e| return asError(e);
-}
-
-// An automatic wrapper has no caller-held transaction to return on refusal.
-// Retain unresolved producer work without fallible rollback at this boundary.
-// Valid unused actor metadata belongs to the document, not the empty journal.
-fn finishAuto(tx: *Transaction) void {
-    if (tx.closed or (tx.pending.items.len == 0 and !tx.rolling_back)) {
-        tx.deinit();
-        return;
-    }
-    std.debug.assert(tx.doc.auto_recovery == null);
-    tx.rolling_back = true;
-    if (tx.scope_heads != null) tx.scope_heads = tx.deps;
-    tx.doc.auto_recovery = tx.*;
-    tx.* = undefined;
-}
-
-/// Opens the transaction an autocommit call works in
-/// ([`AutoCommit::ensure_transaction_open`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs):445-457).
-///
-/// **The isolation heads are the scope**, which is the only difference from
-/// [`Transaction.open`] and the whole of `AutoCommit`'s extra state
-/// ([`autocommit.rs:433-441`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)).
-/// The heads are the document's own, and the document outlives the
-/// transaction, so the borrow holds.
-fn openAuto(gpa: Allocator, doc: *Document) WriteError!Transaction {
-    const args = try doc.transactionArgs(gpa, doc.isolationHeads());
-    return Transaction.init(gpa, doc, args);
-}
-
-/// [`openAuto`], for a caller that owns the transaction's lifetime.
-///
-/// **This is not the autocommit door.** Every module function above opens a
-/// transaction, writes one operation and commits it, because that is what
-/// `AutoCommit` looks like to a Zig caller using the crate's own
-/// `Transactable` impl. The C ABI is a different type — `AMdoc` *is*
-/// `am::AutoCommit` (`rust/automerge-c/src/doc.rs:35-36`) — and
-/// `AutoCommit`'s defining property is that it holds its transaction **open
-/// across calls**, opening it lazily ([`ensure_transaction_open`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs):445-457)
-/// and closing it only on `commit_with` (`:728-739`), `rollback` (`:742-751`)
-/// or a read that needs it (`:459-468`). A caller of this function owns the
-/// returned transaction and makes that choice itself.
-/// Pending native automatic recovery is refused with `error.InvalidOp`; call
-/// `Document.recoverAuto` before taking held ownership.
-pub fn openAutoHeld(gpa: Allocator, doc: *Document) WriteError!Transaction {
-    return openAuto(gpa, doc);
-}
-
-/// Writes `value` at `prop`, and commits
-/// ([`Transactable::put`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):20-31).
-///
-/// **`value` is borrowed** from the caller; the splice copies it into the op
-/// set's own columns, so it has to outlive this call and no longer.
-///
-/// **The returned id is the operation's, and the operation may not exist.**
-/// A `put` that repeats a register's only value writes nothing
-/// ([`op_set.rs:1489-1492`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)) and
-/// the answer is [`OpId.root`] — the head sentinel, which names no operation
-/// anywhere — rather than an id that would send a caller looking for a row
-/// that was never written.
-pub fn put(doc: *Document, obj: ExId, prop: Prop, value: ScalarValue) Error!OpId {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    const made = tx.put(obj, prop, value) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-    return made orelse OpId.root;
-}
-
-/// Creates an object at `prop`, and commits
-/// ([`Transactable::put_object`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):33-39).
-pub fn putObject(doc: *Document, obj: ExId, prop: Prop, t: ObjType) Error!ExId {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    const id = tx.putObject(obj, prop, t) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-    return id;
-}
-
-/// Inserts `value` at `index`, and commits
-/// ([`Transactable::insert`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):41-46).
-pub fn insert(doc: *Document, obj: ExId, index: usize, value: ScalarValue) Error!OpId {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    const id = tx.insert(obj, index, value) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-    return id;
-}
-
-/// Creates an object at `index` in a sequence, and commits
-/// ([`Transactable::insert_object`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):48-51).
-pub fn insertObject(doc: *Document, obj: ExId, index: usize, t: ObjType) Error!ExId {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    const id = tx.insertObject(obj, index, t) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-    return id;
-}
-
-/// Adds `by` to the counter at `prop`, and commits
-/// ([`Transactable::increment`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):53-57).
-///
-/// **`error.MissingCounter` for anything that is not a counter**, and that is
-/// upstream's check before anything is written
-/// ([`inner.rs:466-468`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)) — an
-/// increment on a plain value changes nothing in the document and says so.
-pub fn increment(doc: *Document, obj: ExId, prop: Prop, by: i64) Error!void {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    tx.increment(obj, prop, by) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-}
-
-/// Removes the value at `prop`, and commits
-/// ([`Transactable::delete`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):59-67).
-///
-/// The count is how many delete operations were written; see
-/// [`Transaction.delete`].
-pub fn delete(doc: *Document, obj: ExId, prop: Prop) Error!usize {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    const n = tx.delete(obj, prop) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-    return n;
-}
-
-/// Inserts `values` and removes `del` units at `pos`, and commits
-/// ([`Transactable::splice`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):69-75).
-///
-/// **`values` is borrowed.** The whole batch is written with one
-/// [`OpSet.splice`](opset/op_set.zig); see the module doc.
-pub fn splice(
-    doc: *Document,
-    obj: ExId,
-    pos: usize,
-    del: isize,
-    gpa: Allocator,
-    values: []const hydmod.Value,
-) Error!void {
-    try requireAuto(doc);
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    try spliceHeld(&tx, obj, pos, del, gpa, values);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-}
-
-/// The body of [`splice`], for a caller that owns the transaction — the C
-/// ABI's `AMdoc`, which keeps its transaction open across calls
-/// ([`autocommit.rs:445-457`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)).
-/// **One implementation, two doors**: the autocommit one above opens, calls
-/// this and commits; the held one calls this and does not.
-///
-/// **A list splices `values`; a text splices their strings joined**
-/// ([`inner.rs:619-643`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)),
-/// and both reach [`Transaction.innerSplice`] with the kind that says which.
-/// The list arm was empty once, which is why a `splice` of hydrated values
-/// into a **list** reported success and wrote nothing at all: no operation,
-/// no change, an untouched document. `inner.rs:610` says the values may be
-/// scalars or nested objects, and `inner.rs:633-642` is the branch that
-/// takes them.
-pub fn spliceHeld(
-    tx: *Transaction,
-    obj: ExId,
-    pos: usize,
-    del: isize,
-    gpa: Allocator,
-    values: []const hydmod.Value,
-) Error!void {
-    const meta = tx.exidToObj(obj) catch |e| return asError(e);
-    // `inner.rs:616-618` — a map is neither of the two things a splice writes.
-    switch (meta.typ) {
-        .list => tx.innerSplice(meta, pos, del, .{ .list = values }) catch |e| return asError(e),
-        .text => {
-            const joined = joinTextValues(gpa, values) catch |e| return asError(e);
-            defer gpa.free(joined);
-            tx.innerSplice(meta, pos, del, .{ .text = joined }) catch |e| return asError(e);
-        },
-        else => return error.InvalidOp,
-    }
-}
-
-/// `values_to_splice_text`
-/// ([`inner.rs:1391-1405`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)):
-/// a splice of values into a text object is a splice of the strings, and
-/// anything that is not a string is `error.InvalidValueType`.
-fn joinTextValues(gpa: Allocator, values: []const hydmod.Value) Error![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    for (values) |v| {
-        switch (v) {
-            .str => |s| try out.appendSlice(gpa, s),
-            else => return error.InvalidValueType,
-        }
-    }
-    return out.toOwnedSlice(gpa);
-}
-
-/// Writes `text` at `pos` and removes `del` units, and commits
-/// ([`Transactable::splice_text`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):77-82).
-///
-/// **`text` is borrowed** and the whole run is written with one
-/// [`OpSet.splice`](opset/op_set.zig), one operation per code point (or grapheme
-/// cluster, under that encoding).
-pub fn spliceText(doc: *Document, obj: ExId, pos: usize, del: isize, text: []const u8) Error!void {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    tx.spliceText(obj, pos, del, text) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-}
-
-/// Writes a mark over `[from, to)`, and commits
-/// ([`Transactable::mark`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):84-89).
-///
-/// **`name` and `value` are borrowed.** `expand` decides whether the mark grows
-/// past text inserted at either end later, and it is observable: a begin with
-/// `expand = false` does not extend over an insert made after it.
-pub fn mark(
-    doc: *Document,
-    obj: ExId,
-    from: usize,
-    to: usize,
-    name: []const u8,
-    expand: ExpandMark,
-    value: ?ScalarValue,
-) Error!void {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    tx.mark(obj, from, to, name, expand, value) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-}
-
-/// Removes a mark over `[from, to)`, and commits
-/// ([`Transactable::unmark`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):91-101).
-/// Null removes the mark; a non-null value applies it, as `Transaction.unmark`.
-pub fn unmark(
-    doc: *Document,
-    obj: ExId,
-    from: usize,
-    to: usize,
-    expand: ExpandMark,
-    name: []const u8,
-    value: ?ScalarValue,
-) Error!void {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    tx.unmark(obj, from, to, expand, name, value) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-}
-
-/// Cuts a text block out at `index`, and commits
-/// ([`Transactable::split_block`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):103-105).
-pub fn splitBlock(doc: *Document, obj: ExId, index: usize) Error!ExId {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    const id = tx.splitBlock(obj, index) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-    return id;
-}
-
-/// Joins the block at `index` back into the text, and commits
-/// ([`Transactable::join_block`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):107-110).
-pub fn joinBlock(doc: *Document, text: ExId, index: usize) Error!void {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    tx.joinBlock(text, index) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-}
-
-/// Replaces the block at `index` with a fresh empty one, and commits
-/// ([`Transactable::replace_block`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):112-120).
-pub fn replaceBlock(doc: *Document, text: ExId, index: usize) Error!ExId {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    const id = tx.replaceBlock(text, index) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-    return id;
-}
-
-/// Makes a text object hold `new_text`, and commits
-/// ([`Transactable::update_text`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):144-146).
-///
-/// **This is a diff, not a write.** `textdiff.myersDiff` compares grapheme
-/// clusters and turns the differences into splices, so an unchanged text costs
-/// no operation at all.
-pub fn updateText(doc: *Document, obj: ExId, new_text: []const u8) Error!void {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    tx.updateText(obj, new_text) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-}
-
-/// Brings a map object in line with `value`, and commits
-/// ([`Transactable::update_object`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):148-159).
-///
-/// `API.md` narrows this to a map, so this is upstream's `update_map` and not
-/// its three-way dispatch; a list or a text object is `error.NotAnObject`.
-pub fn updateObject(doc: *Document, obj: ExId, value: hydmod.Map) Error!void {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    tx.updateMapValue(obj, &value) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-}
-
-/// Brings a text object in line with `spans`, marks and all, and commits
-/// ([`Transactable::update_spans`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):126-130).
-///
-/// **`spans` is borrowed and the marks inside it are the caller's.** A block
-/// span names an object the document already holds — `iter::Span`'s payload is
-/// an `ExId` here where upstream's is a hydrated map — so a caller creates the
-/// block with [`putObject`] first and names it here. **This is upstream's
-/// `update_spans` with `UpdateSpansConfig::default()`**, which writes every
-/// mark with [`ExpandMark.after`] ([`marks.rs`:379-383](../../github-automerge-automerge/rust/automerge/src/marks.rs));
-/// [`updateSpansWithConfig`] is the same call with a config that names its own
-/// flags.
-pub fn updateSpans(doc: *Document, obj: ExId, spans: []const Span) Error!void {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    tx.updateSpans(obj, spans) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-}
-
-/// [`updateSpans`] with the expand flags in `config`, and commits
-/// ([`Transactable::update_spans`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):126-130,
-/// whose second argument upstream takes and this takes here).
-///
-/// **Not in `API.md`, and not optional.** Two upstream cases set the flags
-/// rather than take upstream's default —
-/// `multiple_marks_different_expand_behaviors` ([`diff_marks.rs`:864-903](../../github-automerge-automerge/rust/automerge/tests/diff_marks.rs))
-/// names three mark names and grows them in three directions, and
-/// `marks_with_expand_none_at_boundaries` ([`:906-944`](../../github-automerge-automerge/rust/automerge/tests/diff_marks.rs))
-/// takes the default to `None` for every name — and driving [`mark`] three
-/// times instead would test `mark`, not `update_spans`. `config` is borrowed
-/// and is not freed here; the caller owns it.
-pub fn updateSpansWithConfig(
-    doc: *Document,
-    obj: ExId,
-    config: *const UpdateSpansConfig,
-    spans: []const Span,
-) Error!void {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    tx.updateSpansWithConfig(obj, config, spans) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-}
-
-/// Creates an object of type `t` at `prop`, and commits
-/// ([`Transactable::batch_create_object`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):161-171).
-///
-/// **The narrowing from upstream is in the report:** upstream's takes the whole
-/// `hydrate::Value` and fills it, and `API.md` names a type. This makes the
-/// object; [`batchCreateValue`] is the same method with the value.
-pub fn batchCreateObject(doc: *Document, obj: ExId, prop: Prop, t: ObjType) Error!ExId {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    const id = tx.batchCreateObject(obj, prop, t) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-    return id;
-}
-
-/// Creates an object of the kind `value` is at `prop` and fills it, and commits.
-///
-/// **Not in `API.md`, and not optional.** [`batchCreateObject`] cannot fill an
-/// object because its signature carries no value, and [`updateObject`] needs
-/// the object to exist first, so the one operation that puts a whole subtree
-/// into the document in a single batch is this
-/// ([`batch_create_object`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):1269-1331).
-pub fn batchCreateValue(
-    doc: *Document,
-    obj: ExId,
-    prop: Prop,
-    value: hydmod.Value,
-    as_insert: bool,
-) Error!ExId {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    const id = tx.batchCreateValue(obj, prop, value, as_insert) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-    return id;
-}
-
-/// Fills the document root from `value`, and commits
-/// ([`Transactable::init_root_from_hydrate`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):173-175)).
-///
-/// **Keys are sorted before anything is written**, so the same value produces
-/// the same operation ids and so the same change hash on every run.
-pub fn initRootFromHydrate(doc: *Document, value: hydmod.Map) Error!void {
-    try requireAuto(doc);
-    const gpa = doc.allocator();
-    var tx = openAuto(gpa, doc) catch |e| return asError(e);
-    defer finishAuto(&tx);
-    tx.initRootFromHydrate(&value) catch |e| return asError(e);
-    _ = tx.commit(null, null) catch |e| return asError(e);
-}
-
-/// How many operations the document holds that no change accounts for
-/// ([`Transactable::pending_ops`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):11-12).
-///
-/// **This is the document's answer, and it is upstream's definition read from
-/// what a document can answer.** Upstream counts `TransactionInner.pending`
-/// (`inner.rs:103-105`), which is exactly "the operations this transaction
-/// created, which are in the op set and not yet in a change". A local
-/// transaction is the only thing that splices operations in without a change, so
-/// that count *is* the number of operations in the op set whose id is above
-/// [`ChangeGraph.maxOp`](change_graph.zig) — the highest op counter any change
-/// in the graph claims. After a commit it is zero; after a rollback it is zero
-/// for the same reason and by a different route.
-///
-/// **Two walks and not one, because an operation is a row *or* a successor
-/// edge.** A `delete` writes no row: it is a successor edge on the register's
-/// winner ([`next_delete`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):298-306,
-/// and this file's own `delete makes the key absent, not present with a null`
-/// test says the same thing from the other side). A row-only walk therefore
-/// answers one short for every pending delete, which is not a rounding
-/// difference but the wrong number: a transaction that put a key, deleted a
-/// key and made two nested objects has four operations queued and three rows.
-/// The successor walk is the other half of the same count and not a second
-/// source of truth for it — an edge's id is an operation's id, read from the
-/// same columns the row walk reads.
-///
-/// With refused native automatic work, this returns the retained journal's
-/// count without reading partially undone columns. Otherwise it walks rows
-/// and successor edges as described above.
-///
-/// For the *transaction's own* count, which is O(1), see
-/// [`Transaction.count`].
-pub fn pendingOps(doc: *const Document) usize {
-    if (doc.auto_recovery) |*tx| return tx.count();
-    const highest = doc.graph.maxOp();
-    const rows: usize = doc.ops.len();
-    var n: usize = 0;
-    {
-        var ids = doc.ops.idIterRange(.{ .start = 0, .end = rows }) catch return 0;
-        while (ids.maybeTryNext() catch null) |id| {
-            if (@as(u64, id.counter) > highest) n += 1;
-        }
-    }
-    var succ = doc.ops.succIterRange(.{ .start = 0, .end = rows }) catch return 0;
-    while (succ.tryNext() catch null) |cursors| {
-        var edges = cursors.withInc();
-        while (edges.next()) |e| {
-            if (@as(u64, e.id.counter) > highest) n += 1;
-        }
-    }
-    return n;
-}
-
-/// The document's heads, **borrowed** from its change graph and valid until the
-/// next change is added
-/// ([`Transactable::base_heads`](../../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):132-142).
-///
-/// **A borrow, not a copy, and that is the deviation.** Upstream returns
-/// `Vec<ChangeHash>` — the transaction's own `deps` cloned out of it
-/// ([`inner.rs:1386-1388`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)) —
-/// and `API.md` names no allocator, which a `Vec` cannot be built without in
-/// this port's shape. So this is the answer to the question the document-level
-/// caller actually has: *what would the next change depend on?* The next
-/// commit's dependencies are the current heads, because that is what
-/// [`Document.transactionArgs`](doc.zig) derives them from.
-///
-/// For the *transaction's own* base — the heads it started from, which is a
-/// different number once anything has been committed since — see
-/// [`Transaction.baseHeads`].
-pub fn baseHeads(doc: *const Document) []const ChangeHash {
-    return doc.graph.getHeads();
-}
-
 // ── tests ───────────────────────────────────────────────────────────────────
 
-/// A document with a random actor, because every operation needs one and an
-/// empty actor index is not one (`Document.init`'s own note).
+/// A raw document with the deterministic actor used by transaction fixtures.
 fn freshDoc(gpa: Allocator) !Document {
-    return freshDocIn(gpa, .auto);
-}
-
-/// The same, in the mode the caller asked for. **The mode is not a detail
-/// here:** every module function refuses a `.manual` document and
-/// [`Transaction.open`] refuses a `.auto` one, so a fixture has to name it.
-fn freshDocIn(gpa: Allocator, mode: docmod.Mode) !Document {
-    var doc = try Document.init(gpa, std.testing.io, mode);
+    var doc = try Document.init(gpa, std.testing.io);
     doc.setActorId(.{ .bytes = "0123456789abcdef" });
     return doc;
 }
@@ -3226,200 +2954,109 @@ fn registerIn(
     return doc.ops.seekOpsByMapKey(gpa, obj, key, null);
 }
 
-test "put then commit then read back, and the document has one more change" {
+test "put stays pending until commit then the document has one more change" {
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
-    defer doc.deinit();
+    var owner = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    defer owner.deinit();
+    try owner.setActorId(.{ .bytes = "0123456789abcdef" });
 
-    try testing.expectEqual(@as(usize, 0), doc.graph.len());
-    const id = try put(&doc, .root, .{ .key = "name" }, .{ .str = "ada" });
-    try testing.expect(!id.eql(OpId.root));
-
-    try testing.expectEqual(@as(usize, 1), doc.graph.len());
-    var found = try register(gpa, &doc, "name");
+    const id = try owner.put(.root, .{ .key = "name" }, .{ .str = "ada" });
+    try testing.expect(!(id orelse return error.TestUnexpectedResult).eql(OpId.root));
+    try testing.expectEqual(@as(usize, 0), owner.doc.graph.len());
+    try testing.expectEqual(@as(usize, 1), owner.pendingOps());
+    var found = try register(gpa, &owner.doc, "name");
     defer found.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), found.ops.items.len);
     try testing.expectEqualStrings("ada", found.ops.items[0].value().str);
     try testing.expectEqual(Action.set, found.ops.items[0].action());
+    try testing.expect((try owner.commit()) != null);
+    try testing.expectEqual(@as(usize, 1), owner.doc.graph.len());
+    try testing.expectEqual(@as(usize, 0), owner.pendingOps());
 }
 
 test "a redundant put writes no operation and adds no change" {
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
-    defer doc.deinit();
+    var owner = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    defer owner.deinit();
+    try owner.setActorId(.{ .bytes = "0123456789abcdef" });
 
-    _ = try put(&doc, .root, .{ .key = "k" }, .{ .int = 1 });
-    try testing.expectEqual(@as(usize, 1), doc.graph.len());
-    // `op_set.rs:1489-1492` — the register's only value, repeated, is a no-op.
-    const second = try put(&doc, .root, .{ .key = "k" }, .{ .int = 1 });
-    try testing.expect(second.eql(OpId.root));
-    try testing.expectEqual(@as(usize, 1), doc.graph.len());
-    try testing.expectEqual(@as(usize, 0), pendingOps(&doc));
+    _ = try owner.put(.root, .{ .key = "k" }, .{ .int = 1 });
+    const second = try owner.put(.root, .{ .key = "k" }, .{ .int = 1 });
+    try testing.expect(second == null);
+    try testing.expectEqual(@as(usize, 1), owner.pendingOps());
+    try testing.expectEqual(@as(usize, 0), owner.doc.graph.len());
+    try testing.expect((try owner.commit()) != null);
+    const third = try owner.put(.root, .{ .key = "k" }, .{ .int = 1 });
+    try testing.expect(third == null);
+    try testing.expectEqual(@as(usize, 0), owner.pendingOps());
+    try testing.expect((try owner.commit()) == null);
+    try testing.expectEqual(@as(usize, 1), owner.doc.graph.len());
 }
 
-// **This test was about a conflict that upstream does not have, and it is
-// the third place the same bug showed up.** It is the port of the
-// register half of `incremental_list_conflict_survives_isolate_integrate_roundtrip`
-// (`tests/test.rs:4179-4208`), driven through the module-level write surface.
-//
-// It used to isolate at `before`, write `k = 1` then `k = 2` as two module
-// calls, and assert **two visible rows** — a conflicted register. The second
-// call could not see the first because
-// [`Document.commit`](../src/doc.zig) did not advance the isolation heads, so
-// its scope clock stopped at `before`
-// ([`autocommit.rs:464-466`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)).
-// With the heads advanced, the second write **sees** the first and overwrites
-// it, which is what upstream does: `AutoCommit` holds one transaction across
-// both writes ([`autocommit.rs:445-457`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)), and
-// a `put` inside a transaction resolves its register against that
-// transaction's own scope.
-//
-// **So there is no conflict here, upstream or here, and the assertion that
-// said there was was pinning the missing advance.** The property that replaces
-// it is the visibility itself: a write under an isolation sees the previous
-// write under the same isolation, so it *overwrites* rather than forking a
-// second row.
-test "two puts on one key inside one isolation: the second sees the first, so the register is not conflicted" {
+test "two puts inside one isolation share a journal and resolve one register" {
+    // Rust autocommit.rs:445-457 holds one transaction across both writes.
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
-    defer doc.deinit();
-
-    _ = try put(&doc, .root, .{ .key = "warm" }, .{ .int = 1 });
-    const before = try doc.getHeads(gpa);
+    var owner = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    defer owner.deinit();
+    try owner.setActorId(.{ .bytes = "0123456789abcdef" });
+    _ = try owner.put(.root, .{ .key = "warm" }, .{ .int = 1 });
+    const before = try owner.getHeads(gpa);
     defer gpa.free(before);
-    const warm_changes = doc.graph.len();
+    const warm_changes = owner.doc.graph.len();
 
-    try doc.isolate(gpa, before);
-    _ = try put(&doc, .root, .{ .key = "k" }, .{ .int = 1 });
-    _ = try put(&doc, .root, .{ .key = "k" }, .{ .int = 2 });
-    try doc.integrate();
+    try owner.isolate(gpa, before);
+    _ = try owner.put(.root, .{ .key = "k" }, .{ .int = 1 });
+    _ = try owner.put(.root, .{ .key = "k" }, .{ .int = 2 });
+    try testing.expectEqual(warm_changes, owner.doc.graph.len());
+    try testing.expectEqual(@as(usize, 2), owner.pendingOps());
+    try owner.integrate();
 
-    var found = try register(gpa, &doc, "k");
+    var found = try register(gpa, &owner.doc, "k");
     defer found.deinit(gpa);
-    // **One row, not two, and the number is the property.** Two visible rows
-    // is what makes a register conflicted
-    // ([`map_range.rs`:262-263](../../github-automerge-automerge/rust/automerge/src/iter/map_range.rs)),
-    // and a second row here is a write that could not see its predecessor —
-    // the exact symptom of stale isolation heads. A reader that reported one
-    // row for a register that holds two is the failure this port used to
-    // produce in the other direction, so both numbers are worth pinning.
     try testing.expectEqual(@as(usize, 1), found.ops.items.len);
-    // **And the row carries the *second* value**, because the overwrite
-    // happened: the survivor of a register that was written twice under one
-    // scope is the later write, and a row still carrying `1` would mean the
-    // successor edge the second `put` wrote never reached the register.
     try testing.expect(found.ops.items[0].visible());
     try testing.expectEqual(@as(i64, 2), found.ops.items[0].value().int);
-    // Upstream's own index checker: a group's first winner must be its last
-    // visible row ([`op_set.rs`:196-212](../src/opset/op_set.zig)), and a
-    // `reset_top` that resolved the register against the wrong scope would
-    // leave a visible row past the winner.
-    try testing.expect((try doc.ops.validateTopIndex()) == null);
+    try testing.expect((try owner.doc.ops.validateTopIndex()) == null);
+    try testing.expectEqual(warm_changes + 1, owner.doc.graph.len());
 
-    // **Two changes, where upstream makes one, and this is the lifetime
-    // divergence and nothing else.** The register above matches the
-    // reference; the change count does not, and asserting `warm_changes + 1`
-    // here would be asserting the port's write surface rather than the CRDT.
-    try testing.expectEqual(warm_changes + 2, doc.graph.len());
-
-    // Outside any isolation the same pair behaves identically, which is the
-    // control: the advance makes an isolated write behave like an
-    // un-isolated one, it does not change what a `put` means.
-    var single = try freshDoc(gpa);
-    defer single.deinit();
-    _ = try put(&single, .root, .{ .key = "k" }, .{ .int = 1 });
-    _ = try put(&single, .root, .{ .key = "k" }, .{ .int = 2 });
-    var over = try register(gpa, &single, "k");
+    var control = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    defer control.deinit();
+    _ = try control.put(.root, .{ .key = "k" }, .{ .int = 1 });
+    _ = try control.put(.root, .{ .key = "k" }, .{ .int = 2 });
+    var over = try register(gpa, &control.doc, "k");
     defer over.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), over.ops.items.len);
     try testing.expectEqual(@as(i64, 2), over.ops.items[0].value().int);
+    try testing.expectEqual(@as(usize, 0), control.doc.graph.len());
+    try testing.expect((try control.commit()) != null);
+    try testing.expectEqual(@as(usize, 1), control.doc.graph.len());
 }
 
-// **This pins what is left of a divergence, and it used to be worse.** It is
-// the port of upstream's `incremental_list_conflict_survives_isolate_integrate_roundtrip`
-// (`tests/test.rs:4179-4208`) driven through the module-level write surface,
-// which is the one surface here that does **not** hold a transaction open.
-//
-// It was written to go red when the divergence is fixed, and it went red, and
-// the reason it went red was a *bug* rather than the divergence:
-// [`Document.commit`](../src/doc.zig) did not advance the isolation heads to
-// the hash it had just committed, so the second isolated write forked a
-// **second** concurrency actor and could not see the object the first had
-// made. Both halves are gone —
-// [`autocommit.rs:464-466`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs) on the heads,
-// [`automerge.rs:1263-1272`](../../github-automerge-automerge/rust/automerge/src/automerge.rs) on the walk that no longer runs.
-//
-// **What this pins now is the property that fix restored**: two module-level
-// writes inside one isolation both land, the second sees the first's object,
-// and the concurrency walk stops at level 1. The counts below are still two
-// changes per pair where `AutoCommit` makes one
-// ([`autocommit.rs:445-457`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)); **that** is the
-// lifetime divergence, it is a different document rather than a failure, and
-// the module doc's "The transaction's lifetime" section has the citations.
-//
-// **A plain comment and not `///`.** Zig 0.16 refuses a doc comment on a
-// `test` — "documentation comments cannot be attached to tests" — and the
-// refusal is a compile error for the whole module, so it takes every other
-// file's tests down with it rather than only this one.
-test "two module writes inside one isolation both land, and the second sees the first's object" {
+test "isolated object creation and text splice share one actor and one change" {
+    // Rust tests/test.rs:4179-4208: each object-and-text pair is one change.
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
-    defer doc.deinit();
-
-    // `tests/test.rs:4180-4186`: a list, one element, and the heads taken
-    // after that and before anything else.
-    const list = try putObject(&doc, .root, .{ .key = "list" }, .list);
-    _ = try insert(&doc, list, 0, .{ .str = "base" });
-    const beginning = try doc.getHeads(gpa);
+    var owner = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    defer owner.deinit();
+    try owner.setActorId(.{ .bytes = "0123456789abcdef" });
+    const list = try owner.putObject(.root, .{ .key = "list" }, .list);
+    _ = try owner.insert(list, 0, .{ .str = "base" });
+    const beginning = try owner.getHeads(gpa);
     defer gpa.free(beginning);
+    try testing.expectEqual(@as(usize, 1), owner.doc.graph.len());
 
-    // `tests/test.rs:4188-4191`. **Upstream makes this pair one change**:
-    // `put_object` opens a transaction and `splice_text` reuses it, because
-    // `AutoCommit` holds it open (`autocommit.rs:445-457`). Here it is two,
-    // because each module-level call opens and commits its own.
-    const first = try putObject(&doc, list, .{ .index = 0 }, .text);
-    try spliceText(&doc, first, 0, 0, "first");
-    try testing.expectEqual(@as(usize, 4), doc.graph.len());
-
-    // `tests/test.rs:4194-4196`. **This used to be a refusal**, and the
-    // refusal is what this test was written to explain: the second call opens
-    // a *second* transaction, and at stale isolation heads
-    // [`Document.isolatedActorIndex`](../src/doc.zig) finds `maxOpForActor`
-    // non-zero for the fork the first call used, forks again to the next
-    // concurrency level, and the object `second` — which belongs to the
-    // previous fork — falls out of the new transaction's scope clock, so
-    // [`Transaction.exidToObj`] answered `error.InvalidObjId`.
-    //
-    // **It does not any more, and both halves of the cause are gone.**
-    // [`Document.commit`](../src/doc.zig) now advances the isolation to the
-    // hash it just committed, which is upstream's
-    // `if self.isolation.is_some() && hash.is_some() { self.isolation =
-    // vec![hash] }`
-    // ([`autocommit.rs:464-466`, `:735-736`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)); and
-    // with the heads advanced the clock at them **covers** the level-1 fork's
-    // own last op, so `isolate_actor` takes its `break` rather than walking
-    // ([`automerge.rs:1263-1272`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
-    //
-    // What is left is the **lifetime** divergence and only that: two module
-    // calls are still two changes where `AutoCommit` makes one
-    // ([`autocommit.rs:445-457`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)), so the
-    // change and actor counts below are still the port's and not the
-    // reference's.
-    try doc.isolate(gpa, beginning);
-    const second = try putObject(&doc, list, .{ .index = 0 }, .text);
-    // **The property, not the absence of an error**: the object made by the
-    // first isolated write is *visible to the second*, which is the whole of
-    // what the stale heads broke. `spliceText` returning `void` is the
-    // evidence; nothing here asserts that nothing threw.
-    try spliceText(&doc, second, 0, 0, "second");
-    try doc.integrate();
-
-    // The concurrency walk did not run away: **one** level-1 fork, where the
-    // old version had two. `withConcurrency` is applied to the document's own
-    // actor ([`types.rs:78-85`](../../github-automerge-automerge/rust/automerge/src/types.rs)),
-    // so a third would be `fork1.withConcurrency(1)`.
-    try testing.expectEqual(@as(usize, 2), doc.numActors());
-    try testing.expectEqual(@as(usize, 6), doc.graph.len());
+    const first = try owner.putObject(list, .{ .index = 0 }, .text);
+    try owner.spliceText(first, 0, 0, "first");
+    try testing.expectEqual(@as(usize, 1), owner.doc.graph.len());
+    try owner.isolate(gpa, beginning);
+    try testing.expectEqual(@as(usize, 2), owner.doc.graph.len());
+    const second = try owner.putObject(list, .{ .index = 0 }, .text);
+    try owner.spliceText(second, 0, 0, "second");
+    try owner.integrate();
+    try testing.expectEqual(@as(usize, 3), owner.doc.graph.len());
+    try testing.expectEqual(@as(usize, 2), owner.doc.numActors());
+    const got = try owner.text(second, gpa);
+    defer gpa.free(got);
+    try testing.expectEqualStrings("second", got);
 
     const base = types.ActorId{ .bytes = "0123456789abcdef" };
     const fork1 = try types.ActorId.withConcurrency(gpa, base, 1);
@@ -3432,8 +3069,8 @@ test "two module writes inside one isolation both land, and the second sees the 
     var has_fork2 = false;
     var has_fork_of_fork = false;
     var ai: ActorIdx = 0;
-    while (ai < doc.numActors()) : (ai += 1) {
-        const bytes = doc.getActor(ai).?.bytes;
+    while (ai < owner.doc.numActors()) : (ai += 1) {
+        const bytes = owner.doc.getActor(ai).?.bytes;
         if (std.mem.eql(u8, bytes, fork1.bytes)) has_fork1 = true;
         if (std.mem.eql(u8, bytes, fork2.bytes)) has_fork2 = true;
         if (std.mem.eql(u8, bytes, fork_of_fork.bytes)) has_fork_of_fork = true;
@@ -3443,95 +3080,48 @@ test "two module writes inside one isolation both land, and the second sees the 
     try testing.expect(!has_fork_of_fork);
 }
 
-// The second half of the same divergence, isolated from the first.
-//
-// The refusal above has two causes and this separates them: the isolation
-// heads do not advance on commit, and the transaction is not held open.
-// Upstream advances them — `ensure_transaction_closed` and `commit_with` both
-// run `if self.isolation.is_some() && hash.is_some() { self.isolation =
-// hash.map(|h| vec![h]) }` (`autocommit.rs:464-466`, `:736-738`) — and
-// [`Document.commit`](doc.zig) does not, so the second isolated transaction
-// opens at stale heads and forks to the next level.
-//
-// **Moving them here by hand removes the refusal and leaves the count.**
-// That is the statement this test makes: the heads are the small, separate
-// defect, and holding the transaction open is the contract. The reference's
-// one transaction answers **three** changes for the whole test; this answers
-// six, on three actors.
-//
-// A plain comment and not `///`, for the same reason as the test above:
-// Zig 0.16 refuses a doc comment on a `test`, and the refusal is a compile
-// error for the whole module rather than for this file alone.
-test "advancing the isolation heads by hand removes the refusal and leaves the extra changes and actors" {
+test "a history barrier advances isolated heads without splitting a later held pair" {
+    // Explicit getHeads is a close barrier; ordinary writes remain one journal.
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
-    defer doc.deinit();
-
-    const list = try putObject(&doc, .root, .{ .key = "list" }, .list);
-    _ = try insert(&doc, list, 0, .{ .str = "base" });
-    const beginning = try doc.getHeads(gpa);
+    var owner = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    defer owner.deinit();
+    try owner.setActorId(.{ .bytes = "0123456789abcdef" });
+    const list = try owner.putObject(.root, .{ .key = "list" }, .list);
+    _ = try owner.insert(list, 0, .{ .str = "base" });
+    const beginning = try owner.getHeads(gpa);
     defer gpa.free(beginning);
-
-    const first = try putObject(&doc, list, .{ .index = 0 }, .text);
-    try spliceText(&doc, first, 0, 0, "first");
-
-    try doc.isolate(gpa, beginning);
-    const second = try putObject(&doc, list, .{ .index = 0 }, .text);
-
-    // What upstream's commit does and this port's does not
-    // ([`Document.commit`](doc.zig), `autocommit.rs:464-466`).
-    const after_first = try doc.getHeads(gpa);
-    defer gpa.free(after_first);
-    try doc.isolate(gpa, after_first);
-
-    // The write lands now. **It is not the same document**: it is a third
-    // change, and it is written by the document's own actor rather than by the
-    // isolated one, because the heads it opened at already cover everything
-    // that actor has done.
-    try spliceText(&doc, second, 0, 0, "second");
-    try doc.integrate();
-
-    // Three changes upstream (`tests/test.rs:4179-4208`): the base, the
-    // `"first"` pair as one, and the `"second"` pair as one — and the isolated
-    // pair is **one actor and one change**. Six here, and the isolated region
-    // alone is two changes on **two** actors: the fork the first call made,
-    // and the document's own actor for the second.
-    //
-    // Two actors and not three, and that is the point of the test: the advance
-    // is what turns the level-2 fork of the test above back into the
-    // document's own actor, so the *refusal* is the heads and the *count* is
-    // the lifetime. Fixing the heads alone gets `"second"` written and still
-    // does not make upstream's document.
-    try testing.expectEqual(@as(usize, 6), doc.graph.len());
-    try testing.expectEqual(@as(usize, 2), doc.numActors());
-
-    // **The value agreeing is exactly why the count has to be asserted**:
-    // `"second"` wins the register either way, so the hydrate cannot tell the
-    // two documents apart.
-    //
-    // Read the **text object**, not `list[0]`: `list`'s element at index 0 is
-    // the text object itself, so `get` there answers a `.object` and reading
-    // `.value.scalar` off it is a union-field panic rather than a wrong
-    // value. `spliceText` above wrote `"second"` into `second`, so that is
-    // what answers here.
-    const got = try readmod.text(&doc, second, gpa);
+    const first = try owner.putObject(list, .{ .index = 0 }, .text);
+    try owner.spliceText(first, 0, 0, "first");
+    try owner.isolate(gpa, beginning);
+    const second = try owner.putObject(list, .{ .index = 0 }, .text);
+    const after_object = try owner.getHeads(gpa);
+    defer gpa.free(after_object);
+    try testing.expectEqual(@as(usize, 3), owner.doc.graph.len());
+    try owner.spliceText(second, 0, 0, "second");
+    try owner.spliceText(second, 6, 0, "!");
+    try testing.expectEqual(@as(usize, 3), owner.doc.graph.len());
+    try owner.integrate();
+    try testing.expectEqual(@as(usize, 4), owner.doc.graph.len());
+    try testing.expectEqual(@as(usize, 2), owner.doc.numActors());
+    const got = try owner.text(second, gpa);
     defer gpa.free(got);
-    try testing.expectEqualStrings("second", got);
+    try testing.expectEqualStrings("second!", got);
 }
 
 test "a read through a scoped transaction is scoped, and a read through the document is not" {
     const gpa = testing.allocator;
-    var doc = try freshDocIn(gpa, .manual);
+    var doc = try freshDoc(gpa);
     defer doc.deinit();
 
     const text = blk: {
         var setup = try Transaction.open(gpa, &doc);
-        defer setup.deinit();
+        defer setup.deinit() catch @panic("testing allocator cleanup cannot inject failure");
         const t = try setup.putObject(.root, .{ .key = "text" }, .text);
         _ = try setup.put(.root, .{ .key = "size" }, .{ .int = 100 });
         try setup.spliceText(t, 0, 0, "abc");
         try setup.mark(t, 0, 3, "bold", .after, .{ .bool_value = true });
-        _ = try setup.commit(null, null);
+        var committed_1 = try setup.commit();
+        defer committed_1.deinit(gpa);
         break :blk t;
     };
     const heads = try doc.getHeads(gpa);
@@ -3541,10 +3131,11 @@ test "a read through a scoped transaction is scoped, and a read through the docu
     // `Null` — a tombstone, so the present has no mark there at all.
     {
         var moved = try Transaction.open(gpa, &doc);
-        defer moved.deinit();
+        defer moved.deinit() catch @panic("testing allocator cleanup cannot inject failure");
         _ = try moved.put(.root, .{ .key = "size" }, .{ .int = 200 });
         try moved.unmark(text, 0, 3, .none, "bold", null);
-        _ = try moved.commit(null, null);
+        var committed_2 = try moved.commit();
+        defer committed_2.deinit(gpa);
     }
 
     // **Through the document: the present, and no isolation is what says so.**
@@ -3564,7 +3155,7 @@ test "a read through a scoped transaction is scoped, and a read through the docu
     }
 
     var tx = try Transaction.openAt(gpa, &doc, heads);
-    defer tx.deinit();
+    defer tx.deinit() catch @panic("testing allocator cleanup cannot inject failure");
 
     // **Through the transaction, with no heads named, and it is still
     // scoped.** `get_scope(None)` is `self.inner.get_scope()` and not "the
@@ -3630,7 +3221,8 @@ test "a read through a scoped transaction is scoped, and a read through the docu
         defer own.deinit();
         try testing.expectEqual(@as(usize, 0), own.len());
     }
-    _ = try tx.commit(null, null);
+    var committed_3 = try tx.commit();
+    defer committed_3.deinit(gpa);
 
     // **After the commit the document reads 300 and the heads still read the
     // mark** ([`test.rs:2706-2712`](../../github-automerge-automerge/rust/automerge/tests/test.rs)),
@@ -3653,11 +3245,11 @@ test "a read through a scoped transaction is scoped, and a read through the docu
 
 test "an unscoped transaction reads the present, and its own write is in the present" {
     const gpa = testing.allocator;
-    var doc = try freshDocIn(gpa, .manual);
+    var doc = try freshDoc(gpa);
     defer doc.deinit();
 
     var tx = try Transaction.open(gpa, &doc);
-    defer tx.deinit();
+    defer tx.deinit() catch @panic("testing allocator cleanup cannot inject failure");
     _ = try tx.put(.root, .{ .key = "size" }, .{ .int = 7 });
 
     // **`scopeClock` is null, so this is the indexed path** — upstream's
@@ -3700,25 +3292,26 @@ test "an unscoped transaction reads the present, and its own write is in the pre
 
 test "delete makes the key absent, not present with a null" {
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try doc.setActorId(.{ .bytes = "0123456789abcdef" });
     defer doc.deinit();
 
-    _ = try put(&doc, .root, .{ .key = "k" }, .{ .int = 1 });
-    var present = try register(gpa, &doc, "k");
+    _ = try doc.put(.root, .{ .key = "k" }, .{ .int = 1 });
+    var present = try register(gpa, &doc.doc, "k");
     try testing.expectEqual(@as(usize, 1), present.ops.items.len);
     present.deinit(gpa);
 
-    try testing.expectEqual(@as(usize, 1), try delete(&doc, .root, .{ .key = "k" }));
+    try testing.expectEqual(@as(usize, 1), try doc.delete(.root, .{ .key = "k" }));
 
     // **Absent.** A delete is a successor edge on the row it removes, never a
     // row of its own (`columns.rs:423`), so the register has nothing left in
     // it and a reader that answered "a null value" would be inventing one.
-    var gone = try register(gpa, &doc, "k");
+    var gone = try register(gpa, &doc.doc, "k");
     defer gone.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), gone.ops.items.len);
-    try testing.expectEqual(@as(usize, 0), doc.ops.seqLength(.root, doc.textEncoding(), null));
+    try testing.expectEqual(@as(usize, 0), doc.doc.ops.seqLength(.root, doc.textEncoding(), null));
     // The row is still there, as a tombstone, and that is a different fact.
-    var walk = try doc.ops.iter();
+    var walk = try doc.doc.ops.iter();
     var rows: usize = 0;
     while (try walk.next()) |row| {
         rows += 1;
@@ -3730,23 +3323,24 @@ test "delete makes the key absent, not present with a null" {
 
 test "increment on a plain value is MissingCounter and on a counter the count rises" {
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try doc.setActorId(.{ .bytes = "0123456789abcdef" });
     defer doc.deinit();
 
-    _ = try put(&doc, .root, .{ .key = "plain" }, .{ .int = 5 });
+    _ = try doc.put(.root, .{ .key = "plain" }, .{ .int = 5 });
     // **`error.MissingCounter`, before anything is written** (`inner.rs:466-468`).
     try testing.expectError(
         error.MissingCounter,
-        increment(&doc, .root, .{ .key = "plain" }, 1),
+        doc.increment(.root, .{ .key = "plain" }, 1),
     );
-    var plain = try register(gpa, &doc, "plain");
+    var plain = try register(gpa, &doc.doc, "plain");
     defer plain.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), plain.ops.items.len);
     try testing.expectEqual(@as(i64, 5), plain.ops.items[0].value().int);
 
-    _ = try put(&doc, .root, .{ .key = "n" }, .{ .counter = .init(10) });
-    try increment(&doc, .root, .{ .key = "n" }, 7);
-    var count = try register(gpa, &doc, "n");
+    _ = try doc.put(.root, .{ .key = "n" }, .{ .counter = .init(10) });
+    try doc.increment(.root, .{ .key = "n" }, 7);
+    var count = try register(gpa, &doc.doc, "n");
     defer count.deinit(gpa);
     // **The value rises.** A reader that accepted the increment and left the
     // counter alone would answer this with one row and the wrong number; the
@@ -3769,15 +3363,15 @@ test "increment on a plain value is MissingCounter and on a counter the count ri
 
 test "pendingOps counts the queued operations and drops to zero after commit, and baseHeads is the heads from before" {
     const gpa = testing.allocator;
-    var doc = try freshDocIn(gpa, .manual);
+    var doc = try freshDoc(gpa);
     defer doc.deinit();
 
     // Empty: nothing is queued and there are no heads.
-    try testing.expectEqual(@as(usize, 0), pendingOps(&doc));
-    try testing.expectEqual(@as(usize, 0), baseHeads(&doc).len);
+    try testing.expectEqual(@as(usize, 0), doc.ops.len());
+    try testing.expectEqual(@as(usize, 0), doc.graph.getHeads().len);
 
     var tx = try Transaction.open(gpa, &doc);
-    defer tx.deinit();
+    defer tx.deinit() catch @panic("testing allocator cleanup cannot inject failure");
     const base = tx.baseHeads();
     try testing.expectEqual(@as(usize, 0), base.len);
 
@@ -3787,15 +3381,16 @@ test "pendingOps counts the queued operations and drops to zero after commit, an
 
     // **The count is the real one, not a constant and not zero.**
     try testing.expectEqual(@as(usize, 3), tx.count());
-    try testing.expectEqual(@as(usize, 3), pendingOps(&doc));
+    try testing.expectEqual(@as(usize, 3), doc.ops.len());
 
     // The base has not moved: it is the heads from before the transaction.
     try testing.expectEqual(@as(usize, 0), base.len);
     try testing.expectEqualSlices(ChangeHash, base, tx.baseHeads());
 
-    const hash = (try tx.commit(null, null)).?;
+    var committed_4 = try tx.commit();
+    defer committed_4.deinit(gpa);
+    const hash = committed_4.hash.?;
     try testing.expectEqual(@as(usize, 0), tx.count());
-    try testing.expectEqual(@as(usize, 0), pendingOps(&doc));
     try testing.expectEqual(@as(usize, 1), doc.graph.len());
 
     // And the heads are now exactly what the next transaction is based on, so
@@ -3804,31 +3399,31 @@ test "pendingOps counts the queued operations and drops to zero after commit, an
     defer gpa.free(now);
     try testing.expectEqual(@as(usize, 1), now.len);
     try testing.expect(now[0].eql(hash));
-    try testing.expectEqual(@as(usize, 1), baseHeads(&doc).len);
-    try testing.expect(baseHeads(&doc)[0].eql(hash));
+    try testing.expectEqual(@as(usize, 1), doc.graph.getHeads().len);
+    try testing.expect(doc.graph.getHeads()[0].eql(hash));
 
     // A second transaction's base is that head, and the change it commits
     // depends on it.
     var second = try Transaction.open(gpa, &doc);
-    defer second.deinit();
+    defer second.deinit() catch @panic("testing allocator cleanup cannot inject failure");
     try testing.expectEqual(@as(usize, 1), second.baseHeads().len);
     try testing.expect(second.baseHeads()[0].eql(hash));
     _ = try second.put(.root, .{ .key = "d" }, .{ .int = 4 });
-    _ = try second.commit(null, null);
+    var committed_5 = try second.commit();
+    defer committed_5.deinit(gpa);
     try testing.expectEqual(@as(usize, 2), doc.graph.len());
 }
 
 test "a rollback restores the document exactly" {
     const gpa = testing.allocator;
-    var doc = try freshDocIn(gpa, .manual);
+    var doc = try freshDoc(gpa);
     defer doc.deinit();
 
     // A document with something in it, and a byte-for-byte copy of it. **Every
-    // write goes through a `Transaction`,** because this document is in
-    // [`Mode.manual`] and the module functions are the autocommit door.
+    // write goes through the raw document's explicit transaction owner.
     {
         var setup = try Transaction.open(gpa, &doc);
-        defer setup.deinit();
+        defer setup.deinit() catch @panic("testing allocator cleanup cannot inject failure");
         _ = try setup.put(.root, .{ .key = "keep" }, .{ .str = "before" });
         const list = try setup.putObject(.root, .{ .key = "l" }, .list);
         _ = try setup.insert(list, 0, .{ .int = 1 });
@@ -3836,7 +3431,8 @@ test "a rollback restores the document exactly" {
         const text = try setup.putObject(.root, .{ .key = "t" }, .text);
         try setup.spliceText(text, 0, 0, "hello");
         try setup.mark(text, 1, 3, "em", .both, .{ .bool_value = true });
-        _ = try setup.commit(null, null);
+        var committed_6 = try setup.commit();
+        defer committed_6.deinit(gpa);
     }
     // The objects the setup made, found through the document rather than
     // through a variable that would not outlive the block above.
@@ -3847,7 +3443,7 @@ test "a rollback restores the document exactly" {
     const text = doc.ops.idToExid(text_row.ops.items[0].id());
     text_row.deinit(gpa);
     _ = list;
-    var before = try doc.clone(gpa, .auto);
+    var before = try doc.clone(gpa);
     defer before.deinit();
     const before_rows = before.ops.len();
     const before_graph = before.graph.len();
@@ -3860,9 +3456,9 @@ test "a rollback restores the document exactly" {
     const list2 = try tx.putObject(.root, .{ .key = "m2" }, .map);
     _ = try tx.put(list2, .{ .key = "inner" }, .{ .str = "x" });
     try testing.expectEqual(@as(usize, 4), tx.count());
-    try testing.expectEqual(@as(usize, 4), pendingOps(&doc));
+    try testing.expectEqual(@as(usize, 4), tx.count());
     try testing.expectEqual(@as(usize, 4), try tx.rollback());
-    tx.deinit();
+    tx.deinitClosed();
 
     // **`OpSet.debugCmp` and not the heads or the row count**: the comparison
     // is over values, so a slab that was repartitioned on the way out does not
@@ -3874,7 +3470,7 @@ test "a rollback restores the document exactly" {
     for (before_heads, doc.graph.getHeads()) |want, have| {
         try testing.expect(want.eql(have));
     }
-    try testing.expectEqual(@as(usize, 0), pendingOps(&doc));
+    try testing.expectEqual(before_rows, doc.ops.len());
 
     // And the text and the mark are still what they were, read through the
     // document rather than through a row comparison.
@@ -3915,17 +3511,18 @@ test "expand is observable at the mark's own two anchors" {
     // and `none` leave it outside; the two that leave it outside differ from
     // the untouched mark only in that the mark's indices moved right.
     {
-        var doc = try freshDoc(gpa);
+        var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+        try doc.setActorId(.{ .bytes = "0123456789abcdef" });
         defer doc.deinit();
-        const text = try putObject(&doc, .root, .{ .key = "t" }, .text);
-        _ = try spliceText(&doc, text, 0, 0, "abcd");
-        try mark(&doc, text, 1, 3, "em", .none, .{ .bool_value = true });
-        _ = try spliceText(&doc, text, 1, 0, "X");
+        const text = try doc.putObject(.root, .{ .key = "t" }, .text);
+        try doc.spliceText(text, 0, 0, "abcd");
+        try doc.mark(text, 1, 3, "em", .none, .{ .bool_value = true });
+        try doc.spliceText(text, 1, 0, "X");
 
-        const got = try doc.text(gpa, text);
+        const got = try doc.text(text, gpa);
         defer gpa.free(got);
         try testing.expectEqualStrings("aXbcd", got);
-        const marks = try doc.marks(gpa, text);
+        const marks = try doc.marks(text, gpa);
         defer gpa.free(marks);
         // **The mark did not expand backwards**, so `X` is before its begin
         // and outside it. The mark still covers `b` and `c`, and those now sit
@@ -3936,17 +3533,18 @@ test "expand is observable at the mark's own two anchors" {
         try testing.expectEqual(@as(usize, 4), marks[0].end);
     }
     {
-        var doc = try freshDoc(gpa);
+        var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+        try doc.setActorId(.{ .bytes = "0123456789abcdef" });
         defer doc.deinit();
-        const text = try putObject(&doc, .root, .{ .key = "t" }, .text);
-        _ = try spliceText(&doc, text, 0, 0, "abcd");
-        try mark(&doc, text, 1, 3, "em", .before, .{ .bool_value = true });
-        _ = try spliceText(&doc, text, 1, 0, "X");
+        const text = try doc.putObject(.root, .{ .key = "t" }, .text);
+        try doc.spliceText(text, 0, 0, "abcd");
+        try doc.mark(text, 1, 3, "em", .before, .{ .bool_value = true });
+        try doc.spliceText(text, 1, 0, "X");
 
-        const got = try doc.text(gpa, text);
+        const got = try doc.text(text, gpa);
         defer gpa.free(got);
         try testing.expectEqualStrings("aXbcd", got);
-        const marks = try doc.marks(gpa, text);
+        const marks = try doc.marks(text, gpa);
         defer gpa.free(marks);
         // **The mark grew to `[1, 4)`**: the same three characters, the same
         // boolean, one more unit under it. That is what makes the flag a flag,
@@ -3964,14 +3562,15 @@ test "expand is observable at the mark's own two anchors" {
         // same answer for opposite reasons** — one flags the start anchor, the
         // other the end — and a reader that got the rule backwards would make
         // them differ.
-        var doc = try freshDoc(gpa);
+        var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+        try doc.setActorId(.{ .bytes = "0123456789abcdef" });
         defer doc.deinit();
-        const text = try putObject(&doc, .root, .{ .key = "t" }, .text);
-        _ = try spliceText(&doc, text, 0, 0, "abcd");
-        try mark(&doc, text, 1, 3, "em", .after, .{ .bool_value = true });
-        _ = try spliceText(&doc, text, 1, 0, "X");
+        const text = try doc.putObject(.root, .{ .key = "t" }, .text);
+        try doc.spliceText(text, 0, 0, "abcd");
+        try doc.mark(text, 1, 3, "em", .after, .{ .bool_value = true });
+        try doc.spliceText(text, 1, 0, "X");
 
-        const marks = try doc.marks(gpa, text);
+        const marks = try doc.marks(text, gpa);
         defer gpa.free(marks);
         try testing.expectEqual(@as(usize, 1), marks.len);
         try testing.expectEqual(@as(usize, 2), marks[0].start);
@@ -3981,17 +3580,18 @@ test "expand is observable at the mark's own two anchors" {
     // **At the mark's end, index 3.** Here the flag that decides is the end's,
     // and the two that leave `X` outside are the two whose end does not expand.
     {
-        var doc = try freshDoc(gpa);
+        var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+        try doc.setActorId(.{ .bytes = "0123456789abcdef" });
         defer doc.deinit();
-        const text = try putObject(&doc, .root, .{ .key = "t" }, .text);
-        _ = try spliceText(&doc, text, 0, 0, "abcd");
-        try mark(&doc, text, 1, 3, "em", .both, .{ .bool_value = true });
-        _ = try spliceText(&doc, text, 3, 0, "X");
+        const text = try doc.putObject(.root, .{ .key = "t" }, .text);
+        try doc.spliceText(text, 0, 0, "abcd");
+        try doc.mark(text, 1, 3, "em", .both, .{ .bool_value = true });
+        try doc.spliceText(text, 3, 0, "X");
 
-        const got = try doc.text(gpa, text);
+        const got = try doc.text(text, gpa);
         defer gpa.free(got);
         try testing.expectEqualStrings("abcXd", got);
-        const marks = try doc.marks(gpa, text);
+        const marks = try doc.marks(text, gpa);
         defer gpa.free(marks);
         // **The mark grew to `[1, 4)`**: the end expanded forwards, so `X` is
         // inside the mark.
@@ -4007,17 +3607,18 @@ test "expand is observable at the mark's own two anchors" {
         // splice, which is the point: at this anchor a non-expanding end leaves
         // the range alone, and at the other anchor a non-expanding begin does
         // not.
-        var doc = try freshDoc(gpa);
+        var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+        try doc.setActorId(.{ .bytes = "0123456789abcdef" });
         defer doc.deinit();
-        const text = try putObject(&doc, .root, .{ .key = "t" }, .text);
-        _ = try spliceText(&doc, text, 0, 0, "abcd");
-        try mark(&doc, text, 1, 3, "em", .before, .{ .bool_value = true });
-        _ = try spliceText(&doc, text, 3, 0, "X");
+        const text = try doc.putObject(.root, .{ .key = "t" }, .text);
+        try doc.spliceText(text, 0, 0, "abcd");
+        try doc.mark(text, 1, 3, "em", .before, .{ .bool_value = true });
+        try doc.spliceText(text, 3, 0, "X");
 
-        const got = try doc.text(gpa, text);
+        const got = try doc.text(text, gpa);
         defer gpa.free(got);
         try testing.expectEqualStrings("abcXd", got);
-        const marks = try doc.marks(gpa, text);
+        const marks = try doc.marks(text, gpa);
         defer gpa.free(marks);
         try testing.expectEqual(@as(usize, 1), marks.len);
         try testing.expectEqualStrings("em", marks[0].name);
@@ -4025,14 +3626,15 @@ test "expand is observable at the mark's own two anchors" {
         try testing.expectEqual(@as(usize, 3), marks[0].end);
     }
     {
-        var doc = try freshDoc(gpa);
+        var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+        try doc.setActorId(.{ .bytes = "0123456789abcdef" });
         defer doc.deinit();
-        const text = try putObject(&doc, .root, .{ .key = "t" }, .text);
-        _ = try spliceText(&doc, text, 0, 0, "abcd");
-        try mark(&doc, text, 1, 3, "em", .none, .{ .bool_value = true });
-        _ = try spliceText(&doc, text, 3, 0, "X");
+        const text = try doc.putObject(.root, .{ .key = "t" }, .text);
+        try doc.spliceText(text, 0, 0, "abcd");
+        try doc.mark(text, 1, 3, "em", .none, .{ .bool_value = true });
+        try doc.spliceText(text, 3, 0, "X");
 
-        const marks = try doc.marks(gpa, text);
+        const marks = try doc.marks(text, gpa);
         defer gpa.free(marks);
         // **Same answer as `before` at this anchor**, and for the same reason:
         // what decides is the end, and neither of these expands forwards.
@@ -4044,19 +3646,22 @@ test "expand is observable at the mark's own two anchors" {
 
 test "spliceText of ten characters is one change, ten rows, and a contiguous row order" {
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try doc.setActorId(.{ .bytes = "0123456789abcdef" });
     defer doc.deinit();
-    const text = try putObject(&doc, .root, .{ .key = "t" }, .text);
-    const changes_before = doc.graph.len();
+    const text = try doc.putObject(.root, .{ .key = "t" }, .text);
+    _ = try doc.commit();
+    const changes_before = doc.doc.graph.len();
 
-    _ = try spliceText(&doc, text, 0, 0, "0123456789");
+    try doc.spliceText(text, 0, 0, "0123456789");
+    _ = try doc.commit();
 
     // **One change.** Ten operations, one `OpSet.splice` (`Batch.finish`).
-    try testing.expectEqual(changes_before + 1, doc.graph.len());
+    try testing.expectEqual(changes_before + 1, doc.doc.graph.len());
     // The text object itself is a row, so eleven rows and ten characters.
-    try testing.expectEqual(@as(usize, 11), doc.ops.len());
+    try testing.expectEqual(@as(usize, 11), doc.doc.ops.len());
 
-    const got = try doc.text(gpa, text);
+    const got = try doc.text(text, gpa);
     defer gpa.free(got);
     try testing.expectEqualStrings("0123456789", got);
 
@@ -4065,10 +3670,10 @@ test "spliceText of ten characters is one change, ten rows, and a contiguous row
     // from another object in between. That is the property
     // `BatchInsertion::next_pos` assumes when it predicts where each queued
     // operation will land (`inner.rs:1460-1462`).
-    const rows = try doc.ops.scopeToObj(text);
+    const rows = try doc.doc.ops.scopeToObj(text);
     try testing.expectEqual(@as(usize, 1), rows.start);
     try testing.expectEqual(@as(usize, 11), rows.end);
-    try testing.expectEqual(doc.ops.len(), rows.end);
+    try testing.expectEqual(doc.doc.ops.len(), rows.end);
 
     // **`Op.step` is the row-order rule itself** (`op.rs:1048-1071`): the
     // object may not go backwards, the register may not go backwards inside it,
@@ -4078,8 +3683,8 @@ test "spliceText of ten characters is one change, ten rows, and a contiguous row
     var stepper = opmod.OpStepper.initial();
     var previous: ?Op = null;
     var in_object: usize = 0;
-    for (0..doc.ops.len()) |pos| {
-        const at = (try doc.ops.get(pos)).?;
+    for (0..doc.doc.ops.len()) |pos| {
+        const at = (try doc.doc.ops.get(pos)).?;
         try testing.expect(at.step(&stepper));
         if (previous) |prev| {
             // The rows ascend by id because one batch from one actor minted
@@ -4094,12 +3699,13 @@ test "spliceText of ten characters is one change, ten rows, and a contiguous row
     try testing.expectEqual(@as(usize, 10), in_object);
     // And the whole op set, walked by the gate that exists for it
     // (`OpSet::validateOpOrder`, `op_set.rs:177-180`).
-    try testing.expect(try doc.ops.validateOpOrder());
+    try testing.expect(try doc.doc.ops.validateOpOrder());
 }
 
 test "an empty document and a non-object target are refusals, not traps" {
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try doc.setActorId(.{ .bytes = "0123456789abcdef" });
     defer doc.deinit();
 
     // **A non-object target.** `error.NotAnObject`, not a trap: the document
@@ -4107,28 +3713,28 @@ test "an empty document and a non-object target are refusals, not traps" {
     // way.
     try testing.expectError(
         error.NotAnObject,
-        put(&doc, .{ .id = OpId.init(99, 0) }, .{ .key = "k" }, .{ .int = 1 }),
+        doc.put(.{ .id = OpId.init(99, 0) }, .{ .key = "k" }, .{ .int = 1 }),
     );
-    try testing.expectEqual(@as(usize, 0), doc.graph.len());
-    try testing.expectEqual(@as(usize, 0), doc.ops.len());
+    try testing.expectEqual(@as(usize, 0), doc.doc.graph.len());
+    try testing.expectEqual(@as(usize, 0), doc.doc.ops.len());
 
     // **The wrong kind of object for the method**, which is `error.InvalidOp`
     // and the same refusal upstream gives (`inner.rs:616-618`).
     try testing.expectError(
         error.InvalidOp,
-        spliceText(&doc, .root, 0, 0, "x"),
+        doc.spliceText(.root, 0, 0, "x"),
     );
-    const list = try putObject(&doc, .root, .{ .key = "l" }, .list);
+    const list = try doc.putObject(.root, .{ .key = "l" }, .list);
     try testing.expectError(
         error.InvalidOp,
-        spliceText(&doc, list, 0, 0, "x"),
+        doc.spliceText(list, 0, 0, "x"),
     );
 
     // **An index past the end of a sequence** is `error.InvalidIndex`
     // (`insert.zig:136-137`), again not a trap.
     try testing.expectError(
         error.InvalidIndex,
-        insert(&doc, list, 5, .{ .int = 1 }),
+        doc.insert(list, 5, .{ .int = 1 }),
     );
 
     // **A map key on a sequence is a no-op, not a refusal** — and this is the
@@ -4140,44 +3746,24 @@ test "an empty document and a non-object target are refusals, not traps" {
     // would reject a call upstream accepts, and one that *wrote* the operation
     // would add a change and a row to the document for nothing — so both the
     // refusal and the write are checked, and the count is the answer.
-    const changes = doc.graph.len();
-    const rows = doc.ops.len();
-    try testing.expectEqual(@as(usize, 0), try delete(&doc, list, .{ .key = "k" }));
-    try testing.expectEqual(changes, doc.graph.len());
-    try testing.expectEqual(rows, doc.ops.len());
-}
-
-test "the wrong door is an error: the module functions want autocommit and a transaction wants manual" {
-    const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .manual);
-    defer doc.deinit();
-    doc.setActorId(.{ .bytes = "0123456789abcdef" });
-
-    // The module functions are `AutoCommit`, and this document is `Automerge`.
-    try testing.expectError(error.InvalidOp, put(&doc, .root, .{ .key = "k" }, .{ .int = 1 }));
-    try testing.expectError(error.InvalidOp, delete(&doc, .root, .{ .key = "k" }));
-    try testing.expectEqual(@as(usize, 0), doc.graph.len());
-
-    // And the other way round. **Nothing was written on either refusal**, which
-    // is the half that matters: an error that leaves a document half-changed is
-    // worse than a trap in a file that has already been read.
-    var auto = try freshDoc(gpa);
-    defer auto.deinit();
-    try testing.expectError(error.InvalidOp, Transaction.open(gpa, &auto));
-    try testing.expectError(error.InvalidOp, Transaction.openAt(gpa, &auto, null));
-    try testing.expectEqual(@as(usize, 0), auto.graph.len());
-    try testing.expectEqual(@as(usize, 0), auto.ops.len());
+    _ = try doc.commit();
+    const changes = doc.doc.graph.len();
+    const rows = doc.doc.ops.len();
+    try testing.expectEqual(@as(usize, 0), try doc.delete(list, .{ .key = "k" }));
+    try testing.expectEqual(changes, doc.doc.graph.len());
+    try testing.expectEqual(rows, doc.doc.ops.len());
 }
 
 test "a transaction commits nothing when it wrote nothing, and a second commit is refused" {
     const gpa = testing.allocator;
-    var doc = try freshDocIn(gpa, .manual);
+    var doc = try freshDoc(gpa);
     defer doc.deinit();
 
     var first = try Transaction.open(gpa, &doc);
     _ = try first.put(.root, .{ .key = "k" }, .{ .int = 1 });
-    _ = try first.commit(null, null);
-    first.deinit();
+    var committed_7 = try first.commit();
+    defer committed_7.deinit(gpa);
+    first.deinitClosed();
     try testing.expectEqual(@as(usize, 1), doc.graph.len());
 
     var again = try Transaction.open(gpa, &doc);
@@ -4185,29 +3771,34 @@ test "a transaction commits nothing when it wrote nothing, and a second commit i
     // A redundant `put` writes no operation (`op_set.rs:1489-1492`), so there
     // is nothing to commit and no change to add.
     try testing.expectEqual(@as(usize, 0), again.count());
-    try testing.expect((try again.commit(null, null)) == null);
-    again.deinit();
+    var committed_8 = try again.commit();
+    defer committed_8.deinit(gpa);
+    try testing.expect(committed_8.hash == null);
+    again.deinitClosed();
     try testing.expectEqual(@as(usize, 1), doc.graph.len());
 
     // **A second commit is refused**, because upstream takes the inner out of
     // its `Option` before the first one (`manual_transaction.rs:135-145`) and
     // an application twice is a bug rather than a no-op.
     var empty = try Transaction.open(gpa, &doc);
-    defer empty.deinit();
-    try testing.expect((try empty.commit(null, null)) == null);
-    try testing.expectError(error.InvalidOp, empty.commit(null, null));
+    defer empty.deinit() catch @panic("testing allocator cleanup cannot inject failure");
+    var committed_9 = try empty.commit();
+    defer committed_9.deinit(gpa);
+    try testing.expect(committed_9.hash == null);
+    try testing.expectError(error.InvalidOp, empty.commit());
     try testing.expectError(error.InvalidOp, empty.rollback());
     try testing.expectEqual(@as(usize, 1), doc.graph.len());
 }
 
 test "putObject creates an object the document then reports as one" {
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try doc.setActorId(.{ .bytes = "0123456789abcdef" });
     defer doc.deinit();
 
-    const map = try putObject(&doc, .root, .{ .key = "m" }, .map);
-    const list = try putObject(&doc, .root, .{ .key = "l" }, .list);
-    const text = try putObject(&doc, .root, .{ .key = "t" }, .text);
+    const map = try doc.putObject(.root, .{ .key = "m" }, .map);
+    const list = try doc.putObject(.root, .{ .key = "l" }, .list);
+    const text = try doc.putObject(.root, .{ .key = "t" }, .text);
     try testing.expectEqual(ObjType.map, try doc.objectType(map));
     try testing.expectEqual(ObjType.list, try doc.objectType(list));
     try testing.expectEqual(ObjType.text, try doc.objectType(text));
@@ -4222,19 +3813,20 @@ test "putObject creates an object the document then reports as one" {
     // — the one place `put`'s three-arm check differs.
     try testing.expectError(
         error.InvalidOp,
-        putObject(&doc, text, .{ .index = 0 }, .map),
+        doc.putObject(text, .{ .index = 0 }, .map),
     );
 }
 
 test "insert and delete on a list move the element ids" {
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try doc.setActorId(.{ .bytes = "0123456789abcdef" });
     defer doc.deinit();
-    const list = try putObject(&doc, .root, .{ .key = "l" }, .list);
+    const list = try doc.putObject(.root, .{ .key = "l" }, .list);
 
-    const a = try insert(&doc, list, 0, .{ .int = 1 });
-    const b = try insert(&doc, list, 1, .{ .int = 2 });
-    try testing.expectEqual(@as(usize, 2), doc.ops.seqLength(list, doc.textEncoding(), null));
+    const a = try doc.insert(list, 0, .{ .int = 1 });
+    const b = try doc.insert(list, 1, .{ .int = 2 });
+    try testing.expectEqual(@as(usize, 2), doc.doc.ops.seqLength(list, doc.textEncoding(), null));
 
     // An insert's id is also its element id (`op.rs:1140-1146`), so the
     // elements are addressable by the ids `insert` returned — and `index` is
@@ -4242,18 +3834,18 @@ test "insert and delete on a list move the element ids" {
     // seeks a statement about where the elements are rather than about the
     // ids resolving.
     {
-        const at = (try doc.ops.seekListOpid(list, a, .list, null)).?;
+        const at = (try doc.doc.ops.seekListOpid(list, a, .list, null)).?;
         try testing.expectEqual(@as(usize, 0), at.index);
         try testing.expect(at.visible);
     }
     {
-        const at = (try doc.ops.seekListOpid(list, b, .list, null)).?;
+        const at = (try doc.doc.ops.seekListOpid(list, b, .list, null)).?;
         try testing.expectEqual(@as(usize, 1), at.index);
         try testing.expect(at.visible);
     }
 
-    try testing.expectEqual(@as(usize, 1), try delete(&doc, list, .{ .index = 0 }));
-    try testing.expectEqual(@as(usize, 1), doc.ops.seqLength(list, doc.textEncoding(), null));
+    try testing.expectEqual(@as(usize, 1), try doc.delete(list, .{ .index = 0 }));
+    try testing.expectEqual(@as(usize, 1), doc.doc.ops.seqLength(list, doc.textEncoding(), null));
 
     // **The element after the deleted one moved down.** `index` counts the
     // winners in front of the row (`op_set.rs:866-868`), so a delete that
@@ -4261,7 +3853,7 @@ test "insert and delete on a list move the element ids" {
     // that a reader which merely stopped returning `a` would also pass, which
     // is why it is here.
     {
-        const at = (try doc.ops.seekListOpid(list, b, .list, null)).?;
+        const at = (try doc.doc.ops.seekListOpid(list, b, .list, null)).?;
         try testing.expectEqual(@as(usize, 0), at.index);
         try testing.expect(at.visible);
     }
@@ -4273,7 +3865,7 @@ test "insert and delete on a list move the element ids" {
     // visible — which is a different fact from "gone", and the one this port
     // was conflating.
     {
-        const at = (try doc.ops.seekListOpid(list, a, .list, null)).?;
+        const at = (try doc.doc.ops.seekListOpid(list, a, .list, null)).?;
         try testing.expect(!at.visible);
         try testing.expect(!at.op.visible());
     }
@@ -4281,18 +3873,19 @@ test "insert and delete on a list move the element ids" {
     // being expected of a deleted one.
     try testing.expectEqual(
         @as(?opsetmod.FoundOpId, null),
-        try doc.ops.seekListOpid(list, OpId.root, .list, null),
+        try doc.doc.ops.seekListOpid(list, OpId.root, .list, null),
     );
 }
 
 test "mark, unmark and the block methods on a text object" {
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try doc.setActorId(.{ .bytes = "0123456789abcdef" });
     defer doc.deinit();
-    const text = try putObject(&doc, .root, .{ .key = "t" }, .text);
-    _ = try spliceText(&doc, text, 0, 0, "abcdef");
+    const text = try doc.putObject(.root, .{ .key = "t" }, .text);
+    try doc.spliceText(text, 0, 0, "abcdef");
 
-    const block = try splitBlock(&doc, text, 3);
+    const block = try doc.splitBlock(text, 3);
     try testing.expectEqual(ObjType.map, try doc.objectType(block));
     // **A block is one position wide, and a split only inserts**
     // (`split_block` splices one `Make(Map)` row and removes nothing,
@@ -4300,18 +3893,18 @@ test "mark, unmark and the block methods on a text object" {
     // positions. The block's own width is one whatever it holds — `Op.width`'s
     // `.list` arm, and a block row is the "anything else" case in
     // `seq_length`, which measures it as one U+FFFC (`op_set.rs:443-447`).
-    try testing.expectEqual(@as(usize, 7), doc.ops.seqLength(text, doc.textEncoding(), null));
+    try testing.expectEqual(@as(usize, 7), doc.doc.ops.seqLength(text, doc.textEncoding(), null));
 
-    _ = try put(&doc, block, .{ .key = "kind" }, .{ .str = "para" });
-    try joinBlock(&doc, text, 3);
+    _ = try doc.put(block, .{ .key = "kind" }, .{ .str = "para" });
+    try doc.joinBlock(text, 3);
     // **And a join only deletes** (`join_block`, `inner.rs:931-937`), so the
     // six characters are all that is left and the block is gone.
-    try testing.expectEqual(@as(usize, 6), doc.ops.seqLength(text, doc.textEncoding(), null));
-    const joined = try doc.text(gpa, text);
+    try testing.expectEqual(@as(usize, 6), doc.doc.ops.seqLength(text, doc.textEncoding(), null));
+    const joined = try doc.text(text, gpa);
     defer gpa.free(joined);
     try testing.expectEqualStrings("abcdef", joined);
 
-    const again = try replaceBlock(&doc, text, 1);
+    const again = try doc.replaceBlock(text, 1);
     try testing.expectEqual(ObjType.map, try doc.objectType(again));
     // **Six, and the reference says so — run, not reasoned.** `replace_block`
     // is `join_block` then `split_block` (`inner.rs:991-992`), and
@@ -4332,45 +3925,48 @@ test "mark, unmark and the block methods on a text object" {
     // index 1 to delete. A second `replace_block` at the same index then
     // finds a block there, deletes it and inserts one, and the length stays 6
     // — the reference agrees on that too.
-    try testing.expectEqual(@as(usize, 6), doc.ops.seqLength(text, doc.textEncoding(), null));
-    const replaced = try doc.text(gpa, text);
+    try testing.expectEqual(@as(usize, 6), doc.doc.ops.seqLength(text, doc.textEncoding(), null));
+    const replaced = try doc.text(text, gpa);
     defer gpa.free(replaced);
     try testing.expectEqualStrings("a\u{fffc}cdef", replaced);
 
     // **An unmark leaves no mark behind**, which is the tombstone rule
     // (`op_set.rs:1023`): a mark whose value is null is dropped on the way out.
-    try mark(&doc, text, 0, 2, "em", .after, .{ .bool_value = true });
-    const before = try doc.marks(gpa, text);
+    try doc.mark(text, 0, 2, "em", .after, .{ .bool_value = true });
+    const before = try doc.marks(text, gpa);
     try testing.expectEqual(@as(usize, 1), before.len);
     gpa.free(before);
-    try unmark(&doc, text, 0, 2, .after, "em", null);
-    const after = try doc.marks(gpa, text);
+    try doc.unmark(text, 0, 2, .after, "em", null);
+    const after = try doc.marks(text, gpa);
     defer gpa.free(after);
     try testing.expectEqual(@as(usize, 0), after.len);
 }
 
 test "a zero-width mark with no expansion writes nothing" {
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try doc.setActorId(.{ .bytes = "0123456789abcdef" });
     defer doc.deinit();
-    const text = try putObject(&doc, .root, .{ .key = "t" }, .text);
-    _ = try spliceText(&doc, text, 0, 0, "abc");
-    const changes = doc.graph.len();
-    const rows = doc.ops.len();
+    const text = try doc.putObject(.root, .{ .key = "t" }, .text);
+    try doc.spliceText(text, 0, 0, "abc");
+    _ = try doc.commit();
+    const changes = doc.doc.graph.len();
+    const rows = doc.doc.ops.len();
 
     // `inner.rs:813-825` — a mark from 1 to 1 with `ExpandMark::None` is a
     // begin and an end at the same anchor, and upstream writes nothing.
-    try mark(&doc, text, 1, 1, "em", .none, .{ .bool_value = true });
-    try testing.expectEqual(changes, doc.graph.len());
-    try testing.expectEqual(rows, doc.ops.len());
-    try testing.expectEqual(@as(usize, 0), pendingOps(&doc));
+    try doc.mark(text, 1, 1, "em", .none, .{ .bool_value = true });
+    try testing.expectEqual(changes, doc.doc.graph.len());
+    try testing.expectEqual(rows, doc.doc.ops.len());
+    try testing.expectEqual(@as(usize, 0), doc.pendingOps());
 }
 
 test "a spliced list of hydrated values is written in two batches" {
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try doc.setActorId(.{ .bytes = "0123456789abcdef" });
     defer doc.deinit();
-    const list = try putObject(&doc, .root, .{ .key = "l" }, .list);
+    const list = try doc.putObject(.root, .{ .key = "l" }, .list);
 
     var nested = hydmod.List.init(gpa, .root);
     defer nested.deinit();
@@ -4381,41 +3977,44 @@ test "a spliced list of hydrated values is written in two batches" {
         .{ .object = .{ .list = nested } },
         hydmod.Value.scalar(.{ .str = "three" }),
     };
-    const changes = doc.graph.len();
-    try splice(&doc, list, 0, 0, gpa, &values);
+    _ = try doc.commit();
+    const changes = doc.doc.graph.len();
+    try doc.splice(list, 0, 0, &values);
+    _ = try doc.commit();
     // **One change for the whole splice**, however many objects it made.
-    try testing.expectEqual(changes + 1, doc.graph.len());
-    try testing.expectEqual(@as(usize, 3), doc.ops.seqLength(list, doc.textEncoding(), null));
+    try testing.expectEqual(changes + 1, doc.doc.graph.len());
+    try testing.expectEqual(@as(usize, 3), doc.doc.ops.seqLength(list, doc.textEncoding(), null));
 
     // The nested list is there and holds what it was given.
-    var found = try doc.ops.seekOpsByIndex(gpa, list, 1, .list, null);
+    var found = try doc.doc.ops.seekOpsByIndex(gpa, list, 1, .list, null);
     defer found.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), found.ops.items.len);
-    const inner = doc.ops.idToExid(found.ops.items[0].id());
+    const inner = doc.doc.ops.idToExid(found.ops.items[0].id());
     try testing.expectEqual(ObjType.list, try doc.objectType(inner));
-    try testing.expectEqual(@as(usize, 1), doc.ops.seqLength(inner, doc.textEncoding(), null));
+    try testing.expectEqual(@as(usize, 1), doc.doc.ops.seqLength(inner, doc.textEncoding(), null));
 
     // And a scalar spliced into a text object is the strings joined, or a
     // refusal (`inner.rs:1391-1405`).
-    const text = try putObject(&doc, .root, .{ .key = "t" }, .text);
+    const text = try doc.putObject(.root, .{ .key = "t" }, .text);
     var words = [_]hydmod.Value{
         hydmod.Value.scalar(.{ .str = "ab" }),
         hydmod.Value.scalar(.{ .str = "cd" }),
     };
-    try splice(&doc, text, 0, 0, gpa, &words);
-    const got = try doc.text(gpa, text);
+    try doc.splice(text, 0, 0, &words);
+    const got = try doc.text(text, gpa);
     defer gpa.free(got);
     try testing.expectEqualStrings("abcd", got);
     var not_a_string = [_]hydmod.Value{hydmod.Value.scalar(.{ .int = 1 })};
     try testing.expectError(
         error.InvalidValueType,
-        splice(&doc, text, 0, 0, gpa, &not_a_string),
+        doc.splice(text, 0, 0, &not_a_string),
     );
 }
 
 test "initRootFromHydrate fills the root, and updateObject brings a map in line" {
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try doc.setActorId(.{ .bytes = "0123456789abcdef" });
     defer doc.deinit();
 
     var child = hydmod.Map.init(gpa, .root);
@@ -4435,7 +4034,7 @@ test "initRootFromHydrate fills the root, and updateObject brings a map in line"
     child = hydmod.Map.init(gpa, .root);
     try root.putOwned("y", hydmod.MapValue.init(hydmod.Value.scalar(.{ .str = "why" }), false));
 
-    try initRootFromHydrate(&doc, root);
+    try doc.initRootFromHydrate(&root);
     // **The keys were sorted, so the child map's ids are `a` then `b`** — a
     // hash map's own order would have given something else, and the same value
     // would then have produced a different change hash on another run.
@@ -4446,13 +4045,13 @@ test "initRootFromHydrate fills the root, and updateObject brings a map in line"
     // and the shape of a reader that looks in the wrong place. `inner` is the
     // object `z`'s row names, and that is the object the batch wrote into
     // (`inner.rs:1334-1380`, `batch_init_root_map`).
-    var zed = try register(gpa, &doc, "z");
+    var zed = try register(gpa, &doc.doc, "z");
     defer zed.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), zed.ops.items.len);
-    const inner = doc.ops.idToExid(zed.ops.items[0].id());
-    var a = try registerIn(gpa, &doc, inner, "a");
+    const inner = doc.doc.ops.idToExid(zed.ops.items[0].id());
+    var a = try registerIn(gpa, &doc.doc, inner, "a");
     defer a.deinit(gpa);
-    var b = try registerIn(gpa, &doc, inner, "b");
+    var b = try registerIn(gpa, &doc.doc, inner, "b");
     defer b.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), a.ops.items.len);
     try testing.expectEqual(@as(usize, 1), b.ops.items.len);
@@ -4460,7 +4059,7 @@ test "initRootFromHydrate fills the root, and updateObject brings a map in line"
     try testing.expectEqual(@as(i64, 1), a.ops.items[0].value().int);
     try testing.expectEqual(@as(i64, 2), b.ops.items[0].value().int);
 
-    var why = try register(gpa, &doc, "y");
+    var why = try register(gpa, &doc.doc, "y");
     defer why.deinit(gpa);
     try testing.expectEqualStrings("why", why.ops.items[0].value().str);
 
@@ -4468,19 +4067,426 @@ test "initRootFromHydrate fills the root, and updateObject brings a map in line"
     var replacement = hydmod.Map.init(gpa, .root);
     defer replacement.deinit();
     try replacement.putOwned("a", hydmod.MapValue.init(hydmod.Value.scalar(.{ .int = 10 }), false));
-    try updateObject(&doc, inner, replacement);
+    const replacement_value: hydmod.Value = .{ .object = .{ .map = replacement } };
+    try doc.updateObject(inner, &replacement_value);
 
-    var a2 = try registerIn(gpa, &doc, inner, "a");
+    var a2 = try registerIn(gpa, &doc.doc, inner, "a");
     defer a2.deinit(gpa);
     try testing.expectEqual(@as(i64, 10), a2.ops.items[0].value().int);
-    var b2 = try registerIn(gpa, &doc, inner, "b");
+    var b2 = try registerIn(gpa, &doc.doc, inner, "b");
     defer b2.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), b2.ops.items.len);
 }
 
+fn hydratedRootOrderFixture(gpa: Allocator) !hydmod.Map {
+    var root = hydmod.Map.init(gpa, .root);
+    errdefer root.deinit();
+    var child = hydmod.Map.init(gpa, .root);
+    defer child.deinit();
+    var list = hydmod.List.init(gpa, .root);
+    defer list.deinit();
+    try list.push(.{ .int = 7 }, false);
+    try child.putOwned("b", .init(.{ .object = .{ .list = list } }, false));
+    list = hydmod.List.init(gpa, .root);
+    try child.putOwned("c", .init(.{ .int = 3 }, false));
+    try root.putOwned("a", .init(.{ .object = .{ .map = child } }, false));
+    child = hydmod.Map.init(gpa, .root);
+    try root.putOwned("\x00k", .init(.{ .int = 2 }, false));
+    try root.putOwned("m", .init(.{ .int = 20 }, false));
+    try root.putOwned("z\x00", .init(.{ .int = 40 }, false));
+    try root.putOwned("é", .init(.{ .int = 50 }, false));
+    return root;
+}
+
+test "hydrated root joins existing lexical registers and objects with unchanged BFS change bytes" {
+    // The expected stream is built independently of the producer: sorted
+    // root keys, then the child's keys, then its list element
+    // (transaction/inner.rs:1334-1380,1539-1603). Existing root registers
+    // must not be separated or moved behind previously populated children.
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |occupied| {
+        var doc = try freshDoc(gpa);
+        defer doc.deinit();
+        var old_child: ?ExId = null;
+        if (occupied) {
+            var initial = try Transaction.open(gpa, &doc);
+            defer initial.deinit() catch unreachable;
+            _ = try initial.put(.root, .{ .key = "keep" }, .{ .int = 1 });
+            _ = try initial.put(.root, .{ .key = "m" }, .{ .int = 10 });
+            _ = try initial.put(.root, .{ .key = "z" }, .{ .int = 30 });
+            old_child = try initial.putObject(.root, .{ .key = "a" }, .map);
+            _ = try initial.put(old_child.?, .{ .key = "old" }, .{ .int = 99 });
+            _ = try initial.put(.root, .{ .key = "gone" }, .{ .int = 5 });
+            _ = try initial.delete(.root, .{ .key = "gone" });
+            var committed = try initial.commit();
+            defer committed.deinit(gpa);
+        }
+        var replay = try freshDoc(gpa);
+        defer replay.deinit();
+        try applyAll(gpa, &replay, &doc);
+        var root = try hydratedRootOrderFixture(gpa);
+        defer root.deinit();
+        var tx = try Transaction.open(gpa, &doc);
+        defer tx.deinit() catch unreachable;
+        const first = tx.nextId();
+        try tx.initRootFromHydrate(&root);
+        try testing.expectEqual(@as(usize, 8), tx.count());
+
+        const Spec = struct {
+            object: ExId = .root,
+            action: Action = .set,
+            key: @import("opset/types.zig").KeyRef,
+            scalar: ScalarValue = .null_value,
+            insert: bool = false,
+        };
+        const new_map = OpId.init(first.counter + 1, first.actor);
+        const new_list = OpId.init(first.counter + 5, first.actor);
+        const specs = [_]Spec{
+            .{ .key = .fromStr("\x00k"), .scalar = .{ .int = 2 } },
+            .{ .key = .fromStr("a"), .action = .make_map },
+            .{ .key = .fromStr("m"), .scalar = .{ .int = 20 } },
+            .{ .key = .fromStr("z\x00"), .scalar = .{ .int = 40 } },
+            .{ .key = .fromStr("é"), .scalar = .{ .int = 50 } },
+            .{ .object = .{ .id = new_map }, .key = .fromStr("b"), .action = .make_list },
+            .{ .object = .{ .id = new_map }, .key = .fromStr("c"), .scalar = .{ .int = 3 } },
+            .{ .object = .{ .id = new_list }, .key = .{ .seq = .head() }, .scalar = .{ .int = 7 }, .insert = true },
+        };
+        var expected: std.ArrayList(ChangeOp) = .empty;
+        defer {
+            for (expected.items) |*op| op.deinit(gpa);
+            expected.deinit(gpa);
+        }
+        try expected.ensureTotalCapacity(gpa, specs.len);
+        for (specs, 0..) |spec, i| expected.appendAssumeCapacity(try ChangeOp.init(
+            gpa,
+            OpId.init(first.counter + @as(u32, @intCast(i)), first.actor),
+            spec.object,
+            spec.action,
+            spec.key,
+            spec.scalar,
+            spec.insert,
+            false,
+            null,
+            &.{},
+        ));
+        var reference_change = try docmod.encodeOneChange(gpa, doc.ops.actors.items, .{
+            .actor = tx.actor,
+            .seq = tx.seq,
+            .start_op = tx.start_op,
+            .max_op = tx.start_op + specs.len - 1,
+            .time = 0,
+            .message = "",
+            .deps = tx.deps,
+            .footer = &.{},
+        }, expected.items);
+        defer reference_change.deinit(gpa);
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+        try testing.expect(committed.hash != null);
+        try testing.expect(committed.hash.?.eql(reference_change.change.hash));
+        try testing.expectEqual(@as(usize, 1), try replay.applyChanges(gpa, &.{reference_change.change}));
+        try testing.expect(try doc.ops.validateOpOrder());
+        try testing.expect((try doc.ops.validateTopIndex()) == null);
+        try testing.expect(try replay.ops.validateOpOrder());
+        try doc.debugCmp(&replay);
+        const keys = try rootKeys(gpa, &doc);
+        defer gpa.free(keys);
+        const wanted: []const []const u8 = if (occupied)
+            &.{ "\x00k", "a", "keep", "m", "z", "z\x00", "é" }
+        else
+            &.{ "\x00k", "a", "m", "z\x00", "é" };
+        try testing.expectEqual(wanted.len, keys.len);
+        for (wanted, keys) |want, actual| try testing.expectEqualStrings(want, actual);
+        for ([_]struct { key: []const u8, value: i64 }{
+            .{ .key = "\x00k", .value = 2 },
+            .{ .key = "m", .value = 20 },
+            .{ .key = "z\x00", .value = 40 },
+            .{ .key = "é", .value = 50 },
+        }) |want| {
+            const item = (try readmod.get(&doc, .root, .{ .key = want.key })) orelse
+                return error.TestUnexpectedResult;
+            try testing.expectEqual(want.value, item.value.scalar.int);
+        }
+        const child = doc.idToExid(new_map);
+        const list = (try readmod.get(&doc, child, .{ .key = "b" })) orelse
+            return error.TestUnexpectedResult;
+        const element = (try readmod.get(&doc, list.id, .{ .index = 0 })) orelse
+            return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(i64, 7), element.value.scalar.int);
+        if (old_child) |old| {
+            const kept = (try readmod.get(&doc, old, .{ .key = "old" })) orelse
+                return error.TestUnexpectedResult;
+            try testing.expectEqual(@as(i64, 99), kept.value.scalar.int);
+        }
+
+        // Repeat the same root, including identical scalar values, then use
+        // ordinary put/delete on those complete contiguous retained registers.
+        var again = try Transaction.open(gpa, &doc);
+        defer again.deinit() catch unreachable;
+        try again.initRootFromHydrate(&root);
+        try testing.expectEqual(@as(usize, 8), again.count());
+        _ = try again.put(.root, .{ .key = "m" }, .{ .int = 60 });
+        const overwrite = &again.pending.items[8].tx;
+        try testing.expectEqual(@as(usize, if (occupied) 3 else 2), overwrite.pred().len);
+        _ = try again.delete(.root, .{ .key = "a" });
+        var done = try again.commit();
+        defer done.deinit(gpa);
+        var winner = try register(gpa, &doc, "m");
+        defer winner.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), winner.ops.items.len);
+        try testing.expectEqual(@as(i64, 60), winner.ops.items[0].value().int);
+        try testing.expect((try readmod.get(&doc, .root, .{ .key = "a" })) == null);
+        try testing.expect(try doc.ops.validateOpOrder());
+        try testing.expect((try doc.ops.validateTopIndex()) == null);
+        try applyAll(gpa, &replay, &doc);
+        try doc.debugCmp(&replay);
+    }
+}
+
+test "hydrated existing root allocation refusal retains complete published and queued undo" {
+    const observer = testing.allocator;
+    var root = try hydratedRootOrderFixture(observer);
+    defer root.deinit();
+    var reached_success = false;
+    var reached_published_refusal = false;
+    for (0..4096) |offset| {
+        var failing = testing.FailingAllocator.init(observer, .{
+            .fail_index = std.math.maxInt(usize),
+        });
+        const gpa = failing.allocator();
+        var doc = try freshDoc(gpa);
+        defer doc.deinit();
+        {
+            var base = try Transaction.open(gpa, &doc);
+            defer base.deinit() catch unreachable;
+            _ = try base.put(.root, .{ .key = "keep" }, .{ .int = 1 });
+            _ = try base.put(.root, .{ .key = "m" }, .{ .int = 10 });
+            const old = try base.putObject(.root, .{ .key = "a" }, .map);
+            _ = try base.put(old, .{ .key = "old" }, .{ .int = 99 });
+            var committed = try base.commit();
+            defer committed.deinit(gpa);
+        }
+        var baseline = try freshDoc(observer);
+        defer baseline.deinit();
+        try applyAll(observer, &baseline, &doc);
+        var tx = try Transaction.open(gpa, &doc);
+        defer {
+            failing.fail_index = std.math.maxInt(usize);
+            tx.deinit() catch unreachable;
+        }
+        // Earlier operations in the same journal also own their row positions.
+        // Removing the hydrate prefix must restore them before undoing them.
+        _ = try tx.put(.root, .{ .key = "pending" }, .{ .int = 88 });
+        const before = tx.count();
+        failing.fail_index = failing.alloc_index + offset;
+        if (tx.initRootFromHydrate(&root)) |_| {
+            failing.fail_index = std.math.maxInt(usize);
+            try testing.expectEqual(before + 8, tx.count());
+            try testing.expect(try doc.ops.validateOpOrder());
+            try testing.expect((try doc.ops.validateTopIndex()) == null);
+            reached_success = true;
+        } else |primary| {
+            try testing.expectEqual(error.OutOfMemory, primary);
+            failing.fail_index = std.math.maxInt(usize);
+            reached_published_refusal = reached_published_refusal or doc.ops.len() > baseline.ops.len() + 1;
+            if (tx.rolling_back) {
+                try testing.expectError(error.InvalidOp, tx.put(.root, .{ .key = "refused" }, .{ .int = 0 }));
+                try testing.expectError(error.InvalidOp, tx.commit());
+            }
+        }
+        // This is explicit recovery, not an assumption of whole-batch atomicity.
+        const cancelled = tx.count();
+        try testing.expectEqual(cancelled, try tx.rollback());
+        try testing.expect(try doc.ops.validateOpOrder());
+        try testing.expect((try doc.ops.validateTopIndex()) == null);
+        try doc.debugCmp(&baseline);
+        try testing.expectEqual(@as(usize, 1), doc.graph.len());
+        try testing.expectEqual(doc.graph.len(), doc.node_info.items.len);
+        const kept = (try readmod.get(&doc, .root, .{ .key = "keep" })) orelse
+            return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(i64, 1), kept.value.scalar.int);
+        if (reached_success) break;
+    }
+    try testing.expect(reached_published_refusal);
+    try testing.expect(reached_success);
+}
+
+test "hydrated historical root placement uses full raw registers and preserves scoped conflicts" {
+    const gpa = testing.allocator;
+    var doc = try freshDoc(gpa);
+    defer doc.deinit();
+    {
+        var initial = try Transaction.open(gpa, &doc);
+        defer initial.deinit() catch unreachable;
+        _ = try initial.put(.root, .{ .key = "m" }, .{ .int = 1 });
+        _ = try initial.put(.root, .{ .key = "keep" }, .{ .int = 9 });
+        var result = try initial.commit();
+        defer result.deinit(gpa);
+    }
+    const heads = try doc.getHeads(gpa);
+    defer gpa.free(heads);
+    {
+        var current = try Transaction.open(gpa, &doc);
+        defer current.deinit() catch unreachable;
+        _ = try current.put(.root, .{ .key = "m" }, .{ .int = 2 });
+        const child = try current.putObject(.root, .{ .key = "future" }, .map);
+        _ = try current.put(child, .{ .key = "x" }, .{ .int = 8 });
+        var result = try current.commit();
+        defer result.deinit(gpa);
+    }
+    var root = try hydratedRootOrderFixture(gpa);
+    defer root.deinit();
+    var tx = try Transaction.openAt(gpa, &doc, heads);
+    defer tx.deinit() catch unreachable;
+    try tx.initRootFromHydrate(&root);
+    try testing.expectEqual(@as(usize, 8), tx.count());
+    for (tx.pending.items) |item| try testing.expectEqual(@as(usize, 0), item.tx.pred().len);
+    const scoped = try tx.getAll(.root, .{ .key = "m" }, gpa);
+    defer gpa.free(scoped);
+    try testing.expectEqual(@as(usize, 2), scoped.len);
+    try testing.expectEqual(@as(i64, 1), scoped[0].value.scalar.int);
+    try testing.expectEqual(@as(i64, 20), scoped[1].value.scalar.int);
+    const raw = try readmod.getAll(&doc, .root, .{ .key = "m" }, gpa);
+    defer gpa.free(raw);
+    try testing.expectEqual(@as(usize, 2), raw.len);
+    try testing.expectEqual(@as(i64, 2), raw[0].value.scalar.int);
+    try testing.expectEqual(@as(i64, 20), raw[1].value.scalar.int);
+    try testing.expect(try doc.ops.validateOpOrder());
+    try testing.expect((try doc.ops.validateTopIndex()) == null);
+    _ = try tx.put(.root, .{ .key = "m" }, .{ .int = 30 });
+    try testing.expectEqual(@as(usize, 2), tx.pending.items[8].tx.pred().len);
+    var result = try tx.commit();
+    defer result.deinit(gpa);
+    var replay = try freshDoc(gpa);
+    defer replay.deinit();
+    try applyAll(gpa, &replay, &doc);
+    try testing.expect(try doc.ops.validateOpOrder());
+    try testing.expect((try doc.ops.validateTopIndex()) == null);
+    try doc.debugCmp(&replay);
+    const retained = (try readmod.get(&doc, .root, .{ .key = "keep" })) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 9), retained.value.scalar.int);
+}
+
+test "held automatic hydrated root preserves existing child scope and repeated registers" {
+    const gpa = testing.allocator;
+    var owner = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    defer owner.deinit();
+    try owner.setActorId(.{ .bytes = "0123456789abcdef" });
+    _ = try owner.put(.root, .{ .key = "keep" }, .{ .int = 1 });
+    const older = try owner.putObject(.root, .{ .key = "a" }, .map);
+    _ = try owner.put(older, .{ .key = "old" }, .{ .int = 99 });
+    _ = try owner.commit();
+    var root = try hydratedRootOrderFixture(gpa);
+    defer root.deinit();
+    try owner.initRootFromHydrate(&root);
+    try owner.initRootFromHydrate(&root);
+    try testing.expectEqual(@as(usize, 16), owner.pendingOps());
+    _ = try owner.commit();
+    const kept = (try owner.get(.root, .{ .key = "keep" })) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 1), kept.value.scalar.int);
+    const history = (try owner.get(older, .{ .key = "old" })) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 99), history.value.scalar.int);
+    var conflict = try register(gpa, &owner.doc, "a");
+    defer conflict.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), conflict.ops.items.len);
+    try testing.expect(try owner.doc.ops.validateOpOrder());
+    try testing.expect((try owner.doc.ops.validateTopIndex()) == null);
+    var replay = try freshDoc(gpa);
+    defer replay.deinit();
+    try applyAll(gpa, &replay, &owner.doc);
+    try owner.doc.debugCmp(&replay);
+}
+
+test "hydrated retained root changes match pinned Rust canonical replay hashes" {
+    // Recorded from the pinned Rust init_from_hydrate, with identical actor,
+    // initial operation order and scalar types. Replaying its encoded changes
+    // into a fresh Rust document preserves absent keys and exposes all repeated
+    // no-predecessor values (inner.rs:1334-1380; automerge.rs:296-304).
+    const gpa = testing.allocator;
+    const Case = enum { absent, overlap, child };
+    for ([_]Case{ .absent, .overlap, .child }) |case| {
+        var doc = try freshDoc(gpa);
+        defer doc.deinit();
+        {
+            var initial = try Transaction.open(gpa, &doc);
+            defer initial.deinit() catch unreachable;
+            _ = try initial.put(.root, .{ .key = "keep" }, .{ .int = 1 });
+            switch (case) {
+                .absent => {},
+                .overlap => {
+                    _ = try initial.put(.root, .{ .key = "a" }, .{ .int = 1 });
+                    _ = try initial.put(.root, .{ .key = "z" }, .{ .int = 9 });
+                },
+                .child => {
+                    const child = try initial.putObject(.root, .{ .key = "c" }, .map);
+                    _ = try initial.put(child, .{ .key = "x" }, .{ .int = 7 });
+                },
+            }
+            var initial_result = try initial.commit();
+            defer initial_result.deinit(gpa);
+        }
+        var map = hydmod.Map.init(gpa, .root);
+        defer map.deinit();
+        if (case == .overlap) {
+            try map.putOwned("a", .init(.{ .int = 2 }, false));
+        } else {
+            try map.putOwned("first", .init(.{ .int = 2 }, false));
+            try map.putOwned("second", .init(.{ .int = 3 }, false));
+        }
+        const expected = try ChangeHash.parse(gpa, switch (case) {
+            .absent => "c3c5e4e8f8c2bdf01965a2e64e827c4e357d7a10868455ea83298ff12e02aabe",
+            .overlap => "eb57a2cd327f4fae65c273459d894dfba721b9414851dd3d2d7e6daff34a0e28",
+            .child => "e3b70c0eb957818ada50bd1792a590115ae43c6756b97c16f9ca1e20b8f16ed3",
+        });
+        {
+            var tx = try Transaction.open(gpa, &doc);
+            defer tx.deinit() catch unreachable;
+            try tx.initRootFromHydrate(&map);
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+            try testing.expect((result.hash orelse return error.TestUnexpectedResult).eql(expected));
+        }
+        if (case == .overlap) {
+            var tx = try Transaction.open(gpa, &doc);
+            defer tx.deinit() catch unreachable;
+            try tx.initRootFromHydrate(&map);
+            try testing.expectEqual(@as(usize, 1), tx.count());
+            var result = try tx.commit();
+            defer result.deinit(gpa);
+            const repeated = try ChangeHash.parse(gpa, "6ee78ae04f8723bf17b1d8af72dcdaf2110116455ecd0c9b94416e52b1765448");
+            try testing.expect((result.hash orelse return error.TestUnexpectedResult).eql(repeated));
+            var conflict = try register(gpa, &doc, "a");
+            defer conflict.deinit(gpa);
+            try testing.expectEqual(@as(usize, 3), conflict.ops.items.len);
+            try testing.expectEqual(@as(i64, 1), conflict.ops.items[0].value().int);
+            try testing.expectEqual(@as(i64, 2), conflict.ops.items[1].value().int);
+            try testing.expectEqual(@as(i64, 2), conflict.ops.items[2].value().int);
+        } else {
+            const first = (try readmod.get(&doc, .root, .{ .key = "first" })) orelse
+                return error.TestUnexpectedResult;
+            const second = (try readmod.get(&doc, .root, .{ .key = "second" })) orelse
+                return error.TestUnexpectedResult;
+            try testing.expectEqual(@as(i64, 2), first.value.scalar.int);
+            try testing.expectEqual(@as(i64, 3), second.value.scalar.int);
+        }
+        const keep = (try readmod.get(&doc, .root, .{ .key = "keep" })) orelse
+            return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(i64, 1), keep.value.scalar.int);
+        var replay = try freshDoc(gpa);
+        defer replay.deinit();
+        try applyAll(gpa, &replay, &doc);
+        try testing.expect(try doc.ops.validateOpOrder());
+        try testing.expect((try doc.ops.validateTopIndex()) == null);
+        try doc.debugCmp(&replay);
+    }
+}
+
 test "updateMapValue numbers its operations depth first, and the row order is not that order" {
     const gpa = testing.allocator;
-    var doc = try freshDocIn(gpa, .manual);
+    var doc = try freshDoc(gpa);
     defer doc.deinit();
 
     // **A value shaped to separate the two orders.** `a` is a map, `b` a list
@@ -4509,7 +4515,7 @@ test "updateMapValue numbers its operations depth first, and the row order is no
     inner = hydmod.Map.init(gpa, .root);
 
     var tx = try Transaction.open(gpa, &doc);
-    defer tx.deinit();
+    defer tx.deinit() catch @panic("testing allocator cleanup cannot inject failure");
     const start_op = tx.start_op;
     try tx.updateMapValue(.root, &root);
 
@@ -4545,7 +4551,8 @@ test "updateMapValue numbers its operations depth first, and the row order is no
         }
     }
 
-    _ = try tx.commit(null, null);
+    var committed_10 = try tx.commit();
+    defer committed_10.deinit(gpa);
 
     // **And the rows are not in the order the operations were written in.**
     // On an empty document the root's three rows were spliced at 0, then 1 and
@@ -4564,11 +4571,11 @@ test "updateMapValue numbers its operations depth first, and the row order is no
 
 test "a made object resolves the same on every write, and a spent transaction refuses anyway" {
     const gpa = testing.allocator;
-    var doc = try freshDocIn(gpa, .manual);
+    var doc = try freshDoc(gpa);
     defer doc.deinit();
 
     var tx = try Transaction.open(gpa, &doc);
-    defer tx.deinit();
+    defer tx.deinit() catch @panic("testing allocator cleanup cannot inject failure");
     const child = try tx.putObject(.root, .{ .key = "c" }, .map);
     // **The escape hatch, three times.** An object this transaction made is
     // in no clock, so [`exidToObj`] answers it from `made_here` alone
@@ -4579,7 +4586,8 @@ test "a made object resolves the same on every write, and a spent transaction re
     _ = try tx.put(child, .{ .key = "one" }, .{ .int = 1 });
     _ = try tx.put(child, .{ .key = "two" }, .{ .int = 2 });
     _ = try tx.put(child, .{ .key = "three" }, .{ .int = 3 });
-    _ = try tx.commit(null, null);
+    var committed_11 = try tx.commit();
+    defer committed_11.deinit(gpa);
 
     var one = try registerIn(gpa, &doc, child, "one");
     defer one.deinit(gpa);
@@ -4615,7 +4623,7 @@ test "a made object resolves the same on every write, and a spent transaction re
     // The same through the other door onto `requireOpen`, which is a
     // rollback rather than a commit.
     var tx2 = try Transaction.open(gpa, &doc);
-    defer tx2.deinit();
+    defer tx2.deinit() catch @panic("testing allocator cleanup cannot inject failure");
     const again = try tx2.putObject(.root, .{ .key = "c2" }, .map);
     _ = try tx2.put(again, .{ .key = "x" }, .{ .int = 1 });
     _ = try tx2.rollback();
@@ -4624,24 +4632,27 @@ test "a made object resolves the same on every write, and a spent transaction re
 
 test "updateText is a diff: an unchanged text writes no operation" {
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try doc.setActorId(.{ .bytes = "0123456789abcdef" });
     defer doc.deinit();
-    const text = try putObject(&doc, .root, .{ .key = "t" }, .text);
-    _ = try spliceText(&doc, text, 0, 0, "hello world");
+    const text = try doc.putObject(.root, .{ .key = "t" }, .text);
+    try doc.spliceText(text, 0, 0, "hello world");
 
-    const changes = doc.graph.len();
-    const rows = doc.ops.len();
-    try updateText(&doc, text, "hello world");
+    _ = try doc.commit();
+    const changes = doc.doc.graph.len();
+    const rows = doc.doc.ops.len();
+    try doc.updateText(text, "hello world");
     // **No change at all**, which is the property a write and a diff share and
     // only a diff has.
-    try testing.expectEqual(changes, doc.graph.len());
-    try testing.expectEqual(rows, doc.ops.len());
+    try testing.expectEqual(changes, doc.doc.graph.len());
+    try testing.expectEqual(rows, doc.doc.ops.len());
 
-    try updateText(&doc, text, "hello there");
-    const got = try doc.text(gpa, text);
+    try doc.updateText(text, "hello there");
+    _ = try doc.commit();
+    const got = try doc.text(text, gpa);
     defer gpa.free(got);
     try testing.expectEqualStrings("hello there", got);
-    try testing.expect(doc.graph.len() > changes);
+    try testing.expect(doc.doc.graph.len() > changes);
 }
 
 test "a spliced character does not follow the caller's buffer into the change" {
@@ -4657,21 +4668,22 @@ test "a spliced character does not follow the caller's buffer into the change" {
     // `freshDoc` gives both the same one, and the actor, the clock, the
     // operation ids and the dependencies are then all equal, so the two
     // hashes differ in nothing but the payload bytes.
-    var clean = try freshDoc(gpa);
+    var clean = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try clean.setActorId(.{ .bytes = "0123456789abcdef" });
     defer clean.deinit();
-    const clean_text = try putObject(&clean, .root, .{ .key = "t" }, .text);
-    _ = try spliceText(&clean, clean_text, 0, 0, "hello world");
-    const want = clean.graph.getHeads();
+    const clean_text = try clean.putObject(.root, .{ .key = "t" }, .text);
+    try clean.spliceText(clean_text, 0, 0, "hello world");
+    _ = try clean.commit();
+    const want = clean.doc.graph.getHeads();
     try testing.expectEqual(@as(usize, 1), want.len);
 
-    var dirty = try freshDoc(gpa);
+    var dirty = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try dirty.setActorId(.{ .bytes = "0123456789abcdef" });
     defer dirty.deinit();
-    const dirty_text = try putObject(&dirty, .root, .{ .key = "t" }, .text);
+    const dirty_text = try dirty.putObject(.root, .{ .key = "t" }, .text);
 
     var buf: [11]u8 = "hello world".*;
-    var tx = try openAuto(gpa, &dirty);
-    defer tx.deinit();
-    try tx.spliceText(dirty_text, 0, 0, &buf);
+    try dirty.spliceText(dirty_text, 0, 0, &buf);
     // **The caller takes its buffer back before the commit.** That is the
     // whole shape of the bug and not a corner case: every `textdiff` hook
     // splices from a local it frees when the call returns —
@@ -4683,24 +4695,25 @@ test "a spliced character does not follow the caller's buffer into the change" {
     // and a `pending` vector cannot hold a borrow of a local; the port's
     // cannot enforce that, so [`Transaction.ownText`] takes the copy instead.
     @memset(&buf, 'Z');
-    const got = (try tx.commit(null, null)).?;
+    const got = (try dirty.commit()).?;
 
     try testing.expect(want[0].eql(got));
 }
 
 test "batchCreateObject makes an empty object, and batchCreateValue fills it" {
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try doc.setActorId(.{ .bytes = "0123456789abcdef" });
     defer doc.deinit();
 
-    const empty = try batchCreateObject(&doc, .root, .{ .key = "e" }, .map);
+    const empty = try doc.batchCreateObject(.root, .{ .key = "e" }, .map);
     try testing.expectEqual(ObjType.map, try doc.objectType(empty));
-    try testing.expectEqual(@as(usize, 0), doc.ops.seqLength(empty, doc.textEncoding(), null));
+    try testing.expectEqual(@as(usize, 0), doc.doc.ops.seqLength(empty, doc.textEncoding(), null));
 
     var inner = hydmod.Map.init(gpa, .root);
     defer inner.deinit();
     try inner.putOwned("n", hydmod.MapValue.init(hydmod.Value.scalar(.{ .int = 4 }), false));
-    const full = try batchCreateValue(&doc, .root, .{ .key = "f" }, .{ .object = .{ .map = inner } }, false);
+    const full = try doc.batchCreateValue(.root, .{ .key = "f" }, .{ .object = .{ .map = inner } }, false);
     try testing.expectEqual(ObjType.map, try doc.objectType(full));
     // **The child key is in the child object, not in the root.** `full` is the
     // object row 1 made and the batch wrote `"n"` under it
@@ -4709,47 +4722,47 @@ test "batchCreateObject makes an empty object, and batchCreateValue fills it" {
     // as the root and the batch wrote into the root by mistake. Both halves
     // are asserted: the value is where it belongs **and** it is not where it
     // used to land by accident.
-    var n = try doc.ops.seekOpsByMapKey(gpa, full, "n", null);
+    var n = try doc.doc.ops.seekOpsByMapKey(gpa, full, "n", null);
     defer n.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), n.ops.items.len);
     try testing.expectEqual(@as(i64, 4), n.ops.items[0].value().int);
-    var stray = try register(gpa, &doc, "n");
+    var stray = try register(gpa, &doc.doc, "n");
     defer stray.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), stray.ops.items.len);
 
     // A list position and an object value: the `insert` form.
-    const list = try putObject(&doc, .root, .{ .key = "l" }, .list);
-    const nested = try batchCreateValue(&doc, list, .{ .index = 0 }, .{ .object = .{ .map = inner } }, true);
+    const list = try doc.putObject(.root, .{ .key = "l" }, .list);
+    const nested = try doc.batchCreateValue(list, .{ .index = 0 }, .{ .object = .{ .map = inner } }, true);
     try testing.expectEqual(ObjType.map, try doc.objectType(nested));
-    try testing.expectEqual(@as(usize, 1), doc.ops.seqLength(list, doc.textEncoding(), null));
+    try testing.expectEqual(@as(usize, 1), doc.doc.ops.seqLength(list, doc.textEncoding(), null));
 
     // A scalar is not an object (`inner.rs:1288-1293`).
     try testing.expectError(
         error.NotAnObject,
-        batchCreateValue(&doc, .root, .{ .key = "s" }, hydmod.Value.scalar(.{ .int = 1 }), false),
+        doc.batchCreateValue(.root, .{ .key = "s" }, hydmod.Value.scalar(.{ .int = 1 }), false),
     );
 }
 
 test "updateSpans brings a text object's spans and marks in line" {
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try doc.setActorId(.{ .bytes = "0123456789abcdef" });
     defer doc.deinit();
-    const text = try putObject(&doc, .root, .{ .key = "t" }, .text);
-    _ = try spliceText(&doc, text, 0, 0, "hello");
+    const text = try doc.putObject(.root, .{ .key = "t" }, .text);
+    try doc.spliceText(text, 0, 0, "hello");
 
     // One span of text carrying one mark, which the document does not have.
     var marks = MarkSet.init(gpa);
     defer marks.deinit();
     try marks.put("em", .{ .bool_value = true });
 
-    var spans = [_]Span{.{ .text = .{ .text = try gpa.dupe(u8, "hello"), .marks = marks } }};
-    defer gpa.free(spans[0].text.text);
-    try updateSpans(&doc, text, &spans);
+    const spans = [_]@import("iter/spans.zig").SpanInput{.{ .text = .{ .text = "hello", .marks = &marks } }};
+    try doc.updateSpans(text, &spans);
 
-    const got = try doc.text(gpa, text);
+    const got = try doc.text(text, gpa);
     defer gpa.free(got);
     try testing.expectEqualStrings("hello", got);
-    const found = try doc.marks(gpa, text);
+    const found = try doc.marks(text, gpa);
     defer gpa.free(found);
     // **The mark the spans asked for exists.** The text diff cannot see a mark
     // — it compares grapheme clusters — so the second pass is the only thing
@@ -4760,9 +4773,34 @@ test "updateSpans brings a text object's spans and marks in line" {
     try testing.expectEqual(@as(usize, 5), found[0].end);
 
     // Running it again writes nothing: the mark is already there.
-    const rows = doc.ops.len();
-    try updateSpans(&doc, text, &spans);
-    try testing.expectEqual(rows, doc.ops.len());
+    const rows = doc.doc.ops.len();
+    try doc.updateSpans(text, &spans);
+    try testing.expectEqual(rows, doc.doc.ops.len());
+
+    // Borrowed rich blocks must be captured before the caller releases their maps.
+    {
+        var source_block = hydmod.Map.init(gpa, .root);
+        defer source_block.deinit();
+        try source_block.putOwned("kind", hydmod.MapValue.init(.{ .str = "paragraph" }, false));
+        const rich = [_]@import("iter/spans.zig").SpanInput{
+            .{ .block = &source_block },
+            .{ .text = .{ .text = "hello", .marks = &marks } },
+        };
+        try doc.updateSpans(text, &rich);
+        try source_block.putOwned("kind", hydmod.MapValue.init(.{ .str = "mutated" }, false));
+    }
+    _ = try doc.commit();
+    var rich_spans = try readmod.spans(&doc.doc, text, gpa);
+    defer rich_spans.deinit();
+    var block_span = (try rich_spans.next()).?;
+    defer block_span.deinit(gpa);
+    try testing.expect(block_span == .block);
+    try testing.expectEqualStrings("paragraph", block_span.block.get("kind").?.str);
+    var text_span = (try rich_spans.next()).?;
+    defer text_span.deinit(gpa);
+    try testing.expect(text_span == .text);
+    try testing.expectEqualStrings("hello", text_span.text.text);
+    try testing.expect((try rich_spans.next()) == null);
 }
 
 // ── The row order a local write leaves behind ─────────────────────────────────
@@ -4776,11 +4814,10 @@ test "updateSpans brings a text object's spans and marks in line" {
 // so **the local write path has no equivalent check upstream and never had
 // one.** The three tests below are that check.
 
-/// A document in [`Mode.auto`] under `actor`. Two documents that reach the
-/// same state by different doors have to be different actors, or the second
-/// one would answer "already have it".
+/// A raw document under `actor`. Replays use a different actor so applying
+/// the same state does not answer "already have it".
 fn docWithActor(gpa: Allocator, actor: []const u8) !Document {
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = actor });
     return doc;
@@ -4856,29 +4893,31 @@ fn reportRowOrder(left: *const Document, right: *const Document) !void {
 
 test "a map key written after another key lands in key order, and a reader reads that order" {
     const gpa = testing.allocator;
-    var doc = try docWithActor(gpa, "aaaaaaaaaaaaaaaa");
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try doc.setActorId(.{ .bytes = "aaaaaaaaaaaaaaaa" });
     defer doc.deinit();
 
     // **The write order is not the key order, and `"k"` sorts before
     // `"list"`.** This is the two-row document the defect was reported on.
-    _ = try put(&doc, .root, .{ .key = "list" }, .{ .int = 1 });
-    _ = try put(&doc, .root, .{ .key = "k" }, .{ .int = 2 });
+    _ = try doc.put(.root, .{ .key = "list" }, .{ .int = 1 });
+    _ = try doc.put(.root, .{ .key = "k" }, .{ .int = 2 });
+    _ = try doc.commit();
 
     // The same two changes through the other door: the apply path, which is
     // where upstream asserts the order.
     var replay = try docWithActor(gpa, "bbbbbbbbbbbbbbbb");
     defer replay.deinit();
-    try applyAll(gpa, &replay, &doc);
+    try applyAll(gpa, &replay, &doc.doc);
 
     // **The diagnostic runs first**, so that a document out of row order
     // fails with the row and the side on the line above the assertion rather
     // than with `expected true, found false`.
-    try reportRowOrder(&doc, &replay);
+    try reportRowOrder(&doc.doc, &replay);
 
     // **The checker.** Rules R1–R4 of [`Op.step`](opset/op.zig)
     // ([`op.rs:1048-1073`](../../github-automerge-automerge/rust/automerge/src/op_set2/op.rs)),
     // over every row. This answers `false` on the document as it was written.
-    try testing.expect(try doc.ops.validateOpOrder());
+    try testing.expect(try doc.doc.ops.validateOpOrder());
     try testing.expect(try replay.ops.validateOpOrder());
 
     // **The read, which is what makes this a correctness defect and not a
@@ -4889,7 +4928,7 @@ test "a map key written after another key lands in key order, and a reader reads
     // **This is the assertion a by-value comparison cannot make**: the two
     // documents below hold the same rows and the same values, so they compare
     // equal while reading back in opposite orders.
-    const keys = try rootKeys(gpa, &doc);
+    const keys = try rootKeys(gpa, &doc.doc);
     defer gpa.free(keys);
     try testing.expectEqual(@as(usize, 2), keys.len);
     try testing.expectEqualStrings("k", keys[0]);
@@ -4897,7 +4936,69 @@ test "a map key written after another key lands in key order, and a reader reads
 
     // **And the two doors agree**, which is what the apply path's own
     // `debug_assert!` is asking.
-    try testing.expect((try doc.ops.debugDiff(&replay.ops)) == null);
+    try testing.expect((try doc.doc.ops.debugDiff(&replay.ops)) == null);
+}
+
+test "map placement compares key bytes inside each object across retained and deleted registers" {
+    // Intern order deliberately differs from byte order, including prefix,
+    // NUL and multibyte UTF-8 keys. A deleted register still occupies rows.
+    const gpa = testing.allocator;
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    defer doc.deinit();
+    try doc.setActorId(.{ .bytes = "bbbbbbbbbbbbbbbb" });
+    const child = try doc.putObject(.root, .{ .key = "child" }, .map);
+    const ordered = [_][]const u8{ "", "\x00", "a", "a\x00", "a\x00z", "z", "é", "🦀" };
+    const write_order = [_]usize{ 7, 3, 5, 0, 6, 2, 4, 1 };
+    for (write_order) |i| {
+        _ = try doc.put(child, .{ .key = ordered[i] }, .{ .int = @intCast(i) });
+    }
+    _ = try doc.put(child, .{ .key = "" }, .{ .int = 99 });
+    _ = try doc.delete(child, .{ .key = "a\x00" });
+    _ = try doc.commit();
+    // Renumber the resident actor indices before asking for the same object.
+    try doc.setActorId(.{ .bytes = "aaaaaaaaaaaaaaaa" });
+    _ = try doc.put(child, .{ .key = "b" }, .{ .int = 8 });
+    _ = try doc.commit();
+
+    const object_rows = try doc.doc.ops.scopeToObj(child);
+    const expected = [_]struct { key: []const u8, start: usize, end: usize }{
+        .{ .key = "", .start = 0, .end = 2 },
+        .{ .key = "\x00", .start = 2, .end = 3 },
+        .{ .key = "a", .start = 3, .end = 4 },
+        .{ .key = "a\x00", .start = 4, .end = 5 },
+        .{ .key = "a\x00z", .start = 5, .end = 6 },
+        .{ .key = "b", .start = 6, .end = 7 },
+        .{ .key = "z", .start = 7, .end = 8 },
+        .{ .key = "é", .start = 8, .end = 9 },
+        .{ .key = "🦀", .start = 9, .end = 10 },
+        .{ .key = "\x00x", .start = 3, .end = 3 },
+        .{ .key = "a\x00y", .start = 5, .end = 5 },
+        .{ .key = "zz", .start = 8, .end = 8 },
+        .{ .key = "🦀z", .start = 10, .end = 10 },
+    };
+    for (expected) |case| {
+        const rows = try doc.doc.ops.propRange(child, case.key);
+        try testing.expectEqual(object_rows.start + case.start, rows.start);
+        try testing.expectEqual(object_rows.start + case.end, rows.end);
+        var found = try doc.doc.ops.seekOpsByMapKey(gpa, child, case.key, null);
+        defer found.deinit(gpa);
+        try testing.expectEqual(rows.end, found.end_pos);
+        if (std.mem.eql(u8, case.key, "a\x00")) {
+            try testing.expectEqual(@as(usize, 0), found.ops.items.len);
+        }
+    }
+    var keys = try readmod.keys(&doc.doc, child);
+    defer keys.deinit(gpa);
+    const visible = [_][]const u8{ "", "\x00", "a", "a\x00z", "b", "z", "é", "🦀" };
+    for (visible) |key| {
+        try testing.expectEqualStrings(key, (try keys.next()) orelse return error.TestUnexpectedResult);
+    }
+    try testing.expect((try keys.next()) == null);
+    try testing.expect(try doc.doc.ops.validateOpOrder());
+    var replay = try docWithActor(gpa, "cccccccccccccccc");
+    defer replay.deinit();
+    try applyAll(gpa, &replay, &doc.doc);
+    try testing.expect((try doc.doc.ops.debugDiff(&replay.ops)) == null);
 }
 
 test "a register's rows ascend in id, because a local id is above every counter in the document" {
@@ -4907,17 +5008,20 @@ test "a register's rows ascend in id, because a local id is above every counter 
     // so the row it leaves in `"k"` carries the greater id. `"junk"` sorts
     // before `"k"`, so the two registers are in key order and only **R3** is
     // under test here.
-    var peer = try docWithActor(gpa, "bbbbbbbbbbbbbbbb");
+    var peer = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try peer.setActorId(.{ .bytes = "bbbbbbbbbbbbbbbb" });
     defer peer.deinit();
     var i: usize = 0;
     while (i < 5) : (i += 1) {
-        _ = try put(&peer, .root, .{ .key = "junk" }, .{ .int = @intCast(i) });
+        _ = try peer.put(.root, .{ .key = "junk" }, .{ .int = @intCast(i) });
     }
-    _ = try put(&peer, .root, .{ .key = "k" }, .{ .int = 99 });
+    _ = try peer.put(.root, .{ .key = "k" }, .{ .int = 99 });
+    _ = try peer.commit();
 
-    var doc = try docWithActor(gpa, "aaaaaaaaaaaaaaaa");
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try doc.setActorId(.{ .bytes = "aaaaaaaaaaaaaaaa" });
     defer doc.deinit();
-    try applyAll(gpa, &doc, &peer);
+    try applyAll(gpa, &doc.doc, &peer.doc);
 
     // **This actor has written nothing**, so its own next counter is 1, and
     // `1` sorts *below* the peer's `6`. `start_op` is
@@ -4927,41 +5031,42 @@ test "a register's rows ascend in id, because a local id is above every counter 
     // and [`TransactionInner::next_id`] adds the pending count
     // ([`inner.rs:294-296`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)),
     // so the row about to be written is `7` and appending at the register's
-    // end keeps R3. **This is why the register path can append unconditionally
-    // and only the absent-key path has to search, and it is asserted rather
-    // than reasoned about: a `start_op` that were per-actor would put `1` after
-    // `6` here and `validateOpOrder` would answer `false`.**
-    const id = try put(&doc, .root, .{ .key = "k" }, .{ .int = 100 });
-    try testing.expectEqual(@as(u32, 7), id.counter);
+    // end keeps R3. The query supplies that end for both present and absent
+    // keys. A `start_op` that were per-actor would put `1` after `6` here,
+    // and `validateOpOrder` would answer `false`.
+    const id = try doc.put(.root, .{ .key = "k" }, .{ .int = 100 });
+    try testing.expectEqual(@as(u32, 7), (id orelse return error.TestUnexpectedResult).counter);
 
-    const ids = try registerIds(gpa, &doc, "k");
+    const ids = try registerIds(gpa, &doc.doc, "k");
     defer gpa.free(ids);
     try testing.expectEqual(@as(usize, 2), ids.len);
     try testing.expect(ids[0].order(ids[1]) == .lt);
-    try testing.expect(try doc.ops.validateOpOrder());
+    try testing.expect(try doc.doc.ops.validateOpOrder());
 
     // The `top` index still agrees with the rows, which a register with two
     // rows and one visible winner is the easy way to break.
-    try testing.expect((try doc.ops.validateTopIndex()) == null);
+    try testing.expect((try doc.doc.ops.validateTopIndex()) == null);
 }
 
 test "a list insert lands where the sequence order says, not where the write happened" {
     const gpa = testing.allocator;
-    var doc = try docWithActor(gpa, "aaaaaaaaaaaaaaaa");
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
+    try doc.setActorId(.{ .bytes = "aaaaaaaaaaaaaaaa" });
     defer doc.deinit();
 
-    const list = try putObject(&doc, .root, .{ .key = "l" }, .list);
-    _ = try insert(&doc, list, 0, .{ .str = "a" });
-    _ = try insert(&doc, list, 1, .{ .str = "b" });
-    _ = try insert(&doc, list, 2, .{ .str = "c" });
-    // Two more, both at a **position** rather than at the end.
-    _ = try insert(&doc, list, 0, .{ .str = "z" });
-    _ = try insert(&doc, list, 2, .{ .str = "y" });
+    const list = try doc.putObject(.root, .{ .key = "l" }, .list);
+    _ = try doc.insert(list, 0, .{ .str = "a" });
+    _ = try doc.insert(list, 1, .{ .str = "b" });
+    _ = try doc.insert(list, 2, .{ .str = "c" });
+    // Insert at positions rather than at the end.
+    _ = try doc.insert(list, 0, .{ .str = "z" });
+    _ = try doc.insert(list, 2, .{ .str = "y" });
+    _ = try doc.commit();
 
     var replay = try docWithActor(gpa, "bbbbbbbbbbbbbbbb");
     defer replay.deinit();
-    try applyAll(gpa, &replay, &doc);
-    try reportRowOrder(&doc, &replay);
+    try applyAll(gpa, &replay, &doc.doc);
+    try reportRowOrder(&doc.doc, &replay);
 
     // **A sequence register's key is the element it hangs by, so R2's sequence
     // arm is a different rule from a map key's** — the previous key may equal
@@ -4971,15 +5076,15 @@ test "a list insert lands where the sequence order says, not where the write hap
     // checked here rather than assumed. The same answer from the apply path
     // is the control: the two were already equal before the map fix and are
     // equal now.
-    try testing.expect(try doc.ops.validateOpOrder());
-    try testing.expect((try doc.ops.validateTopIndex()) == null);
-    try testing.expect((try doc.ops.debugDiff(&replay.ops)) == null);
+    try testing.expect(try doc.doc.ops.validateOpOrder());
+    try testing.expect((try doc.doc.ops.validateTopIndex()) == null);
+    try testing.expect((try doc.doc.ops.debugDiff(&replay.ops)) == null);
 
     // **The read.** The five values, in the order the sequence walks them, is
     // what says the two insertions went where they were asked to go rather
     // than merely that the rows are in some legal order.
     var term: readmod.ValueTerm = undefined;
-    var it = try readmod.values(&doc, list, &term);
+    var it = try readmod.values(&doc.doc, list, &term);
     // `Values` owns nothing: the term is the out-slot the caller frees
     // ([read.zig:697-708](read.zig)).
     defer term.deinit(gpa);
@@ -5057,39 +5162,14 @@ test "a list insert lands where the sequence order says, not where the write hap
 //   the five `diff_marks` block cases, `testing.allocator`, and the lifetime
 //   now being unconditional instead of resting on a capacity guess.
 //
-// * **The row a map write lands on is computed here, not by `propRange`, and
-//   that is a deviation with a cause.** Upstream's `local_map_op` writes
-//   `query.end_pos` and stops there
-//   ([`inner.rs:473`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)),
-//   because upstream's `end_pos` is `prop_range(obj, prop).end`
-//   ([`op_set.rs:611-628`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs))
-//   and `prop_range` is `key_str.scope_to_value(Some(prop), obj_range)`
-//   ([`op_set.rs:1268-1271`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)),
-//   which is **a descent into a sorted column**: hexane answers the sorted
-//   insertion point for a value the column does not hold — over
-//   `aaa aaa bbb bbb bbb ccc`, `"aab"` answers `2..2` and `"ddd"` answers `6..6`
-//   ([`hexane/src/tests.rs:3464-3476`](../../github-automerge-automerge/rust/hexane/src/tests.rs)).
-//   The port's `key_str` holds **interned ids**, which are in first-seen order
-//   and not key order, so a descent is not available and `propRange` walks
-//   instead ([op_set.zig:2056-2071](opset/op_set.zig)). **A walk that finds
-//   nothing has no sorted place to stop at, so it answers the object's end** —
-//   which is the answer for a key greater than every key the object holds,
-//   and the wrong answer for every other absent key. The new register then
-//   landed behind registers it sorts before, **rule R2** (`op.rs:1059-1060`)
-//   was broken, and because a map reader does not sort
-//   ([`map_range.zig:1486-1490`](iter/map_range.zig)) the document read back
-//   as a **different map**. So [`mapKeyRow`] supplies the one position
-//   `propRange` cannot: the first row of the object whose key sorts above the
-//   new one.
+// * Map writes use the full physical register end from `OpSet.propRange`,
+//   matching `inner.rs:473` and `op_set.rs:611-628,1268-1271`. Native bounds
+//   compare resolved key bytes, not first-seen intern IDs. An absent key
+//   receives its sorted insertion slot; existing conflicts and deleted rows
+//   remain in the register. Map range reads use the same bounds.
 //
-//   **The same gap is still open in `OpSet.mapRange`**
-//   ([op_set.zig:2584-2600](opset/op_set.zig)), which takes its two key bounds
-//   from `propRange` as well: a key-span read whose bounds are absent from the
-//   object still starts and ends in the wrong place. That is a reader, and
-//   `op_set.zig` was read-only for this change — **it is reported, not fixed.**
-//
-// * **R3 holds on this path by construction, and that is why only the
-//   absent-key case searches.** `start_op` is `change_graph.max_op() + 1`
+// * **R3 holds on this path by construction.**
+//   `start_op` is `change_graph.max_op() + 1`
 //   ([`automerge.rs:567`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)) —
 //   **the whole document's maximum, not this actor's own next counter** — and
 //   [`TransactionInner::next_id`] adds the pending count
@@ -5120,21 +5200,24 @@ test "commit allocation refusals preserve rollback and recorded history" {
     for (0..256) |offset| {
         var failing = testing.FailingAllocator.init(testing.allocator, .{});
         const gpa = failing.allocator();
-        var doc = try Document.init(gpa, testing.io, .manual);
+        var doc = try Document.init(gpa, testing.io);
         defer doc.deinit();
         doc.setActorId(types.ActorId.init("rollback-regression"));
         {
             var first = try Transaction.open(gpa, &doc);
-            defer first.deinit();
+            defer first.deinit() catch @panic("allocator is not injecting during cleanup");
             _ = try first.put(.root, .{ .key = "baseline" }, .{ .int = 7 });
-            _ = try first.commit(null, null);
+            var result = try first.commit();
+            defer result.deinit(gpa);
         }
-        try doc.updateDiffCursor();
         var tx = try Transaction.open(gpa, &doc);
-        defer tx.deinit();
+        defer {
+            failing.fail_index = std.math.maxInt(usize);
+            tx.deinit() catch @panic("allocation restored before cleanup");
+        }
         _ = try tx.put(.root, .{ .key = "uncommitted" }, .{ .int = 42 });
         failing.fail_index = failing.alloc_index + offset;
-        const hash = tx.commit("refused", 9) catch |commit_error| {
+        var result = tx.commitWith(.{ .message = "refused", .time = 9 }) catch |commit_error| {
             failing.fail_index = std.math.maxInt(usize);
             try testing.expectEqual(error.OutOfMemory, commit_error);
             try testing.expect(!tx.closed);
@@ -5142,13 +5225,11 @@ test "commit allocation refusals preserve rollback and recorded history" {
             try testing.expectEqual(@as(usize, 1), try tx.rollback());
             try testing.expect((try readmod.get(&doc, .root, .{ .key = "uncommitted" })) == null);
             try testing.expectEqual(@as(i64, 7), (try readmod.get(&doc, .root, .{ .key = "baseline" })).?.value.scalar.int);
-            var patches = try doc.diffIncremental(gpa);
-            defer patches.deinit();
-            try testing.expectEqual(@as(usize, 0), patches.len());
             continue;
         };
         failing.fail_index = std.math.maxInt(usize);
-        try testing.expect(hash != null);
+        defer result.deinit(gpa);
+        try testing.expect(result.hash != null);
         try testing.expectEqual(@as(usize, 2), doc.graph.len());
         reached_success = true;
         break;
@@ -5159,10 +5240,13 @@ test "commit allocation refusals preserve rollback and recorded history" {
 test "textFor refusal preserves the previous borrowed buffer" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     const gpa = failing.allocator();
-    var doc = try Document.init(gpa, testing.io, .manual);
+    var doc = try Document.init(gpa, testing.io);
     defer doc.deinit();
     var tx = try Transaction.open(gpa, &doc);
-    defer tx.deinit();
+    defer {
+        failing.fail_index = std.math.maxInt(usize);
+        tx.deinit() catch @panic("allocation restored before cleanup");
+    }
     const obj = try tx.putObject(.root, .{ .key = "text" }, .text);
     try tx.spliceText(obj, 0, 0, "hello");
     const before = try tx.textFor(obj);
@@ -5174,173 +5258,164 @@ test "textFor refusal preserves the previous borrowed buffer" {
 }
 
 test "native validation refusal without recovery work leaves reads and writes available" {
-    // Reject a scalar write into committed text before producer publication.
-    // The refusal must not turn an unchanged document into recovery-only state.
+    // Validation before publication leaves the held journal writable.
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
     defer doc.deinit();
-    const text = try putObject(&doc, .root, .{ .key = "text" }, .text);
-    try spliceText(&doc, text, 0, 0, "original");
-    const rows = doc.ops.len();
-    const changes = doc.graph.len();
-    const max_op = doc.graph.maxOp();
-
-    try testing.expectError(error.InvalidOp, put(&doc, text, .{ .key = "scalar" }, .{ .int = 7 }));
-    const unchanged = try readmod.text(&doc, text, gpa);
+    const text = try doc.putObject(.root, .{ .key = "text" }, .text);
+    try doc.spliceText(text, 0, 0, "original");
+    _ = try doc.commit();
+    const rows = doc.doc.ops.len();
+    const changes = doc.doc.graph.len();
+    const max_op = doc.doc.graph.maxOp();
+    try testing.expectError(error.InvalidOp, doc.put(text, .{ .key = "scalar" }, .{ .int = 7 }));
+    const unchanged = try doc.text(text, gpa);
     defer gpa.free(unchanged);
     try testing.expectEqualStrings("original", unchanged);
-    try testing.expect(doc.auto_recovery == null);
-    try testing.expectEqual(@as(usize, 0), pendingOps(&doc));
-    try testing.expectEqual(rows, doc.ops.len());
-    try testing.expectEqual(changes, doc.graph.len());
-    try testing.expectEqual(max_op, doc.graph.maxOp());
-    try testing.expectEqual(@as(usize, 0), try doc.recoverAuto());
-
-    try spliceText(&doc, text, 8, 0, "!");
-    const following = try readmod.text(&doc, text, gpa);
+    try testing.expectEqual(@as(usize, 0), doc.pendingOps());
+    try testing.expectEqual(rows, doc.doc.ops.len());
+    try testing.expectEqual(changes, doc.doc.graph.len());
+    try testing.expectEqual(max_op, doc.doc.graph.maxOp());
+    try doc.spliceText(text, 8, 0, "!");
+    const following = try doc.text(text, gpa);
     defer gpa.free(following);
     try testing.expectEqualStrings("original!", following);
-    try testing.expect(doc.auto_recovery == null);
+    try testing.expectEqual(@as(usize, 1), doc.pendingOps());
 }
 
 test "native fresh-document validation refusal leaves unused actor metadata readable" {
-    // Opening the refused write interns an actor, but publishes no operation.
-    // Document-owned metadata must not keep an empty transaction in recovery.
+    // A refused write can intern an actor without publishing any operation.
     const gpa = testing.allocator;
-    var doc = try freshDoc(gpa);
+    var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
     defer doc.deinit();
-    try testing.expectError(error.InvalidOp, put(&doc, .root, .{ .index = 0 }, .{ .int = 7 }));
-    try testing.expect((try readmod.get(&doc, .root, .{ .key = "text" })) == null);
-    try testing.expect(doc.auto_recovery == null);
-    try testing.expectEqual(@as(usize, 0), pendingOps(&doc));
-    try testing.expectEqual(@as(usize, 0), doc.ops.len());
-    try testing.expectEqual(@as(usize, 0), doc.graph.len());
-    try testing.expectEqual(@as(u64, 0), doc.graph.maxOp());
-    try testing.expectEqual(doc.ops.actors.items.len, doc.graph.numActors());
-    try testing.expectEqual(doc.ops.actors.items.len, doc.authors.count());
+    try doc.setActorId(.{ .bytes = "0123456789abcdef" });
+    try testing.expectError(error.InvalidOp, doc.put(.root, .{ .index = 0 }, .{ .int = 7 }));
+    try testing.expect((try doc.get(.root, .{ .key = "text" })) == null);
+    try testing.expectEqual(@as(usize, 0), doc.pendingOps());
+    try testing.expectEqual(@as(usize, 0), doc.doc.ops.len());
+    try testing.expectEqual(@as(usize, 0), doc.doc.graph.len());
+    try testing.expectEqual(@as(u64, 0), doc.doc.graph.maxOp());
+    try testing.expectEqual(doc.doc.ops.actors.items.len, doc.doc.graph.numActors());
+    try testing.expectEqual(doc.doc.ops.actors.items.len, doc.doc.authors.count());
     try testing.expectEqualStrings("0123456789abcdef", doc.getActorId().bytes);
-    try testing.expectEqual(@as(usize, 0), try doc.recoverAuto());
-
-    const text = try putObject(&doc, .root, .{ .key = "text" }, .text);
-    try spliceText(&doc, text, 0, 0, "fresh");
-    const following = try readmod.text(&doc, text, gpa);
+    const text = try doc.putObject(.root, .{ .key = "text" }, .text);
+    try doc.spliceText(text, 0, 0, "fresh");
+    const following = try doc.text(text, gpa);
     defer gpa.free(following);
     try testing.expectEqualStrings("fresh", following);
-    try testing.expect(doc.auto_recovery == null);
 }
 
-test "isolated native auto refusal recovers before another write without id collisions" {
-    // Each offset starts with a fresh fixture: a late refusal must exercise
-    // published rows, not capacities warmed by an earlier failed attempt.
+test "isolated held auto rollback refusal retries without operation id collisions" {
+    // Fresh fixtures exercise late publication and a second refused rollback.
     var reached_success = false;
     var reached_published_refusal = false;
     var reached_second_refusal = false;
     for (0..512) |offset| {
         var failing = testing.FailingAllocator.init(testing.allocator, .{});
         const gpa = failing.allocator();
-        var doc = try freshDoc(gpa);
+        var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
         defer doc.deinit();
+        try doc.setActorId(.{ .bytes = "0123456789abcdef" });
         try doc.isolate(gpa, &.{});
         failing.fail_index = failing.alloc_index + offset;
-        const refused = put(&doc, .root, .{ .key = "a" }, .{ .int = 41 });
+        const refused = doc.put(.root, .{ .key = "a" }, .{ .int = 41 });
         if (refused) |_| {
             failing.fail_index = std.math.maxInt(usize);
             reached_success = true;
             break;
         } else |primary| {
             try testing.expectEqual(error.OutOfMemory, primary);
-            const published = doc.ops.len() != 0;
-            if (published) {
-                reached_published_refusal = true;
-                // Refuse the recovery attempt as well, then restore allocation.
-                // The second call must not allocate another operation id.
-                failing.fail_index = failing.alloc_index;
-                try testing.expectError(error.OutOfMemory, put(&doc, .root, .{ .key = "blocked" }, .{ .int = 99 }));
-                try testing.expect(doc.auto_recovery != null);
-                try testing.expectEqual(@as(u64, 0), doc.graph.maxOp());
-                reached_second_refusal = true;
-            }
-            failing.fail_index = std.math.maxInt(usize);
-            const following = try put(&doc, .root, .{ .key = "b" }, .{ .int = 42 });
-            try testing.expect((try readmod.get(&doc, .root, .{ .key = "a" })) == null);
-            try testing.expect((try readmod.get(&doc, .root, .{ .key = "blocked" })) == null);
-            try testing.expectEqual(@as(i64, 42), (try readmod.get(&doc, .root, .{ .key = "b" })).?.value.scalar.int);
-            try testing.expectEqual(@as(usize, 1), doc.ops.len());
-            try testing.expectEqual(@as(u32, 1), following.counter);
-            try testing.expectEqual(@as(u64, 1), doc.graph.maxOp());
-            try testing.expect(try doc.ops.validateOpOrder());
-            try testing.expect((try doc.ops.validateTopIndex()) == null);
-            const bytes = try doc.save(gpa);
-            defer gpa.free(bytes);
-            var loaded = try Document.load(gpa, testing.io, bytes, doc.textEncoding(), .auto);
-            defer loaded.deinit();
-            try testing.expectEqual(@as(usize, 1), loaded.ops.len());
-            try testing.expect((try readmod.get(&loaded, .root, .{ .key = "a" })) == null);
-            try testing.expectEqual(@as(i64, 42), (try readmod.get(&loaded, .root, .{ .key = "b" })).?.value.scalar.int);
         }
+        const published = doc.doc.ops.len() != 0;
+        if (published) {
+            reached_published_refusal = true;
+            failing.fail_index = failing.alloc_index;
+            try testing.expectError(error.OutOfMemory, doc.rollback());
+            try testing.expectError(error.InvalidOp, doc.put(.root, .{ .key = "blocked" }, .{ .int = 99 }));
+            try testing.expectEqual(@as(u64, 0), doc.doc.graph.maxOp());
+            reached_second_refusal = true;
+        }
+        failing.fail_index = std.math.maxInt(usize);
+        _ = try doc.rollback();
+        const following = try doc.put(.root, .{ .key = "b" }, .{ .int = 42 });
+        try testing.expect((try doc.get(.root, .{ .key = "a" })) == null);
+        try testing.expect((try doc.get(.root, .{ .key = "blocked" })) == null);
+        try testing.expectEqual(@as(i64, 42), (try doc.get(.root, .{ .key = "b" })).?.value.scalar.int);
+        try testing.expectEqual(@as(usize, 1), doc.doc.ops.len());
+        try testing.expectEqual(@as(u32, 1), (following orelse return error.TestUnexpectedResult).counter);
+        try testing.expectEqual(@as(u64, 0), doc.doc.graph.maxOp());
+        try testing.expect(try doc.doc.ops.validateOpOrder());
+        try testing.expect((try doc.doc.ops.validateTopIndex()) == null);
+        const bytes = try doc.save(gpa);
+        defer gpa.free(bytes);
+        var loaded = try Document.load(gpa, testing.io, bytes, doc.textEncoding());
+        defer loaded.deinit();
+        try testing.expectEqual(@as(usize, 1), loaded.ops.len());
+        try testing.expect((try readmod.get(&loaded, .root, .{ .key = "a" })) == null);
+        try testing.expectEqual(@as(i64, 42), (try readmod.get(&loaded, .root, .{ .key = "b" })).?.value.scalar.int);
     }
     try testing.expect(reached_success);
     try testing.expect(reached_published_refusal);
     try testing.expect(reached_second_refusal);
 }
 
-test "native hydrated auto refusal retains published and queued producer undo" {
-    // A child is queued before the parent batch is published, then written in
-    // a second batch. Sweep both sides of that ownership handover.
+test "native hydrated held auto refusal retains published and queued producer undo" {
+    // A nested producer crosses publication before failure; explicit rollback
+    // must preserve the previously committed parent list.
     var reached_success = false;
     var reached_published_refusal = false;
     for (0..1024) |offset| {
         var failing = testing.FailingAllocator.init(testing.allocator, .{});
         const gpa = failing.allocator();
-        var doc = try freshDoc(gpa);
+        var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
         defer doc.deinit();
-        const list = try putObject(&doc, .root, .{ .key = "list" }, .list);
+        const list = try doc.putObject(.root, .{ .key = "list" }, .list);
+        _ = try doc.commit();
         var nested = hydmod.List.init(gpa, .root);
         defer nested.deinit();
         try nested.push(.{ .int = 7 }, false);
         const values = [_]hydmod.Value{
-            .{ .int = 1 },
-            .{ .object = .{ .list = nested } },
-            .{ .int = 3 },
+            .{ .int = 1 }, .{ .object = .{ .list = nested } }, .{ .int = 3 },
         };
         failing.fail_index = failing.alloc_index + offset;
-        if (splice(&doc, list, 0, 0, gpa, &values)) |_| {
+        if (doc.splice(list, 0, 0, &values)) |_| {
             failing.fail_index = std.math.maxInt(usize);
             reached_success = true;
-            try testing.expectEqual(@as(usize, 3), doc.ops.seqLength(list, doc.textEncoding(), null));
+            try testing.expectEqual(@as(usize, 3), try doc.length(list));
             break;
         } else |primary| {
             try testing.expectEqual(error.OutOfMemory, primary);
-            reached_published_refusal = reached_published_refusal or doc.ops.len() > 1;
-            failing.fail_index = std.math.maxInt(usize);
-            _ = try insert(&doc, list, 0, .{ .int = 42 });
-            try testing.expectEqual(@as(usize, 1), doc.ops.seqLength(list, doc.textEncoding(), null));
-            try testing.expectEqual(@as(i64, 42), (try readmod.get(&doc, list, .{ .index = 0 })).?.value.scalar.int);
-            try testing.expectEqual(@as(usize, 2), doc.ops.len());
-            try testing.expectEqual(@as(usize, 2), doc.graph.len());
-            try testing.expect(try doc.ops.validateOpOrder());
-            try testing.expect((try doc.ops.validateTopIndex()) == null);
         }
+        reached_published_refusal = reached_published_refusal or doc.doc.ops.len() > 1;
+        failing.fail_index = std.math.maxInt(usize);
+        _ = try doc.rollback();
+        _ = try doc.insert(list, 0, .{ .int = 42 });
+        try testing.expectEqual(@as(usize, 1), try doc.length(list));
+        try testing.expectEqual(@as(i64, 42), (try doc.get(list, .{ .index = 0 })).?.value.scalar.int);
+        try testing.expectEqual(@as(usize, 2), doc.doc.ops.len());
+        try testing.expectEqual(@as(usize, 1), doc.doc.graph.len());
+        _ = try doc.commit();
+        try testing.expectEqual(@as(usize, 2), doc.doc.graph.len());
+        try testing.expect(try doc.doc.ops.validateOpOrder());
+        try testing.expect((try doc.doc.ops.validateTopIndex()) == null);
     }
     try testing.expect(reached_success);
     try testing.expect(reached_published_refusal);
 }
 
-test "retained native recovery refuses overlapping mutation and survives scope release" {
-    // Find a fresh-fixture refusal after a row was published, then exercise
-    // the explicit recovery door with another allocation refusal.
+test "retained held auto rollback refuses overlapping mutation and survives caller release" {
+    // Release caller storage after producer refusal, then retry the real held
+    // journal's rollback while close barriers and writers remain refused.
     var reached = false;
     for (0..512) |offset| {
         var failing = testing.FailingAllocator.init(testing.allocator, .{});
         const gpa = failing.allocator();
-        var doc = try freshDoc(gpa);
+        var doc = try @import("autocommit.zig").AutoCommit.init(gpa, testing.io);
         defer doc.deinit();
         try doc.isolate(gpa, &.{});
         const transient = try gpa.dupe(u8, "refused");
         failing.fail_index = failing.alloc_index + offset;
-        const attempted = put(&doc, .root, .{ .key = "a" }, .{ .str = transient });
-        // A retained undo may keep a slice descriptor, but must not read bytes
-        // the caller was promised it could release when the wrapper returned.
+        const attempted = doc.put(.root, .{ .key = "a" }, .{ .str = transient });
         gpa.free(transient);
         if (attempted) |_| {
             failing.fail_index = std.math.maxInt(usize);
@@ -5349,35 +5424,41 @@ test "retained native recovery refuses overlapping mutation and survives scope r
             try testing.expectEqual(error.OutOfMemory, primary);
         }
         failing.fail_index = std.math.maxInt(usize);
-        if (doc.ops.len() == 0) continue;
+        if (doc.doc.ops.len() == 0) {
+            _ = try doc.rollback();
+            continue;
+        }
         reached = true;
-        try testing.expect(doc.auto_recovery != null);
-        try testing.expectEqual(@as(usize, 1), pendingOps(&doc));
-        try testing.expectError(error.InvalidOp, openAutoHeld(gpa, &doc));
+        try testing.expectEqual(@as(usize, 1), doc.pendingOps());
+        try testing.expectError(error.InvalidOp, doc.put(.root, .{ .key = "blocked" }, .{ .int = 99 }));
+        try testing.expectError(error.InvalidOp, doc.commit());
         try testing.expectError(error.InvalidOp, doc.isolate(gpa, &.{}));
         try testing.expectError(error.InvalidOp, doc.integrate());
-        try testing.expectError(error.InvalidOp, doc.putActorRef(gpa, types.ActorId.init("overlap")));
+        try testing.expectError(error.InvalidOp, doc.setActorId(types.ActorId.init("overlap")));
         try testing.expectError(error.InvalidOp, doc.applyChanges(gpa, &.{}));
         try testing.expectError(error.InvalidOp, doc.save(gpa));
-        doc.setMode(.manual);
-        try testing.expectError(error.InvalidOp, Transaction.open(gpa, &doc));
-        try testing.expectError(error.InvalidOp, Transaction.openAt(gpa, &doc, &.{}));
-        // These configuration changes do not mutate rows or renumber IDs.
-        // Releasing the document's heads must not release recovery's scope.
-        doc.dropIsolation();
-        doc.setActorId(types.ActorId.init("following"));
-        doc.resetDiffCursor();
         failing.fail_index = failing.alloc_index;
-        try testing.expectError(error.OutOfMemory, doc.recoverAuto());
-        try testing.expect(doc.auto_recovery != null);
+        try testing.expectError(error.OutOfMemory, doc.rollback());
+        try testing.expectEqual(@as(usize, 1), doc.pendingOps());
         failing.fail_index = std.math.maxInt(usize);
-        try testing.expectEqual(@as(usize, 1), try doc.recoverAuto());
-        try testing.expectEqual(@as(usize, 0), try doc.recoverAuto());
-        try testing.expect(doc.auto_recovery == null);
-        doc.setMode(.auto);
-        _ = try put(&doc, .root, .{ .key = "b" }, .{ .int = 42 });
-        try testing.expect((try readmod.get(&doc, .root, .{ .key = "a" })) == null);
-        try testing.expectEqual(@as(i64, 42), (try readmod.get(&doc, .root, .{ .key = "b" })).?.value.scalar.int);
+        try testing.expectEqual(@as(usize, 1), try doc.rollback());
+        try testing.expectEqual(@as(usize, 0), try doc.rollback());
+        try doc.integrate();
+        try doc.setActorId(types.ActorId.init("following"));
+        _ = try doc.put(.root, .{ .key = "b" }, .{ .int = 42 });
+        try testing.expect((try doc.get(.root, .{ .key = "a" })) == null);
+        try testing.expectEqual(@as(i64, 42), (try doc.get(.root, .{ .key = "b" })).?.value.scalar.int);
+        const heads = try doc.getHeads(gpa);
+        defer gpa.free(heads);
+        try testing.expectEqual(@as(usize, 1), heads.len);
+        var meta = (try doc.doc.getChangeMetaByHash(gpa, heads[0])) orelse
+            return error.TestUnexpectedResult;
+        defer meta.deinit(gpa);
+        try testing.expectEqualSlices(u8, &heads[0].bytes, &meta.hash.bytes);
+        try testing.expectEqualStrings("following", meta.actor.bytes);
+        try testing.expectEqual(@as(u64, 1), meta.seq);
+        try testing.expectEqual(@as(u64, 1), meta.start_op);
+        try testing.expectEqual(@as(u64, 1), meta.max_op);
         break;
     }
     try testing.expect(reached);
@@ -5389,16 +5470,17 @@ test "manual published producer refusal retains resumable undo and baseline" {
     const allocation_count = blk: {
         var failing = testing.FailingAllocator.init(testing.allocator, .{});
         const gpa = failing.allocator();
-        var doc = try freshDocIn(gpa, .manual);
+        var doc = try freshDoc(gpa);
         defer doc.deinit();
         {
             var baseline = try Transaction.open(gpa, &doc);
-            defer baseline.deinit();
+            defer baseline.deinit() catch @panic("allocator is not injecting during cleanup");
             _ = try baseline.put(.root, .{ .key = "k" }, .{ .int = 7 });
-            _ = try baseline.commit(null, null);
+            var result = try baseline.commit();
+            defer result.deinit(gpa);
         }
         var tx = try Transaction.openAt(gpa, &doc, doc.graph.getHeads());
-        defer tx.deinit();
+        defer tx.deinit() catch @panic("allocator is not injecting during cleanup");
         const before = failing.alloc_index;
         _ = try tx.put(.root, .{ .key = "k" }, .{ .int = 42 });
         const count = failing.alloc_index - before;
@@ -5410,16 +5492,20 @@ test "manual published producer refusal retains resumable undo and baseline" {
     for (0..allocation_count + 1) |offset| {
         var failing = testing.FailingAllocator.init(testing.allocator, .{});
         const gpa = failing.allocator();
-        var doc = try freshDocIn(gpa, .manual);
+        var doc = try freshDoc(gpa);
         defer doc.deinit();
         {
             var baseline = try Transaction.open(gpa, &doc);
-            defer baseline.deinit();
+            defer baseline.deinit() catch @panic("allocator is not injecting during cleanup");
             _ = try baseline.put(.root, .{ .key = "k" }, .{ .int = 7 });
-            _ = try baseline.commit(null, null);
+            var result = try baseline.commit();
+            defer result.deinit(gpa);
         }
         var tx = try Transaction.openAt(gpa, &doc, doc.graph.getHeads());
-        defer tx.deinit();
+        defer {
+            failing.fail_index = std.math.maxInt(usize);
+            tx.deinit() catch @panic("allocation restored before cleanup");
+        }
         failing.fail_index = failing.alloc_index + offset;
         if (tx.put(.root, .{ .key = "k" }, .{ .int = 42 })) |_| {
             failing.fail_index = std.math.maxInt(usize);
@@ -5434,7 +5520,7 @@ test "manual published producer refusal retains resumable undo and baseline" {
         if (queued != 0) {
             reached_partial = true;
             try testing.expect(tx.rolling_back);
-            try testing.expectError(error.InvalidOp, tx.commit(null, null));
+            try testing.expectError(error.InvalidOp, tx.commit());
             failing.fail_index = failing.alloc_index;
             try testing.expectError(error.OutOfMemory, tx.rollback());
             failing.fail_index = std.math.maxInt(usize);
@@ -5452,19 +5538,298 @@ test "manual published producer refusal retains resumable undo and baseline" {
 }
 
 test "manual validation refusal before batch publication remains writable" {
-    // Invalid text must not poison an otherwise valid manual transaction:
-    // no operation from the refused splice was queued or published.
+    // An invalid lead byte after valid units must not poison an otherwise
+    // valid transaction or queue/publish any part of the refused splice.
     const gpa = testing.allocator;
-    var doc = try freshDocIn(gpa, .manual);
+    var doc = try freshDoc(gpa);
     defer doc.deinit();
     var tx = try Transaction.open(gpa, &doc);
-    defer tx.deinit();
+    defer tx.deinit() catch @panic("testing allocator has no injected failure");
     const text = try tx.putObject(.root, .{ .key = "text" }, .text);
-    try testing.expectError(error.InvalidUtf8, tx.spliceText(text, 0, 0, "\xff"));
+    const pending = tx.count();
+    try testing.expectError(error.InvalidUtf8, tx.spliceText(text, 0, 0, "valid \xc3\xa9\xff"));
+    try testing.expectEqual(pending, tx.count());
     try testing.expect(!tx.rolling_back);
     try tx.spliceText(text, 0, 0, "okay");
-    _ = try tx.commit(null, null);
+    var result = try tx.commit();
+    defer result.deinit(gpa);
     const got = try doc.text(gpa, text);
     defer gpa.free(got);
     try testing.expectEqualStrings("okay", got);
+}
+
+test "pending transaction clone owns independent journal and patch log" {
+    // Rolling back a clone cannot consume the source's rows, text or log.
+    const gpa = testing.allocator;
+    var source = try docWithActor(gpa, "journal-source");
+    defer source.deinit();
+    var log = patchesmod.PatchLog.active(gpa);
+    defer log.deinit();
+    var tx = try Transaction.openWithPatchLog(gpa, &source, &log, null);
+    defer tx.deinit() catch @panic("testing allocator has no injected failure");
+    const text = try tx.putObject(.root, .{ .key = "text" }, .text);
+    try tx.spliceText(text, 0, 0, "owned pending text");
+    const pending = tx.count();
+    var target = try source.clonePending(gpa);
+    defer target.deinit();
+    var copy = try tx.cloneInto(gpa, &target);
+    defer copy.deinit() catch @panic("testing allocator has no injected failure");
+    try testing.expectEqual(pending, copy.count());
+    try testing.expectEqual(pending, try copy.rollback());
+    var discarded = copy.takePatchLog();
+    defer discarded.deinit();
+    try testing.expectEqual(@as(usize, 0), discarded.events.items.len);
+    try testing.expect((try readmod.get(&target, .root, .{ .key = "text" })) == null);
+    try testing.expectEqual(pending, tx.count());
+    const visible = try tx.text(text, gpa);
+    defer gpa.free(visible);
+    try testing.expectEqualStrings("owned pending text", visible);
+    var result = try tx.commit();
+    defer result.deinit(gpa);
+    try testing.expect(result.hash != null);
+    try testing.expect(result.patch_log.events.items.len != 0);
+    try testing.expectEqual(@as(usize, 1), source.graph.len());
+    try testing.expectEqual(@as(usize, 0), target.graph.len());
+}
+
+test "pending map overwrite clone commits independently with the same hash" {
+    // Commit the source first so its nonempty predecessor storage is released
+    // before the cloned journal encodes the same overwrite.
+    const gpa = testing.allocator;
+    var source = try docWithActor(gpa, "clone-map-overwrite");
+    defer source.deinit();
+    {
+        var initial = try Transaction.open(gpa, &source);
+        defer initial.deinit() catch @panic("testing allocator has no injected failure");
+        _ = try initial.put(.root, .{ .key = "k" }, .{ .int = 7 });
+        var result = try initial.commit();
+        defer result.deinit(gpa);
+    }
+    var tx = try Transaction.open(gpa, &source);
+    defer tx.deinit() catch @panic("testing allocator has no injected failure");
+    _ = try tx.put(.root, .{ .key = "k" }, .{ .int = 42 });
+    var target = try source.clonePending(gpa);
+    defer target.deinit();
+    var copy = try tx.cloneInto(gpa, &target);
+    defer copy.deinit() catch @panic("testing allocator has no injected failure");
+
+    var source_result = try tx.commit();
+    defer source_result.deinit(gpa);
+    var clone_result = try copy.commit();
+    defer clone_result.deinit(gpa);
+    try testing.expect(source_result.hash != null);
+    try testing.expect(clone_result.hash != null);
+    try testing.expectEqualSlices(u8, &source_result.hash.?.bytes, &clone_result.hash.?.bytes);
+    try testing.expectEqual(
+        @as(i64, 42),
+        (try readmod.get(&source, .root, .{ .key = "k" })).?.value.scalar.int,
+    );
+    try testing.expectEqual(
+        @as(i64, 42),
+        (try readmod.get(&target, .root, .{ .key = "k" })).?.value.scalar.int,
+    );
+}
+
+test "pending transaction clone allocation refusal preserves the source owner" {
+    // Sweep both raw pending-row duplication and owned journal duplication.
+    const gpa = testing.allocator;
+    var source = try docWithActor(gpa, "clone-refusal");
+    defer source.deinit();
+    var log = patchesmod.PatchLog.active(gpa);
+    defer log.deinit();
+    var tx = try Transaction.openWithPatchLog(gpa, &source, &log, null);
+    defer tx.deinit() catch @panic("testing allocator has no injected failure");
+    const text = try tx.putObject(.root, .{ .key = "text" }, .text);
+    try tx.spliceText(text, 0, 0, "preserved");
+    const pending = tx.count();
+    var reached_success = false;
+    var saw_raw_refusal = false;
+    var saw_journal_refusal = false;
+    for (0..4096) |offset| {
+        var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = offset });
+        const clone_gpa = failing.allocator();
+        var target = source.clonePending(clone_gpa) catch |clone_error| {
+            try testing.expectEqual(error.OutOfMemory, clone_error);
+            saw_raw_refusal = true;
+            try testing.expectEqual(pending, tx.count());
+            try testing.expectEqual(@as(usize, 0), source.graph.len());
+            continue;
+        };
+        defer target.deinit();
+        var copy = tx.cloneInto(clone_gpa, &target) catch |journal_error| {
+            try testing.expectEqual(error.OutOfMemory, journal_error);
+            saw_journal_refusal = true;
+            failing.fail_index = std.math.maxInt(usize);
+            try testing.expectEqual(pending, tx.count());
+            const visible = try tx.text(text, gpa);
+            defer gpa.free(visible);
+            try testing.expectEqualStrings("preserved", visible);
+            try testing.expectEqual(@as(usize, 0), source.graph.len());
+            continue;
+        };
+        failing.fail_index = std.math.maxInt(usize);
+        try copy.deinit();
+        reached_success = true;
+        break;
+    }
+    try testing.expect(saw_raw_refusal);
+    try testing.expect(saw_journal_refusal);
+    try testing.expect(reached_success);
+    try testing.expectEqual(pending, tx.count());
+    var result = try tx.commit();
+    defer result.deinit(gpa);
+    try testing.expect(result.hash != null);
+    try testing.expect(result.patch_log.events.items.len != 0);
+}
+
+test "logged transaction rollback preserves the consumed caller log prefix" {
+    // A committed prefix remains owned after a later transaction is undone.
+    const gpa = testing.allocator;
+    var doc = try docWithActor(gpa, "log-prefix");
+    defer doc.deinit();
+    var log = patchesmod.PatchLog.active(gpa);
+    defer log.deinit();
+    {
+        var first = try Transaction.openWithPatchLog(gpa, &doc, &log, null);
+        defer first.deinit() catch @panic("testing allocator has no injected failure");
+        _ = try first.put(.root, .{ .key = "prefix" }, .{ .str = "kept" });
+        var result = try first.commit();
+        defer result.deinit(gpa);
+        log.deinit();
+        log = result.patch_log.take();
+    }
+    const prefix_len = log.events.items.len;
+    try testing.expect(prefix_len != 0);
+    var next = try Transaction.openWithPatchLog(gpa, &doc, &log, null);
+    defer next.deinit() catch @panic("testing allocator has no injected failure");
+    _ = try next.put(.root, .{ .key = "discard" }, .{ .str = "removed" });
+    try testing.expectEqual(@as(usize, 1), try next.rollback());
+    var retained = next.takePatchLog();
+    defer retained.deinit();
+    try testing.expectEqual(prefix_len, retained.events.items.len);
+    try testing.expectEqualStrings("prefix", retained.events.items[0].event.put_map.key);
+    try testing.expectEqualStrings("kept", retained.events.items[0].event.put_map.value.scalar.str);
+    try testing.expect((try readmod.get(&doc, .root, .{ .key = "discard" })) == null);
+    try testing.expectEqualStrings("kept", (try readmod.get(&doc, .root, .{ .key = "prefix" })).?.value.scalar.str);
+}
+
+test "logged fork constructor allocation refusal retains document and caller log" {
+    // Exercise every allocating preflight while reusing another document's
+    // nonempty log; metadata rebinding and ownership transfer wait for success.
+    var saw_refusal = false;
+    var reached_success = false;
+    for (0..512) |offset| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var doc = try docWithActor(gpa, "constructor-prefix");
+        defer doc.deinit();
+        var log = patchesmod.PatchLog.active(gpa);
+        defer log.deinit();
+        {
+            var first = try Transaction.openWithPatchLog(gpa, &doc, &log, null);
+            defer first.deinit() catch @panic("allocator is not injecting during cleanup");
+            _ = try first.put(.root, .{ .key = "prefix" }, .{ .str = "kept" });
+            var result = try first.commit();
+            defer result.deinit(gpa);
+            log.deinit();
+            log = result.patch_log.take();
+        }
+        var fork = try doc.fork(gpa);
+        defer fork.deinit();
+        fork.setActorId(doc.getActorId());
+        const before = try fork.saveWithOptions(testing.allocator, .{ .deflate = false, .retain_orphans = true });
+        defer testing.allocator.free(before);
+        const actor_before = fork.actor;
+        const identity_before = fork.patchIdentity();
+        const log_identity = log.identity;
+        const events = log.events.items;
+        const actors = log.actors.items;
+        const prefix_len = log.events.items.len;
+        failing.fail_index = failing.alloc_index + offset;
+        var next = Transaction.openWithPatchLog(gpa, &fork, &log, null) catch |open_error| {
+            failing.fail_index = std.math.maxInt(usize);
+            try testing.expectEqual(error.OutOfMemory, open_error);
+            saw_refusal = true;
+            try testing.expectEqual(prefix_len, log.events.items.len);
+            try testing.expectEqualStrings("prefix", log.events.items[0].event.put_map.key);
+            try testing.expectEqualStrings("kept", log.events.items[0].event.put_map.value.scalar.str);
+            try testing.expectEqual(@as(usize, 1), doc.graph.len());
+            try testing.expectEqual(@as(usize, 1), fork.graph.len());
+            try testing.expectEqual(@as(usize, 1), fork.numActors());
+            try testing.expectEqualDeep(actor_before, fork.actor);
+            try testing.expectEqual(identity_before, fork.patchIdentity());
+            const after = try fork.saveWithOptions(testing.allocator, .{ .deflate = false, .retain_orphans = true });
+            defer testing.allocator.free(after);
+            try testing.expectEqualSlices(u8, before, after);
+            try testing.expect(log.recording);
+            try testing.expectEqual(log_identity, log.identity);
+            try testing.expectEqual(events.ptr, log.events.items.ptr);
+            try testing.expectEqual(actors.ptr, log.actors.items.ptr);
+            try testing.expectEqualStrings("constructor-prefix", log.actors.items[0].bytes);
+            try testing.expect(log.checkpoint == null);
+            try testing.expect(log.speculative_actor == null);
+            continue;
+        };
+        failing.fail_index = std.math.maxInt(usize);
+        defer next.deinit() catch @panic("allocation restored before cleanup");
+        try testing.expect(!log.recording);
+        try testing.expectEqual(identity_before, next.patch_log.identity.?);
+        try testing.expectEqual(@as(usize, 0), try next.rollback());
+        var retained = next.takePatchLog();
+        defer retained.deinit();
+        try testing.expectEqual(prefix_len, retained.events.items.len);
+        reached_success = true;
+        break;
+    }
+    try testing.expect(saw_refusal);
+    try testing.expect(reached_success);
+}
+
+test "logged historical construction accepts the projected concurrency actor on a fork" {
+    // A fork lacks the scoped actor until preparation selects it. Opening must
+    // migrate against that projected table, before publishing the new actor.
+    const gpa = testing.allocator;
+    var owner = try docWithActor(gpa, "scoped-compatible");
+    defer owner.deinit();
+    var first_head: ChangeHash = undefined;
+    for ([_][]const u8{ "first", "second" }, 0..) |key, index| {
+        var seed = try Transaction.open(gpa, &owner);
+        defer seed.deinit() catch unreachable;
+        _ = try seed.put(.root, .{ .key = key }, .{ .int = @intCast(index) });
+        var result = try seed.commit();
+        defer result.deinit(gpa);
+        if (index == 0) first_head = result.hash.?;
+    }
+    var fork = try owner.fork(gpa);
+    defer fork.deinit();
+    fork.setActorId(owner.getActorId());
+    var log = patchesmod.PatchLog.active(gpa);
+    defer log.deinit();
+    {
+        var first = try Transaction.openWithPatchLog(gpa, &owner, &log, &.{first_head});
+        defer first.deinit() catch unreachable;
+        _ = try first.put(.root, .{ .key = "prefix" }, .{ .int = 7 });
+        var result = try first.commit();
+        defer result.deinit(gpa);
+        log.deinit();
+        log = result.patch_log.take();
+    }
+    try testing.expectEqual(@as(usize, 1), fork.numActors());
+    try testing.expectEqual(@as(usize, 2), log.actors.items.len);
+    const expected_actor = try types.ActorId.withConcurrency(gpa, fork.getActorId(), 1);
+    defer gpa.free(expected_actor.bytes);
+    var scoped = try Transaction.openWithPatchLog(gpa, &fork, &log, &.{first_head});
+    defer scoped.deinit() catch unreachable;
+    try testing.expect(!log.recording);
+    try testing.expectEqualStrings(expected_actor.bytes, fork.getActor(scoped.actor).?.bytes);
+    try testing.expectEqual(@as(usize, 2), fork.numActors());
+    try testing.expectEqual(@as(usize, 1), scoped.patch_log.events.items.len);
+    _ = try scoped.put(.root, .{ .key = "local" }, .{ .int = 8 });
+    var result = try scoped.commit();
+    defer result.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), result.patch_log.events.items.len);
+    try testing.expectEqualStrings("prefix", result.patch_log.events.items[0].event.put_map.key);
+    try testing.expectEqualStrings("local", result.patch_log.events.items[1].event.put_map.key);
+    try testing.expectEqual(@as(i64, 7), result.patch_log.events.items[0].event.put_map.value.scalar.int);
+    try testing.expectEqual(@as(i64, 8), result.patch_log.events.items[1].event.put_map.value.scalar.int);
 }

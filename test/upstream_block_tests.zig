@@ -1,68 +1,8 @@
-//! `rust/automerge/tests/block_tests.rs`, ported case for case and in
-//! upstream's order.
-//!
-//! Upstream's file is 946 lines with **19** `#[test]` functions, and **all
-//! nineteen are here**, in upstream's order, each carrying its upstream line
-//! numbers. Nothing in this file is a recorded gap.
-//!
-//! **The nineteenth was a gap until `UpdateSpansConfig` landed**, and the way
-//! it is written is worth naming because the alternative would have passed for
-//! the same thing: `update_spans_uses_expand_config`
-//! (`block_tests.rs:676-726`) builds a config with a per-mark `After` *and* a
-//! `default_expand` of `None`, and
-//! [`transact.updateSpansWithConfig`](../src/transact.zig) is the only door
-//! that can carry both. Driving [`transact.mark`](../src/transact.zig) with
-//! `ExpandMark.after` would have produced the same three spans and answered a
-//! different question.
-//!
-//! ## Four mappings a reader needs before the first case
-//!
-//! **1. A block span names an object here and carries a hydrated map upstream.**
-//! Upstream's `Span::Block(Map)` ([`spans.rs`:416-417](../../github-automerge-automerge/rust/automerge/src/iter/spans.rs))
-//! holds the block's contents inline; this port's is `block: ExId`
-//! ([`iter/spans.zig`:502](../../src/iter/spans.zig)) because [`hydrate.zig`](../src/hydrate.zig)
-//! owns the value types and [`updateSpans`](../src/transact.zig) reads the
-//! contents off the object the span names
-//! ([`transact.zig`:2134-2162](../src/transact.zig), `hydrateBlock`). So
-//! upstream's `Span::Block(hydrate_map!{…})` becomes **`blockTemplate`**, a
-//! map object put at the document root under a name of this file's choosing and
-//! filled with that map, and the span names it.
-//!
-//! **That is the whole deviation, and it is a deviation in the document, not in
-//! the assertion.** Two things make it invisible to what these cases check:
-//! `myers_block_diff` compares blocks **by content**
-//! ([`text_diff.rs`:260](../../github-automerge-automerge/rust/automerge/src/text_diff.rs),
-//! [`Block.eql`](../src/transact.zig)), so a template whose contents equal the
-//! block already in the text makes the diff write nothing at all — which is
-//! exactly what upstream's `update_spans` does with the same contents — and the
-//! templates live at the root, never in the text, so no case's `spans(&text)`
-//! can see one.
-//!
-//! **2. A text span owns its bytes and its mark set here.** Upstream's is
-//! `text: String` plus `marks: Option<Arc<MarkSet>>`
-//! ([`spans.rs`:412-415](../../github-automerge-automerge/rust/automerge/src/iter/spans.rs));
-//! the port has no `Arc`, so [`Span.deinit`](../src/iter/spans.zig) takes the
-//! allocator back and frees both. A span this file builds is **this file's**,
-//! and [`updateSpans`](../src/transact.zig) only *reads* it
-//! ([`transact.zig`:2899](../src/transact.zig)) — so unlike `putOwned`, which
-//! takes its value over, the caller frees it.
-//!
-//! **3. `spans_at(&text, &heads)` is an isolation here.** Upstream's method
-//! ([`read.rs`:205-211](../../github-automerge-automerge/rust/automerge/src/read.rs))
-//! has no port spelling; [`Document.isolate`](../src/doc.zig) followed by
-//! [`read.spans`](../src/read.zig) and [`Document.integrate`](../src/doc.zig)
-//! is the same read, because `readScope` ([`read.zig`:450](../src/read.zig))
-//! reads the document's isolation and [`Spans.init`](../src/iter/spans.zig)
-//! takes that clock. Case 8 is the only case that needs it.
-//!
-//! **4. Every case that can carry both shapes also round-trips through
-//! `applyChanges`** — see [`expectSameThroughApplyChanges`] for why, and why the
-//! row order is the assertion that matters rather than the content.
-//!
-//! The leak arbiter is [`gpa`], and every owned value in this file comes out of
-//! it: every document, every head list, every change view array, every hydrated
-//! mirror, every span this file builds, and every byte string a reader hands
-//! back.
+//! `rust/automerge/tests/block_tests.rs`, all nineteen cases in upstream order.
+//! Each case retains its upstream line citation and complete payload assertions.
+//! AutoCommit holds writes until a barrier. SpanInput borrows fresh Map payloads
+//! and text/marks for the call; returned Span values own their complete payloads.
+//! Replay checks compare operation rows and the materialized root independently.
 
 const std = @import("std");
 const am = @import("zautomerge");
@@ -81,7 +21,7 @@ const gpa = testing.allocator;
 const io = std.testing.io;
 const Allocator = std.mem.Allocator;
 
-const Document = am.doc.Document;
+const Document = am.autocommit.AutoCommit;
 const Change = am.change_record.Change;
 const ExId = am.ExId;
 const ObjType = am.ObjType;
@@ -93,7 +33,8 @@ const UpdateSpansConfig = am.marks.UpdateSpansConfig;
 const hyd = am.hydrate;
 const Mirror = hyd.Value;
 const Patch = am.patches.Patch;
-const Span = am.transaction.Span;
+const Span = am.iter.spans.Span;
+const SpanInput = am.iter.spans.SpanInput;
 
 /// The document root, [`automerge::ROOT`](../src/root.zig).
 const root: ExId = am.root;
@@ -130,23 +71,19 @@ fn mintActor() am.ActorId {
 
 /// A document in the autocommit flavour, which is upstream's `AutoCommit`.
 fn newDoc() !Document {
-    var doc = try Document.init(gpa, io, .auto);
+    var doc = try Document.init(gpa, io);
     errdefer doc.deinit();
-    doc.setActorId(mintActor());
+    try doc.setActorId(mintActor());
     return doc;
 }
 
-/// [`Document.forkAt`](../src/doc.zig) at the source's own heads, which is what
-/// upstream's `doc.fork()` means. [`Document.fork`](../src/doc.zig) mints its
-/// actor through the source's retained `io`, so this file goes through the
-/// door that takes a nameable one. **Determinism, not a leak**: `fork`
-/// allocates that actor from the **fork's own** arena, which
-/// [`Document.deinit`](../src/doc.zig) frees.
+/// Fork at the committed source heads, then assign a deterministic actor.
 fn forkDoc(src: *Document) !Document {
     const heads = try src.getHeads(gpa);
     defer gpa.free(heads);
-    var out = try src.forkAt(gpa, heads, .auto);
-    out.setActorId(mintActor());
+    var out = try src.forkAt(gpa, heads);
+    errdefer out.deinit();
+    try out.setActorId(mintActor());
     return out;
 }
 
@@ -155,36 +92,15 @@ fn forkDoc(src: *Document) !Document {
 /// [`Document.getHeads`](../src/doc.zig). **Owned**: every call in this file
 /// binds it and frees it, because a leak in a test is an `ABRT` that kills the
 /// binary and hides every test after it.
-fn headsOf(doc: *const Document) ![]am.ChangeHash {
+fn headsOf(doc: *Document) ![]am.ChangeHash {
     return doc.getHeads(gpa);
-}
-
-/// The scalar at `obj.prop`, or `error.NotAnObject` / `error.NoSuchKey`
-/// ([`ReadDoc::get`](../src/read.zig),
-/// [`read.rs`:259](../../github-automerge-automerge/rust/automerge/src/read.rs)).
-fn scalarAt(doc: *const Document, obj: ExId, prop: Prop) !ScalarValue {
-    const item = (try am.read.get(doc, obj, prop)) orelse return error.NoSuchKey;
-    return switch (item.value) {
-        .scalar => |s| s,
-        .object => error.NotAnObject,
-    };
-}
-
-/// The object at `obj.prop` ([`ReadDoc::get`](../src/read.zig)'s
-/// `(Value, ExId)` pair).
-fn objectAt(doc: *const Document, obj: ExId, prop: Prop) !ExId {
-    const item = (try am.read.get(doc, obj, prop)) orelse return error.NoSuchKey;
-    return switch (item.value) {
-        .object => item.id,
-        .scalar => error.NotAnObject,
-    };
 }
 
 /// The object type at `obj.prop`, and the object itself, which is what
 /// upstream's `doc.get(&block1, "type").unwrap().unwrap()` destructures into a
 /// `(Value, ObjId)` pair.
-fn objectAndType(doc: *const Document, obj: ExId, prop: Prop) !struct { id: ExId, typ: ObjType } {
-    const item = (try am.read.get(doc, obj, prop)) orelse return error.NoSuchKey;
+fn objectAndType(doc: *Document, obj: ExId, prop: Prop) !struct { id: ExId, typ: ObjType } {
+    const item = (try doc.get(obj, prop)) orelse return error.NoSuchKey;
     return switch (item.value) {
         .object => |t| .{ .id = item.id, .typ = t },
         .scalar => error.NotAnObject,
@@ -194,8 +110,8 @@ fn objectAndType(doc: *const Document, obj: ExId, prop: Prop) !struct { id: ExId
 /// `doc.text(&id)`. **The reader hands back a caller-owned string**
 /// ([`read.rs`:181](../../github-automerge-automerge/rust/automerge/src/read.rs)),
 /// which is why this frees it and why the assertion comes on the next line.
-fn expectText(doc: *const Document, obj: ExId, want: []const u8) !void {
-    const got = try am.read.text(doc, obj, gpa);
+fn expectText(doc: *Document, obj: ExId, want: []const u8) !void {
+    const got = try doc.text(obj, gpa);
     defer gpa.free(got);
     try testing.expectEqualStrings(want, got);
 }
@@ -203,13 +119,7 @@ fn expectText(doc: *const Document, obj: ExId, want: []const u8) !void {
 /// The materialized root at the present, through
 /// [`hydrate.hydrateMap`](../src/hydrate.zig).
 fn hydrateNow(doc: *Document) !Mirror {
-    return am.hydrate.hydrateMap(am.doc.Set, &doc.ops, gpa, root, null);
-}
-
-/// The map at `obj` at the present, which is what upstream's `Span::Block`
-/// carries once [`Spans`](../src/iter/spans.zig) has read the block out.
-fn hydrateAt(doc: *Document, obj: ExId) !Mirror {
-    return am.hydrate.hydrateMap(am.doc.Set, &doc.ops, gpa, obj, null);
+    return doc.hydrate(root, null, gpa);
 }
 
 // ── The round trip every case below also takes ───────────────────────────────
@@ -256,13 +166,13 @@ fn expectSameThroughApplyChanges(doc: *Document) !void {
     const view = try changeViews(&all);
     defer gpa.free(view);
 
-    var applied = try Document.init(gpa, io, .auto);
+    var applied = try Document.init(gpa, io);
     defer applied.deinit();
-    applied.setActorId(mintActor());
+    try applied.setActorId(mintActor());
     _ = try applied.applyChanges(gpa, view);
 
     // **First the rows, then the content.**
-    try applied.debugCmp(doc);
+    try (try applied.document()).debugCmp(try doc.document());
 
     var written = try hydrateNow(doc);
     defer written.deinit();
@@ -341,24 +251,6 @@ fn vint(i: i64) Mirror {
     return .{ .int = i };
 }
 
-/// **A block map in the document, for a [`Span`] to name** — the port's spelling
-/// of upstream's `Span::Block(hydrate_map!{…})`. See mapping 1 at the top.
-///
-/// `key` names the slot at the root, so **one document needs one distinct key
-/// per template**; this file's cases never need two blocks with the same
-/// contents, because a block the text already holds with those contents is named
-/// directly instead of through a template.
-///
-/// **The caller still owns `m`.** [`updateObject`](../src/transact.zig) takes
-/// the map by value and reads it ([`transact.zig`:2892](../src/transact.zig)),
-/// so the `deinit` belongs to the caller and is a `defer` here at the call
-/// site.
-fn blockTemplate(doc: *Document, key: []const u8, m: hyd.Map) !ExId {
-    const id = try am.transaction.putObject(doc, root, .{ .key = key }, .map);
-    try am.transaction.updateObject(doc, id, m);
-    return id;
-}
-
 // ── Spans ────────────────────────────────────────────────────────────────────
 
 /// What a span is expected to read as. **Either `block` is set, or `text` is**;
@@ -403,13 +295,13 @@ const empty_map: hyd.Map = .{ .gpa = gpa, .id = .root, .entries = .empty };
 /// Every span of `obj`, in order, **owned by the caller** — each carries its own
 /// text bytes and its own mark set
 /// ([`Spans.next`](../src/iter/spans.zig) hands the span over).
-fn collectSpans(doc: *const Document, obj: ExId) !std.ArrayList(Span) {
+fn collectSpans(doc: *Document, obj: ExId) !std.ArrayList(Span) {
     var out: std.ArrayList(Span) = .empty;
     errdefer {
         for (out.items) |*s| s.deinit(gpa);
         out.deinit(gpa);
     }
-    var walk = try am.read.spans(doc, obj, gpa);
+    var walk = try doc.spans(obj, gpa);
     defer walk.deinit();
     while (try walk.next()) |found| try out.append(gpa, found);
     return out;
@@ -446,8 +338,8 @@ fn strLess(_: void, a: []const u8, b: []const u8) bool {
 /// `expectKeys`, brought over with its reasoning: commenting out the sort in
 /// `Batch.bfs` gave five failures there where **every** content assertion still
 /// passed.
-fn expectKeys(doc: *const Document, obj: ExId, want: []const []const u8) !void {
-    var keys = try am.read.keys(doc, obj);
+fn expectKeys(doc: *Document, obj: ExId, want: []const []const u8) !void {
+    var keys = try doc.keys(obj);
     defer keys.deinit(gpa);
     var got: std.ArrayList([]const u8) = .empty;
     defer {
@@ -493,8 +385,7 @@ fn expectKeys(doc: *const Document, obj: ExId, want: []const []const u8) !void {
 ///    ([`hydrate/map.rs`:13](../../github-automerge-automerge/rust/automerge/src/hydrate/map.rs)):
 ///    two blocks with the same contents are equal whatever they are called.
 ///
-/// `doc` is mutable because resolving a block's contents reads the op set
-/// ([`hydrateMap`](../src/hydrate.zig) takes it mutably).
+/// Returned block Maps are compared directly, without rehydrating object ids.
 fn expectSpans(doc: *Document, obj: ExId, wants: []const Want) !void {
     var got = try collectSpans(doc, obj);
     defer freeSpans(&got);
@@ -513,7 +404,7 @@ fn expectSpans(doc: *Document, obj: ExId, wants: []const Want) !void {
 
     for (got.items, wants, 0..) |s, want, i| {
         switch (s) {
-            .block => |id| {
+            .block => |have| {
                 const expected = want.block orelse {
                     std.debug.print(
                         "\nspan {d} is a block, want text \"{s}\"\n",
@@ -521,15 +412,7 @@ fn expectSpans(doc: *Document, obj: ExId, wants: []const Want) !void {
                     );
                     return error.SpanKindDiffers;
                 };
-                var have = try hydrateAt(doc, id);
-                defer have.deinit();
-                // **The expected map is borrowed into a `Mirror` for the
-                // comparison and that local is never freed**:
-                // [`hydrate.Value.eql`](../src/hydrate.zig) only reads, and the
-                // copy of the map struct shares the caller's `entries`
-                // allocation, so nothing is allocated and nothing is released.
-                var want_value: Mirror = .{ .object = .{ .map = expected.* } };
-                if (!have.eql(&want_value)) {
+                if (!have.eql(expected)) {
                     std.debug.print("\nspan {d}: block contents differ\n", .{i});
                     return error.BlockContentsDiffer;
                 }
@@ -552,7 +435,7 @@ fn expectSpans(doc: *Document, obj: ExId, wants: []const Want) !void {
                     // `inner.rs:1132-1139`), so the row order the reader yields
                     // is the sorted one — which is what this expects.
                     std.mem.sort([]const u8, keys.items, {}, strLess);
-                    try expectKeys(doc, id, keys.items);
+                    try expectKeys(doc, have.id, keys.items);
                 }
             },
             .text => |t| {
@@ -626,16 +509,8 @@ fn expectSpans(doc: *Document, obj: ExId, wants: []const Want) !void {
     }
 }
 
-/// **`spans_at(obj, heads)`** — upstream's method
-/// ([`read.rs`:205-211](../../github-automerge-automerge/rust/automerge/src/read.rs)),
-/// which this port has no spelling of, as mapping 3 at the top of the file
-/// says: [`Document.isolate`](../src/doc.zig) at `heads`, then
-/// [`expectSpans`], then [`Document.integrate`](../src/doc.zig).
-///
-/// **The `integrate` is a `defer` and not the last line**, so a failed
-/// assertion does not leave the document isolated for the replay that follows
-/// it — an isolation is a *view*, and a read through a view is not the read the
-/// next assertion wants.
+/// Read historical spans through an isolated AutoCommit view. Integration is
+/// deferred so an assertion failure cannot leave the replay in that view.
 fn expectSpansAt(
     doc: *Document,
     obj: ExId,
@@ -647,37 +522,6 @@ fn expectSpansAt(
         std.debug.print("leaving the isolation failed: {s}\n", .{@errorName(e)});
     };
     return expectSpans(doc, obj, wants);
-}
-
-/// The span list [`updateSpans`](../src/transact.zig) takes, built from
-/// `texts` and `blocks` in lockstep and **owned by the caller** — the free
-/// function reads its argument and copies what it writes into the document, so
-/// unlike [`mapPut`] it does not take anything over.
-fn spanList(
-    texts: []const []const u8,
-    blocks: []const ?ExId,
-    marks: []const ?[]const MarkSet.Entry,
-) ![]Span {
-    std.debug.assert(texts.len == blocks.len);
-    std.debug.assert(texts.len == marks.len);
-    const out = try gpa.alloc(Span, texts.len);
-    errdefer gpa.free(out);
-    for (texts, blocks, marks, out) |t, b, m, *slot| {
-        slot.* = if (b) |id| .{ .block = id } else blk: {
-            const copy = try gpa.dupe(u8, t);
-            errdefer gpa.free(copy);
-            var set: ?MarkSet = null;
-            if (m) |entries| set = try MarkSet.fromPairs(gpa, entries);
-            break :blk .{ .text = .{ .text = copy, .marks = set } };
-        };
-    }
-    return out;
-}
-
-/// Gives back a list from [`spanList`], each span releasing what it owns.
-fn freeSpanList(list: []Span) void {
-    for (list) |*s| s.deinit(gpa);
-    gpa.free(list);
 }
 
 // ── Patches ──────────────────────────────────────────────────────────────────
@@ -743,10 +587,17 @@ fn showPatches(patches: []const Patch) void {
                     });
                 }
             },
-            .splice_text => |s| std.debug.print(
-                "      SpliceText {{ index: {d}, value: \"{s}\", marks: {s} }}\n",
-                .{ s.index, s.value.asStr(), if (s.marks == null) "none" else "some" },
-            ),
+            .splice_text => |s| {
+                const rendered = s.value.makeString(gpa) catch |err| {
+                    std.debug.print("      SpliceText rendering failed: {s}\n", .{@errorName(err)});
+                    continue;
+                };
+                defer gpa.free(rendered);
+                std.debug.print(
+                    "      SpliceText {{ index: {d}, value: \"{s}\", marks: {s} }}\n",
+                    .{ s.index, rendered, if (s.marks == null) "none" else "some" },
+                );
+            },
             .increment => |s| std.debug.print(
                 "      Increment {{ prop: {s}, value: {d} }}\n",
                 .{ propName(s.prop), s.value },
@@ -793,39 +644,39 @@ test "block: update blocks changes a block's properties" {
     // `"ordered-list-item"` and `attrs` is a map holding `1`.
     //
     // **The assertion is that all four of that survives the rewrite**
-    // (`block_tests.rs:81-103`), which is why the templates below are built
-    // with nested containers rather than three scalars.
+    // (`block_tests.rs:81-103`), including all nested containers.
     var doc = try newDoc();
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    const block1 = try am.transaction.splitBlock(&doc, text, 0);
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
+    const block1 = try doc.splitBlock(text, 0);
     var one = hmap();
     defer one.deinit();
     try mapPut(&one, "parents", vlist(hlist()));
     try mapPut(&one, "type", vstr("ordered-list-item"));
     try mapPut(&one, "attrs", vmap(hmap()));
-    try am.transaction.updateObject(&doc, block1, one);
-    try am.transaction.spliceText(&doc, text, 1, 0, "item 1");
+    const one_value = vmap(one);
+    try doc.updateObject(block1, &one_value);
+    try doc.spliceText(text, 1, 0, "item 1");
 
-    const block2 = try am.transaction.splitBlock(&doc, text, 7);
+    const block2 = try doc.splitBlock(text, 7);
     var two = hmap();
     defer two.deinit();
     try mapPut(&two, "parents", vlist(hlist()));
     try mapPut(&two, "type", vstr("ordered-list-item"));
     try mapPut(&two, "attrs", vmap(hmap()));
-    try am.transaction.updateObject(&doc, block2, two);
-    try am.transaction.spliceText(&doc, text, 8, 0, "item 2");
+    const two_value = vmap(two);
+    try doc.updateObject(block2, &two_value);
+    try doc.spliceText(text, 8, 0, "item 2");
 
     try doc.updateDiffCursor();
 
-    // **The two block templates**, which is mapping 1 at the top of the file.
+    // Fresh borrowed payloads retain the exact nested containers.
     var para = hmap();
     defer para.deinit();
     try mapPut(&para, "type", vstr("paragraph"));
     try mapPut(&para, "parents", vlist(hlist()));
     try mapPut(&para, "attrs", vmap(hmap()));
-    const tmpl_para = try blockTemplate(&doc, "span-block-para", para);
 
     var ul_parents = hlist();
     try listPut(&ul_parents, vstr("ordered-list-item"));
@@ -836,15 +687,15 @@ test "block: update blocks changes a block's properties" {
     try mapPut(&unordered, "type", vstr("unordered-list-item"));
     try mapPut(&unordered, "parents", vlist(ul_parents));
     try mapPut(&unordered, "attrs", vmap(ul_attrs));
-    const tmpl_unordered = try blockTemplate(&doc, "span-block-unordered", unordered);
 
-    const want = try spanList(
-        &.{ "", "item 1", "", "item 2" },
-        &.{ tmpl_para, null, tmpl_unordered, null },
-        &.{ null, null, null, null },
-    );
-    defer freeSpanList(want);
-    try am.transaction.updateSpans(&doc, text, want);
+    const want = [_]SpanInput{
+        .{ .block = &para },
+        .{ .text = .{ .text = "item 1" } },
+        .{ .block = &unordered },
+        .{ .text = .{ .text = "item 2" } },
+    };
+    try doc.updateSpans(text, &want);
+    try expectKeys(&doc, root, &.{"text"});
 
     // **Upstream's expected value, `block_tests.rs:83-102`, rebuilt.**
     var want_para = hmap();
@@ -882,11 +733,11 @@ test "block: update blocks updates the text around them" {
     var doc = try newDoc();
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    _ = try am.transaction.splitBlock(&doc, text, 0);
-    try am.transaction.spliceText(&doc, text, 1, 0, "first thing");
-    _ = try am.transaction.splitBlock(&doc, text, 12);
-    try am.transaction.spliceText(&doc, text, 13, 0, "second thing");
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
+    _ = try doc.splitBlock(text, 0);
+    try doc.spliceText(text, 1, 0, "first thing");
+    _ = try doc.splitBlock(text, 12);
+    try doc.spliceText(text, 13, 0, "second thing");
 
     try doc.updateDiffCursor();
 
@@ -895,22 +746,21 @@ test "block: update blocks updates the text around them" {
     try mapPut(&ordered, "type", vstr("ordered-list-item"));
     try mapPut(&ordered, "parents", vlist(hlist()));
     try mapPut(&ordered, "attrs", vmap(hmap()));
-    const tmpl_ordered = try blockTemplate(&doc, "span-block-ordered", ordered);
 
     var para = hmap();
     defer para.deinit();
     try mapPut(&para, "type", vstr("paragraph"));
     try mapPut(&para, "parents", vlist(hlist()));
     try mapPut(&para, "attrs", vmap(hmap()));
-    const tmpl_para = try blockTemplate(&doc, "span-block-para", para);
 
-    const want = try spanList(
-        &.{ "", "the first thing", "", "the things are done" },
-        &.{ tmpl_ordered, null, tmpl_para, null },
-        &.{ null, null, null, null },
-    );
-    defer freeSpanList(want);
-    try am.transaction.updateSpans(&doc, text, want);
+    const want = [_]SpanInput{
+        .{ .block = &ordered },
+        .{ .text = .{ .text = "the first thing" } },
+        .{ .block = &para },
+        .{ .text = .{ .text = "the things are done" } },
+    };
+    try doc.updateSpans(text, &want);
+    try expectKeys(&doc, root, &.{"text"});
 
     var want_ordered = hmap();
     defer want_ordered.deinit();
@@ -944,25 +794,24 @@ test "block: update blocks updates the marks around them" {
     var doc = try newDoc();
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    try am.transaction.spliceText(&doc, text, 0, 0, "onetwo");
-    const block2 = try am.transaction.splitBlock(&doc, text, 6);
-    try am.transaction.spliceText(&doc, text, 7, 0, "threefour");
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
+    try doc.spliceText(text, 0, 0, "onetwo");
+    _ = try doc.splitBlock(text, 6);
+    try doc.spliceText(text, 7, 0, "threefour");
 
     try doc.updateDiffCursor();
 
-    // **The two empty block spans name `block2` itself, not a template.** The
-    // port compares blocks by content ([`Block.eql`](../src/transact.zig),
-    // `text_diff.rs:260`), and `block2` is an empty map already, so naming it
-    // makes the diff write **nothing at all** for that element — which is what
-    // upstream's fresh `hydrate_map!{}` does against the same empty block.
-    const want = try spanList(
-        &.{ "one", "two", "", "three", "four", "" },
-        &.{ null, null, block2, null, null, block2 },
-        &.{ null, &.{bold}, null, &.{bold}, null, null },
-    );
-    defer freeSpanList(want);
-    try am.transaction.updateSpans(&doc, text, want);
+    var bold_marks = try MarkSet.fromPairs(gpa, &.{bold});
+    defer bold_marks.deinit();
+    const want = [_]SpanInput{
+        .{ .text = .{ .text = "one" } },
+        .{ .text = .{ .text = "two", .marks = &bold_marks } },
+        .{ .block = &empty_map },
+        .{ .text = .{ .text = "three", .marks = &bold_marks } },
+        .{ .text = .{ .text = "four" } },
+        .{ .block = &empty_map },
+    };
+    try doc.updateSpans(text, &want);
 
     // **Upstream's expected value, `block_tests.rs:210-229`.**
     try expectSpans(&doc, text, &.{
@@ -986,25 +835,24 @@ test "block: update blocks with what is already there writes nothing" {
     var doc = try newDoc();
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    const block1 = try am.transaction.splitBlock(&doc, text, 0);
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
+    const block1 = try doc.splitBlock(text, 0);
     var one = hmap();
     defer one.deinit();
     try mapPut(&one, "parents", vlist(hlist()));
     try mapPut(&one, "type", vstr("ordered-list-item"));
     try mapPut(&one, "attrs", vmap(hmap()));
-    try am.transaction.updateObject(&doc, block1, one);
-    try am.transaction.spliceText(&doc, text, 1, 0, "item 1");
+    const one_value = vmap(one);
+    try doc.updateObject(block1, &one_value);
+    try doc.spliceText(text, 1, 0, "item 1");
 
     try doc.updateDiffCursor();
 
-    // **The block span names `block1` itself.** Same reason as case 3: the
-    // contents match, so the diff writes nothing, so there is no patch. Naming
-    // `block1` says the no-op is about the **existing** block, which is the
-    // claim upstream is making.
-    const want = try spanList(&.{ "", "item 1" }, &.{ block1, null }, &.{ null, null });
-    defer freeSpanList(want);
-    try am.transaction.updateSpans(&doc, text, want);
+    const want = [_]SpanInput{
+        .{ .block = &one },
+        .{ .text = .{ .text = "item 1" } },
+    };
+    try doc.updateSpans(text, &want);
 
     // **`diff_incremental`**, which is upstream's `diff_incremental`
     // (`autocommit.rs`:216-220): the patch stream since the cursor
@@ -1030,30 +878,29 @@ test "block: update blocks rewrites text and block type in one call" {
     var doc = try newDoc();
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    const block1 = try am.transaction.splitBlock(&doc, text, 0);
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
+    const block1 = try doc.splitBlock(text, 0);
     var para = hmap();
     defer para.deinit();
     try mapPut(&para, "parents", vlist(hlist()));
     try mapPut(&para, "type", vstr("paragraph"));
     try mapPut(&para, "attrs", vmap(hmap()));
-    try am.transaction.updateObject(&doc, block1, para);
-    try am.transaction.spliceText(&doc, text, 1, 0, "hello world");
+    const para_value = vmap(para);
+    try doc.updateObject(block1, &para_value);
+    try doc.spliceText(text, 1, 0, "hello world");
 
     var unordered = hmap();
     defer unordered.deinit();
     try mapPut(&unordered, "type", vstr("unordered-list-item"));
     try mapPut(&unordered, "parents", vlist(hlist()));
     try mapPut(&unordered, "attrs", vmap(hmap()));
-    const tmpl_unordered = try blockTemplate(&doc, "span-block-unordered", unordered);
 
-    const want = try spanList(
-        &.{ "", "goodbye world" },
-        &.{ tmpl_unordered, null },
-        &.{ null, null },
-    );
-    defer freeSpanList(want);
-    try am.transaction.updateSpans(&doc, text, want);
+    const want = [_]SpanInput{
+        .{ .block = &unordered },
+        .{ .text = .{ .text = "goodbye world" } },
+    };
+    try doc.updateSpans(text, &want);
+    try expectKeys(&doc, root, &.{"text"});
 
     var want_unordered = hmap();
     defer want_unordered.deinit();
@@ -1080,8 +927,8 @@ test "block: a block's type and parents can be text objects" {
     var doc = try newDoc();
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    const block1 = try am.transaction.splitBlock(&doc, text, 0);
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
+    const block1 = try doc.splitBlock(text, 0);
 
     // **`update_object`'s three-way dispatch** (`inner.rs`:1213-1245) has to
     // make the nested text objects and then fill them, and a nested **text**
@@ -1093,7 +940,8 @@ test "block: a block's type and parents can be text objects" {
     defer props.deinit();
     try mapPut(&props, "type", vtext(try htext("ordered-list-item")));
     try mapPut(&props, "parents", vlist(parents));
-    try am.transaction.updateObject(&doc, block1, props);
+    const props_value = vmap(props);
+    try doc.updateObject(block1, &props_value);
 
     const type_item = try objectAndType(&doc, block1, .{ .key = "type" });
     try testing.expectEqual(ObjType.text, type_item.typ);
@@ -1101,7 +949,7 @@ test "block: a block's type and parents can be text objects" {
 
     const parents_item = try objectAndType(&doc, block1, .{ .key = "parents" });
     try testing.expectEqual(ObjType.list, parents_item.typ);
-    try testing.expectEqual(@as(usize, 1), try am.read.length(&doc, parents_item.id));
+    try testing.expectEqual(@as(usize, 1), try doc.length(parents_item.id));
     const elem = try objectAndType(&doc, parents_item.id, .{ .index = 0 });
     try testing.expectEqual(ObjType.text, elem.typ);
     try expectText(&doc, elem.id, "div");
@@ -1127,25 +975,25 @@ test "block: update spans deletes an attribute the new block does not name" {
     var doc = try newDoc();
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    const block1 = try am.transaction.splitBlock(&doc, text, 0);
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
+    const block1 = try doc.splitBlock(text, 0);
     var parents = hlist();
     try listPut(&parents, vtext(try htext("div")));
     var props = hmap();
     defer props.deinit();
     try mapPut(&props, "type", vtext(try htext("ordered-list-item")));
     try mapPut(&props, "parents", vlist(parents));
-    try am.transaction.updateObject(&doc, block1, props);
+    const props_value = vmap(props);
+    try doc.updateObject(block1, &props_value);
 
     var want_block = hmap();
     defer want_block.deinit();
     try mapPut(&want_block, "type", vstr("ordered-list-item"));
     try mapPut(&want_block, "parents", vlist(hlist()));
-    const tmpl = try blockTemplate(&doc, "span-block-attrs", want_block);
 
-    const want = try spanList(&.{""}, &.{tmpl}, &.{null});
-    defer freeSpanList(want);
-    try am.transaction.updateSpans(&doc, text, want);
+    const want = [_]SpanInput{.{ .block = &want_block }};
+    try doc.updateSpans(text, &want);
+    try expectKeys(&doc, root, &.{"text"});
 
     // **Upstream's expected value, `block_tests.rs:387-390`.**
     var expected = hmap();
@@ -1168,16 +1016,16 @@ test "block: marks on spans respect heads" {
     var doc = try newDoc();
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    try am.transaction.spliceText(&doc, text, 0, 0, "hello world");
-    try am.transaction.mark(&doc, text, 0, 5, "bold", .after, .{ .bool_value = true });
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
+    try doc.spliceText(text, 0, 0, "hello world");
+    try doc.mark(text, 0, 5, "bold", .after, .{ .bool_value = true });
 
     // **Owned and freed.** A leak here is an `ABRT` that kills the binary and
     // hides every test after this one.
     const heads = try headsOf(&doc);
     defer gpa.free(heads);
 
-    try am.transaction.mark(&doc, text, 5, 11, "italic", .after, .{ .bool_value = true });
+    try doc.mark(text, 5, 11, "italic", .after, .{ .bool_value = true });
 
     // **Upstream's expected value, `block_tests.rs:419-428`.**
     try expectSpansAt(&doc, text, heads, &.{
@@ -1198,10 +1046,10 @@ test "block: a mark in the spans crosses a block marker" {
     var doc = try newDoc();
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    try am.transaction.spliceText(&doc, text, 0, 0, "lix");
-    try am.transaction.mark(&doc, text, 0, 3, "bold", .after, .{ .bool_value = true });
-    _ = try am.transaction.splitBlock(&doc, text, 1);
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
+    try doc.spliceText(text, 0, 0, "lix");
+    try doc.mark(text, 0, 3, "bold", .after, .{ .bool_value = true });
+    _ = try doc.splitBlock(text, 1);
 
     try expectSpans(&doc, text, &.{
         .{ .text = "l", .marks = &.{bold} },
@@ -1221,11 +1069,11 @@ test "block: a mark does not survive the deletion of the text it covered" {
     var doc = try newDoc();
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    try am.transaction.spliceText(&doc, text, 0, 0, "hello");
-    try am.transaction.mark(&doc, text, 0, 5, "bold", .both, .{ .bool_value = true });
-    try am.transaction.spliceText(&doc, text, 0, 5, "");
-    try am.transaction.spliceText(&doc, text, 0, 0, "hi");
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
+    try doc.spliceText(text, 0, 0, "hello");
+    try doc.mark(text, 0, 5, "bold", .both, .{ .bool_value = true });
+    try doc.spliceText(text, 0, 5, "");
+    try doc.spliceText(text, 0, 0, "hi");
 
     try expectSpans(&doc, text, &.{.{ .text = "hi" }});
     try expectSameThroughApplyChanges(&doc);
@@ -1249,12 +1097,12 @@ test "block: spans consolidate the marks a deleted mark left empty" {
     var doc = try newDoc();
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    try am.transaction.spliceText(&doc, text, 0, 0, "hello middle world");
-    try am.transaction.mark(&doc, text, 0, 9, "bold", .none, .{ .bool_value = true });
-    try am.transaction.mark(&doc, text, 9, 18, "italic", .none, .{ .bool_value = true });
-    try am.transaction.mark(&doc, text, 6, 9, "bold", .none, .null_value);
-    try am.transaction.mark(&doc, text, 9, 12, "italic", .none, .null_value);
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
+    try doc.spliceText(text, 0, 0, "hello middle world");
+    try doc.mark(text, 0, 9, "bold", .none, .{ .bool_value = true });
+    try doc.mark(text, 9, 18, "italic", .none, .{ .bool_value = true });
+    try doc.mark(text, 6, 9, "bold", .none, .null_value);
+    try doc.mark(text, 9, 12, "italic", .none, .null_value);
 
     // **Upstream's expected value, `block_tests.rs:538-549`.**
     try expectSpans(&doc, text, &.{
@@ -1276,10 +1124,10 @@ test "block: spans consolidate a mark removed over the text it covered" {
     var doc = try newDoc();
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    try am.transaction.spliceText(&doc, text, 0, 0, "hello world");
-    try am.transaction.mark(&doc, text, 0, 6, "bold", .none, .{ .bool_value = true });
-    try am.transaction.mark(&doc, text, 0, 6, "bold", .none, .null_value);
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
+    try doc.spliceText(text, 0, 0, "hello world");
+    try doc.mark(text, 0, 6, "bold", .none, .{ .bool_value = true });
+    try doc.mark(text, 0, 6, "bold", .none, .null_value);
 
     try expectSpans(&doc, text, &.{.{ .text = "hello world" }});
     try expectSameThroughApplyChanges(&doc);
@@ -1298,10 +1146,10 @@ test "block: spans consolidate a mark removed over the tail it covered" {
     var doc = try newDoc();
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    try am.transaction.spliceText(&doc, text, 0, 0, "hello world");
-    try am.transaction.mark(&doc, text, 6, 11, "bold", .none, .{ .bool_value = true });
-    try am.transaction.mark(&doc, text, 6, 11, "bold", .none, .null_value);
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
+    try doc.spliceText(text, 0, 0, "hello world");
+    try doc.mark(text, 6, 11, "bold", .none, .{ .bool_value = true });
+    try doc.mark(text, 6, 11, "bold", .none, .null_value);
 
     try expectSpans(&doc, text, &.{.{ .text = "hello world" }});
     try expectSameThroughApplyChanges(&doc);
@@ -1324,17 +1172,20 @@ test "block: update spans diffs the marks as well as the text" {
     var doc = try newDoc();
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    try am.transaction.spliceText(&doc, text, 0, 0, "hello world");
-    try am.transaction.mark(&doc, text, 0, 5, "bold", .both, .{ .bool_value = true });
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
+    try doc.spliceText(text, 0, 0, "hello world");
+    try doc.mark(text, 0, 5, "bold", .both, .{ .bool_value = true });
 
-    const want = try spanList(
-        &.{ "hello", " ", "world" },
-        &.{ null, null, null },
-        &.{ &.{italic}, null, &.{ bold, italic } },
-    );
-    defer freeSpanList(want);
-    try am.transaction.updateSpans(&doc, text, want);
+    var italic_marks = try MarkSet.fromPairs(gpa, &.{italic});
+    defer italic_marks.deinit();
+    var both_marks = try MarkSet.fromPairs(gpa, &.{ bold, italic });
+    defer both_marks.deinit();
+    const want = [_]SpanInput{
+        .{ .text = .{ .text = "hello", .marks = &italic_marks } },
+        .{ .text = .{ .text = " " } },
+        .{ .text = .{ .text = "world", .marks = &both_marks } },
+    };
+    try doc.updateSpans(text, &want);
 
     try expectSpans(&doc, text, &.{
         .{ .text = "hello", .marks = &.{italic} },
@@ -1357,13 +1208,12 @@ test "block: update spans takes the expand flags from its config" {
     // (`block_tests.rs:711-724`): `"Oh "` unmarked, `"hello!"` bold, `" world"`
     // unmarked. `After` grows the mark forwards and not backwards, so the
     // second insert lands outside it — and **the default is `None`, so nothing
-    // else in the document grows at all.** Driving [`transact.mark`](../src/transact.zig)
-    // with `ExpandMark.after` instead would test `mark`, which is why this case
-    // goes through [`transact.updateSpansWithConfig`](../src/transact.zig).
+    // else in the document grows at all.** Calling `mark` with `.after` would
+    // test a different method, so this case uses AutoCommit.updateSpansWithConfig.
     var doc = try newDoc();
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
 
     // **The config, built the way upstream builds it.** [`init`] is upstream's
     // `UpdateSpansConfig::default()` (`marks.rs`:467-473) and
@@ -1376,18 +1226,18 @@ test "block: update spans takes the expand flags from its config" {
     _ = config.withDefaultExpand(.none);
     try config.setMarkExpand("bold", .after);
 
-    const want = try spanList(
-        &.{ "hello", " world" },
-        &.{ null, null },
-        &.{ &.{bold}, null },
-    );
-    defer freeSpanList(want);
-    try am.transaction.updateSpansWithConfig(&doc, text, &config, want);
+    var bold_marks = try MarkSet.fromPairs(gpa, &.{bold});
+    defer bold_marks.deinit();
+    const want = [_]SpanInput{
+        .{ .text = .{ .text = "hello", .marks = &bold_marks } },
+        .{ .text = .{ .text = " world" } },
+    };
+    try doc.updateSpansWithConfig(text, &config, &want);
 
     // **Insert after the mark — should be marked, `block_tests.rs:702`.**
-    try am.transaction.spliceText(&doc, text, 5, 0, "!");
+    try doc.spliceText(text, 5, 0, "!");
     // **Insert before the mark — should NOT be marked, `block_tests.rs:705`.**
-    try am.transaction.spliceText(&doc, text, 0, 0, "Oh ");
+    try doc.spliceText(text, 0, 0, "Oh ");
 
     // **Upstream's expected value, `block_tests.rs:711-724`.**
     try expectSpans(&doc, text, &.{
@@ -1418,10 +1268,10 @@ test "block: diff emits the block update and the block's own contents" {
     var doc = try newDoc();
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
-    doc.resetDiffCursor();
-    const block = try am.transaction.splitBlock(&doc, text, 0);
-    const parents = try am.transaction.putObject(&doc, block, .{ .key = "parents" }, .list);
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
+    try doc.resetDiffCursor();
+    const block = try doc.splitBlock(text, 0);
+    const parents = try doc.putObject(block, .{ .key = "parents" }, .list);
 
     const heads = try headsOf(&doc);
     defer gpa.free(heads);
@@ -1430,7 +1280,7 @@ test "block: diff emits the block update and the block's own contents" {
     defer first.deinit();
     try expectBlockUpdatePatches(first.slice(), text, block, parents);
 
-    try am.transaction.spliceText(&doc, text, 0, 0, "hello world");
+    try doc.spliceText(text, 0, 0, "hello world");
     var second = try doc.diff(gpa, &.{}, heads);
     defer second.deinit();
     try expectBlockUpdatePatches(second.slice(), text, block, parents);
@@ -1513,7 +1363,7 @@ test "block: diff exposes rich text when a deletion is reversed" {
     defer doc.deinit();
 
     const text = try richTextWithTwoBlocks(&doc);
-    try am.transaction.mark(&doc, text, 1, 6, "bold", .none, .{ .bool_value = true });
+    try doc.mark(text, 1, 6, "bold", .none, .{ .bool_value = true });
 
     const visible = try headsOf(&doc);
     defer gpa.free(visible);
@@ -1527,7 +1377,7 @@ test "block: diff exposes rich text when a deletion is reversed" {
         return error.DiffIsEmpty;
     }
 
-    _ = try am.transaction.delete(&doc, root, .{ .key = "text" });
+    _ = try doc.delete(root, .{ .key = "text" });
     const hidden = try headsOf(&doc);
     defer gpa.free(hidden);
 
@@ -1551,24 +1401,25 @@ test "block: diff exposes rich text when a deletion is reversed" {
 /// is not used by the one case that calls this (`block_tests.rs:824` binds it to
 /// `_`).
 fn richTextWithTwoBlocks(doc: *Document) !ExId {
-    const text = try am.transaction.putObject(doc, root, .{ .key = "text" }, .text);
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
 
     // **Every index below is `doc.length(&text)` read at that moment**, which is
     // upstream's line (`block_tests.rs`:799`, `:803`, `:815`) and is what makes
     // the second block land *after* "Hello" rather than at a hard-coded 5.
-    const first = try am.transaction.splitBlock(doc, text, try am.read.length(doc, text));
+    const first = try doc.splitBlock(text, try doc.length(text));
     var first_props = hmap();
     defer first_props.deinit();
     try mapPut(&first_props, "type", vstr("paragraph"));
     try mapPut(&first_props, "parents", vlist(hlist()));
     try mapPut(&first_props, "attrs", vmap(hmap()));
-    try am.transaction.updateObject(doc, first, first_props);
+    const first_props_value = vmap(first_props);
+    try doc.updateObject(first, &first_props_value);
 
-    const first_text_index = try am.read.length(doc, text);
-    try am.transaction.spliceText(doc, text, first_text_index, 0, "Hello");
+    const first_text_index = try doc.length(text);
+    try doc.spliceText(text, first_text_index, 0, "Hello");
 
-    const second_index = try am.read.length(doc, text);
-    const second = try am.transaction.splitBlock(doc, text, second_index);
+    const second_index = try doc.length(text);
+    const second = try doc.splitBlock(text, second_index);
     var second_parents = hlist();
     try listPut(&second_parents, vstr("blockquote"));
     var second_attrs = hmap();
@@ -1578,10 +1429,11 @@ fn richTextWithTwoBlocks(doc: *Document) !ExId {
     try mapPut(&second_props, "type", vstr("heading"));
     try mapPut(&second_props, "parents", vlist(second_parents));
     try mapPut(&second_props, "attrs", vmap(second_attrs));
-    try am.transaction.updateObject(doc, second, second_props);
+    const second_props_value = vmap(second_props);
+    try doc.updateObject(second, &second_props_value);
 
-    const second_text_index = try am.read.length(doc, text);
-    try am.transaction.spliceText(doc, text, second_text_index, 0, "World");
+    const second_text_index = try doc.length(text);
+    try doc.spliceText(text, second_text_index, 0, "World");
     return text;
 }
 
@@ -1596,11 +1448,11 @@ test "block: a merge produces an insertion diff for the block" {
     var doc = try newDoc();
     defer doc.deinit();
 
-    const text = try am.transaction.putObject(&doc, root, .{ .key = "text" }, .text);
+    const text = try doc.putObject(root, .{ .key = "text" }, .text);
     var fork = try forkDoc(&doc);
     defer fork.deinit();
 
-    const block1 = try am.transaction.splitBlock(&doc, text, 0);
+    const block1 = try doc.splitBlock(text, 0);
 
     try fork.updateDiffCursor();
     const heads_before = try headsOf(&fork);
@@ -1657,10 +1509,9 @@ test "block: a splice preserves the marks around what it replaced" {
     var doc = try newDoc();
     defer doc.deinit();
 
-    const txt = try am.transaction.putObject(&doc, root, .{ .key = "txt" }, .text);
-    try am.transaction.spliceText(&doc, txt, 0, 0, "abc");
-    try am.transaction.mark(
-        &doc,
+    const txt = try doc.putObject(root, .{ .key = "txt" }, .text);
+    try doc.spliceText(txt, 0, 0, "abc");
+    try doc.mark(
         txt,
         1,
         2,
@@ -1668,8 +1519,7 @@ test "block: a splice preserves the marks around what it replaced" {
         .none,
         .{ .str = "marked" },
     );
-    try am.transaction.mark(
-        &doc,
+    try doc.mark(
         txt,
         1,
         2,
@@ -1685,7 +1535,7 @@ test "block: a splice preserves the marks around what it replaced" {
         .{ .text = "c" },
     });
 
-    try am.transaction.spliceText(&doc, txt, 1, 1, "d");
+    try doc.spliceText(txt, 1, 1, "d");
 
     // **Upstream's expected value, `block_tests.rs:929-944`.**
     try expectSpans(&doc, txt, &.{
@@ -1696,70 +1546,48 @@ test "block: a splice preserves the marks around what it replaced" {
     try expectSameThroughApplyChanges(&doc);
 }
 
-// Zig 0.16.0 / upstream / Rust / port
-//
-// * **This section is a port of `$AUTOMERGE_REF/rust/automerge/tests/
-//   block_tests.rs`: all nineteen upstream `#[test]` cases, in upstream's
-//   order, each carrying its upstream line numbers. Nothing here is a recorded
-//   gap, and every case is a behaviour case — none of them asserts a Rust
-//   type's layout, so none was dropped on that ground.
-//
-// * **`update_spans` takes a config, and the port has two doors for it.**
-//   Upstream's is one method whose second argument is the config
-//   ([`marks.rs`:468-473](../../github-automerge-automerge/rust/automerge/src/marks.rs)),
-//   read by `apply_marks_diff` for every mark it writes and every mark it
-//   removes ([`text_diff.rs`:217-221](../../github-automerge-automerge/rust/automerge/src/text_diff.rs),
-//   `:235-239`). The port has [`transact.updateSpansWithConfig`](../src/transact.zig),
-//   which takes one, and [`transact.updateSpans`](../src/transact.zig), which
-//   builds upstream's `UpdateSpansConfig::default()` for the caller
-//   (`transact.zig`:1989-1991`) — upstream's default because
-//   `ExpandMark::default` is `After`
-//   ([`marks.rs`:379-383](../../github-automerge-automerge/rust/automerge/src/marks.rs)).
-//   **Only case 15 needs the config door**, and it needs it precisely because
-//   its answer would be the same either way: it sets `default_expand` to `None`
-//   *and* `bold` to `After`, and `transact.mark` with `ExpandMark.after` would
-//   have produced the same three spans while testing a different method.
-//   [API.md](../API.md) still drops the type; `UpdateSpansConfig` is in
-//   [`src/marks.zig`](../src/marks.zig) for the same reason it is there for
-//   `diff_marks.rs`'s two cases.
-//
-// * **A block span names an object here and carries a hydrated map upstream.**
-//   Upstream's is `Span::Block(Map)` (`spans.rs`:416-417); this port's is
-//   `block: ExId` ([`iter/spans.zig`:502](../src/iter/spans.zig)) because
-//   [`hydrate.zig`](../src/hydrate.zig) owns the value types and
-//   [`updateSpans`](../src/transact.zig) reads the contents off the object the
-//   span names ([`transact.zig`:2134-2162](../src/transact.zig)). So upstream's
-//   `Span::Block(hydrate_map!{…})` becomes [`blockTemplate`]: a map object put
-//   at the root and filled with that map. **This is a deviation in the
-//   document, not in the assertion** — `myers_block_diff` compares blocks **by
-//   content** ([`text_diff.rs`:260](../../github-automerge-automerge/rust/automerge/src/text_diff.rs)),
-//   so a template content-equal to the block already in the text writes nothing,
-//   and the templates live at the root where no case's `spans(&text)` can see
-//   one. Where the block the text already holds *is* the content wanted, the
-//   span names that block directly instead of going through a template
-//   (cases 3 and 4), which is what upstream's fresh `hydrate_map!{}` compares
-//   equal to anyway.
-//
-// * **`spans_at` does not exist here** ([`read.rs`:205-211](../../github-automerge-automerge/rust/automerge/src/read.rs)).
-//   [`Document.isolate`](../src/doc.zig) plus [`read.spans`](../src/read.zig)
-//   plus [`Document.integrate`](../src/doc.zig) is the same read, because
-//   [`readScope`](../src/read.zig) reads the document's isolation and
-//   [`Spans.init`](../src/iter/spans.zig) takes that clock. Case 8 is the only
-//   case that needs it.
-//
-// * **This file's actors are minted, not random.** Upstream draws one at
-//   random ([`automerge.rs`:314](../../github-automerge-automerge/rust/automerge/src/automerge.rs));
-//   a counter gives distinct bytes, a stable order and the same bytes on every
-//   run, which is the same reason [`test/upstream_doc_test.zig`](upstream_doc_test.zig)
-//   gives — a failure nobody can reproduce is not a finding.
-//
-// * **`AutoCommit`'s one lazy transaction is the port's one transaction per
-//   call.** Upstream's opens on the first mutating call and holds it
-//   ([`autocommit.rs`:445-457](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)),
-//   so all of case 1's writes are one change here; the port's free functions
-//   open, apply and commit each ([`transact.zig`](../src/transact.zig)), so they
-//   are several. **Only case 4 can tell the difference**, and it does not: it
-//   asks that a no-op `update_spans` write *nothing*, and a transaction that
-//   wrote nothing commits nothing whichever door wrote it. Cases 16 to 18 read
-//   diffs over `&[]` or over heads taken after every write, where the change
-//   boundaries do not enter the claim.
+test "parity rich fresh nested blocks own output after document teardown" {
+    // Source inputs and the document can die before the owning output is inspected.
+    var expected = hmap();
+    defer expected.deinit();
+    var expected_parents = hlist();
+    try listPut(&expected_parents, vtext(try htext("div")));
+    try mapPut(&expected, "type", vtext(try htext("paragraph")));
+    try mapPut(&expected, "parents", vlist(expected_parents));
+    var output: std.ArrayList(Span) = .empty;
+    defer freeSpans(&output);
+    {
+        var doc = try newDoc();
+        defer doc.deinit();
+        const text = try doc.putObject(root, .{ .key = "text" }, .text);
+        {
+            var block = hmap();
+            defer block.deinit();
+            var parents = hlist();
+            try listPut(&parents, vtext(try htext("div")));
+            try mapPut(&block, "type", vtext(try htext("paragraph")));
+            try mapPut(&block, "parents", vlist(parents));
+            const input = [_]SpanInput{
+                .{ .block = &block },
+                .{ .text = .{ .text = "body" } },
+            };
+            try doc.updateSpans(text, &input);
+        }
+        try expectKeys(&doc, root, &.{"text"});
+        output = try collectSpans(&doc, text);
+    }
+    try testing.expectEqual(@as(usize, 2), output.items.len);
+    try testing.expect(output.items[0] == .block);
+    try testing.expect(output.items[1] == .text);
+    const got = &output.items[0].block;
+    try testing.expect(got.eql(&expected));
+    const got_type = got.get("type").?;
+    const rendered = try got_type.object.text.makeString(gpa);
+    defer gpa.free(rendered);
+    try testing.expectEqualStrings("paragraph", rendered);
+    const got_parent = got.get("parents").?.object.list.get(0).?;
+    const parent_string = try got_parent.object.text.makeString(gpa);
+    defer gpa.free(parent_string);
+    try testing.expectEqualStrings("div", parent_string);
+    try testing.expectEqualStrings("body", output.items[1].text.text);
+}

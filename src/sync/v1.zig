@@ -157,7 +157,7 @@ pub const State = struct {
     sent_hashes: std.ArrayList(ChangeHash) = .empty,
     /// Whether an unanswered message is on the wire
     /// (`v1_compat_test/state.rs:52`). **A bit, not a counter**: it is cleared on
-    /// receive and nowhere else (`v1_compat_test/mod.rs:184`).
+    /// receive; an incompatible caller log leaves it unchanged.
     in_flight: bool = false,
     /// Whether we have ever answered this peer (`v1_compat_test/state.rs:58`).
     /// It is what makes the first message go out even with nothing to send,
@@ -436,12 +436,33 @@ pub fn receiveSyncMessage(
     state: *State,
     message: Message,
 ) ProtocolError!void {
-    state.in_flight = false;
-    // The message is this call's from the first statement, so its guard is
-    // armed **before** the first fallible one, for the reason the v2 receive
-    // path gives: `getHeads` used to fail with the message owned by nobody.
+    return receiveSyncMessageImpl(gpa, doc, state, message, null);
+}
+
+/// Receives a legacy message with a borrowed caller log through the existing
+/// legacy protocol. Consumes the message on success and error. Actor mismatch
+/// during logged loading leaves the document, peer state and log unchanged.
+pub fn receiveSyncMessageWithPatchLog(
+    gpa: Allocator,
+    doc: *Document,
+    state: *State,
+    message: Message,
+    log: *@import("../patches.zig").PatchLog,
+) ProtocolError!void {
+    return receiveSyncMessageImpl(gpa, doc, state, message, log);
+}
+
+fn receiveSyncMessageImpl(
+    gpa: Allocator,
+    doc: *Document,
+    state: *State,
+    message: Message,
+    log: ?*@import("../patches.zig").PatchLog,
+) ProtocolError!void {
     var owned = message;
     errdefer owned.deinit();
+    // The ordinary route retains upstream's clear-before-failure order.
+    if (log == null) state.in_flight = false;
 
     const before_heads = try doc.getHeads(gpa);
     defer gpa.free(before_heads);
@@ -451,7 +472,16 @@ pub fn receiveSyncMessage(
     if (!changes_is_empty) {
         const joined = try owned.changes.join(gpa);
         defer gpa.free(joined);
-        _ = try doc.loadIncremental(gpa, joined);
+        if (log) |sink| {
+            _ = try doc.loadIncrementalWithPatchLog(gpa, joined, sink);
+        } else {
+            _ = try doc.loadIncremental(gpa, joined);
+        }
+    }
+    // Logged loading applies Doc's branch-specific contract before peer state changes.
+    if (log != null) state.in_flight = false;
+
+    if (!changes_is_empty) {
         const after_heads = try doc.getHeads(gpa);
         defer gpa.free(after_heads);
         const advanced = try msg.advanceHeads(gpa, before_heads, after_heads, state.shared_heads);
@@ -779,26 +809,28 @@ const Framed = struct {
 
 /// A stored change stream split into its framed chunks, each re-framed so it can
 /// go into a message on its own.
+/// This is a fixture helper, not the live sync message path.
 ///
 /// **Re-framed, not copied:** `chunkmod.writeChunk` is the writer for the
-/// framing `parseChunks` reads, so the bytes a peer receives here are the bytes a
+/// framing `ChunkStream` reads, so the bytes a peer receives here are the bytes a
 /// reader will accept, checksum included. The hash is `changeHashOf`, which is
 /// what a change chunk's identity is (`chunk.rs:79`) — the same value
 /// `parseChange` computes for the same body.
 fn splitStream(gpa: Allocator, bytes: []const u8) ![]Framed {
-    const chunks = try chunkmod.parseChunks(bytes, gpa);
-    defer gpa.free(chunks);
+    var stream = chunkmod.ChunkStream.init(bytes);
     var out: std.ArrayList(Framed) = .empty;
     errdefer {
         for (out.items) |framed| gpa.free(framed.bytes);
         out.deinit(gpa);
     }
-    for (chunks) |c| {
+    while (try stream.next()) |c| {
         var framed: std.ArrayList(u8) = .empty;
         errdefer framed.deinit(gpa);
         try chunkmod.writeChunk(&framed, gpa, c.typ, c.data);
+        const owned = try framed.toOwnedSlice(gpa);
+        errdefer gpa.free(owned);
         try out.append(gpa, .{
-            .bytes = try framed.toOwnedSlice(gpa),
+            .bytes = owned,
             .hash = chunkmod.changeHashOf(c.typ, c.data),
         });
     }
@@ -808,6 +840,66 @@ fn splitStream(gpa: Allocator, bytes: []const u8) ![]Framed {
 fn freeFramed(gpa: Allocator, frames: []Framed) void {
     for (frames) |framed| gpa.free(framed.bytes);
     gpa.free(frames);
+}
+
+fn splitStreamAndFree(gpa: Allocator, bytes: []const u8) !void {
+    const frames = try splitStream(gpa, bytes);
+    defer freeFramed(gpa, frames);
+}
+
+fn splitStreamRejectLater(gpa: Allocator, bytes: []const u8) !void {
+    const frames = splitStream(gpa, bytes) catch |failure| switch (failure) {
+        error.InvalidMagic => return,
+        else => return failure,
+    };
+    defer freeFramed(gpa, frames);
+    return error.TestUnexpectedResult;
+}
+
+test "v1 splitStream spends only the required frame output allocation budget" {
+    // Measure the writer and output-vector costs separately from parsing.
+    // The fixture payload is the change stream used by the queued-message test.
+    const gpa = testing.allocator;
+    const bytes = try readFixture(gpa, two_changes_shuffled_fixture);
+    defer gpa.free(bytes);
+    const chunks = try chunkmod.parseChunks(bytes, gpa);
+    defer gpa.free(chunks);
+    var output_cost: testing.FailingAllocator = .init(gpa, .{});
+    const counted_output = output_cost.allocator();
+    var vector: std.ArrayList(Framed) = .empty;
+    defer vector.deinit(counted_output);
+    for (chunks) |c| {
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(counted_output);
+        try chunkmod.writeChunk(&frame, counted_output, c.typ, c.data);
+        const owned = try frame.toOwnedSlice(counted_output);
+        defer counted_output.free(owned);
+        try vector.append(counted_output, .{
+            .bytes = &.{},
+            .hash = chunkmod.changeHashOf(c.typ, c.data),
+        });
+    }
+    const owned_vector = try vector.toOwnedSlice(counted_output);
+    defer counted_output.free(owned_vector);
+
+    var actual_cost: testing.FailingAllocator = .init(gpa, .{});
+    const counted_actual = actual_cost.allocator();
+    const frames = try splitStream(counted_actual, bytes);
+    defer freeFramed(counted_actual, frames);
+    try testing.expectEqual(chunks.len, frames.len);
+    for (chunks, frames) |c, framed| {
+        try testing.expectEqualSlices(u8, c.frame, framed.bytes);
+        try testing.expect(chunkmod.changeHashOf(c.typ, c.data).eql(framed.hash));
+        try testing.expect(c.frame.ptr != framed.bytes.ptr);
+    }
+    try testing.expectEqual(output_cost.alloc_index, actual_cost.alloc_index);
+    try testing.checkAllAllocationFailures(gpa, splitStreamAndFree, .{bytes});
+
+    // A later bad header must discard frames already produced by the stream.
+    const malformed = try std.mem.concat(gpa, u8, &.{ bytes, &.{ 0, 0, 0, 0 } });
+    defer gpa.free(malformed);
+    try splitStreamRejectLater(gpa, malformed);
+    try testing.checkAllAllocationFailures(gpa, splitStreamRejectLater, .{malformed});
 }
 
 /// Where the corpus lives, relative to the process working directory. A unit
@@ -920,7 +1012,7 @@ fn carriesDocument(m: *const Message) bool {
 /// are the reference's own change chunks: see the note on `fixture_paths` for
 /// why this file cannot commit a change of its own.
 fn docWith(gpa: Allocator, parts: []const []const u8) !Document {
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = "cccccccccccccccccccccccccccccccc" });
     for (parts) |part| _ = try doc.loadIncremental(gpa, part);
@@ -930,7 +1022,7 @@ fn docWith(gpa: Allocator, parts: []const []const u8) !Document {
 /// An empty document with the same actor id as [`docWith`], so the only
 /// difference between the two is what they hold.
 fn emptyDoc(gpa: Allocator) !Document {
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = "cccccccccccccccccccccccccccccccc" });
     return doc;
@@ -1939,7 +2031,7 @@ fn convergeBase(gpa: Allocator) !Document {
         defer parsed.deinit();
         const bytes = try err.hexFrom(gpa, parsed.value.hex);
         defer gpa.free(bytes);
-        return Document.load(gpa, std.testing.io, bytes, docmod.defaultTextEncoding(), .manual);
+        return Document.load(gpa, std.testing.io, bytes, docmod.defaultTextEncoding());
     }
     std.debug.print("converge.jsonl has no `converge-base` record\n", .{});
     return error.GoldenVectorsNotFound;
@@ -2170,11 +2262,13 @@ test "a v1-only peer and a v2 peer converge, and the v1 peer never emits a v2 ch
     {
         const text = (try readmod.get(&v2, .root, .{ .key = "text" })).?.id;
         var t = try trans.Transaction.open(gpa, &v2);
-        defer t.deinit();
+        // Closed on success; failure exits and destroys the owning v2 document.
+        defer t.deinitClosed();
         _ = try t.put(.root, .{ .key = "only_v2" }, .{ .int = 1 });
         try t.increment(.root, .{ .key = "counter" }, 3);
         try t.mark(text, 0, 2, "em", .both, .{ .bool_value = true });
-        _ = try t.commit("v2", oracle_time);
+        var committed = try t.commitWith(.{ .message = "v2", .time = oracle_time });
+        defer committed.deinit(gpa);
     }
 
     // The v1 peer: a write only it makes, a counter increment, and a splice
@@ -2186,11 +2280,13 @@ test "a v1-only peer and a v2 peer converge, and the v1 peer never emits a v2 ch
     {
         const text = (try readmod.get(&v1, .root, .{ .key = "text" })).?.id;
         var t = try trans.Transaction.open(gpa, &v1);
-        defer t.deinit();
+        // Closed on success; failure exits and destroys the owning v1 document.
+        defer t.deinitClosed();
         _ = try t.put(.root, .{ .key = "only_v1" }, .{ .int = 2 });
         try t.increment(.root, .{ .key = "counter" }, 4);
         try t.spliceText(text, 4, 0, "ZZ");
-        _ = try t.commit("v1", oracle_time);
+        var committed = try t.commitWith(.{ .message = "v1", .time = oracle_time });
+        defer committed.deinit(gpa);
     }
 
     // **The control**: the two documents are not the same document.
@@ -2326,3 +2422,220 @@ test "a v1-only peer and a v2 peer converge, and the v1 peer never emits a v2 ch
 //   does not ask. **Not covered by a test**: producing such a document needs an
 //   op set and a change graph that disagree, and nothing in the public surface
 //   builds one.
+
+test "API parity external sync v1 logs received changes" {
+    // A separately allocated empty receiver accepts a log indexed into the incoming actors.
+    const PatchLog = @import("../patches.zig").PatchLog;
+    const gpa = testing.allocator;
+    var source = try Document.init(gpa, testing.io);
+    defer source.deinit();
+    var tx = try trans.Transaction.open(gpa, &source);
+    // Closed on success; test failure destroys the complete source owner.
+    defer tx.deinitClosed();
+    _ = try tx.put(.root, .{ .key = "legacy" }, .{ .str = "received" });
+    var committed = try tx.commit();
+    defer committed.deinit(gpa);
+    var target = try Document.init(gpa, testing.io);
+    defer target.deinit();
+    var state = State.new(gpa);
+    defer state.deinit();
+    var log = PatchLog.active(gpa);
+    defer log.deinit();
+    try log.bind(source.patchIdentity(), source.ops.actors.items);
+    try testing.expect(source.patchIdentity() != target.patchIdentity());
+    try @This().receiveSyncMessageWithPatchLog(
+        gpa,
+        &target,
+        &state,
+        try externalV1Message(gpa, &source),
+        &log,
+    );
+    const item = (try readmod.get(&target, .root, .{ .key = "legacy" })).?;
+    try testing.expectEqualStrings("received", item.value.scalar.str);
+    var patches = try log.makePatches(Document, &target);
+    defer patches.deinit();
+    try testing.expectEqual(@as(usize, 1), patches.items.items.len);
+    try testing.expectEqualStrings("legacy", patches.items.items[0].action.put_map.key);
+}
+
+fn externalV1Put(gpa: Allocator, doc: *Document, key: []const u8) !void {
+    var tx = try trans.Transaction.open(gpa, doc);
+    defer tx.deinitClosed();
+    _ = try tx.put(.root, .{ .key = key }, .{ .str = key });
+    var committed = try tx.commit();
+    defer committed.deinit(gpa);
+}
+
+fn externalV1Message(gpa: Allocator, source: *Document) !Message {
+    var change = (try source.getLastLocalChange(gpa)).?;
+    defer change.deinit(gpa);
+    var message = Message.init(gpa);
+    errdefer message.deinit();
+    message.heads = try source.getHeads(gpa);
+    const raw = try change.change.encode(gpa);
+    errdefer gpa.free(raw);
+    message.changes.items = try gpa.alloc([]u8, 1);
+    message.changes.items[0] = raw;
+    return message;
+}
+
+test "API parity external sync v1 actor mismatch preserves document peer and retained log" {
+    // A is absent from both the nonempty B receiver and the incoming B change.
+    const PatchLog = @import("../patches.zig").PatchLog;
+    const gpa = testing.allocator;
+    var owner = try Document.init(gpa, testing.io);
+    defer owner.deinit();
+    owner.setActorId(.{ .bytes = "a" });
+    try externalV1Put(gpa, &owner, "retained");
+    var log = PatchLog.active(gpa);
+    defer log.deinit();
+    try log.bind(owner.patchIdentity(), owner.ops.actors.items);
+    log.putMap(
+        .root,
+        "retained",
+        .{ .scalar = .{ .str = "retained" } },
+        types.OpId.init(1, 0),
+        false,
+        false,
+    );
+    if (log.oom) return error.OutOfMemory;
+    log.heads = try owner.getHeads(gpa);
+    const log_identity = log.identity;
+    const log_actor_storage = log.actors.items.ptr;
+    const log_event_storage = log.events.items.ptr;
+    const log_heads = log.heads.?;
+    const log_event = log.events.items[0];
+
+    var target = try Document.init(gpa, testing.io);
+    defer target.deinit();
+    target.setActorId(.{ .bytes = "b" });
+    try externalV1Put(gpa, &target, "base");
+    const before_save = try target.save(gpa);
+    defer gpa.free(before_save);
+    var before_doc = try readmod.hydrate(&target, .root, null, gpa);
+    defer before_doc.deinit();
+    const before_heads = try target.getHeads(gpa);
+    defer gpa.free(before_heads);
+    const actor_storage = target.ops.actors.items.ptr;
+    try testing.expectEqual(@as(usize, 1), target.ops.actors.items.len);
+    try testing.expectEqualStrings("b", target.ops.actors.items[0].bytes);
+    var source = try Document.load(
+        gpa,
+        testing.io,
+        before_save,
+        types.TextEncoding.platformDefault(),
+    );
+    defer source.deinit();
+    source.setActorId(.{ .bytes = "b" });
+    try externalV1Put(gpa, &source, "incoming");
+
+    var state = State.new(gpa);
+    defer state.deinit();
+    state.in_flight = true;
+    state.have_responded = true;
+    state.shared_heads = try gpa.dupe(ChangeHash, before_heads);
+    state.last_sent_heads = try gpa.dupe(ChangeHash, before_heads);
+    state.their_heads = try gpa.dupe(ChangeHash, before_heads);
+    state.their_need = try gpa.dupe(ChangeHash, before_heads);
+    const haves = try gpa.alloc(Have, 1);
+    haves[0] = Have.empty(gpa);
+    state.their_have = haves;
+    haves[0].last_sync = try gpa.dupe(ChangeHash, before_heads);
+    try state.insertSent(before_heads[0]);
+    const before_state = state;
+    const before_have = haves[0];
+
+    try testing.expectError(error.PatchLogMismatch, @This().receiveSyncMessageWithPatchLog(
+        gpa,
+        &target,
+        &state,
+        try externalV1Message(gpa, &source),
+        &log,
+    ));
+
+    try testing.expect(state.in_flight);
+    try testing.expect(state.have_responded);
+    try testing.expectEqual(before_state.shared_heads.ptr, state.shared_heads.ptr);
+    try testing.expectEqual(before_state.last_sent_heads.ptr, state.last_sent_heads.ptr);
+    try testing.expectEqual(before_state.their_heads.?.ptr, state.their_heads.?.ptr);
+    try testing.expectEqual(before_state.their_need.?.ptr, state.their_need.?.ptr);
+    try testing.expectEqual(before_state.their_have.?.ptr, state.their_have.?.ptr);
+    try testing.expectEqual(before_state.sent_hashes.items.ptr, state.sent_hashes.items.ptr);
+    try expectSameHashes(before_heads, state.shared_heads);
+    try expectSameHashes(before_heads, state.last_sent_heads);
+    try expectSameHashes(before_heads, state.their_heads.?);
+    try expectSameHashes(before_heads, state.their_need.?);
+    try expectSameHashes(before_heads, state.sent_hashes.items);
+    try testing.expectEqual(@as(usize, 1), state.their_have.?.len);
+    try testing.expectEqualDeep(before_have, state.their_have.?[0]);
+    try expectSameHashes(before_heads, state.their_have.?[0].last_sync);
+
+    var after_doc = try readmod.hydrate(&target, .root, null, gpa);
+    defer after_doc.deinit();
+    try testing.expect(before_doc.eql(&after_doc));
+    const after_save = try target.save(gpa);
+    defer gpa.free(after_save);
+    try testing.expectEqualSlices(u8, before_save, after_save);
+    const after_heads = try target.getHeads(gpa);
+    defer gpa.free(after_heads);
+    try expectSameHashes(before_heads, after_heads);
+    try testing.expectEqualStrings("b", target.getActorId().bytes);
+    try testing.expectEqual(actor_storage, target.ops.actors.items.ptr);
+    try testing.expectEqual(@as(usize, 1), target.ops.actors.items.len);
+    try testing.expectEqualStrings("b", target.ops.actors.items[0].bytes);
+    try testing.expect(!target.hasChange(source.graph.getHeads()[0]));
+
+    try testing.expectEqual(log_identity, log.identity);
+    try testing.expectEqual(log_actor_storage, log.actors.items.ptr);
+    try testing.expectEqual(log_event_storage, log.events.items.ptr);
+    try testing.expectEqual(@as(usize, 1), log.actors.items.len);
+    try testing.expectEqualStrings("a", log.actors.items[0].bytes);
+    try testing.expectEqual(@as(usize, 1), log.events.items.len);
+    try testing.expectEqualDeep(log_event, log.events.items[0]);
+    try testing.expectEqual(log_heads.ptr, log.heads.?.ptr);
+    try expectSameHashes(owner.graph.getHeads(), log.heads.?);
+    try testing.expect(log.recording);
+    try testing.expect(!log.oom);
+    try testing.expectEqual(@as(usize, 0), log.expose.count());
+    try testing.expectEqual(@as(usize, 0), log.completed.items.items.len);
+    try testing.expect(log.checkpoint == null);
+    try testing.expect(log.speculative_actor == null);
+    var retained = try log.makePatches(Document, &owner);
+    defer retained.deinit();
+    try testing.expectEqual(@as(usize, 1), retained.items.items.len);
+    try testing.expectEqualStrings("retained", retained.items.items[0].action.put_map.key);
+}
+
+test "API parity external sync v1 empty message does not migrate foreign actors" {
+    // Without incoming changes the reference does not compare either actor table.
+    const PatchLog = @import("../patches.zig").PatchLog;
+    const gpa = testing.allocator;
+    var owner = try Document.init(gpa, testing.io);
+    defer owner.deinit();
+    owner.setActorId(.{ .bytes = "a" });
+    try externalV1Put(gpa, &owner, "base");
+    var target = try Document.init(gpa, testing.io);
+    defer target.deinit();
+    target.setActorId(.{ .bytes = "b" });
+    try externalV1Put(gpa, &target, "base");
+    const saved = try target.save(gpa);
+    defer gpa.free(saved);
+    var log = PatchLog.active(gpa);
+    defer log.deinit();
+    try log.bind(owner.patchIdentity(), owner.ops.actors.items);
+    try testing.expect(owner.patchIdentity() != target.patchIdentity());
+    var state = State.new(gpa);
+    defer state.deinit();
+    state.in_flight = true;
+    var message = Message.init(gpa);
+    message.heads = try target.getHeads(gpa);
+    try @This().receiveSyncMessageWithPatchLog(gpa, &target, &state, message, &log);
+    try testing.expect(!state.in_flight);
+    try expectSameHashes(target.graph.getHeads(), state.shared_heads);
+    try expectSameHashes(target.graph.getHeads(), state.their_heads.?);
+    try testing.expectEqual(@as(usize, 0), log.events.items.len);
+    const after = try target.save(gpa);
+    defer gpa.free(after);
+    try testing.expectEqualSlices(u8, saved, after);
+    try testing.expectEqualStrings("a", log.actors.items[0].bytes);
+}

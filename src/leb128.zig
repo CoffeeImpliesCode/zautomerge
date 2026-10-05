@@ -144,36 +144,18 @@ pub fn writeSigned(out: []u8, value: anytype) usize {
 /// The three are distinct on purpose: a truncated stream is not an overlong
 /// encoding, and neither is a value too wide for a `u64`.
 pub fn readUnsigned(in: []const u8) ParseError!struct { value: u64, len: usize } {
-    var result: u64 = 0;
-    var shift: usize = 0;
-    var i: usize = 0;
-    while (true) {
-        if (i >= in.len) return error.UnexpectedEnd;
-        if (i >= max_unsigned_size) return error.InvalidLeb128;
-        const byte = in[i];
-        const payload: u64 = byte & 0x7f;
-        if (i == max_unsigned_size - 1) {
-            // The tenth byte may only carry the single remaining bit.
-            if (payload > 1) return error.Overflow;
-        } else if (shift >= 64) {
-            return error.Overflow;
-        }
-        result |= payload << @intCast(shift);
-        i += 1;
-        if (byte & 0x80 == 0) {
-            // A zero terminator anywhere but the first byte is the same value
-            // one byte earlier, so the encoding is overlong. The canonical
-            // unsigned encoding stops at the first byte that leaves nothing
-            // above it, and only the value 0 reaches a zero payload, which it
-            // writes in a single byte — so a zero here can only be padding.
-            // Upstream refuses it as `Leb128Overlong`
-            // (`storage/parse/leb128.rs:32-33`).
-            if (shift > 0 and payload == 0) return error.InvalidLeb128;
-            break;
-        }
-        shift += 7;
+    if (in.len == 0) return error.UnexpectedEnd;
+    const first = in[0];
+    if (first & 0x80 == 0) return .{ .value = first, .len = 1 };
+    if (in.len < 2) return error.UnexpectedEnd;
+    const second = in[1];
+    const result = @as(u64, first & 0x7f) | (@as(u64, second & 0x7f) << 7);
+    if (second & 0x80 == 0) {
+        if (second == 0) return error.InvalidLeb128;
+        return .{ .value = result, .len = 2 };
     }
-    return .{ .value = result, .len = i };
+    const longer = try readLong(false, in, result);
+    return .{ .value = longer.value, .len = longer.len };
 }
 
 /// Reads a signed LEB128 from `in`, returning the value and bytes consumed.
@@ -191,55 +173,72 @@ pub fn readUnsigned(in: []const u8) ParseError!struct { value: u64, len: usize }
 /// The three are the same three the unsigned reader reports, under the same
 /// rule and with the same meaning.
 pub fn readSigned(in: []const u8) ParseError!struct { value: i64, len: usize } {
-    var result: u64 = 0;
-    var shift: usize = 0;
-    var i: usize = 0;
-    var byte: u8 = 0;
-    // The byte before the one being read, which is the penultimate byte of
-    // the encoding once the terminator arrives. Upstream tracks the same
-    // byte as `prev` (`storage/parse/leb128.rs:50`, `:73`).
-    var prev: u8 = 0;
-    while (true) {
-        if (i >= in.len) return error.UnexpectedEnd;
-        if (i >= max_signed_size) return error.InvalidLeb128;
-        byte = in[i];
-        i += 1;
+    if (in.len == 0) return error.UnexpectedEnd;
+    const first = in[0];
+    if (first & 0x80 == 0) {
+        const value: i8 = @bitCast(first << 1);
+        return .{ .value = value >> 1, .len = 1 };
+    }
+    if (in.len < 2) return error.UnexpectedEnd;
+    const second = in[1];
+    var result = @as(u64, first & 0x7f) | (@as(u64, second & 0x7f) << 7);
+    if (second & 0x80 == 0) {
+        if ((second == 0 and first & 0x40 == 0) or
+            (second == 0x7f and first & 0x40 != 0)) return error.InvalidLeb128;
+        if (second & 0x40 != 0) result |= ~@as(u64, 0) << 14;
+        return .{ .value = @bitCast(result), .len = 2 };
+    }
+    const longer = try readLong(true, in, result);
+    return .{ .value = @bitCast(longer.value), .len = longer.len };
+}
+
+fn readLong(
+    comptime signed: bool,
+    in: []const u8,
+    initial: u64,
+) ParseError!struct { value: u64, len: usize } {
+    // The caller has checked and consumed two continuation bytes. Fixed
+    // shifts 14..56 never discard payload bits; each load is guarded before
+    // it happens, and a terminator returns before inspecting later bytes.
+    var result = initial;
+    inline for (2..9) |index| {
+        if (in.len <= index) return error.UnexpectedEnd;
+        const byte = in[index];
         const payload: u64 = byte & 0x7f;
-        if (i == max_signed_size) {
-            // The tenth byte carries only the sign and its extension: it must
-            // be all zeros or all ones, and it sets bit 63.
-            if (payload == 0x7f) {
-                result |= @as(u64, 1) << 63;
-            } else if (payload != 0x00) {
-                return error.Overflow;
-            }
-        } else if (shift < 64) {
-            result |= payload << @intCast(shift);
-        } else if (payload != 0 and payload != 0x7f) {
-            return error.Overflow;
-        }
+        result |= payload << (index * 7);
         if (byte & 0x80 == 0) {
-            // Overlong when the terminator continues the sign of the byte
-            // before it: `0x00` after a penultimate byte whose sign bit is
-            // clear, `0x7f` after one whose sign bit is set. Either way the
-            // value was already complete one byte earlier. Upstream refuses
-            // both as `Leb128Overlong` (`storage/parse/leb128.rs:63-65`), and
-            // the canonical signed encoding cannot produce either: its
-            // terminator is the byte where the remaining value is 0 with the
-            // sign bit clear, or -1 with it set, which the penultimate byte
-            // would have reached first.
-            if (shift >= 7 and ((payload == 0 and (prev & 0x40) == 0) or
-                (payload == 0x7f and (prev & 0x40) != 0))) return error.InvalidLeb128;
-            break;
+            if (signed) {
+                const previous = in[index - 1];
+                if ((payload == 0 and previous & 0x40 == 0) or
+                    (payload == 0x7f and previous & 0x40 != 0)) return error.InvalidLeb128;
+                if (byte & 0x40 != 0) result |= ~@as(u64, 0) << ((index + 1) * 7);
+            } else if (payload == 0) return error.InvalidLeb128;
+            return .{ .value = result, .len = index + 1 };
         }
-        prev = byte;
-        shift += 7;
     }
-    // Sign extension, when the sign bit is set and bits remain above it.
-    if (shift + 7 < 64 and (byte & 0x40) != 0) {
-        result |= ~@as(u64, 0) << @intCast(shift + 7);
+    if (in.len < 10) return error.UnexpectedEnd;
+    const byte = in[9];
+    const payload: u64 = byte & 0x7f;
+    // Overflow precedes both canonicality and continuation/EOF checks,
+    // including an overflowing tenth byte with its continuation bit set.
+    if (signed) {
+        if (payload == 0x7f) {
+            result |= @as(u64, 1) << 63;
+        } else if (payload != 0) return error.Overflow;
+    } else {
+        if (payload > 1) return error.Overflow;
+        result |= payload << 63;
     }
-    return .{ .value = @bitCast(result), .len = i };
+    if (byte & 0x80 == 0) {
+        if (signed) {
+            if ((payload == 0 and in[8] & 0x40 == 0) or
+                (payload == 0x7f and in[8] & 0x40 != 0)) return error.InvalidLeb128;
+        } else if (payload == 0) return error.InvalidLeb128;
+        return .{ .value = result, .len = 10 };
+    }
+    // The original loop checked EOF before its ten-byte length limit.
+    if (in.len == 10) return error.UnexpectedEnd;
+    return error.InvalidLeb128;
 }
 
 /// Appends `value` as unsigned LEB128 to `list`. `value` is
@@ -1098,6 +1097,91 @@ test "a stream of varints decodes value by value and lands exactly on its end" {
     try std.testing.expectEqual(count, reads);
 }
 
+test "checked readers preserve scalar errors and consumption on arbitrary bytes" {
+    // Compare errors as well as values: ten continuations at EOF differ from
+    // eleven, and an overflowing tenth payload wins over a missing terminator.
+    var prng: std.Random.DefaultPrng = .init(random_seed ^ 0x6c65_6231_3238);
+    const random = prng.random();
+    var bytes: [40]u8 = undefined;
+    for (0..6000) |sample| {
+        random.bytes(&bytes);
+        const len = sample % (bytes.len + 1);
+        try expectScalarReaders(bytes[0..len]);
+        for (0..@min(len, 11)) |terminator| {
+            for (bytes[0..terminator]) |*byte| byte.* |= 0x80;
+            bytes[terminator] &= 0x7f;
+            try expectScalarReaders(bytes[0..len]);
+            bytes[terminator] |= 0x80;
+        }
+    }
+    for (0..256) |payload| {
+        @memset(&bytes, 0x80);
+        bytes[9] = @intCast(payload);
+        for (0..12) |len| try expectScalarReaders(bytes[0..len]);
+        bytes[8] = 0xff;
+        for (0..12) |len| try expectScalarReaders(bytes[0..len]);
+    }
+}
+
+fn expectScalarReaders(bytes: []const u8) !void {
+    if (scalarReaderOracle(false, bytes)) |expected| {
+        const actual = try readUnsigned(bytes);
+        try std.testing.expectEqual(expected.value, actual.value);
+        try std.testing.expectEqual(expected.len, actual.len);
+    } else |expected| {
+        try std.testing.expectError(expected, readUnsigned(bytes));
+    }
+    if (scalarReaderOracle(true, bytes)) |expected| {
+        const actual = try readSigned(bytes);
+        try std.testing.expectEqual(@as(i64, @bitCast(expected.value)), actual.value);
+        try std.testing.expectEqual(expected.len, actual.len);
+    } else |expected| {
+        try std.testing.expectError(expected, readSigned(bytes));
+    }
+}
+
+fn scalarReaderOracle(
+    comptime signed: bool,
+    bytes: []const u8,
+) ParseError!struct { value: u64, len: usize } {
+    // Independent variable-shift model of the original readers, test-only.
+    var result: u64 = 0;
+    var shift: usize = 0;
+    var index: usize = 0;
+    var previous: u8 = 0;
+    while (true) {
+        if (index >= bytes.len) return error.UnexpectedEnd;
+        if (index >= 10) return error.InvalidLeb128;
+        const byte = bytes[index];
+        const payload: u64 = byte & 0x7f;
+        if (index == 9) {
+            if (signed) {
+                if (payload == 0x7f) {
+                    result |= @as(u64, 1) << 63;
+                } else if (payload != 0) return error.Overflow;
+            } else {
+                if (payload > 1) return error.Overflow;
+                result |= payload << 63;
+            }
+        } else {
+            result |= payload << @intCast(shift);
+        }
+        index += 1;
+        if (byte & 0x80 == 0) {
+            if (signed) {
+                if (shift >= 7 and ((payload == 0 and previous & 0x40 == 0) or
+                    (payload == 0x7f and previous & 0x40 != 0))) return error.InvalidLeb128;
+                if (shift + 7 < 64 and byte & 0x40 != 0) {
+                    result |= ~@as(u64, 0) << @intCast(shift + 7);
+                }
+            } else if (shift > 0 and payload == 0) return error.InvalidLeb128;
+            return .{ .value = result, .len = index };
+        }
+        previous = byte;
+        shift += 7;
+    }
+}
+
 // Zig 0.16.0 / upstream / Rust / port
 //
 // * **`Leb128TooLarge` is reported as `InvalidLeb128`, and that is a port
@@ -1118,13 +1202,12 @@ test "a stream of varints decodes value by value and lands exactly on its end" {
 //   observe — the fixture corpus only requires that the load fails. It is left
 //   alone deliberately and recorded here so it is not mistaken for an oversight.
 //
-// * **`readUnsigned` cannot loop forever on any input.** The loop's exits are
-//   an index past the end of the input (`error.UnexpectedEnd`), an index past
-//   [`max_unsigned_size`] (`error.InvalidLeb128`) and a terminator. The third is
-//   the only one that consumes nothing, and the second bounds it to ten
-//   iterations regardless of what the input holds, so no length of input makes
-//   the decoder spin. The same holds for [`readSigned`]. The eight fuzz
-//   crashers in `tests/fuzz-crashers/` are the regression suite for it, and
+// * **Both readers perform at most ten guarded byte loads.** The longer path
+//   uses fixed shifts through bit 56 and an explicit tenth-byte arm. Each
+//   terminator returns a positive consumed length before inspecting later
+//   bytes. After ten continuations EOF still precedes the length-limit error,
+//   as it did in the original scalar loop. The eight fuzz crashers in
+//   `tests/fuzz-crashers/` are the regression suite for totality, and
 //   `storage/totality_test.zig` walks them.
 //
 // * **The random sweeps are the only tests here that can be flaky, and they

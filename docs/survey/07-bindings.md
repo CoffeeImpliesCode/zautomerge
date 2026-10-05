@@ -825,21 +825,34 @@ The `exemplar` is a fixed input document whose *interpretation* is specified in 
 
 ## Zig mapping notes
 
-**`#[no_mangle] pub unsafe extern "C" fn` -> `export fn` + `callconv(.C)`.** Every `*const T` -> `*const T`, `*mut T` -> `*T`, `usize` -> `usize`, `bool` -> `bool` (C `_Bool`, 1 byte), `c_int` -> `c_int`. The `?*const AMdoc` null convention is a real `?*T` in Zig. The `-> bool` "did the out-param get written" pattern becomes `?T` returns or an out-param struct.
+**C exports preserve the header.** Rust `#[no_mangle] extern "C"` functions map to Zig `export fn`.
+The native Zig API can use optional returns. The C API keeps its original out-parameters and signatures.
+`test/c/cabi.zig` checks the shipped declarations and exposed layouts.
 
-**Opaque handles -> `*anyopaque` or a distinct `opaque {}`.** `AMdoc`, `AMactorId`, `AMobjId`, `AMchange`, `AMcursor`, `AMmark`, `AMsyncHave`, `AMsyncMessage`, `AMsyncState`, `AMitem` are all opaque. A Zig port must *add* `pub fn amDocFree(*AMdoc) void` etc. — the Rust ABI has no such functions, and the "borrowed from the result" invariant is enforced only by documentation.
+**Opaque handles keep result ownership.** `AMdoc`, `AMactorId`, `AMobjId`, and the other handles remain opaque to C callers.
+The port does not add per-handle free functions.
+`AMresultFree` releases result-owned items and their handles (`src/c/result.zig:399-417`, `:1280-1287`).
+`AMdoc` embeds one native `AutoCommit`, not a duplicate C journal (`src/c/doc.zig:334-347`).
+Ordinary reads leave that journal open. History, save, setters, and sync close it.
+`AMclone` copies pending rows and journal state into a final result allocation without closing the source (`src/c/doc.zig:3002-3021`).
 
-**`enum AMresult { Items(Vec<AMitem>), Error(String) }` -> `union(enum)`.** `pub const AMresult = union(enum) { items: []AMitem, err: []const u8 };` exported by pointer. This is the one Rust type in the C crate that maps *cleanly* to Zig — Zig tagged unions are exactly Rust enums with payloads. `AMresultStatus` becomes a derived function, not a tag.
+**`AMresult` remains opaque to C.** Internally, the native result stores an allocator and an items/error union.
+The union is not an exposed C layout (`src/c/result.zig:338-355`).
 
 **`#[repr(C)] enum` with sequential tags -> `enum(c_int)`.** `AMstatus` (`Ok=0, Error, InvalidResult`) and `AMidxType` map directly. **`AMvalType` and `AMmarkExpand` do not** — their discriminants are explicit bit-shifts and out-of-order values. A Zig port MUST pin the exact integers (`AM_VAL_TYPE_VOID = 1<<0` ... `AM_VAL_TYPE_UNKNOWN = 1<<20`; `AM_MARK_EXPAND_NONE = 1` ... `BOTH = 4`) because the C header's numeric values are ABI. `enum(c_int)` with explicit values preserves them.
 
-**`Rc<Item>` inside `AMitem` -> explicit refcount.** `AMitem` is `Rc<Item>` (`src/item.rs:1023`). A Zig port needs `struct { rc: std.atomic.Value(usize), body: *Item }` or a hand-rolled `Rc`. The three `Rc::get_mut` accessors must be reimplemented as "succeed iff `rc.load(.monotonic) == 1`". `std.atomic.Value(usize)` is the direct mapping; there is no `Rc` in the Zig standard library.
+**`Rc<Item>` inside `AMitem` maps to an explicit non-atomic count.**
+The native `getMut` succeeds only when that count equals one (`src/c/doc.zig:1197-1202`, `:1260-1265`).
+The C bridge requires one caller-owned global serialization boundary, even across distinct handles (`src/c/result.zig:94-113`).
 
 **`RefCell<T>` -> raw pointer plus a documented non-reentrancy invariant.** `AMobjId.c_actor_id: RefCell<Option<AMactorId>>` (`src/obj.rs:30-33`), `AMsyncState.their_haves_storage` (`src/sync/state.rs:22`), `AMsyncMessage.changes_storage` (`src/sync/message.rs:26-27`), `AMactorId.hex_str`, `AMchange.change_hash`, `AMcursor.bytes`/`fmt_str`, `AMdoc`'s inner `AutoCommit`. Zig has no `RefCell`; these become `*T` (possibly `?*T`) fields. Each is lazily populated, so the port needs an explicit "is it already built?" flag — the `RefCell<Option<T>>` *is* the flag in Rust.
 
 **`UnsafeCell<Option<AMactorId>>` inside `Value::ActorId` / `Box<am::Change>` inside `Value::Change`** (`src/item.rs:33-44`) — the internal `Value` enum is a heterogeneous, un-`repr(C)` union used only inside `AMitem`. In Zig this is a tagged union with one field per `AMvalType`; a C-facing port should keep it private.
 
-**`AMitems` -> a plain, explicit struct.** The Rust `{detail: [u8; 24], phantom: PhantomData<&'a mut AMresult>}` with "modifying `detail` will cause undefined behavior" is *worse* for a Zig port than the obvious design. Replace with `pub const AMitems = struct { ptr: [*]AMitem, len: usize, offset: isize };` — the `Detail` layout at `src/items.rs:11-15` is exactly that. A Zig port can then make `advance`/`next`/`prev` methods with a `*AMitems` receiver and no lifetime erasure, which removes one whole class of UB. **Recommendation: do not reproduce the opaque-bytes hack.**
+**`AMitems` keeps the shipped layout and random-access cursor semantics.**
+The header exposes `len`, `offset`, and `ptr` (`include/automerge.h:360-370`).
+These fields match Rust's hidden `Detail` layout.
+Native `Items(T)` is an `extern struct` with that layout (`src/c/result.zig:642-660`).
 
 **Iterators -> methods, not `Iterator`.** `AMitems` is a random-access cursor, not a Rust `Iterator`: `next(n)` gets-then-advances, `prev(n)` advances-then-gets (`src/items.rs:69-93`). A `Iterator` interface + `next()` cannot express the `n`-step form. Model it as `amItemsNext(items: *AMitems, n: isize) ?*AMitem` and port the `Detail` arithmetic verbatim, including the reversed-encoding-by-negative-offset trick (`:36-59`) and the `is_stopped` bound `offset < -len || offset == len` (`:80-83`).
 
@@ -850,7 +863,9 @@ Native Zig entry points retain explicit allocator and capability contracts.
 
 **`Result<T, E>` -> error unions.** Straightforward inside Zig. But the C ABI deliberately *erases* `E` into a string (`AMresult::error(&e.to_string())`, `src/result.rs:12-14` and ~35 `From` impls). A Zig C ABI should keep the erase-to-string behaviour for compatibility while retaining the typed error internally.
 
-**`Option<T>` -> `?T`.** Two encoding choices in the C crate worth keeping: (a) a `NULL` `*const AMitems heads` means "current" (`src/doc.rs:246-251`) — `?*const AMitems` in Zig; (b) `AMsyncStateTheirHeads(state, has_value: *bool)` uses an out-param *plus* an empty result rather than an optional item (`src/sync/state.rs:186-201`) — the port should return `?[]const AMitem` and keep the out-param only for C compatibility.
+**`Option<T>` maps to native `?T`, without changing the C ABI.**
+A null `AMitems* heads` selects the current view (`src/doc.rs:246-251`).
+`AMsyncStateTheirHeads` keeps its C out-parameter and result conventions (`src/sync/state.rs:186-201`).
 
 **`HashMap<Datatype, ExternalTypeConstructor>` -> `std.StringHashMap`.** `src/lib.rs:450`; in a Zig port this only exists in the wasm layer, which is out of scope for a native port.
 
@@ -868,7 +883,11 @@ These checks certify only the target and compiler configuration in which they ru
 
 1. **`#[wasm_bindgen]` + `JsValue` + `unchecked_param_type`/`unchecked_return_type`/`skip_typescript`** (`src/lib.rs` throughout) — a proc-macro codegen pipeline that emits JS glue, a `.d.ts`, and a set of TypeScript `declare` statements. `zig translate-c`/wasm target does none of this. A Zig wasm binding would need a hand-written JS shim layer plus a hand-written `.d.ts`.
 2. **The 380-line `typescript_custom_section` + `interface Automerge` declaration merge** (`src/lib.rs:60-443`). The generated `.d.ts` is incomplete without it; `skip_typescript` methods have *no* generated signature at all. This is a macro that expands into public API with no mechanical equivalent.
-3. **`serde` / `serde_wasm_bindgen` derive-driven serialization** of `am::ExpandedChange`, `am::sync::Message`, `FragmentMeta`, `Commit` (`src/lib.rs:1991-1992`, `:2023-2024`, `:2131-2140`). A Zig port must hand-write the JSON writer *and* the reader for the decoded-change shape, and must keep them field-for-field compatible with the JS `DecodedChange` type. The one hand-rolled oddity — `encode_change` uses the deprecated `into_serde` because `serde_wasm_bindgen::from_value` "fails for some inscrutable reason" (`src/lib.rs:1979-1982`) — is a note that the round trip is not self-evidently correct.
+3. **`serde` / `serde_wasm_bindgen` marshalling** covers Rust `ExpandedChange`, sync messages, fragment metadata, and commits (`src/lib.rs:1991-1992`, `:2023-2024`, `:2131-2140`).
+   Native `ExpandedChange` already implements JSON stringify and parse (`src/change.zig:629-820`).
+   `AutoSerde(R)` also supports native JSON and non-JSON serialization (`src/autoserde.zig:175-212`).
+   These codecs do not supply a `JsValue` or wasm-bindgen bridge.
+   Rust's deprecated `into_serde` workaround remains upstream-specific (`src/lib.rs:1979-1982`).
 4. **`JS::from(am::sync::State)` / `JS(state).try_into()`** (`src/interop.rs:91-131`, `:375-445`) — a 50-line hand-written bidirectional mapping between a Rust struct and a JS POJO, with a `BadSyncState` error. Plus the TS typo `theirHeed` (`src/lib.rs:396`) proving the two sides are kept in sync manually.
 5. **`Symbol.for` + `Proxy` + `Reflect`** (`src/constants.ts`, `src/proxies.ts`) — pure JS-runtime object model. No Zig analogue; a native port drops the entire proxy layer and exposes the `wasm` class surface directly.
 6. **`__wbg_ptr` identity check** (`src/proxies.ts` `isSameDocument`) — a wasm-bindgen implementation detail used as a public invariant. There is no stable equivalent.
@@ -886,7 +905,10 @@ These checks certify only the target and compiler configuration in which they ru
 
 **Unverifiable: the empty-`AMitems` case.** `Detail::is_stopped` with `len == 0` is `offset < 0 || offset == 0`, so a fresh forward cursor over an empty result is *already stopped*. `AMresultItems` returns `Default::default()` for an empty result anyway (`src/result.rs:597-604`, `{detail: [0;24]}`), which is indistinguishable from a cursor at `len == 0` over a non-empty result. Both spell "no items", so it is probably benign, but the encoding cannot distinguish them.
 
-**Unverifiable: the `A_M(...)_` -> `AM_..._` header regex fixup.** `CMakeLists.txt:153-155` patches cbindgen's output with a regex derived from one specific mangling. If cbindgen changes its casing rule, the patch silently stops matching and the header gets `A_M_ObjType` instead of `AM_OBJ_TYPE_MAP` with no error. I read the CMake but did not run it, so I cannot confirm the patch currently produces the documented names. **A Zig port must hand-check all 5 enums against these names.**
+**Upstream header regex fixup remains unverified here.** `CMakeLists.txt:153-155` patches cbindgen names after generation.
+That historical source observation does not describe native header generation.
+The port ships its own header and compile-time enum/layout/signature checks in `test/c/cabi.zig`.
+Their presence is not a new ABI gate result.
 
 **Unverifiable: the `USIZE_` -> `+8` patch hardcodes pointer size.** `CMakeLists.txt:157-159` substitutes `${CMAKE_SIZEOF_VOID_P}`, but `Detail` is `{usize, isize, *const c_void}` — 24 bytes on 64-bit, 12 on 32-bit. The header embeds the size at generation time, so a header generated on x86-64 and used on 32-bit is ABI-incompatible. The README warns about exactly this for the whole header (`README.md:56-59`) but the failure is silent, not a compile error.
 
@@ -898,7 +920,11 @@ These checks certify only the target and compiler configuration in which they ru
 
 **`AMsyncStateTheir*` write through `has_value` without a null check** (`src/sync/state.rs:193`, `:226`, `:258`). The doc says `\pre \p has_value \`!= NULL\``; the code does `*has_value = true` unconditionally. Passing `NULL` is UB with no diagnostic.
 
-**UTF-8 vs UTF-16 indexing is a silent cross-binding hazard.** C defaults to byte offsets (`CMakeLists.txt:110`); wasm hard-codes UTF-16 code units (`src/lib.rs:456`, `:1929`). The same document yields different `AMobjSize`/`AMgetCursorPosition` values depending on which binding produced or read it. **No test in this checkout reads the same document through both.** A Zig port must pick one and document it, or re-implement the `TextEncoding` selection the core crate already has.
+**UTF-8 versus UTF-16 remains an upstream cross-binding hazard.**
+C defaults to byte offsets (`CMakeLists.txt:110`). Wasm uses UTF-16 units (`src/lib.rs:456`, `:1929`).
+No test inspected in the pinned upstream checkout reads the same document through both bindings.
+Native C selects UTF-8 units (`src/c/doc.zig:286-288`).
+Native documents support four explicit encoding modes (`src/types.zig:955-980`).
 
 **The wasm `f64`-as-index convention is a silent-corruption vector.** `start as usize` (`:616`), `index as usize` (`:740`), `index as f64` for the inverse. A JS caller passing `-1`, `1.5` or `NaN` gets a wrapped/huge index, not a `RangeError`. `js_usize` (`:2110-2116`) exists and validates, but is used only for fragment levels. A Zig port should apply the validating helper everywhere.
 
@@ -906,7 +932,9 @@ These checks certify only the target and compiler configuration in which they ru
 
 **The wasm `Automerge` methods are `&mut self` for reads.** 40+ of the 89 methods take `&mut self` even though they are logically reads (`getHeads` `:1512`, `getChanges` `:1361`, `topoHistoryTraversal` `:1824`). A Zig port using a plain `*Automerge` will not reproduce any aliasing check, because there is none to reproduce — the JS layer's `InternalState.heads` bookkeeping is the only thing preventing two mutable views, and it is advisory (`src/internal_state.ts:20-30`).
 
-**The `interop/exemplar` fixture is untested.** Nothing in the repo reads it. It cannot be used as a regression oracle for a port without writing the oracle first.
+**The pinned upstream checkout does not test `interop/exemplar` against its export JSON.**
+The native repository includes a copy in its fixture manifest and checks its expected load outcome (`test/fixtures/manifest.zig:85-87`).
+That loadability assertion does not compare the document against the pinned export JSON.
 
 **The Nix flake pins a future nightly (`2026-04-25`) and a future nixpkgs (`nixos-26.05`)** (`flake.nix:6`, `:70`). The `-Zbuild-std=std,panic_unwind` + `-wasm-use-legacy-eh` combination is required for `PanicError` to reach JS at all (`scripts/compile.mjs:36-40`); a port that drops it turns every recoverable panic into a permanent module abort. This is the single most fragile part of the wasm build and it is invisible from the Rust source.
 

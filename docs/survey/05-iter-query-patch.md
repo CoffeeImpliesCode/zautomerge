@@ -712,14 +712,27 @@ pub fn anonymize(document: &Automerge) -> Result<Automerge, AnonymizeError>
 ### Ownership and lifetimes
 
 - Zig readers borrow the op set and any stored clock buffers. Keep both live until the walk ends.
-  A returned text span owns its buffer and can outlive the walk.
-  Its mark names and block-object promises still borrow the document.
-- `intoOwned` copies a range row's key, scalar payload, and successor data.
-  Its resolved object ids still borrow actor bytes. Keep the document live.
-- `DiffIter.log` transfers its path-map array. Free it with the walk's allocator or transfer it to `PatchLog.pathHint`.
-  The log requires the same allocator and retains the map's borrowed keys.
-- `PatchBuilder.init` consumes the map and retains its allocator for map growth and disposal.
-  The patch output arena is a separate resource. It owns the emitted patch payloads.
+  Returned spans own text, mark payloads, and hydrated block maps.
+  They can outlive the walk and document. Release each span once (`src/iter/spans.zig:560-595`).
+  `SpanInput` borrows text, marks, and block maps only during the writer call (`src/iter/spans.zig:615-623`).
+- Native `hydrate.Value` exposes scalar tags directly and containers under `.object`.
+  Its `init` and `dup` return an `OwnedValue` wrapper for independent storage (`src/hydrate.zig:437-485`).
+  `MapValue.init(value, false)` means no conflict, not an object ID (`src/hydrate.zig:977-999`).
+- `MarkSet.nonDeletedMarks()` returns a borrowed view that ignores null tombstones.
+  Keep the source set live and unmodified (`src/marks.zig:423-426`, `:583-603`).
+- Fully owned map and list range rows copy payloads and ID actor bytes.
+  Those owned rows do not retain the source document.
+  `DocObjItem.valueOwned` instead detaches only the value.
+  Its object ID and remaining item fields still borrow the document (`src/iter/doc.zig`, `DocObjItem.valueOwned`).
+- `hydrate.Map.putOwned` copies byte-backed scalars and transfers composite container ownership.
+  It does not deeply copy every composite input. Use the container's explicit duplication method for an independent deep copy.
+- `DiffIter.log` transfers its path-map array through `PatchLog.pathHint`.
+  `pathHint` consumes the array and copies payloads into log-owned storage (`src/patches.zig:3412-3425`).
+  The first `makePatches` consumes the matching current-state path map, as Rust does.
+  It is not a persistent map guarantee (`src/patches.zig:3443-3460`).
+- Patch batches own emitted payloads independently of the document.
+  Text trees use the arena's stable child allocator. Moving the batch does not invalidate that allocator.
+  `Patches.clone` makes an independent owner (`src/patches.zig:394-398`, `:1258-1293`).
 - `ExIdPromise<'a>` (`iter/tools.rs:188-246`) is a hand-rolled deferred resolution: it holds either `&'a OpSet` + `OpId` or an already-resolved `ExId`, resolved on `exid()`. In Zig, either store `union(enum){ op_set: *const OpSet, exid: ExId }` and branch at resolve time, or resolve eagerly at construction. Eager is correct and cheaper; the deferred form only exists in Rust to avoid work on the common `op_id()` path.
 - `Arc<ExId>` in `DocObjItem.obj` (`iter/doc.rs:338`) is a refcounted, cheaply-clonable object id that the iterator re-creates only when the object changes (`iter/doc.rs:294-296`). In Zig: either an interned pointer (`*const ExId` owned by a document-level interner) or a small refcount. The pointer-equality check there is an optimization, not a semantic.
 - `Box<dyn OpQueryTerm<'a>>` inside `Values` (`iter/values.rs:10`) is a **trait object**. Zig has no trait objects; use a vtable struct `{ ptr: *anyopaque, nextFn: *const fn(*anyopaque) ?Op, getMarksFn: ..., rangeFn: ... }`, or — better — since there is exactly one concrete term (`TopOps`) constructed by `Automerge::values_for`, make `Values` hold a concrete `TopOps` and drop the `dyn` indirection entirely. That removes one heap allocation per `values()` call.
@@ -750,12 +763,11 @@ pub fn anonymize(document: &Automerge) -> Result<Automerge, AnonymizeError>
 - `SpansActionValue` (`iter/spans.rs:56-59`) is a hand-rolled `Either` with an explicit `#[expect(clippy::large_enum_variant)]` at `:55`, and the source comment notes boxing "loses a few milliseconds on some iteration benchmarks" (`:54`). In Zig: `union(enum){ current: Unshift, diff: Unshift }`, both inline, for the same reason.
 - `DiffHook` (`text_diff/myers.rs:29-52`) is a trait with an **associated type** `type Error`. Zig equivalent: a vtable `{ equal, delete, insert, replace, finish, ptr }` where every hook returns `AutomergeError!void` directly — the associated type exists only so `TxHook` and `BlockDiffHook` can both use `AutomergeError`; collapsing it is strictly better.
 - `OpQueryTerm<'a>` (`op_set2/op_set/op_query.rs:14`) is a **private bound on a public type** (`Values`). This is a Rust-specific hazard: it makes `Values` unusable as a generic parameter outside the crate. Monomorphizing to `TopOps` removes the problem entirely.
-- `TextValue` (`text_value.rs:38,76,114,154`) has associated element types `u8`, `char`, `u16`, and `String` over separate `SequenceTree<T>` instances.
-  **Port decision:** `ConcreteTextValue` retains UTF-8 bytes and a runtime `TextEncoding`.
-  `removeRange` requires scalar or current grapheme boundaries and refuses split UTF-8/UTF-16 units without mutation.
-  Rust's trees retain native units (`text_value.rs:36,113,152`) and render incomplete units lossily (`:60-62`, `:137-139`).
-  The port does not preserve those incomplete units or stored grapheme segmentation.
-  Patch coalescing uses one span instead of Rust's repeated unit removals (`patches/patch_builder.rs:242-249`).
+- `TextValue` (`text_value.rs:38,76,114,154`) has encoding-specific sequence-tree elements.
+  The native `ConcreteTextValue` also stores `u8`, `u16`, code points, or grapheme slices in separate trees.
+  It preserves incomplete UTF-8/UTF-16 units and stored grapheme segmentation.
+  `makeString` returns caller-owned UTF-8 and renders incomplete units lossily.
+  There is no borrowed `.bytes` or `asStr` view (`src/patches.zig:386-416`).
 - `Deref`/`DerefMut` on `hydrate::Map` (`hydrate/map.rs:92-102`) exposing the inner `HashMap<String, MapValue>` — there is no Zig operator overloading. Either expose the field publicly (matching the Rust behavior callers already rely on) or provide a full pass-through method set.
 
 ### Data structures
@@ -775,8 +787,11 @@ pub fn anonymize(document: &Automerge) -> Result<Automerge, AnonymizeError>
 
 - `SequenceTreeNode::split_child` asserts `full_child.is_full()` and that lengths add up (`sequence_tree.rs:200-241`); `merge` asserts `self.is_full()` (`:414-425`); `remove_from_leaf`/`remove_element_from_non_leaf` decrement `length` unconditionally (`:243-271`). These are pointer/offset invariants in Zig: `ArrayList` bounds must be checked by the same reasoning. `find_child_index` panics rather than returning an error (`sequence_tree.rs:169`) — in Zig use `std.debug.panic` (matches) or return an error (safer, changes the contract).
 - `OpSet::hydrate_op` panics on a non-`Make`/`Put` op (`hydrate.rs:302`). In Zig, switch the default arm to `unreachable` only if the op-set invariant is enforced upstream; otherwise return an error.
-- `hydrate::List::apply` / `Text::apply` `todo!()` on `PatchAction::Mark` (`hydrate/list.rs:73-75`, `hydrate/text.rs:54-56`). **These are live panics reachable from the public `Value::apply_patches`.** Any document whose patch stream contains a `Mark` action will abort. A Zig port must decide: implement mark application on hydrated lists/text, or return an explicit error. Returning `error.UnsupportedMark` is the honest port; silently succeeding would hide the divergence.
-- `autoserde.rs:57-58`, `:86-87` — double `unwrap()` per entry. In Zig these become `catch unreachable` and will crash on any doc where `keys()` and `get()` disagree, i.e. any list, since `Keys` yields element-id strings for sequences (`read.rs:48-49`).
+- Rust `hydrate::List::apply` and `Text::apply` panic on `PatchAction::Mark` (`hydrate/list.rs:73-75`, `hydrate/text.rs:54-56`).
+  Native list and text mirrors implement that action (`src/hydrate.zig:1550-1569`, `:1791-1793`).
+  This removes the proposed `UnsupportedMark` refusal, without claiming a new conformance result.
+- Rust `AutoSerde` uses double `unwrap()` per entry (`autoserde.rs:57-58`, `:86-87`).
+  Native `AutoSerde(R)` uses the reader adapter and generic serialization backend (`src/autoserde.zig:175-212`).
 - `PatchBuilder::get_path` returning `None` silently drops patches (`patches/patch_builder.rs:184-186` and five other call sites). In Zig, propagate an error or record a diagnostic; silent drop is how materialized views desync.
 - `PatchLog::finish_current_view` calls `.expect("AutoCommit's patch log always belongs to its document")` (`patches/patch_log.rs:292-293`) — an `unreachable` that is a real invariant.
 - `structural_character_from_rank` calls `char::from_u32(codepoint).expect("character rank should map to a valid Unicode scalar")` (`anonymize.rs:360`) — a real invariant, portable as `std.unicode.utf8Decode` + unreachable.
@@ -789,7 +804,10 @@ pub fn anonymize(document: &Automerge) -> Result<Automerge, AnonymizeError>
 - **`Index<usize>` / `IndexMut<isize>` on a wrapper (`V`, `text_diff/myers.rs:110-122`)** — Zig has no indexing operators. `V` is used as `vf[k] += 1` throughout `find_middle_snake`; port to an explicit `fn get(self, k: isize) usize` / `fn set(self, k: isize, v: usize)` or, better, to a `[]usize` plus a local `offset` that is added at each access site.
 - **`#[cfg(feature = "wasm")]` on trait impls** (`hydrate.rs:329`, `:336`). Rust allows `impl From<Value> for JsValue` under a feature gate. Zig has no conditional trait impls; the `wasm_bindgen::JsValue` conversions are a separate build artifact anyway and should be dropped or made an explicit `toJson`-style function.
 - **`#[macro_export] macro_rules!` that expand into the public API**: `hydrate_map!`, `hydrate_list!`, `hydrate_text!` (`hydrate.rs:305-327`). These are part of the public surface (exported at crate root, used in `hydrate/tests.rs:24-28`) and have no Zig analogue. Replace with builder functions: `hydrate.Map.init(.{ .{"key", value} }, ...)` or `hydrate.mapFromPairs`.
-- **`#[derive(Serialize)]` surface**: `AutoSerde` is a `serde::Serialize` impl, not a data type (`autoserde.rs:30-128`). `crate::value::ScalarValue`'s serde impls are what make `Value::Scalar(v) => v.serialize(...)` work (`autoserde.rs:127`). In Zig this is a hand-written `pub fn writeJson(self, writer: anytype) !void` on each value type, or a `std.json` emission path. The `SerializeMap`/`SerializeSeq` vtable split (`autoserde.rs:52-66`, `:79-90`) is a serializer interface — port as a small `JsonWriter` struct with `writeObjectStart(len)`, `writeKey`, `writeObjectEnd`, `writeArrayStart`, `writeArrayEnd`.
+- **`#[derive(Serialize)]` surface**: Rust `AutoSerde` implements serialization, not deserialization (`autoserde.rs:30-128`).
+  Native `AutoSerde(R)` borrows a compile-time `ReadDoc` adapter and preserves its pending and historical scope.
+  It supports JSON and non-JSON backends, without raw hydration or transaction closure.
+  Backends declare `Error`, map/sequence boundaries, keys, elements, strings, and scalar methods (`src/autoserde.zig:1-7`, `:25-45`).
 - **`thiserror` `#[error(transparent)]` / `#[from]`** (`anonymize.rs:25`, `error.rs`) → Zig error sets plus a manual `format`. `AnonymizeError::Apply(#[from] AutomergeError)` is error-set flattening; in Zig, either nest the error payload or merge the sets.
 - **`impl Trait` in return position**: `MarkAccumulator::into_iter` (`marks.rs:68`), `MarkDiff::iter_before`/`iter_after`/`iter` (`iter/spans.rs:326,334,342`), `RichTextQueryState::iter` (`marks.rs:429`), `Map::iter` (`hydrate/map.rs:16`), `List::iter` (`hydrate/list.rs:25`), `ReadDoc::iter`'s default body. Each becomes a concrete iterator struct (or a comptime-generic `Iter` over the container).
 - **`std::iter::from_fn` with a closure state machine** (`iter/spans.rs:345-386`): a `Pop` enum + `move ||` closure capturing two `Peekable`s. In Zig: an explicit struct with the two cursors and the `Pop` tag as an enum field.
@@ -809,8 +827,18 @@ Three findings dominate, in order of how badly a Zig port would get them wrong.
 1. **`query/` is dead code and will mislead the port plan.** There is no `mod query;` anywhere in the crate (`lib.rs:238-286` lists the module tree; no `query` entry; a crate-wide grep for `mod query` returns nothing). `query/list_state.rs` and `query/seek_mark.rs` are orphans from the pre-`op_set2` op-tree implementation: they import `crate::op_set`, `crate::op_tree::{LastInsert, OpTreeNode}`, `crate::query::{Index, ListState, OpQueryTerm, QueryResult, TreeQuery}`, and `crate::types::ListEncoding`, none of which exist (verified: no `op_set.rs`/`op_tree.rs`/`query.rs` at `src/` root, no `ListEncoding` in `types.rs`). They are **not compiled and not part of the API**. Anything a port plan extracts from them is fiction. The same applies to `src/automerge/tests.rs:6` (`use crate::op_tree::B`). Note the *live* replacements with deceptively similar names: `iter::Diff`/`DiffIter` (`iter/tools.rs:611,529`) supersede `query::{Index, QueryResult, TreeQuery}`; `iter/list_range::ListState` (`iter/list_range.rs:81`) supersedes `query::list_state::ListState`; and `marks::RichTextQueryState` (`marks.rs:403`) is the live one — there is a second, dead `RichTextQueryState` in `query/list_state.rs:11` with a *different* field type (`&'a OldMarkData` vs `MarkData<'a>`).
 
 2. **`hydrate` silently loses object identity, marks, map order, and blocks, and `todo!()`s on `Mark`.** Concretely, all provable from the source: `MapValue`/`List::push`/`ListValue::new` all take an `ExId` and discard it (`hydrate/map.rs:78-82`, `hydrate/list.rs:105-107,127-133`); `hydrate::Map` is a `HashMap`, so applying patches does not preserve key order (`hydrate/map.rs:11`); `hydrate::Text.marks` is never written because `Text::apply` `todo!()`s on `PatchAction::Mark` (`hydrate/text.rs:11-14,54-56`), and `hydrate::List::apply` `todo!()`s on the same action (`hydrate/list.rs:73-75`); `OpSet::hydrate_text` goes through `self.text(obj, clock)`, so hydrated text has **no marks and no block objects at all** (`hydrate.rs:278-286`); `Value::apply` drops any patch that descends into a `Value::Text` (`hydrate.rs:97-104`); `OpSet::hydrate_op` panics on any op that is not `Make`/`Put` (`hydrate.rs:302`). A Zig port that "fixes" these will not round-trip with the Rust implementation's output, and one that copies them faithfully ships two reachable panics through the public `Value::apply_patches`. The port plan must state which behaviour it is matching; myers/patch tests will not catch the divergence because it is a data-loss divergence, not a crash.
+   These are findings about the pinned Rust source, not unimplemented native API gaps.
+   Native hydrated scalars use flat tags, and native mark application follows the source paths cited above.
+
 
 3. **The patch pipeline's correctness rests on three non-local invariants a port will not see.** (a) `PatchLog` stores events as `OpId`, which is an *index into a sorted, insert-order-dependent actor table*; every new actor shifts indices, so `migrate_actors` must re-index all buffered events and every op id on the way, and it returns `PatchLogMismatch` when the lists diverge non-monotonically (`patches/patch_log.rs:634-659`). Drop this and every buffered event points at the wrong actor. (b) `make_current_patches` sorts events **by object, not chronologically** (`patches/patch_log.rs:510-529`, sort at `:519`); the only thing preserving chronology across a backwards time travel (isolate) is `finish_current_view` having already frozen concrete patches (`patches/patch_log.rs:279-303`). A port that "fixes" the sort to chronological order will produce correct-looking but *different* patch streams. (c) `PatchBuilder::get_path` returning `None` **silently drops the patch** (`patches/patch_builder.rs:184-186` and five other call sites), and path resolution depends on `path_map` being a live hint invalidated by `path_hint != events_len()` (`patches/patch_log.rs:496-501`) plus the cycle-breaking `seen` set (`patches/patch_builder.rs:150-153`). Any mismatch between the path map and the op set drops changes from a materialized view with no error.
+   Native external logs use that sorted actor-prefix compatibility, not an opaque document token (`src/patches.zig:2888-3004`).
+   A shorter equal-prefix document can leave old trailing actors in the log.
+   Rendering checks resident actor IDs through `exportPatchId` and returns `InvalidActorIndex` if one is absent.
+   Rust indexes that actor directly and can panic. Batch allocation ownership remains a separate strict pointer check.
+   Full-load current-state recording and empty-document incremental load retain their distinct migration branches.
+   These source contracts do not certify the current retained-log incremental conformance gate.
+
 
 Lower-severity but real:
 
@@ -822,6 +850,7 @@ Lower-severity but real:
 - **`myers_block_diff`'s mark pass re-runs `doc.marks_for(text_obj, None)` inside the add loop** (`text_diff.rs:218`). Quadratic in added marks. Porting as-is inherits a performance cliff; changing it changes nothing observable.
 - **`MarkSet::without_unmarks` clones the whole map then retains** (`marks.rs:182-187`, with the crate's own `// FIXME - do I need this clone?`). It is on the hot `get_marks` path.
 - **`PatchBuilder::splice_text` compares `Option<Arc<MarkSet>>` by value, not by pointer** (`patches/patch_builder.rs:213`), despite the `last_mark_set` "keep this around for a quick pointer equality test" comment at `:18`. `Option<Arc<T>>: PartialEq` compares `T`, so every spliced text span pays a deep mark-set comparison. The comment is wrong and the code allocates.
-- **`sequence_tree::Iter` is O(n log n)** (`sequence_tree.rs:512-526`) because it goes through `get(index)` per step rather than walking `elements` directly. `hydrate::List` and `PatchAction::Insert` both iterate through it, so patch application and list hydration are both paying tree descents. A direct walk is a free 10-100x on long lists; it changes no semantics.
+- Rust `sequence_tree::Iter` descends through `get(index)` per step (`sequence_tree.rs:512-526`).
+  A direct walk can avoid those descents. This survey has no measurement of a native speedup.
 - **`structural_character_from_rank` is not injective for single-byte non-printable, non-control input** (`anonymize.rs:352-357`): the entire `[0x20, 0x7f]` rank space collapses onto `0x7f`. `anonymize()` still produces a valid document, but distinct source characters can map to the same output character. Only observable via the `#[cfg(test)]` `ShapeSignature` invariant, which a port has no reason to reproduce.
 - **Unverifiable without running the Rust code**: the exact coalescing boundaries in `PatchBuilder` (e.g. whether `splice_text` should compare marks by pointer or by value changes the shape of emitted patches, and the source comment and code disagree). Same for the interaction between `expose` and `should_skip` (`patches/patch_log.rs:683-689`) at the boundary case where an exposed object is also the target of the next event. Neither is decidable from reading the source; both change observable patch output.

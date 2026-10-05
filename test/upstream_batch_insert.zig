@@ -89,10 +89,9 @@
 //! ```
 //!
 //! The mirror a **document** is handed is the other way round:
-//! [`batchCreateValue`](../src/transact.zig), [`splice`](../src/transact.zig)
-//! and [`initRootFromHydrate`](../src/transact.zig) take their value by value
-//! and [`Queue.push`](../src/transact.zig) stores a `*const hydmod.Value`, so
-//! the batch **borrows** it and copies out of it. The local keeps ownership
+//! [`batchCreateValue`](../src/autocommit.zig), [`splice`](../src/autocommit.zig)
+//! and [`initRootFromHydrate`](../src/autocommit.zig) borrow their payloads
+//! for the batch and copy their contents. The local keeps ownership,
 //! and `defer value.deinit()` is correct.
 
 const std = @import("std");
@@ -112,6 +111,7 @@ const gpa = testing.allocator;
 const io = std.testing.io;
 
 const Document = am.doc.Document;
+const AutoCommit = am.AutoCommit;
 const ExId = am.ExId;
 const ObjType = am.ObjType;
 const Prop = am.Prop;
@@ -122,8 +122,7 @@ const Patch = am.patches.Patch;
 const Mirror = am.hydrate.Value;
 const MirrorMap = am.hydrate.Map;
 const MirrorList = am.hydrate.List;
-const Tx = am.manual_transaction.Transaction;
-const trans = am.transaction;
+const Tx = am.Transaction;
 
 /// The document root, [`automerge::ROOT`](../src/root.zig).
 const root: ExId = am.root;
@@ -160,18 +159,16 @@ fn mintActor() ActorId {
 }
 
 /// A new document in the autocommit flavour ([`AutoCommit::new`](../src/doc.zig)).
-fn newDoc() !Document {
-    var doc = try Document.init(gpa, io, .auto);
+fn newDoc() !AutoCommit {
+    var doc = try AutoCommit.init(gpa, io);
     errdefer doc.deinit();
-    doc.setActorId(mintActor());
+    try doc.setActorId(mintActor());
     return doc;
 }
 
-/// The same in the manual flavour ([`Automerge::new`](../src/doc.zig)), which
-/// is what a transaction and a rollback need: the autocommit door commits
-/// every call.
+/// A raw document for the explicit transaction and rollback cases.
 fn newManualDoc() !Document {
-    var doc = try Document.init(gpa, io, .manual);
+    var doc = try Document.init(gpa, io);
     errdefer doc.deinit();
     doc.setActorId(mintActor());
     return doc;
@@ -182,7 +179,7 @@ fn newManualDoc() !Document {
 /// The scalar at `prop`, or `error.NoSuchKey` when nothing is there and
 /// `error.NotAnObject` when an object is — upstream's
 /// `doc.get(&obj, prop).unwrap().unwrap().0` narrowed to the scalar case.
-fn scalarAt(doc: *const Document, obj: ExId, prop: Prop) !ScalarValue {
+fn scalarAt(doc: anytype, obj: ExId, prop: Prop) !ScalarValue {
     const item = (try am.read.get(doc, obj, prop)) orelse return error.NoSuchKey;
     return switch (item.value) {
         .scalar => |s| s,
@@ -192,7 +189,7 @@ fn scalarAt(doc: *const Document, obj: ExId, prop: Prop) !ScalarValue {
 
 /// The id of the object at `prop`, or `error.NoSuchKey`. Upstream's
 /// `doc.get(&obj, prop).unwrap().unwrap().1`.
-fn objectAt(doc: *const Document, obj: ExId, prop: Prop) !ExId {
+fn objectAt(doc: anytype, obj: ExId, prop: Prop) !ExId {
     const item = (try am.read.get(doc, obj, prop)) orelse return error.NoSuchKey;
     return switch (item.value) {
         .object => item.id,
@@ -207,7 +204,7 @@ fn objectAt(doc: *const Document, obj: ExId, prop: Prop) !ExId {
 /// `Value::Object(ObjType::Map)` is one value carrying both facts, and the
 /// port's [`DocItem`](../src/read.zig) splits them: the tag says *object*, and
 /// [`Document.objectType`](../src/doc.zig) says which.
-fn expectObjType(doc: *const Document, obj: ExId, prop: Prop, want: ObjType) !void {
+fn expectObjType(doc: anytype, obj: ExId, prop: Prop, want: ObjType) !void {
     const id = try objectAt(doc, obj, prop);
     const got = try doc.objectType(id);
     if (got != want) {
@@ -221,7 +218,7 @@ fn expectObjType(doc: *const Document, obj: ExId, prop: Prop, want: ObjType) !vo
 /// **Not `expectEqual` on a [`ScalarValue`]:** that helper uses `std.meta.eql`,
 /// which for a slice is the pointer and the length, so a `str` read out of the
 /// document would never equal a literal.
-fn expectStr(doc: *const Document, obj: ExId, prop: Prop, want: []const u8) !void {
+fn expectStr(doc: anytype, obj: ExId, prop: Prop, want: []const u8) !void {
     const got = try scalarAt(doc, obj, prop);
     if (got != .str) {
         std.debug.print("value at {s} is a {t}, want a str\n", .{ @tagName(prop), got });
@@ -232,7 +229,7 @@ fn expectStr(doc: *const Document, obj: ExId, prop: Prop, want: []const u8) !voi
 
 /// `Value::int(i)` at `prop`. The tag is checked, so an `i64` and a `u64` of
 /// the same value are not one value.
-fn expectInt(doc: *const Document, obj: ExId, prop: Prop, want: i64) !void {
+fn expectInt(doc: anytype, obj: ExId, prop: Prop, want: i64) !void {
     const got = try scalarAt(doc, obj, prop);
     if (got != .int) {
         std.debug.print("value at {s} is a {t}, want an int\n", .{ @tagName(prop), got });
@@ -242,7 +239,7 @@ fn expectInt(doc: *const Document, obj: ExId, prop: Prop, want: i64) !void {
 }
 
 /// `ScalarValue::Boolean(b)` at `prop` — upstream's `vbool`.
-fn expectBool(doc: *const Document, obj: ExId, prop: Prop, want: bool) !void {
+fn expectBool(doc: anytype, obj: ExId, prop: Prop, want: bool) !void {
     const got = try scalarAt(doc, obj, prop);
     if (got != .bool_value) {
         std.debug.print("value at {s} is a {t}, want a bool\n", .{ @tagName(prop), got });
@@ -255,25 +252,25 @@ fn expectBool(doc: *const Document, obj: ExId, prop: Prop, want: bool) !void {
 ///
 /// **A helper and not a `defer` at every call site**, because
 /// [`am.read.text`](../src/read.zig) returns a **caller-owned** string.
-fn expectText(doc: *const Document, obj: ExId, want: []const u8) !void {
+fn expectText(doc: anytype, obj: ExId, want: []const u8) !void {
     const got = try am.read.text(doc, obj, gpa);
     defer gpa.free(got);
     try testing.expectEqualStrings(want, got);
 }
 
 /// `doc.length(&obj)`.
-fn expectLength(doc: *const Document, obj: ExId, want: usize) !void {
+fn expectLength(doc: anytype, obj: ExId, want: usize) !void {
     try testing.expectEqual(want, try am.read.length(doc, obj));
 }
 
 /// The text of the text object at `index`.
-fn expectTextAt(doc: *const Document, list: ExId, index: usize, want: []const u8) !void {
+fn expectTextAt(doc: anytype, list: ExId, index: usize, want: []const u8) !void {
     const id = try objectAt(doc, list, .{ .index = index });
     try expectText(doc, id, want);
 }
 
 /// The string at `index`.
-fn expectStrAt(doc: *const Document, list: ExId, index: usize, want: []const u8) !void {
+fn expectStrAt(doc: anytype, list: ExId, index: usize, want: []const u8) !void {
     const prop: Prop = .{ .index = index };
     const got = try scalarAt(doc, list, prop);
     if (got != .str) {
@@ -284,7 +281,7 @@ fn expectStrAt(doc: *const Document, list: ExId, index: usize, want: []const u8)
 }
 
 /// The integer at `index`.
-fn expectIntAt(doc: *const Document, list: ExId, index: usize, want: i64) !void {
+fn expectIntAt(doc: anytype, list: ExId, index: usize, want: i64) !void {
     const prop: Prop = .{ .index = index };
     const got = try scalarAt(doc, list, prop);
     if (got != .int) {
@@ -311,7 +308,7 @@ fn expectIntAt(doc: *const Document, list: ExId, index: usize, want: i64) !void 
 /// renders a sequence anchor into a buffer the walk owns and overwrites, and a
 /// map key borrows the op set's string table
 /// ([`keys.zig`](../src/iter/keys.zig) *The key is borrowed, not owned*).
-fn expectKeys(doc: *const Document, obj: ExId, want: []const []const u8) !void {
+fn expectKeys(doc: anytype, obj: ExId, want: []const []const u8) !void {
     var keys = try am.read.keys(doc, obj);
     defer keys.deinit(gpa);
     var got: std.ArrayList([]const u8) = .empty;
@@ -337,8 +334,7 @@ fn expectKeys(doc: *const Document, obj: ExId, want: []const []const u8) !void {
 /// Upstream's `doc.get_heads()` on an `AutoCommit`: the isolation first, then
 /// the graph's heads ([`autocommit.rs`:695-700](../github-automerge-automerge/rust/automerge/src/autocommit.rs)).
 /// The caller frees the result.
-fn headsOf(doc: *const Document) ![]ChangeHash {
-    if (doc.isolationHeads()) |at| return gpa.dupe(ChangeHash, at);
+fn headsOf(doc: *AutoCommit) ![]ChangeHash {
     return doc.getHeads(gpa);
 }
 
@@ -349,21 +345,20 @@ fn headsOf(doc: *const Document) ![]ChangeHash {
 /// call mints through the source's retained `io`, so its actor differs on
 /// every run. **And this is determinism, not a leak**: `fork` allocates the
 /// actor from the **fork's own** arena, which [`Document.deinit`] frees.
-fn forkDoc(src: *Document) !Document {
+fn forkDoc(src: *AutoCommit) !AutoCommit {
     const heads = try src.getHeads(gpa);
     defer gpa.free(heads);
-    return src.forkAt(gpa, heads, .auto);
+    return src.forkAt(gpa, heads);
 }
 
-/// `doc.hydrate(&obj, None)`: the mirror of `obj` at the present. The port
-/// reaches the same mirror through [`hydrate.hydrateMap`](../src/hydrate.zig),
-/// which takes the op set and an optional clock rather than a document.
-fn hydrateObj(doc: *Document, obj: ExId) !Mirror {
-    return am.hydrate.hydrateMap(am.doc.Set, &doc.ops, gpa, obj, null);
+/// Hydrates the current view without publishing pending automatic writes.
+fn hydrateObj(doc: anytype, obj: ExId) !Mirror {
+    if (@TypeOf(doc) == *AutoCommit) return doc.hydrate(obj, null, gpa);
+    return am.read.hydrate(doc, obj, null, gpa);
 }
 
 /// `doc.hydrate(ROOT, None)`.
-fn hydrateNow(doc: *Document) !Mirror {
+fn hydrateNow(doc: anytype) !Mirror {
     return hydrateObj(doc, root);
 }
 
@@ -384,7 +379,7 @@ fn changeViews(list: *const am.doc.Changes) ![]am.change_record.Change {
 /// the other.**
 ///
 /// A case above builds its document through the port's **write path** — the
-/// free functions or a [`Tx`] — and this replays the same operations through the
+/// owner methods or a [`Tx`] — and this replays the same operations through the
 /// **read path**, `Document.applyChanges`, and requires the two documents to be
 /// the same document.
 ///
@@ -415,7 +410,7 @@ fn changeViews(list: *const am.doc.Changes) ![]am.change_record.Change {
 /// so a row-order divergence fails there with a diagnostic naming the fault,
 /// before a content comparison can paper over it. The mirror comparison is
 /// second and is there to catch a divergence the op set does not show.
-fn expectSameThroughApplyChanges(doc: *Document) !void {
+fn expectSameThroughApplyChanges(doc: anytype) !void {
     var all = try doc.getChanges(gpa, &.{});
     defer all.deinit(gpa);
     // A document that holds no change cannot carry both shapes, and
@@ -426,13 +421,14 @@ fn expectSameThroughApplyChanges(doc: *Document) !void {
     const view = try changeViews(&all);
     defer gpa.free(view);
 
-    var applied = try Document.init(gpa, io, .auto);
+    var applied = try Document.init(gpa, io);
     defer applied.deinit();
     applied.setActorId(mintActor());
     _ = try applied.applyChanges(gpa, view);
 
     // **First the rows, then the content.**
-    try applied.debugCmp(doc);
+    const raw = if (@TypeOf(doc) == *AutoCommit) try doc.document() else doc;
+    try applied.debugCmp(raw);
 
     var written = try hydrateNow(doc);
     defer written.deinit();
@@ -566,7 +562,7 @@ test "batch: batch_insert_flat_map" {
         .{ .key = "b", .value = .{ .int = 42 } },
     });
     defer value.deinit();
-    const obj_id = try trans.batchCreateValue(&doc, root, .{ .key = "data" }, value, false);
+    const obj_id = try doc.batchCreateValue(root, .{ .key = "data" }, value, false);
 
     try expectObjType(&doc, root, .{ .key = "data" }, .map);
     try expectStr(&doc, obj_id, .{ .key = "a" }, "hello");
@@ -594,7 +590,7 @@ test "batch: batch_insert_nested_maps" {
     try putChild(&value, "outer", .{ .object = .{ .map = outer } });
     try value.putOwned("top_level", .{ .value = .scalar(.{ .str = "flat" }), .conflict = false });
 
-    const root_obj = try trans.batchCreateValue(&doc, root, .{ .key = "nested" }, .{ .object = .{ .map = value } }, false);
+    const root_obj = try doc.batchCreateValue(root, .{ .key = "nested" }, .{ .object = .{ .map = value } }, false);
 
     try expectObjType(&doc, root_obj, .{ .key = "outer" }, .map);
     const outer_id = try objectAt(&doc, root_obj, .{ .key = "outer" });
@@ -610,12 +606,12 @@ test "batch: batch_insert_nested_maps" {
 test "batch: batch_insert_map_overwrites_existing_key" {
     var doc = try newDoc();
     defer doc.deinit();
-    _ = try trans.put(&doc, root, .{ .key = "key" }, .{ .str = "old_value" });
+    _ = try doc.put(root, .{ .key = "key" }, .{ .str = "old_value" });
     try expectStr(&doc, root, .{ .key = "key" }, "old_value");
 
     var value = try mapScalars(&.{.{ .key = "child", .value = .{ .str = "new" } }});
     defer value.deinit();
-    _ = try trans.batchCreateValue(&doc, root, .{ .key = "key" }, value, false);
+    _ = try doc.batchCreateValue(root, .{ .key = "key" }, value, false);
 
     try expectObjType(&doc, root, .{ .key = "key" }, .map);
     try expectKeys(&doc, root, &.{"key"});
@@ -628,7 +624,7 @@ test "batch: batch_insert_flat_list" {
     defer doc.deinit();
     var value = try listScalars(&.{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 } });
     defer value.deinit();
-    const obj_id = try trans.batchCreateValue(&doc, root, .{ .key = "nums" }, value, false);
+    const obj_id = try doc.batchCreateValue(root, .{ .key = "nums" }, value, false);
 
     try expectLength(&doc, obj_id, 3);
     try expectIntAt(&doc, obj_id, 0, 1);
@@ -650,7 +646,7 @@ test "batch: batch_insert_list_with_nested_objects" {
     try pushChild(&users, .{ .object = .{ .map = alice } });
     try pushChild(&users, .{ .object = .{ .map = bob } });
 
-    const list_id = try trans.batchCreateValue(&doc, root, .{ .key = "users" }, .{ .object = .{ .list = users } }, false);
+    const list_id = try doc.batchCreateValue(root, .{ .key = "users" }, .{ .object = .{ .list = users } }, false);
 
     try expectLength(&doc, list_id, 2);
     try expectObjType(&doc, list_id, .{ .index = 0 }, .map);
@@ -675,20 +671,20 @@ test "batch: batch_insert_scalar_fails" {
     // the port asserts the arm instead of a bare `Err(_)`.
     try testing.expectError(
         error.NotAnObject,
-        trans.batchCreateValue(&doc, root, .{ .key = "foo" }, .scalar(.{ .int = 1 }), false),
+        doc.batchCreateValue(root, .{ .key = "foo" }, .scalar(.{ .int = 1 }), false),
     );
 }
 
 test "batch: batch_insert_into_list_at_end" {
     var doc = try newDoc();
     defer doc.deinit();
-    const list_id = try trans.putObject(&doc, root, .{ .key = "items" }, .list);
-    _ = try trans.insert(&doc, list_id, 0, .{ .str = "first" });
-    _ = try trans.insert(&doc, list_id, 1, .{ .str = "second" });
+    const list_id = try doc.putObject(root, .{ .key = "items" }, .list);
+    _ = try doc.insert(list_id, 0, .{ .str = "first" });
+    _ = try doc.insert(list_id, 1, .{ .str = "second" });
 
     var value = try mapScalars(&.{.{ .key = "key", .value = .{ .str = "third" } }});
     defer value.deinit();
-    _ = try trans.batchCreateValue(&doc, list_id, .{ .index = 2 }, value, true);
+    _ = try doc.batchCreateValue(list_id, .{ .index = 2 }, value, true);
 
     try expectLength(&doc, list_id, 3);
     try expectStrAt(&doc, list_id, 0, "first");
@@ -703,16 +699,16 @@ test "batch: batch_insert_into_list_at_end" {
 test "batch: batch_insert_into_list_at_middle" {
     var doc = try newDoc();
     defer doc.deinit();
-    const list_id = try trans.putObject(&doc, root, .{ .key = "items" }, .list);
-    _ = try trans.insert(&doc, list_id, 0, .{ .str = "a" });
-    _ = try trans.insert(&doc, list_id, 1, .{ .str = "c" });
+    const list_id = try doc.putObject(root, .{ .key = "items" }, .list);
+    _ = try doc.insert(list_id, 0, .{ .str = "a" });
+    _ = try doc.insert(list_id, 1, .{ .str = "c" });
 
     // **Insert at index 1 with insert=true, shifting "c" to index 2** — the
     // comment upstream carries (`batch_insert.rs`:172-173), and the assertion
     // that makes it mean something.
     var value = try mapScalars(&.{.{ .key = "val", .value = .{ .str = "b" } }});
     defer value.deinit();
-    _ = try trans.batchCreateValue(&doc, list_id, .{ .index = 1 }, value, true);
+    _ = try doc.batchCreateValue(list_id, .{ .index = 1 }, value, true);
 
     try expectLength(&doc, list_id, 3);
     try expectStrAt(&doc, list_id, 0, "a");
@@ -725,15 +721,15 @@ test "batch: batch_insert_into_list_at_middle" {
 test "batch: batch_put_overwrites_existing_list_element" {
     var doc = try newDoc();
     defer doc.deinit();
-    const list_id = try trans.putObject(&doc, root, .{ .key = "items" }, .list);
-    _ = try trans.insert(&doc, list_id, 0, .{ .str = "old_a" });
-    _ = try trans.insert(&doc, list_id, 1, .{ .str = "old_b" });
-    _ = try trans.insert(&doc, list_id, 2, .{ .str = "old_c" });
+    const list_id = try doc.putObject(root, .{ .key = "items" }, .list);
+    _ = try doc.insert(list_id, 0, .{ .str = "old_a" });
+    _ = try doc.insert(list_id, 1, .{ .str = "old_b" });
+    _ = try doc.insert(list_id, 2, .{ .str = "old_c" });
 
     // Overwrite element at index 1 with a map using insert=false
     var value = try mapScalars(&.{.{ .key = "replaced", .value = .{ .bool_value = true } }});
     defer value.deinit();
-    _ = try trans.batchCreateValue(&doc, list_id, .{ .index = 1 }, value, false);
+    _ = try doc.batchCreateValue(list_id, .{ .index = 1 }, value, false);
 
     // Length should stay the same (overwrite, not insert)
     try expectLength(&doc, list_id, 3);
@@ -756,7 +752,7 @@ test "batch: batch_insert_with_text" {
     defer data.deinit();
     try putChild(&data, "greeting", greeting);
 
-    const obj_id = try trans.batchCreateValue(&doc, root, .{ .key = "data" }, .{ .object = .{ .map = data } }, false);
+    const obj_id = try doc.batchCreateValue(root, .{ .key = "data" }, .{ .object = .{ .map = data } }, false);
 
     try expectObjType(&doc, obj_id, .{ .key = "greeting" }, .text);
     const text_id = try objectAt(&doc, obj_id, .{ .key = "greeting" });
@@ -775,7 +771,7 @@ test "batch: batch_insert_text_in_list" {
     try pushChild(&texts, one);
     try pushChild(&texts, two);
 
-    const list_id = try trans.batchCreateValue(&doc, root, .{ .key = "texts" }, .{ .object = .{ .list = texts } }, false);
+    const list_id = try doc.batchCreateValue(root, .{ .key = "texts" }, .{ .object = .{ .list = texts } }, false);
 
     try expectLength(&doc, list_id, 2);
     try expectTextAt(&doc, list_id, 0, "one");
@@ -797,7 +793,7 @@ test "batch: batch_insert_deeply_nested" {
     defer l1.deinit();
     try putChild(&l1, "level1", .{ .object = .{ .map = l2 } });
 
-    const obj_id = try trans.batchCreateValue(&doc, root, .{ .key = "deep" }, .{ .object = .{ .map = l1 } }, false);
+    const obj_id = try doc.batchCreateValue(root, .{ .key = "deep" }, .{ .object = .{ .map = l1 } }, false);
 
     // **Every level is read through its own id**, which is what makes this a
     // depth assertion and not a lookup: a batch that wrote the deepest object
@@ -829,7 +825,7 @@ test "batch: batch_insert_mixed_nesting" {
     try data.putOwned("count", .{ .value = .scalar(.{ .int = 2 }), .conflict = false });
     try putChild(&data, "users", .{ .object = .{ .list = users } });
 
-    const obj_id = try trans.batchCreateValue(&doc, root, .{ .key = "data" }, .{ .object = .{ .map = data } }, false);
+    const obj_id = try doc.batchCreateValue(root, .{ .key = "data" }, .{ .object = .{ .map = data } }, false);
 
     try expectInt(&doc, obj_id, .{ .key = "count" }, 2);
     try expectKeys(&doc, obj_id, &.{ "count", "users" });
@@ -864,11 +860,11 @@ test "batch: batch_insert_survives_save_load" {
     try putChild(&data, "items", items);
     try putChild(&data, "nested", .{ .object = .{ .map = nested } });
 
-    _ = try trans.batchCreateValue(&doc, root, .{ .key = "data" }, .{ .object = .{ .map = data } }, false);
+    _ = try doc.batchCreateValue(root, .{ .key = "data" }, .{ .object = .{ .map = data } }, false);
 
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var doc2 = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
+    var doc2 = try Document.load(gpa, io, saved, .unicode_code_point);
     defer doc2.deinit();
 
     const data_id = try objectAt(&doc2, root, .{ .key = "data" });
@@ -889,11 +885,11 @@ test "batch: batch_insert_merges_correctly" {
 
     var v1 = try mapScalars(&.{.{ .key = "from", .value = .{ .str = "doc1" } }});
     defer v1.deinit();
-    _ = try trans.batchCreateValue(&doc1, root, .{ .key = "obj1" }, v1, false);
+    _ = try doc1.batchCreateValue(root, .{ .key = "obj1" }, v1, false);
 
     var v2 = try mapScalars(&.{.{ .key = "from", .value = .{ .str = "doc2" } }});
     defer v2.deinit();
-    _ = try trans.batchCreateValue(&doc2, root, .{ .key = "obj2" }, v2, false);
+    _ = try doc2.batchCreateValue(root, .{ .key = "obj2" }, v2, false);
 
     const heads = try doc1.merge(gpa, &doc2);
     gpa.free(heads);
@@ -912,15 +908,15 @@ test "batch: multiple_batch_inserts" {
 
     var v1 = try mapScalars(&.{.{ .key = "a", .value = .{ .int = 1 } }});
     defer v1.deinit();
-    _ = try trans.batchCreateValue(&doc, root, .{ .key = "first" }, v1, false);
+    _ = try doc.batchCreateValue(root, .{ .key = "first" }, v1, false);
 
     var v2 = try mapScalars(&.{.{ .key = "b", .value = .{ .int = 2 } }});
     defer v2.deinit();
-    _ = try trans.batchCreateValue(&doc, root, .{ .key = "second" }, v2, false);
+    _ = try doc.batchCreateValue(root, .{ .key = "second" }, v2, false);
 
     var v3 = try mapScalars(&.{.{ .key = "c", .value = .{ .int = 3 } }});
     defer v3.deinit();
-    _ = try trans.batchCreateValue(&doc, root, .{ .key = "third" }, v3, false);
+    _ = try doc.batchCreateValue(root, .{ .key = "third" }, v3, false);
 
     const first_id = try objectAt(&doc, root, .{ .key = "first" });
     try expectInt(&doc, first_id, .{ .key = "a" }, 1);
@@ -940,15 +936,15 @@ test "batch: multiple_batch_inserts" {
 test "batch: batch_insert_into_existing_map" {
     var doc = try newDoc();
     defer doc.deinit();
-    const parent = try trans.putObject(&doc, root, .{ .key = "parent" }, .map);
-    _ = try trans.put(&doc, parent, .{ .key = "existing" }, .{ .str = "value" });
+    const parent = try doc.putObject(root, .{ .key = "parent" }, .map);
+    _ = try doc.put(parent, .{ .key = "existing" }, .{ .str = "value" });
 
     var value = try mapScalars(&.{
         .{ .key = "y", .value = .{ .int = 2 } },
         .{ .key = "x", .value = .{ .int = 1 } },
     });
     defer value.deinit();
-    _ = try trans.batchCreateValue(&doc, parent, .{ .key = "child" }, value, false);
+    _ = try doc.batchCreateValue(parent, .{ .key = "child" }, value, false);
 
     try expectStr(&doc, parent, .{ .key = "existing" }, "value");
     const child_id = try objectAt(&doc, parent, .{ .key = "child" });
@@ -981,12 +977,12 @@ test "batch: batch_insert_into_existing_map" {
 test "batch: batch_insert_into_existing_list" {
     var doc = try newDoc();
     defer doc.deinit();
-    const list_id = try trans.putObject(&doc, root, .{ .key = "list" }, .list);
-    _ = try trans.insert(&doc, list_id, 0, .{ .str = "existing" });
+    const list_id = try doc.putObject(root, .{ .key = "list" }, .list);
+    _ = try doc.insert(list_id, 0, .{ .str = "existing" });
 
     var value = try mapScalars(&.{.{ .key = "appended", .value = .{ .bool_value = true } }});
     defer value.deinit();
-    _ = try trans.batchCreateValue(&doc, list_id, .{ .index = 1 }, value, true);
+    _ = try doc.batchCreateValue(list_id, .{ .index = 1 }, value, true);
 
     try expectLength(&doc, list_id, 2);
     try expectStrAt(&doc, list_id, 0, "existing");
@@ -1008,7 +1004,7 @@ test "batch: batch_insert_matches_hydrate_output" {
     try input.putOwned("count", .{ .value = .scalar(.{ .int = 42 }), .conflict = false });
     try putChild(&input, "tags", tags);
 
-    const obj_id = try trans.batchCreateValue(&doc, root, .{ .key = "data" }, .{ .object = .{ .map = input } }, false);
+    const obj_id = try doc.batchCreateValue(root, .{ .key = "data" }, .{ .object = .{ .map = input } }, false);
 
     var hydrated = try hydrateObj(&doc, obj_id);
     defer hydrated.deinit();
@@ -1036,23 +1032,21 @@ test "batch: batch_insert_matches_hydrate_output" {
 }
 
 test "batch: batch_insert_with_transaction" {
-    // **`Automerge::new` and `doc.transaction()`**, so a `.manual` document
-    // and [`Tx.open`] — the autocommit door commits every call
-    // ([`transact.zig`](../src/transact.zig):2581-2596), and upstream's second
-    // half of this case is the commit.
+    // Upstream opens a raw transaction and publishes the entire batch once.
     var doc = try newManualDoc();
     defer doc.deinit();
     var value = try mapScalars(&.{.{ .key = "key", .value = .{ .str = "from_tx" } }});
     defer value.deinit();
 
     var tx = try Tx.open(gpa, &doc);
-    defer tx.deinit();
+    defer tx.deinitClosed(); // The whole raw document also dies on an error path.
     const obj_id = try tx.batchCreateValue(root, .{ .key = "data" }, value, false);
     // **`tx.get`, not `doc.get`**: a transaction resolves its scope through
     // its own clock, and this is upstream's read *inside* the transaction.
     const in_tx = (try tx.get(obj_id, .{ .key = "key" })) orelse return error.NoSuchKey;
     try testing.expectEqualStrings("from_tx", in_tx.value.scalar.str);
-    _ = try tx.commit(null, null);
+    var committed = try tx.commit();
+    defer committed.deinit(gpa);
 
     try expectObjType(&doc, root, .{ .key = "data" }, .map);
     // **The write path against the read path** — see the helper's doc above.
@@ -1066,7 +1060,7 @@ test "batch: batch_insert_transaction_rollback" {
     defer value.deinit();
     {
         var tx = try Tx.open(gpa, &doc);
-        defer tx.deinit();
+        defer tx.deinitClosed(); // The whole raw document also dies on an error path.
         _ = try tx.batchCreateValue(root, .{ .key = "data" }, value, false);
         _ = try tx.rollback();
     }
@@ -1080,7 +1074,7 @@ test "batch: batch_insert_empty_map" {
     var value = MirrorMap.init(gpa, .root);
     defer value.deinit();
 
-    const obj_id = try trans.batchCreateValue(&doc, root, .{ .key = "empty" }, .{ .object = .{ .map = value } }, false);
+    const obj_id = try doc.batchCreateValue(root, .{ .key = "empty" }, .{ .object = .{ .map = value } }, false);
 
     try expectObjType(&doc, root, .{ .key = "empty" }, .map);
     try expectKeys(&doc, obj_id, &.{});
@@ -1094,7 +1088,7 @@ test "batch: batch_insert_empty_list" {
     var value = MirrorList.init(gpa, .root);
     defer value.deinit();
 
-    const obj_id = try trans.batchCreateValue(&doc, root, .{ .key = "empty" }, .{ .object = .{ .list = value } }, false);
+    const obj_id = try doc.batchCreateValue(root, .{ .key = "empty" }, .{ .object = .{ .list = value } }, false);
 
     try expectObjType(&doc, root, .{ .key = "empty" }, .list);
     try expectLength(&doc, obj_id, 0);
@@ -1108,7 +1102,7 @@ test "batch: batch_insert_empty_text" {
     var value = try textMirror("");
     defer value.deinit();
 
-    const obj_id = try trans.batchCreateValue(&doc, root, .{ .key = "empty" }, value, false);
+    const obj_id = try doc.batchCreateValue(root, .{ .key = "empty" }, value, false);
 
     try expectObjType(&doc, root, .{ .key = "empty" }, .text);
     try expectText(&doc, obj_id, "");
@@ -1131,7 +1125,7 @@ test "batch: batch_insert_various_scalar_types" {
         .{ .key = "float_val", .value = .{ .float = 5.14 } },
     });
     defer value.deinit();
-    const obj_id = try trans.batchCreateValue(&doc, root, .{ .key = "scalars" }, value, false);
+    const obj_id = try doc.batchCreateValue(root, .{ .key = "scalars" }, value, false);
 
     try expectStr(&doc, obj_id, .{ .key = "str_val" }, "hello");
     try expectInt(&doc, obj_id, .{ .key = "int_val" }, 42);
@@ -1169,17 +1163,17 @@ test "batch: batch_insert_equivalent_to_individual_ops" {
     try value.putOwned("name", .{ .value = .scalar(.{ .str = "test" }), .conflict = false });
     try value.putOwned("count", .{ .value = .scalar(.{ .int = 5 }), .conflict = false });
     try putChild(&value, "items", items);
-    _ = try trans.batchCreateValue(&doc_batch, root, .{ .key = "data" }, .{ .object = .{ .map = value } }, false);
+    _ = try doc_batch.batchCreateValue(root, .{ .key = "data" }, .{ .object = .{ .map = value } }, false);
 
     var doc_individual = try newDoc();
     defer doc_individual.deinit();
-    const data = try trans.putObject(&doc_individual, root, .{ .key = "data" }, .map);
-    _ = try trans.put(&doc_individual, data, .{ .key = "name" }, .{ .str = "test" });
-    _ = try trans.put(&doc_individual, data, .{ .key = "count" }, .{ .int = 5 });
-    const list = try trans.putObject(&doc_individual, data, .{ .key = "items" }, .list);
-    _ = try trans.insert(&doc_individual, list, 0, .{ .str = "a" });
-    _ = try trans.insert(&doc_individual, list, 1, .{ .str = "b" });
-    _ = try trans.insert(&doc_individual, list, 2, .{ .str = "c" });
+    const data = try doc_individual.putObject(root, .{ .key = "data" }, .map);
+    _ = try doc_individual.put(data, .{ .key = "name" }, .{ .str = "test" });
+    _ = try doc_individual.put(data, .{ .key = "count" }, .{ .int = 5 });
+    const list = try doc_individual.putObject(data, .{ .key = "items" }, .list);
+    _ = try doc_individual.insert(list, 0, .{ .str = "a" });
+    _ = try doc_individual.insert(list, 1, .{ .str = "b" });
+    _ = try doc_individual.insert(list, 2, .{ .str = "c" });
 
     var hydrated_batch = try hydrateNow(&doc_batch);
     defer hydrated_batch.deinit();
@@ -1213,7 +1207,7 @@ test "batch: batch_insert_generates_patches" {
     defer value.deinit();
     try value.putOwned("name", .{ .value = .scalar(.{ .str = "test" }), .conflict = false });
     try putChild(&value, "items", items);
-    _ = try trans.batchCreateValue(&doc, root, .{ .key = "data" }, .{ .object = .{ .map = value } }, false);
+    _ = try doc.batchCreateValue(root, .{ .key = "data" }, .{ .object = .{ .map = value } }, false);
 
     var patches = try doc.diffIncremental(gpa);
     defer patches.deinit();
@@ -1239,7 +1233,7 @@ test "batch: batch_insert_text_generates_splice_patch" {
     var value = MirrorMap.init(gpa, .root);
     defer value.deinit();
     try putChild(&value, "greeting", greeting);
-    _ = try trans.batchCreateValue(&doc, root, .{ .key = "data" }, .{ .object = .{ .map = value } }, false);
+    _ = try doc.batchCreateValue(root, .{ .key = "data" }, .{ .object = .{ .map = value } }, false);
 
     var patches = try doc.diffIncremental(gpa);
     defer patches.deinit();
@@ -1262,7 +1256,7 @@ test "batch: batch_insert_list_of_lists" {
     try pushChild(&matrix, inner0);
     try pushChild(&matrix, inner1);
 
-    const outer = try trans.batchCreateValue(&doc, root, .{ .key = "matrix" }, .{ .object = .{ .list = matrix } }, false);
+    const outer = try doc.batchCreateValue(root, .{ .key = "matrix" }, .{ .object = .{ .list = matrix } }, false);
 
     try expectLength(&doc, outer, 2);
     const row0 = try objectAt(&doc, outer, .{ .index = 0 });
@@ -1280,9 +1274,9 @@ test "batch: batch_insert_list_of_lists" {
 test "batch: batch_put_overwrite_with_nested_structure" {
     var doc = try newDoc();
     defer doc.deinit();
-    const list_id = try trans.putObject(&doc, root, .{ .key = "items" }, .list);
-    _ = try trans.insert(&doc, list_id, 0, .{ .str = "placeholder" });
-    _ = try trans.insert(&doc, list_id, 1, .{ .str = "keep" });
+    const list_id = try doc.putObject(root, .{ .key = "items" }, .list);
+    _ = try doc.insert(list_id, 0, .{ .str = "placeholder" });
+    _ = try doc.insert(list_id, 1, .{ .str = "keep" });
 
     // Overwrite index 0 with a complex nested structure
     var child0 = MirrorMap.init(gpa, .root);
@@ -1297,7 +1291,7 @@ test "batch: batch_put_overwrite_with_nested_structure" {
     try value.putOwned("name", .{ .value = .scalar(.{ .str = "complex" }), .conflict = false });
     try putChild(&value, "children", .{ .object = .{ .list = children } });
 
-    _ = try trans.batchCreateValue(&doc, list_id, .{ .index = 0 }, .{ .object = .{ .map = value } }, false);
+    _ = try doc.batchCreateValue(list_id, .{ .index = 0 }, .{ .object = .{ .map = value } }, false);
 
     try expectLength(&doc, list_id, 2);
     const obj_id = try objectAt(&doc, list_id, .{ .index = 0 });
@@ -1316,15 +1310,13 @@ test "batch: batch_put_overwrite_with_nested_structure" {
 test "batch: batch_init_map_flat" {
     var doc = try newDoc();
     defer doc.deinit();
-    // **`initRootFromHydrate` takes its `hydmod.Map` by value**
-    // ([`hydrate.zig`](../src/hydrate.zig):929-932), so the call copies the
-    // caller's map into the parameter and frees nothing: the caller keeps
-    // ownership and must deinit its own map.
+    // The automatic owner borrows the hydrated map and copies its contents;
+    // the caller retains and frees the map.
     var map = MirrorMap.init(gpa, .root);
     defer map.deinit();
     try map.putOwned("name", .{ .value = .scalar(.{ .str = "test" }), .conflict = false });
     try map.putOwned("count", .{ .value = .scalar(.{ .int = 42 }), .conflict = false });
-    try trans.initRootFromHydrate(&doc, map);
+    try doc.initRootFromHydrate(&map);
 
     try expectStr(&doc, root, .{ .key = "name" }, "test");
     try expectInt(&doc, root, .{ .key = "count" }, 42);
@@ -1352,7 +1344,7 @@ test "batch: batch_init_map_nested" {
     defer map.deinit();
     try putChild(&map, "meta", .{ .object = .{ .map = meta } });
     try putChild(&map, "users", .{ .object = .{ .list = users } });
-    try trans.initRootFromHydrate(&doc, map);
+    try doc.initRootFromHydrate(&map);
 
     const users_id = try objectAt(&doc, root, .{ .key = "users" });
     try expectLength(&doc, users_id, 2);
@@ -1372,7 +1364,7 @@ test "batch: batch_init_map_with_text" {
     var map = MirrorMap.init(gpa, .root);
     defer map.deinit();
     try putChild(&map, "greeting", greeting);
-    try trans.initRootFromHydrate(&doc, map);
+    try doc.initRootFromHydrate(&map);
 
     try expectObjType(&doc, root, .{ .key = "greeting" }, .text);
     const text_id = try objectAt(&doc, root, .{ .key = "greeting" });
@@ -1389,11 +1381,11 @@ test "batch: batch_init_map_survives_save_load" {
     defer map.deinit();
     try map.putOwned("name", .{ .value = .scalar(.{ .str = "test" }), .conflict = false });
     try putChild(&map, "items", items);
-    try trans.initRootFromHydrate(&doc, map);
+    try doc.initRootFromHydrate(&map);
 
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var doc2 = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
+    var doc2 = try Document.load(gpa, io, saved, .unicode_code_point);
     defer doc2.deinit();
 
     try expectStr(&doc2, root, .{ .key = "name" }, "test");
@@ -1416,16 +1408,16 @@ test "batch: batch_init_map_equivalent_to_individual_ops" {
     try map.putOwned("name", .{ .value = .scalar(.{ .str = "test" }), .conflict = false });
     try map.putOwned("count", .{ .value = .scalar(.{ .int = 5 }), .conflict = false });
     try putChild(&map, "items", items);
-    try trans.initRootFromHydrate(&doc_batch, map);
+    try doc_batch.initRootFromHydrate(&map);
 
     var doc_individual = try newDoc();
     defer doc_individual.deinit();
-    _ = try trans.put(&doc_individual, root, .{ .key = "name" }, .{ .str = "test" });
-    _ = try trans.put(&doc_individual, root, .{ .key = "count" }, .{ .int = 5 });
-    const list = try trans.putObject(&doc_individual, root, .{ .key = "items" }, .list);
-    _ = try trans.insert(&doc_individual, list, 0, .{ .str = "a" });
-    _ = try trans.insert(&doc_individual, list, 1, .{ .str = "b" });
-    _ = try trans.insert(&doc_individual, list, 2, .{ .str = "c" });
+    _ = try doc_individual.put(root, .{ .key = "name" }, .{ .str = "test" });
+    _ = try doc_individual.put(root, .{ .key = "count" }, .{ .int = 5 });
+    const list = try doc_individual.putObject(root, .{ .key = "items" }, .list);
+    _ = try doc_individual.insert(list, 0, .{ .str = "a" });
+    _ = try doc_individual.insert(list, 1, .{ .str = "b" });
+    _ = try doc_individual.insert(list, 2, .{ .str = "c" });
 
     var hydrated_batch = try hydrateNow(&doc_batch);
     defer hydrated_batch.deinit();
@@ -1449,7 +1441,7 @@ test "batch: batch_init_map_generates_patches" {
     defer map.deinit();
     try map.putOwned("name", .{ .value = .scalar(.{ .str = "test" }), .conflict = false });
     try putChild(&map, "items", items);
-    try trans.initRootFromHydrate(&doc, map);
+    try doc.initRootFromHydrate(&map);
 
     // **`doc.diff(&[], &heads)`, not `diff_incremental`.** Upstream's case
     // takes no cursor update at all (`batch_insert.rs`:823-824) — the whole
@@ -1477,9 +1469,9 @@ test "batch: batch_init_map_generates_patches" {
 test "batch: splice_insert_scalars" {
     var doc = try newDoc();
     defer doc.deinit();
-    const list_id = try trans.putObject(&doc, root, .{ .key = "list" }, .list);
-    _ = try trans.insert(&doc, list_id, 0, .{ .str = "a" });
-    _ = try trans.insert(&doc, list_id, 1, .{ .str = "d" });
+    const list_id = try doc.putObject(root, .{ .key = "list" }, .list);
+    _ = try doc.insert(list_id, 0, .{ .str = "a" });
+    _ = try doc.insert(list_id, 1, .{ .str = "d" });
 
     const values = [_]ScalarValue{ .{ .str = "b" }, .{ .str = "c" } };
     try spliceScalars(&doc, list_id, 1, 0, &values);
@@ -1496,7 +1488,7 @@ test "batch: splice_insert_scalars" {
 test "batch: splice_insert_objects" {
     var doc = try newDoc();
     defer doc.deinit();
-    const list_id = try trans.putObject(&doc, root, .{ .key = "list" }, .list);
+    const list_id = try doc.putObject(root, .{ .key = "list" }, .list);
 
     var alice = MirrorMap.init(gpa, .root);
     try alice.putOwned("name", .{ .value = .scalar(.{ .str = "alice" }), .conflict = false });
@@ -1507,7 +1499,7 @@ test "batch: splice_insert_objects" {
     values[0] = .{ .object = .{ .map = alice } };
     values[1] = .{ .object = .{ .map = bob } };
 
-    try trans.splice(&doc, list_id, 0, 0, gpa, &values);
+    try doc.splice(list_id, 0, 0, &values);
 
     try expectLength(&doc, list_id, 2);
     const alice_id = try objectAt(&doc, list_id, .{ .index = 0 });
@@ -1521,7 +1513,7 @@ test "batch: splice_insert_objects" {
 test "batch: splice_insert_mixed" {
     var doc = try newDoc();
     defer doc.deinit();
-    const list_id = try trans.putObject(&doc, root, .{ .key = "list" }, .list);
+    const list_id = try doc.putObject(root, .{ .key = "list" }, .list);
 
     var nested = MirrorMap.init(gpa, .root);
     try nested.putOwned("nested", .{ .value = .scalar(.{ .bool_value = true }), .conflict = false });
@@ -1534,7 +1526,7 @@ test "batch: splice_insert_mixed" {
     values[1] = .{ .object = .{ .map = nested } };
     values[2] = try listScalars(&.{ .{ .int = 1 }, .{ .int = 2 } });
 
-    try trans.splice(&doc, list_id, 0, 0, gpa, &values);
+    try doc.splice(list_id, 0, 0, &values);
 
     try expectLength(&doc, list_id, 3);
     try expectStrAt(&doc, list_id, 0, "hello");
@@ -1549,10 +1541,10 @@ test "batch: splice_insert_mixed" {
 test "batch: splice_delete_and_insert" {
     var doc = try newDoc();
     defer doc.deinit();
-    const list_id = try trans.putObject(&doc, root, .{ .key = "list" }, .list);
-    _ = try trans.insert(&doc, list_id, 0, .{ .str = "a" });
-    _ = try trans.insert(&doc, list_id, 1, .{ .str = "b" });
-    _ = try trans.insert(&doc, list_id, 2, .{ .str = "c" });
+    const list_id = try doc.putObject(root, .{ .key = "list" }, .list);
+    _ = try doc.insert(list_id, 0, .{ .str = "a" });
+    _ = try doc.insert(list_id, 1, .{ .str = "b" });
+    _ = try doc.insert(list_id, 2, .{ .str = "c" });
 
     // Delete "b", insert "x" and "y" in its place
     const values = [_]ScalarValue{ .{ .str = "x" }, .{ .str = "y" } };
@@ -1570,12 +1562,12 @@ test "batch: splice_delete_and_insert" {
 test "batch: splice_delete_only" {
     var doc = try newDoc();
     defer doc.deinit();
-    const list_id = try trans.putObject(&doc, root, .{ .key = "list" }, .list);
-    _ = try trans.insert(&doc, list_id, 0, .{ .str = "a" });
-    _ = try trans.insert(&doc, list_id, 1, .{ .str = "b" });
-    _ = try trans.insert(&doc, list_id, 2, .{ .str = "c" });
+    const list_id = try doc.putObject(root, .{ .key = "list" }, .list);
+    _ = try doc.insert(list_id, 0, .{ .str = "a" });
+    _ = try doc.insert(list_id, 1, .{ .str = "b" });
+    _ = try doc.insert(list_id, 2, .{ .str = "c" });
 
-    try trans.splice(&doc, list_id, 1, 1, gpa, &.{});
+    try doc.splice(list_id, 1, 1, &.{});
 
     try expectLength(&doc, list_id, 2);
     try expectStrAt(&doc, list_id, 0, "a");
@@ -1587,7 +1579,7 @@ test "batch: splice_delete_only" {
 test "batch: splice_with_text" {
     var doc = try newDoc();
     defer doc.deinit();
-    const list_id = try trans.putObject(&doc, root, .{ .key = "list" }, .list);
+    const list_id = try doc.putObject(root, .{ .key = "list" }, .list);
 
     // **The array owns the two text mirrors** — they are moved into it and the
     // array's `defer` is the one free, so a `defer hello.deinit()` beside it
@@ -1598,7 +1590,7 @@ test "batch: splice_with_text" {
     values[0] = try textMirror("hello");
     values[1] = try textMirror("world");
 
-    try trans.splice(&doc, list_id, 0, 0, gpa, &values);
+    try doc.splice(list_id, 0, 0, &values);
 
     try expectLength(&doc, list_id, 2);
     try expectTextAt(&doc, list_id, 0, "hello");
@@ -1610,7 +1602,7 @@ test "batch: splice_with_text" {
 test "batch: splice_deeply_nested" {
     var doc = try newDoc();
     defer doc.deinit();
-    const list_id = try trans.putObject(&doc, root, .{ .key = "list" }, .list);
+    const list_id = try doc.putObject(root, .{ .key = "list" }, .list);
 
     const scores = try listScalars(&.{ .{ .int = 10 }, .{ .int = 20 } });
     var alice = MirrorMap.init(gpa, .root);
@@ -1625,7 +1617,7 @@ test "batch: splice_deeply_nested" {
     defer for (&values) |*v| v.deinit();
     values[0] = .{ .object = .{ .map = top } };
 
-    try trans.splice(&doc, list_id, 0, 0, gpa, &values);
+    try doc.splice(list_id, 0, 0, &values);
 
     const map_id = try objectAt(&doc, list_id, .{ .index = 0 });
     const users_id = try objectAt(&doc, map_id, .{ .key = "users" });
@@ -1641,7 +1633,7 @@ test "batch: splice_deeply_nested" {
 test "batch: splice_survives_save_load" {
     var doc = try newDoc();
     defer doc.deinit();
-    const list_id = try trans.putObject(&doc, root, .{ .key = "list" }, .list);
+    const list_id = try doc.putObject(root, .{ .key = "list" }, .list);
 
     var entry = MirrorMap.init(gpa, .root);
     try entry.putOwned("key", .{ .value = .scalar(.{ .str = "val" }), .conflict = false });
@@ -1650,11 +1642,11 @@ test "batch: splice_survives_save_load" {
     values[0] = .{ .object = .{ .map = entry } };
     values[1] = .scalar(.{ .int = 42 });
 
-    try trans.splice(&doc, list_id, 0, 0, gpa, &values);
+    try doc.splice(list_id, 0, 0, &values);
 
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var doc2 = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
+    var doc2 = try Document.load(gpa, io, saved, .unicode_code_point);
     defer doc2.deinit();
 
     const list_id2 = try objectAt(&doc2, root, .{ .key = "list" });
@@ -1669,8 +1661,8 @@ test "batch: splice_survives_save_load" {
 test "batch: splice_merges_correctly" {
     var doc1 = try newDoc();
     defer doc1.deinit();
-    const list_id = try trans.putObject(&doc1, root, .{ .key = "list" }, .list);
-    _ = try trans.insert(&doc1, list_id, 0, .{ .str = "shared" });
+    const list_id = try doc1.putObject(root, .{ .key = "list" }, .list);
+    _ = try doc1.insert(list_id, 0, .{ .str = "shared" });
 
     var doc2 = try forkDoc(&doc1);
     defer doc2.deinit();
@@ -1680,7 +1672,7 @@ test "batch: splice_merges_correctly" {
     var v1: [1]Mirror = undefined;
     defer for (&v1) |*v| v.deinit();
     v1[0] = .{ .object = .{ .map = from1 } };
-    try trans.splice(&doc1, list_id, 1, 0, gpa, &v1);
+    try doc1.splice(list_id, 1, 0, &v1);
 
     const list_id2 = try objectAt(&doc2, root, .{ .key = "list" });
     var from2 = MirrorMap.init(gpa, .root);
@@ -1688,7 +1680,7 @@ test "batch: splice_merges_correctly" {
     var v2: [1]Mirror = undefined;
     defer for (&v2) |*v| v.deinit();
     v2[0] = .{ .object = .{ .map = from2 } };
-    try trans.splice(&doc2, list_id2, 1, 0, gpa, &v2);
+    try doc2.splice(list_id2, 1, 0, &v2);
 
     const heads = try doc1.merge(gpa, &doc2);
     gpa.free(heads);
@@ -1708,16 +1700,15 @@ test "batch: splice_merges_correctly" {
 test "batch: batch_create_object_rejects_map_key_in_text" {
     var doc = try newDoc();
     defer doc.deinit();
-    const text = try trans.putObject(&doc, root, .{ .key = "k0" }, .text);
+    const text = try doc.putObject(root, .{ .key = "k0" }, .text);
+    _ = try doc.commit();
 
     // **`Mark::new("bold", Null, 0, 0)` with `ExpandMark::After`** — a
     // zero-width mark, which is a begin and an end at the same anchor
-    // ([`marks.rs`](../src/marks.zig)). Upstream writes it in its own
-    // transaction (`doc.commit()` before and after); the port's autocommit
-    // door opens, writes and commits on every call
-    // ([`transact.zig`](../src/transact.zig):2581-2596), so the same three
-    // changes come out and the `commit()` lines have no separate spelling.
-    try trans.mark(&doc, text, 0, 0, "bold", .after, null);
+    // ([`marks.rs`](../src/marks.zig)). Preserve upstream's explicit change
+    // boundaries before and after the mark (`batch_insert.rs`:1041,1049).
+    try doc.mark(text, 0, 0, "bold", .after, null);
+    _ = try doc.commit();
 
     var value = try mapScalars(&.{.{ .key = "m0", .value = .{ .int = -128 } }});
     defer value.deinit();
@@ -1737,7 +1728,7 @@ test "batch: batch_create_object_rejects_map_key_in_text" {
     // ([`transact.zig`](../src/transact.zig):1920).
     try testing.expectError(
         error.InvalidOp,
-        trans.batchCreateValue(&doc, text, .{ .key = "k0" }, value, false),
+        doc.batchCreateValue(text, .{ .key = "k0" }, value, false),
     );
 }
 
@@ -1770,19 +1761,19 @@ test "batch: a batch written locally and the same changes applied elsewhere mate
     try data.putOwned("count", .{ .value = .scalar(.{ .int = 2 }), .conflict = false });
     try putChild(&data, "greeting", hello);
     try putChild(&data, "users", .{ .object = .{ .list = users } });
-    _ = try trans.batchCreateValue(&built, root, .{ .key = "data" }, .{ .object = .{ .map = data } }, false);
+    _ = try built.batchCreateValue(root, .{ .key = "data" }, .{ .object = .{ .map = data } }, false);
 
     // **A second batch into an existing list**, so the second document's own
     // op set has a sequence splice as well as a map sort.
-    const list_id = try trans.putObject(&built, root, .{ .key = "list" }, .list);
-    _ = try trans.insert(&built, list_id, 0, .{ .str = "keep" });
+    const list_id = try built.putObject(root, .{ .key = "list" }, .list);
+    _ = try built.insert(list_id, 0, .{ .str = "keep" });
     var tail = MirrorMap.init(gpa, .root);
     try tail.putOwned("z", .{ .value = .scalar(.{ .int = 1 }), .conflict = false });
     try tail.putOwned("a", .{ .value = .scalar(.{ .int = 2 }), .conflict = false });
     var tails: [1]Mirror = undefined;
     defer for (&tails) |*v| v.deinit();
     tails[0] = .{ .object = .{ .map = tail } };
-    try trans.splice(&built, list_id, 1, 0, gpa, &tails);
+    try built.splice(list_id, 1, 0, &tails);
 
     var changes = try built.getChanges(gpa, &.{});
     defer changes.deinit(gpa);
@@ -1790,7 +1781,7 @@ test "batch: a batch written locally and the same changes applied elsewhere mate
     defer gpa.free(views);
     for (0..changes.len()) |i| views[i] = changes.at(i);
 
-    var applied = try Document.init(gpa, io, .auto);
+    var applied = try Document.init(gpa, io);
     defer applied.deinit();
     _ = try applied.applyChanges(gpa, views);
 
@@ -1822,10 +1813,10 @@ test "batch: a batch written locally and the same changes applied elsewhere mate
 /// upstream's nine `splice` cases build: a `hydrate::Value::Scalar` vector
 /// rather than a nested structure. **A helper and not a repeated
 /// `listScalars`** so that the *borrowing* rule stays visible: the slice
-/// [`trans.splice`] takes is [`trans.splice`]'s to read only, so the
+/// `AutoCommit.splice` takes is borrowed, so the
 /// mirrors can be temporaries.
 fn spliceScalars(
-    doc: *Document,
+    doc: *AutoCommit,
     list: ExId,
     pos: usize,
     del: isize,
@@ -1834,7 +1825,7 @@ fn spliceScalars(
     const values = try gpa.alloc(Mirror, vals.len);
     defer gpa.free(values);
     for (vals, values) |v, *slot| slot.* = .scalar(v);
-    try trans.splice(doc, list, pos, del, gpa, values);
+    try doc.splice(list, pos, del, values);
 }
 
 // ── Zig 0.16.0 / upstream / Rust / port ───────────────────────────────────────
@@ -1852,17 +1843,11 @@ fn spliceScalars(
 // not optional**. Every `batch_create_object(…, &value, …)` above is
 // `batchCreateValue`, and `as_insert` is upstream's `insert`.
 //
-// ## `AutoCommit::new` is a `.auto` document, and `Automerge::new` a `.manual` one
+// ## Automatic owners and raw documents are separate types
 //
-// Upstream has two document types and one transaction type; the port has one
-// document type with a [`Mode`](../src/doc.zig) flag, so the two flavours are a
-// constructor argument. `AutoCommit::new` is [`newDoc`] and
-// `Automerge::new` is [`newManualDoc`]. **Two of upstream's cases need the
-// second** — `batch_insert_with_transaction` and
-// `batch_insert_transaction_rollback`, which open a `Transaction` and commit
-// or roll it back — and the autocommit door commits every call
-// ([`transact.zig`](../src/transact.zig):2581-2596), so a rollback is only
-// expressible through [`Tx.open`] on a `.manual` document.
+// `AutoCommit::new` is [`newDoc`] and `Automerge::new` is [`newManualDoc`].
+// The automatic owner holds a transaction across ordinary reads and setup
+// writes. The explicit commit and rollback cases open [`Tx`] on a raw document.
 //
 // ## `hydrate_map!` and `hydrate_list!` are builders, not macros
 //
@@ -1900,14 +1885,11 @@ fn spliceScalars(
 // named by the caller, which is what makes "taken over" and "still mine"
 // distinguishable in the source.
 //
-// ## `init_root_from_hydrate` takes its map by value
+// ## `init_root_from_hydrate` borrows its map
 //
-// [`initRootFromHydrate`](../src/transact.zig) takes a `hydmod.Map` **by
-// value** ([`hydrate.zig`](../src/hydrate.zig):929-932), so the call copies
-// the caller's map into the parameter and frees nothing: the caller keeps
-// ownership and must deinit its own map, and handing it a temporary would
-// leak. **That is upstream's shape and not a port decision** — Rust moves,
-// Zig copies.
+// [`AutoCommit.initRootFromHydrate`](../src/autocommit.zig) takes a borrowed
+// `*const hydrate.Map`. The caller retains ownership and deinitializes the map
+// after the batch has copied its contents.
 //
 // ## `Value::Object(t)` is a tag plus an object id
 //
@@ -1929,13 +1911,10 @@ fn spliceScalars(
 // payload, and the float is compared bit-for-bit because upstream writes
 // `Value::f64(5.14)` against the same literal.
 //
-// ## `doc.hydrate` is `hydrateMap` over the op set
+// ## Hydration reads the current view without committing
 //
-// Upstream's `ReadDoc::hydrate(&self, obj, heads)` is a method; the port reaches
-// the same mirror through [`hydrate.hydrateMap`](../src/hydrate.zig), which
-// takes the op set and an optional clock rather than a document, so
-// [`hydrateObj`] and [`hydrateNow`] name the pair once. `Document.ops` is
-// public, so nothing here reaches into a private.
+// [`hydrateObj`] uses the shared ReadDoc surface. Null heads deliberately read
+// the raw current view, including held pending operations.
 //
 // ## `merge` returns the heads and they are freed
 //
@@ -1953,13 +1932,10 @@ fn spliceScalars(
 // run. `fork` allocates that actor from the **fork's own** arena, which
 // [`Document.deinit`](../src/doc.zig) frees, so nothing is leaked either way.
 //
-// ## `doc.commit()` has no separate spelling
+// ## Explicit commits preserve reference change boundaries
 //
-// Upstream's two `AutoCommit` cases here call `doc.commit()` between writes to
-// bound a change. The port's autocommit door opens, writes and commits on
-// every call ([`transact.zig`](../src/transact.zig):2581-2596), so the same
-// three changes come out with no `commit` to call. **The change boundaries are
-// the same and nothing observable in either case reads them.**
+// The map-key-in-text regression commits before and after its zero-width mark,
+// matching `batch_insert.rs`:1041,1049. Ordinary reads do not commit setup writes.
 //
 // ## Two gaps, both named at their place above
 //

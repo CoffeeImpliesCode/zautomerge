@@ -374,7 +374,7 @@ pub const Anonymize = struct {
         defer changes.deinit(self.gpa);
         try self.buildActorMap(changes.slice());
 
-        var out = try Document.initWithEncoding(self.gpa, document.io, document.textEncoding(), document.documentMode());
+        var out = try Document.initWithEncoding(self.gpa, document.io, document.textEncoding());
         // **On failure nothing has moved into `out` that `out` does not own**:
         // every change is applied, and a failure inside `applyChanges` frees
         // what it copied. So this one `errdefer` is right and needs no second
@@ -909,7 +909,7 @@ pub const Anonymize = struct {
         defer changes.deinit(self.gpa);
         try self.buildActorMap(changes.slice());
 
-        var out = try Document.initWithEncoding(self.gpa, document.io, document.textEncoding(), document.documentMode());
+        var out = try Document.initWithEncoding(self.gpa, document.io, document.textEncoding());
         errdefer out.deinit();
 
         for (changes.slice()) |built| {
@@ -2993,7 +2993,7 @@ const messages = [_][]const u8{ "private-message", "second private message", "th
 /// at [`fuzz.rs:34-64`](../../github-automerge-automerge/rust/automerge/src/anonymize/fuzz.rs)):
 /// a list, a text object and a counter, and a commit that carries a message.
 fn buildFuzzBase(gpa: Allocator, actor: []const u8) !struct { doc: Document, head: ChangeHash, list: ExId, text: ExId } {
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     const idx = try doc.putActorRef(gpa, .{ .bytes = actor });
     const list = ExId{ .id = OpId.init(1, idx) };
@@ -3023,16 +3023,12 @@ fn buildFuzzBase(gpa: Allocator, actor: []const u8) !struct { doc: Document, hea
 /// The eleven opcodes are each a test in their own right below.
 /// A second copy of a document, loaded from its own saved bytes.
 ///
-/// **Through `save` and [`Document.load`] and not [`Document.fork`].** A fork
-/// mints a fresh actor id from the allocator and hands the bytes to the new
-/// document as an opaque actor the document never frees
-/// ([`doc.zig:3796-3801`](doc.zig)), so every fork is a leak — and a fixture
-/// that wants three replicas wants two of them. A reload is what a peer does,
-/// and it costs this fixture nothing the fork would have given it.
+/// Reload through `save` and `Document.load` to exercise the peer's serialized
+/// path while preserving the source actor and text encoding.
 fn loadCopy(gpa: Allocator, source: *Document) !Document {
     const bytes = try source.save(gpa);
     defer gpa.free(bytes);
-    return Document.load(gpa, std.testing.io, bytes, source.textEncoding(), .auto);
+    return Document.load(gpa, std.testing.io, bytes, source.textEncoding());
 }
 
 fn documentFromProgram(gpa: Allocator, program: []const u8) !Document {
@@ -3074,7 +3070,7 @@ fn documentFromProgram(gpa: Allocator, program: []const u8) !Document {
     // Merge the replicas into the first, the way `fuzz.rs:58-61` does, so the
     // document under test holds concurrent edits from three actors.
     for (replicas[1..]) |other| {
-        var incoming = try other.clone(gpa, .auto);
+        var incoming = try other.clone(gpa);
         defer incoming.deinit();
         const merged = try doc.merge(gpa, &incoming);
         defer gpa.free(merged);
@@ -3106,7 +3102,7 @@ fn runInstruction(
     if (opcode == 9) {
         const from = @as(usize, a) % replicas.len;
         if (from == who) return;
-        var incoming = try replicas[from].clone(gpa, .auto);
+        var incoming = try replicas[from].clone(gpa);
         defer incoming.deinit();
         // **The merged document's heads are returned to the caller to free**,
         // and discarding them is a leak, not a style question.
@@ -3395,9 +3391,11 @@ fn appendLiveElements(
     obj: ExId,
     out: *std.ArrayList(OpId),
 ) !void {
+    const counter = obj.counter() orelse return error.MissingKey;
+    const actor = obj.actor() orelse return error.MissingActor;
     for (rows.rows) |row| {
         if (row.obj != .id) continue;
-        if (row.obj.id.counter != obj.id.counter or row.obj.id.actor != obj.id.actor) continue;
+        if (row.obj.id.counter != counter or row.obj.id.actor != actor) continue;
         switch (row.action) {
             .set => if (row.insert) try out.append(gpa, row.id),
             .delete => {
@@ -3725,7 +3723,7 @@ fn keepValue(a: Allocator, v: ScalarValue) !ScalarValue {
 /// | 27 | the second actor inserting into the first actor's list | a change with an `other_actors` entry |
 /// | 28 | the second actor writing the shared key into the map | key consistency across actors too |
 fn buildRich(gpa: Allocator) !Document {
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     const a = try doc.putActorRef(gpa, .{ .bytes = actor_a });
     const b = try doc.putActorRef(gpa, .{ .bytes = actor_b });
@@ -3815,7 +3813,7 @@ fn buildRich(gpa: Allocator) !Document {
 /// is a document but not *this* document: there is no second operation to
 /// cross-check the shape against, and no object to carry a key's consistency.
 fn buildBareScalar(gpa: Allocator, value: ScalarValue) !Document {
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     _ = try applySpec(gpa, &doc, .{
         .actor = actor_a,
@@ -3858,7 +3856,7 @@ fn richPair(gpa: Allocator, seed: [seed_length]u8) !Pair {
     const built_bytes = try built.save(gpa);
     defer gpa.free(built_bytes);
 
-    var source = try Document.load(gpa, std.testing.io, built_bytes, built.textEncoding(), .auto);
+    var source = try Document.load(gpa, std.testing.io, built_bytes, built.textEncoding());
     errdefer source.deinit();
     const source_bytes = try source.save(gpa);
     errdefer gpa.free(source_bytes);
@@ -3893,7 +3891,7 @@ test "an anonymized document with a map, a nested map, a list, text, a counter, 
     var pair = try richPair(gpa, @splat(7));
     defer pair.deinit(gpa);
 
-    var loaded = try Document.load(gpa, std.testing.io, pair.anonymized_bytes, pair.anonymized.textEncoding(), .auto);
+    var loaded = try Document.load(gpa, std.testing.io, pair.anonymized_bytes, pair.anonymized.textEncoding());
     defer loaded.deinit();
     try testing.expect(!loaded.isEmpty());
     // The reloaded document is the same document the rewrite produced, which is
@@ -4079,7 +4077,7 @@ test "a deleted key stays deleted, and a conflicted register's conflict is prese
 /// every field a rule looks at, so a test that puts one field back is the only
 /// thing wrong.
 fn oneChange(gpa: Allocator, spec: ChangeSpec) !Document {
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     _ = try applySpec(gpa, &doc, spec);
     return doc;
@@ -5157,7 +5155,7 @@ test "the same seed rewrites the same document the same way, and a different see
     defer built.deinit();
     const built_bytes = try built.save(gpa);
     defer gpa.free(built_bytes);
-    var source = try Document.load(gpa, std.testing.io, built_bytes, built.textEncoding(), .auto);
+    var source = try Document.load(gpa, std.testing.io, built_bytes, built.textEncoding());
     defer source.deinit();
 
     var first = try anonymize(gpa, &source, @splat(7));
@@ -5254,11 +5252,13 @@ test "the rewrite keeps every change's position and dependencies and replaces it
 
 /// The next `Str` value inserted into `obj`, advancing `cursor` past it.
 fn nextTextValue(rows: *const OpRows, obj: ExId, cursor: *usize) !?[]const u8 {
+    const counter = obj.counter() orelse return error.MissingKey;
+    const actor = obj.actor() orelse return error.MissingActor;
     while (cursor.* < rows.rows.len) {
         const row = rows.rows[cursor.*];
         cursor.* += 1;
         if (row.obj != .id) continue;
-        if (row.obj.id.counter != obj.id.counter or row.obj.id.actor != obj.id.actor) continue;
+        if (row.obj.id.counter != counter or row.obj.id.actor != actor) continue;
         if (!row.insert) continue;
         return switch (row.value) {
             .str => |s| s,
@@ -5480,7 +5480,7 @@ const many_author_b = "private author two";
 /// arrives.
 fn buildManyChanges(gpa: Allocator, count: usize, payload_len: usize) !Document {
     std.debug.assert(payload_len <= many_payload_max);
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
 
     var key_buf: [12]u8 = @splat(0);

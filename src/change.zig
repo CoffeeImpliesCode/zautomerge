@@ -2,8 +2,8 @@
 //!
 //! A change is the unit of causality. It names the changes it depends on, the
 //! actor that authored it, where its op counters start, and its ops. The ops
-//! are columnar and belong to the columnar layer; this module owns the fixed
-//! header in front of them and the identity that goes with it.
+//! are columnar; the borrowed header view and independent expanded records
+//! share the existing document column encoder/decoder rather than a second codec.
 //!
 //! A change chunk is `[4 magic][4 checksum][1 type][uleb len][body]`, and the
 //! change hash is `SHA-256(type || uleb(len) || body)`
@@ -42,17 +42,17 @@
 //! * `time` is **signed**. A timestamp before 1970 is a negative sleb128, and
 //!   writing it as uleb128 changes the change hash.
 //!
-//! ## What this module does not decode
+//! ## Borrowed parsing and owned decoding
 //!
 //! `parseChange` reads the header and leaves the op columns where they are.
 //! The op count is not in the header — it is the row count of the columns —
-//! so `max_op` is not knowable here and stays 0 until `withOpCount` is called
-//! by whoever decodes the columns. Upstream reaches the same value by walking
-//! the ops (`Change::max_op`, `change.rs:74-76`).
+//! so a header-only parse leaves `max_op` at 0 until `withOpCount` is called.
+//! `Change.decode` builds an independent ExpandedChange, while `fromBytes`
+//! validates all operations and returns an owned body with its count filled in.
 //!
-//! For the same reason the author footer — everything after the op data,
-//! `uleb(1) || uleb(len) || bytes` (`change.rs:365-403`) — is left inside
-//! `bytes` rather than split out: where it starts needs the op data length.
+//! The complete author footer remains in the borrowed body; `extraBytes` locates
+//! it without retaining decoded ops. ExpandedChange owns these opaque bytes and
+//! preserves them verbatim; its parsed `author` is informational, as in Rust.
 
 const std = @import("std");
 const err = @import("error.zig");
@@ -60,6 +60,10 @@ const types = @import("types.zig");
 const leb128 = @import("leb128.zig");
 const parse = @import("storage/parse.zig");
 const chunk = @import("storage/chunk.zig");
+const changechunk = @import("storage/change_chunk.zig");
+const doccodec = @import("doc.zig");
+const opmod = @import("opset/op.zig");
+const value = @import("value.zig");
 
 const ParseError = err.ParseError;
 const Allocator = std.mem.Allocator;
@@ -177,12 +181,11 @@ pub const Change = struct {
     /// they go straight to [`ChangeMetadata.fromChange`](ChangeMetadata.fromChange),
     /// which borrows rather than copies.
     pub fn withOpCount(self: Change, num_ops: u64) ParseError!Change {
-        if (self.start_op > std.math.maxInt(u32)) return error.Overflow;
+        if (self.start_op == 0 or self.start_op > std.math.maxInt(u32))
+            return error.Overflow;
         var next = self;
-        next.max_op = if (num_ops == 0)
-            self.start_op - 1
-        else
-            self.start_op + (num_ops - 1);
+        next.max_op = if (num_ops == 0) self.start_op - 1 else std.math.add(u64, self.start_op, num_ops - 1) catch return error.Overflow;
+        if (next.max_op > std.math.maxInt(u32)) return error.Overflow;
         return next;
     }
 
@@ -236,6 +239,9 @@ pub const Change = struct {
         return out.toOwnedSlice(gpa);
     }
 
+    /// Display allocation and checked hexadecimal output-size failures.
+    pub const DisplayError = Allocator.Error || error{Overflow};
+
     /// A short form for an error message: the hash prefix, the author, the
     /// sequence number, the op range, and the message.
     ///
@@ -244,7 +250,7 @@ pub const Change = struct {
     /// is formatted into a new buffer and borrows nothing from the change.
     /// The intermediate actor hex the format needs is freed here, so the one
     /// allocation that reaches the caller is the string itself.
-    pub fn debugString(self: Change, gpa: Allocator) Allocator.Error![]u8 {
+    pub fn debugString(self: Change, gpa: Allocator) DisplayError![]u8 {
         // Eight hex digits is enough to find the change in a hash set and
         // short enough to keep an error readable.
         var hash_prefix: [16]u8 = undefined;
@@ -254,6 +260,150 @@ pub const Change = struct {
         return std.fmt.allocPrint(gpa, "change {s} by {s} seq {d} ops {d}-{d} at {d}: {s}", .{
             hash_prefix[0..8], actor_hex, self.seq, self.start_op, self.max_op, self.time, self.message,
         });
+    }
+
+    /// The individual footer's author bytes, borrowed from `bytes`. Malformed,
+    /// unknown and absent footers return null, as Rust's accessor does.
+    /// Column parsing errors and allocation failure remain typed errors.
+    pub fn author(self: Change, gpa: Allocator) ParseError!?[]const u8 {
+        return doccodec.decodeAuthorFooter(try self.extraBytes(gpa)) catch null;
+    }
+
+    /// The complete opaque footer, borrowed from the original body.
+    pub fn extraBytes(self: Change, gpa: Allocator) ParseError![]const u8 {
+        var parsed = try changechunk.parseChangeChunkWithHash(self.bytes, gpa, self.hash);
+        defer parsed.deinit(gpa);
+        return parsed.footer;
+    }
+
+    /// Number of operation rows, not columns. No decoded operations are cached.
+    pub fn len(self: Change, gpa: Allocator) ParseError!usize {
+        var parsed = try changechunk.parseChangeChunkWithHash(self.bytes, gpa, self.hash);
+        defer parsed.deinit(gpa);
+        return parsed.opCount();
+    }
+
+    /// Whether the change contains no operations.
+    pub fn isEmpty(self: Change, gpa: Allocator) ParseError!bool {
+        return (try self.len(gpa)) == 0;
+    }
+
+    /// An independent uncompressed, framed byte buffer. Release with `gpa.free`.
+    pub fn rawBytes(self: Change, gpa: Allocator) Allocator.Error![]u8 {
+        return self.encode(gpa);
+    }
+
+    /// An independent framed buffer, compressed above Rust's 256-byte cutoff.
+    /// Release with `gpa.free`; no cache mutates this borrowed header view.
+    pub fn compressedBytes(self: Change, gpa: Allocator) Allocator.Error![]u8 {
+        const raw_len = 9 + leb128.unsignedSize(self.bytes.len) + self.bytes.len;
+        // storage/change.rs:17,295-301 tests the complete uncompressed chunk size.
+        if (raw_len <= 256) return self.encode(gpa);
+        var compressed: std.ArrayList(u8) = .empty;
+        defer compressed.deinit(gpa);
+        try chunk.compressChunk(&compressed, gpa, self.bytes);
+        return compressed.toOwnedSlice(gpa);
+    }
+
+    /// Independent actor bytes, author first, then referenced actors in wire order.
+    /// Release each `actor.bytes` and then the array with `gpa.free`.
+    pub fn actorsOwned(self: Change, gpa: Allocator) Allocator.Error![]ActorId {
+        const actors = try gpa.alloc(ActorId, self.other_actors.len + 1);
+        errdefer gpa.free(actors);
+        var filled: usize = 0;
+        errdefer for (actors[0..filled]) |actor_id| gpa.free(actor_id.bytes);
+        actors[0] = .{ .bytes = try gpa.dupe(u8, self.actor.bytes) };
+        filled = 1;
+        for (self.other_actors, 1..) |actor_id, i| {
+            actors[i] = .{ .bytes = try gpa.dupe(u8, actor_id.bytes) };
+            filled += 1;
+        }
+        return actors;
+    }
+
+    /// Parses exactly one framed raw/compressed change into an independent owner.
+    /// The returned `Built` must be released once with `deinit(gpa)`.
+    pub fn fromBytes(gpa: Allocator, bytes: []const u8) ParseError!doccodec.Built {
+        const framed = try chunk.parseChunk(bytes);
+        const owned: chunk.Inflated = switch (framed.typ) {
+            .change => blk: {
+                const hash = framed.hash orelse return error.InvalidChecksum;
+                break :blk .{ .body = try gpa.dupe(u8, framed.data), .hash = hash };
+            },
+            .compressed => try chunk.decompressChunkWithHash(gpa, framed),
+            else => return error.InvalidChunkType,
+        };
+        errdefer gpa.free(owned.body);
+        var parsed = try parseChangeWithHash(owned.body, gpa, owned.hash);
+        errdefer parsed.deinit(gpa);
+        const decoded = try decodeOps(gpa, parsed);
+        defer {
+            for (decoded) |*op| op.deinit(gpa);
+            gpa.free(decoded);
+        }
+        parsed = try parsed.withOpCount(decoded.len);
+        return .{ .body = owned.body, .change = parsed };
+    }
+
+    /// Decodes using the document's existing column codec. The result owns every
+    /// payload and actor byte and survives this view and its source bytes.
+    pub fn decode(self: Change, gpa: Allocator) ParseError!ExpandedChange {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+        const actors = try alloc.alloc(ActorId, self.other_actors.len + 1);
+        actors[0] = .{ .bytes = try alloc.dupe(u8, self.actor.bytes) };
+        for (self.other_actors, 1..) |actor_id, i|
+            actors[i] = .{ .bytes = try alloc.dupe(u8, actor_id.bytes) };
+        const decoded = try decodeOps(gpa, self);
+        defer {
+            for (decoded) |*op| op.deinit(gpa);
+            gpa.free(decoded);
+        }
+        _ = try self.withOpCount(decoded.len);
+        const ops = try alloc.alloc(ExpandedOp, decoded.len);
+        for (decoded, ops) |*op, *expanded| {
+            const preds = try alloc.alloc(ExpandedOpId, op.pred().len);
+            for (op.pred(), preds) |pred, *target|
+                target.* = try expandId(pred, actors);
+            expanded.* = .{
+                .action = try cloneAction(alloc, try value.opTypeFromActionAndValue(
+                    op.action(),
+                    op.value(),
+                    op.markName(),
+                    op.expand(),
+                )),
+                .obj = if (op.obj()) |id| .{ .id = try expandId(id, actors) } else .root,
+                .key = switch (op.key()) {
+                    .map => |key| .{ .map = try alloc.dupe(u8, key) },
+                    .seq => |element| .{ .seq = if (element.id.counter == 0)
+                        .head
+                    else
+                        .{ .id = try expandId(element.id, actors) } },
+                },
+                .pred = preds,
+                .insert = op.insert(),
+            };
+        }
+        const footer = try self.extraBytes(gpa);
+        const extra = try alloc.dupe(u8, footer);
+        const message = if (self.message.len == 0) null else try alloc.dupe(u8, self.message);
+        const deps = try alloc.dupe(ChangeHash, self.deps);
+        const owner = try gpa.create(std.heap.ArenaAllocator);
+        owner.* = arena;
+        return .{
+            .ops = ops,
+            .actor = actors[0],
+            .hash = self.hash,
+            .seq = self.seq,
+            .start_op = self.start_op,
+            .time = self.time,
+            .message = message,
+            .deps = deps,
+            .extra_bytes = extra,
+            .author = doccodec.decodeAuthorFooter(extra) catch null,
+            .storage = owner,
+        };
     }
 
     /// Frees the actor array `parseChange` allocated. Everything else in the
@@ -267,14 +417,602 @@ pub const Change = struct {
     }
 };
 
+/// An actor-byte operation identity, independent of any document actor table.
+/// Byte slices borrow the containing ExpandedChange or standalone owned operation.
+pub const ExpandedOpId = struct {
+    counter: u64,
+    actor: ActorId,
+
+    /// Serializes a stable counter@actor identity, independent of actor indices.
+    pub fn jsonStringify(self: ExpandedOpId, jws: anytype) !void {
+        try jws.beginWriteRaw();
+        try jws.writer.print("\"{d}@", .{self.counter});
+        for (self.actor.bytes) |byte| try jws.writer.print("{x:0>2}", .{byte});
+        try jws.writer.writeByte('"');
+        jws.endWriteRaw();
+    }
+};
+
+/// A structured legacy operation. `dup` creates a standalone independent owner;
+/// decoded operations are owned together by ExpandedChange. Literal inputs borrow
+/// their payloads. Shallow copies never create an additional disposal obligation.
+pub const ExpandedOp = struct {
+    action: value.OpType,
+    obj: ObjectId,
+    key: Key,
+    pred: []const ExpandedOpId,
+    insert: bool = false,
+    /// Null for literals and operations owned by a parent change.
+    storage: ?*std.heap.ArenaAllocator = null,
+
+    pub const ObjectId = union(enum) { root, id: ExpandedOpId };
+    pub const ElementId = union(enum) { head, id: ExpandedOpId };
+    pub const Key = union(enum) { map: []const u8, seq: ElementId };
+
+    /// Deep independent copy. Release once with `deinit` using the same allocator.
+    pub fn dup(self: ExpandedOp, gpa: Allocator) Allocator.Error!ExpandedOp {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        var result = try cloneExpandedOp(arena.allocator(), self);
+        const storage = try gpa.create(std.heap.ArenaAllocator);
+        storage.* = arena;
+        result.storage = storage;
+        return result;
+    }
+
+    /// Releases only this standalone owner; parent-owned/literal views own nothing.
+    pub fn deinit(self: *ExpandedOp, gpa: Allocator) void {
+        if (self.storage) |storage| {
+            storage.deinit();
+            gpa.destroy(storage);
+        }
+        self.* = undefined;
+    }
+
+    /// Rust legacy Operation JSON fields, including datatype and elemId.
+    pub fn jsonStringify(self: ExpandedOp, jws: anytype) !void {
+        try jws.beginObject();
+        try jws.objectField("action");
+        try jws.write(actionName(self.action));
+        try jws.objectField("obj");
+        switch (self.obj) {
+            .root => try jws.write("_root"),
+            .id => |id| try id.jsonStringify(jws),
+        }
+        switch (self.key) {
+            .map => |key| {
+                try jws.objectField("key");
+                try jws.write(key);
+            },
+            .seq => |element| {
+                try jws.objectField("elemId");
+                switch (element) {
+                    .head => try jws.write("_head"),
+                    .id => |id| try id.jsonStringify(jws),
+                }
+            },
+        }
+        if (self.insert) {
+            try jws.objectField("insert");
+            try jws.write(true);
+        }
+        switch (self.action) {
+            .put => |scalar| {
+                const datatype: ?[]const u8 = switch (scalar) {
+                    .int => "int",
+                    .uint => "uint",
+                    .float => "float64",
+                    .counter => "counter",
+                    .timestamp => "timestamp",
+                    else => null,
+                };
+                if (datatype) |name| {
+                    try jws.objectField("datatype");
+                    try jws.write(name);
+                }
+                try jws.objectField("value");
+                try jws.write(scalar);
+            },
+            .increment => |amount| {
+                try jws.objectField("value");
+                try jws.write(amount);
+            },
+            .mark_begin => |mark| {
+                try jws.objectField("name");
+                try jws.write(mark.name);
+                try jws.objectField("value");
+                try jws.write(mark.value);
+                try jws.objectField("expand");
+                try jws.write(mark.expand);
+            },
+            .mark_end => |mark| {
+                try jws.objectField("expand");
+                try jws.write(mark.expand);
+            },
+            else => {},
+        }
+        try jws.objectField("pred");
+        try jws.beginArray();
+        for (self.pred) |id| try id.jsonStringify(jws);
+        try jws.endArray();
+        try jws.endObject();
+    }
+
+    /// JSON parser allocations belong to the std.json Parsed owner, not this view.
+    pub fn jsonParse(gpa: Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!ExpandedOp {
+        var raw_options = options;
+        raw_options.parse_numbers = false;
+        return jsonParseFromValue(
+            gpa,
+            try std.json.innerParse(std.json.Value, gpa, source, raw_options),
+            options,
+        );
+    }
+
+    /// Parses the exact legacy field names and validates action/datatype combinations.
+    pub fn jsonParseFromValue(gpa: Allocator, source: std.json.Value, options: std.json.ParseOptions) std.json.ParseFromValueError!ExpandedOp {
+        if (source != .object) return error.UnexpectedToken;
+        var fields = source.object.iterator();
+        while (fields.next()) |field| {
+            const name = field.key_ptr.*;
+            const known = [_][]const u8{
+                "action",   "obj",   "key",  "elemId", "pred", "insert",
+                "datatype", "value", "name", "expand", "ref",
+            };
+            var found = false;
+            for (known) |candidate| {
+                if (std.mem.eql(u8, name, candidate)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.UnknownField;
+        }
+        const action = try jsonString(try jsonRequired(source, "action"));
+        const object = try jsonString(try jsonRequired(source, "obj"));
+        const obj: ObjectId = if (std.mem.eql(u8, object, "_root")) .root else .{ .id = try parseExpandedId(gpa, object) };
+        if (source.object.get("ref")) |reference|
+            _ = try parseExpandedId(gpa, try jsonString(reference));
+        const map_key = source.object.get("key");
+        const seq_key = source.object.get("elemId");
+        if (map_key != null and seq_key != null) return error.DuplicateField;
+        const key: Key = if (map_key) |map| .{ .map = try gpa.dupe(u8, try jsonString(map)) } else if (seq_key) |seq| blk: {
+            const text = try jsonString(seq);
+            break :blk .{ .seq = if (std.mem.eql(u8, text, "_head"))
+                .head
+            else
+                .{ .id = try parseExpandedId(gpa, text) } };
+        } else return error.MissingField;
+        const predecessor_values = try jsonRequired(source, "pred");
+        if (predecessor_values != .array) return error.UnexpectedToken;
+        const preds = try gpa.alloc(ExpandedOpId, predecessor_values.array.items.len);
+        for (predecessor_values.array.items, preds) |item, *id|
+            id.* = try parseExpandedId(gpa, try jsonString(item));
+        // Rust SortedVec deserialization sorts by counter, then actor bytes.
+        std.mem.sort(ExpandedOpId, preds, {}, expandedIdLessThan);
+        const insert = if (source.object.get("insert")) |flag|
+            try jsonBool(flag)
+        else
+            false;
+        const expand = if (source.object.get("expand")) |flag|
+            try jsonBool(flag)
+        else
+            false;
+        const resolved: value.OpType = if (std.mem.eql(u8, action, "makeMap"))
+            .{ .make = .map }
+        else if (std.mem.eql(u8, action, "makeTable")) .{ .make = .table } else if (std.mem.eql(u8, action, "makeList")) .{ .make = .list } else if (std.mem.eql(u8, action, "makeText")) .{ .make = .text } else if (std.mem.eql(u8, action, "del")) .delete else if (std.mem.eql(u8, action, "set"))
+            .{ .put = try jsonOpScalar(gpa, source, options) }
+        else if (std.mem.eql(u8, action, "inc")) blk: {
+            const scalar = try value.ScalarValue.jsonParseFromValue(
+                gpa,
+                try jsonRequired(source, "value"),
+                options,
+            );
+            break :blk .{ .increment = scalar.asI64() orelse
+                return error.UnexpectedToken };
+        } else if (std.mem.eql(u8, action, "markBegin")) .{ .mark_begin = .{
+            .name = try gpa.dupe(u8, try jsonString(try jsonRequired(source, "name"))),
+            .value = try jsonOpScalar(gpa, source, options),
+            .expand = expand,
+        } } else if (std.mem.eql(u8, action, "markEnd"))
+            .{ .mark_end = .{ .expand = expand } }
+        else
+            return error.InvalidEnumTag;
+        return .{ .action = resolved, .obj = obj, .key = key, .pred = preds, .insert = insert };
+    }
+};
+
+/// Owned structured legacy change, with no document or persistent decoded op set.
+/// `decode`/`dup` own their arena and are released once with `deinit(gpa)`.
+/// Literals borrow inputs. std.json parsing instead borrows its Parsed arena:
+/// release the Parsed wrapper, not its value. Assignment is not a deep copy.
+pub const ExpandedChange = struct {
+    ops: []const ExpandedOp,
+    actor: ActorId,
+    /// Informational computed hash. Encoding always recomputes identity.
+    hash: ?ChangeHash = null,
+    seq: u64,
+    start_op: u64,
+    time: i64,
+    /// Null and empty messages encode identically.
+    message: ?[]const u8,
+    deps: []const ChangeHash,
+    /// Authoritative complete footer, including unknown/trailing bytes.
+    extra_bytes: []const u8 = &.{},
+    /// Informational parsed author; ignored when encoding, exactly as Rust.
+    author: ?[]const u8 = null,
+    /// Null for borrowed literals and std.json Parsed arena views.
+    storage: ?*std.heap.ArenaAllocator = null,
+
+    /// Releases this independent decode/dup owner and invalidates every payload.
+    pub fn deinit(self: *ExpandedChange, gpa: Allocator) void {
+        if (self.storage) |storage| {
+            storage.deinit();
+            gpa.destroy(storage);
+        }
+        self.* = undefined;
+    }
+
+    /// Deep independent copy, including operation IDs, scalar and footer bytes.
+    pub fn dup(self: ExpandedChange, gpa: Allocator) Allocator.Error!ExpandedChange {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+        var result = self;
+        const ops = try alloc.alloc(ExpandedOp, self.ops.len);
+        for (self.ops, ops) |op, *target| target.* = try cloneExpandedOp(alloc, op);
+        result.ops = ops;
+        result.actor = .{ .bytes = try alloc.dupe(u8, self.actor.bytes) };
+        result.message = if (self.message) |message| try alloc.dupe(u8, message) else null;
+        result.deps = try alloc.dupe(ChangeHash, self.deps);
+        result.extra_bytes = try alloc.dupe(u8, self.extra_bytes);
+        result.author = if (self.author) |author_bytes|
+            try alloc.dupe(u8, author_bytes)
+        else
+            null;
+        const storage = try gpa.create(std.heap.ArenaAllocator);
+        storage.* = arena;
+        result.storage = storage;
+        return result;
+    }
+
+    /// Encodes through the same column codec used by Document commits. Inputs
+    /// remain borrowed; the returned body/header pair owns its storage.
+    /// Footer bytes are authoritative; hash and author never alter encoding.
+    pub fn encode(self: ExpandedChange, gpa: Allocator) doccodec.DocumentError!doccodec.Built {
+        if (self.start_op == 0 or self.start_op > std.math.maxInt(u32))
+            return error.Overflow;
+        const max_op = if (self.ops.len == 0) self.start_op - 1 else std.math.add(u64, self.start_op, self.ops.len - 1) catch return error.Overflow;
+        if (max_op > std.math.maxInt(u32)) return error.Overflow;
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var actors: std.ArrayList(ActorId) = .empty;
+        try actors.append(scratch, self.actor);
+        for (self.ops) |op| {
+            switch (op.obj) {
+                .root => {},
+                .id => |id| try addActor(scratch, &actors, id.actor),
+            }
+            switch (op.key) {
+                .map => {},
+                .seq => |element| switch (element) {
+                    .head => {},
+                    .id => |id| try addActor(scratch, &actors, id.actor),
+                },
+            }
+            for (op.pred) |id| try addActor(scratch, &actors, id.actor);
+        }
+        std.mem.sort(ActorId, actors.items, {}, actorLessThan);
+        const author_index = try actorIndex(actors.items, self.actor);
+        const ops = try scratch.alloc(opmod.ChangeOp, self.ops.len);
+        for (self.ops, ops, 0..) |op, *target, i| {
+            const decomposed = opmod.decompose(op.action);
+            const preds = try scratch.alloc(types.OpId, op.pred.len);
+            for (op.pred, preds, 0..) |id, *pred, j| {
+                if (j > 0 and expandedIdLessThan({}, id, op.pred[j - 1]))
+                    return error.InvalidValue;
+                pred.* = try compactId(id, actors.items);
+            }
+            target.* = try opmod.ChangeOp.init(
+                scratch,
+                types.OpId.init(@intCast(self.start_op + i), author_index),
+                switch (op.obj) {
+                    .root => .root,
+                    .id => |id| .{ .id = try compactId(id, actors.items) },
+                },
+                decomposed.action,
+                switch (op.key) {
+                    .map => |key| .{ .map = key },
+                    .seq => |element| .{ .seq = switch (element) {
+                        .head => types.ElemId.head(),
+                        .id => |id| types.ElemId.fromOpId(try compactId(id, actors.items)),
+                    } },
+                },
+                decomposed.value,
+                op.insert,
+                decomposed.expand,
+                decomposed.mark_name,
+                preds,
+            );
+        }
+        const deps = try scratch.dupe(ChangeHash, self.deps);
+        std.mem.sort(ChangeHash, deps, {}, hashLessThan);
+        return doccodec.encodeOneChange(gpa, actors.items, .{
+            .actor = author_index,
+            .seq = self.seq,
+            .start_op = self.start_op,
+            .max_op = max_op,
+            .time = self.time,
+            .message = self.message orelse "",
+            .deps = deps,
+            .footer = self.extra_bytes,
+        }, ops);
+    }
+
+    /// Rust legacy Change JSON, not a serialization of implementation storage.
+    pub fn jsonStringify(self: ExpandedChange, jws: anytype) !void {
+        try jws.beginObject();
+        try jws.objectField("ops");
+        try jws.write(self.ops);
+        try jws.objectField("actor");
+        try jws.write(self.actor);
+        if (self.hash) |hash| {
+            try jws.objectField("hash");
+            try jws.write(hash);
+        }
+        try jws.objectField("seq");
+        try jws.write(self.seq);
+        try jws.objectField("startOp");
+        try jws.write(self.start_op);
+        try jws.objectField("time");
+        try jws.write(self.time);
+        try jws.objectField("message");
+        try jws.write(self.message);
+        try jws.objectField("deps");
+        try jws.write(self.deps);
+        if (self.extra_bytes.len != 0) {
+            try jws.objectField("extra_bytes");
+            try jws.beginArray();
+            for (self.extra_bytes) |byte| try jws.write(byte);
+            try jws.endArray();
+        }
+        if (self.author) |author_bytes| {
+            try jws.objectField("author");
+            try jws.beginWriteRaw();
+            try jws.writer.writeByte('"');
+            for (author_bytes) |byte| try jws.writer.print("{x:0>2}", .{byte});
+            try jws.writer.writeByte('"');
+            jws.endWriteRaw();
+        }
+        try jws.endObject();
+    }
+
+    /// Token parser using the standard Parsed arena ownership convention.
+    pub fn jsonParse(gpa: Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!ExpandedChange {
+        var raw_options = options;
+        raw_options.parse_numbers = false;
+        return jsonParseFromValue(
+            gpa,
+            try std.json.innerParse(std.json.Value, gpa, source, raw_options),
+            options,
+        );
+    }
+
+    /// Parses legacy field names. Unknown change fields are ignored as Rust does.
+    pub fn jsonParseFromValue(gpa: Allocator, source: std.json.Value, options: std.json.ParseOptions) std.json.ParseFromValueError!ExpandedChange {
+        if (source != .object) return error.UnexpectedToken;
+        const start_op = try std.json.innerParseFromValue(
+            u64,
+            gpa,
+            try jsonRequired(source, "startOp"),
+            options,
+        );
+        if (start_op == 0) return error.InvalidNumber;
+        const actor_bytes = err.hexFrom(gpa, try jsonString(
+            try jsonRequired(source, "actor"),
+        )) catch |e| return jsonCodecError(e);
+        const operation_values = try jsonRequired(source, "ops");
+        if (operation_values != .array) return error.UnexpectedToken;
+        const ops = try gpa.alloc(ExpandedOp, operation_values.array.items.len);
+        for (operation_values.array.items, ops) |item, *op|
+            op.* = try ExpandedOp.jsonParseFromValue(gpa, item, options);
+        const deps = try std.json.innerParseFromValue(
+            []const ChangeHash,
+            gpa,
+            try jsonRequired(source, "deps"),
+            options,
+        );
+        const message_value = source.object.get("message") orelse .null;
+        const message = if (message_value == .null) null else try gpa.dupe(u8, try jsonString(message_value));
+        return .{
+            .ops = ops,
+            .actor = .{ .bytes = actor_bytes },
+            .start_op = start_op,
+            .seq = try std.json.innerParseFromValue(
+                u64,
+                gpa,
+                try jsonRequired(source, "seq"),
+                options,
+            ),
+            .time = try std.json.innerParseFromValue(
+                i64,
+                gpa,
+                try jsonRequired(source, "time"),
+                options,
+            ),
+            .message = message,
+            .deps = deps,
+            .hash = if (source.object.get("hash")) |hash|
+                try std.json.innerParseFromValue(?ChangeHash, gpa, hash, options)
+            else
+                null,
+            .extra_bytes = if (source.object.get("extra_bytes")) |extra|
+                try jsonByteArray(gpa, extra, options)
+            else
+                &.{},
+            .author = if (source.object.get("author")) |author_bytes|
+                if (author_bytes == .null) null else err.hexFrom(gpa, try jsonString(author_bytes)) catch |e|
+                    return jsonCodecError(e)
+            else
+                null,
+        };
+    }
+};
+
+fn decodeOps(gpa: Allocator, change: Change) ParseError![]opmod.ChangeOp {
+    const indices = try gpa.alloc(types.ActorIdx, change.other_actors.len + 1);
+    defer gpa.free(indices);
+    for (indices, 0..) |*index, i|
+        index.* = std.math.cast(types.ActorIdx, i) orelse return error.Overflow;
+    return doccodec.decodeChangeOps(gpa, change, indices);
+}
+
+fn jsonByteArray(gpa: Allocator, source: std.json.Value, options: std.json.ParseOptions) std.json.ParseFromValueError![]const u8 {
+    if (source != .array) return error.UnexpectedToken;
+    for (source.array.items) |item| {
+        if (item != .integer and item != .number_string) return error.UnexpectedToken;
+    }
+    return std.json.innerParseFromValue([]const u8, gpa, source, options);
+}
+
+fn jsonCodecError(e: anyerror) std.json.ParseFromValueError {
+    return if (e == error.OutOfMemory) error.OutOfMemory else error.UnexpectedToken;
+}
+
+fn jsonRequired(source: std.json.Value, name: []const u8) std.json.ParseFromValueError!std.json.Value {
+    return source.object.get(name) orelse error.MissingField;
+}
+
+fn jsonString(source: std.json.Value) std.json.ParseFromValueError![]const u8 {
+    return if (source == .string) source.string else error.UnexpectedToken;
+}
+
+fn jsonBool(source: std.json.Value) std.json.ParseFromValueError!bool {
+    return if (source == .bool) source.bool else error.UnexpectedToken;
+}
+
+fn parseExpandedId(gpa: Allocator, text: []const u8) std.json.ParseFromValueError!ExpandedOpId {
+    const separator = std.mem.indexOfScalar(u8, text, '@') orelse
+        return error.UnexpectedToken;
+    const counter = std.fmt.parseInt(u64, text[0..separator], 10) catch
+        return error.UnexpectedToken;
+    const actor = err.hexFrom(gpa, text[separator + 1 ..]) catch |e|
+        return jsonCodecError(e);
+    return .{ .counter = counter, .actor = .{ .bytes = actor } };
+}
+
+fn jsonOpScalar(gpa: Allocator, source: std.json.Value, options: std.json.ParseOptions) std.json.ParseFromValueError!value.ScalarValue {
+    const scalar = try value.ScalarValue.jsonParseFromValue(
+        gpa,
+        try jsonRequired(source, "value"),
+        options,
+    );
+    const datatype = source.object.get("datatype") orelse return scalar;
+    const want = std.meta.stringToEnum(value.ScalarValue.DataType, try jsonString(datatype)) orelse return error.InvalidEnumTag;
+    return scalar.asDatatype(want) catch |e|
+        return jsonCodecError(e);
+}
+
+fn actionName(action: value.OpType) []const u8 {
+    return switch (action) {
+        .make => |kind| switch (kind) {
+            .map => "makeMap",
+            .table => "makeTable",
+            .list => "makeList",
+            .text => "makeText",
+        },
+        .delete => "del",
+        .increment => "inc",
+        .put => "set",
+        .mark_begin => "markBegin",
+        .mark_end => "markEnd",
+    };
+}
+
+fn expandedIdLessThan(_: void, a: ExpandedOpId, b: ExpandedOpId) bool {
+    if (a.counter != b.counter) return a.counter < b.counter;
+    return std.mem.order(u8, a.actor.bytes, b.actor.bytes) == .lt;
+}
+
+fn actorLessThan(_: void, a: ActorId, b: ActorId) bool {
+    return std.mem.order(u8, a.bytes, b.bytes) == .lt;
+}
+
+fn hashLessThan(_: void, a: ChangeHash, b: ChangeHash) bool {
+    return std.mem.order(u8, &a.bytes, &b.bytes) == .lt;
+}
+
+fn addActor(gpa: Allocator, actors: *std.ArrayList(ActorId), actor: ActorId) Allocator.Error!void {
+    for (actors.items) |item| if (item.eql(actor)) return;
+    try actors.append(gpa, actor);
+}
+
+fn actorIndex(actors: []const ActorId, actor: ActorId) ParseError!types.ActorIdx {
+    for (actors, 0..) |item, i| if (item.eql(actor))
+        return std.math.cast(types.ActorIdx, i) orelse error.Overflow;
+    return error.MissingActor;
+}
+
+fn compactId(id: ExpandedOpId, actors: []const ActorId) ParseError!types.OpId {
+    const counter = std.math.cast(u32, id.counter) orelse return error.Overflow;
+    return types.OpId.init(counter, try actorIndex(actors, id.actor));
+}
+
+fn expandId(id: types.OpId, actors: []const ActorId) ParseError!ExpandedOpId {
+    if (id.actor >= actors.len) return error.MissingActor;
+    return .{ .counter = id.counter, .actor = actors[id.actor] };
+}
+
+fn cloneExpandedId(gpa: Allocator, id: ExpandedOpId) Allocator.Error!ExpandedOpId {
+    return .{ .counter = id.counter, .actor = .{ .bytes = try gpa.dupe(u8, id.actor.bytes) } };
+}
+
+fn cloneScalar(gpa: Allocator, scalar: value.ScalarValue) Allocator.Error!value.ScalarValue {
+    return scalar.dup(gpa);
+}
+
+fn cloneAction(gpa: Allocator, action: value.OpType) Allocator.Error!value.OpType {
+    return switch (action) {
+        .put => |scalar| .{ .put = try cloneScalar(gpa, scalar) },
+        .mark_begin => |mark| .{ .mark_begin = .{
+            .expand = mark.expand,
+            .name = try gpa.dupe(u8, mark.name),
+            .value = try cloneScalar(gpa, mark.value),
+        } },
+        else => action,
+    };
+}
+
+fn cloneExpandedOp(gpa: Allocator, op: ExpandedOp) Allocator.Error!ExpandedOp {
+    const preds = try gpa.alloc(ExpandedOpId, op.pred.len);
+    for (op.pred, preds) |pred, *target| target.* = try cloneExpandedId(gpa, pred);
+    return .{
+        .action = try cloneAction(gpa, op.action),
+        .obj = switch (op.obj) {
+            .root => .root,
+            .id => |id| .{ .id = try cloneExpandedId(gpa, id) },
+        },
+        .key = switch (op.key) {
+            .map => |key| .{ .map = try gpa.dupe(u8, key) },
+            .seq => |element| .{ .seq = switch (element) {
+                .head => .head,
+                .id => |id| .{ .id = try cloneExpandedId(gpa, id) },
+            } },
+        },
+        .pred = preds,
+        .insert = op.insert,
+    };
+}
+
 /// The change graph's view of a change: the same fields, without the bytes.
 ///
 /// The graph keeps one of these per node for the life of the document, where
 /// the encoded change is usually gone, so a metadata value outlives the chunk
 /// it came from only if it was copied — see `intoOwned`. Upstream stores
 /// `actor, author, seq, start_op, max_op, timestamp, message, deps, hash, extra`
-/// (`op_set2/types.rs:748-760`); `author` and `extra` are the author footer,
-/// which this module leaves inside `Change.bytes`.
+/// (`op_set2/types.rs:748-760`). This low-level record's author is from the
+/// individual footer, not the document's inherited actor-author association.
 pub const ChangeMetadata = struct {
     /// The actor that authored the change.
     actor: ActorId,
@@ -294,6 +1032,10 @@ pub const ChangeMetadata = struct {
     max_op: u64,
     /// The actors this change references but does not own.
     other_actors: []const ActorId,
+    /// Individual arbitrary-byte author, null for absent/unknown/malformed footer.
+    author: ?[]const u8 = null,
+    /// Complete opaque individual footer, including unknown/trailing bytes.
+    extra: []const u8 = &.{},
 
     /// The metadata for a change, borrowing everything from it: the actor
     /// bytes, the dependency hashes, the message and the referenced actor
@@ -303,7 +1045,9 @@ pub const ChangeMetadata = struct {
     /// function that takes `ChangeMetadata` by value therefore does not take
     /// ownership of it unless it says so, and the ones that do not say so
     /// copy it instead.
-    pub fn fromChange(change: Change) ChangeMetadata {
+    /// Footer-location parsing uses temporary allocations only; errors return no owner.
+    pub fn fromChange(gpa: Allocator, change: Change) ParseError!ChangeMetadata {
+        const footer = try change.extraBytes(gpa);
         return .{
             .actor = change.actor,
             .deps = change.deps,
@@ -314,6 +1058,8 @@ pub const ChangeMetadata = struct {
             .start_op = change.start_op,
             .max_op = change.max_op,
             .other_actors = change.other_actors,
+            .author = doccodec.decodeAuthorFooter(footer) catch null,
+            .extra = footer,
         };
     }
 
@@ -322,12 +1068,9 @@ pub const ChangeMetadata = struct {
     /// (`op_set2/types.rs:762-777`) is the same move, for the same reason.
     ///
     /// **The result is owned by the caller** and must be released with
-    /// [`deinit`](ChangeMetadata.deinit): four allocations — the actor bytes,
-    /// the dependency hashes, the message, and the referenced actor bytes with
-    /// their array. Handing it *to* a function does not pass that ownership
-    /// on unless the callee says it took it, which is why every in-tree caller
-    /// of `addChange` keeps its own `defer meta.deinit(gpa)` and the callee
-    /// copies.
+    /// [`deinit`](ChangeMetadata.deinit). Actor, dependency, message, other-actor,
+    /// author and opaque footer storage are independent of the source record.
+    /// Passing this value does not transfer ownership unless a callee says so.
     pub fn intoOwned(self: ChangeMetadata, gpa: Allocator) Allocator.Error!ChangeMetadata {
         const actor = try gpa.dupe(u8, self.actor.bytes);
         errdefer gpa.free(actor);
@@ -335,6 +1078,10 @@ pub const ChangeMetadata = struct {
         errdefer gpa.free(deps);
         const message = try gpa.dupe(u8, self.message);
         errdefer gpa.free(message);
+        const author_bytes = if (self.author) |bytes| try gpa.dupe(u8, bytes) else null;
+        errdefer if (author_bytes) |bytes| gpa.free(bytes);
+        const extra = try gpa.dupe(u8, self.extra);
+        errdefer gpa.free(extra);
 
         const others = try gpa.alloc(ActorId, self.other_actors.len);
         var filled: usize = 0;
@@ -357,6 +1104,8 @@ pub const ChangeMetadata = struct {
             .start_op = self.start_op,
             .max_op = self.max_op,
             .other_actors = others,
+            .author = author_bytes,
+            .extra = extra,
         };
     }
 
@@ -368,6 +1117,8 @@ pub const ChangeMetadata = struct {
         gpa.free(self.message);
         for (self.other_actors) |a| gpa.free(a.bytes);
         gpa.free(self.other_actors);
+        if (self.author) |bytes| gpa.free(bytes);
+        gpa.free(self.extra);
         self.* = undefined;
     }
 
@@ -982,15 +1733,16 @@ test "withOpCount derives max_op and refuses a counter that does not fit" {
 
 test "change metadata copies the change and can own its bytes" {
     const gpa = testing.allocator;
-    var change = try parseChange(&built_body, gpa);
+    const body = built_header ++ [_]u8{0};
+    var change = try parseChange(&body, gpa);
     defer change.deinit(gpa);
-    const verified = try change.withOpCount(2);
+    const verified = try change.withOpCount(0);
 
-    const borrowed = ChangeMetadata.fromChange(verified);
+    const borrowed = try ChangeMetadata.fromChange(gpa, verified);
     try testing.expectEqual(change.hash.bytes, borrowed.hash.bytes);
     try testing.expectEqual(@as(u64, 300), borrowed.seq);
     try testing.expectEqual(@as(u64, 16384), borrowed.start_op);
-    try testing.expectEqual(@as(u64, 16385), borrowed.max_op);
+    try testing.expectEqual(@as(u64, 16383), borrowed.max_op);
     try testing.expectEqual(@as(i64, -1000), borrowed.time);
     try testing.expectEqualStrings("change 2", borrowed.message);
     try testing.expectEqual(@as(u32, 300), borrowed.clockEntry().?);
@@ -1061,10 +1813,9 @@ test "debugString names the change" {
 test "every change a document hands out names the counter its own last op row carries" {
     const docmod = @import("doc.zig");
     const transact = @import("transact.zig");
-    const changechunk = @import("storage/change_chunk.zig");
 
     const gpa = testing.allocator;
-    var doc = try docmod.Document.init(gpa, std.testing.io, .manual);
+    var doc = try docmod.Document.init(gpa, std.testing.io);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = &([_]u8{0xa1} ** 16) });
 
@@ -1073,19 +1824,28 @@ test "every change a document hands out names the counter its own last op row ca
     // shape**: `start_op` is `graph.max_op() + 1` and its own `max_op` is one
     // below that, so the next change reuses the counter — which is the one
     // arrangement where a range read from the wrong end still looks plausible.
-    var t1 = try transact.Transaction.open(gpa, &doc);
-    _ = try t1.put(.root, .{ .key = "a" }, .{ .int = 1 });
-    const inner = try t1.putObject(.root, .{ .key = "m" }, .map);
-    _ = try t1.put(inner, .{ .key = "deep" }, .{ .str = "v" });
-    _ = (try t1.commit(null, 1)).?;
-    t1.deinit();
+    {
+        var t1 = try transact.Transaction.open(gpa, &doc);
+        // On error the owning document is destroyed; on success the journal is closed.
+        defer t1.deinitClosed();
+        _ = try t1.put(.root, .{ .key = "a" }, .{ .int = 1 });
+        const inner = try t1.putObject(.root, .{ .key = "m" }, .map);
+        _ = try t1.put(inner, .{ .key = "deep" }, .{ .str = "v" });
+        var committed1 = try t1.commitWith(.{ .message = null, .time = 1 });
+        defer committed1.deinit(gpa);
+        try testing.expect(committed1.hash != null);
+    }
 
     _ = try doc.emptyCommit(gpa, null, 2);
 
-    var t2 = try transact.Transaction.open(gpa, &doc);
-    _ = try t2.put(.root, .{ .key = "z" }, .{ .uint = 9 });
-    _ = (try t2.commit(null, 3)).?;
-    t2.deinit();
+    {
+        var t2 = try transact.Transaction.open(gpa, &doc);
+        defer t2.deinitClosed();
+        _ = try t2.put(.root, .{ .key = "z" }, .{ .uint = 9 });
+        var committed2 = try t2.commitWith(.{ .message = null, .time = 3 });
+        defer committed2.deinit(gpa);
+        try testing.expect(committed2.hash != null);
+    }
 
     try testing.expectEqual(@as(u64, 4), doc.graph.maxOp());
     const actor = doc.getActorIndex().?;
@@ -1156,7 +1916,7 @@ test "every change a document hands out names the counter its own last op row ca
     // the header and none of the operations. The row counts above are what each
     // application has to land, so this is the same number observed at the far
     // end of the wire.
-    var peer = try docmod.Document.init(gpa, std.testing.io, .auto);
+    var peer = try docmod.Document.init(gpa, std.testing.io);
     defer peer.deinit();
     for (changes.slice(), want) |built, w| {
         const framed = try built.change.encode(gpa);
@@ -1169,14 +1929,18 @@ test "every change a document hands out names the counter its own last op row ca
     // that arrived over sync is decoded on the way in (`Document.applyChanges`
     // fills its range from the decoded rows), and has to come back out of
     // `getChangeByHash` carrying the same one.
-    var other = try docmod.Document.init(gpa, std.testing.io, .manual);
+    var other = try docmod.Document.init(gpa, std.testing.io);
     defer other.deinit();
     other.setActorId(.{ .bytes = &([_]u8{0xb2} ** 16) });
-    var t3 = try transact.Transaction.open(gpa, &other);
-    _ = try t3.put(.root, .{ .key = "p" }, .{ .int = 4 });
-    _ = try t3.put(.root, .{ .key = "q" }, .{ .int = 5 });
-    _ = (try t3.commit(null, 4)).?;
-    t3.deinit();
+    {
+        var t3 = try transact.Transaction.open(gpa, &other);
+        defer t3.deinitClosed();
+        _ = try t3.put(.root, .{ .key = "p" }, .{ .int = 4 });
+        _ = try t3.put(.root, .{ .key = "q" }, .{ .int = 5 });
+        var committed3 = try t3.commitWith(.{ .message = null, .time = 4 });
+        defer committed3.deinit(gpa);
+        try testing.expect(committed3.hash != null);
+    }
 
     var theirs = try other.getChanges(gpa, &.{});
     defer theirs.deinit(gpa);
@@ -1212,4 +1976,443 @@ test "every change a document hands out names the counter its own last op row ca
         (try last.change.withOpCount(1)).max_op,
         last.change.max_op,
     );
+}
+
+test "change author reads individual empty arbitrary and opaque footers" {
+    // A zero-column change separates footer semantics from document inheritance.
+    const header = [_]u8{ 0, 1, 0xaa, 1, 17, 0, 0, 0, 0 };
+    inline for (.{
+        .{ .footer = "", .author = @as(?[]const u8, null) },
+        .{ .footer = "\x01\x03\xff\x00\x80", .author = @as(?[]const u8, "\xff\x00\x80") },
+        .{ .footer = "\x7f\x00\xfe", .author = @as(?[]const u8, null) },
+    }) |case| {
+        const body = header ++ case.footer;
+        var change = try parseChange(body, testing.allocator);
+        defer change.deinit(testing.allocator);
+        const author = try change.author(testing.allocator);
+        if (case.author) |expected| {
+            try testing.expectEqualSlices(u8, expected, author.?);
+        } else {
+            try testing.expect(author == null);
+        }
+    }
+}
+
+test "change author ignores malformed individual footer like Rust" {
+    const body = [_]u8{ 0, 1, 0xaa, 1, 17, 0, 0, 0, 0, 1, 3, 0xff };
+    var change = try parseChange(&body, testing.allocator);
+    defer change.deinit(testing.allocator);
+    try testing.expect((try change.author(testing.allocator)) == null);
+}
+
+test "expanded change owns decoded operations and preserves binary identity" {
+    const gpa = testing.allocator;
+    var source = try gpa.dupe(u8, &two_change_chunks_body);
+    var change = try parseChange(source, gpa);
+    var expanded = try change.decode(gpa);
+    defer expanded.deinit(gpa);
+    const original_hash = change.hash;
+    change.deinit(gpa);
+    gpa.free(source);
+    source = &.{};
+    try testing.expectEqualStrings("change 1", expanded.message.?);
+    try testing.expectEqual(@as(usize, 1), expanded.ops.len);
+    var rebuilt = try expanded.encode(gpa);
+    defer rebuilt.deinit(gpa);
+    try testing.expect(original_hash.eql(rebuilt.change.hash));
+    try testing.expectEqual(@as(u64, 1), rebuilt.change.max_op);
+}
+
+test "expanded authored operation preserves reference bytes through JSON and opaque footer" {
+    // tools/oracle/src/api_parity.rs:792-797 writes this one-op reference.
+    // Rust change.rs:206-216 ignores informational author/hash on conversion;
+    // the complete footer, including its unknown suffix, determines identity.
+    const gpa = testing.allocator;
+    const reference_hex =
+        "856f4a83f46c71c5013b000fa1a1a1a1a1a1a1a1a1a1a1a1a1a1a10101000000" ++
+        "05150a34014202560270027f08617574686f726564017f017f027f000103ff008000ff8042";
+    var reference: [reference_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&reference, reference_hex);
+    var reference_hash: [hash_size]u8 = undefined;
+    _ = try std.fmt.hexToBytes(
+        &reference_hash,
+        "f46c71c52cf27a837e54ae553224aebe1d7be42d2ef2a361849a0f896ac0f98c",
+    );
+    const json =
+        \\{"ops":[{"action":"set","obj":"_root","key":"authored","value":true,"pred":[]}],
+        \\"actor":"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1","seq":1,"startOp":1,"time":0,
+        \\"message":null,"deps":[],"extra_bytes":[1,3,255,0,128,0,255,128,66],
+        \\"author":"00","hash":"0000000000000000000000000000000000000000000000000000000000000000"}
+    ;
+    var parsed = try std.json.parseFromSlice(ExpandedChange, gpa, json, .{});
+    defer parsed.deinit();
+    var built = try parsed.value.encode(gpa);
+    defer built.deinit(gpa);
+    try testing.expectEqualSlices(u8, &reference_hash, &built.change.hash.bytes);
+    const encoded = try built.change.rawBytes(gpa);
+    defer gpa.free(encoded);
+    try testing.expectEqualSlices(u8, &reference, encoded);
+    try testing.expectEqual(@as(u64, 1), built.change.max_op);
+
+    var loaded = try Change.fromBytes(gpa, &reference);
+    defer loaded.deinit(gpa);
+    var decoded = try loaded.change.decode(gpa);
+    defer decoded.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), decoded.ops.len);
+    try testing.expect(decoded.ops[0].action.put.bool_value);
+    try testing.expectEqualSlices(u8, "\xff\x00\x80", decoded.author.?);
+    try testing.expectEqualSlices(u8, "\x01\x03\xff\x00\x80\x00\xff\x80B", decoded.extra_bytes);
+    const serialized = try std.json.Stringify.valueAlloc(gpa, decoded, .{});
+    defer gpa.free(serialized);
+    var reparsed = try std.json.parseFromSlice(ExpandedChange, gpa, serialized, .{});
+    defer reparsed.deinit();
+    var rebuilt = try reparsed.value.encode(gpa);
+    defer rebuilt.deinit(gpa);
+    try testing.expectEqualSlices(u8, &reference_hash, &rebuilt.change.hash.bytes);
+    const rebuilt_bytes = try rebuilt.change.rawBytes(gpa);
+    defer gpa.free(rebuilt_bytes);
+    try testing.expectEqualSlices(u8, &reference, rebuilt_bytes);
+}
+
+test "expanded empty change JSON preserves author opaque bytes and empty interval" {
+    const gpa = testing.allocator;
+    const Expanded = @import("change.zig").ExpandedChange;
+    const json =
+        \\{"ops":[],"actor":"aa","seq":1,"startOp":17,"time":-1,"message":null,"deps":[],"extra_bytes":[1,3,255,0,128,127,0,254],"author":"ff0080"}
+    ;
+    var parsed = try std.json.parseFromSlice(Expanded, gpa, json, .{});
+    defer parsed.deinit();
+    var built = try parsed.value.encode(gpa);
+    defer built.deinit(gpa);
+    try testing.expectEqual(@as(u64, 16), built.change.max_op);
+    var expanded = try built.change.decode(gpa);
+    defer expanded.deinit(gpa);
+    try testing.expectEqualSlices(u8, "\xff\x00\x80", expanded.author.?);
+    try testing.expectEqualSlices(u8, "\x01\x03\xff\x00\x80\x7f\x00\xfe", expanded.extra_bytes);
+    const output_json = try std.json.Stringify.valueAlloc(gpa, expanded, .{});
+    defer gpa.free(output_json);
+    var roundtrip = try std.json.parseFromSlice(Expanded, gpa, output_json, .{});
+    defer roundtrip.deinit();
+    var rebuilt = try roundtrip.value.encode(gpa);
+    defer rebuilt.deinit(gpa);
+    try testing.expect(built.change.hash.eql(rebuilt.change.hash));
+}
+
+test "expanded operation variants retain ordered predecessors and typed values" {
+    const gpa = testing.allocator;
+    const Expanded = @import("change.zig").ExpandedChange;
+    const json =
+        \\{"ops":[
+        \\{"action":"makeMap","obj":"_root","key":"map","pred":[]},
+        \\{"action":"makeTable","obj":"_root","key":"table","pred":[]},
+        \\{"action":"makeList","obj":"_root","key":"list","pred":[]},
+        \\{"action":"makeText","obj":"_root","key":"text","pred":[]},
+        \\{"action":"set","obj":"_root","key":"int","datatype":"int","value":-2,"pred":["1@bb","2@aa"]},
+        \\{"action":"set","obj":"_root","key":"uint","datatype":"uint","value":18446744073709551615,"pred":[]},
+        \\{"action":"set","obj":"_root","key":"float","datatype":"float64","value":1.5,"pred":[]},
+        \\{"action":"set","obj":"_root","key":"counter","datatype":"counter","value":8,"pred":[]},
+        \\{"action":"set","obj":"_root","key":"timestamp","datatype":"timestamp","value":-4,"pred":[]},
+        \\{"action":"set","obj":"_root","key":"null","value":null,"pred":[]},
+        \\{"action":"set","obj":"_root","key":"bool","value":true,"pred":[]},
+        \\{"action":"set","obj":"3@aa","elemId":"_head","insert":true,"value":"hello","pred":[]},
+        \\{"action":"inc","obj":"_root","key":"counter","value":-3,"pred":["8@aa"]},
+        \\{"action":"del","obj":"3@aa","elemId":"12@aa","pred":["12@aa"]},
+        \\{"action":"markBegin","obj":"4@aa","elemId":"_head","insert":true,"name":"bold","value":true,"expand":true,"pred":[]},
+        \\{"action":"markEnd","obj":"4@aa","elemId":"15@aa","insert":true,"expand":false,"pred":[]}
+        \\],"actor":"aa","seq":1,"startOp":1,"time":0,"message":"variants","deps":[]}
+    ;
+    var parsed = try std.json.parseFromSlice(Expanded, gpa, json, .{});
+    defer parsed.deinit();
+    var built = try parsed.value.encode(gpa);
+    defer built.deinit(gpa);
+    var expanded = try built.change.decode(gpa);
+    defer expanded.deinit(gpa);
+    try testing.expectEqual(@as(usize, 16), expanded.ops.len);
+    const serialized = try std.json.Stringify.valueAlloc(gpa, expanded, .{});
+    defer gpa.free(serialized);
+    var reparsed = try std.json.parseFromSlice(Expanded, gpa, serialized, .{});
+    defer reparsed.deinit();
+    var rebuilt = try reparsed.value.encode(gpa);
+    defer rebuilt.deinit(gpa);
+    try testing.expect(built.change.hash.eql(rebuilt.change.hash));
+}
+
+test "expanded operation datatype validation rejects incompatible scalars" {
+    const Expanded = @import("change.zig").ExpandedChange;
+    const json =
+        \\{"ops":[{"action":"set","obj":"_root","key":"bad","datatype":"counter","value":true,"pred":[]}],"actor":"aa","seq":1,"startOp":1,"time":0,"message":null,"deps":[]}
+    ;
+    try testing.expectError(
+        error.UnexpectedToken,
+        std.json.parseFromSlice(Expanded, testing.allocator, json, .{}),
+    );
+}
+
+test "expanded binary conversion preserves bytes unknown values and unknown footer" {
+    const gpa = testing.allocator;
+    const Expanded = @import("change.zig").ExpandedChange;
+    const Op = @import("change.zig").ExpandedOp;
+    const ops = [_]Op{
+        .{
+            .action = .{ .put = .{ .bytes = "\x00\xff\x80" } },
+            .obj = .root,
+            .key = .{ .map = "bytes" },
+            .pred = &.{},
+            .insert = false,
+        },
+        .{
+            .action = .{ .put = .{ .unknown = .{ .type_code = 15, .bytes = "\xfe\x00" } } },
+            .obj = .root,
+            .key = .{ .map = "unknown" },
+            .pred = &.{},
+            .insert = false,
+        },
+    };
+    const expanded: Expanded = .{
+        .ops = &ops,
+        .actor = .{ .bytes = "\xaa" },
+        .seq = 1,
+        .start_op = 1,
+        .time = 0,
+        .message = null,
+        .deps = &.{},
+        .extra_bytes = "\x7f\x00\xfe",
+    };
+    var built = try expanded.encode(gpa);
+    defer built.deinit(gpa);
+    var decoded = try built.change.decode(gpa);
+    defer decoded.deinit(gpa);
+    try testing.expectEqualSlices(u8, "\x00\xff\x80", decoded.ops[0].action.put.bytes);
+    try testing.expectEqual(@as(u8, 15), decoded.ops[1].action.put.unknown.type_code);
+    try testing.expectEqualSlices(u8, "\xfe\x00", decoded.ops[1].action.put.unknown.bytes);
+    try testing.expectEqualSlices(u8, expanded.extra_bytes, decoded.extra_bytes);
+    try testing.expect(decoded.author == null);
+    var rebuilt = try decoded.encode(gpa);
+    defer rebuilt.deinit(gpa);
+    try testing.expect(built.change.hash.eql(rebuilt.change.hash));
+}
+
+test "change byte helpers return independent framed and compressed owners" {
+    const gpa = testing.allocator;
+    var change = try parseChange(&two_change_chunks_body, gpa);
+    defer change.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), try change.len(gpa));
+    try testing.expect(!(try change.isEmpty(gpa)));
+    const raw = try change.rawBytes(gpa);
+    defer gpa.free(raw);
+    const compressed = try change.compressedBytes(gpa);
+    defer gpa.free(compressed);
+    var reparsed = try Change.fromBytes(gpa, compressed);
+    defer reparsed.deinit(gpa);
+    try testing.expect(change.hash.eql(reparsed.change.hash));
+    try testing.expectEqual(@as(u64, 1), reparsed.change.max_op);
+    const raw_chunk = try chunk.parseChunk(raw);
+    try testing.expectEqualSlices(u8, change.bytes, raw_chunk.data);
+    const actors = try change.actorsOwned(gpa);
+    defer {
+        for (actors) |actor| gpa.free(actor.bytes);
+        gpa.free(actors);
+    }
+    try testing.expectEqual(@as(usize, 1), actors.len);
+    try testing.expectEqualSlices(u8, change.actor.bytes, actors[0].bytes);
+}
+
+test "expanded decoding and reencoding release partial allocation failures" {
+    const Probe = struct {
+        fn run(gpa: Allocator) !void {
+            var change = try parseChange(&two_change_chunks_body, gpa);
+            defer change.deinit(gpa);
+            var expanded = try change.decode(gpa);
+            defer expanded.deinit(gpa);
+            var built = try expanded.encode(gpa);
+            defer built.deinit(gpa);
+            try testing.expect(change.hash.eql(built.change.hash));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Probe.run, .{});
+}
+
+test "expanded encoding rejects overflowing counter intervals" {
+    const Expanded = @import("change.zig").ExpandedChange;
+    const Op = @import("change.zig").ExpandedOp;
+    const ops = [_]Op{
+        .{
+            .action = .{ .put = .null_value },
+            .obj = .root,
+            .key = .{ .map = "a" },
+            .pred = &.{},
+            .insert = false,
+        },
+        .{
+            .action = .{ .put = .null_value },
+            .obj = .root,
+            .key = .{ .map = "b" },
+            .pred = &.{},
+            .insert = false,
+        },
+    };
+    const expanded: Expanded = .{
+        .ops = &ops,
+        .actor = .{ .bytes = "\xaa" },
+        .seq = 1,
+        .start_op = std.math.maxInt(u32),
+        .time = 0,
+        .message = null,
+        .deps = &.{},
+    };
+    try testing.expectError(error.Overflow, expanded.encode(testing.allocator));
+}
+
+test "change framed parsing rejects trailing bytes and non change chunks" {
+    const gpa = testing.allocator;
+    var change = try parseChange(&two_change_chunks_body, gpa);
+    defer change.deinit(gpa);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const encoded = try change.encode(gpa);
+    defer gpa.free(encoded);
+    try out.appendSlice(gpa, encoded);
+    try out.append(gpa, 0);
+    try testing.expectError(error.TrailingBytes, Change.fromBytes(gpa, out.items));
+    out.clearRetainingCapacity();
+    try chunk.writeChunk(&out, gpa, .document, "");
+    try testing.expectError(error.InvalidChunkType, Change.fromBytes(gpa, out.items));
+}
+
+test "change operation count rejects oversized intervals without arithmetic panic" {
+    var change = try parseChange(&two_change_chunks_body, testing.allocator);
+    defer change.deinit(testing.allocator);
+    try testing.expectError(error.Overflow, change.withOpCount(std.math.maxInt(u64)));
+    change.start_op = std.math.maxInt(u32);
+    try testing.expectError(error.Overflow, change.withOpCount(2));
+    const empty = try change.withOpCount(0);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u32) - 1), empty.max_op);
+}
+
+test "expanded operation standalone copy survives its parent and source bytes" {
+    const gpa = testing.allocator;
+    const source = try gpa.dupe(u8, &two_change_chunks_body);
+    var change = try parseChange(source, gpa);
+    var expanded = try change.decode(gpa);
+    const expected_json = try std.json.Stringify.valueAlloc(gpa, expanded.ops[0], .{});
+    defer gpa.free(expected_json);
+    var op = try expanded.ops[0].dup(gpa);
+    defer op.deinit(gpa);
+    expanded.deinit(gpa);
+    change.deinit(gpa);
+    gpa.free(source);
+    const actual_json = try std.json.Stringify.valueAlloc(gpa, op, .{});
+    defer gpa.free(actual_json);
+    try testing.expectEqualStrings(expected_json, actual_json);
+}
+
+test "expanded structured JSON rejects bytes and unknown values like Rust" {
+    const gpa = testing.allocator;
+    inline for (.{
+        value.ScalarValue{ .bytes = "\x00\xff" },
+        value.ScalarValue{ .unknown = .{ .type_code = 15, .bytes = "\x80" } },
+    }) |scalar| {
+        const ops = [_]ExpandedOp{.{
+            .action = .{ .put = scalar },
+            .obj = .root,
+            .key = .{ .map = "value" },
+            .pred = &.{},
+        }};
+        const expanded: ExpandedChange = .{
+            .ops = &ops,
+            .actor = .{ .bytes = "\xaa" },
+            .seq = 1,
+            .start_op = 1,
+            .time = 0,
+            .message = null,
+            .deps = &.{},
+        };
+        const json = try std.json.Stringify.valueAlloc(gpa, expanded, .{});
+        defer gpa.free(json);
+        try testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(ExpandedChange, gpa, json, .{}));
+    }
+}
+
+test "expanded informational author and hash never replace authoritative extra bytes" {
+    const gpa = testing.allocator;
+    const expanded: ExpandedChange = .{
+        .ops = &.{},
+        .actor = .{ .bytes = "\xaa" },
+        .seq = 1,
+        .start_op = 17,
+        .time = 0,
+        .message = null,
+        .deps = &.{},
+        .author = "\xff\x80",
+        .hash = ChangeHash.zero,
+    };
+    var built = try expanded.encode(gpa);
+    defer built.deinit(gpa);
+    try testing.expect((try built.change.author(gpa)) == null);
+    try testing.expect(!built.change.hash.eql(ChangeHash.zero));
+    var decoded = try built.change.decode(gpa);
+    defer decoded.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), decoded.extra_bytes.len);
+    try testing.expect(decoded.author == null);
+}
+
+test "change compression helper uses framed cutoff and preserves decompressed identity" {
+    const gpa = testing.allocator;
+    const ops = [_]ExpandedOp{.{
+        .action = .{ .put = .{ .str = "repeated payload " ** 40 } },
+        .obj = .root,
+        .key = .{ .map = "payload" },
+        .pred = &.{},
+    }};
+    const expanded: ExpandedChange = .{
+        .ops = &ops,
+        .actor = .{ .bytes = "\xaa" },
+        .seq = 1,
+        .start_op = 1,
+        .time = 0,
+        .message = null,
+        .deps = &.{},
+    };
+    var built = try expanded.encode(gpa);
+    defer built.deinit(gpa);
+    const bytes = try built.change.compressedBytes(gpa);
+    defer gpa.free(bytes);
+    const framed = try chunk.parseChunk(bytes);
+    try testing.expectEqual(chunk.ChunkType.compressed, framed.typ);
+    var restored = try Change.fromBytes(gpa, bytes);
+    defer restored.deinit(gpa);
+    try testing.expect(built.change.hash.eql(restored.change.hash));
+    try testing.expectEqualSlices(u8, built.body, restored.body);
+}
+
+test "change metadata owns individual author and complete opaque footer" {
+    const gpa = testing.allocator;
+    const source = try gpa.dupe(u8, &[_]u8{ 0, 1, 0xaa, 1, 17, 0, 0, 0, 0, 1, 3, 0xff, 0, 0x80, 0xfe });
+    var change = try parseChange(source, gpa);
+    const borrowed = try ChangeMetadata.fromChange(gpa, try change.withOpCount(0));
+    var owned = try borrowed.intoOwned(gpa);
+    defer owned.deinit(gpa);
+    change.deinit(gpa);
+    gpa.free(source);
+    try testing.expectEqualSlices(u8, "\xff\x00\x80", owned.author.?);
+    try testing.expectEqualSlices(u8, "\x01\x03\xff\x00\x80\xfe", owned.extra);
+    try testing.expectEqual(@as(u64, 16), owned.max_op);
+}
+
+test "change metadata allocation failures never leak author or opaque footer" {
+    const Probe = struct {
+        fn run(gpa: Allocator) !void {
+            const body = [_]u8{
+                0, 1, 0xaa, 1, 17, 0, 0, 0, 0, 1, 3, 0xff, 0, 0x80, 0xfe,
+            };
+            var change = try parseChange(&body, gpa);
+            defer change.deinit(gpa);
+            const borrowed = try ChangeMetadata.fromChange(gpa, try change.withOpCount(0));
+            var owned = try borrowed.intoOwned(gpa);
+            defer owned.deinit(gpa);
+            try testing.expectEqualSlices(u8, "\xff\x00\x80", owned.author.?);
+            try testing.expectEqualSlices(u8, "\x01\x03\xff\x00\x80\xfe", owned.extra);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Probe.run, .{});
 }

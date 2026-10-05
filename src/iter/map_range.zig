@@ -226,16 +226,20 @@ pub fn ExIdPromise(comptime O: type) type {
             };
         }
 
-        /// The promise with the id resolved and the op set dropped
-        /// ([`ExIdPromise::into_owned`](../../github-automerge-automerge/rust/automerge/src/iter/tools.rs), `iter/tools.rs:236-241`).
-        pub fn intoOwned(self: Self) Self {
+        /// Resolves the id and independently owns its actor bytes.
+        /// Rust's `into_owned` retains actor storage through Arc
+        /// (`iter/tools.rs:236-241`); this result must be deinitialized once.
+        pub fn intoOwned(self: Self, gpa: std.mem.Allocator) !Self {
             return .{
                 .id = self.id,
-                .promise = .{ .exid = switch (self.promise) {
-                    .set => |set| set.idToExid(self.id),
-                    .exid => |e| e,
-                } },
+                .promise = .{ .exid = try self.exid().dup(gpa) },
             };
+        }
+
+        /// Releases only a promise returned by `intoOwned`.
+        pub fn deinitOwned(self: *Self, gpa: std.mem.Allocator) void {
+            self.promise.exid.deinitOwned(gpa);
+            self.* = undefined;
         }
 
         /// Whether two promises name the same row, by op id
@@ -289,12 +293,8 @@ pub fn predates(over: ClockRange, id: OpId) bool {
 /// held past the string table's own life would be the other half of the same
 /// problem.
 ///
-/// **The id is a third borrow**: resolving it reads the op set's actor table
-/// ([`ExIdPromise`]), and the [`ExId`] it produces holds **the actor's bytes**,
-/// which in a document are that document's arena ([`ExId.Named.actor`],
-/// `types.zig:280-288`). Neither [`intoOwned`](MapRangeItem.intoOwned) nor any
-/// other copy of this row releases it — the borrow survives the copy, so an
-/// owned row still has to be read while the document is alive.
+/// Resolving an ID borrows the op set's actor bytes until document teardown.
+/// `intoOwned` copies those bytes as well as key/value payloads.
 pub fn MapRangeItem(comptime O: type) type {
     return struct {
         const Self = @This();
@@ -345,63 +345,27 @@ pub fn MapRangeItem(comptime O: type) type {
             return self.maybe_exid.exid();
         }
 
-        /// A copy that owns its key and its value
-        /// ([`MapRangeItem::into_owned`](../../github-automerge-automerge/rust/automerge/src/iter/map_range.rs), `map_range.rs:30-39`).
-        ///
-        /// # What survives a failure
-        ///
-        /// **Nothing.** The only reachable error is
-        /// `error.OutOfMemory`, and the copy is **failure-atomic**: the key is
-        /// duped first and `errdefer` releases it immediately, before the one
-        /// other fallible step ([`ValueRef.intoOwned`](../../opset/types.zig)),
-        /// so on the error path the caller owns nothing at all and the row it
-        /// passed in is untouched.
-        ///
-        /// # What the copy does *not* detach
-        ///
-        /// **`id` is still a borrow.** The copy resolves the promise and drops
-        /// the op set pointer, which is upstream's
-        /// `into_owned`, but an [`ExId`] is a counter plus **the actor's bytes**
-        /// — in a document, that document's arena
-        /// ([`ExId.Named.actor`](../../src/types.zig), `types.zig:280-288`).
-        /// Nothing here copies or releases those bytes, so an owned row still
-        /// cannot outlive the document it was read from; see
-        /// [`OwnedMapRangeItem`]'s field comment.
+        /// Copies key, scalar payloads and the resolved ID's actor bytes
+        /// (`map_range.rs:30-39`). The result survives document teardown.
+        /// OOM transfers nothing and leaves this borrowed item untouched.
         pub fn intoOwned(self: Self, gpa: Allocator) !OwnedMapRangeItem {
             const key = try gpa.dupe(u8, self.key);
             errdefer gpa.free(key);
+            var id_copy = try self.maybe_exid.exid().dup(gpa);
+            errdefer id_copy.deinitOwned(gpa);
             return .{
                 .key = key,
                 .value = try self.value.intoOwned(gpa),
                 .conflict = self.conflict,
                 .pos = self.pos,
-                .id = self.maybe_exid.intoOwned().exid(),
+                .id = id_copy,
             };
         }
     };
 }
 
-/// A [`MapRangeItem`] that owns its key and its value
-/// ([`MapRangeItem<'static>`](../../github-automerge-automerge/rust/automerge/src/iter/map_range.rs), `map_range.rs:30`).
-///
-/// Upstream's `Cow` and `ValueRef::into_owned` free themselves when the
-/// `'static` item is dropped; a borrowed slice cannot be dropped, so the copy
-/// and the free travel together here, as they do for
-/// [`ChangeMetadata.intoOwned`](../../src/change.zig).
-///
-/// # "Owns its key and its value" is the whole of what it owns
-///
-/// **`id` is not owned.** Upstream's `ExId::Id` holds an `ActorId` by value and
-/// its `ActorId` owns a `Vec<u8>` of actor bytes
-/// ([`exid.rs:17`](../../github-automerge-automerge/rust/automerge/src/exid.rs)),
-/// so `into_owned` has nothing to drop. The port's [`ExId`] **borrows** those
-/// bytes from whoever interned the actor ([`ExId.Named.actor`](../../src/types.zig),
-/// `types.zig:280-288`), and [`MapRangeItem.intoOwned`] resolves the promise
-/// without copying them — so an `OwnedMapRangeItem` **still has to be read while
-/// the document is alive.** Reading `item.id`'s actor bytes after
-/// `Document.deinit` reads released memory, and neither
-/// [`deinit`](OwnedMapRangeItem.deinit) nor any other call on this type
-/// releases or extends that borrow.
+/// A fully independent map item; key, value and ID actor bytes are owned.
+/// Copies share one owner and must not be released twice (`map_range.rs:30-39`).
 pub const OwnedMapRangeItem = struct {
     /// The key, owned: a copy the caller frees with
     /// [`deinit`](OwnedMapRangeItem.deinit) and the same allocator
@@ -413,30 +377,14 @@ pub const OwnedMapRangeItem = struct {
     conflict: bool,
     /// The row the winner was read from.
     pos: usize,
-    /// The row's id, already resolved.
-    ///
-    /// **Still borrowing the actor's bytes** from the document that interned
-    /// the actor — the type's first section. This is the one field
-    /// [`MapRangeItem.intoOwned`] does not detach and
-    /// [`deinit`](OwnedMapRangeItem.deinit) does not release.
+    /// The resolved ID, including independently owned actor bytes.
     id: ExId,
 
-    /// Gives back every byte [`MapRangeItem.intoOwned`] allocated, and nothing
-    /// this item borrowed.
-    ///
-    /// **Once, on the one owner, with the allocator the copy was taken with.**
-    /// The receiver is a pointer and the body ends in `self.* = undefined`, so a
-    /// second call reads undefined storage rather than freeing `key` and the
-    /// value twice; a **copy** carries those bytes but not the teardown, so
-    /// deiniting both a copy and the original is a double free. A *move* is
-    /// fine.
-    ///
-    /// **The `id`'s actor bytes are not among the bytes this frees** — they
-    /// belong to the document, and a caller that outlives the document has to
-    /// keep its own copy of the actor (see the type's first section).
+    /// Releases all owned payloads exactly once with the constructor allocator.
     pub fn deinit(self: *OwnedMapRangeItem, gpa: Allocator) void {
         gpa.free(self.key);
         self.value.deinit(gpa);
+        self.id.deinitOwned(gpa);
         self.* = undefined;
     }
 };
@@ -522,15 +470,9 @@ fn mapEntryDiffItem(
 /// A walk of a map object's rows, one entry per row ([`MapIter`],
 /// [`map_range.rs:107-201`](../../github-automerge-automerge/rust/automerge/src/iter/map_range.rs)).
 ///
-/// **It has no step of its own, and that is the port's spelling.** Upstream
-/// spells it `Iterator::next` and `Iterator::nth`; the port gives
-/// [`tools.SkipIter`] and [`tools.DiffKernel`] one walk, and
-/// [`tools.takeAt`](tools.zig#L232) reaches for the positional entry point
-/// first. This walk has [`shiftNext`] and so it is read through that — the
-/// same dispatch [`OpSet.actionValueIter`] makes over
-/// [`opiter.ActionValueIter`], which likewise has no `next`. A row walk with
-/// no `next` also cannot be handed to [`tools.Unshift`], which is why
-/// [`MapDiff`] wraps the diff kernel and not this.
+/// Contiguous reads use the four forward streams. Positional reads retain the
+/// same row shape for skipped positions; [`tools.takeAt`] selects `next` for
+/// a zero skip, including the skipper's final exhausted sentinel.
 ///
 /// The four cursors are moved in lockstep and every method that moves one
 /// moves all four, so `pos` is a position and not a guess.
@@ -611,13 +553,42 @@ pub const MapIter = struct {
         return self.advanceTo(self.pos() +| amount);
     }
 
-    /// Moves the **window** to `rows` and nothing else
-    /// ([`Column.Iterator.shift`](../hexane/column.zig), `column.rs:538-545`).
-    pub fn shift(self: *Self, rows: RowRange) void {
-        self.id.shift(rows);
-        self.key_str.shift(rows);
-        self.action.shift(rows);
-        self.value.shift(rows);
+    /// Repositions all windows atomically. A typed refusal leaves every
+    /// cursor and window unchanged (`column.rs:538-545`).
+    pub fn shift(self: *Self, rows: RowRange) ReadError!void {
+        var staged = self.*;
+        try staged.id.shift(rows);
+        try staged.key_str.shift(rows);
+        try staged.action.shift(rows);
+        try staged.value.shift(rows);
+        self.* = staged;
+    }
+
+    /// Reads one row from the forward streams (`map_range.rs:169-185`).
+    /// Guard total readers individually so a short column or final sentinel
+    /// stays partial, while all available columns still consume the same row.
+    pub fn next(self: *Self) ReadError!?MapEntry {
+        const actor = try self.id.actor.next();
+        const ctr = try self.id.ctr.next();
+        const key = try self.key_str.next();
+        const action = if (self.action.pos() < self.action.maxPos())
+            try self.action.tryNext()
+        else
+            null;
+        const value = if (self.value.pos() < self.value.maxPos())
+            try self.value.tryNext()
+        else
+            null;
+        if (actor == null or ctr == null or key == null or action == null or value == null)
+            return null;
+        const key_id = key.? orelse return null;
+        return MapEntry.init(
+            OpId.init(ctr.?, actor.?),
+            self.id.pos() - 1,
+            self.strings.resolve(self.strings.ctx, key_id),
+            action.?,
+            value.?,
+        );
     }
 
     /// Repositions onto `rows` and reads the row at its start
@@ -673,15 +644,8 @@ comptime {
     // Claiming a nullable mark here would say "sometimes", which is not true,
     // and would let a caller that checked it be told nothing.
     //
-    // **The mark does not claim a `next`, and does not need one — and this is
-    // the answer to "is it a full `Shiftable` if it has no `next`?"** The
-    // kernel is upstream's eight names (`shift.rs:19-74`) and `next` is not
-    // among them. [`tools.takeAt`](tools.zig#L232) falls through to
-    // `shiftNext` for a walk with no partial step (`tools.zig:232-246`),
-    // which is the same dispatch [`OpSet.actionValueIter`] already makes over
-    // [`opiter.ActionValueIter`] — a walk with a total step and a positional
-    // entry point, and no `next` either. Nothing that assumes a full kernel
-    // breaks, because a full kernel is the eight names and this has all eight.
+    // `next` is a partial forward step in addition to the eight kernel methods.
+    // The conformance mark checks only the positional kernel.
     _ = MapIter.shiftable;
 }
 
@@ -1287,7 +1251,7 @@ test "a map with one key yields the key, the value, and no conflict" {
     try expectValue(got.items[0].value, .{ .scalar = .{ .str = "one" } });
     try testing.expectEqual(false, got.items[0].conflict);
     try testing.expectEqual(opId(1, 0), got.items[0].opId());
-    try testing.expect(got.items[0].id().eql(.{ .id = opId(1, 0) }));
+    try testing.expectEqual(opId(1, 0), got.items[0].id().opId().?);
 }
 
 test "a map key with three rows yields the winner by op id, flagged conflicted" {
@@ -1724,7 +1688,7 @@ test "an owned map item frees every byte it copied" {
     defer owned.deinit(gpa);
     try testing.expectEqualStrings("a", owned.key);
     try expectValue(owned.value.value, .{ .scalar = .{ .str = "one" } });
-    try testing.expect(owned.id.eql(.{ .id = opId(1, 0) }));
+    try testing.expectEqual(opId(1, 0), owned.id.opId().?);
     try testing.expectEqual(false, owned.conflict);
 }
 
@@ -1740,12 +1704,11 @@ test "a promise resolves its op id and forgets the op set" {
 
     // The promise holds the op id and the op set, and resolves on demand
     // (`iter/tools.rs:225-234`).
-    // **The operation, not the shape.** An [`ExId`] has two shapes for the same
-    // operation — a bare `OpId`, and an `OpId` plus the actor's bytes
-    // ([`types.zig`](../../src/types.zig)) — and identity is the operation
-    // alone, so reading the field is what would be wrong here.
+    // The stable public identity has actor bytes; its contextual opId keeps
+    // the table-local hint used by the promise.
     try testing.expectEqual(opId(1, 0), got.items[0].maybe_exid.exid().opId().?);
-    const owned = got.items[0].maybe_exid.intoOwned();
+    var owned = try got.items[0].maybe_exid.intoOwned(gpa);
+    defer owned.deinitOwned(gpa);
     // Once owned the op set is gone, and the answer is the same answer.
     try testing.expect(owned.exid().eql(got.items[0].maybe_exid.exid()));
     // Equality is by op id and nothing else (`iter/tools.rs:195-199`).
@@ -2106,3 +2069,121 @@ test "reading a map costs one step per key, not one step per key in the document
 //   `MapDiff.next` calls `getIncrementDiffAtPos` (op_set.zig:3344-3373), which
 //   walks **that row's own** successors — `O(successors of this row)`, a
 //   property of the document and not a function of the map's size.
+
+test "API parity owned map result survives document destruction" {
+    const gpa = testing.allocator;
+    var owned = blk: {
+        const actor_bytes = try gpa.dupe(u8, &.{ 0, 255, 128 });
+        defer gpa.free(actor_bytes);
+        const doc = try Fixture.build(gpa, &.{types.ActorId.init(actor_bytes)}, &.{
+            row(opId(1, 0), .root, .{ .map = "a" }, .set, .{ .str = "one" }, &.{}),
+        });
+        defer doc.destroy();
+        var range = try MapRange(opmod.Op).init(&doc.set, try doc.set.scopeToObj(.root), null);
+        break :blk try (try range.next()).?.intoOwned(gpa);
+    };
+    defer owned.deinit(gpa);
+    try testing.expectEqualStrings("a", owned.key);
+    try expectValue(owned.value.value, .{ .scalar = .{ .str = "one" } });
+    try testing.expectEqualSlices(u8, &.{ 0, 255, 128 }, owned.id.actorBytes().?.bytes);
+}
+
+test "API parity failed map reposition preserves the next unread register" {
+    const gpa = testing.allocator;
+    const doc = try Fixture.build(gpa, &.{actor_a}, &.{
+        row(opId(1, 0), .root, .{ .map = "a" }, .set, .{ .str = "one" }, &.{}),
+        row(opId(2, 0), .root, .{ .map = "b" }, .set, .{ .str = "two" }, &.{}),
+    });
+    defer doc.destroy();
+    var range = try MapRange(opmod.Op).init(&doc.set, try doc.set.scopeToObj(.root), null);
+    try testing.expectEqualStrings("a", (try range.next()).?.key);
+    try testing.expectError(error.InvalidValue, range.shiftNext(.{ .start = 0, .end = 1 }));
+    try testing.expectEqualStrings("b", (try range.next()).?.key);
+    try testing.expect((try range.next()) == null);
+}
+
+test "map row steps match positional reads through rebased windows and exhaustion" {
+    const gpa = testing.allocator;
+    const doc = try Fixture.build(gpa, &.{actor_a}, &.{
+        row(opId(1, 0), .root, .{ .map = "a" }, .set, .{ .str = "prefix" }, &.{}),
+        row(opId(2, 0), .root, .{ .map = "b" }, .set, .null_value, &.{}),
+        row(opId(3, 0), .root, .{ .map = "c" }, .set, .{ .int = -129 }, &.{}),
+        row(opId(4, 0), .root, .{ .map = "d" }, .set, .{ .str = "tail" }, &.{}),
+    });
+    defer doc.destroy();
+    const rows = RowRange{ .start = 1, .end = 4 };
+    var forward = MapIter.init(
+        try doc.set.idIterRange(rows),
+        try doc.set.keyStrIterRange(rows),
+        try doc.set.actionIterRange(rows),
+        try doc.set.valueIterRange(rows),
+        doc.set.strings,
+    );
+    var positional = forward;
+    const whole = RowRange{ .start = 0, .end = rows.end };
+    var shifted = MapIter.init(
+        try doc.set.idIterRange(whole),
+        try doc.set.keyStrIterRange(whole),
+        try doc.set.actionIterRange(whole),
+        try doc.set.valueIterRange(whole),
+        doc.set.strings,
+    );
+    try shifted.shift(rows);
+    try testing.expect((try shifted.next()).?.value.eql(.null_value));
+    try testing.expect((try shifted.next()).?.value.eql(.{ .int = -129 }));
+    try testing.expectEqualStrings("tail", (try shifted.next()).?.value.str);
+    try testing.expect((try shifted.next()) == null);
+    for (rows.start..rows.end) |pos| {
+        const got = (try forward.next()).?;
+        const want = (try positional.shiftNext(.{ .start = pos, .end = rows.end })).?;
+        try testing.expectEqual(want.id, got.id);
+        try testing.expectEqual(want.pos, got.pos);
+        try testing.expectEqualStrings(want.key, got.key);
+        try testing.expectEqual(want.action, got.action);
+        try testing.expect(want.value.eql(got.value));
+    }
+    try testing.expect((try forward.next()) == null);
+    try testing.expect((try forward.next()) == null);
+    var empty = forward;
+    try empty.shift(.{ .start = 4, .end = 4 });
+    try testing.expect((try empty.next()) == null);
+
+    // A short action window has the same partial result as a positional read.
+    var short = MapIter.init(
+        try doc.set.idIterRange(rows),
+        try doc.set.keyStrIterRange(rows),
+        try doc.set.actionIterRange(.{ .start = 1, .end = 1 }),
+        try doc.set.valueIterRange(rows),
+        doc.set.strings,
+    );
+    try testing.expect((try short.next()) == null);
+}
+
+test "short map row streams return partial exhaustion" {
+    const gpa = testing.allocator;
+    const doc = try Fixture.build(gpa, &.{actor_a}, &.{
+        row(opId(1, 0), .root, .{ .map = "a" }, .set, .{ .str = "prefix" }, &.{}),
+        row(opId(2, 0), .root, .{ .map = "b" }, .set, .{ .str = "payload" }, &.{}),
+    });
+    defer doc.destroy();
+    const rows = RowRange{ .start = 1, .end = 2 };
+    for (0..5) |short_column| {
+        var iter = MapIter.init(
+            try doc.set.idIterRange(rows),
+            try doc.set.keyStrIterRange(rows),
+            try doc.set.actionIterRange(rows),
+            try doc.set.valueIterRange(rows),
+            doc.set.strings,
+        );
+        switch (short_column) {
+            0 => iter.id.actor.setMax(rows.start),
+            1 => iter.id.ctr.setMax(rows.start),
+            2 => iter.key_str.setMax(rows.start),
+            3 => iter.action.setMax(rows.start),
+            4 => iter.value.setMax(rows.start),
+            else => unreachable,
+        }
+        try testing.expect((try iter.next()) == null);
+        try testing.expect((try iter.next()) == null);
+    }
+}

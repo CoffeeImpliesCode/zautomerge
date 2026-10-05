@@ -161,9 +161,12 @@ pub const BoolPrefixCodec = struct {
     pub const LoadCursor = hexane.Bool.LoadCursor;
     /// The boolean streaming encoder, unchanged by the swapped weight.
     pub const StreamEncoder = hexane.Bool.StreamEncoder;
+    /// Counts and opening parity are independent of the swapped prefix weight.
+    pub const WireSpliceWriter = hexane.Bool.WireSpliceWriter;
 
     pub const segmentsOf = hexane.Bool.segmentsOf;
     pub const wireRange = hexane.Bool.wireRange;
+    pub const wireRangeFromSegs = hexane.Bool.wireRangeFromSegs;
     /// A boolean run carries no payload: its value is its position in the
     /// run sequence, so `to - from` copies of `value` **is** the run's items.
     /// A fragment cut out of a longer sequence cannot say so for itself —
@@ -359,9 +362,12 @@ pub const MetaPrefixCodec = struct {
     pub const LoadCursor = hexane.Rle(u64).LoadCursor;
     /// The run-length streaming encoder, unchanged by the swapped weight.
     pub const StreamEncoder = hexane.Rle(u64).StreamEncoder;
+    /// Metadata words keep the integer codec's exact payload and counted seams.
+    pub const WireSpliceWriter = hexane.Rle(u64).WireSpliceWriter;
 
     pub const segmentsOf = hexane.Rle(u64).segmentsOf;
     pub const wireRange = hexane.Rle(u64).wireRange;
+    pub const wireRangeFromSegs = hexane.Rle(u64).wireRangeFromSegs;
     /// A metadata word is stored in the run's own payload, so a fragment
     /// reads back the words it was written from and `value` is not read
     /// (`hexane/column.zig:678-697`). The swapped weight does not change
@@ -573,6 +579,14 @@ pub const IncColumn = hexane.Column(?i64, hexane.RleOption(i64));
 
 // ── The five index columns ─────────────────────────────────────────────────
 
+/// Which column families a prepared batch can change.
+pub const OverlayOptions = struct {
+    rows: bool,
+    successors: bool,
+    visibility: bool,
+    payloads: bool,
+};
+
 /// The derived views the query layer reads instead of scanning the sixteen
 /// data columns (`columns.rs:37-43`).
 ///
@@ -596,6 +610,65 @@ pub const Indexes = struct {
     /// The cache's names are borrowed from the document's string table, which
     /// must outlive this: the module doc says which one and why.
     mark: markidx.MarkIndexColumn,
+
+    /// Independent staged views of only the derived columns a batch writes.
+    /// Keep this value and its bound `Indexes` at stable addresses.
+    pub const Overlay = struct {
+        text: ?TextColumn.Overlay = null,
+        top: ?BoolPrefixColumn.Overlay = null,
+        visible: ?BoolColumn.Overlay = null,
+        inc: ?IncColumn.Overlay = null,
+        mark: ?markidx.MarkIndexColumn.Overlay = null,
+
+        /// Binds every prepared column into the provisional index set.
+        pub fn bind(self: *Overlay, view: *Indexes) void {
+            inline for (@typeInfo(Overlay).@"struct".fields) |field| {
+                if (@field(self, field.name)) |*stage| stage.bind(&@field(view, field.name));
+            }
+        }
+
+        /// Captures all bound provisional columns before publication/disposal.
+        pub fn capture(self: *Overlay, view: *Indexes) void {
+            inline for (@typeInfo(Overlay).@"struct".fields) |field| {
+                if (@field(self, field.name)) |*stage| stage.capture(&@field(view, field.name));
+            }
+        }
+
+        /// Publishes every prepared derived column without allocating.
+        pub fn publish(self: *Overlay, source: *Indexes) void {
+            inline for (@typeInfo(Overlay).@"struct".fields) |field| {
+                if (@field(self, field.name)) |*stage| stage.publish(&@field(source, field.name));
+            }
+        }
+
+        /// Disposes prepared derived columns; source values remain unchanged.
+        pub fn deinit(self: *Overlay) void {
+            inline for (@typeInfo(Overlay).@"struct".fields) |field| {
+                if (@field(self, field.name)) |*stage| stage.deinit();
+            }
+        }
+    };
+
+    /// Prepares selected derived-column overlays in their final stable storage.
+    pub fn beginOverlay(self: *Indexes, out: *Overlay, options: OverlayOptions) ParseError!void {
+        out.* = .{};
+        errdefer out.deinit();
+        inline for (@typeInfo(Overlay).@"struct".fields) |field| {
+            const needed = if (comptime std.mem.eql(u8, field.name, "mark"))
+                options.rows
+            else if (comptime std.mem.eql(u8, field.name, "inc"))
+                options.successors
+            else
+                options.rows or options.visibility;
+            if (needed) {
+                @field(out, field.name) = @as(@typeInfo(field.type).optional.child, undefined);
+                @field(self, field.name).beginOverlay(&@field(out, field.name).?) catch |e| {
+                    @field(out, field.name) = null;
+                    return e;
+                };
+            }
+        }
+    }
 
     /// Five empty index columns (`Indexes::default`, `columns.rs:47-56`).
     pub fn init(gpa: Allocator) ParseError!Indexes {
@@ -838,6 +911,102 @@ pub fn Columns(comptime O: type) type {
         expand: BoolColumn,
         /// The five derived index columns (`columns.rs:39`).
         index: Indexes,
+
+        /// Selective column overlays for one unpublished batch.
+        /// Untouched slab payloads remain borrowed from the source.
+        pub const Overlay = struct {
+            id_actor: ?ActorColumn.Overlay = null,
+            id_ctr: ?CounterColumn.Overlay = null,
+            obj_actor: ?ActorOptColumn.Overlay = null,
+            obj_ctr: ?UintOptColumn.Overlay = null,
+            key_actor: ?ActorOptColumn.Overlay = null,
+            key_ctr: ?OptCounterColumn.Overlay = null,
+            key_str: ?UintOptColumn.Overlay = null,
+            succ_count: ?CountColumn.Overlay = null,
+            succ_actor: ?ActorColumn.Overlay = null,
+            succ_ctr: ?CounterColumn.Overlay = null,
+            insert: ?BoolPrefixColumn.Overlay = null,
+            action: ?ActionColumn.Overlay = null,
+            value_meta: ?MetaColumn.Overlay = null,
+            value: ?ValueColumn.Overlay = null,
+            mark_name: ?UintOptColumn.Overlay = null,
+            expand: ?BoolColumn.Overlay = null,
+            index: Indexes.Overlay = .{},
+
+            /// Binds prepared columns into an otherwise borrowed column view.
+            pub fn bind(self: *Overlay, view: *Self) void {
+                inline for (@typeInfo(Overlay).@"struct".fields) |field| {
+                    if (comptime std.mem.eql(u8, field.name, "index")) {
+                        self.index.bind(&view.index);
+                    } else if (@field(self, field.name)) |*stage| {
+                        stage.bind(&@field(view, field.name));
+                    }
+                }
+            }
+
+            /// Captures every bound column before publication or disposal.
+            pub fn capture(self: *Overlay, view: *Self) void {
+                inline for (@typeInfo(Overlay).@"struct".fields) |field| {
+                    if (comptime std.mem.eql(u8, field.name, "index")) {
+                        self.index.capture(&view.index);
+                    } else if (@field(self, field.name)) |*stage| {
+                        stage.capture(&@field(view, field.name));
+                    }
+                }
+            }
+
+            /// Publishes prepared columns without allocation or decoding.
+            pub fn publish(self: *Overlay, source: *Self) void {
+                inline for (@typeInfo(Overlay).@"struct".fields) |field| {
+                    if (comptime std.mem.eql(u8, field.name, "index")) {
+                        self.index.publish(&source.index);
+                    } else if (@field(self, field.name)) |*stage| {
+                        stage.publish(&@field(source, field.name));
+                    }
+                }
+            }
+
+            /// Releases only provisional storage, not borrowed source slabs.
+            pub fn deinit(self: *Overlay) void {
+                inline for (@typeInfo(Overlay).@"struct".fields) |field| {
+                    if (comptime std.mem.eql(u8, field.name, "index")) {
+                        self.index.deinit();
+                    } else if (@field(self, field.name)) |*stage| {
+                        stage.deinit();
+                    }
+                }
+            }
+        };
+
+        /// Initializes selected overlays in their final stable storage.
+        pub fn beginOverlay(
+            self: *Self,
+            out: *Overlay,
+            options: OverlayOptions,
+        ) ParseError!void {
+            out.* = .{};
+            errdefer out.deinit();
+            inline for (@typeInfo(Overlay).@"struct".fields) |field| {
+                if (comptime !std.mem.eql(u8, field.name, "index")) {
+                    const needed = if (comptime std.mem.eql(u8, field.name, "value"))
+                        options.payloads
+                    else if (comptime std.mem.eql(u8, field.name, "succ_count"))
+                        options.rows or options.successors
+                    else if (comptime std.mem.startsWith(u8, field.name, "succ_"))
+                        options.successors
+                    else
+                        options.rows;
+                    if (needed) {
+                        @field(out, field.name) = @as(@typeInfo(field.type).optional.child, undefined);
+                        @field(self, field.name).beginOverlay(&@field(out, field.name).?) catch |e| {
+                            @field(out, field.name) = null;
+                            return e;
+                        };
+                    }
+                }
+            }
+            try self.index.beginOverlay(&out.index, options);
+        }
 
         /// Sixteen empty data columns and five empty index columns
         /// (`Columns::default`, `columns.rs:57-80`).
@@ -1211,6 +1380,69 @@ pub fn Columns(comptime O: type) type {
 
         // ── Renumbering actors ──────────────────────────────────────────
 
+        /// Owns the four prepared actor columns until publication or disposal.
+        /// The source columns remain unchanged on every preparation failure.
+        pub const PreparedActorRemap = struct {
+            id_actor: ActorColumn,
+            succ_actor: ActorColumn,
+            obj_actor: ActorOptColumn,
+            key_actor: ActorOptColumn,
+            spent: bool = false,
+
+            /// Releases an unpublished remap. Safe after `publish`.
+            pub fn deinit(self: *PreparedActorRemap) void {
+                if (self.spent) return;
+                self.id_actor.deinit();
+                self.succ_actor.deinit();
+                self.obj_actor.deinit();
+                self.key_actor.deinit();
+                self.spent = true;
+            }
+
+            /// Replaces all four actor columns without allocating.
+            pub fn publish(self: *PreparedActorRemap, cols: *Self) void {
+                std.debug.assert(!self.spent);
+                cols.id_actor.swapContents(&self.id_actor);
+                cols.succ_actor.swapContents(&self.succ_actor);
+                cols.obj_actor.swapContents(&self.obj_actor);
+                cols.key_actor.swapContents(&self.key_actor);
+                self.deinit();
+            }
+        };
+
+        /// Prepares an actor remap without changing the source column set.
+        pub fn prepareActorRemap(
+            self: *Self,
+            gpa: Allocator,
+            ctx: anytype,
+            comptime f: fn (@TypeOf(ctx), ActorIdx) ActorIdx,
+        ) ParseError!PreparedActorRemap {
+            var id_actor = try stagedRemap(ActorColumn, ActorIdx, &self.id_actor, gpa, ctx, f);
+            errdefer id_actor.deinit();
+            var succ_actor = try stagedRemap(ActorColumn, ActorIdx, &self.succ_actor, gpa, ctx, f);
+            errdefer succ_actor.deinit();
+            const opt = shiftOptActor(@TypeOf(ctx), f);
+            var obj_actor = try stagedRemap(ActorOptColumn, ?ActorIdx, &self.obj_actor, gpa, ctx, opt);
+            errdefer obj_actor.deinit();
+            var key_actor = try stagedRemap(ActorOptColumn, ?ActorIdx, &self.key_actor, gpa, ctx, opt);
+            errdefer key_actor.deinit();
+            return .{
+                .id_actor = id_actor,
+                .succ_actor = succ_actor,
+                .obj_actor = obj_actor,
+                .key_actor = key_actor,
+            };
+        }
+
+        /// Prepares the column half of inserting an actor at `idx`.
+        pub fn prepareActorInsertion(
+            self: *Self,
+            gpa: Allocator,
+            idx: ActorIdx,
+        ) ParseError!PreparedActorRemap {
+            return self.prepareActorRemap(gpa, idx, actorShiftedUp);
+        }
+
         /// Every actor index in the op set, renumbered by `f`
         /// (`Columns::remap_actors`, `columns.rs:332-340`).
         ///
@@ -1263,26 +1495,9 @@ pub fn Columns(comptime O: type) type {
             ctx: anytype,
             comptime f: fn (@TypeOf(ctx), ActorIdx) ActorIdx,
         ) ParseError!void {
-            var id_actor = try stagedRemap(ActorColumn, ActorIdx, &self.id_actor, gpa, ctx, f);
-            errdefer id_actor.deinit();
-            var succ_actor = try stagedRemap(ActorColumn, ActorIdx, &self.succ_actor, gpa, ctx, f);
-            errdefer succ_actor.deinit();
-            const opt = shiftOptActor(@TypeOf(ctx), f);
-            var obj_actor = try stagedRemap(ActorOptColumn, ?ActorIdx, &self.obj_actor, gpa, ctx, opt);
-            errdefer obj_actor.deinit();
-            var key_actor = try stagedRemap(ActorOptColumn, ?ActorIdx, &self.key_actor, gpa, ctx, opt);
-            errdefer key_actor.deinit();
-            // The commit. Nothing below can fail, so no `errdefer` above can
-            // fire after the column it guards has been swapped, and the four
-            // columns move together or none of them does.
-            self.id_actor.swapContents(&id_actor);
-            id_actor.deinit();
-            self.succ_actor.swapContents(&succ_actor);
-            succ_actor.deinit();
-            self.obj_actor.swapContents(&obj_actor);
-            obj_actor.deinit();
-            self.key_actor.swapContents(&key_actor);
-            key_actor.deinit();
+            var prepared = try self.prepareActorRemap(gpa, ctx, f);
+            defer prepared.deinit();
+            prepared.publish(self);
         }
 
         /// Renumber the actor indices as if a new actor had been interned at
@@ -1346,8 +1561,39 @@ pub fn Columns(comptime O: type) type {
 
         // ── Writing rows ────────────────────────────────────────────────
 
-        /// Inserts `ops` before row `pos` and returns how many rows were
-        /// written (`Columns::splice`, `columns.rs:419-492`).
+        /// Inserts `ops` before row `pos` and returns how many rows were written.
+        pub fn splice(
+            self: *Self,
+            gpa: Allocator,
+            pos: usize,
+            ops: []const O,
+            text_encoding: types.TextEncoding,
+            strings: StringTable,
+        ) ParseError!usize {
+            return self.spliceMapped(
+                O,
+                gpa,
+                pos,
+                ops,
+                text_encoding,
+                strings,
+                {},
+                identityMappedOp,
+            );
+        }
+
+        fn identityMappedOp(_: void, op: *const O) ParseError!O {
+            return op.*;
+        }
+
+        /// Maps non-delete entries in `ops` to rows of `P` and inserts them before
+        /// row `pos` (`Columns::splice`, `columns.rs:419-492`).
+        ///
+        /// `map` runs once per non-delete op in input order, before any column
+        /// changes. Its `op` pointer borrows the corresponding element of `ops`
+        /// for the callback call; `ctx` is passed through unchanged. It runs on
+        /// the calling thread and must not reenter this `Columns` value. `P` must
+        /// provide the row accessors consumed by `Columns`.
         ///
         /// A delete is not a row: it is filtered out here (`:423`) and does
         /// not appear in the return value, in any of the sixteen columns, or
@@ -1383,67 +1629,105 @@ pub fn Columns(comptime O: type) type {
         /// is the *interned* one, resolved back out of `strings`, so the
         /// cache is anchored in the document and not in the op; the module
         /// doc has the lifetime and the owner.
-        pub fn splice(
+        pub fn spliceMapped(
             self: *Self,
+            comptime P: type,
             gpa: Allocator,
             pos: usize,
             ops: []const O,
             text_encoding: types.TextEncoding,
             strings: StringTable,
+            ctx: anytype,
+            comptime map: fn (@TypeOf(ctx), *const O) ParseError!P,
         ) ParseError!usize {
-            var kept: std.ArrayList(O) = .empty;
+            var kept: std.ArrayList(P) = .empty;
             defer kept.deinit(gpa);
-            for (ops) |o| {
+            var one_inline: [1]P = undefined;
+            var one_len: usize = 0;
+            for (ops) |*o| {
                 if (o.action() == .delete) continue; // columns.rs:423
-                try kept.append(gpa, o);
+                const mapped = try map(ctx, o);
+                if (comptime @hasDecl(P, "objId")) {
+                    // A raw external name cannot enter actor-indexed columns.
+                    // Contextful callers must map it to a canonical ID first.
+                    if (mapped.objId() == .named) return error.InvalidValue;
+                }
+                if (ops.len == 1) {
+                    one_inline[one_len] = mapped;
+                    one_len += 1;
+                } else {
+                    try kept.append(gpa, mapped);
+                }
             }
-            const rows = kept.items;
+
+            const rows: []const P = if (ops.len == 1) one_inline[0..one_len] else kept.items;
             const n = rows.len;
 
             // columns.rs:425-426 — before anything moves.
             const value_pos = try prefixOffset(MetaColumn, &self.value_meta, pos);
             const succ_pos = try prefixOffset(CountColumn, &self.succ_count, pos);
 
-            var id_actors = try gpa.alloc(ActorIdx, n);
-            defer gpa.free(id_actors);
-            var id_ctrs = try gpa.alloc(u32, n);
-            defer gpa.free(id_ctrs);
-            var obj_actors = try gpa.alloc(?ActorIdx, n);
-            defer gpa.free(obj_actors);
-            var obj_ctrs = try gpa.alloc(?u32, n);
-            defer gpa.free(obj_ctrs);
-            var key_actors = try gpa.alloc(?ActorIdx, n);
-            defer gpa.free(key_actors);
-            var key_ctrs = try gpa.alloc(?u32, n);
-            defer gpa.free(key_ctrs);
-            var key_strs = try gpa.alloc(?u32, n);
-            defer gpa.free(key_strs);
-            var inserts = try gpa.alloc(bool, n);
-            defer gpa.free(inserts);
-            var actions = try gpa.alloc(u64, n);
-            defer gpa.free(actions);
-            var expands = try gpa.alloc(bool, n);
-            defer gpa.free(expands);
-            var mark_names = try gpa.alloc(?u32, n);
-            defer gpa.free(mark_names);
-            var metas = try gpa.alloc(u64, n);
-            defer gpa.free(metas);
-            var tops = try gpa.alloc(bool, n);
-            defer gpa.free(tops);
-            var widths = try gpa.alloc(?u32, n);
-            defer gpa.free(widths);
-            var visibles = try gpa.alloc(bool, n);
-            defer gpa.free(visibles);
+            // Single-row updates keep row scratch in this frame; larger splices
+            // retain heap storage and its fallible cleanup.
+            var id_actors_inline: [1]ActorIdx = undefined;
+            var id_actors: []ActorIdx = if (n <= 1) id_actors_inline[0..n] else try gpa.alloc(ActorIdx, n);
+            defer if (n > 1) gpa.free(id_actors);
+            var id_ctrs_inline: [1]u32 = undefined;
+            var id_ctrs: []u32 = if (n <= 1) id_ctrs_inline[0..n] else try gpa.alloc(u32, n);
+            defer if (n > 1) gpa.free(id_ctrs);
+            var obj_actors_inline: [1]?ActorIdx = undefined;
+            var obj_actors: []?ActorIdx = if (n <= 1) obj_actors_inline[0..n] else try gpa.alloc(?ActorIdx, n);
+            defer if (n > 1) gpa.free(obj_actors);
+            var obj_ctrs_inline: [1]?u32 = undefined;
+            var obj_ctrs: []?u32 = if (n <= 1) obj_ctrs_inline[0..n] else try gpa.alloc(?u32, n);
+            defer if (n > 1) gpa.free(obj_ctrs);
+            var key_actors_inline: [1]?ActorIdx = undefined;
+            var key_actors: []?ActorIdx = if (n <= 1) key_actors_inline[0..n] else try gpa.alloc(?ActorIdx, n);
+            defer if (n > 1) gpa.free(key_actors);
+            var key_ctrs_inline: [1]?u32 = undefined;
+            var key_ctrs: []?u32 = if (n <= 1) key_ctrs_inline[0..n] else try gpa.alloc(?u32, n);
+            defer if (n > 1) gpa.free(key_ctrs);
+            var key_strs_inline: [1]?u32 = undefined;
+            var key_strs: []?u32 = if (n <= 1) key_strs_inline[0..n] else try gpa.alloc(?u32, n);
+            defer if (n > 1) gpa.free(key_strs);
+            var inserts_inline: [1]bool = undefined;
+            var inserts: []bool = if (n <= 1) inserts_inline[0..n] else try gpa.alloc(bool, n);
+            defer if (n > 1) gpa.free(inserts);
+            var actions_inline: [1]u64 = undefined;
+            var actions: []u64 = if (n <= 1) actions_inline[0..n] else try gpa.alloc(u64, n);
+            defer if (n > 1) gpa.free(actions);
+            var expands_inline: [1]bool = undefined;
+            var expands: []bool = if (n <= 1) expands_inline[0..n] else try gpa.alloc(bool, n);
+            defer if (n > 1) gpa.free(expands);
+            var mark_names_inline: [1]?u32 = undefined;
+            var mark_names: []?u32 = if (n <= 1) mark_names_inline[0..n] else try gpa.alloc(?u32, n);
+            defer if (n > 1) gpa.free(mark_names);
+            var metas_inline: [1]u64 = undefined;
+            var metas: []u64 = if (n <= 1) metas_inline[0..n] else try gpa.alloc(u64, n);
+            defer if (n > 1) gpa.free(metas);
+            var tops_inline: [1]bool = undefined;
+            var tops: []bool = if (n <= 1) tops_inline[0..n] else try gpa.alloc(bool, n);
+            defer if (n > 1) gpa.free(tops);
+            var widths_inline: [1]?u32 = undefined;
+            var widths: []?u32 = if (n <= 1) widths_inline[0..n] else try gpa.alloc(?u32, n);
+            defer if (n > 1) gpa.free(widths);
+            var visibles_inline: [1]bool = undefined;
+            var visibles: []bool = if (n <= 1) visibles_inline[0..n] else try gpa.alloc(bool, n);
+            defer if (n > 1) gpa.free(visibles);
             // One builder per row, in row order, which is the whole of what
             // `extend` takes (mark_index.rs:277-289). Upstream collects the
             // same list — `ops.clone().map(O::mark_index).collect()`
-            // (columns.rs:468-470) — and this port spells it one allocation of
-            // `n`, so the size is known before the first element exists and
-            // the buffer goes back on every path.
-            var mark_builders = try gpa.alloc(?markidx.MarkIndexBuilder, n);
-            defer gpa.free(mark_builders);
-            var succ_counts = try gpa.alloc(u32, n);
-            defer gpa.free(succ_counts);
+            // (columns.rs:468-470) — and this port reserves `n` slots before
+            // the first element exists, releasing heap storage on every path.
+            var mark_builders_inline: [1]?markidx.MarkIndexBuilder = undefined;
+            var mark_builders: []?markidx.MarkIndexBuilder = if (n <= 1)
+                mark_builders_inline[0..n]
+            else
+                try gpa.alloc(?markidx.MarkIndexBuilder, n);
+            defer if (n > 1) gpa.free(mark_builders);
+            var succ_counts_inline: [1]u32 = undefined;
+            var succ_counts: []u32 = if (n <= 1) succ_counts_inline[0..n] else try gpa.alloc(u32, n);
+            defer if (n > 1) gpa.free(succ_counts);
 
             var raw: std.ArrayList(u8) = .empty;
             defer raw.deinit(gpa);
@@ -1990,7 +2274,9 @@ fn encodeInterned(gpa: Allocator, col: *const UintOptColumn, strings: StringTabl
     while (try it.next()) |id| {
         // The wire carries the bytes, so the ids are resolved here and copied
         // out; the column itself never learns a string.
-        try values.append(gpa, if (id) |i| try gpa.dupe(u8, strings.resolve(strings.ctx, i)) else null);
+        // Reserve before copying so ownership transfer cannot fail.
+        try values.ensureUnusedCapacity(gpa, 1);
+        values.appendAssumeCapacity(if (id) |i| try gpa.dupe(u8, strings.resolve(strings.ctx, i)) else null);
     }
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -2295,7 +2581,8 @@ const Table = struct {
             if (std.mem.eql(u8, item, text)) return std.math.cast(u32, i) orelse error.Overflow;
         }
         const id = std.math.cast(u32, self.items.items.len) orelse error.Overflow;
-        try self.items.append(gpa, try gpa.dupe(u8, text));
+        try self.items.ensureUnusedCapacity(gpa, 1);
+        self.items.appendAssumeCapacity(try gpa.dupe(u8, text));
         return id;
     }
 };
@@ -4150,6 +4437,70 @@ fn xorshift(seed: *u64) u64 {
     return x;
 }
 
+fn exerciseCountedPrefixEdits(comptime E: type, value: E.Value, other: E.Value) !void {
+    const gpa = testing.allocator;
+    const C = hexane.Column(E.Value, E);
+    var base: [260]E.Value = undefined;
+    @memset(base[0..2], other);
+    @memset(base[2..130], value);
+    @memset(base[130..258], other);
+    @memset(base[258..], value);
+    for ([_]usize{ 0, 1, 2, 3, 64, 127, 128, 130, 131, 258, 259, 260 }) |at| {
+        for ([_]usize{ 0, @min(@as(usize, 2), base.len - at), base.len - at }) |del| {
+            const inserted = [_]E.Value{ other, value };
+            for ([_][]const E.Value{ &.{}, &inserted }) |ins| {
+                var col = try C.initWithBudget(gpa, 4);
+                defer col.deinit();
+                try col.extend(gpa, &base);
+                const before = try col.encode(gpa);
+                defer gpa.free(before);
+                var stage = try col.stageSplice(at, del, ins);
+                defer stage.deinit();
+                const untouched = try col.encode(gpa);
+                defer gpa.free(untouched);
+                try testing.expectEqualSlices(u8, before, untouched);
+                stage.publish(&col);
+                var want: [262]E.Value = undefined;
+                @memcpy(want[0..at], base[0..at]);
+                @memcpy(want[at..][0..ins.len], ins);
+                @memcpy(want[at + ins.len ..][0 .. base.len - at - del], base[at + del ..]);
+                const length = base.len - del + ins.len;
+                const expected = try E.wireEncode(gpa, want[0..length], false);
+                defer gpa.free(expected);
+                const bytes = try col.encode(gpa);
+                defer gpa.free(bytes);
+                try testing.expectEqualSlices(u8, expected, bytes);
+                var loaded = try C.load(gpa, bytes);
+                defer loaded.deinit();
+                const loaded_bytes = try loaded.encode(gpa);
+                defer gpa.free(loaded_bytes);
+                try testing.expectEqualSlices(u8, expected, loaded_bytes);
+                var total: i64 = 0;
+                for (want[0..length], 0..) |v, i| {
+                    try testing.expectEqual(total, try col.getPrefix(i));
+                    try testing.expectEqual(total, try loaded.getPrefix(i));
+                    try testing.expectEqual(v, (try col.get(i)).?);
+                    try testing.expectEqual(v, (try loaded.get(i)).?);
+                    try E.accumulate(v, &total);
+                }
+                try testing.expectEqual(total, try col.getPrefix(length));
+                try testing.expectEqual(total, try loaded.getPrefix(length));
+                try testing.expect((try col.checkInvariants()) == null);
+                try testing.expect((try loaded.checkInvariants()) == null);
+            }
+        }
+    }
+}
+
+test "counted prefix edits preserve canonical bytes full metadata words and prefix bases" {
+    // Clip and delete both padded and unpadded boolean seams, and equal-width
+    // metadata words whose low type nibbles must never be confused.
+    try exerciseCountedPrefixEdits(BoolPrefixCodec, true, false);
+    try exerciseCountedPrefixEdits(BoolPrefixCodec, false, true);
+    try exerciseCountedPrefixEdits(MetaPrefixCodec, 0x16, 0x17);
+    try exerciseCountedPrefixEdits(MetaPrefixCodec, 0x16, 0x28);
+}
+
 test "fuzz_prefix_column_bool" {
     // `tests.rs`. Two hundred trials of three hundred inserts and removals
     // against a `PrefixColumn<bool>`, with a plain array as the model and
@@ -5279,5 +5630,243 @@ test "the nullable instantiation of the same wire folds the same way, and the no
             std.debug.print("three rows in front of the null run: {any}\n", .{outcome});
             return error.TestUnexpectedResult;
         }
+    }
+}
+
+fn countedPrefixConsumerRows(succs: []const OpId, incs: []const ?i64) [12]Row {
+    // Returned rows borrow these caller-owned buffers throughout every comparison.
+    var rows: [12]Row = undefined;
+    for (&rows, 0..) |*row, i| {
+        const middle = i >= 4 and i < 8;
+        row.* = .{
+            .op_id = OpId.init(@intCast(i + 1), 0),
+            .parent = OpId.init(1, 1),
+            .anchor = seqAt(1, 1),
+            .does_insert = middle,
+            .is_top = middle,
+            .is_visible = middle,
+            .does_expand = middle,
+            .units = 1,
+            .v = if (middle) .{ .uint = 67 } else .{ .str = if (i < 4) "a" else "e" },
+        };
+    }
+    for ([_]usize{ 1, 5, 10 }) |i| {
+        rows[i].succs = succs;
+        rows[i].incs = incs;
+    }
+    rows[5].act = .mark;
+    rows[5].name = "em";
+    rows[5].mark = markStartWord(rows[5].op_id);
+    return rows;
+}
+
+fn expectCountedPrefixConsumer(
+    cols: *const Columns(Row),
+    reference: *const Columns(Row),
+    rows: []const Row,
+) !void {
+    const gpa = testing.allocator;
+    var succs: usize = 0;
+    for (rows) |row| succs += row.succCount();
+    try checkLengths(cols, gpa, rows.len, succs);
+    try expectSameColumns(gpa, reference, cols);
+    try expectSameColumn(TextColumn, gpa, &reference.index.text, &cols.index.text, "text");
+    try expectSameColumn(BoolPrefixColumn, gpa, &reference.index.top, &cols.index.top, "top");
+    try expectSameColumn(BoolColumn, gpa, &reference.index.visible, &cols.index.visible, "visible");
+    try expectSameColumn(IncColumn, gpa, &reference.index.inc, &cols.index.inc, "inc");
+    const marks = try markRows(&cols.index.mark, gpa);
+    defer gpa.free(marks);
+    const reference_marks = try markRows(&reference.index.mark, gpa);
+    defer gpa.free(reference_marks);
+    try testing.expectEqualSlices(?markidx.MarkIdx, reference_marks, marks);
+    try expectCacheAgreesWithRows(&cols.index.mark, gpa);
+    for (rows) |row| {
+        if (row.mark) |_| {
+            const data = cols.index.mark.markData(row.op_id) orelse
+                return error.TestUnexpectedResult;
+            try testing.expectEqualStrings(row.name.?, data.name);
+            switch (row.v) {
+                .str => |text| switch (data.value) {
+                    .str => |actual| try testing.expectEqualStrings(text, actual),
+                    else => return error.TestUnexpectedResult,
+                },
+                .uint => |value| switch (data.value) {
+                    .uint => |actual| try testing.expectEqual(value, actual),
+                    else => return error.TestUnexpectedResult,
+                },
+                else => unreachable,
+            }
+        }
+    }
+
+    const metas = try valuesOf(MetaColumn, &cols.value_meta, gpa);
+    defer gpa.free(metas);
+    const raw = try cols.value.encode(gpa);
+    defer gpa.free(raw);
+    var inserts: i64 = 0;
+    var tops: i64 = 0;
+    var bytes: i64 = 0;
+    var successors: i64 = 0;
+    for (rows, 0..) |row, i| {
+        try testing.expectEqual(row.metaValue().raw, metas[i]);
+        try testing.expectEqual(inserts, try cols.insert.getPrefix(i));
+        try testing.expectEqual(tops, try cols.index.top.getPrefix(i));
+        try testing.expectEqual(bytes, try cols.value_meta.getPrefix(i));
+        try testing.expectEqual(successors, try cols.succ_count.getPrefix(i));
+        const offset: usize = @intCast(bytes);
+        switch (row.v) {
+            .str => |text| try testing.expectEqualStrings(text, raw[offset .. offset + text.len]),
+            .uint => |value| try testing.expectEqual(@as(u8, @intCast(value)), raw[offset]),
+            else => unreachable,
+        }
+        const successor_offset: usize = @intCast(successors);
+        for (row.succs, 0..) |successor, j| {
+            const at = successor_offset + j;
+            try testing.expectEqual(successor.actor, (try cols.succ_actor.get(at)).?);
+            try testing.expectEqual(
+                @as(u32, @intCast(successor.counter)),
+                (try cols.succ_ctr.get(at)).?,
+            );
+            try testing.expectEqual(row.incs[j], (try cols.index.inc.get(at)).?);
+        }
+        inserts += @intFromBool(row.does_insert);
+        tops += @intFromBool(row.is_top);
+        bytes += @intCast(try row.metaValue().length());
+        successors += @intCast(row.succCount());
+    }
+    try testing.expectEqual(inserts, try cols.insert.getPrefix(rows.len));
+    try testing.expectEqual(tops, try cols.index.top.getPrefix(rows.len));
+    try testing.expectEqual(bytes, try cols.value_meta.getPrefix(rows.len));
+    try testing.expectEqual(successors, try cols.succ_count.getPrefix(rows.len));
+    try testing.expectEqual(@as(usize, @intCast(bytes)), raw.len);
+}
+
+fn countedPrefixConsumerRefusal(
+    failing: *testing.FailingAllocator,
+    comptime remove: bool,
+) !void {
+    const gpa = testing.allocator;
+    const agpa = failing.allocator();
+    const source_successors = [_]OpId{ OpId.init(21, 0), OpId.init(22, 1) };
+    const source_increments = [_]?i64{ null, 7 };
+    const source = countedPrefixConsumerRows(&source_successors, &source_increments);
+    const added_successors = [_]OpId{ OpId.init(41, 0), OpId.init(42, 1) };
+    const added_increments = [_]?i64{ -3, null };
+    const added = [_]Row{
+        .{
+            .op_id = OpId.init(31, 1),
+            .parent = OpId.init(1, 1),
+            .anchor = seqAt(1, 1),
+            .does_insert = true,
+            .is_top = true,
+            .units = 2,
+            .v = .{ .uint = 68 },
+            .succs = &added_successors,
+            .incs = &added_increments,
+        },
+        .{
+            .op_id = OpId.init(32, 1),
+            .act = .mark,
+            .anchor = seqAt(1, 1),
+            .name = "em",
+            .mark = markStartWord(OpId.init(32, 1)),
+            .is_top = false,
+            .is_visible = false,
+            .does_expand = true,
+            .v = .{ .str = "z" },
+        },
+        .{
+            .op_id = OpId.init(33, 1),
+            .anchor = seqAt(1, 1),
+            .does_insert = true,
+            .v = .{ .uint = 68 },
+        },
+    };
+    var table = Table.init(agpa);
+    defer table.deinit();
+    var cols = try Columns(Row).init(agpa);
+    defer cols.deinit();
+    _ = try cols.splice(agpa, 0, &source, .unicode_code_point, table.asTable());
+
+    // Save the source independently, not through a clone sharing staged roots.
+    var reference_table = Table.init(gpa);
+    defer reference_table.deinit();
+    var before = try Columns(Row).init(gpa);
+    defer before.deinit();
+    _ = try before.splice(gpa, 0, &source, .unicode_code_point, reference_table.asTable());
+    var saved = try cols.exportColumns(gpa, table.asTable());
+    defer saved.deinit(gpa);
+    const saved_data = try gpa.dupe(u8, saved.data);
+    defer gpa.free(saved_data);
+    const saved_specs = try specsOf(saved.cols, gpa);
+    defer gpa.free(saved_specs);
+
+    const outcome = if (remove)
+        cols.removeOps(agpa, 2, source[2..10])
+    else
+        cols.splice(agpa, 2, &added, .unicode_code_point, table.asTable());
+    // Disable refusal before observation; only the consumer call is under test.
+    failing.fail_index = std.math.maxInt(usize);
+    if (outcome) |written| {
+        try testing.expectEqual(@as(usize, if (remove) 8 else 3), written);
+    } else |failure| {
+        try testing.expectEqual(error.OutOfMemory, failure);
+        try expectCountedPrefixConsumer(&cols, &before, &source);
+        var unchanged = try cols.exportColumns(gpa, table.asTable());
+        defer unchanged.deinit(gpa);
+        const unchanged_specs = try specsOf(unchanged.cols, gpa);
+        defer gpa.free(unchanged_specs);
+        try testing.expectEqualSlices(ColumnSpec, saved_specs, unchanged_specs);
+        try testing.expectEqualSlices(u8, saved_data, unchanged.data);
+        // Retrying the real consumer proves the refused source remains usable.
+        const retried = if (remove)
+            try cols.removeOps(agpa, 2, source[2..10])
+        else
+            try cols.splice(agpa, 2, &added, .unicode_code_point, table.asTable());
+        try testing.expectEqual(@as(usize, if (remove) 8 else 3), retried);
+    }
+
+    var expected: std.ArrayList(Row) = .empty;
+    defer expected.deinit(gpa);
+    try expected.appendSlice(gpa, source[0..2]);
+    if (!remove) try expected.appendSlice(gpa, &added);
+    const tail: usize = if (remove) 10 else 2;
+    try expected.appendSlice(gpa, source[tail..]);
+    var after = try Columns(Row).init(gpa);
+    defer after.deinit();
+    _ = try after.splice(gpa, 0, expected.items, .unicode_code_point, reference_table.asTable());
+    try expectCountedPrefixConsumer(&cols, &after, expected.items);
+    if (remove) try testing.expect(cols.index.mark.markData(source[5].op_id) == null);
+}
+
+test "composite splice preserves counted prefix runs and every column on allocation refusal" {
+    // Insert inside a compressed repeat, splitting both boolean and metadata seams.
+    var probe: testing.FailingAllocator = .init(testing.allocator, .{});
+    try countedPrefixConsumerRefusal(&probe, false);
+    const needed = probe.alloc_index;
+    for (0..needed + 1) |fail_index| {
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        countedPrefixConsumerRefusal(&failing, false) catch |failure| switch (failure) {
+            error.OutOfMemory => continue,
+            else => return failure,
+        };
+    }
+}
+
+test "composite removeOps preserves counted prefix runs and every column on allocation refusal" {
+    // Start and end inside repeats, crossing both seams and a successor pair.
+    var probe: testing.FailingAllocator = .init(testing.allocator, .{});
+    try countedPrefixConsumerRefusal(&probe, true);
+    const needed = probe.alloc_index;
+    for (0..needed + 1) |fail_index| {
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        countedPrefixConsumerRefusal(&failing, true) catch |failure| switch (failure) {
+            error.OutOfMemory => continue,
+            else => return failure,
+        };
     }
 }

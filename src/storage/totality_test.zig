@@ -329,7 +329,12 @@ fn storageRead(bytes: []const u8, alloc: Allocator) ParseError!void {
 /// else: the sweeps below go through [`storageRead`] so that a failure points
 /// at a parser in this slice rather than at one above it.
 fn loadRead(bytes: []const u8) doc_mod.LoadError!void {
-    var doc = try doc_mod.Document.load(gpa, std.testing.io, bytes, doc_mod.defaultTextEncoding(), .auto);
+    var doc = try doc_mod.Document.load(
+        gpa,
+        std.testing.io,
+        bytes,
+        doc_mod.defaultTextEncoding(),
+    );
     doc.deinit();
 }
 

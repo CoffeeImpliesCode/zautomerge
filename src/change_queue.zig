@@ -281,11 +281,110 @@ fn opCountOf(change: Change) u64 {
     return change.max_op - change.start_op + 1;
 }
 
+/// Detached removal closure owned by one caller; copying it does not create
+/// another owner. Release plan storage with `deinit`, including after `publish`.
+/// The preparation allocator must remain valid until then. The source queue
+/// must remain at the same address and unmodified until publication; aborting
+/// never accesses or frees queue-owned changes.
+pub const PreparedActorBranchRemoval = struct {
+    gpa: Allocator,
+    removed: IndexByHash,
+    source: *const ChangeQueue,
+    source_changes: []const Change,
+    published: bool = false,
+
+    /// Removes the prepared closure without allocating. Call at most once
+    /// against the unchanged source queue. Surviving changes retain arrival
+    /// order, but existing element aliases are invalidated by compaction.
+    pub fn publish(self: *PreparedActorBranchRemoval, queue: *ChangeQueue) void {
+        std.debug.assert(!self.published);
+        std.debug.assert(queue == self.source);
+        std.debug.assert(queue.changes.items.ptr == self.source_changes.ptr);
+        std.debug.assert(queue.changes.items.len == self.source_changes.len);
+        var kept_count: usize = 0;
+        for (queue.changes.items, 0..) |*change, index| {
+            if (self.removed.contains(change.hash)) {
+                // Actor/sequence keys borrow change storage, so both indexes
+                // must stop referring to the change before it is freed.
+                const removed_hash = queue.index_by_hash.remove(change.hash);
+                const removed_seq = queue.incoming_actor_seqs.remove(.{
+                    .actor = change.actor,
+                    .seq = change.seq,
+                });
+                std.debug.assert(removed_hash);
+                std.debug.assert(removed_seq);
+                change.deinit(queue.gpa);
+            } else {
+                const position = queue.index_by_hash.getPtr(change.hash) orelse unreachable;
+                position.* = kept_count;
+                if (kept_count != index) {
+                    queue.changes.items[kept_count] = change.*;
+                }
+                kept_count += 1;
+            }
+        }
+        queue.changes.items.len = kept_count;
+        self.published = true;
+    }
+
+    /// Releases only detached plan storage; an unpublished plan is aborted.
+    /// The token is unusable afterward. Neither the queue nor its changes are
+    /// accessed, and the borrowed allocator itself is not released.
+    pub fn deinit(self: *PreparedActorBranchRemoval) void {
+        self.removed.deinit(self.gpa);
+        self.* = undefined;
+    }
+};
+
+/// Detached mutable queue metadata borrowing the source's durable change bodies.
+/// Copying the token does not create another owner. Keep the source at the same
+/// address and unmodified until `publish` or `deinit`; neither operation allocates.
+/// Incoming changes added to `view` must also borrow bodies that outlive the
+/// published queue. Release this token once with `deinit`, including after publish.
+pub const PreparedProjection = struct {
+    /// Independently owned metadata; mutate through queue methods, not by
+    /// replacing its allocator or installing a body arena.
+    view: ChangeQueue,
+    /// Borrowed unchanged source, and its metadata slice at preparation.
+    source: *const ChangeQueue,
+    source_changes: []const Change,
+    published: bool = false,
+
+    /// Replaces the unchanged source queue and consumes staged metadata.
+    /// Moves any source-owned body arena before releasing old metadata, so
+    /// staged changes and already-popped batches retain their borrowed bytes.
+    /// Call at most once, against the source given to `prepareProjection`.
+    pub fn publish(self: *PreparedProjection, target: *ChangeQueue) void {
+        std.debug.assert(!self.published);
+        std.debug.assert(target == self.source);
+        std.debug.assert(target.changes.items.ptr == self.source_changes.ptr);
+        std.debug.assert(target.changes.items.len == self.source_changes.len);
+        std.debug.assert(self.view.owned_bodies == null);
+        self.view.owned_bodies = target.owned_bodies;
+        target.owned_bodies = null;
+        target.deinit();
+        target.* = self.view;
+        self.view = ChangeQueue.init(target.gpa);
+        self.published = true;
+    }
+
+    /// Aborts unpublished metadata without touching source bodies; after
+    /// publication releases only the empty staging queue. `gpa` must match
+    /// preparation. The token is unusable afterward.
+    pub fn deinit(self: *PreparedProjection, gpa: Allocator) void {
+        // Stateless allocator pointers are undefined; compare only the vtable.
+        std.debug.assert(gpa.vtable == self.view.gpa.vtable);
+        std.debug.assert(self.view.owned_bodies == null);
+        self.view.deinit();
+        self.* = undefined;
+    }
+};
+
 /// The queue of changes that are waiting for their dependencies
 /// (`ChangeQueue`, `change_queue.rs:42-51`).
 pub const ChangeQueue = struct {
-    /// The allocator this queue allocates from. Every `gpa` passed to a method
-    /// must be it, because `deinit` and `clear` free with it.
+    /// The allocator for queue-owned storage. Mutating methods' `gpa` must
+    /// match it; preparation may use a separate allocator for detached plans.
     gpa: Allocator,
     /// The changes still waiting, in the order they arrived. Removing a change
     /// keeps the order of the rest, so a queue that is mostly blocked stays in
@@ -295,6 +394,10 @@ pub const ChangeQueue = struct {
     index_by_hash: IndexByHash,
     /// Every queued change's actor and sequence number, the duplicate check.
     incoming_actor_seqs: ActorSeqSet,
+    /// Only clones own backing change bodies. Ordinary queues borrow them
+    /// from their document. Retained through `clear` and ready-batch transfers,
+    /// and released by queue `deinit` after the queued actor arrays.
+    owned_bodies: ?std.heap.ArenaAllocator = null,
 
     /// An empty queue.
     pub fn init(gpa: Allocator) ChangeQueue {
@@ -306,13 +409,60 @@ pub const ChangeQueue = struct {
         };
     }
 
-    /// Frees every queued change and the two indexes. The queue is unusable
-    /// afterwards.
+    /// Independent copy of pending changes in arrival order, with rebuilt
+    /// indexes and exact body bytes, hashes and op counts. Source changes must
+    /// have encoded bodies. Refusal leaves the source unchanged.
+    /// The returned queue owns its body arena and actor arrays through `gpa`;
+    /// release it once with `deinit`. Ready batches popped from this clone
+    /// borrow its body arena, so keep the clone alive while reading them.
+    pub fn clone(
+        self: *const ChangeQueue,
+        gpa: Allocator,
+    ) (Error || error_types.ParseError)!ChangeQueue {
+        var out = ChangeQueue.init(gpa);
+        errdefer out.deinit();
+        out.owned_bodies = std.heap.ArenaAllocator.init(gpa);
+        const arena = out.owned_bodies.?.allocator();
+        try out.changes.ensureTotalCapacity(gpa, self.changes.items.len);
+        for (self.changes.items) |change| {
+            const body = try arena.dupe(u8, change.bytes);
+            var copied = try change_mod.parseChangeWithHash(body, gpa, change.hash);
+            copied.max_op = change.max_op;
+            try out.push(gpa, copied);
+        }
+        return out;
+    }
+
+    /// Copies only queue metadata, never encoded bodies or their header slices.
+    /// The result owns actor arrays and indexes through `gpa`, borrowing bodies
+    /// from this unchanged, address-stable queue until publication or abort.
+    /// On refusal this queue is unchanged. Use `PreparedProjection.deinit(gpa)`
+    /// on every successful preparation, including after publication.
+    pub fn prepareProjection(self: *const ChangeQueue, gpa: Allocator) Error!PreparedProjection {
+        var view = ChangeQueue.init(gpa);
+        errdefer view.deinit();
+        try view.changes.ensureTotalCapacity(gpa, self.changes.items.len);
+        for (self.changes.items) |change| {
+            var copied = change;
+            copied.other_actors = try gpa.dupe(ActorId, change.other_actors);
+            // Push takes ownership of the detached actor array on every path.
+            try view.push(gpa, copied);
+        }
+        return .{
+            .view = view,
+            .source = self,
+            .source_changes = self.changes.items,
+        };
+    }
+
+    /// Frees queued changes, both indexes and any clone-owned body arena.
+    /// The queue and all clone-body views are unusable afterwards.
     pub fn deinit(self: *ChangeQueue) void {
         self.clear();
         self.changes.deinit(self.gpa);
         self.index_by_hash.deinit(self.gpa);
         self.incoming_actor_seqs.deinit(self.gpa);
+        if (self.owned_bodies) |*arena| arena.deinit();
         self.* = undefined;
     }
 
@@ -430,8 +580,24 @@ pub const ChangeQueue = struct {
         actor: ActorId,
         seq: u64,
     ) Error!void {
+        var prepared = try self.prepareRemoveActorBranchFrom(gpa, actor, seq);
+        defer prepared.deinit();
+        prepared.publish(self);
+    }
+
+    /// Prepares removal of the actor's changes at or after `seq` and their
+    /// transitive dependents. All allocation uses `gpa` for detached storage;
+    /// success and `error.OutOfMemory` leave queue storage and indexes unchanged.
+    /// The caller owns the returned plan and must call `deinit`. Keep this queue
+    /// at the same address and unmodified until calling the plan's `publish`.
+    pub fn prepareRemoveActorBranchFrom(
+        self: *const ChangeQueue,
+        gpa: Allocator,
+        actor: ActorId,
+        seq: u64,
+    ) Error!PreparedActorBranchRemoval {
         var removed: IndexByHash = .empty;
-        defer removed.deinit(gpa);
+        errdefer removed.deinit(gpa);
         // Dependency hash to the changes waiting for it, so the removal can
         // walk forwards through the dependents.
         var dependents: std.HashMapUnmanaged(ChangeHash, std.ArrayList(ChangeHash), HashContext, 80) = .empty;
@@ -453,7 +619,12 @@ pub const ChangeQueue = struct {
         for (self.changes.items) |change| {
             if (change.actor.eql(actor) and change.seq >= seq) conflicts += 1;
         }
-        if (conflicts == 0) return;
+        if (conflicts == 0) return .{
+            .gpa = gpa,
+            .removed = removed,
+            .source = self,
+            .source_changes = self.changes.items,
+        };
 
         // The work list is at least this big, and usually exactly this big: the
         // walk only adds the changes that depend on the branch.
@@ -474,38 +645,19 @@ pub const ChangeQueue = struct {
         var head: usize = 0;
         while (head < work.items.len) : (head += 1) {
             var found = dependents.fetchRemove(work.items[head]) orelse continue;
+            defer found.value.deinit(gpa);
             for (found.value.items) |child| {
                 const entry = try removed.getOrPut(gpa, child);
                 if (!entry.found_existing) try work.append(gpa, child);
             }
-            found.value.deinit(gpa);
         }
 
-        // Everything that allocates happens before anything is dropped, so a
-        // failure here leaves the queue exactly as it was.
-        var kept: std.ArrayList(Change) = .empty;
-        errdefer kept.deinit(gpa);
-        try kept.ensureTotalCapacity(gpa, self.changes.items.len);
-        var kept_count: usize = 0;
-        for (self.changes.items) |change| {
-            if (removed.contains(change.hash)) continue;
-            // The survivors move down as the dropped ones come out, so the
-            // hash index is rewritten here rather than after the move.
-            self.index_by_hash.put(gpa, change.hash, kept_count) catch return error.OutOfMemory;
-            kept_count += 1;
-        }
-
-        for (self.changes.items) |*change| {
-            if (removed.contains(change.hash)) {
-                change.deinit(gpa);
-                _ = self.index_by_hash.remove(change.hash);
-                _ = self.incoming_actor_seqs.remove(.{ .actor = change.actor, .seq = change.seq });
-            } else {
-                kept.appendAssumeCapacity(change.*);
-            }
-        }
-        self.changes.deinit(gpa);
-        self.changes = kept;
+        return .{
+            .gpa = gpa,
+            .removed = removed,
+            .source = self,
+            .source_changes = self.changes.items,
+        };
     }
 
     /// Removes and returns every queued change whose dependencies the document
@@ -767,49 +919,12 @@ const testing = std.testing;
 // Tests
 // ---------------------------------------------------------------------------
 
-/// A hash nothing else in these tests produces: the counter in the first four
-/// bytes, so a failure names the change that was being built.
+/// A deliberately absent hash, or a corrupted identity for the cycle test.
+/// Real change identities always come from the codec.
 fn testHash(n: u32) ChangeHash {
     var hash = ChangeHash.zero;
     std.mem.writeInt(u32, hash.bytes[0..4], n, .little);
     return hash;
-}
-
-/// A change for a queue to own. The one allocation a `Change` owns is the
-/// `other_actors` array, and that is the only one made here: a container that
-/// drops a change without freeing it is caught by `std.testing.allocator`
-/// rather than passing quietly. Everything else a change points at is
-/// borrowed, which is what a parsed change does — the dependency hashes and
-/// the actor bytes come out of the chunk the change was read from, and the
-/// document owns that. So `deps` must outlive whatever holds the change.
-///
-/// `num_ops` is how many ops the change claims, which is what the batch's op
-/// count is checked against; the op counter of a change is derived from its
-/// sequence number so that two changes never claim the same op range.
-fn testChange(
-    gpa: Allocator,
-    hash: ChangeHash,
-    actor: []const u8,
-    seq: u64,
-    num_ops: u64,
-    deps: []const ChangeHash,
-) Error!Change {
-    const others = try gpa.alloc(ActorId, 1);
-    errdefer gpa.free(others);
-    others[0] = .{ .bytes = actor };
-    return .{
-        .bytes = &.{},
-        .header_len = 0,
-        .actor = .{ .bytes = actor },
-        .deps = deps,
-        .hash = hash,
-        .time = 0,
-        .message = "",
-        .seq = seq,
-        .start_op = seq,
-        .max_op = if (num_ops == 0) seq - 1 else seq + num_ops - 1,
-        .other_actors = others,
-    };
 }
 
 /// Copies the hashes of a batch into `out`, in dependency order, for
@@ -827,12 +942,14 @@ const Fixture = struct {
     queue: ChangeQueue,
     graph: ChangeGraph,
     authors: Authors,
-
+    gpa: Allocator,
+    bodies: std.ArrayList([]u8) = .empty,
     fn init(gpa: Allocator) Fixture {
         return .{
             .queue = ChangeQueue.init(gpa),
             .graph = ChangeGraph.init(gpa),
             .authors = Authors.init(gpa),
+            .gpa = gpa,
         };
     }
 
@@ -840,14 +957,84 @@ const Fixture = struct {
         self.queue.deinit();
         self.graph.deinit();
         self.authors.deinit();
+        for (self.bodies.items) |body| self.gpa.free(body);
+        self.bodies.deinit(self.gpa);
+    }
+
+    /// Encodes real root-map operations and retains their borrowed body bytes
+    /// until the queue, graph, and any extracted batches have been released.
+    fn change(
+        self: *Fixture,
+        actor: []const u8,
+        seq: u64,
+        start: u64,
+        num_ops: usize,
+        deps: []const ChangeHash,
+    ) !Change {
+        return self.changeWith(actor, seq, start, num_ops, deps, .{});
+    }
+
+    const Metadata = struct {
+        message: ?[]const u8 = null,
+        footer: []const u8 = &.{},
+        predecessor: ?change_mod.ExpandedOpId = null,
+    };
+
+    fn changeWith(
+        self: *Fixture,
+        actor: []const u8,
+        seq: u64,
+        start: u64,
+        num_ops: usize,
+        deps: []const ChangeHash,
+        metadata: Metadata,
+    ) !Change {
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const alloc = scratch.allocator();
+        const ops = try alloc.alloc(change_mod.ExpandedOp, num_ops);
+        for (ops, 0..) |*op, i| {
+            op.* = .{
+                .action = .{ .put = .{ .uint = i } },
+                .obj = .root,
+                .key = .{ .map = try std.fmt.allocPrint(alloc, "key-{d}", .{start + i}) },
+                .pred = &.{},
+            };
+            if (i == 0) {
+                if (metadata.predecessor) |predecessor| {
+                    const preds = try alloc.alloc(change_mod.ExpandedOpId, 1);
+                    preds[0] = predecessor;
+                    op.pred = preds;
+                    op.key = .{ .map = try std.fmt.allocPrint(
+                        alloc,
+                        "key-{d}",
+                        .{predecessor.counter},
+                    ) };
+                }
+            }
+        }
+        const expanded: change_mod.ExpandedChange = .{
+            .ops = ops,
+            .actor = .init(actor),
+            .seq = seq,
+            .start_op = start,
+            .time = 0,
+            .message = metadata.message,
+            .deps = deps,
+            .extra_bytes = metadata.footer,
+        };
+        var built = try expanded.encode(self.gpa);
+        errdefer built.deinit(self.gpa);
+        try self.bodies.append(self.gpa, built.body);
+        return built.change;
     }
 
     /// Applies a change to the graph, so a later sort sees its dependencies as
     /// already satisfied.
-    fn apply(self: *Fixture, gpa: Allocator, change: Change) Error!void {
-        var owned_change = change;
+    fn apply(self: *Fixture, gpa: Allocator, applied_change: Change) (Error || error_types.ParseError)!void {
+        var owned_change = applied_change;
         defer owned_change.deinit(gpa);
-        var meta = try ChangeMetadata.fromChange(change).intoOwned(gpa);
+        var meta = try (try ChangeMetadata.fromChange(gpa, applied_change)).intoOwned(gpa);
         defer meta.deinit(gpa);
         try self.graph.addChange(gpa, &self.authors, meta);
     }
@@ -875,8 +1062,9 @@ test "a change with no dependencies is popped" {
     var f: Fixture = Fixture.init(gpa);
     defer f.deinit();
 
-    const c1 = testHash(1);
-    try f.queue.push(gpa, try testChange(gpa, c1, "a", 1, 3, &.{}));
+    const change = try f.change("a", 1, 1, 3, &.{});
+    const c1 = change.hash;
+    try f.queue.push(gpa, change);
 
     try testing.expectEqual(@as(usize, 1), f.queue.len());
     try testing.expect(f.queue.contains(c1));
@@ -902,13 +1090,16 @@ test "a chain of three pushed in reverse is popped in dependency order" {
     var f: Fixture = Fixture.init(gpa);
     defer f.deinit();
 
-    const c1 = testHash(1);
-    const c2 = testHash(2);
-    const c3 = testHash(3);
+    const first = try f.change("a", 1, 1, 1, &.{});
+    const c1 = first.hash;
+    const second = try f.change("a", 2, 2, 1, &.{c1});
+    const c2 = second.hash;
+    const third = try f.change("a", 3, 3, 1, &.{c2});
+    const c3 = third.hash;
     // Newest first: nothing here could be applied as it stands.
-    try f.queue.push(gpa, try testChange(gpa, c3, "a", 3, 1, &.{c2}));
-    try f.queue.push(gpa, try testChange(gpa, c2, "a", 2, 1, &.{c1}));
-    try f.queue.push(gpa, try testChange(gpa, c1, "a", 1, 1, &.{}));
+    try f.queue.push(gpa, third);
+    try f.queue.push(gpa, second);
+    try f.queue.push(gpa, first);
     try testing.expectEqual(@as(usize, 3), f.queue.len());
 
     var batch = try f.queue.popTopoSortedReady(gpa, &f.graph);
@@ -927,14 +1118,17 @@ test "a chain whose first change is already applied is still ordered" {
     var f: Fixture = Fixture.init(gpa);
     defer f.deinit();
 
-    const c1 = testHash(1);
-    const c2 = testHash(2);
-    const c3 = testHash(3);
+    const first = try f.change("a", 1, 1, 1, &.{});
+    const c1 = first.hash;
+    const second = try f.change("a", 2, 2, 1, &.{c1});
+    const c2 = second.hash;
+    const third = try f.change("a", 3, 3, 1, &.{c2});
+    const c3 = third.hash;
     // The document already holds the root of the chain, so the sort is seeded
     // from `graph.hasChange`, not from the queue.
-    try f.apply(gpa, try testChange(gpa, c1, "a", 1, 1, &.{}));
-    try f.queue.push(gpa, try testChange(gpa, c3, "a", 3, 1, &.{c2}));
-    try f.queue.push(gpa, try testChange(gpa, c2, "a", 2, 1, &.{c1}));
+    try f.apply(gpa, first);
+    try f.queue.push(gpa, third);
+    try f.queue.push(gpa, second);
 
     var batch = try f.queue.popTopoSortedReady(gpa, &f.graph);
     defer batch.deinit();
@@ -951,12 +1145,15 @@ test "two changes with no dependency between them are both popped" {
     defer f.deinit();
 
     // A fork: two changes on top of the same parent, which the graph has.
-    const root = testHash(1);
-    const left = testHash(2);
-    const right = testHash(3);
-    try f.apply(gpa, try testChange(gpa, root, "a", 1, 1, &.{}));
-    try f.queue.push(gpa, try testChange(gpa, left, "b", 1, 1, &.{root}));
-    try f.queue.push(gpa, try testChange(gpa, right, "c", 1, 2, &.{root}));
+    const parent = try f.change("a", 1, 1, 1, &.{});
+    const root = parent.hash;
+    try f.apply(gpa, parent);
+    const left_change = try f.change("b", 1, 2, 1, &.{root});
+    const left = left_change.hash;
+    try f.queue.push(gpa, left_change);
+    const right_change = try f.change("c", 1, 2, 2, &.{root});
+    const right = right_change.hash;
+    try f.queue.push(gpa, right_change);
 
     var batch = try f.queue.popTopoSortedReady(gpa, &f.graph);
     defer batch.deinit();
@@ -978,16 +1175,21 @@ test "three queued changes waiting on the same queued change are all released" {
     // A merge: one queued change in the middle, and three that wait for it.
     // They hang off one dependency, so releasing them walks one list, and a
     // list that lost an entry would leave that change waiting forever.
-    const base = testHash(1);
-    const mid = testHash(2);
-    const left = testHash(3);
-    const right = testHash(4);
-    const last = testHash(5);
-    try f.apply(gpa, try testChange(gpa, base, "a", 1, 1, &.{}));
-    try f.queue.push(gpa, try testChange(gpa, left, "b", 1, 1, &.{mid}));
-    try f.queue.push(gpa, try testChange(gpa, mid, "c", 1, 1, &.{base}));
-    try f.queue.push(gpa, try testChange(gpa, right, "d", 1, 1, &.{mid}));
-    try f.queue.push(gpa, try testChange(gpa, last, "e", 1, 1, &.{mid}));
+    const parent = try f.change("a", 1, 1, 1, &.{});
+    const base = parent.hash;
+    try f.apply(gpa, parent);
+    const middle = try f.change("c", 1, 2, 1, &.{base});
+    const mid = middle.hash;
+    const left_change = try f.change("b", 1, 3, 1, &.{mid});
+    const left = left_change.hash;
+    try f.queue.push(gpa, left_change);
+    try f.queue.push(gpa, middle);
+    const right_change = try f.change("d", 1, 3, 1, &.{mid});
+    const right = right_change.hash;
+    try f.queue.push(gpa, right_change);
+    const last_change = try f.change("e", 1, 3, 1, &.{mid});
+    const last = last_change.hash;
+    try f.queue.push(gpa, last_change);
 
     var batch = try f.queue.popTopoSortedReady(gpa, &f.graph);
     defer batch.deinit();
@@ -1011,11 +1213,12 @@ test "one sort orders a merge of sixty-four heads and emits all of them" {
     // blocked change to report and a downstream mark to spread — and every
     // one of those lists is walked once.
     const tips = 64;
-    const base = testHash(1);
-    const merge = testHash(2);
+    const parent = try f.change("a", 1, 1, 1, &.{});
+    const base = parent.hash;
+    try f.apply(gpa, parent);
+    const merge_change = try f.change("a", 2, 2, 1, &.{base});
+    const merge = merge_change.hash;
     const gone = testHash(3);
-    const orphan = testHash(4);
-    try f.apply(gpa, try testChange(gpa, base, "a", 1, 1, &.{}));
 
     const deps = try gpa.alloc(ChangeHash, 2);
     defer gpa.free(deps);
@@ -1026,13 +1229,19 @@ test "one sort orders a merge of sixty-four heads and emits all of them" {
     // that can release the tips. Its own dependency is `base`, which the
     // document already has, so it is ready on the first pass and everything
     // else in this batch waits on it rather than on arrival order.
-    try f.queue.push(gpa, try testChange(gpa, merge, "a", 2, 1, &.{base}));
-    var n: u32 = 0;
-    while (n < tips) : (n += 1) {
-        try f.queue.push(gpa, try testChange(gpa, testHash(0x100 + n), "b", n + 1, 1, deps));
+    try f.queue.push(gpa, merge_change);
+    var tip_hashes: [tips]ChangeHash = undefined;
+    for (&tip_hashes, 0..) |*hash, n| {
+        var actor: [16]u8 = undefined;
+        const actor_bytes = try std.fmt.bufPrint(&actor, "tip-{d}", .{n});
+        const tip = try f.change(actor_bytes, 1, 3, 1, deps);
+        hash.* = tip.hash;
+        try f.queue.push(gpa, tip);
     }
-    // Waiting for a change nobody has, and one that waits for it in turn.
-    try f.queue.push(gpa, try testChange(gpa, orphan, "c", 1, 1, &.{gone}));
+    // Waiting for a change nobody has.
+    const orphan_change = try f.change("c", 1, 1, 1, &.{gone});
+    const orphan = orphan_change.hash;
+    try f.queue.push(gpa, orphan_change);
 
     var batch = try f.queue.popTopoSortedReady(gpa, &f.graph);
     defer batch.deinit();
@@ -1049,10 +1258,7 @@ test "one sort orders a merge of sixty-four heads and emits all of them" {
     var order: [tips + 1]ChangeHash = undefined;
     batchHashesInto(batch, &order);
     try testing.expect(order[0].eql(merge));
-    var at: usize = 1;
-    while (at < order.len) : (at += 1) {
-        try testing.expect(order[at].eql(testHash(@intCast(0x100 + at - 1))));
-    }
+    try testing.expectEqualSlices(ChangeHash, &tip_hashes, order[1..]);
 }
 
 test "a change waiting for a change nobody has stays queued and is reported" {
@@ -1060,11 +1266,13 @@ test "a change waiting for a change nobody has stays queued and is reported" {
     var f: Fixture = Fixture.init(gpa);
     defer f.deinit();
 
-    const c1 = testHash(1);
-    const c2 = testHash(2);
     const gone = testHash(99);
-    try f.queue.push(gpa, try testChange(gpa, c2, "a", 2, 1, &.{c1}));
-    try f.queue.push(gpa, try testChange(gpa, c1, "a", 1, 1, &.{gone}));
+    const first = try f.change("a", 1, 1, 1, &.{gone});
+    const c1 = first.hash;
+    const second = try f.change("a", 2, 2, 1, &.{c1});
+    const c2 = second.hash;
+    try f.queue.push(gpa, second);
+    try f.queue.push(gpa, first);
 
     var batch = try f.queue.popTopoSortedReady(gpa, &f.graph);
     defer batch.deinit();
@@ -1093,8 +1301,14 @@ test "a dependency cycle is refused and leaves the queue alone" {
     // be built, and the sort says so instead of spinning.
     const a = testHash(1);
     const b = testHash(2);
-    try f.queue.push(gpa, try testChange(gpa, a, "a", 1, 1, &.{b}));
-    try f.queue.push(gpa, try testChange(gpa, b, "b", 1, 1, &.{a}));
+    // Corrupt only the decoded identities: producing this graph on the wire
+    // would require a hash preimage. The bodies themselves remain real changes.
+    var first = try f.change("a", 1, 1, 1, &.{b});
+    first.hash = a;
+    var second = try f.change("b", 1, 1, 1, &.{a});
+    second.hash = b;
+    try f.queue.push(gpa, first);
+    try f.queue.push(gpa, second);
 
     try testing.expectError(error.ChangeGraph, f.queue.popTopoSortedReady(gpa, &f.graph));
 
@@ -1110,7 +1324,9 @@ test "a dependency cycle is refused and leaves the queue alone" {
     var single: Fixture = Fixture.init(gpa);
     defer single.deinit();
     const self_dep = testHash(7);
-    try single.queue.push(gpa, try testChange(gpa, self_dep, "a", 1, 1, &.{self_dep}));
+    var self_change = try single.change("a", 1, 1, 1, &.{self_dep});
+    self_change.hash = self_dep;
+    try single.queue.push(gpa, self_change);
     try testing.expectError(error.ChangeGraph, single.queue.popTopoSortedReady(gpa, &single.graph));
     try testing.expectEqual(@as(usize, 1), single.queue.len());
 }
@@ -1120,17 +1336,20 @@ test "missingDepsFrom walks through queued changes and stops at applied ones" {
     var f: Fixture = Fixture.init(gpa);
     defer f.deinit();
 
-    const root = testHash(1);
-    const q1 = testHash(2);
-    const q2 = testHash(3);
+    const parent = try f.change("a", 1, 1, 1, &.{});
+    const root = parent.hash;
     const far = testHash(10);
     const nearer = testHash(11);
 
-    try f.apply(gpa, try testChange(gpa, root, "a", 1, 1, &.{}));
+    try f.apply(gpa, parent);
     // q1 waits for `far`; q2 waits for q1 and for `nearer`, neither of which
     // the document has.
-    try f.queue.push(gpa, try testChange(gpa, q1, "a", 2, 1, &.{ root, far }));
-    try f.queue.push(gpa, try testChange(gpa, q2, "a", 3, 1, &.{ q1, nearer }));
+    const first = try f.change("a", 2, 2, 1, &.{ root, far });
+    const q1 = first.hash;
+    try f.queue.push(gpa, first);
+    const second = try f.change("a", 3, 3, 1, &.{ q1, nearer });
+    const q2 = second.hash;
+    try f.queue.push(gpa, second);
 
     // Starting at the applied change reports nothing: everything below it is
     // applied too.
@@ -1156,26 +1375,31 @@ test "a change the queue already holds is dropped, a repeated sequence number is
     var f: Fixture = Fixture.init(gpa);
     defer f.deinit();
 
-    const c1 = testHash(1);
-    try f.queue.push(gpa, try testChange(gpa, c1, "a", 1, 1, &.{}));
+    const first = try f.change("a", 1, 1, 1, &.{});
+    const c1 = first.hash;
+    try f.queue.push(gpa, first);
     // The same change again: a peer re-announcing it is normal, and the queue
     // takes it and throws it away.
-    try f.queue.push(gpa, try testChange(gpa, c1, "a", 1, 1, &.{}));
+    try f.queue.push(gpa, try f.change("a", 1, 1, 1, &.{}));
     try testing.expectEqual(@as(usize, 1), f.queue.len());
+    try testing.expect(f.queue.contains(c1));
 
     // A different change claiming the same slot of the actor's history is a
     // conflict, not a duplicate.
+    const conflicting = try f.change("a", 1, 1, 2, &.{});
+    const conflict_hash = conflicting.hash;
     try testing.expectError(
         error.DuplicateSeqNumber,
-        f.queue.push(gpa, try testChange(gpa, testHash(2), "a", 1, 1, &.{})),
+        f.queue.push(gpa, conflicting),
     );
     try testing.expectEqual(@as(usize, 1), f.queue.len());
-    try testing.expect(!f.queue.contains(testHash(2)));
+    try testing.expect(!f.queue.contains(conflict_hash));
 
     // Another actor may use that sequence number, and a failed push left
     // nothing behind.
-    const other = testHash(3);
-    try f.queue.push(gpa, try testChange(gpa, other, "b", 1, 1, &.{}));
+    const other_change = try f.change("b", 1, 1, 1, &.{});
+    const other = other_change.hash;
+    try f.queue.push(gpa, other_change);
     try testing.expectEqual(@as(usize, 2), f.queue.len());
     try testing.expect(f.queue.contains(other));
 }
@@ -1185,25 +1409,32 @@ test "removeActorBranchFrom drops the branch and everything that depends on it" 
     var f: Fixture = Fixture.init(gpa);
     defer f.deinit();
 
-    const a1 = testHash(1);
-    const a2 = testHash(2);
-    const a3 = testHash(3);
-    const a4 = testHash(4);
-    const b1 = testHash(5);
-    const c1 = testHash(6);
-    const d1 = testHash(7);
     // One actor's chain of four, a second actor's lone change, and two more
     // changes hung off the middle of the chain. Removing the chain from its
     // second change has to reach the fourth — two steps down the chain — and
     // both of the others: `c1` one step sideways, and `d1`, which depends only
     // on `c1`, two steps out.
-    try f.queue.push(gpa, try testChange(gpa, a1, "a", 1, 1, &.{}));
-    try f.queue.push(gpa, try testChange(gpa, a2, "a", 2, 1, &.{a1}));
-    try f.queue.push(gpa, try testChange(gpa, a3, "a", 3, 1, &.{a2}));
-    try f.queue.push(gpa, try testChange(gpa, a4, "a", 4, 1, &.{a3}));
-    try f.queue.push(gpa, try testChange(gpa, b1, "b", 1, 1, &.{}));
-    try f.queue.push(gpa, try testChange(gpa, c1, "c", 1, 1, &.{ a2, b1 }));
-    try f.queue.push(gpa, try testChange(gpa, d1, "d", 1, 1, &.{c1}));
+    const first = try f.change("a", 1, 1, 1, &.{});
+    const a1 = first.hash;
+    try f.queue.push(gpa, first);
+    const second = try f.change("a", 2, 2, 1, &.{a1});
+    const a2 = second.hash;
+    try f.queue.push(gpa, second);
+    const third = try f.change("a", 3, 3, 1, &.{a2});
+    const a3 = third.hash;
+    try f.queue.push(gpa, third);
+    const fourth = try f.change("a", 4, 4, 1, &.{a3});
+    const a4 = fourth.hash;
+    try f.queue.push(gpa, fourth);
+    const independent = try f.change("b", 1, 1, 1, &.{});
+    const b1 = independent.hash;
+    try f.queue.push(gpa, independent);
+    const sideways = try f.change("c", 1, 3, 1, &.{ a2, b1 });
+    const c1 = sideways.hash;
+    try f.queue.push(gpa, sideways);
+    const downstream = try f.change("d", 1, 4, 1, &.{c1});
+    const d1 = downstream.hash;
+    try f.queue.push(gpa, downstream);
 
     // Everything from `a2` on, plus the change that depends on it.
     try f.queue.removeActorBranchFrom(gpa, .init("a"), 2);
@@ -1236,15 +1467,133 @@ test "removeActorBranchFrom drops the branch and everything that depends on it" 
     try testing.expect(f.queue.contains(b1));
 }
 
+test "prepared actor branch removal keeps queue aliases and indexes on allocation failure" {
+    // Fail each detached-plan allocation against a populated queue, then
+    // exercise both abort and publication through the real queue consumer.
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        testPreparedActorBranchRemoval,
+        .{},
+    );
+}
+
+fn testPreparedActorBranchRemoval(plan_gpa: Allocator) !void {
+    const gpa = testing.allocator;
+    var bodies = Fixture.init(gpa);
+    defer bodies.deinit();
+    var queue = ChangeQueue.init(gpa);
+    defer queue.deinit();
+    var hashes: [5]ChangeHash = undefined;
+    const first = try bodies.change("a", 1, 1, 1, &.{});
+    hashes[0] = first.hash;
+    try queue.push(gpa, first);
+    const second = try bodies.change("a", 2, 2, 1, &.{hashes[0]});
+    hashes[1] = second.hash;
+    try queue.push(gpa, second);
+    const sideways = try bodies.change("c", 1, 3, 1, &.{hashes[1]});
+    hashes[2] = sideways.hash;
+    try queue.push(gpa, sideways);
+    const independent = try bodies.change("b", 1, 1, 1, &.{});
+    hashes[3] = independent.hash;
+    try queue.push(gpa, independent);
+    const downstream = try bodies.change("d", 1, 4, 1, &.{hashes[2]});
+    hashes[4] = downstream.hash;
+    try queue.push(gpa, downstream);
+    const changes_ptr = queue.slice().ptr;
+    const changes_capacity = queue.changes.capacity;
+    const hash_capacity = queue.index_by_hash.capacity();
+    const seq_capacity = queue.incoming_actor_seqs.capacity();
+
+    var aborted = queue.prepareRemoveActorBranchFrom(plan_gpa, .init("a"), 2) catch |err| {
+        try expectPreparedRemovalQueueUnchanged(
+            &queue,
+            &hashes,
+            changes_ptr,
+            changes_capacity,
+            hash_capacity,
+            seq_capacity,
+        );
+        return err;
+    };
+    aborted.deinit();
+    try expectPreparedRemovalQueueUnchanged(
+        &queue,
+        &hashes,
+        changes_ptr,
+        changes_capacity,
+        hash_capacity,
+        seq_capacity,
+    );
+    var prepared = queue.prepareRemoveActorBranchFrom(plan_gpa, .init("a"), 2) catch |err| {
+        try expectPreparedRemovalQueueUnchanged(
+            &queue,
+            &hashes,
+            changes_ptr,
+            changes_capacity,
+            hash_capacity,
+            seq_capacity,
+        );
+        return err;
+    };
+    defer prepared.deinit();
+    try expectPreparedRemovalQueueUnchanged(
+        &queue,
+        &hashes,
+        changes_ptr,
+        changes_capacity,
+        hash_capacity,
+        seq_capacity,
+    );
+    prepared.publish(&queue);
+    try testing.expect(queue.slice().ptr == changes_ptr);
+    try testing.expectEqual(changes_capacity, queue.changes.capacity);
+    try testing.expectEqual(hash_capacity, queue.index_by_hash.capacity());
+    try testing.expectEqual(seq_capacity, queue.incoming_actor_seqs.capacity());
+    try testing.expectEqual(@as(usize, 2), queue.len());
+    try testing.expect(queue.slice()[0].hash.eql(hashes[0]));
+    try testing.expect(queue.slice()[1].hash.eql(hashes[3]));
+    try testing.expect(queue.get(hashes[3]).?.hash.eql(hashes[3]));
+    for ([_]usize{ 1, 2, 4 }) |index| try testing.expect(!queue.contains(hashes[index]));
+    try testing.expect(!queue.containsActorSeq(.init("a"), 2));
+    try testing.expect(!queue.containsActorSeq(.init("c"), 1));
+    try testing.expect(!queue.containsActorSeq(.init("d"), 1));
+    try testing.expect(queue.containsActorSeq(.init("a"), 1));
+    try testing.expect(queue.containsActorSeq(.init("b"), 1));
+}
+
+fn expectPreparedRemovalQueueUnchanged(
+    queue: *const ChangeQueue,
+    hashes: []const ChangeHash,
+    changes_ptr: [*]const Change,
+    changes_capacity: usize,
+    hash_capacity: u32,
+    seq_capacity: u32,
+) !void {
+    try testing.expect(queue.slice().ptr == changes_ptr);
+    try testing.expectEqual(changes_capacity, queue.changes.capacity);
+    try testing.expectEqual(hash_capacity, queue.index_by_hash.capacity());
+    try testing.expectEqual(seq_capacity, queue.incoming_actor_seqs.capacity());
+    try testing.expectEqual(hashes.len, queue.len());
+    for (hashes, queue.slice(), 0..) |hash, change, index| {
+        try testing.expect(change.hash.eql(hash));
+        try testing.expect(queue.get(hash).?.hash.eql(hash));
+        try testing.expectEqual(index, queue.index_by_hash.get(hash).?);
+        try testing.expect(queue.containsActorSeq(change.actor, change.seq));
+    }
+    try testing.expectEqual(hashes.len, queue.index_by_hash.count());
+    try testing.expectEqual(hashes.len, queue.incoming_actor_seqs.count());
+}
+
 test "clear empties the queue and keeps it usable" {
     const gpa = testing.allocator;
     var f: Fixture = Fixture.init(gpa);
     defer f.deinit();
 
-    const c1 = testHash(1);
-    const c2 = testHash(2);
-    try f.queue.push(gpa, try testChange(gpa, c2, "a", 2, 1, &.{c1}));
-    try f.queue.push(gpa, try testChange(gpa, c1, "a", 1, 1, &.{}));
+    const first = try f.change("a", 1, 1, 1, &.{});
+    const c1 = first.hash;
+    const second = try f.change("a", 2, 2, 1, &.{c1});
+    try f.queue.push(gpa, second);
+    try f.queue.push(gpa, first);
     try testing.expectEqual(@as(usize, 2), f.queue.len());
 
     f.queue.clear();
@@ -1253,7 +1602,7 @@ test "clear empties the queue and keeps it usable" {
 
     // The change numbers of a cleared queue are free again, so a peer's next
     // batch is not refused for a sequence number nothing is holding.
-    try f.queue.push(gpa, try testChange(gpa, c1, "a", 1, 1, &.{}));
+    try f.queue.push(gpa, try f.change("a", 1, 1, 1, &.{}));
     var batch = try f.queue.popTopoSortedReady(gpa, &f.graph);
     defer batch.deinit();
     try testing.expectEqual(@as(usize, 1), batch.len());
@@ -1266,27 +1615,175 @@ test "a large reverse-arriving chain is emitted in dependency order" {
     const gpa = testing.allocator;
     const n: usize = 8_000;
 
-    // The changes borrow their dependency slices from this array.
     const hashes = try gpa.alloc(ChangeHash, n);
     defer gpa.free(hashes);
-    for (hashes, 0..) |*hash, at| {
-        hash.* = testHash(@intCast(at + 1));
-    }
-
     var f: Fixture = Fixture.init(gpa);
     defer f.deinit();
-    for (hashes, 0..) |hash, at| {
-        const rev = n - 1 - at;
-        const deps = if (rev == 0) &.{} else hashes[n - rev ..][0..1];
-        try f.queue.push(gpa, try testChange(gpa, hash, "a", @intCast(rev + 1), 1, deps));
+    var pending: std.ArrayList(Change) = .empty;
+    defer {
+        for (pending.items) |*change| change.deinit(gpa);
+        pending.deinit(gpa);
     }
+    for (hashes, 0..) |*hash, at| {
+        const deps = if (at == 0) &.{} else hashes[at - 1 ..][0..1];
+        var change = try f.change("a", at + 1, at + 1, 1, deps);
+        errdefer change.deinit(gpa);
+        hash.* = change.hash;
+        try pending.append(gpa, change);
+    }
+    while (pending.pop()) |change| try f.queue.push(gpa, change);
     try testing.expectEqual(n, f.queue.len());
 
     var batch = try f.queue.popTopoSortedReady(gpa, &f.graph);
     defer batch.deinit();
     try testing.expectEqual(n, batch.len());
     for (hashes, 0..) |hash, at| {
-        try testing.expect(batch.at(n - 1 - at).hash.eql(hash));
+        try testing.expect(batch.at(at).hash.eql(hash));
     }
     try testing.expect(f.queue.isEmpty());
+}
+
+test "cloned queued changes survive original queue and byte storage deinit" {
+    // Walk clone allocation refusals and read the successful clone only after
+    // all original queued changes and their borrowed body bytes are freed.
+    try testing.checkAllAllocationFailures(testing.allocator, testQueueCloneOwnedBytes, .{});
+}
+
+fn testQueueCloneOwnedBytes(clone_gpa: Allocator) !void {
+    const gpa = testing.allocator;
+    var expected_body: std.ArrayList(u8) = .empty;
+    defer expected_body.deinit(gpa);
+    var expected_dep: ChangeHash = undefined;
+    var cloned = blk: {
+        var source = Fixture.init(gpa);
+        defer source.deinit();
+        const parent = try source.change("base-actor", 1, 1, 2, &.{});
+        expected_dep = parent.hash;
+        defer {
+            var owned_parent = parent;
+            owned_parent.deinit(gpa);
+        }
+        const change = try source.changeWith(
+            "original-actor",
+            3,
+            3,
+            7,
+            &.{parent.hash},
+            .{
+                .message = "queued clone message",
+                .footer = &.{ 0xfa, 0xfb, 0xfc },
+                .predecessor = .{ .counter = 2, .actor = .init("base-actor") },
+            },
+        );
+        // Clone preserves both real operation columns and the opaque footer.
+        try source.queue.push(gpa, change);
+        try expected_body.appendSlice(gpa, change.bytes);
+        try source.queue.push(gpa, try source.change("second-actor", 1, 1, 1, &.{}));
+        const result = source.queue.clone(clone_gpa) catch |err| {
+            try testing.expectEqual(@as(usize, 2), source.queue.len());
+            try testing.expectEqualSlices(u8, expected_body.items, source.queue.slice()[0].bytes);
+            return err;
+        };
+        break :blk result;
+    };
+    defer cloned.deinit();
+    try testing.expectEqual(@as(usize, 2), cloned.len());
+    const first = cloned.slice()[0];
+    try testing.expectEqualSlices(u8, expected_body.items, first.bytes);
+    try testing.expectEqualStrings("original-actor", first.actor.bytes);
+    try testing.expectEqualStrings("queued clone message", first.message);
+    try testing.expectEqual(@as(u64, 3), first.seq);
+    try testing.expectEqual(@as(u64, 9), first.max_op);
+    try testing.expectEqualSlices(ChangeHash, &.{expected_dep}, first.deps);
+    try testing.expectEqualStrings("base-actor", first.other_actors[0].bytes);
+    try testing.expect(cloned.get(first.hash).?.hash.eql(first.hash));
+    try testing.expect(cloned.containsActorSeq(first.actor, first.seq));
+    try testing.expectEqualStrings("second-actor", cloned.slice()[1].actor.bytes);
+    try cloned.removeActorBranchFrom(clone_gpa, first.actor, first.seq);
+    try testing.expectEqual(@as(usize, 1), cloned.len());
+    try testing.expectEqualStrings("second-actor", cloned.slice()[0].actor.bytes);
+}
+
+test "prepared projection borrows bodies and transfers clone body ownership" {
+    // Walk metadata allocation failures, abort a pruned stage, then publish
+    // without copying bodies or releasing the original clone's body arena.
+    try testing.checkAllAllocationFailures(testing.allocator, testQueueProjection, .{});
+}
+
+fn testQueueProjection(stage_gpa: Allocator) !void {
+    const gpa = testing.allocator;
+    var queue = blk: {
+        var source = Fixture.init(gpa);
+        defer source.deinit();
+        const parent = try source.change("base-actor", 1, 1, 2, &.{});
+        defer {
+            var owned_parent = parent;
+            owned_parent.deinit(gpa);
+        }
+        const change = try source.changeWith(
+            "projection-actor",
+            3,
+            3,
+            7,
+            &.{parent.hash},
+            .{
+                .message = "projection message",
+                .footer = &.{ 0xfa, 0xfb },
+                .predecessor = .{ .counter = 2, .actor = .init("base-actor") },
+            },
+        );
+        try source.queue.push(gpa, change);
+        break :blk try source.queue.clone(gpa);
+    };
+    defer queue.deinit();
+    const old = queue.slice()[0];
+    const old_metadata = queue.slice().ptr;
+
+    var aborted = queue.prepareProjection(stage_gpa) catch |err| {
+        try testing.expect(queue.slice().ptr == old_metadata);
+        try testing.expectEqualStrings("projection message", queue.slice()[0].message);
+        return err;
+    };
+    try testing.expect(aborted.view.slice().ptr != old_metadata);
+    try testing.expect(aborted.view.slice()[0].other_actors.ptr != old.other_actors.ptr);
+    try testing.expect(aborted.view.slice()[0].bytes.ptr == old.bytes.ptr);
+    try testing.expect(aborted.view.slice()[0].actor.bytes.ptr == old.actor.bytes.ptr);
+    try testing.expect(aborted.view.slice()[0].deps.ptr == old.deps.ptr);
+    try testing.expectEqual(old.max_op, aborted.view.slice()[0].max_op);
+    aborted.view.clear();
+    aborted.deinit(stage_gpa);
+    try testing.expect(queue.slice().ptr == old_metadata);
+    try testing.expect(queue.contains(old.hash));
+    try testing.expect(queue.owned_bodies != null);
+    try testing.expectEqualStrings("projection message", queue.slice()[0].message);
+
+    var prepared = queue.prepareProjection(stage_gpa) catch |err| {
+        try testing.expect(queue.slice().ptr == old_metadata);
+        try testing.expectEqualStrings("projection message", queue.slice()[0].message);
+        return err;
+    };
+    defer prepared.deinit(stage_gpa);
+    prepared.publish(&queue);
+    try testing.expect(queue.owned_bodies != null);
+    try testing.expect(queue.slice().ptr != old_metadata);
+    try testing.expect(queue.slice()[0].bytes.ptr == old.bytes.ptr);
+    try testing.expectEqualStrings("projection-actor", queue.slice()[0].actor.bytes);
+    try testing.expectEqualStrings("projection message", queue.slice()[0].message);
+    try testing.expect(queue.containsActorSeq(old.actor, old.seq));
+    try testing.expect(queue.get(old.hash).?.hash.eql(old.hash));
+    try testing.expectEqualSlices(u8, &.{ 0xfa, 0xfb }, queue.slice()[0].bytes[queue.slice()[0].bytes.len - 2 ..]);
+
+    var pruned = queue.prepareProjection(stage_gpa) catch |err| {
+        try testing.expect(queue.contains(old.hash));
+        try testing.expectEqualStrings("projection message", queue.slice()[0].message);
+        return err;
+    };
+    defer pruned.deinit(stage_gpa);
+    pruned.view.clear();
+    pruned.publish(&queue);
+    try testing.expect(queue.isEmpty());
+    try testing.expect(!queue.contains(old.hash));
+    try testing.expect(!queue.containsActorSeq(old.actor, old.seq));
+    try testing.expect(queue.owned_bodies != null);
+    try testing.expectEqualStrings("projection message", old.message);
 }

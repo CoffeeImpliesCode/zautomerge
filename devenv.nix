@@ -11,6 +11,9 @@ let
 in
 {
   packages = with pkgs; [
+    # C ABI conformance uses these; cmocka is not a port library dependency.
+    cmocka
+    pkg-config
     git
     jq
     # Byte-level inspection of automerge documents and sync payloads.

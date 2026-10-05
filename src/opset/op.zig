@@ -757,8 +757,13 @@ pub const OpBuilder = struct {
     /// The parent object as the object columns spell it: null for the root,
     /// whose two columns are both null (`AsChangeOp for B`,
     /// `op_set2/op.rs:1276-1281`; `op_set2/columns.rs:143-148`).
+    /// Named public objects must be resolved by the owning OpSet before
+    /// reaching the column writer; this accessor only exposes `.id` values.
     pub fn obj(self: *const OpBuilder) ?OpId {
-        return self._obj.opId();
+        return switch (self._obj) {
+            .id => |object_id| object_id,
+            .root, .named => null,
+        };
     }
 
     /// The parent object as `Op::obj` holds it (`op_set2/op.rs:837`), root
@@ -770,13 +775,13 @@ pub const OpBuilder = struct {
     /// The parent object's actor, or null for the root
     /// (`OpLike::obj_actor`, `op_set2/op.rs:1332-1334`).
     pub fn objActor(self: *const OpBuilder) ?ActorIdx {
-        return self._obj.actor();
+        return if (self.obj()) |object_id| object_id.actor else null;
     }
 
     /// The parent object's counter, or null for the root
     /// (`OpLike::obj_ctr`, `op_set2/op.rs:1335-1337`).
     pub fn objCtr(self: *const OpBuilder) ?u32 {
-        return self._obj.counter();
+        return if (self.obj()) |object_id| object_id.counter else null;
     }
 
     /// The object this operation makes, and of what type, or null for an
@@ -1600,16 +1605,14 @@ pub const TxOp = struct {
 /// Unlike [`Op`], a change op is not a row yet: it has no row position until
 /// the merge walks assign one, and its successors are known rather than read.
 ///
-/// **The accessors after [`ChangeOp.succIncAt`] forward.** The reason is the
-/// one [`TxOp`] gives: a generic reader (`columns.zig:503`) is written against
-/// one interface over all four op types. Each forwards one-for-one to the
-/// [`OpBuilder`] accessor of the same name, except the successor ones, which
-/// read this op's own `succs` because a decoded op's successors are a list
-/// rather than columns. Everything borrowed is borrowed from the builder or
-/// from `succs`, and the op is `undefined` after [`ChangeOp.deinit`].
+/// **Most accessors after [`ChangeOp.succIncAt`] forward.** A generic reader
+/// (`columns.zig:503`) uses one interface over all four op types. Successor
+/// accessors read `succs`, and predecessor accessors select the owned builder
+/// list or the transaction-only borrowed view. Other accessors forward to
+/// [`OpBuilder`]. The op is `undefined` after [`ChangeOp.deinit`].
 ///
-/// Not thread-safe, and not shared: one `ChangeOp` belongs to one change
-/// decode.
+/// Not thread-safe or shared: one `ChangeOp` belongs to one change decode or
+/// one pending transaction. A transaction view must not escape that journal.
 pub const ChangeOp = struct {
     /// The successors its predecessors gained, in ascending id order.
     succs: std.ArrayList(SuccEntry),
@@ -1624,6 +1627,10 @@ pub const ChangeOp = struct {
     conflicted: bool,
     /// The operation itself.
     bld: OpBuilder,
+    /// Nonempty predecessor ids borrowed only from the paired `Pending.tx`.
+    /// Null uses the owned builder list. The owner must stay alive and its
+    /// predecessor storage must not be mutated while this view lives.
+    borrowed_pred: ?[]const OpId = null,
 
     /// A change op holding the columns of one decoded operation, owning a
     /// copy of `pred` and no successors yet.
@@ -1659,17 +1666,45 @@ pub const ChangeOp = struct {
         };
     }
 
-    /// Frees the successor list and the builder's predecessor list, and
-    /// nothing else: every borrowed payload — the map key, the `str`/`bytes`
-    /// payload, the mark name — belongs to the change or the document it was
-    /// decoded out of.
+    /// A transaction-only view of `tx`, without copying its predecessors.
     ///
-    /// `gpa` must be the allocator [`init`] was given, for the reason
-    /// [`OpBuilder.deinit`] gives. Afterwards the op is `undefined`: no
-    /// accessor may be called on it, and a second call frees `undefined`
-    /// without any optimize mode diagnosing it, so call it exactly once. A
-    /// copy taken beforehand names the same two allocations and is not a
-    /// second owner.
+    /// The result's builder owns an empty predecessor list; `pred()` borrows
+    /// only `tx.bld._pred` storage. Keep that storage alive and unmodified
+    /// until this view is disposed. Store it with its owner in `Pending`,
+    /// dispose the view before the owner, and never let it escape the pending
+    /// transaction. Other payloads retain `TxOp`'s existing borrow contract.
+    /// This constructor allocates nothing; successor growth still takes an
+    /// allocator, which must also be passed to `deinit`.
+    pub fn initBorrowingTxPred(tx: *const TxOp) ChangeOp {
+        const predecessors = tx.pred();
+        return .{
+            .succs = .empty,
+            .pos = null,
+            .subsort = 0,
+            .conflicted = false,
+            .bld = .{
+                ._id = tx.id(),
+                ._obj = tx.objId(),
+                ._action = tx.action(),
+                ._key = tx.key(),
+                ._insert = tx.insert(),
+                ._value = tx.value(),
+                ._expand = tx.expand(),
+                ._mark_name = tx.markName(),
+                ._pred = .empty,
+            },
+            .borrowed_pred = if (predecessors.len != 0) predecessors else null,
+        };
+    }
+
+    /// Frees the successor list and the builder's owned predecessor list.
+    /// A transaction's borrowed predecessors are not freed here; the paired
+    /// `Pending.tx` owns them and must be disposed after this view. Other
+    /// borrowed payloads belong to the change, document or transaction journal.
+    ///
+    /// `gpa` must be the allocator used for the owned lists. Afterwards the op
+    /// is `undefined`: no accessor may be called on it. Call exactly once;
+    /// a copy names the same owned allocations and is not a second owner.
     pub fn deinit(self: *ChangeOp, gpa: Allocator) void {
         self.succs.deinit(gpa);
         self.bld.deinit(gpa);
@@ -1943,16 +1978,17 @@ pub const ChangeOp = struct {
     pub fn opIdCtr(self: *const ChangeOp) u32 {
         return self.bld.opIdCtr();
     }
-    /// How many predecessors the decoded operation declared
-    /// (`OpBuilder.predCount`, `op_set2/op.rs:1307-1309`).
+    /// How many predecessors the operation declares (`OpBuilder.predCount`,
+    /// `op_set2/op.rs:1307-1309`), including a transaction's borrowed view.
     pub fn predCount(self: *const ChangeOp) u32 {
-        return self.bld.predCount();
+        return std.math.cast(u32, self.pred().len) orelse std.math.maxInt(u32);
     }
-    /// The predecessor ids, borrowed from the builder's own list
-    /// (`OpBuilder.pred`, `op_set2/op.rs:1319-1321`). They are valid until
-    /// [`ChangeOp.deinit`], which frees that list.
+    /// The predecessor ids (`OpBuilder.pred`, `op_set2/op.rs:1319-1321`).
+    /// Owning views borrow their builder list until `ChangeOp.deinit`.
+    /// Transaction views borrow the paired `Pending.tx` list; it must remain
+    /// alive and unmodified until this view is disposed, before its owner.
     pub fn pred(self: *const ChangeOp) []const OpId {
-        return self.bld.pred();
+        return self.borrowed_pred orelse self.bld.pred();
     }
 };
 
@@ -2061,8 +2097,12 @@ pub const Op = struct {
     /// The parent object as the object columns spell it: null for the root,
     /// whose two columns are both null (`OpSet::iter`, `op_set.rs:1318-1342`;
     /// `obj_actor`/`obj_ctr`, `op_set2/columns.rs:143-148`).
+    /// Named public objects require owning-OpSet resolution before use.
     pub fn obj(self: *const Op) ?OpId {
-        return self._obj.opId();
+        return switch (self._obj) {
+            .id => |object_id| object_id,
+            .root, .named => null,
+        };
     }
 
     /// The parent object as `Op::obj` holds it (`op_set2/op.rs:837`).
@@ -2073,13 +2113,13 @@ pub const Op = struct {
     /// The parent object's actor, or null for the root
     /// (`OpLike::obj_actor`, `op_set2/op.rs:1332-1334`).
     pub fn objActor(self: *const Op) ?ActorIdx {
-        return self._obj.actor();
+        return if (self.obj()) |object_id| object_id.actor else null;
     }
 
     /// The parent object's counter, or null for the root
     /// (`OpLike::obj_ctr`, `op_set2/op.rs:1335-1337`).
     pub fn objCtr(self: *const Op) ?u32 {
-        return self._obj.counter();
+        return if (self.obj()) |object_id| object_id.counter else null;
     }
 
     /// The object this operation makes, and of what type, or null
@@ -2586,8 +2626,23 @@ pub const Op = struct {
     /// Nothing here reads a successor: the invariant is about ids, keys and
     /// objects only, which is why `step` needs no allocator and cannot fail.
     pub fn step(self: *const Op, stepper: *OpStepper) bool {
-        if (!self._obj.eql(stepper.obj)) {
-            const ok = self._obj.order(stepper.obj) == .gt;
+        // Rows carry canonical table IDs. A public named ID must first be
+        // resolved by the owning OpSet; this kernel cannot verify its hint.
+        const object_order: ?std.math.Order = switch (self._obj) {
+            .root => switch (stepper.obj) {
+                .root => .eq,
+                .id => .lt,
+                .named => null,
+            },
+            .id => |object_id| switch (stepper.obj) {
+                .root => .gt,
+                .id => |previous_id| object_id.order(previous_id),
+                .named => null,
+            },
+            .named => null,
+        };
+        if (object_order == null or object_order.? != .eq) {
+            const ok = object_order != null and object_order.? == .gt;
             stepper.obj = self._obj;
             stepper.key = self.elemidOrKey();
             stepper.id = self._id;
@@ -2982,6 +3037,21 @@ test "step advances the stepper even when it rejects the row" {
     try testing.expect(stepper.id.eql(idOf(1)));
 }
 
+test "row order requires canonical table IDs rather than public actor hints" {
+    var stepper = OpStepper.initial();
+    const named = ObjId.withActor(OpId.init(1, 999), .{ .bytes = "actor" });
+    const unresolved = (Row{ .obj = named, .id = idOf(2), .key = .{ .map = "a" } }).toOp(0);
+    // This kernel has no actor table with which to resolve the hint.
+    try testing.expect(!unresolved.step(&stepper));
+    try testing.expect(stepper.id.eql(idOf(2)));
+
+    stepper = OpStepper.initial();
+    const canonical = (Row{ .obj = .{ .id = idOf(1) }, .id = idOf(2), .key = .{ .map = "a" } }).toOp(0);
+    try testing.expect(canonical.step(&stepper));
+    const same_register = (Row{ .obj = .{ .id = idOf(1) }, .id = idOf(3), .key = .{ .map = "a" } }).toOp(1);
+    try testing.expect(same_register.step(&stepper));
+}
+
 /// A row store that places a new op where upstream's local-insert paths put
 /// it, so the session test exercises real positions rather than a hand-drawn
 /// order.
@@ -3020,10 +3090,18 @@ const Model = struct {
         self.rows.deinit(gpa);
     }
 
+    fn sameObject(a: ObjId, b: ObjId) bool {
+        return switch (a) {
+            .root => b == .root,
+            .id => |id| b == .id and id.eql(b.id),
+            .named => false,
+        };
+    }
+
     /// The first row of `obj`, or the end of the store if it has none.
     fn objStart(self: Model, obj: ObjId) usize {
         for (self.rows.items, 0..) |r, i| {
-            if (r.obj.eql(obj)) return i;
+            if (sameObject(r.obj, obj)) return i;
         }
         return self.rows.items.len;
     }
@@ -3033,7 +3111,7 @@ const Model = struct {
         const start = self.objStart(obj);
         var i = start;
         while (i < self.rows.items.len) : (i += 1) {
-            if (!self.rows.items[i].obj.eql(obj)) return i;
+            if (!sameObject(self.rows.items[i].obj, obj)) return i;
         }
         return self.rows.items.len;
     }

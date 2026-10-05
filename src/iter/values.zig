@@ -757,7 +757,8 @@ const Table = struct {
             if (std.mem.eql(u8, item, text)) return std.math.cast(u32, i) orelse error.Overflow;
         }
         const id = std.math.cast(u32, self.items.items.len) orelse error.Overflow;
-        try self.items.append(gpa, try gpa.dupe(u8, text));
+        try self.items.ensureUnusedCapacity(gpa, 1);
+        self.items.appendAssumeCapacity(try gpa.dupe(u8, text));
         return id;
     }
 };
@@ -776,6 +777,7 @@ const Fixture = struct {
             self.table.deinit();
             return e;
         };
+        errdefer self.table.deinit();
         errdefer self.set.deinit();
         _ = try self.set.splice(0, rows);
         // The index is **derived**, never declared: a row carries no statement
@@ -932,9 +934,10 @@ test "Values answers on a map, a list and a text object through one interface" {
     const list = made(2, 0);
     const text = made(3, 0);
     const doc = try Fixture.build(gpa, &.{actor_a}, &.{
-        // Root map: two keys, and the first makes a list.
+        // Root map: one scalar, a list, and a text object.
         mapRow(opId(1, 0), .root, "a", .{ .int = 1 }, &.{}),
         row(opId(2, 0), .root, .{ .map = "l" }, false, .make_list, .null_value, &.{}),
+        row(opId(3, 0), .root, .{ .map = "t" }, false, .make_text, .null_value, &.{}),
         // A list: two elements.
         row(opId(4, 0), list, anchor(opId(4, 0)), true, .set, .{ .str = "x" }, &.{}),
         row(opId(5, 0), list, anchor(opId(4, 0)), true, .set, .{ .str = "y" }, &.{}),
@@ -943,8 +946,8 @@ test "Values answers on a map, a list and a text object through one interface" {
     });
     defer doc.destroy();
 
-    // The map: a scalar and an **object**. `make_list` is a make action, so the
-    // value is `ValueRef::Object` and not a null scalar
+    // The map: a scalar and two objects. Make actions carry an object type,
+    // not a null scalar.
     // ([`op_set2/types.rs:667-675`](../../github-automerge-automerge/rust/automerge/src/op_set2/types.rs));
     // this is where a reader that read the scalar column alone would answer
     // null.
@@ -961,6 +964,9 @@ test "Values answers on a map, a list and a text object through one interface" {
         const second = (try walk.next()).?;
         try testing.expectEqual(types.ObjType.list, second.value.object);
         try testing.expectEqual(@as(u32, 2), second.id.opId().?.counter);
+        const third = (try walk.next()).?;
+        try testing.expectEqual(types.ObjType.text, third.value.object);
+        try testing.expectEqual(@as(u32, 3), third.id.opId().?.counter);
         try testing.expect((try walk.next()) == null);
     }
 

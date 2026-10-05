@@ -6,7 +6,7 @@ const types = @import("types.zig");
 
 const ParseError = err.ParseError;
 const Error = err.Error;
-const ExId = types.ExId;
+const ObjType = types.ObjType;
 const ActorId = types.ActorId;
 
 /// The wire tag of a scalar value. The numeric values are format: they are the
@@ -141,13 +141,9 @@ pub const ValueMeta = struct {
     }
 };
 
-/// A scalar value.
-///
-/// **Every slice this type carries is a borrow.** `str` and `bytes` point
-/// into the arena that owns the value column, `actor_id` borrows the actor
-/// table's bytes the way every [`ActorId`](types.zig) does, and
-/// `unknown.bytes` points into that same value column. None of them is copied
-/// here and none is released here.
+/// A scalar whose slices borrow their source unless obtained through `dup`.
+/// Release explicitly duplicated payloads with `deinitOwned`; ordinary copies
+/// are not independent owners (`value.rs:517-534`).
 pub const ScalarValue = union(enum) {
     null_value,
     bool_value: bool,
@@ -201,6 +197,222 @@ pub const ScalarValue = union(enum) {
         }
     };
 
+    /// The numerical datatype used by change serde (`value.rs:429-445`).
+    pub const DataType = enum { counter, timestamp, bytes, uint, int, float64, undefined };
+
+    /// Constructs a borrowed scalar from an idiomatic primitive.
+    /// Strings and byte slices remain borrowed; use `dup` for independent storage.
+    pub fn from(v: anytype) ScalarValue {
+        const T = @TypeOf(v);
+        if (T == ScalarValue) return v;
+        if (T == Counter) return .{ .counter = v };
+        return switch (@typeInfo(T)) {
+            .void, .null => .null_value,
+            .bool => .{ .bool_value = v },
+            .int => |i| if (i.signedness == .signed) .{ .int = @intCast(v) } else .{ .uint = @intCast(v) },
+            .comptime_int => if (v < 0) .{ .int = v } else .{ .uint = v },
+            .float, .comptime_float => .{ .float = @floatCast(v) },
+            .pointer => .{ .str = v },
+            else => @compileError("ScalarValue.from requires a scalar, number, bool, string, or void"),
+        };
+    }
+
+    /// Constructs a borrowed arbitrary byte scalar.
+    pub fn fromBytes(v: []const u8) ScalarValue {
+        return .{ .bytes = v };
+    }
+
+    /// Constructs an owned UTF-8 scalar from one Unicode scalar value.
+    pub fn fromCodepoint(gpa: std.mem.Allocator, cp: u21) !OwnedScalarValue {
+        var buf: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(cp, &buf) catch return error.InvalidCharacter;
+        return (ScalarValue{ .str = buf[0..len] }).intoOwned(gpa);
+    }
+
+    /// Whether this scalar carries the indicated exact tag.
+    pub fn isBytes(self: ScalarValue) bool {
+        return self == .bytes;
+    }
+    /// Whether this scalar is a string.
+    pub fn isStr(self: ScalarValue) bool {
+        return self == .str;
+    }
+    /// Whether this scalar is a signed integer.
+    pub fn isInt(self: ScalarValue) bool {
+        return self == .int;
+    }
+    /// Whether this scalar is an unsigned integer.
+    pub fn isUint(self: ScalarValue) bool {
+        return self == .uint;
+    }
+    /// Whether this scalar is a floating-point number.
+    pub fn isF64(self: ScalarValue) bool {
+        return self == .float;
+    }
+    /// Whether this scalar is a counter.
+    pub fn isCounter(self: ScalarValue) bool {
+        return self == .counter;
+    }
+    /// Whether this scalar is a timestamp.
+    pub fn isTimestamp(self: ScalarValue) bool {
+        return self == .timestamp;
+    }
+    /// Whether this scalar is a boolean.
+    pub fn isBoolean(self: ScalarValue) bool {
+        return self == .bool_value;
+    }
+    /// Whether this scalar is null.
+    pub fn isNull(self: ScalarValue) bool {
+        return self == .null_value;
+    }
+    /// Borrows the byte payload, or returns null for another tag.
+    pub fn asBytes(self: ScalarValue) ?[]const u8 {
+        return if (self == .bytes) self.bytes else null;
+    }
+    /// Borrows the string payload, or returns null for another tag.
+    pub fn asStr(self: ScalarValue) ?[]const u8 {
+        return if (self == .str) self.str else null;
+    }
+    /// Returns the boolean payload, or null for another tag.
+    pub fn asBool(self: ScalarValue) ?bool {
+        return if (self == .bool_value) self.bool_value else null;
+    }
+
+    /// Rust's lossy numeric cast: integer casts wrap; float casts saturate,
+    /// truncate fractions and map NaN to zero (`value.rs:725-779`).
+    pub fn asI64(self: ScalarValue) ?i64 {
+        return switch (self) {
+            .int, .timestamp => |i| i,
+            .uint => |u| @bitCast(u),
+            .counter => |c| c.current,
+            .float => |f| if (std.math.isNan(f)) 0 else if (f >= 0x1p63) std.math.maxInt(i64) else if (f <= -0x1p63) std.math.minInt(i64) else @intFromFloat(f),
+            else => null,
+        };
+    }
+    /// Rust's unsigned numeric cast, with wrapping signed integers and
+    /// saturating floats (`value.rs:752-759`).
+    pub fn asU64(self: ScalarValue) ?u64 {
+        return switch (self) {
+            .int, .timestamp => |i| @bitCast(i),
+            .uint => |u| u,
+            .counter => |c| @bitCast(c.current),
+            .float => |f| if (std.math.isNan(f) or f <= 0) 0 else if (f >= 0x1p64) std.math.maxInt(u64) else @intFromFloat(f),
+            else => null,
+        };
+    }
+    /// Casts numeric tags to floating point, or returns null.
+    pub fn asF64(self: ScalarValue) ?f64 {
+        return switch (self) {
+            .int, .timestamp => |i| @floatFromInt(i),
+            .uint => |u| @floatFromInt(u),
+            .counter => |c| @floatFromInt(c.current),
+            .float => |f| f,
+            else => null,
+        };
+    }
+    /// Returns integer-like tags with wrapping Uint conversion; floats and
+    /// nonnumeric tags return zero (`value.rs:807-813`).
+    pub fn asI64OrDefault(self: ScalarValue) i64 {
+        return if (self == .float) 0 else self.asI64() orelse 0;
+    }
+    /// Copies every borrowed payload. The caller releases with `deinitOwned`.
+    /// OOM leaves the source untouched and transfers no allocation.
+    pub fn dup(self: ScalarValue, gpa: std.mem.Allocator) !ScalarValue {
+        return switch (self) {
+            .str => |s| .{ .str = try gpa.dupe(u8, s) },
+            .bytes => |s| .{ .bytes = try gpa.dupe(u8, s) },
+            .actor_id => |a| .{ .actor_id = try ActorId.initCopy(gpa, a.bytes) },
+            .unknown => |u| .{ .unknown = .{ .type_code = u.type_code, .bytes = try gpa.dupe(u8, u.bytes) } },
+            else => self,
+        };
+    }
+    /// Releases only a scalar obtained from `dup`, invalidating it.
+    pub fn deinitOwned(self: *ScalarValue, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .str, .bytes => |s| gpa.free(s),
+            .actor_id => |a| gpa.free(a.bytes),
+            .unknown => |u| gpa.free(u.bytes),
+            else => {},
+        }
+        self.* = undefined;
+    }
+    /// Returns an independent, single-owner scalar.
+    pub fn intoOwned(self: ScalarValue, gpa: std.mem.Allocator) !OwnedScalarValue {
+        return .{ .value = try self.dup(gpa) };
+    }
+    /// Copies the byte payload into caller-owned storage, refusing other tags.
+    pub fn intoBytes(self: ScalarValue, gpa: std.mem.Allocator) ![]u8 {
+        return gpa.dupe(u8, self.asBytes() orelse return error.InvalidValueType);
+    }
+    /// Copies the string into caller-owned storage, refusing other tags.
+    pub fn intoString(self: ScalarValue, gpa: std.mem.Allocator) ![]u8 {
+        return gpa.dupe(u8, self.asStr() orelse return error.InvalidValueType);
+    }
+    /// Formats using Rust Display syntax (`value.rs:889-903`).
+    pub fn format(self: ScalarValue, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .null_value => try w.writeAll("null"),
+            .bool_value => |b| try w.writeAll(if (b) "true" else "false"),
+            .int, .timestamp => |i| {
+                if (self == .timestamp) try w.writeAll("Timestamp: ");
+                try w.print("{d}", .{i});
+            },
+            .uint => |u| try w.print("{d}", .{u}),
+            .float => |f| try w.print("{d:.324}", .{f}),
+            .str => |s| try w.print("\"{s}\"", .{s}),
+            .counter => |c| try w.print("Counter: {d}", .{c.current}),
+            .bytes, .actor_id => {
+                const bytes = if (self == .bytes) self.bytes else self.actor_id.bytes;
+                try w.writeAll("\"[");
+                for (bytes, 0..) |b, i| {
+                    if (i != 0) try w.writeAll(", ");
+                    try w.print("{d}", .{b});
+                }
+                try w.writeAll("]\"");
+            },
+            .unknown => |u| try w.print("unknown type {d}", .{u.type_code}),
+        }
+    }
+    /// Writes an untagged Rust-compatible scalar JSON value.
+    pub fn writeJson(self: ScalarValue, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        return writeScalar(w, self);
+    }
+    /// Integrates scalar JSON with Zig's nested container/separator tracking.
+    pub fn jsonStringify(self: ScalarValue, jws: *std.json.Stringify) !void {
+        try jws.beginWriteRaw();
+        try self.writeJson(jws.writer);
+        jws.endWriteRaw();
+    }
+    /// Parses Rust's scalar JSON input domain; arrays and objects are rejected
+    /// even though Bytes/Unknown serialize to them (legacy serde scalar:6-62).
+    /// String storage belongs to the JSON parser's allocator/arena.
+    pub fn jsonParseFromValue(gpa: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !ScalarValue {
+        return switch (source) {
+            .null => .null_value,
+            .bool => |b| .{ .bool_value = b },
+            .integer => |i| if (i >= 0) .{ .uint = @intCast(i) } else .{ .int = i },
+            .float => |f| .{ .float = f },
+            .number_string => |s| blk: {
+                if (!std.mem.eql(u8, s, "-0")) {
+                    if (std.fmt.parseInt(u64, s, 10)) |u| break :blk .{ .uint = u } else |_| {}
+                    if (std.fmt.parseInt(i64, s, 10)) |i| break :blk .{ .int = i } else |_| {}
+                }
+                const f = std.fmt.parseFloat(f64, s) catch return error.InvalidNumber;
+                if (!std.math.isFinite(f)) return error.Overflow;
+                break :blk .{ .float = f };
+            },
+            .string => |s| .{ .str = try gpa.dupe(u8, s) },
+            else => error.UnexpectedToken,
+        };
+    }
+    /// Reads JSON through the same value parser as `jsonParseFromValue`.
+    pub fn jsonParse(gpa: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !ScalarValue {
+        var raw_options = options;
+        raw_options.parse_numbers = false;
+        const parsed = try std.json.innerParse(std.json.Value, gpa, source, raw_options);
+        return jsonParseFromValue(gpa, parsed, options);
+    }
+
     /// Whether the two values are the same value of the same type. Two
     /// scalars of different tags are never equal, and slices are compared by
     /// content rather than by pointer.
@@ -238,33 +450,383 @@ pub const ScalarValue = union(enum) {
         };
     }
 
-    /// Coerces a value to the requested type, as the load path does when a
-    /// stored value does not match its declared type.
-    ///
-    /// A map or table is `error.NotAnObject`, because a scalar is never one.
-    /// A list or a text object turns an integer into a counter and leaves
-    /// every other value as it is; a `uint` that does not fit an `i64` is
-    /// `error.InvalidValueType` and the value is returned unchanged.
-    pub fn asDatatype(self: ScalarValue, want: types.ObjType) !ScalarValue {
+    /// Coerces to a numeric/bytes datatype (`value.rs:543-613`), borrowing
+    /// unchanged byte payloads. Refusal leaves the original value untouched.
+    pub fn asDatatype(self: ScalarValue, want: DataType) error{InvalidValueType}!ScalarValue {
         return switch (want) {
-            .map, .table => error.NotAnObject,
-            .list, .text => switch (self) {
-                .int => |i| ScalarValue{ .counter = .init(i) },
-                .uint => |u| ScalarValue{ .counter = .init(std.math.cast(i64, u) orelse
-                    return error.InvalidValueType) },
-                else => self,
+            .counter, .timestamp => blk: {
+                const i = switch (self) {
+                    .int => |v| v,
+                    .uint => |v| std.math.cast(i64, v) orelse return error.InvalidValueType,
+                    else => return error.InvalidValueType,
+                };
+                break :blk if (want == .counter) .{ .counter = .init(i) } else .{ .timestamp = i };
             },
+            .bytes => if (self == .bytes) self else error.InvalidValueType,
+            .int => .{ .int = self.asI64() orelse return error.InvalidValueType },
+            .uint => .{ .uint = self.asU64() orelse return error.InvalidValueType },
+            .float64 => .{ .float = self.asF64() orelse return error.InvalidValueType },
+            .undefined => self,
         };
     }
 };
 
-/// A value in the document: a scalar, or a reference to an object.
+/// A public value: its object kind or a scalar, never an object identity
+/// (`value.rs:10-16`). Scalar payloads borrow their source.
 pub const Value = union(enum) {
-    /// The value itself, with the borrows [`ScalarValue`](value.zig) states.
     scalar: ScalarValue,
-    /// An object id, whose actor bytes borrow the document that minted it.
-    object: ExId,
+    object: ObjType,
+
+    /// Constructs the corresponding object-kind value.
+    pub fn map() Value {
+        return .{ .object = .map };
+    }
+    /// Constructs a list-kind value.
+    pub fn list() Value {
+        return .{ .object = .list };
+    }
+    /// Constructs a text-kind value.
+    pub fn text() Value {
+        return .{ .object = .text };
+    }
+    /// Constructs a legacy table-kind value.
+    pub fn table() Value {
+        return .{ .object = .table };
+    }
+    /// Constructs a scalar value from a primitive or an object kind.
+    pub fn from(v: anytype) Value {
+        if (@TypeOf(v) == Value) return v;
+        if (@TypeOf(v) == ObjType) return .{ .object = v };
+        return .{ .scalar = ScalarValue.from(v) };
+    }
+    /// Constructs a borrowed string value.
+    pub fn str(v: []const u8) Value {
+        return .{ .scalar = .{ .str = v } };
+    }
+    /// Constructs an integer value.
+    pub fn int(v: i64) Value {
+        return .{ .scalar = .{ .int = v } };
+    }
+    /// Constructs an unsigned integer value.
+    pub fn uint(v: u64) Value {
+        return .{ .scalar = .{ .uint = v } };
+    }
+    /// Constructs a floating point value.
+    pub fn float(v: f64) Value {
+        return .{ .scalar = .{ .float = v } };
+    }
+    /// Constructs a counter value.
+    pub fn counter(v: i64) Value {
+        return .{ .scalar = .{ .counter = .init(v) } };
+    }
+    /// Constructs a timestamp value.
+    pub fn timestamp(v: i64) Value {
+        return .{ .scalar = .{ .timestamp = v } };
+    }
+    /// Constructs a borrowed byte value.
+    pub fn bytes(v: []const u8) Value {
+        return .{ .scalar = .{ .bytes = v } };
+    }
+    /// Constructs an owned string value from one Unicode scalar value.
+    pub fn fromCodepoint(gpa: std.mem.Allocator, cp: u21) !OwnedValue {
+        const owned = try ScalarValue.fromCodepoint(gpa, cp);
+        return .{ .value = .{ .scalar = owned.value } };
+    }
+    /// Whether this is an object kind.
+    pub fn isObject(self: Value) bool {
+        return self == .object;
+    }
+    /// Whether this is a scalar.
+    pub fn isScalar(self: Value) bool {
+        return self == .scalar;
+    }
+    /// The object kind, or null for scalars.
+    pub fn asObject(self: Value) ?ObjType {
+        return if (self == .object) self.object else null;
+    }
+    /// The borrowed scalar, or null for objects.
+    pub fn asScalar(self: Value) ?ScalarValue {
+        return if (self == .scalar) self.scalar else null;
+    }
+    /// Whether this scalar has the indicated tag; objects return false.
+    pub fn isBytes(self: Value) bool {
+        return if (self.asScalar()) |s| s.isBytes() else false;
+    }
+    /// Whether this scalar is a string.
+    pub fn isStr(self: Value) bool {
+        return if (self.asScalar()) |s| s.isStr() else false;
+    }
+    /// Whether this scalar is an integer.
+    pub fn isInt(self: Value) bool {
+        return if (self.asScalar()) |s| s.isInt() else false;
+    }
+    /// Whether this scalar is an unsigned integer.
+    pub fn isUint(self: Value) bool {
+        return if (self.asScalar()) |s| s.isUint() else false;
+    }
+    /// Whether this scalar is a float.
+    pub fn isF64(self: Value) bool {
+        return if (self.asScalar()) |s| s.isF64() else false;
+    }
+    /// Whether this scalar is a counter.
+    pub fn isCounter(self: Value) bool {
+        return if (self.asScalar()) |s| s.isCounter() else false;
+    }
+    /// Whether this scalar is a timestamp.
+    pub fn isTimestamp(self: Value) bool {
+        return if (self.asScalar()) |s| s.isTimestamp() else false;
+    }
+    /// Whether this scalar is a boolean.
+    pub fn isBoolean(self: Value) bool {
+        return if (self.asScalar()) |s| s.isBoolean() else false;
+    }
+    /// Whether this scalar is null.
+    pub fn isNull(self: Value) bool {
+        return if (self.asScalar()) |s| s.isNull() else false;
+    }
+    /// Borrows bytes, or returns null.
+    pub fn asBytes(self: Value) ?[]const u8 {
+        return if (self.asScalar()) |s| s.asBytes() else null;
+    }
+    /// Borrows a string, or returns null.
+    pub fn asStr(self: Value) ?[]const u8 {
+        return if (self.asScalar()) |s| s.asStr() else null;
+    }
+    /// Returns a lossy numeric conversion, or null.
+    pub fn asI64(self: Value) ?i64 {
+        return if (self.asScalar()) |s| s.asI64() else null;
+    }
+    /// Returns an unsigned numeric conversion, or null.
+    pub fn asU64(self: Value) ?u64 {
+        return if (self.asScalar()) |s| s.asU64() else null;
+    }
+    /// Returns a floating numeric conversion, or null.
+    pub fn asF64(self: Value) ?f64 {
+        return if (self.asScalar()) |s| s.asF64() else null;
+    }
+    /// Returns a boolean, or null.
+    pub fn asBool(self: Value) ?bool {
+        return if (self.asScalar()) |s| s.asBool() else null;
+    }
+    /// Copies a scalar into an independent owner, refusing objects.
+    pub fn intoScalar(self: Value, gpa: std.mem.Allocator) !OwnedScalarValue {
+        return (self.asScalar() orelse return error.InvalidValueType).intoOwned(gpa);
+    }
+    /// Copies byte storage, refusing other values.
+    pub fn intoBytes(self: Value, gpa: std.mem.Allocator) ![]u8 {
+        return (self.asScalar() orelse return error.InvalidValueType).intoBytes(gpa);
+    }
+    /// Copies string storage, refusing other values.
+    pub fn intoString(self: Value, gpa: std.mem.Allocator) ![]u8 {
+        return (self.asScalar() orelse return error.InvalidValueType).intoString(gpa);
+    }
+    /// Copies every scalar payload; objects own no allocation.
+    pub fn intoOwned(self: Value, gpa: std.mem.Allocator) !OwnedValue {
+        return .{ .value = switch (self) {
+            .object => self,
+            .scalar => |s| .{ .scalar = try s.dup(gpa) },
+        } };
+    }
+    /// Compares object kinds or scalars by content.
+    pub fn eql(a: Value, b: Value) bool {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+        return switch (a) {
+            .object => |o| o == b.object,
+            .scalar => |s| s.eql(b.scalar),
+        };
+    }
+    /// Writes Rust's object/scalar Display form.
+    pub fn format(self: Value, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .scalar => |s| try s.format(w),
+            .object => |o| try w.writeAll(switch (o) {
+                .map => "map",
+                .list => "list",
+                .text => "text",
+                .table => "table",
+            }),
+        }
+    }
 };
+
+/// Independently owned scalar storage. Copies share ownership; deinit once.
+pub const OwnedScalarValue = struct {
+    value: ScalarValue,
+    /// Releases copied payloads with the allocator used to construct them.
+    pub fn deinit(self: *OwnedScalarValue, gpa: std.mem.Allocator) void {
+        self.value.deinitOwned(gpa);
+        self.* = undefined;
+    }
+};
+
+/// Independently owned public value storage. Copies are not new owners.
+pub const OwnedValue = struct {
+    value: Value,
+    /// Releases scalar storage with the allocator used for `intoOwned`.
+    pub fn deinit(self: *OwnedValue, gpa: std.mem.Allocator) void {
+        if (self.value == .scalar) self.value.scalar.deinitOwned(gpa);
+        self.* = undefined;
+    }
+};
+
+// Canonical scalar JSON renderer, moved from AutoSerde. Rust untagged serde
+// writes counter/timestamp as integers and byte scalars as number arrays.
+fn writeScalar(w: *std.Io.Writer, s: ScalarValue) std.Io.Writer.Error!void {
+    switch (s) {
+        .null_value => try w.writeAll("null"),
+        .bool_value => |b| try w.writeAll(if (b) "true" else "false"),
+        .int => |i| try w.print("{d}", .{i}),
+        .uint => |u| try w.print("{d}", .{u}),
+        .counter => |c| try w.print("{d}", .{c.current}),
+        .timestamp => |t| try w.print("{d}", .{t}),
+        .float => |f| try writeJsonFloat(f, w),
+        .str => |s1| try writeJsonString(s1, w),
+        .bytes => |b| try writeJsonBytes(b, w),
+        .actor_id => |a| try writeJsonBytes(a.bytes, w),
+        .unknown => |u| {
+            try w.writeAll("{\"type_code\":");
+            try w.print("{d}", .{u.type_code});
+            try w.writeAll(",\"bytes\":");
+            try writeJsonBytes(u.bytes, w);
+            try w.writeAll("}");
+        },
+    }
+}
+
+fn writeJsonString(s: []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.writeByte('"');
+    var run: usize = 0;
+    for (s, 0..) |b, i| {
+        if (shortEscape(b)) |esc| {
+            try w.writeAll(s[run..i]);
+            try w.writeAll(esc);
+            run = i + 1;
+        } else if (b < 0x20) {
+            try w.writeAll(s[run..i]);
+            try w.print("\\u{x:0>4}", .{b});
+            run = i + 1;
+        }
+    }
+    try w.writeAll(s[run..]);
+    try w.writeByte('"');
+}
+
+fn shortEscape(b: u8) ?[]const u8 {
+    return switch (b) {
+        0x08 => "\\b",
+        0x09 => "\\t",
+        0x0a => "\\n",
+        0x0c => "\\f",
+        0x0d => "\\r",
+        0x22 => "\\\"",
+        0x5c => "\\\\",
+        else => null,
+    };
+}
+
+fn writeJsonBytes(b: []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.writeByte('[');
+    for (b, 0..) |x, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.print("{d}", .{x});
+    }
+    try w.writeByte(']');
+}
+
+// zmij-1.0.23 chooses fixed notation in this exponent interval, with a
+// decimal suffix on whole-valued floats and explicit positive exponent signs.
+const fixed_lo: i32 = -5;
+const fixed_hi: i32 = 15;
+
+fn writeJsonFloat(v: f64, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    if (!std.math.isFinite(v)) {
+        try w.writeAll("null");
+        return;
+    }
+    var buf: [24]u8 = undefined;
+    try w.writeAll(renderF64(&buf, v));
+}
+
+fn renderF64(buf: []u8, v: f64) []const u8 {
+    std.debug.assert(std.math.isFinite(v));
+    const d = std.fmt.float.binaryToDecimal(
+        u64,
+        @bitCast(v),
+        std.math.floatMantissaBits(f64),
+        std.math.floatExponentBits(f64),
+        false,
+        &std.fmt.float.Backend64_TablesFull,
+    );
+    var at: usize = 0;
+    if (d.sign) {
+        buf[at] = '-';
+        at += 1;
+    }
+    if (d.mantissa == 0) {
+        @memcpy(buf[at..][0..3], "0.0");
+        return buf[0 .. at + 3];
+    }
+    const width = decimalWidth(d.mantissa);
+    const exp10: i32 = d.exponent + @as(i32, @intCast(width)) - 1;
+    var digits: [17]u8 = undefined;
+    writeDigits(&digits, d.mantissa, width);
+    const w: i32 = @intCast(width);
+    if (exp10 >= fixed_lo and exp10 <= fixed_hi) {
+        if (w - 1 <= exp10) {
+            @memcpy(buf[at..][0..width], digits[0..width]);
+            const zeros: usize = @intCast(exp10 + 3 - w);
+            @memset(buf[at + width ..][0..zeros], '0');
+            buf[at + @as(usize, @intCast(exp10 + 1))] = '.';
+            return buf[0 .. at + @as(usize, @intCast(exp10 + 3))];
+        }
+        if (exp10 >= 0) {
+            const point: usize = @intCast(exp10 + 1);
+            @memcpy(buf[at..][0..point], digits[0..point]);
+            buf[at + point] = '.';
+            @memcpy(buf[at + point + 1 ..][0 .. width - point], digits[point..width]);
+            return buf[0 .. at + width + 1];
+        }
+        const lead: usize = @intCast(1 - exp10);
+        @memcpy(buf[at..][0..2], "0.");
+        @memset(buf[at + 2 ..][0 .. lead - 2], '0');
+        @memcpy(buf[at + lead ..][0..width], digits[0..width]);
+        return buf[0 .. at + lead + width];
+    }
+    buf[at] = digits[0];
+    at += 1;
+    if (w > 1) {
+        buf[at] = '.';
+        @memcpy(buf[at + 1 ..][0 .. width - 1], digits[1..width]);
+        at += width;
+    }
+    buf[at] = 'e';
+    at += 1;
+    buf[at] = if (exp10 >= 0) '+' else '-';
+    at += 1;
+    var nbuf: [4]u8 = undefined;
+    const digits_of_exp = std.fmt.bufPrint(&nbuf, "{d}", .{
+        @as(u32, @intCast(@abs(exp10))),
+    }) catch unreachable;
+    @memcpy(buf[at..][0..digits_of_exp.len], digits_of_exp);
+    return buf[0 .. at + digits_of_exp.len];
+}
+
+fn decimalWidth(v: u64) usize {
+    var n = v;
+    var width: usize = 1;
+    while (n >= 10) : (width += 1) n /= 10;
+    return width;
+}
+
+fn writeDigits(buf: []u8, v: u64, width: usize) void {
+    var n = v;
+    var i = width;
+    while (i > 0) {
+        i -= 1;
+        buf[i] = '0' + @as(u8, @intCast(n % 10));
+        n /= 10;
+    }
+}
 
 /// What an operation does. The numeric values are format: they are the
 /// contents of the op set's action column and appear in every saved document.
@@ -496,4 +1058,78 @@ test "counters merge by wrapping addition" {
         ScalarValue.Counter.init(3),
         ScalarValue.Counter{ .current = one.current +% one.current +% one.current },
     );
+}
+
+test "API parity public values preserve object kinds and numeric coercions" {
+    const gpa = std.testing.allocator;
+    inline for (.{ types.ObjType.map, types.ObjType.list, types.ObjType.text, types.ObjType.table }) |kind| {
+        const v: Value = .{ .object = kind };
+        try std.testing.expectEqual(kind, v.asObject().?);
+        try std.testing.expect(v.isObject());
+        try std.testing.expect(!v.isScalar());
+    }
+    const high: ScalarValue = .{ .uint = @as(u64, 1) << 63 };
+    const maximum: ScalarValue = .{ .uint = std.math.maxInt(u64) };
+    try std.testing.expectEqual(std.math.minInt(i64), high.asI64().?);
+    try std.testing.expectEqual(@as(i64, -1), maximum.asI64().?);
+    const original = try gpa.dupe(u8, "consumer");
+    var owned = try (ScalarValue{ .str = original }).intoOwned(gpa);
+    defer owned.deinit(gpa);
+    gpa.free(original);
+    try std.testing.expectEqualStrings("consumer", owned.value.asStr().?);
+}
+
+test "API parity scalar formatter and JSON preserve unknown bytes" {
+    const gpa = std.testing.allocator;
+    const v: ScalarValue = .{ .unknown = .{ .type_code = 12, .bytes = &.{ 0, 255 } } };
+    const json = try std.json.Stringify.valueAlloc(gpa, v, .{});
+    defer gpa.free(json);
+    try std.testing.expectEqualStrings("{\"type_code\":12,\"bytes\":[0,255]}", json);
+    const rendered = try std.fmt.allocPrint(gpa, "{f}", .{ScalarValue{ .int = -7 }});
+    defer gpa.free(rendered);
+    try std.testing.expectEqualStrings("-7", rendered);
+}
+
+test "API parity scalar numeric casts match Rust saturation and wrapping" {
+    const nan: ScalarValue = .{ .float = std.math.nan(f64) };
+    const inf: ScalarValue = .{ .float = std.math.inf(f64) };
+    const neg_inf: ScalarValue = .{ .float = -std.math.inf(f64) };
+    const negative: ScalarValue = .{ .int = -1 };
+    try std.testing.expectEqual(@as(?i64, 0), nan.asI64());
+    try std.testing.expectEqual(@as(?u64, 0), nan.asU64());
+    try std.testing.expectEqual(@as(?i64, std.math.maxInt(i64)), inf.asI64());
+    try std.testing.expectEqual(@as(?i64, std.math.minInt(i64)), neg_inf.asI64());
+    try std.testing.expectEqual(@as(?u64, 0), neg_inf.asU64());
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), negative.asU64());
+    try std.testing.expectEqual(@as(?i64, -7), (ScalarValue{ .float = -7.9 }).asI64());
+    try std.testing.expect((ScalarValue{ .str = "7" }).asI64() == null);
+}
+
+test "API parity nested scalar JSON preserves unsigned limits and rejects unsupported shapes" {
+    const gpa = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(ScalarValue, gpa, "18446744073709551615", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(std.math.maxInt(u64), parsed.value.uint);
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(ScalarValue, gpa, "[0,255]", .{}));
+    const values = [_]ScalarValue{ .{ .counter = .init(7) }, .{ .str = "a\nb" }, .{ .float = 1e21 } };
+    const json = try std.json.Stringify.valueAlloc(gpa, values, .{});
+    defer gpa.free(json);
+    try std.testing.expectEqualStrings("[7,\"a\\nb\",1e+21]", json);
+    const refused: ScalarValue = .{ .uint = std.math.maxInt(u64) };
+    try std.testing.expectError(error.InvalidValueType, refused.asDatatype(.counter));
+    try std.testing.expectEqual(@as(i64, -1), (try refused.asDatatype(.int)).int);
+}
+
+test "API parity owned scalar and codepoint copies clean up allocation failures" {
+    const scenario = struct {
+        fn exercise(gpa: std.mem.Allocator) !void {
+            const borrowed: ScalarValue = .{ .unknown = .{ .type_code = 15, .bytes = &.{ 0, 255, 128 } } };
+            var owned = try borrowed.intoOwned(gpa);
+            defer owned.deinit(gpa);
+            var codepoint = try Value.fromCodepoint(gpa, 0x1f600);
+            defer codepoint.deinit(gpa);
+            try std.testing.expectEqualStrings("\xf0\x9f\x98\x80", codepoint.value.asStr().?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, scenario.exercise, .{});
 }

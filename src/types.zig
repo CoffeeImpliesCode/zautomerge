@@ -83,11 +83,37 @@ pub const ChangeHash = struct {
     /// hex and `error.InvalidChangeHashBytes` for one whose length is not
     /// [`hash_size`](types.zig). The result owns nothing the caller has to
     /// free.
-    pub fn parse(gpa: std.mem.Allocator, text: []const u8) !ChangeHash {
-        const decoded = try err.hexFrom(gpa, text);
-        defer gpa.free(decoded);
-        if (decoded.len != hash_size) return error.InvalidChangeHashBytes;
-        return .{ .bytes = decoded[0..hash_size].* };
+    pub fn parse(_: std.mem.Allocator, text: []const u8) error{ InvalidHex, InvalidChangeHashBytes }!ChangeHash {
+        if (text.len % 2 != 0) return error.InvalidHex;
+        for (text) |c| if (!std.ascii.isHex(c)) return error.InvalidHex;
+        if (text.len != hash_size * 2) return error.InvalidChangeHashBytes;
+        var bytes: [hash_size]u8 = undefined;
+        _ = std.fmt.hexToBytes(&bytes, text) catch return error.InvalidHex;
+        return .{ .bytes = bytes };
+    }
+
+    /// Returns the fixed-size lowercase hexadecimal spelling.
+    pub fn toHex(self: ChangeHash) [hash_size * 2]u8 {
+        var out: [hash_size * 2]u8 = undefined;
+        err.hexInto(&self.bytes, &out);
+        return out;
+    }
+    /// Writes the hexadecimal Display form (`types.rs:717-721`).
+    pub fn format(self: ChangeHash, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writeHex(w, &self.bytes);
+    }
+    /// Serializes a hash as a hexadecimal JSON string.
+    pub fn jsonStringify(self: ChangeHash, jws: *std.json.Stringify) !void {
+        try stringifyHex(jws, &self.bytes);
+    }
+    /// Parses a hexadecimal hash; returned hash owns no allocation.
+    pub fn jsonParseFromValue(gpa: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !ChangeHash {
+        if (source != .string) return error.UnexpectedToken;
+        return parse(gpa, source.string) catch return error.UnexpectedToken;
+    }
+    /// Parses through the canonical hexadecimal JSON value codec.
+    pub fn jsonParse(gpa: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !ChangeHash {
+        return jsonParseFromValue(gpa, try std.json.innerParse(std.json.Value, gpa, source, options), options);
     }
 };
 
@@ -175,7 +201,7 @@ pub const ActorId = struct {
     /// that the caller frees with that allocator. Every actor length is legal,
     /// so the result is `2 * bytes.len` characters.
     pub fn toHex(gpa: std.mem.Allocator, self: ActorId) ![]u8 {
-        const out = try gpa.alloc(u8, self.bytes.len * 2);
+        const out = try gpa.alloc(u8, std.math.mul(usize, self.bytes.len, 2) catch return error.Overflow);
         err.hexInto(self.bytes, out);
         return out;
     }
@@ -211,7 +237,7 @@ pub const ActorId = struct {
         // the value's LEB128 encoding needs and cannot fail
         // (`parse/leb128.rs:15-40`, reached through `leb128::unsignedSize`).
         const leb = @import("leb128.zig").unsignedSize(level);
-        const out = try gpa.alloc(u8, 4 + leb + self.bytes.len);
+        const out = try gpa.alloc(u8, std.math.add(usize, 4 + leb, self.bytes.len) catch return error.Overflow);
         @memcpy(out[0..4], &concurrency_magic_bytes);
         // `writeUnsigned` writes and reports how many bytes it used; it cannot
         // fail, and its return is the width `unsignedSize` promised above.
@@ -219,7 +245,108 @@ pub const ActorId = struct {
         @memcpy(out[4 + n ..], self.bytes);
         return .{ .bytes = out };
     }
+
+    /// Writes arbitrary actor bytes as lowercase hex (`types.rs:98-108`).
+    pub fn format(self: ActorId, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writeHex(w, self.bytes);
+    }
+    /// Serializes an actor as a hexadecimal JSON string.
+    pub fn jsonStringify(self: ActorId, jws: *std.json.Stringify) !void {
+        try stringifyHex(jws, self.bytes);
+    }
+    /// Decodes arbitrary actor bytes into the JSON parser's allocator.
+    pub fn jsonParseFromValue(gpa: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !ActorId {
+        if (source != .string) return error.UnexpectedToken;
+        return fromHex(gpa, source.string) catch |e| switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.UnexpectedToken,
+        };
+    }
+    /// Parses the same hex-string codec from a token source.
+    pub fn jsonParse(gpa: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !ActorId {
+        return jsonParseFromValue(gpa, try std.json.innerParse(std.json.Value, gpa, source, options), options);
+    }
 };
+
+/// Arbitrary author bytes, never UTF-8 (`author.rs:134-183`).
+/// `init` borrows; `initCopy`/`fromHex` own an allocation freed with the same
+/// allocator. Copies of an owned author are not independent owners.
+pub const Author = struct {
+    bytes: []const u8,
+    /// Borrows caller bytes, including empty and non-UTF-8 strings.
+    pub fn init(bytes: []const u8) Author {
+        return .{ .bytes = bytes };
+    }
+    /// Copies bytes into an independent author allocation.
+    pub fn initCopy(gpa: std.mem.Allocator, bytes: []const u8) !Author {
+        return .{ .bytes = try gpa.dupe(u8, bytes) };
+    }
+    /// Copies this author's bytes into an independent allocation.
+    pub fn dup(self: Author, gpa: std.mem.Allocator) !Author {
+        return initCopy(gpa, self.bytes);
+    }
+    /// Releases only an author obtained from an owned constructor.
+    pub fn deinitOwned(self: *Author, gpa: std.mem.Allocator) void {
+        gpa.free(self.bytes);
+        self.* = undefined;
+    }
+    /// Returns its borrowed raw byte view.
+    pub fn asBytes(self: Author) []const u8 {
+        return self.bytes;
+    }
+    /// Content equality of author bytes.
+    pub fn eql(a: Author, b: Author) bool {
+        return std.mem.eql(u8, a.bytes, b.bytes);
+    }
+    /// Lexicographic byte ordering.
+    pub fn order(a: Author, b: Author) std.math.Order {
+        return std.mem.order(u8, a.bytes, b.bytes);
+    }
+    /// Returns caller-owned lowercase hex, including an empty spelling.
+    pub fn toHex(self: Author, gpa: std.mem.Allocator) ![]u8 {
+        return ActorId.toHex(gpa, .init(self.bytes));
+    }
+    /// Decodes hexadecimal author bytes; malformed hex is `InvalidHex`.
+    pub fn fromHex(gpa: std.mem.Allocator, text: []const u8) !Author {
+        return .{ .bytes = try err.hexFrom(gpa, text) };
+    }
+    /// Writes author Display hex without allocation.
+    pub fn format(self: Author, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writeHex(w, self.bytes);
+    }
+    /// Serializes arbitrary bytes as a hexadecimal JSON string.
+    pub fn jsonStringify(self: Author, jws: *std.json.Stringify) !void {
+        try stringifyHex(jws, self.bytes);
+    }
+    /// Parses bytes into the JSON parser allocator; never validates UTF-8.
+    pub fn jsonParseFromValue(gpa: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !Author {
+        if (source != .string) return error.UnexpectedToken;
+        return fromHex(gpa, source.string) catch |e| switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.UnexpectedToken,
+        };
+    }
+    /// Reads a hex string from the JSON token source.
+    pub fn jsonParse(gpa: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Author {
+        return jsonParseFromValue(gpa, try std.json.innerParse(std.json.Value, gpa, source, options), options);
+    }
+};
+
+fn writeHex(w: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void {
+    var buf: [2]u8 = undefined;
+    for (bytes) |b| {
+        err.hexInto(&.{b}, &buf);
+        try w.writeAll(&buf);
+    }
+}
+
+fn stringifyHex(jws: *std.json.Stringify, bytes: []const u8) !void {
+    try jws.beginWriteRaw();
+    try jws.writer.writeByte('"');
+    try writeHex(jws.writer, bytes);
+    try jws.writer.writeByte('"');
+    jws.endWriteRaw();
+}
 
 /// The fixed prefix a concurrency-derived actor id carries. Upstream's
 /// `CONCURRENCY_MAGIC_BYTES` ([`types.rs:23`](../../github-automerge-automerge/rust/automerge/src/types.rs));
@@ -357,37 +484,40 @@ pub const OpId = struct {
 /// and so sort before most real actors: the fork lands at the front of the
 /// table and shifts everything.
 ///
-/// **Identity is the [`OpId`] alone, in both shapes.** The actor is a repair
-/// hint, never part of what the id *is*, so a `.named` and an `.id` naming the
-/// same operation are the same value to [`ExId.eql`], [`ExId.order`] and every
-/// hash map keyed by an `ExId`. That is what keeps this addition from reaching
-/// the op set, whose own tables are keyed by [`OpId`] directly
-/// ([`ObjIndex.objectType`](opset/index.zig)).
+/// Named IDs compare by counter and actor bytes, independent of cached index.
+/// Unresolved table-local `.id` values are a distinct representation; resolve
+/// them against the document before stable comparison. `dup` and codecs copy
+/// actor bytes, while ordinary document-returned IDs remain borrowed.
 pub const ExId = union(enum) {
     /// An operation named by its counter and actor index alone.
     id: OpId,
-    /// Upstream's `ExId::Id` (`exid.rs:17`): the operation and the actor's
-    /// bytes, with the index the actor had folded into the operation.
+    /// Upstream's full-u64 `ExId::Id` (`exid.rs:17`), plus actor bytes and a
+    /// cached actor-table hint independent of the resident u32 row bound.
     named: Named,
     /// The document root, which no operation made.
     root,
 
     /// An operation identity with a borrowed actor repair hint.
     pub const Named = struct {
-        /// The operation this names.
-        op: OpId,
-        /// Borrows the actor's bytes from the document that minted the id, the
-        /// way every [`ActorId`] in the port does. Upstream's `ExId` owns a
-        /// clone (`op_set.rs:1057-1059`); the borrow is valid as long as the
-        /// document is, because the actor table's bytes live in the document's
-        /// arena for its whole life.
+        /// A stable public counter and an actor-table repair hint. The counter
+        /// is not limited by the resident document's u32 row representation.
+        pub const Id = struct {
+            counter: u64,
+            actor: ActorIdx,
+        };
+
+        /// The full-width stable identity and its cached actor hint.
+        op: Id,
+        /// Borrowed for a directly constructed or document-returned ID.
+        /// `parse`, `fromBytes`, and `dup` instead own this storage and require
+        /// exactly one `deinitOwned` call (`exid.rs:17`, `op_set.rs:1057-1059`).
         actor: ActorId,
     };
 
     /// Upstream's `ExId::Id(counter, actor, actor_index)`
     /// (`op_set.rs:1057-1059`).
     pub fn withActor(op: OpId, who: ActorId) ExId {
-        return .{ .named = .{ .op = op, .actor = who } };
+        return .{ .named = .{ .op = .{ .counter = op.counter, .actor = op.actor }, .actor = who } };
     }
 
     /// The id a cursor's two halves name: `.root` when neither half is
@@ -410,23 +540,31 @@ pub const ExId = union(enum) {
         return self == .root;
     }
 
-    /// The operation id, or null for the root.
+    /// A resident operation id, or null for the root or a counter above u32.
     pub fn opId(self: ExId) ?OpId {
         return switch (self) {
             .root => null,
             .id => |i| i,
-            .named => |n| n.op,
+            .named => |n| .{ .counter = std.math.cast(u32, n.op.counter) orelse return null, .actor = n.op.actor },
         };
     }
 
     /// The operation counter, or `null` for the root.
-    pub fn counter(self: ExId) ?u32 {
-        return if (self.opId()) |i| i.counter else null;
+    pub fn counter(self: ExId) ?u64 {
+        return switch (self) {
+            .root => null,
+            .id => |i| i.counter,
+            .named => |n| n.op.counter,
+        };
     }
 
     /// The actor-table index, or `null` for the root.
     pub fn actor(self: ExId) ?ActorIdx {
-        return if (self.opId()) |i| i.actor else null;
+        return switch (self) {
+            .root => null,
+            .id => |i| i.actor,
+            .named => |n| n.op.actor,
+        };
     }
 
     /// The actor's bytes, or null when this id does not carry them.
@@ -442,28 +580,40 @@ pub const ExId = union(enum) {
         };
     }
 
-    /// Compares operation identities. Actor repair hints do not affect equality.
+    /// Stable named identity compares counter+actor bytes, ignoring cached
+    /// indices (`exid.rs:126-136`). Unresolved `.id` is a distinct domain.
     pub fn eql(a: ExId, b: ExId) bool {
-        const ai = a.opId() orelse return b == .root;
-        const bi = b.opId() orelse return false;
-        return ai.eql(bi);
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+        return switch (a) {
+            .root => true,
+            .id => |i| i.eql(b.id),
+            .named => |n| n.op.counter == b.named.op.counter and n.actor.eql(b.named.actor),
+        };
     }
 
-    /// Orders the root first, then operation identities. Ignores actor repair hints.
+    /// Root first, then unresolved IDs, then stable named identities. Mixed
+    /// representations never compare equal; this keeps ordering transitive.
     pub fn order(a: ExId, b: ExId) std.math.Order {
-        const ai = a.opId() orelse return if (b.isRoot()) .eq else .lt;
-        const bi = b.opId() orelse return .gt;
-        return ai.order(bi);
+        if (a == .root) return if (b == .root) .eq else .lt;
+        if (b == .root) return .gt;
+        if (a == .id) return if (b == .id) a.id.order(b.id) else .lt;
+        if (b == .id) return .gt;
+        const ctr = std.math.order(a.named.op.counter, b.named.op.counter);
+        return if (ctr == .eq) a.named.actor.order(b.named.actor) else ctr;
     }
 
     /// Removes actor index `idx` and shifts later indices down.
     /// Returns `null` if this operation used `idx`. The root is unchanged.
     pub fn withoutActor(self: ExId, idx: ActorIdx) ?ExId {
-        const i = self.opId() orelse return self;
-        const n = i.withoutActor(idx) orelse return null;
         return switch (self) {
-            .named => |v| withActor(n, v.actor),
-            else => .{ .id = n },
+            .root => .root,
+            .id => |i| if (i.withoutActor(idx)) |n| .{ .id = n } else null,
+            .named => |n| blk: {
+                if (n.op.actor == idx) break :blk null;
+                var result = self;
+                if (n.op.actor > idx) result.named.op.actor -= 1;
+                break :blk result;
+            },
         };
     }
 
@@ -471,12 +621,128 @@ pub const ExId = union(enum) {
     /// bytes it names are the same actor either way, so they ride along.
     /// The `OpId.withNewActor` index-overflow precondition also applies here.
     pub fn withNewActor(self: ExId, idx: ActorIdx) ExId {
-        const i = self.opId() orelse return self;
-        const n = i.withNewActor(idx);
         return switch (self) {
-            .named => |v| withActor(n, v.actor),
-            else => .{ .id = n },
+            .root => .root,
+            .id => |i| .{ .id = i.withNewActor(idx) },
+            .named => |n| blk: {
+                var result = self;
+                if (n.op.actor >= idx) result.named.op.actor += 1;
+                break :blk result;
+            },
         };
+    }
+
+    /// Deep-copies named actor bytes. Root and unresolved IDs allocate nothing.
+    /// The result is released exactly once with `deinitOwned`.
+    pub fn dup(self: ExId, gpa: std.mem.Allocator) !ExId {
+        return switch (self) {
+            .named => |n| .{ .named = .{ .op = n.op, .actor = try ActorId.initCopy(gpa, n.actor.bytes) } },
+            else => self,
+        };
+    }
+    /// Releases actor bytes only from an explicitly owned ID or codec result.
+    pub fn deinitOwned(self: *ExId, gpa: std.mem.Allocator) void {
+        if (self.* == .named) gpa.free(self.named.actor.bytes);
+        self.* = undefined;
+    }
+    /// Rust's versioned stable byte codec (`exid.rs:24-67`). The wire order
+    /// is actor length/bytes, index hint, counter despite upstream variable names.
+    /// Unresolved IDs refuse rather than fabricating an actor.
+    pub fn toBytes(self: ExId, gpa: std.mem.Allocator) (Error || ParseError)![]u8 {
+        if (self == .root) return gpa.dupe(u8, &.{0});
+        if (self != .named) return error.InvalidObjId;
+        const n = self.named;
+        const leb = @import("leb128.zig");
+        const overhead = 1 + leb.unsignedSize(n.actor.bytes.len) +
+            leb.unsignedSize(n.op.actor) + leb.unsignedSize(n.op.counter);
+        const size = std.math.add(usize, overhead, n.actor.bytes.len) catch return error.Overflow;
+        const out = try gpa.alloc(u8, size);
+        out[0] = 0x10;
+        var at: usize = 1;
+        at += leb.writeUnsigned(out[at..], n.actor.bytes.len);
+        @memcpy(out[at..][0..n.actor.bytes.len], n.actor.bytes);
+        at += n.actor.bytes.len;
+        at += leb.writeUnsigned(out[at..], n.op.actor);
+        _ = leb.writeUnsigned(out[at..], n.op.counter);
+        return out;
+    }
+    /// Parses full-u64 stable counters into independently owned actor bytes.
+    /// Actor hints retain checked u32 bounds; trailing bytes are ignored as
+    /// Rust does (`exid.rs:97-123`).
+    /// Every malformed/truncated input returns a typed error, never an assert.
+    pub fn fromBytes(gpa: std.mem.Allocator, bytes: []const u8) (Error || ParseError)!ExId {
+        if (bytes.len == 0) return error.UnexpectedEnd;
+        if (bytes[0] & 0x0f != 0) return error.InvalidObjIdFormat;
+        const tag = bytes[0] >> 4;
+        if (tag == 0) return .root;
+        if (tag != 1) return error.InvalidObjIdFormat;
+        const leb = @import("leb128.zig");
+        const len = try leb.readUnsigned(bytes[1..]);
+        var at: usize = 1 + len.len;
+        const actor_len = std.math.cast(usize, len.value) orelse return error.Overflow;
+        if (actor_len > bytes.len - at) return error.UnexpectedEnd;
+        const actor_bytes = bytes[at..][0..actor_len];
+        at += actor_len;
+        const hint = try leb.readUnsigned(bytes[at..]);
+        at += hint.len;
+        const ctr = try leb.readUnsigned(bytes[at..]);
+        const index = std.math.cast(u32, hint.value) orelse return error.Overflow;
+        return .{ .named = .{ .op = .{ .counter = ctr.value, .actor = index }, .actor = try ActorId.initCopy(gpa, actor_bytes) } };
+    }
+    /// Parses `_root` or decimal-counter@hex-actor into owned actor bytes.
+    /// String syntax has no cached index, so the hint is zero.
+    pub fn parse(gpa: std.mem.Allocator, text: []const u8) (Error || ParseError)!ExId {
+        if (std.mem.eql(u8, text, "_root")) return .root;
+        const split = std.mem.indexOfScalar(u8, text, '@') orelse return error.InvalidObjIdFormat;
+        const digits = text[0..split];
+        if (digits.len == 0) return error.InvalidObjIdFormat;
+        for (digits) |c| if (!std.ascii.isDigit(c)) return error.InvalidObjIdFormat;
+        const ctr = std.fmt.parseInt(u64, digits, 10) catch |e| switch (e) {
+            error.Overflow => return error.Overflow,
+            else => return error.InvalidObjIdFormat,
+        };
+        const who = ActorId.fromHex(gpa, text[split + 1 ..]) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidObjIdFormat,
+        };
+        return .{ .named = .{ .op = .{ .counter = ctr, .actor = 0 }, .actor = who } };
+    }
+    /// Writes `_root` or counter@hex-actor (`exid.rs:148-154`).
+    /// Unresolved internal IDs cannot be formatted and return WriteFailed.
+    pub fn format(self: ExId, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .root => try w.writeAll("_root"),
+            .id => return error.WriteFailed,
+            .named => |n| {
+                try w.print("{d}@", .{n.op.counter});
+                try n.actor.format(w);
+            },
+        }
+    }
+    /// Allocates the stable string spelling; caller frees the returned bytes.
+    pub fn toString(self: ExId, gpa: std.mem.Allocator) (Error || ParseError)![]u8 {
+        if (self == .id) return error.InvalidObjId;
+        return std.fmt.allocPrint(gpa, "{f}", .{self});
+    }
+    /// Writes stable identity as a JSON string (`exid.rs:169-175`).
+    pub fn jsonStringify(self: ExId, jws: *std.json.Stringify) !void {
+        try jws.beginWriteRaw();
+        try jws.writer.writeByte('"');
+        try self.format(jws.writer);
+        try jws.writer.writeByte('"');
+        jws.endWriteRaw();
+    }
+    /// Parses stable string JSON into the JSON allocator's owned actor bytes.
+    pub fn jsonParseFromValue(gpa: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !ExId {
+        if (source != .string) return error.UnexpectedToken;
+        return parse(gpa, source.string) catch |e| switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.UnexpectedToken,
+        };
+    }
+    /// Reads the stable string codec from a JSON token stream.
+    pub fn jsonParse(gpa: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !ExId {
+        return jsonParseFromValue(gpa, try std.json.innerParse(std.json.Value, gpa, source, options), options);
     }
 };
 
@@ -693,6 +959,17 @@ pub const TextEncoding = enum {
     utf16_code_unit,
     grapheme_cluster,
 
+    /// The declared build indexing mode, defaulting to code points when the
+    /// older build-options module has no option. Never inferred from the OS
+    /// (`text_value.rs:12-22`).
+    pub fn platformDefault() TextEncoding {
+        const options = @import("build_options");
+        if (comptime !@hasDecl(options, "text_indexing")) return .unicode_code_point;
+        const choice = comptime (std.meta.stringToEnum(TextEncoding, options.text_indexing) orelse
+            @compileError("text_indexing must name a TextEncoding tag"));
+        return choice;
+    }
+
     /// The number of units in `s` under this encoding.
     pub fn width(self: TextEncoding, s: []const u8) usize {
         return switch (self) {
@@ -815,7 +1092,7 @@ test "ExId root and remapping" {
     try std.testing.expect(ExId.isRoot(ExId.root));
     try std.testing.expect(ExId.counter(ExId.root) == null);
     const a: ExId = .{ .id = .init(3, 1) };
-    try std.testing.expectEqual(@as(?u32, 3), ExId.counter(a));
+    try std.testing.expectEqual(@as(?u64, 3), ExId.counter(a));
     // Removing actor 0 shifts actor 1 down to 0; removing actor 1 removes the
     // id itself.
     try std.testing.expect(ExId.actor(a.withoutActor(0).?) == 0);
@@ -947,4 +1224,114 @@ test "ActorId.random draws sixteen secure bytes, and no two draws agree" {
     // Sixteen bytes from a process-wide counter repeat; sixteen bytes from the
     // operating system do not.
     try std.testing.expect(!a.eql(b));
+}
+
+test "API parity stable identity codecs preserve arbitrary actor and author bytes" {
+    const gpa = std.testing.allocator;
+    const actor = ActorId.init(&.{ 0, 255, 128 });
+    const id = ExId.withActor(OpId.init(1, 7), actor);
+    const bytes = try id.toBytes(gpa);
+    defer gpa.free(bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0x10, 3, 0, 255, 128, 7, 1 }, bytes);
+    var decoded = try ExId.fromBytes(gpa, bytes);
+    defer decoded.deinitOwned(gpa);
+    try std.testing.expectEqualSlices(u8, actor.bytes, decoded.actorBytes().?.bytes);
+    const text = try std.fmt.allocPrint(gpa, "{f}", .{decoded});
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("1@00ff80", text);
+    const author = try @This().Author.fromHex(gpa, "00ff80");
+    defer gpa.free(author.bytes);
+    const json = try std.json.Stringify.valueAlloc(gpa, author, .{});
+    defer gpa.free(json);
+    try std.testing.expectEqualStrings("\"00ff80\"", json);
+    const hash: ChangeHash = .{ .bytes = @splat(0xab) };
+    const hash_text = try std.fmt.allocPrint(gpa, "{f}", .{hash});
+    defer gpa.free(hash_text);
+    try std.testing.expectEqualStrings("abababababababababababababababababababababababababababababababab", hash_text);
+}
+
+test "API parity identity parsers refuse truncation and oversized counters without trapping" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.UnexpectedEnd, ExId.fromBytes(gpa, ""));
+    try std.testing.expectError(error.InvalidObjIdFormat, ExId.fromBytes(gpa, &.{1}));
+    try std.testing.expectError(error.UnexpectedEnd, ExId.fromBytes(gpa, &.{ 0x10, 2, 0 }));
+    try std.testing.expectError(error.Overflow, ExId.parse(gpa, "18446744073709551616@00"));
+    var zero_id = try ExId.parse(gpa, "0@");
+    defer zero_id.deinitOwned(gpa);
+    try std.testing.expectEqual(@as(?u64, 0), zero_id.counter());
+}
+
+test "API parity stable IDs ignore index hints and distinguish actor bytes" {
+    const a = ExId.withActor(.init(4, 0), .init("a"));
+    const b = ExId.withActor(.init(4, 0), .init("b"));
+    const moved_a = ExId.withActor(.init(4, 99), .init("a"));
+    const local: ExId = .{ .id = .init(4, 0) };
+    try std.testing.expect(!a.eql(b));
+    try std.testing.expect(a.eql(moved_a));
+    try std.testing.expectEqual(std.math.Order.eq, a.order(moved_a));
+    try std.testing.expectEqual(std.math.Order.lt, a.order(b));
+    try std.testing.expect(!a.eql(local));
+    try std.testing.expect(!b.eql(local));
+    try std.testing.expectEqual(std.math.Order.lt, local.order(a));
+}
+
+test "API parity identity codecs release each partial allocation on failure" {
+    const scenario = struct {
+        fn exercise(gpa: std.mem.Allocator) !void {
+            var parsed = try ExId.parse(gpa, "1@00ff80");
+            defer parsed.deinitOwned(gpa);
+            const bytes = try parsed.toBytes(gpa);
+            defer gpa.free(bytes);
+            var decoded = try ExId.fromBytes(gpa, bytes);
+            defer decoded.deinitOwned(gpa);
+            var detached = try decoded.dup(gpa);
+            defer detached.deinitOwned(gpa);
+            try std.testing.expect(parsed.eql(detached));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, scenario.exercise, .{});
+}
+
+test "API parity public stable IDs preserve full u64 counters beyond resident row capacity" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{ "4294967296@00ff80", "18446744073709551615@00ff80" }, [_]u64{ 4294967296, std.math.maxInt(u64) }) |text, counter_value| {
+        var parsed = try ExId.parse(gpa, text);
+        defer parsed.deinitOwned(gpa);
+        try std.testing.expectEqual(counter_value, parsed.counter().?);
+        try std.testing.expect(parsed.opId() == null);
+        const encoded = try parsed.toBytes(gpa);
+        defer gpa.free(encoded);
+        var decoded = try ExId.fromBytes(gpa, encoded);
+        defer decoded.deinitOwned(gpa);
+        try std.testing.expect(parsed.eql(decoded));
+        var hinted = decoded;
+        hinted.named.op.actor = 7;
+        try std.testing.expectEqual(@as(?ActorIdx, 7), hinted.actor());
+        const shifted = hinted.withNewActor(4);
+        try std.testing.expectEqual(@as(?ActorIdx, 8), shifted.actor());
+        try std.testing.expectEqual(counter_value, shifted.counter().?);
+        const removed = hinted.withoutActor(4).?;
+        try std.testing.expectEqual(@as(?ActorIdx, 6), removed.actor());
+        try std.testing.expectEqual(counter_value, removed.counter().?);
+        try std.testing.expect(hinted.withoutActor(7) == null);
+        var copied = try hinted.dup(gpa);
+        defer copied.deinitOwned(gpa);
+        try std.testing.expect(hinted.eql(copied));
+        try std.testing.expectEqual(counter_value, copied.counter().?);
+        if (counter_value == std.math.maxInt(u64)) {
+            const overflow_bytes = try gpa.dupe(u8, encoded);
+            defer gpa.free(overflow_bytes);
+            overflow_bytes[overflow_bytes.len - 1] = 2;
+            try std.testing.expectError(error.Overflow, ExId.fromBytes(gpa, overflow_bytes));
+        }
+        const rendered = try decoded.toString(gpa);
+        defer gpa.free(rendered);
+        try std.testing.expectEqualStrings(text, rendered);
+        const json = try std.json.Stringify.valueAlloc(gpa, decoded, .{});
+        defer gpa.free(json);
+        const expected_json = try std.fmt.allocPrint(gpa, "\"{s}\"", .{text});
+        defer gpa.free(expected_json);
+        try std.testing.expectEqualStrings(expected_json, json);
+    }
+    try std.testing.expectError(error.Overflow, ExId.parse(gpa, "18446744073709551616@00"));
 }

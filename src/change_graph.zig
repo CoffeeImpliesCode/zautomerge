@@ -49,6 +49,8 @@
 //! sorted by hash, which is what the `BTreeSet<ChangeHash>` upstream gives.
 //! `recomputeHeads` derives the same set from the child edges, and is what a
 //! graph loaded from a stored document should be checked against.
+//! Unchecked loading instead installs the stored set with `installStoredHeads`,
+//! including hashes absent from the reconstructed DAG (`change_graph.rs:1017`).
 //!
 //! **The one place the sorted array is more expensive than upstream's tree.**
 //! A `BTreeSet` removes in `O(log H)`; a sorted array removes in `O(H)`,
@@ -457,6 +459,44 @@ pub const LevelRange = struct {
     }
 };
 
+/// Owned preflight result for an ordered batch. Metadata and sparse cache entries
+/// belong to this value until `publish` transfers them to the prepared graph.
+/// Copying this value does not create another owner. Always call `deinit`, also
+/// after publication. The graph must not mutate between preparation and publication.
+pub const PreparedChanges = struct {
+    gpa: Allocator,
+    base_len: usize,
+    records: std.ArrayList(Record) = .empty,
+
+    const Record = struct {
+        meta: ChangeMetadata,
+        actor: ActorIdx,
+        cache: StagedCache,
+    };
+
+    /// Publishes the complete batch without allocating. Requires the same,
+    /// unchanged graph passed to `prepareChanges`; consumes the owned records.
+    pub fn publish(self: *PreparedChanges, graph: *ChangeGraph) void {
+        std.debug.assert(graph.len() == self.base_len);
+        for (self.records.items) |record| {
+            const idx = graph.publishOwnedNode(record.meta, record.actor);
+            graph.commitCache(record.cache, idx);
+        }
+        self.records.clearRetainingCapacity();
+    }
+
+    /// Releases unpublished records and the preparation storage with the retained
+    /// allocator. The value is invalid afterward.
+    pub fn deinit(self: *PreparedChanges) void {
+        for (self.records.items) |*record| {
+            record.meta.deinit(self.gpa);
+            record.cache.deinit(self.gpa);
+        }
+        self.records.deinit(self.gpa);
+        self.* = undefined;
+    }
+};
+
 /// The graph of changes.
 pub const ChangeGraph = struct {
     /// The allocator this graph allocates from. As with `std.ArrayList`,
@@ -560,6 +600,70 @@ pub const ChangeGraph = struct {
         self.* = undefined;
     }
 
+    /// Copies this graph exactly into an independent owner using `gpa`, without
+    /// replaying changes. Metadata, indexes, clocks and fragments own destination
+    /// storage; the source is unchanged on success or error. Caller deinits the
+    /// result. Like other owners, assignment does not create another owned copy.
+    pub fn clone(self: *const ChangeGraph, gpa: Allocator) Error!ChangeGraph {
+        var result = ChangeGraph.init(gpa);
+        errdefer result.deinit();
+        try result.nodes.ensureTotalCapacity(gpa, self.nodes.items.len);
+        for (self.nodes.items) |node| {
+            var copied = node;
+            copied.meta = try node.meta.intoOwned(gpa);
+            result.nodes.appendAssumeCapacity(copied);
+        }
+        try result.parent_edges.appendSlice(gpa, self.parent_edges.items);
+        try result.child_edges.appendSlice(gpa, self.child_edges.items);
+        try result.by_hash.ensureUnusedCapacity(gpa, @intCast(self.by_hash.count()));
+        var hashes = self.by_hash.iterator();
+        while (hashes.next()) |entry| {
+            result.by_hash.putAssumeCapacityNoClobber(entry.key_ptr.*, entry.value_ptr.*);
+        }
+        try result.heads.appendSlice(gpa, self.heads.items);
+        try result.heads_stamp.appendSlice(gpa, self.heads_stamp.items);
+        result.heads_epoch = self.heads_epoch;
+        try result.seq_index.ensureTotalCapacity(gpa, self.seq_index.items.len);
+        for (self.seq_index.items) |list| {
+            var copied: std.ArrayList(NodeIdx) = .empty;
+            errdefer copied.deinit(gpa);
+            try copied.appendSlice(gpa, list.items);
+            result.seq_index.appendAssumeCapacity(copied);
+        }
+        try result.clock_cache.ensureTotalCapacity(gpa, self.clock_cache.items.len);
+        for (self.clock_cache.items) |entry| {
+            result.clock_cache.appendAssumeCapacity(.{
+                .node = entry.node,
+                .clock = try cloneSeqClock(gpa, entry.clock),
+            });
+        }
+        const top = try cloneSeqClock(gpa, self.fragment_top);
+        result.fragment_top.deinit();
+        result.fragment_top = top;
+        try result.fragment_cache.ensureTotalCapacity(gpa, self.fragment_cache.items.len);
+        for (self.fragment_cache.items) |fragment| {
+            const deps = try gpa.dupe(NodeIdx, fragment.deps);
+            errdefer gpa.free(deps);
+            const clock = try cloneSeqClock(gpa, fragment.clock);
+            result.fragment_cache.appendAssumeCapacity(.{
+                .head = fragment.head,
+                .deps = deps,
+                .clock = clock,
+            });
+        }
+        result.max_op = self.max_op;
+        result.stamp = self.stamp;
+        try result.visit_stamp.appendSlice(gpa, self.visit_stamp.items);
+        return result;
+    }
+
+    fn cloneSeqClock(gpa: Allocator, source: SeqClock) Error!SeqClock {
+        const values = source.values();
+        const result = try SeqClock.init(gpa, values.len);
+        @memcpy(result.slots[0..values.len], values);
+        return result;
+    }
+
     /// The number of changes in the graph (`len`, `change_graph.rs:188-190`).
     pub fn len(self: *const ChangeGraph) usize {
         return self.nodes.items.len;
@@ -650,9 +754,42 @@ pub const ChangeGraph = struct {
 
     /// The current heads, sorted ascending by hash (`heads`,
     /// `change_graph.rs:126-128`). Borrows the graph, and is invalidated by the
-    /// next `addChange`.
+    /// next `addChange` or successful `installStoredHeads`.
     pub fn getHeads(self: *const ChangeGraph) []const ChangeHash {
         return self.heads.items;
+    }
+
+    /// Restores a parsed snapshot's stored heads after unchecked reconstruction.
+    ///
+    /// Loader-only: copies `heads` into the graph's sorted unique head set, retaining
+    /// hashes absent from the graph without validating or rederiving them
+    /// (`change_graph.rs:41`, `:1017`, `:1043`). `heads` may borrow `getHeads`.
+    /// Invalidates existing head borrows on success. `error.OutOfMemory` leaves the
+    /// previous heads and scratch stamps unchanged; use the graph's allocator.
+    pub fn installStoredHeads(
+        self: *ChangeGraph,
+        gpa: Allocator,
+        heads: []const ChangeHash,
+    ) !void {
+        var staged: std.ArrayList(ChangeHash) = .empty;
+        errdefer staged.deinit(gpa);
+        try staged.appendSlice(gpa, heads);
+        std.mem.sort(ChangeHash, staged.items, {}, hashLessThan);
+        var unique: usize = 0;
+        for (staged.items) |head| {
+            if (unique != 0 and staged.items[unique - 1].eql(head)) continue;
+            staged.items[unique] = head;
+            unique += 1;
+        }
+        staged.items.len = unique;
+        try self.heads_stamp.ensureTotalCapacity(gpa, unique);
+
+        // Publication cannot fail, and no scratch mark describes the replaced set.
+        self.heads.deinit(gpa);
+        self.heads = staged;
+        self.heads_stamp.items.len = unique;
+        @memset(self.heads_stamp.items, 0);
+        self.heads_epoch = 1;
     }
 
     /// Whether `list` is exactly the set of current heads, order and
@@ -826,6 +963,144 @@ pub const ChangeGraph = struct {
         // From here nothing can fail: `pushNode` had the room its own commit
         // needs, and `staged` holds every allocation the cache commit makes.
         self.commitCache(staged, idx);
+    }
+
+    /// Preflights an ordered batch, including dependencies on earlier records.
+    /// Actors must already be interned in `authors` and mirrored in this graph.
+    /// Inputs are borrowed and copied; duplicate hashes are ignored. Any error
+    /// leaves history, heads and caches unchanged (reserved capacity may grow).
+    /// The caller owns the result and must publish or discard it, then deinit it.
+    /// No graph mutation may intervene before publication. Preparation is exclusive:
+    /// allocator callbacks must not reenter this graph while its projection is live.
+    pub fn prepareChanges(
+        self: *ChangeGraph,
+        gpa: Allocator,
+        authors: *Authors,
+        metas: []const ChangeMetadata,
+    ) Error!PreparedChanges {
+        if (authors.count() != self.numActors()) return error.InvalidIndex;
+        var prepared: PreparedChanges = .{ .gpa = gpa, .base_len = self.len() };
+        errdefer prepared.deinit();
+        if (metas.len == 0) return prepared;
+
+        if (metas.len > max_node_count -| self.len()) return error.Fail;
+        var edge_count: usize = 0;
+        var fragment_count: usize = 0;
+        for (metas) |meta| {
+            edge_count = std.math.add(usize, edge_count, meta.deps.len) catch
+                return error.Fail;
+            if (meta.hash.fragmentLevel() != 0) fragment_count += 1;
+        }
+        if (edge_count > max_edge_count -| self.parent_edges.items.len) return error.Fail;
+        if (edge_count > max_edge_count -| self.child_edges.items.len) return error.Fail;
+        try prepared.records.ensureTotalCapacity(gpa, metas.len);
+        try self.nodes.ensureUnusedCapacity(gpa, metas.len);
+        try self.visit_stamp.ensureUnusedCapacity(gpa, metas.len);
+        try self.by_hash.ensureUnusedCapacity(gpa, @intCast(metas.len));
+        try self.parent_edges.ensureUnusedCapacity(gpa, edge_count);
+        try self.child_edges.ensureUnusedCapacity(gpa, edge_count);
+        try self.clock_cache.ensureUnusedCapacity(
+            gpa,
+            (self.len() % cache_step + metas.len) / cache_step,
+        );
+        try self.fragment_cache.ensureUnusedCapacity(gpa, fragment_count);
+
+        // Only the sparse frontier is copied, never historical nodes or metadata.
+        // Its entries borrow old/staged clocks; removing a projected entry must
+        // not free either owner. The projected top clock has its own storage.
+        var projected_fragments: std.ArrayList(FragmentNode) = .empty;
+        defer projected_fragments.deinit(gpa);
+        try projected_fragments.appendSlice(gpa, self.fragment_cache.items);
+        var projected_top = try self.fragment_top.clone();
+        const old_fragments = self.fragment_cache;
+        const old_top = self.fragment_top;
+        const old_parent_len = self.parent_edges.items.len;
+        const old_clock_len = self.clock_cache.items.len;
+        self.fragment_cache = projected_fragments;
+        self.fragment_top = projected_top;
+        defer {
+            // Unlink only speculative suffixes. Existing nodes and their child
+            // links, heads and op counters were never written by preparation.
+            for (prepared.records.items) |record| {
+                const removed = self.by_hash.remove(record.meta.hash);
+                std.debug.assert(removed);
+                self.seq_index.items[record.actor].items.len -= 1;
+            }
+            self.nodes.items.len = prepared.base_len;
+            self.visit_stamp.items.len = prepared.base_len;
+            self.parent_edges.items.len = old_parent_len;
+            self.clock_cache.items.len = old_clock_len;
+            projected_fragments = self.fragment_cache;
+            projected_top = self.fragment_top;
+            self.fragment_cache = old_fragments;
+            self.fragment_top = old_top;
+            projected_top.deinit();
+        }
+
+        for (metas) |meta| {
+            if (self.by_hash.contains(meta.hash)) continue;
+            for (meta.deps) |dep| {
+                if (!self.by_hash.contains(dep)) return error.MissingDeps;
+            }
+            const actor = authors.lookup(meta.actor) orelse return error.InvalidIndex;
+            for (meta.other_actors) |other| {
+                if (authors.lookup(other) == null) return error.InvalidIndex;
+            }
+            if (meta.seq == 0 or std.math.cast(u32, meta.seq) == null) return error.InvalidSeq;
+            const have = self.seqForActor(actor);
+            if (meta.seq <= have) return error.DuplicateSeqNumber;
+            if (meta.seq != have + 1) return error.InvalidSeq;
+            try self.seq_index.items[actor].ensureUnusedCapacity(gpa, 1);
+            var owned = try meta.intoOwned(gpa);
+            errdefer owned.deinit(gpa);
+            const cache = try self.stageCache(gpa, meta, actor);
+            const idx: NodeIdx = @intCast(self.len());
+            prepared.records.appendAssumeCapacity(.{
+                .meta = owned,
+                .actor = actor,
+                .cache = cache,
+            });
+            var parent_head: ?NodeIdx = null;
+            var parent_tail: ?NodeIdx = null;
+            for (meta.deps) |dep| {
+                const edge: NodeIdx = @intCast(self.parent_edges.items.len);
+                self.parent_edges.appendAssumeCapacity(.{
+                    .target = self.by_hash.get(dep).?,
+                    .next = null,
+                });
+                if (parent_tail) |tail| {
+                    self.parent_edges.items[tail].next = edge;
+                } else {
+                    parent_head = edge;
+                }
+                parent_tail = edge;
+            }
+            self.nodes.appendAssumeCapacity(.{
+                .meta = owned,
+                .actor = actor,
+                .parents = parent_head,
+                .children = null,
+            });
+            self.by_hash.putAssumeCapacityNoClobber(meta.hash, idx);
+            self.visit_stamp.appendAssumeCapacity(0);
+            self.seq_index.items[actor].appendAssumeCapacity(idx);
+            if (cache.clock) |clock| self.commitCachedClock(idx, clock);
+            if (cache.fragment) |fragment| {
+                for (fragment.supersede) |at| {
+                    _ = self.fragment_cache.orderedRemove(at);
+                }
+                self.fragment_top.merge(fragment.clock);
+                self.fragment_cache.appendAssumeCapacity(.{
+                    .head = idx,
+                    .deps = fragment.deps,
+                    .clock = fragment.clock,
+                });
+            }
+        }
+        // Dependencies may borrow getHeads(); reserve only after copying inputs.
+        try self.heads.ensureUnusedCapacity(gpa, metas.len);
+        try self.heads_stamp.ensureUnusedCapacity(gpa, metas.len);
+        return prepared;
     }
 
     /// The first dependency of `meta` this graph does not have, or null when
@@ -1766,8 +2041,20 @@ pub const ChangeGraph = struct {
     pub fn insertActor(self: *ChangeGraph, gpa: Allocator, idx: ActorIdx) Error!void {
         const at: usize = idx;
         if (at > self.seq_index.items.len) return error.InvalidIndex;
-        try self.stageActorInsert(gpa);
+        try self.reserveActorInsert(gpa);
+        self.publishActorInsert(idx);
+    }
 
+    /// Reserves one actor slot in every graph mirror without changing indices
+    /// or visible lengths. Failure leaves all mirrors unchanged.
+    pub fn reserveActorInsert(self: *ChangeGraph, gpa: Allocator) Error!void {
+        try self.stageActorInsert(gpa);
+    }
+
+    /// Publishes a previously reserved actor slot and remaps existing node
+    /// actors. Requires `idx <= numActors()` and no intervening actor mutation.
+    pub fn publishActorInsert(self: *ChangeGraph, idx: ActorIdx) void {
+        std.debug.assert(idx <= self.seq_index.items.len);
         // From here nothing can fail.
         for (self.nodes.items) |*node| {
             if (node.actor >= idx) node.actor += 1;
@@ -2012,14 +2299,6 @@ pub const ChangeGraph = struct {
             if (!self.by_hash.contains(dep)) return error.MissingDeps;
         }
 
-        // The index of the node being added, and of the first edge this
-        // change contributes to each adjacency list. The checks above bound
-        // all three, so these restate the bound where the index is minted
-        // instead of adding a failure mode: none of them can fail here.
-        const idx = try nextIndex(self.nodes.items.len);
-        var parent_edge = try nextIndex(self.parent_edges.items.len);
-        var child_edge = try nextIndex(self.child_edges.items.len);
-
         var owned = try meta.intoOwned(gpa);
         errdefer owned.deinit(gpa);
 
@@ -2032,7 +2311,17 @@ pub const ChangeGraph = struct {
         try self.parent_edges.ensureUnusedCapacity(gpa, meta.deps.len);
         try self.child_edges.ensureUnusedCapacity(gpa, meta.deps.len);
 
-        // From here nothing can fail.
+        return self.publishOwnedNode(owned, actor);
+    }
+
+    /// Transfers owned metadata after reserving all graph and actor-list capacity.
+    fn publishOwnedNode(self: *ChangeGraph, owned: ChangeMetadata, actor: ActorIdx) NodeIdx {
+        std.debug.assert(self.nodes.items.len < max_node_count);
+        std.debug.assert(owned.deps.len <= max_edge_count - self.parent_edges.items.len);
+        std.debug.assert(owned.deps.len <= max_edge_count - self.child_edges.items.len);
+        const idx: NodeIdx = @intCast(self.nodes.items.len);
+        var parent_edge: NodeIdx = @intCast(self.parent_edges.items.len);
+        var child_edge: NodeIdx = @intCast(self.child_edges.items.len);
 
         // The dependency edges hang off the new node, and every dependency is
         // already in the graph, so every parent index is below `idx`. Each
@@ -2450,6 +2739,77 @@ fn lastWalkVisited(graph: *const ChangeGraph) usize {
         if (seen == graph.stamp) n += 1;
     }
     return n;
+}
+
+test "stored head installation leaves published state intact on allocation failure" {
+    // Refuse each allocation before publication, including the parallel scratch growth.
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var graph = ChangeGraph.init(gpa);
+    defer graph.deinit();
+    graph.heads_epoch = 7;
+    const heads = [_]ChangeHash{ testHash(3), testHash(2), testHash(2) };
+    var skip: usize = 0;
+    while (skip < 8) : (skip += 1) {
+        failing.fail_index = failing.alloc_index + skip;
+        const outcome = graph.installStoredHeads(gpa, &heads);
+        failing.fail_index = std.math.maxInt(usize);
+        if (outcome) |_| {
+            try testing.expect(skip != 0);
+            try testing.expectEqualSlices(
+                ChangeHash,
+                &.{ testHash(2), testHash(3) },
+                graph.getHeads(),
+            );
+            try testing.expectEqual(@as(usize, 2), graph.heads_stamp.items.len);
+            try testing.expectEqual(@as(u32, 1), graph.heads_epoch);
+            return;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqual(@as(usize, 0), graph.getHeads().len);
+            try testing.expectEqual(@as(usize, 0), graph.heads_stamp.items.len);
+            try testing.expectEqual(@as(u32, 7), graph.heads_epoch);
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "stored heads replace derived heads and retain unknown hashes across publication" {
+    // Unchecked loading trusts the snapshot head set, not the reconstructed links.
+    const gpa = testing.allocator;
+    var b = Builder.init(gpa);
+    defer b.deinit();
+    const graph = &b.graph;
+    const c1 = try b.change("a", 1, 1, &.{});
+    const c2 = try b.change("a", 2, 1, &.{c1});
+    const unknown = testHash(999);
+    try graph.installStoredHeads(gpa, &.{ unknown, c1, unknown });
+    var stored = [_]ChangeHash{ c1, unknown };
+    std.mem.sort(ChangeHash, &stored, {}, hashLessThan);
+    try testing.expectEqualSlices(ChangeHash, &stored, graph.getHeads());
+    try testing.expect(!graph.hasChange(unknown));
+    const derived = try graph.recomputeHeads(gpa);
+    defer gpa.free(derived);
+    try testing.expectEqualSlices(ChangeHash, &.{c2}, derived);
+    try testing.expectEqual(graph.getHeads().len, graph.heads_stamp.items.len);
+    for (graph.heads_stamp.items) |stamp| {
+        try testing.expectEqual(@as(u32, 0), stamp);
+        try testing.expect(stamp != graph.heads_epoch);
+    }
+
+    const c3 = try b.change("b", 3, 1, &.{c1});
+    var published = [_]ChangeHash{ c3, unknown };
+    std.mem.sort(ChangeHash, &published, {}, hashLessThan);
+    try testing.expectEqualSlices(ChangeHash, &published, graph.getHeads());
+    try testing.expectEqual(graph.getHeads().len, graph.heads_stamp.items.len);
+    for (graph.heads_stamp.items) |stamp| try testing.expect(stamp != graph.heads_epoch);
+
+    // A borrowed existing head slice is also a valid replacement input.
+    try graph.installStoredHeads(gpa, graph.getHeads());
+    try testing.expectEqualSlices(ChangeHash, &published, graph.getHeads());
+    try graph.installStoredHeads(gpa, &.{});
+    try testing.expectEqual(@as(usize, 0), graph.getHeads().len);
+    try testing.expectEqual(@as(usize, 0), graph.heads_stamp.items.len);
 }
 
 test "a linear history of three changes has one head at each step" {
@@ -4684,6 +5044,55 @@ test "a refused change leaves the graph, its heads and its fragments where they 
     try testing.expectEqual(@as(ActorIdx, 1), b.graph.nodeFor(fixture.tip).?.actor);
 }
 
+fn addPreparedFragmentBatch(b: *Builder, gpa: Allocator) Error!void {
+    const actor = b.authors.lookup(.{ .bytes = "z" }).?;
+    const seq = b.graph.seqForActor(actor);
+    const hashes = [_]ChangeHash{
+        levelHash(500_003, 1),
+        levelHash(500_004, 2),
+        levelHash(500_005, 1),
+    };
+    var metas: [3]ChangeMetadata = undefined;
+    for (&metas, 0..) |*meta, i| {
+        meta.* = .{
+            .actor = .{ .bytes = "z" },
+            .deps = if (i == 0) b.graph.getHeads() else hashes[i - 1 .. i],
+            .hash = hashes[i],
+            .time = 0,
+            .message = "prepared",
+            .seq = seq + i + 1,
+            .start_op = 2 + i,
+            .max_op = 2 + i,
+            .other_actors = &.{},
+        };
+    }
+    var prepared = try b.graph.prepareChanges(gpa, &b.authors, &metas);
+    defer prepared.deinit();
+    prepared.publish(&b.graph);
+}
+
+test "a prepared graph batch preserves history on every allocation refusal" {
+    // Later records depend on staged changes and supersede staged fragments.
+    // Every refused attempt is observed through clocks, metadata and fragments.
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var b = Builder.init(gpa);
+    defer b.deinit();
+    _ = try buildRefusalFixture(&b);
+    var before = try Snapshot.take(gpa, &b.graph);
+    defer before.deinit(gpa);
+    try sweepRefusals(&failing, &b, before, addPreparedFragmentBatch, SameGraphCheck{});
+    try testing.expectEqual(before.hashes.len + 3, b.graph.len());
+    try testing.expectEqualSlices(ChangeHash, &.{levelHash(500_005, 1)}, b.graph.getHeads());
+    try testing.expect((try b.graph.getFragment(gpa, levelHash(500_003, 1))) == null);
+    var last = (try b.graph.getFragment(gpa, levelHash(500_005, 1))).?;
+    defer last.deinit(gpa);
+    try testing.expectEqualSlices(ChangeHash, &.{levelHash(500_004, 2)}, last.boundary);
+    var clock = try b.graph.clockAt(gpa, b.graph.getHeads());
+    defer clock.deinit();
+    try testing.expect(clock.contains(.{ .actor = b.indexOf("z"), .counter = 4 }));
+}
+
 test "a refused change whose author and other actors are new leaves the author table and every mirror where they were" {
     // A real allocator through a counter, as the two refusals above: never armed
     // until the sweep, and the same allocator the graph is built with.
@@ -4811,6 +5220,49 @@ test "a refused change whose author and other actors are new leaves the author t
     try testing.expectEqual(before.hashes.len + 1, members.count());
     try testing.expect(members.contains(new_hash));
     for (before.hashes) |hash| try testing.expect(members.contains(hash));
+}
+
+test "graph clone owns metadata and caches independently after allocation refusals" {
+    // Refuse each destination allocation, observe the unchanged source, then
+    // destroy the source before reading and remapping the successful clone.
+    const gpa = testing.allocator;
+    var b = Builder.init(gpa);
+    var source_live = true;
+    defer if (source_live) b.deinit();
+    _ = try buildRefusalFixture(&b);
+    var before = try Snapshot.take(gpa, &b.graph);
+    defer before.deinit(gpa);
+    var copied = false;
+    var skip: usize = 0;
+    while (skip < 512) : (skip += 1) {
+        var failing: testing.FailingAllocator = .init(gpa, .{ .fail_index = skip });
+        if (b.graph.clone(failing.allocator())) |graph| {
+            var owned = graph;
+            owned.deinit();
+            copied = true;
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            var unchanged = try Snapshot.take(gpa, &b.graph);
+            defer unchanged.deinit(gpa);
+            try expectSameSnapshot(before, unchanged);
+        }
+    }
+    try testing.expect(skip > 0);
+    // The successful allocator context must outlive its clone. Repeat the copy
+    // with the stable test allocator rather than retaining a loop-local context.
+    try testing.expect(copied);
+    var independent = try b.graph.clone(gpa);
+    defer independent.deinit();
+    b.deinit();
+    source_live = false;
+    var after = try Snapshot.take(gpa, &independent);
+    defer after.deinit(gpa);
+    try expectSameSnapshot(before, after);
+    try independent.insertActor(gpa, 0);
+    var clock = try independent.clockAt(gpa, independent.getHeads());
+    defer clock.deinit();
+    try testing.expect(clock.contains(.{ .actor = 1, .counter = 40 }));
 }
 
 // ── Diff against the reference, for the actor-insertion route ───────────────

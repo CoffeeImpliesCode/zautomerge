@@ -94,7 +94,7 @@ const gpa = testing.allocator;
 const io = std.testing.io;
 const Allocator = std.mem.Allocator;
 
-const Document = am.doc.Document;
+const Document = am.AutoCommit;
 const Change = am.change_record.Change;
 const ChangeHash = am.ChangeHash;
 const ExId = am.ExId;
@@ -142,9 +142,9 @@ fn mintActor() ActorId {
 
 /// A document in the flavour upstream's `AutoCommit` is.
 fn newDoc() !Document {
-    var doc = try Document.init(gpa, io, .auto);
+    var doc = try Document.init(gpa, io);
     errdefer doc.deinit();
-    doc.setActorId(mintActor());
+    try doc.setActorId(mintActor());
     return doc;
 }
 
@@ -159,8 +159,9 @@ fn newDoc() !Document {
 fn forkDoc(src: *Document) !Document {
     const heads = try src.getHeads(gpa);
     defer gpa.free(heads);
-    var out = try src.forkAt(gpa, heads, .auto);
-    out.setActorId(mintActor());
+    var out = try src.forkAt(gpa, heads);
+    errdefer out.deinit();
+    try out.setActorId(mintActor());
     return out;
 }
 
@@ -169,7 +170,7 @@ fn forkDoc(src: *Document) !Document {
 /// The scalar at `obj.prop`, or `error.NotAnObject` / `error.NoSuchKey`.
 ///
 /// **`ReadDoc::get`** ([`read.rs`:259](../github-automerge-automerge/rust/automerge/src/read.rs)).
-fn scalarAt(doc: *const Document, obj: ExId, prop: am.Prop) !ScalarValue {
+fn scalarAt(doc: *Document, obj: ExId, prop: am.Prop) !ScalarValue {
     const item = (try am.read.get(doc, obj, prop)) orelse return error.NoSuchKey;
     return switch (item.value) {
         .scalar => |s| s,
@@ -216,11 +217,11 @@ fn expectSameThroughApplyChanges(doc: *Document) !void {
     defer gpa.free(views);
     for (0..all.len()) |i| views[i] = all.at(i);
 
-    var replayed = try Document.init(gpa, io, .auto);
+    var replayed = try am.doc.Document.init(gpa, io);
     defer replayed.deinit();
     _ = try replayed.applyChanges(gpa, views);
 
-    try replayed.debugCmp(doc);
+    try replayed.debugCmp(try doc.document());
 }
 
 // ── The fixture both of the first two cases build ────────────────────────────
@@ -271,7 +272,7 @@ fn docWithOrphans() !Orphans {
     var doc1 = try newDoc();
     errdefer doc1.deinit();
     // "Create a document with an orphan change" (`:10-11`).
-    _ = try am.transaction.put(&doc1, root, .{ .key = "key" }, .{ .str = "value" });
+    _ = try doc1.put(root, .{ .key = "key" }, .{ .str = "value" });
 
     const base_heads = try doc1.getHeads(gpa);
     defer gpa.free(base_heads);
@@ -290,7 +291,7 @@ fn docWithOrphans() !Orphans {
     // into `doc2`.
     defer doc2.deinit();
 
-    _ = try am.transaction.put(&doc2, root, .{ .key = "key" }, .{ .str = "value2" });
+    _ = try doc2.put(root, .{ .key = "key" }, .{ .str = "value2" });
     var first = try doc2.getChanges(gpa, base_heads);
     errdefer first.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), first.len());
@@ -313,7 +314,7 @@ fn docWithOrphans() !Orphans {
     // the change that write produced, with a count to say it was one.
     const after_first = try doc2.getHeads(gpa);
     defer gpa.free(after_first);
-    _ = try am.transaction.put(&doc2, root, .{ .key = "key" }, .{ .str = "value3" });
+    _ = try doc2.put(root, .{ .key = "key" }, .{ .str = "value3" });
     var second = try doc2.getChanges(gpa, after_first);
     defer second.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), second.len());
@@ -349,18 +350,13 @@ test "save keeps an orphaned change, and the dependency later drains it" {
     var orphans = try docWithOrphans();
     defer orphans.deinit();
 
-    // `let saved = doc.save();` (`:36`). **`Document.save` is upstream's
-    // `AutoCommit::save`**, and the port's `Document` is upstream's
-    // `Automerge` underneath one `AutoCommit`. **The merge is recorded in
-    // [`Document.saveWithOptions`](../src/doc.zig)'s own doc comment**, and the
-    // only difference between the two layers is the save cursor, which moves to
-    // the document's heads — a side effect this case does not read, because
-    // `orphans.doc` is freed at the end of the test.
+    // `let saved = doc.save();` (`:36`). The facade closes pending work before
+    // the raw save, including the retained orphan queue.
     const saved = try orphans.doc.save(gpa);
     defer gpa.free(saved);
 
     // `let mut loaded = AutoCommit::load(&saved).unwrap();` (`:37`).
-    var loaded = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
+    var loaded = try Document.load(gpa, io, saved, .unicode_code_point);
     defer loaded.deinit();
 
     // **An addition, not a gap.** Upstream asserts only the value at `:42-45`,
@@ -429,7 +425,7 @@ test "save discards the orphan when retain_orphans is false" {
     const saved = try orphans.doc.saveWithOptions(gpa, .{ .deflate = true, .retain_orphans = false });
     defer gpa.free(saved);
 
-    var loaded = try Document.load(gpa, io, saved, .unicode_code_point, .auto);
+    var loaded = try Document.load(gpa, io, saved, .unicode_code_point);
     defer loaded.deinit();
 
     // **An addition, not a gap.** The oracle reports this case's save as 139
@@ -474,7 +470,7 @@ test "loading an orphan change stream without a document chunk first is refused"
     var doc = try newDoc();
     defer doc.deinit();
 
-    _ = try am.transaction.put(&doc, root, .{ .key = "key" }, .{ .str = "value" });
+    _ = try doc.put(root, .{ .key = "key" }, .{ .str = "value" });
     // "let _ = doc.save_incremental();" (`:75`). **Discarded on purpose**,
     // exactly as upstream discards it: it exists to move the save cursor past
     // the first change, so the second save carries the second change alone.
@@ -488,7 +484,7 @@ test "loading an orphan change stream without a document chunk first is refused"
     const heads1 = try doc.getHeads(gpa);
     defer gpa.free(heads1);
 
-    _ = try am.transaction.put(&doc, root, .{ .key = "key" }, .{ .str = "value2" });
+    _ = try doc.put(root, .{ .key = "key" }, .{ .str = "value2" });
     var second = try doc.getChanges(gpa, heads1);
     defer second.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), second.len());
@@ -524,7 +520,7 @@ test "loading an orphan change stream without a document chunk first is refused"
     // the refusal assertion on purpose**, so it is still exercised while the
     // refusal below is failing — a case whose last statement is the failing one
     // reports nothing about the assertions before it.
-    var known = try Document.load(gpa, io, first, .unicode_code_point, .auto);
+    var known = try Document.load(gpa, io, first, .unicode_code_point);
     defer known.deinit();
     try testing.expectEqual(@as(usize, 1), try known.applyChanges(gpa, &.{second.at(0)}));
     try testing.expectEqualStrings("value2", (try scalarAt(&known, root, .{ .key = "key" })).str);
@@ -555,7 +551,7 @@ test "loading an orphan change stream without a document chunk first is refused"
     // rather than relaxed — relaxing it would have deleted the only record that
     // the rule was missing — and it now passes against the fix recorded in the
     // diff block at the foot of this file.
-    if (Document.load(gpa, io, orphan, .unicode_code_point, .auto)) |accepted| {
+    if (Document.load(gpa, io, orphan, .unicode_code_point)) |accepted| {
         var wrongly = accepted;
         wrongly.deinit();
         std.debug.print(
@@ -727,10 +723,9 @@ test "loading an orphan change stream without a document chunk first is refused"
 //    ([`autocommit.rs`:445-457](../github-automerge-automerge/rust/automerge/src/autocommit.rs))
 //    and `get_last_local_change` closes it
 //    ([`:615-618`](../github-automerge-automerge/rust/automerge/src/autocommit.rs)),
-//    so `put` → `get_last_local_change` → `put` is **two** changes upstream. The
-//    port's `am.transaction.put` opens, applies and commits each time, so it is
-//    two as well: the fork makes two, `doc1` makes one, and every assertion
-//    here depends on nothing else.
+//    so `put` → `get_last_local_change` → `put` is **two** changes upstream.
+//    The port's direct `AutoCommit.put` keeps work pending until `getChanges`
+//    closes it: the fork makes two changes and `doc1` makes one.
 // 3. **A `Change` is a borrow here.** See the file header; the consequence is
 //    [`Orphans`] carrying its [`am.doc.Changes`] list, and the fork being freed
 //    with `defer` rather than `errdefer` because the view does not point into

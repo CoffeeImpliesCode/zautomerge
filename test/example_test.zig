@@ -36,7 +36,7 @@ const io = std.testing.io;
 
 const Allocator = std.mem.Allocator;
 
-const Document = am.doc.Document;
+const Document = am.AutoCommit;
 const ExId = am.ExId;
 const ObjType = am.ObjType;
 
@@ -73,7 +73,7 @@ const Strings = struct {
 ///
 /// `read.objectType` answers what the reader is about to walk, so a
 /// non-sequence is refused here rather than walked as an empty list.
-fn snapshot(list: Allocator, doc: *const Document, obj: ExId) !Strings {
+fn snapshot(list: Allocator, doc: *Document, obj: ExId) !Strings {
     if (try am.read.objectType(doc, obj) != .list) return error.NotAList;
     var out = Strings.init(list);
     errdefer out.deinit();
@@ -92,7 +92,7 @@ fn snapshot(list: Allocator, doc: *const Document, obj: ExId) !Strings {
 
 /// The scalar at `key`, or `error.NoSuchKey` when the key is absent and
 /// `error.NotAnObject` when it holds one.
-fn scalar(doc: *const Document, obj: ExId, key: []const u8) !am.ScalarValue {
+fn scalar(doc: *Document, obj: ExId, key: []const u8) !am.ScalarValue {
     const item = (try am.read.get(doc, obj, .{ .key = key })) orelse return error.NoSuchKey;
     return switch (item.value) {
         .scalar => |s| s,
@@ -109,7 +109,7 @@ fn scalar(doc: *const Document, obj: ExId, key: []const u8) !am.ScalarValue {
 /// and a make action's own id *is* the id of the object it makes, so the id is
 /// the second field of the pair `get` returns ([`read.DocItem`](../src/read.zig),
 /// `op_set.rs:1054-1060`).
-fn objectId(doc: *const Document, obj: ExId, key: []const u8) !ExId {
+fn objectId(doc: *Document, obj: ExId, key: []const u8) !ExId {
     const item = (try am.read.get(doc, obj, .{ .key = key })) orelse return error.NoSuchKey;
     return switch (item.value) {
         .object => item.id,
@@ -119,7 +119,7 @@ fn objectId(doc: *const Document, obj: ExId, key: []const u8) !ExId {
 
 /// The id of the element at `index` of the sequence `obj`, or
 /// `error.NoSuchElement` when the sequence is shorter than that.
-fn elementId(doc: *const Document, obj: ExId, index: usize) !ExId {
+fn elementId(doc: *Document, obj: ExId, index: usize) !ExId {
     const item = (try am.read.get(doc, obj, .{ .index = index })) orelse return error.NoSuchElement;
     return switch (item.value) {
         .object => item.id,
@@ -131,34 +131,34 @@ test "the address book: the crate-root example, run as a consumer runs it" {
     // A new document in the autocommit flavour, which is upstream's
     // `AutoCommit::new`
     // ([`autocommit.rs:92-94`](../github-automerge-automerge/rust/automerge/src/autocommit.rs),
-    // [`doc.zig:328-331`](../src/doc.zig)). Every mutating call below opens a
-    // transaction and commits it, so this session holds none.
-    var doc = try Document.init(gpa, io, .auto);
+    // [`AutoCommit`](../src/autocommit.zig)). Mutations share a held transaction;
+    // ordinary reads observe pending writes, and save closes the transaction.
+    var doc = try Document.init(gpa, io);
     defer doc.deinit();
     // **A named actor**, because a random one would make a failure
     // unreproducible. Upstream draws one at random
     // ([`automerge.rs:314`](../github-automerge-automerge/rust/automerge/src/automerge.rs));
     // this document takes its bytes from its caller
     // ([`doc.zig:2227-2232`](../src/doc.zig)).
-    doc.setActorId(.{ .bytes = "0123456789abcdef" });
+    try doc.setActorId(.{ .bytes = "0123456789abcdef" });
 
     // `putObject` creates a nested object in the root key/value map and returns
     // the id of the new object, in this case a list
     // ([`Transactable::put_object`](../github-automerge-automerge/rust/automerge/src/transaction/transactable.rs):33-39).
-    const contacts = try am.transaction.putObject(&doc, am.root, .{ .key = "contacts" }, .list);
+    const contacts = try doc.putObject(am.root, .{ .key = "contacts" }, .list);
 
     // Now we can insert objects into the list, and finally set keys in the map
     // each one is (`lib.rs:127-132`).
-    const alice = try am.transaction.insertObject(&doc, contacts, 0, .map);
-    _ = try am.transaction.put(&doc, alice, .{ .key = "name" }, .{ .str = "Alice" });
-    _ = try am.transaction.put(&doc, alice, .{ .key = "email" }, .{ .str = "alice@example.com" });
+    const alice = try doc.insertObject(contacts, 0, .map);
+    _ = try doc.put(alice, .{ .key = "name" }, .{ .str = "Alice" });
+    _ = try doc.put(alice, .{ .key = "email" }, .{ .str = "alice@example.com" });
 
     // **The addresses.** The reference's example has no list to remove from,
     // and a removal step is what makes the session worth running: a document
     // that only ever grows is a document nobody has ever had to fix.
-    const alice_addresses = try am.transaction.putObject(&doc, alice, .{ .key = "addresses" }, .list);
-    _ = try am.transaction.insert(&doc, alice_addresses, 0, .{ .str = "1 Main St" });
-    _ = try am.transaction.insert(&doc, alice_addresses, 1, .{ .str = "PO Box 12" });
+    const alice_addresses = try doc.putObject(alice, .{ .key = "addresses" }, .list);
+    _ = try doc.insert(alice_addresses, 0, .{ .str = "1 Main St" });
+    _ = try doc.insert(alice_addresses, 1, .{ .str = "PO Box 12" });
 
     // **A map key is not a sequence index**, so making a nested object under a
     // key of a list is refused rather than answered. This line is not part of
@@ -168,17 +168,17 @@ test "the address book: the crate-root example, run as a consumer runs it" {
     // ([`Transaction.putObject`](../src/transact.zig), `inner.rs:285-289`).
     try testing.expectError(
         error.InvalidOp,
-        am.transaction.putObject(&doc, alice_addresses, .{ .key = "work" }, .map),
+        doc.putObject(alice_addresses, .{ .key = "work" }, .map),
     );
 
     // Create another contact (`lib.rs:134-137`), with one address of its own,
     // so the removal below has an untouched neighbour to be measured against.
-    const bob = try am.transaction.insertObject(&doc, contacts, 1, .map);
-    _ = try am.transaction.put(&doc, bob, .{ .key = "name" }, .{ .str = "Bob" });
-    _ = try am.transaction.put(&doc, bob, .{ .key = "email" }, .{ .str = "bob@example.com" });
-    _ = try am.transaction.put(&doc, bob, .{ .key = "zip" }, .{ .uint = 94110 });
-    const bob_addresses = try am.transaction.putObject(&doc, bob, .{ .key = "addresses" }, .list);
-    _ = try am.transaction.insert(&doc, bob_addresses, 0, .{ .str = "22 Rue Verte" });
+    const bob = try doc.insertObject(contacts, 1, .map);
+    _ = try doc.put(bob, .{ .key = "name" }, .{ .str = "Bob" });
+    _ = try doc.put(bob, .{ .key = "email" }, .{ .str = "bob@example.com" });
+    _ = try doc.put(bob, .{ .key = "zip" }, .{ .uint = 94110 });
+    const bob_addresses = try doc.putObject(bob, .{ .key = "addresses" }, .list);
+    _ = try doc.insert(bob_addresses, 0, .{ .str = "22 Rue Verte" });
 
     // The premises, asked through the document rather than through a reader's
     // answer: two contacts, a map for each, and a list for the addresses.
@@ -211,7 +211,7 @@ test "the address book: the crate-root example, run as a consumer runs it" {
     // **The removal.** `delete` reports how many delete operations it wrote,
     // which is one for a list element ([`Transaction.delete`](../src/transact.zig),
     // `inner.rs:573-598`).
-    try testing.expectEqual(@as(usize, 1), try am.transaction.delete(&doc, alice_addresses, .{ .index = 0 }));
+    try testing.expectEqual(@as(usize, 1), try doc.delete(alice_addresses, .{ .index = 0 }));
 
     // **The copies taken before the write still hold their bytes**, which is the
     // whole of what "the copy is the caller's" means
@@ -251,7 +251,7 @@ test "the address book: the crate-root example, run as a consumer runs it" {
     // indexed document and a UTF-8 indexed one have identical bytes
     // ([`doc.zig:2767-2775`](../src/doc.zig)), so the answer is the same
     // [`Document.init`] call at the top of this test.
-    var reloaded = try Document.load(gpa, io, data, am.doc.defaultTextEncoding(), .auto);
+    var reloaded = try Document.load(gpa, io, data, am.doc.defaultTextEncoding());
     defer reloaded.deinit();
 
     // **The whole document, through the same public reads.** A save that lost a
@@ -288,12 +288,10 @@ test "the address book: the crate-root example, run as a consumer runs it" {
 //
 // * **The example is upstream's, and it is the first block of the crate docs**
 //   ([`lib.rs:113-143`](../github-automerge-automerge/rust/automerge/src/lib.rs)).
-//   `AutoCommit` is `Document` in the `.auto` mode here
-//   ([`doc.zig:328-331`](../src/doc.zig)), and the three calls the example
-//   makes are `transaction.putObject`, `transaction.insertObject` and
-//   `transaction.put`, one for one. **Nothing was added to make it pass and
-//   nothing was taken out.** The `addresses` list is the one addition, and the
-//   comment in the test says why.
+//   `AutoCommit` owns the raw `Document` and its held transaction, and the three
+//   calls the example makes are `doc.putObject`, `doc.insertObject` and
+//   `doc.put`, one for one.
+//   The `addresses` list is the one addition, and the comment in the test says why.
 //
 // * **The second upstream example is not ported as a merge.** Upstream's second
 //   block loads the saved bytes on two devices, edits each, and merges
@@ -308,7 +306,7 @@ test "the address book: the crate-root example, run as a consumer runs it" {
 //   `impl Into<Prop>` and `impl Into<ScalarValue>`
 //   ([`inner.rs:241-248`](../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)),
 //   so `doc.put(&alice, "name", "Alice")` reads as one call. Here it is
-//   `am.transaction.put(&doc, alice, .{ .key = "name" }, .{ .str = "Alice" })`
+//   `doc.put(alice, .{ .key = "name" }, .{ .str = "Alice" })`
 //   ([`types.Prop`](../src/types.zig):452-455), because a Zig union has no
 //   implicit conversion from its payload and an argument that is "either a key
 //   or an index" has to say which. **`ScalarValue` is the port's answer to
@@ -316,20 +314,17 @@ test "the address book: the crate-root example, run as a consumer runs it" {
 //   conversions read as two struct literals rather than as one call with two
 //   bare literals.
 //
-// * **The write door is spelled `zautomerge.transaction`.** Upstream splits the
+// * **The write door is the `AutoCommit` owner.** Upstream splits the
 //   two representations across [`Automerge`] and [`AutoCommit`]
-//   ([`lib.rs:15-24`](../github-automerge-automerge/rust/automerge/src/lib.rs)),
-//   and this port has one `Document` with a `Mode` flag and two modules over it:
-//   `transaction` for the autocommit door and `manual_transaction` for the
-//   caller who commits. `API.md` §Write lists the methods as free functions
-//   without saying which module they are in, and the example had to pick one.
+//   ([`lib.rs:15-24`](../github-automerge-automerge/rust/automerge/src/lib.rs)).
+//   Raw `Document` writes use an explicit `Transaction`; automatic writes
+//   use the owner methods and close only at publication barriers.
 //
 // * **[API.md](../API.md) §Document does not match the signatures, and this
 //   file is the first thing to have to compile against both.** It writes
-//   `init(gpa) Document` and `load(gpa, bytes) LoadError!Document`; the port
-//   has `init(gpa, mode)` ([`doc.zig:2233-2235`](../src/doc.zig)) and
-//   `load(gpa, bytes, encoding, mode)`
-//   ([`doc.zig:2770-2775`](../src/doc.zig)). The encoding is not a choice
+//   `init(gpa) Document` and `load(gpa, bytes) LoadError!Document`; constructors
+//   also take the retained I/O capability, and load takes a text encoding.
+//   The encoding is not a choice
 //   this port made: it is not in the file, because a UTF-16 indexed document
 //   and a UTF-8 indexed one have identical bytes
 //   ([`:2767-2769`](../src/doc.zig)), so a load that guessed would be wrong
@@ -670,7 +665,7 @@ fn compareShape(
     cdoc: *const cabi.AMdoc,
     root: *const cabi.AMobjId,
     heads: ?*const cabi.AMitems,
-    zig_doc: *const Document,
+    zig_doc: *Document,
     shape: Shape,
     want: []const KeyValue,
     clock: []const u8,
@@ -730,8 +725,7 @@ fn compareShape(
 ///
 /// The clock is the reason there are two batches. The six writes before
 /// [`past`] are one change — an autocommit document holds its transaction
-/// open until a read closes it ([`src/c/doc.zig:269-282`](../src/c/doc.zig)
-/// is the C side of that rule), and the read below is what closes it — and
+/// open across ordinary reads, and `getHeads` closes it — and
 /// the two after it are a second. So `past` is a single head, and the state
 /// it names differs from the current one in **two observable ways**: `b`'s
 /// winner is the earlier row, and `e` is not in the map at all. A clock that
@@ -739,23 +733,24 @@ fn compareShape(
 /// duplicate of the unclocked one, and the comparison would prove that the
 /// `heads` parameter was ignored.
 fn rangesFixture(list: Allocator) !struct { doc: Document, past: []ChangeHash } {
-    var doc = try Document.init(list, io, .auto);
+    var doc = try Document.init(list, io);
     errdefer doc.deinit();
-    doc.setActorId(.{ .bytes = "0123456789abcdef" });
-    _ = try am.transaction.put(&doc, am.root, .{ .key = "a" }, .{ .int = 1 });
-    _ = try am.transaction.put(&doc, am.root, .{ .key = "b" }, .{ .str = "one" });
-    _ = try am.transaction.put(&doc, am.root, .{ .key = "c" }, .{ .int = 3 });
-    _ = try am.transaction.put(&doc, am.root, .{ .key = "d" }, .{ .str = "four" });
-    _ = try am.transaction.put(&doc, am.root, .{ .key = "d" }, .{ .str = "four!" });
-    // The read that closes the autocommit transaction, so the heads below are
-    // this batch's and not a prefix of the next one.
+    try doc.setActorId(.{ .bytes = "0123456789abcdef" });
+    _ = try doc.put(am.root, .{ .key = "a" }, .{ .int = 1 });
+    _ = try doc.put(am.root, .{ .key = "b" }, .{ .str = "one" });
+    _ = try doc.put(am.root, .{ .key = "c" }, .{ .int = 3 });
+    _ = try doc.put(am.root, .{ .key = "d" }, .{ .str = "four" });
+    _ = try doc.put(am.root, .{ .key = "d" }, .{ .str = "four!" });
+    // Ordinary length reads remain pending; getHeads closes this first batch.
     _ = try am.read.length(&doc, am.root);
     const past = try doc.getHeads(list);
     errdefer list.free(past);
     // **`b` a second time, after the clock**: this is what makes `b` two rows
     // wide at the current state and gives the clock something to hide.
-    _ = try am.transaction.put(&doc, am.root, .{ .key = "b" }, .{ .str = "two" });
-    _ = try am.transaction.put(&doc, am.root, .{ .key = "e" }, .{ .int = 5 });
+    _ = try doc.put(am.root, .{ .key = "b" }, .{ .str = "two" });
+    _ = try doc.put(am.root, .{ .key = "e" }, .{ .int = 5 });
+    // Close at the fixture transfer boundary: an open owner cannot move.
+    _ = try doc.commit();
     return .{ .doc = doc, .past = past };
 }
 
@@ -800,7 +795,7 @@ test "the four bound shapes: one document through AMmapRange and through read.ma
     // — a `heads` clock handed to `MapRange::init` on the C side, an
     // already-narrowed document on the Zig side — have to give the same
     // answer, and neither is derived from the other.
-    var fork = try doc.forkAt(gpa, fixture.past, .auto);
+    var fork = try doc.forkAt(gpa, fixture.past);
     defer fork.deinit();
 
     for ([_][]const Shape{ &held_bounds, &absent_bounds }) |table| {

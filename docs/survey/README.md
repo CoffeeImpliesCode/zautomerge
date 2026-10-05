@@ -1,9 +1,13 @@
 # Automerge API survey
 
-Eight sections, one per slice of the reference implementation. Every claim
-carries a `path:line` citation into the Rust source at commit
-`ddbff535407e4d28cd2a82eaf6c6add08caa3bdd`. Read the section that covers your
-change before working on it; the [plan](../plan.md) cites them by section.
+Eight sections describe the pinned reference implementation.
+Upstream claims cite Rust source at commit `ddbff535407e4d28cd2a82eaf6c6add08caa3bdd`.
+Native mapping notes cite this repository's `src/` contracts.
+Read the section for your change. The [plan](../plan.md) cites these sections.
+
+The native API cutover updates those mapping notes without changing the upstream version pin.
+Source-ready contracts are not completed test or performance gates.
+Dated results certify only the recorded revision and scope.
 
 Source: `../github-automerge-automerge`, read-only. Crate `automerge` 0.12.0
 (64,979 lines, 163 files) and `hexane` 1.0.0-alpha.5 (32,664 lines, 39 files),
@@ -32,8 +36,8 @@ plus the binding layers.
   diff-match-patch, despite the directory name (05).
 - UTF-8 versus UTF-16 indexing is a silent cross-binding divergence in the
   upstream bindings, with no test reading a document through both (07).
-- `interop/exemplar` is the only cross-implementation artefact in the
-  repository, and nothing asserts against it (08).
+- `interop/exemplar` is the cross-implementation artifact inspected in the pinned upstream repository (08).
+  The native fixture manifest includes a loadability expectation, not a comparison against its pinned export JSON.
 - Three chunks of upstream are dead code and are not ported:
   `op_set2/skip_list.rs` (20,160 bytes), `query/` (`list_state.rs`,
   `seek_mark.rs`, 372 lines) and `indexed_cache.rs` (02, 05, 06). The fourth

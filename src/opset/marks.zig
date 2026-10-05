@@ -232,10 +232,10 @@ pub fn MarkIter(comptime I: type) type {
         }
 
         /// Moves the walk's window to `rows` — the window only, not the
-        /// position, which is what the kernel's `void` `shift` means here
-        /// (`OpIter.shift`).
-        pub fn shift(self: *Self, rows: RowRange) void {
-            self.iter.shift(rows);
+        /// position (`OpIter.shift`).
+        /// A parse refusal leaves the underlying cursor and window unchanged.
+        pub fn shift(self: *Self, rows: RowRange) ParseError!void {
+            return self.iter.shift(rows);
         }
 
         /// Repositions the walk onto `rows` and reads the row at its start
@@ -332,8 +332,9 @@ pub fn NoMarkIter(comptime I: type) type {
 
         /// Moves the walk's window to `rows` — the window only, not the
         /// position (`OpIter.shift`).
-        pub fn shift(self: *Self, rows: RowRange) void {
-            self.iter.shift(rows);
+        /// A parse refusal leaves the underlying cursor and window unchanged.
+        pub fn shift(self: *Self, rows: RowRange) ParseError!void {
+            return self.iter.shift(rows);
         }
 
         /// Repositions the walk onto `rows` and reads the row at its start
@@ -800,7 +801,7 @@ test "a Shiftable adapter repositions into a later window" {
     // accessor that lands on a row is `shiftNext` and not `shift`.
     var fresh = MarkIter(opiter.OpIter(OpBuilder)).init(gpa, try fix.walk(1, fix.rows));
     defer fresh.deinit();
-    fresh.shift(.{ .start = 0, .end = 3 });
+    try fresh.shift(.{ .start = 0, .end = 3 });
     try testing.expectEqual(@as(usize, 3), fresh.maxPos());
     try testing.expectEqualStrings("a", (try fresh.next()).?.asStr());
     // Row 2 is the mark's begin, which neither adapter returns, so the walk

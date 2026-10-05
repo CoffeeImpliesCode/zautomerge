@@ -755,11 +755,10 @@ pub fn BlockOrText(comptime Block: type) type {
 /// `span_as_grapheme` (`text_diff.rs:475-488`): expands spans into blocks and
 /// grapheme clusters, which is the new side of a block diff.
 ///
-/// **The returned list owns its array and none of its payloads.** Only the
-/// `.grapheme` entries borrow: they are subslices of `spans[i].text`, cut by
-/// [`graphemes`], so the caller's spans must stay alive and unmodified for as
-/// long as the list is read. The caller frees the list itself with the same
-/// allocator.
+/// The returned list owns its array, not its payloads. Graphemes are subslices
+/// of the input text; block entries copy the `Block` descriptor without
+/// duplicating its map or other referenced payloads. Keep all source payloads
+/// live and unchanged while reading the list, then deinit its array with `gpa`.
 pub fn spanAsGrapheme(
     gpa: Allocator,
     comptime Block: type,
@@ -1122,11 +1121,9 @@ pub fn BlockDiffHook(comptime Sink: type, comptime Block: type) type {
 /// **The mark pass is not here.** Upstream runs a second pass over the marks
 /// after this one (`apply_marks_diff`, `text_diff.rs:165-248`), and this module
 /// does not publish it — it needs the `marks` and `iter` types this module does
-/// not own. The port runs it inside the transaction instead:
-/// [`Transaction.updateSpansWithConfig`](transact.zig) and the free
-/// [`transact.updateSpansWithConfig`](transact.zig) both call this function for
-/// the first pass and apply the mark diff for the second, so a consumer never
-/// sequences the two by hand.
+/// not own. The held transaction's `updateSpansWithConfig` runs this first
+/// pass and then applies the mark diff. The automatic owner delegates to
+/// that same transaction, so callers never sequence the two passes manually.
 pub fn myersBlockDiff(
     gpa: Allocator,
     comptime Sink: type,

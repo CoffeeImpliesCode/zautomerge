@@ -92,7 +92,7 @@ const gpa = testing.allocator;
 /// that value is `std.testing.io`; an executable passes its own `init.io`.
 const io = std.testing.io;
 
-const Document = am.doc.Document;
+const Document = am.AutoCommit;
 const ExId = am.ExId;
 const ScalarValue = am.ScalarValue;
 const Mirror = am.hydrate.Value;
@@ -115,25 +115,25 @@ const actor: am.ActorId = .{ .bytes = "markpatches00" };
 //    [`test_mark_patches.rs`:8-41](../github-automerge-automerge/rust/automerge/tests/test_mark_patches.rs)
 
 test "mark_patches_at_end_of_text" {
-    var doc1 = try Document.init(gpa, io, .auto);
+    var doc1 = try Document.init(gpa, io);
     defer doc1.deinit();
-    doc1.setActorId(actor);
+    try doc1.setActorId(actor);
 
-    const text = try am.transaction.putObject(&doc1, root, .{ .key = "text" }, .text);
-    try am.transaction.spliceText(&doc1, text, 0, 0, "sample");
+    const text = try doc1.putObject(root, .{ .key = "text" }, .text);
+    try doc1.spliceText(text, 0, 0, "sample");
     const heads_before_mark = try doc1.getHeads(gpa);
     defer gpa.free(heads_before_mark);
 
     const saved = try doc1.save(gpa);
     defer gpa.free(saved);
-    var doc2 = try Document.load(gpa, io, saved, doc1.textEncoding(), .auto);
+    var doc2 = try Document.load(gpa, io, saved, doc1.textEncoding());
     defer doc2.deinit();
 
     // `Mark::new("bold".to_string(), true, 5, 6)` with `ExpandMark::After`
     // ([`test_mark_patches.rs`:16-21](../github-automerge-automerge/rust/automerge/tests/test_mark_patches.rs)): the run is the
     // **last** character, `"e"`, and `After` is upstream's
     // `Default for ExpandMark` ([`marks.rs`:379-383](../github-automerge-automerge/rust/automerge/src/marks.rs)).
-    try am.transaction.mark(&doc1, text, 5, 6, "bold", .after, .{ .bool_value = true });
+    try doc1.mark(text, 5, 6, "bold", .after, .{ .bool_value = true });
 
     // "Pop the patches" upstream
     // ([`test_mark_patches.rs`:24](../github-automerge-automerge/rust/automerge/tests/test_mark_patches.rs)). **The first
@@ -189,24 +189,24 @@ test "mark_patches_at_end_of_text" {
 // ── 2. The hydrate clause ─────────────────────────────────────────────────────
 
 test "a mark patch hydrates: the replay reproduces the document and the mirror outlives a mutation" {
-    var doc1 = try Document.init(gpa, io, .auto);
+    var doc1 = try Document.init(gpa, io);
     defer doc1.deinit();
-    doc1.setActorId(actor);
+    try doc1.setActorId(actor);
 
-    const text = try am.transaction.putObject(&doc1, root, .{ .key = "text" }, .text);
-    try am.transaction.spliceText(&doc1, text, 0, 0, "sample");
+    const text = try doc1.putObject(root, .{ .key = "text" }, .text);
+    try doc1.spliceText(text, 0, 0, "sample");
     // **A byte-bearing scalar beside the object.** The ownership claim below is
     // about bytes a mirror copies, and a `str` in a register is the smallest
     // thing in this document that exercises it: nothing else here owns a
     // payload a later write can move.
-    _ = try am.transaction.put(&doc1, root, .{ .key = "label" }, .{ .str = "sample" });
+    _ = try doc1.put(root, .{ .key = "label" }, .{ .str = "sample" });
     const heads_before_mark = try doc1.getHeads(gpa);
     defer gpa.free(heads_before_mark);
 
     const saved = try doc1.save(gpa);
     defer gpa.free(saved);
     const enc = doc1.textEncoding();
-    var doc2 = try Document.load(gpa, io, saved, enc, .auto);
+    var doc2 = try Document.load(gpa, io, saved, enc);
     defer doc2.deinit();
 
     // **The mirror as it stood before the mark**, which is what the stream is
@@ -220,7 +220,7 @@ test "a mark patch hydrates: the replay reproduces the document and the mirror o
     var popped = try doc2.diffIncremental(gpa);
     defer popped.deinit();
 
-    try am.transaction.mark(&doc1, text, 5, 6, "bold", .after, .{ .bool_value = true });
+    try doc1.mark(text, 5, 6, "bold", .after, .{ .bool_value = true });
     const changes_after_mark = try doc1.saveAfter(gpa, heads_before_mark);
     defer gpa.free(changes_after_mark);
     _ = try doc2.loadIncremental(gpa, changes_after_mark);
@@ -257,15 +257,14 @@ test "a mark patch hydrates: the replay reproduces the document and the mirror o
     // it would be reading — and the mirror is read again afterwards. Nothing
     // about the mirror changes, because nothing in it belongs to the document.
     for (0..64) |i| {
-        try am.transaction.spliceText(&doc2, text, 0, 0, "x");
-        _ = try am.transaction.put(
-            &doc2,
+        try doc2.spliceText(text, 0, 0, "x");
+        _ = try doc2.put(
             root,
             .{ .key = "filler" },
             .{ .str = if (i == 63) "the last one, and a different length" else "filler" },
         );
     }
-    try am.transaction.unmark(&doc2, text, 0, 5, .none, "bold", null);
+    try doc2.unmark(text, 0, 5, .none, "bold", null);
 
     try expectText(&replayed, "sample", 1);
     try expectBoldMark(&replayed);
@@ -274,15 +273,10 @@ test "a mark patch hydrates: the replay reproduces the document and the mirror o
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// The materialised root map at the present
-/// ([`Automerge::hydrate`](../src/doc.zig)), which the port reaches through the
-/// op set ([`hydrate.hydrateMap`](../src/hydrate.zig)).
-///
-/// **`*Document` and not `*const Document`**: `hydrateMap` takes the op set by
-/// mutable pointer ([`hydrate.zig`](../src/hydrate.zig):1548), which is a read
-/// of the document rather than a change to it.
+/// Materialises an owned mirror using the public reader. Hydrate observes the
+/// current document without introducing a publication barrier.
 fn hydrateNow(doc: *Document) !Mirror {
-    return am.hydrate.hydrateMap(am.doc.Set, &doc.ops, gpa, root, null);
+    return doc.hydrate(root, null, gpa);
 }
 
 /// `v`'s root map, or a failure that says what `v` holds instead.
@@ -352,8 +346,10 @@ fn textOf(v: *const Mirror, key: []const u8) !*const am.hydrate.Text {
 /// because the thing it should have found was never there.
 fn expectText(v: *const Mirror, want: []const u8, want_marks: usize) !void {
     const t = try textOf(v, "text");
-    if (!std.mem.eql(u8, want, t.asStr())) {
-        std.debug.print("the mirror's text is \"{s}\", want \"{s}\"\n", .{ t.asStr(), want });
+    const rendered = try t.makeString(gpa);
+    defer gpa.free(rendered);
+    if (!std.mem.eql(u8, want, rendered)) {
+        std.debug.print("the mirror's text is \"{s}\", want \"{s}\"\n", .{ rendered, want });
         return error.TestExpectedEqual;
     }
     if (t.marks.len() != want_marks) {
@@ -467,10 +463,9 @@ fn expectSameValue(where: []const u8, a: *const Mirror, b: *const Mirror) !void 
 //   `marks.ExpandMark.after` and is upstream's `Default`
 //   ([`marks.rs`:379-383](../github-automerge-automerge/rust/automerge/src/marks.rs)).
 //
-// * **`AutoCommit::dump()` is not ported.** Upstream calls it twice
-//   ([`test_mark_patches.rs`:26, :30](../github-automerge-automerge/rust/automerge/tests/test_mark_patches.rs)) and
-//   discards the output; a debug print that asserts nothing is not a test, so
-//   neither call has a counterpart here.
+// * **The upstream `dump()` calls only print diagnostics.** Upstream calls it
+//   twice ([`test_mark_patches.rs`:26, :30](../github-automerge-automerge/rust/automerge/tests/test_mark_patches.rs))
+//   and discards the output; neither call contributes an assertion here.
 //
 // * **`AutoCommit::save_after` is `Document.saveAfter`** ([`doc.zig`](../src/doc.zig))
 //   and it returns the change chunks a peer missing `heads` needs, which is
@@ -485,7 +480,7 @@ fn expectSameValue(where: []const u8, a: *const Mirror, b: *const Mirror) !void 
 // * **The hydrate clause compares marks by hand, because `hydrate.Text.eql`
 //   does not.** Upstream's `Text` derives `PartialEq` over `value` *and*
 //   `marks` ([`hydrate/text.rs`:7-11](../github-automerge-automerge/rust/automerge/src/hydrate/text.rs)); the
-//   port's `Text.eql` compares `asStr()` only, and says why at the function: a
+//   port's `Text.eql` compares native text units only:
 //   name-to-value set records what each name last held and not where, so
 //   comparing it would let two texts that are not equal look equal. **The
 //   clause therefore reads `Text.marks` directly**, and `expectSameMirror`

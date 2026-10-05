@@ -1,11 +1,9 @@
 //! The document: the actor table, the change graph, the change queue, the op
 //! set, and the load / save / commit / merge surface around them.
 //!
-//! Upstream `automerge.rs` (2,361 lines) and `autocommit.rs` (1,378) are one
-//! struct and one wrapper: `Automerge` holds the state and `AutoCommit` holds
-//! an `Automerge` plus an open transaction. This is [`Document`], which holds
-//! the state and a [`Mode`], because [plan §3.2](../../docs/plan.md) makes the
-//! two flavours one type with a flag.
+//! Upstream `automerge.rs` owns the raw state and `autocommit.rs` wraps it with
+//! one held transaction. `Document` is the raw owner; `autocommit.AutoCommit`
+//! owns the separate automatic lifecycle over the same transaction kernel.
 //!
 //! # The five fields upstream keeps, and the three this adds
 //!
@@ -151,7 +149,6 @@ const Bundle = bundlem.Bundle;
 const Change = changerec.Change;
 const ChangeGraph = graphmod.ChangeGraph;
 const ChangeHash = types.ChangeHash;
-const ChangeMetadata = changerec.ChangeMetadata;
 const ChangeOp = opmod.ChangeOp;
 const ChangeQueue = queuemod.ChangeQueue;
 const Cell = columnarenc.Cell;
@@ -212,10 +209,14 @@ pub const MarkError = OpError;
 ///
 /// [`ParseError`] because a document arrives from disk or from a peer;
 /// [`opsetmod.LoadError`] because loading an op set rebuilds its index and
-/// checks its mark order; [`Error`] because the screen in front of a merge
+/// checks its mark order and migration reads operation rows; [`Error`] because the screen
 /// refuses a duplicate; [`InternalError`] because a check upstream treats as
-/// impossible is one here too.
-pub const LoadError = ParseError || opsetmod.LoadError || Error || InternalError;
+/// impossible is one here too. Optional scalar-string migration uses the native
+/// transaction's complete write-error basis below. Naming TransactionError here
+/// would create a cycle because WriteError already includes LoadError.
+pub const LoadError = ParseError || opsetmod.LoadError || Error || InternalError ||
+    opitermod.ReadOpError || opsetmod.SearchError || iterdoc.DiffError ||
+    @import("hydrate.zig").OpHydrateError || error{ChangeType};
 
 /// Constructor refusal: allocation, entropy unavailability, or cancellation.
 pub const InitError = Allocator.Error || std.Io.RandomSecureError;
@@ -238,24 +239,19 @@ pub const Strings = struct {
     gpa: Allocator,
     /// The bytes themselves. One arena, so the table is released by one call.
     arena: std.heap.ArenaAllocator,
-    /// The strings, in the order they were first interned. An id is an index
-    /// into this list, which is why the list never reorders.
-    ///
-    /// **The lookup is a scan, not a hash.** A document's distinct map keys and
-    /// mark names are its own vocabulary — tens of entries, not millions — and
-    /// the alternative is a second structure to keep in step with this one for
-    /// no measurable win. `opset/columns.zig`'s test tables and `author.zig`'s
-    /// fixtures both scan for the same reason.
-    items: std.ArrayList([]const u8) = .empty,
+    /// The only ordered key storage. IDs are insertion indices, so entries
+    /// are never removed or reordered. The map borrows immutable arena bytes;
+    /// its index replaces a vocabulary-wide scan without a second key table.
+    map: std.StringArrayHashMapUnmanaged(void) = .empty,
 
     /// An empty table. `gpa` must be the allocator every later call passes.
     pub fn init(gpa: Allocator) Strings {
         return .{ .gpa = gpa, .arena = .init(gpa) };
     }
 
-    /// Releases the bytes, the list and the index in one call.
+    /// Releases the ordered map and all its owned key bytes in one call.
     pub fn deinit(self: *Strings) void {
-        self.items.deinit(self.gpa);
+        self.map.deinit(self.gpa);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -269,7 +265,7 @@ pub const Strings = struct {
     /// How many strings the table holds, which is the number of ids it can
     /// name.
     pub fn count(self: *const Strings) usize {
-        return self.items.items.len;
+        return self.map.count();
     }
 
     /// The bytes of the string `id` names, or the empty string for an id the
@@ -279,21 +275,29 @@ pub const Strings = struct {
     fn resolve(ctx: *const anyopaque, id: u32) []const u8 {
         const self: *const Strings = @ptrCast(@alignCast(ctx));
         const i: usize = id;
-        if (i >= self.items.items.len) return &.{};
-        return self.items.items[i];
+        const keys = self.map.keys();
+        if (i >= keys.len) return &.{};
+        return keys[i];
     }
 
     /// The id of `bytes`, interning it if the table has not seen it.
     /// `error.Overflow` once the table holds more strings than an id can name,
     /// which is `ParseError` because that is where a save fails too.
+    /// Duplicates allocate nothing. A refusal publishes no key and consumes no
+    /// ID; earlier resolved byte borrows remain valid until `deinit`.
     fn intern(ctx: *const anyopaque, bytes: []const u8, gpa: Allocator) ParseError!u32 {
         const self: *Strings = @ptrCast(@alignCast(@constCast(ctx)));
-        for (self.items.items, 0..) |item, i| {
-            if (std.mem.eql(u8, item, bytes)) return std.math.cast(u32, i) orelse error.Overflow;
+        if (self.map.getIndex(bytes)) |i| {
+            return std.math.cast(u32, i) orelse error.Overflow;
         }
-        const id = std.math.cast(u32, self.items.items.len) orelse return error.Overflow;
-        const owned = self.arena.allocator().dupe(u8, bytes) catch return error.OutOfMemory;
-        try self.items.append(gpa, owned);
+        const len = self.map.count();
+        const id = std.math.cast(u32, len) orelse return error.Overflow;
+        const next_len = std.math.add(usize, len, 1) catch return error.Overflow;
+        // Reserve before copying, and publish only once no fallible work remains.
+        // A refused copy leaves capacity but no key or ID behind.
+        try self.map.ensureTotalCapacity(gpa, next_len);
+        const owned = try self.arena.allocator().dupe(u8, bytes);
+        self.map.putAssumeCapacityNoClobber(owned, {});
         return id;
     }
 };
@@ -406,34 +410,26 @@ pub const Actor = union(enum) {
     }
 };
 
-/// Which upstream flavour a caller asked for
-/// ([plan §3.2](../../docs/plan.md)).
-///
-/// Upstream splits the document in two because `Automerge` makes the caller
-/// open a `Transaction` and `AutoCommit` opens one per call. Zig has no borrow
-/// across a call boundary, so the difference is a field a caller reads rather
-/// than a type it cannot mix.
-///
-/// **Every entry point in this file behaves identically in both modes.** The
-/// difference is entirely in the transaction slice, which is the only code
-/// that can hold an open transaction: it reads [`Document.mode`] and either
-/// requires one (`.manual`) or opens and closes one around each mutating call
-/// (`.auto`). [`Document.emptyCommit`] is available in both, because upstream's
-/// `Automerge::empty_commit`
-/// ([`automerge.rs:693-697`](../../github-automerge-automerge/rust/automerge/src/automerge.rs))
-/// is on the `Automerge` flavour and `AutoCommit` reaches it through it.
-pub const Mode = enum {
-    /// `Automerge`: the caller opens a transaction and commits it.
-    manual,
-    /// `AutoCommit`: the document opens a transaction per mutating call.
-    auto,
+/// Policy for an unreadable tail after the first valid chunk.
+pub const OnPartialLoad = enum { refuse, ignore };
+/// Unchecked loading preserves stored heads without comparing them to derived heads.
+pub const VerificationMode = enum { check, dont_check };
+/// Optional migration of visible scalar strings in maps and lists.
+pub const StringMigration = enum { no_migration, convert_to_text };
+/// Load inputs are borrowed during the call; author bytes are copied into the owner.
+pub const LoadOptions = struct {
+    on_partial_load: OnPartialLoad = .refuse,
+    verification_mode: VerificationMode = .check,
+    string_migration: StringMigration = .no_migration,
+    patch_log: ?*patchesmod.PatchLog = null,
+    text_encoding: TextEncoding = TextEncoding.platformDefault(),
+    author: ?[]const u8 = null,
 };
 
 /// What [`Document.stats`] reports
 /// ([`ReadDoc::stats`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):2300-2315).
 ///
-/// Upstream's struct also carries the crate name, the crate version and the
-/// `rustc` version, which are facts about the build rather than the document.
+/// Package and compiler provenance names this Zig build, not Rust's toolchain.
 pub const Stats = struct {
     /// How many changes the graph holds.
     num_changes: u64,
@@ -441,18 +437,29 @@ pub const Stats = struct {
     num_ops: u64,
     /// How many actors the table holds.
     num_actors: u64,
+    /// Static package name from the package manifest.
+    package_name: []const u8,
+    /// Static package version from the package manifest.
+    package_version: []const u8,
+    /// Static version of the Zig compiler that built this module.
+    compiler_version: []const u8,
 };
 
-/// What the change graph cannot remember about one of its own nodes, kept here
-/// so that the collector can rebuild the change the node came from.
+/// An imported object identity and its live type. Actor bytes borrow the document.
+pub const ImportedObject = struct {
+    id: ExId,
+    object_type: ObjType,
+};
+
+/// Change reconstruction details kept beside each graph node.
 ///
 /// Upstream stores both in the change columns beside the graph
 /// ([`ChangeGraphCols::load`](../../github-automerge-automerge/rust/automerge/src/change_graph.rs):926-1050).
-/// The port's [`ChangeMetadata`] has no `start_op` and no `extra_bytes` field,
-/// and a document that could not rebuild a change byte for byte could not
-/// answer a peer with one — nor produce the hash it already recorded.
-/// `start_op` is *not* derivable from the graph: it is `max_op - num_ops + 1`
-/// and `num_ops` is what the collector is trying to establish.
+/// The graph's internal [`changerec.ChangeMetadata`] has no `extra` field.
+/// The owned public metadata combines that graph record with this sidecar;
+/// the collector also needs it to reproduce the bytes covered by the hash.
+/// Keeping the original `start_op` beside the footer lets every collector
+/// path use the same reconstruction record, including empty changes.
 pub const NodeInfo = struct {
     /// The counter of the change's first op, never zero.
     start_op: u64,
@@ -521,9 +528,57 @@ pub const Built = struct {
     }
 };
 
-/// A list of [`Built`] changes, each dependency before the change that needs it.
+/// Caller-owned change metadata matching Rust `op_set2/types.rs:749-774`.
+///
+/// `actor.bytes`, `author`, `message`, `deps` and `extra` are independent copies:
+/// no field borrows the document. One value has one owner, released exactly once
+/// with `deinit(gpa)` using the allocator passed to the reader. Assignment copies
+/// the ownership handle, not the storage; copies must not be released separately.
+pub const ChangeMetadata = struct {
+    actor: ActorId,
+    /// UTF8 author associated with the actor, or `null` when none is known.
+    author: ?[]const u8,
+    seq: u64,
+    /// Inclusive operation interval; an empty change has `max_op = start_op - 1`.
+    start_op: u64,
+    max_op: u64,
+    /// Signed Unix timestamp in seconds, as stored in the change.
+    timestamp: i64,
+    /// Stored UTF8 message, or `null` for an absent/empty encoded message.
+    message: ?[]const u8,
+    deps: []const ChangeHash,
+    hash: ChangeHash,
+    /// Complete opaque footer bytes, including any encoded author.
+    extra: []const u8,
+
+    /// Releases every owned field. The value and its views are invalid afterward.
+    pub fn deinit(self: *ChangeMetadata, gpa: Allocator) void {
+        gpa.free(self.actor.bytes);
+        if (self.author) |bytes| gpa.free(bytes);
+        if (self.message) |bytes| gpa.free(bytes);
+        gpa.free(self.deps);
+        gpa.free(self.extra);
+        self.* = undefined;
+    }
+};
+
+/// Single-owner metadata collection; neither the list nor its fields borrow a document.
+/// Release once with `deinit(gpa)`, using the reader's allocator. Copies share ownership.
+pub const ChangeMetas = struct {
+    /// Metadata in dependency order. Views remain valid until this collection is released.
+    items: std.ArrayList(ChangeMetadata) = .empty,
+
+    /// Releases the metadata fields and the list; the value is invalid afterward.
+    pub fn deinit(self: *ChangeMetas, gpa: Allocator) void {
+        for (self.items.items) |*meta| meta.deinit(gpa);
+        self.items.deinit(gpa);
+        self.* = undefined;
+    }
+};
+
+/// A caller-owned list of [`Built`] changes in the producing reader's order.
 pub const Changes = struct {
-    /// The changes, in dependency order.
+    /// The changes, in selection order; hash-batch requests need not be causal.
     items: std.ArrayList(Built) = .empty,
 
     /// How many changes the list holds.
@@ -543,7 +598,7 @@ pub const Changes = struct {
         return self.items.items[0..];
     }
 
-    /// The change at `index`, in dependency order.
+    /// The change at `index`, in selection order.
     pub fn at(self: *const Changes, index: usize) Change {
         return self.items.items[index].change;
     }
@@ -1157,7 +1212,7 @@ fn countAt(list: ?[]const Cell, i: usize) ParseError!u64 {
 /// end is `error.MissingActor`.
 ///
 /// The caller owns the result: each op owns a copy of its predecessor list.
-fn decodeChangeOps(
+pub fn decodeChangeOps(
     gpa: Allocator,
     change: Change,
     actors: []const ActorIdx,
@@ -1165,7 +1220,7 @@ fn decodeChangeOps(
     // The op block is parsed from the body the change already holds, so the
     // header is read twice. That is the price of not duplicating the metadata
     // block reader, and it is a read of already-validated bytes.
-    var block = try changechunk.parseChangeChunk(change.bytes, gpa);
+    var block = try changechunk.parseChangeChunkWithHash(change.bytes, gpa, change.hash);
     defer block.deinit(gpa);
     const cols = block.ops;
 
@@ -1763,6 +1818,7 @@ pub const footer_author_id: u64 = 1;
 /// Decodes a footer into the author it names, or null when it names none.
 pub fn decodeAuthorFooter(footer: ?[]const u8) ParseError!?[]const u8 {
     const bytes = footer orelse return null;
+    if (bytes.len == 0) return null;
     var in: Input = .init(bytes);
     const id = try in.takeUleb();
     if (id != footer_author_id) return null;
@@ -2494,7 +2550,7 @@ pub const ChangeHeader = struct {
 /// everything the caller knew that a parse cannot read has to be filled in
 /// again on the way out. There is exactly one such field, and it is
 /// `max_op`; see the `withOpCount` below for why it is not optional.
-fn encodeOneChange(
+pub fn encodeOneChange(
     gpa: Allocator,
     actors: []const ActorId,
     meta: ChangeHeader,
@@ -2568,12 +2624,9 @@ fn encodeOneChange(
 /// A document: an actor table, a change graph, a change queue, an op set, and
 /// the text encoding the whole thing is measured in.
 ///
-/// Upstream's `Automerge`
-/// ([automerge.rs:248-263](../../github-automerge-automerge/rust/automerge/src/automerge.rs))
-/// plus the `AutoCommit` wrapper
-/// ([autocommit.rs:63-72](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)),
-/// with the two collapsed into one type and a `Mode` field as
-/// [plan §3.2](../../docs/plan.md) requires.
+/// Raw committed state corresponding to upstream `Automerge`
+/// (`automerge.rs:248-263`). The separate `autocommit.AutoCommit` owns automatic
+/// transaction boundaries; this owner never opens an automatic transaction.
 ///
 /// Single owner: call `deinit` exactly once. Do not shallow-copy an owning
 /// document. Move it only when no borrow of its address remains. `clone` and
@@ -2581,23 +2634,17 @@ fn encodeOneChange(
 /// remain live until disposal; do not replace ownership-bearing fields.
 /// All access requires caller synchronization. Readers can update shared scratch
 /// and caches. Do not mutate through another entry point while a walk is live.
-/// A refused native automatic write with unresolved producer or rollback work
-/// is retained for `recoverAuto`; the next native automatic write retries it
-/// before allocating operation IDs. A no-work validation refusal leaves reads
-/// and writes available; valid unused actor metadata remains document-owned.
-/// While recovery is pending, keep the document at its address and do not read
-/// rows. Storage/actor-table/isolation mutators refuse with `error.InvalidOp`.
-/// Configuration-only `setMode`, `setActorId`, `dropIsolation` and
-/// `resetDiffCursor` remain permitted: they neither move rows nor renumber
-/// retained operation IDs. Retained scope heads are independently owned.
 pub const Document = struct {
+    /// Historical head keys and clock buffers survive selection of another scope.
+    pub const HistoricalScope = struct {
+        heads: []ChangeHash,
+        clock: *clockmod.Clock,
+    };
     /// Allocator for retained document state. Mutators must use this allocator.
     /// Methods that return independent output buffers may use another allocator.
     gpa: Allocator,
     /// Borrowed randomness capability. Its provider must outlive this document.
     io: std.Io,
-    /// `.auto` commits each write; `.manual` requires an explicit transaction.
-    mode: Mode = .auto,
     /// Owned, address-stable table of interned map keys and mark names.
     strings: *Strings,
     /// The rows, and the actor table the columns index.
@@ -2654,62 +2701,13 @@ pub const Document = struct {
     /// ([autocommit.rs:433-441](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)).
     /// Owned copied heads; null disables isolation. Released with `self.gpa`.
     isolation: ?[]ChangeHash = null,
-    /// Unresolved native automatic producer or rollback work, owned solely by
-    /// this document. Null means no recovery is needed, including after no-work
-    /// validation refusal. Do not replace this field or move the document while
-    /// it is non-null; its transaction borrows this document's address.
-    auto_recovery: ?@import("transact.zig").Transaction = null,
 
-    /// The clock the last scoped read built — [`Document.readScope`] for the
-    /// isolation, [`Document.clockAtScope`] for caller-named heads — and the
-    /// state it was built from. Null until a scoped read is taken.
-    ///
-    /// **Both readers share this one clock, which is why there is one cache
-    /// and not two.** They answer the same question with the same shape, and
-    /// a document can only hold the most recent one; alternating between them
-    /// at different heads rebuilds, and that is the same cost as not caching.
-    ///
-    /// **This is a cache because six of the readers in
-    /// [read.zig](read.zig) hand a *walk* to their caller, and a walk copies
-    /// the clock by value.** [`OpSet.topOps`](opset/op_set.zig) puts a
-    /// `?Clock` — not a `?*const Clock` — into its [`TopOps`](opset/top_op.zig),
-    /// and [`Parents`](opset/parents.zig), [`MapRange`](iter/map_range.zig),
-    /// [`ListRange`](iter/list_range.zig) and [`Spans`](iter/spans.zig) do the
-    /// same; each is documented as borrowing the caller's clock. So a clock
-    /// built inside a reader and freed when the reader returns would leave
-    /// every walk that reader handed out reading freed memory.
-    ///
-    /// **The three fields after it are the cache key, and the row count is
-    /// what makes the cache sound**: `clock_at(heads)` can only change if the
-    /// set of changes reachable from `heads` changed, and the only way that
-    /// happens without a new isolation is a change being applied — which adds
-    /// rows. The actor count is there because `Clock.slots` is sized by it,
-    /// and [`Document.setActorId`] can intern an actor without writing a row.
-    read_scope: ?clockmod.Clock = null,
-    /// The heads [`read_scope`] was built for — the isolation, or the `heads`
-    /// [`Document.clockAtScope`] was handed — **copied** rather than borrowed:
-    /// [`Document.isolate`] frees the slice it replaces, and a caller's slice
-    /// is the caller's to free.
-    read_scope_heads: []ChangeHash = &.{},
-    /// How many rows the op set held when [`read_scope`] was built.
-    read_scope_ops: usize = 0,
-    /// How many actors the graph held when [`read_scope`] was built.
-    read_scope_actors: usize = 0,
+    historical_scopes: std.ArrayList(HistoricalScope) = .empty,
+    /// Internal clone/render metadata; moves preserve it, but actor tables decide compatibility.
+    patch_identity: u64,
 
-    /// The patches this document's own applies have recorded, and the index
-    /// that makes an incremental diff cheap
-    /// ([`AutoCommit::patch_log`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs),
-    /// `autocommit.rs:67`).
-    ///
-    /// **Upstream's `Automerge` has no such field and `AutoCommit` does**
-    /// (`autocommit.rs:67` against `automerge.rs`, where the log is a parameter
-    /// of `apply_changes_log_patches`, `automerge.rs:1063-1068`). This port has
-    /// **one** `Document` type with a [`Mode`](Mode) flag rather than two, so
-    /// the field is here and starts **inactive** (`autocommit.rs:82`), which is
-    /// what a caller that never asks for a diff pays for: nothing is recorded.
-    ///
-    /// [`Document.diffIncremental`] is what turns it on, and only through
-    /// [`Document.updateDiffCursor`].
+    /// Internal facade log storage, inactive until explicitly enabled.
+    /// Raw transactions return their own logs; commit does not synthesize a diff.
     patch_log: patchesmod.PatchLog,
     /// The heads the next incremental diff starts from
     /// ([`AutoCommit::diff_cursor`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs),
@@ -2739,8 +2737,8 @@ pub const Document = struct {
     /// `io` is borrowed for later actor draws. Entropy refusal or cancellation
     /// returns an error and no document. Use `setActorId` for deterministic ids.
     /// Upstream also draws a fresh actor (`automerge.rs:307-317`).
-    pub fn init(gpa: Allocator, io: std.Io, mode: Mode) InitError!Document {
-        return initWithEncoding(gpa, io, defaultTextEncoding(), mode);
+    pub fn init(gpa: Allocator, io: std.Io) InitError!Document {
+        return initWithEncoding(gpa, io, defaultTextEncoding());
     }
 
     /// A new, empty document measuring text in `encoding`. The encoding is a
@@ -2751,18 +2749,20 @@ pub const Document = struct {
         gpa: Allocator,
         io: std.Io,
         encoding: TextEncoding,
-        mode: Mode,
     ) InitError!Document {
-        return initOwned(gpa, io, encoding, mode, null);
+        return initOwned(gpa, io, encoding, null);
     }
 
-    fn initOwned(gpa: Allocator, io: std.Io, encoding: TextEncoding, mode: Mode, actor_id: ?ActorId) InitError!Document {
+    fn initOwned(gpa: Allocator, io: std.Io, encoding: TextEncoding, actor_id: ?ActorId) InitError!Document {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const id = if (actor_id) |actor|
             ActorId.init(try arena.allocator().dupe(u8, actor.bytes))
         else
             try ActorId.random(arena.allocator(), io);
+        var identity_bytes: [8]u8 = undefined;
+        try io.randomSecure(&identity_bytes);
+        const patch_identity = std.mem.readInt(u64, &identity_bytes, .little);
         // The table is **heap allocated**, because the op set keeps a pointer
         // to it: `StringTable.ctx` is `&self.strings`, and returning a Document
         // by value relocates the field, so a table stored inline would leave
@@ -2779,7 +2779,7 @@ pub const Document = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .mode = mode,
+            .patch_identity = patch_identity,
             .strings = strings,
             .ops = ops,
             .authors = authorsmod.Authors.init(gpa),
@@ -2797,19 +2797,15 @@ pub const Document = struct {
 
     /// Releases everything: the op set, the graph, the queue, both actor
     /// tables, the string table, the arena, the node table, the patch log,
-    /// both cursors, the cached read scope and any retained automatic recovery.
+    /// both cursors and retained historical read clocks.
     /// The document is `undefined` afterward. A second disposal is invalid.
     pub fn deinit(self: *Document) void {
-        if (self.auto_recovery) |*tx| tx.deinit();
         self.diff_cursor.deinit(self.gpa);
         self.save_cursor.deinit(self.gpa);
         self.patch_log.deinit();
         if (self.isolation) |heads| self.gpa.free(heads);
-        // The read scope is freed before the graph it was built from, and it
-        // frees its `slots` with the allocator it was built with — which is
-        // the one `readScope` was handed.
-        if (self.read_scope) |*scope| scope.deinit();
-        self.gpa.free(self.read_scope_heads);
+        self.invalidateHistoricalScopes();
+        self.historical_scopes.deinit(self.gpa);
         self.node_info.deinit(self.gpa);
         self.actor_authors.deinit(self.gpa);
         // **The list, not the names in it**: those are arena bytes, released
@@ -2825,42 +2821,24 @@ pub const Document = struct {
         self.* = undefined;
     }
 
-    /// Rolls back a refused native automatic write and returns its total undone
-    /// operation count, or zero when no recovery is pending. Allocation and
-    /// column refusals retain the progressed transaction for another attempt.
-    /// Uses the document allocator. Success disposes the retained record once.
-    /// Until success, do not read rows or mutate document storage through fields.
-    pub fn recoverAuto(self: *Document) @import("transact.zig").WriteError!usize {
-        var tx = self.auto_recovery orelse return 0;
-        self.auto_recovery = null;
-        // Rollback's actor-removal fan must run without the public mutation
-        // guard; the local transaction remains the sole owner during this call.
-        errdefer self.auto_recovery = tx;
-        const cancelled = try tx.rollback();
-        tx.deinit();
-        return cancelled;
-    }
-
-    fn requireRecovered(self: *const Document) Error!void {
-        if (self.auto_recovery != null) return error.InvalidOp;
-    }
-
     /// The allocator this document allocates from.
     pub fn allocator(self: *const Document) Allocator {
         return self.gpa;
     }
 
-    /// Which flavour the caller asked for. Every entry point in this file
-    /// behaves the same in both; see [`Mode`].
-    pub fn documentMode(self: *const Document) Mode {
-        return self.mode;
+    /// Stable clone/render metadata, not an external patch-log compatibility token.
+    pub fn patchIdentity(self: *const Document) u64 {
+        return self.patch_identity;
     }
 
-    /// Changes the flavour, for a document that was built in one and is being
-    /// used as the other. **Nothing this file does changes with it**, so this
-    /// only matters to a caller holding a transaction.
-    pub fn setMode(self: *Document, next: Mode) void {
-        self.mode = next;
+    /// Releases historical iterator clocks after a mutation invalidates their borrows.
+    pub fn invalidateHistoricalScopes(self: *Document) void {
+        for (self.historical_scopes.items) |*scope| {
+            self.gpa.free(scope.heads);
+            scope.clock.deinit();
+            self.gpa.destroy(scope.clock);
+        }
+        self.historical_scopes.clearRetainingCapacity();
     }
 
     // ── The actor table ────────────────────────────────────────────────────
@@ -2922,7 +2900,6 @@ pub const Document = struct {
     /// splits the op set's copy from the graph's, so this is where the two are
     /// kept equal.
     pub fn putActorRef(self: *Document, gpa: Allocator, actor: ActorId) Error!ActorIdx {
-        try self.requireRecovered();
         if (self.ops.lookupActor(actor)) |idx| return @intCast(idx);
         const slot = self.actorSlot(actor);
         try self.insertActor(gpa, slot, actor);
@@ -2952,34 +2929,52 @@ pub const Document = struct {
         return lo;
     }
 
-    /// Interns `actor` at `slot`, which must be the position
-    /// [`Document.actorSlot`] gives, and rewrites every index at or above it in
-    /// the op set, the change graph and the cached actor
-    /// ([`Automerge::insert_actor`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):1301-1306).
-    fn insertActor(self: *Document, gpa: Allocator, slot: usize, actor: ActorId) Error!void {
+    const PreparedActorInsert = struct {
+        idx: ActorIdx,
+        ops: Set.PreparedActorInsert,
+        authors: authorsmod.Authors.PreparedInsert,
+
+        fn deinit(self: *PreparedActorInsert) void {
+            self.ops.deinit();
+            self.authors.deinit();
+        }
+
+        fn publish(self: *PreparedActorInsert, doc: *Document) void {
+            self.ops.publish(&doc.ops);
+            self.authors.publish(&doc.authors);
+            doc.graph.publishActorInsert(self.idx);
+            doc.actor_authors.insertAssumeCapacity(self.idx, null);
+            doc.actor.rewriteWithNewActor(self.idx);
+            doc.invalidateHistoricalScopes();
+        }
+    };
+
+    /// Copies and reserves every actor mirror before any index becomes visible.
+    /// Aborted actor copies remain arena-owned scratch until document teardown.
+    fn prepareActorInsert(
+        self: *Document,
+        gpa: Allocator,
+        slot: usize,
+        actor: ActorId,
+    ) Error!PreparedActorInsert {
         const idx = std.math.cast(ActorIdx, slot) orelse return error.InvalidIndex;
-        // **The slot is an insertion point, not a position past the end.**
-        // `put_actor_ref` is `binary_search` over the sorted table: `Ok` means
-        // the actor is there, and `Err(idx)` means it belongs at `idx`
-        // ([`automerge.rs:1309-1315`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-        // and upstream hands that straight to `insert_actor`, which inserts
-        // there ([`:1301-1307`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
-        // Requiring `slot == actors.len` refused every actor that sorts before
-        // one already in the table, which is the common case for a second
-        // actor and invisible with one actor — the same invisibility that hid
-        // the `actorAt` mapping. Each of the four tables below takes a middle
-        // index already: [`OpSet.insertActor`](opset/op_set.zig) rewrites every
-        // index at or above it, [`authorsmod.Authors.insertAt`] and
-        // [`ChangeGraph.insertActor`] shift the rest down.
         if (slot > self.ops.actors.items.len) return error.InvalidIndex;
-        const owned = self.arena.allocator().dupe(u8, actor.bytes) catch return error.OutOfMemory;
-        self.ops.insertActor(slot, .{ .bytes = owned }) catch |e| return opError(e);
-        errdefer _ = self.ops.removeActor(idx) catch {};
-        try self.authors.insertAt(gpa, idx, .{ .bytes = owned });
-        errdefer self.authors.removeAt(gpa, idx) catch {};
-        try self.graph.insertActor(gpa, idx);
-        try self.actor_authors.insert(gpa, idx, null);
-        self.actor.rewriteWithNewActor(idx);
+        const owned = try self.arena.allocator().dupe(u8, actor.bytes);
+        var ops = self.ops.prepareActorInsert(slot, .{ .bytes = owned }) catch |e|
+            return opError(e);
+        errdefer ops.deinit();
+        var authors = try self.authors.prepareInsertAt(gpa, idx, .{ .bytes = owned });
+        errdefer authors.deinit();
+        try self.graph.reserveActorInsert(gpa);
+        try self.actor_authors.ensureUnusedCapacity(gpa, 1);
+        return .{ .idx = idx, .ops = ops, .authors = authors };
+    }
+
+    /// Publishes one sorted insertion across all mirrors without a fallible tail.
+    fn insertActor(self: *Document, gpa: Allocator, slot: usize, actor: ActorId) Error!void {
+        var prepared = try self.prepareActorInsert(gpa, slot, actor);
+        defer prepared.deinit();
+        prepared.publish(self);
     }
 
     /// The author an actor already has, or null
@@ -3073,30 +3068,8 @@ pub const Document = struct {
         return lo;
     }
 
-    /// Records `name` in [`Document.author_names`] unless it is already there.
-    ///
-    /// **Upstream's [`put_author`](../../github-automerge-automerge/rust/automerge/src/author.rs):117-132),
-    /// which is a binary search for the name and an insert at the answer** —
-    /// the same shape [`Authors.search`](author.zig) has, over a table this
-    /// document keeps rather than one `author.zig` owns. The port's
-    /// [`authorsmod.Authors`] is the *actor* table, so upstream's author-name
-    /// set has no other home in this tree, and this is it.
-    ///
-    /// **The insertion point and the capacity are taken here, and the element
-    /// is written later by [`Document.insertAuthorName`].** Splitting the
-    /// write out is what lets a caller stage an author before the fallible
-    /// step that links a change into the graph and finish it afterwards; see
-    /// [`Document.stageAuthor`] for why that matters.
-    fn stageAuthorName(self: *Document, gpa: Allocator, name: []const u8) Allocator.Error!?usize {
-        const at = self.authorNameSlot(name) orelse return null;
-        try self.author_names.ensureUnusedCapacity(gpa, 1);
-        return at;
-    }
-
-    /// Writes the name [`Document.stageAuthorName`] reserved room for. Cannot
-    /// fail: `at` is a position found over the same table and the capacity was
-    /// reserved for exactly this element, and nothing between the two touches
-    /// `author_names`.
+    /// Inserts into capacity reserved before publication. Recompute the position
+    /// at publication because a batch can contain several new author names.
     fn insertAuthorName(self: *Document, at: usize, name: []const u8) void {
         self.author_names.insertAssumeCapacity(at, name);
     }
@@ -3116,8 +3089,8 @@ pub const Document = struct {
     /// histories would collide. The id comes from the retained `io` capability;
     /// entropy refusal leaves both actor and author unchanged.
     pub fn setAuthor(self: *Document, gpa: Allocator, author: ?[]const u8) Error!void {
-        try self.requireRecovered();
-        std.debug.assert(gpa.ptr == self.gpa.ptr and gpa.vtable == self.gpa.vtable);
+        // Stateless allocator contexts are undefined; never compare their ptr.
+        std.debug.assert(gpa.vtable == self.gpa.vtable);
         // An `if` rather than a `switch`: this body had never been analysed,
         // because nothing in the tree called `setAuthor`, and it is the lazy
         // analysis that hid it (STATUS.md defect 10).
@@ -3219,8 +3192,10 @@ pub const Document = struct {
         const slot: ?usize = if (i < self.actor_authors.items.len) i else null;
         const name = self.arena.allocator().dupe(u8, author) catch
             return error.OutOfMemory;
-        const at = try self.stageAuthorName(gpa, name);
-        return .{ .name = name, .at = at, .slot = slot };
+        if (self.authorNameSlot(name) != null) {
+            try self.author_names.ensureUnusedCapacity(gpa, 1);
+        }
+        return .{ .name = name, .slot = slot };
     }
 
     /// Finishes an association [`Document.stageAuthor`] prepared. **Writes the
@@ -3229,7 +3204,7 @@ pub const Document = struct {
     /// caller that stages before its last fallible step leaves the document
     /// exactly as it found it on every refusal.
     fn linkAuthor(self: *Document, staged: StagedAuthor) void {
-        if (staged.at) |at| self.insertAuthorName(at, staged.name);
+        if (self.authorNameSlot(staged.name)) |at| self.insertAuthorName(at, staged.name);
         if (staged.slot) |slot| self.actor_authors.items[slot] = staged.name;
     }
 
@@ -3252,9 +3227,6 @@ pub const Document = struct {
         /// The name, already copied into the arena, and what both tables are
         /// given.
         name: []const u8,
-        /// Where the name belongs in `author_names`, or **null when it is
-        /// already there** — a second actor with the same name grows nothing.
-        at: ?usize,
         /// The actor's slot in `actor_authors`, or null when the actor table
         /// has no slot for this actor.
         slot: ?usize,
@@ -3338,114 +3310,172 @@ pub const Document = struct {
         }
     };
 
-    /// Builds the arguments for a transaction over the whole document, or over
-    /// `heads` when they are given
-    /// ([`transaction_args`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):533-577).
-    ///
-    /// **The isolated case may choose a different actor.** Upstream's
-    /// `isolate_actor` ([`:1259-1281`](../../github-automerge-automerge/rust/automerge/src/automerge.rs))
-    /// walks up concurrency levels until it finds an actor the clock at `heads`
-    /// already covers, because a transaction that starts op counters above what
-    /// `heads` contains would create ops inside a document the reader cannot
-    /// see.
-    ///
-    /// The fallback is [`ActorId.withConcurrency`](types.zig) — four magic
-    /// bytes, the level as LEB128, then this actor's bytes
-    /// ([`types.rs:78-85`](../../github-automerge-automerge/rust/automerge/src/types.rs)) —
-    /// and the walk terminates because every level interns a new actor and the
-    /// clock only ever covers more.
+    /// Owns unpublished transaction arguments and their actor/queue preflight.
+    /// Keep the token at a stable address until publication or disposal.
+    pub const PreparedTransactionArgs = struct {
+        gpa: Allocator,
+        owner: *Document,
+        args: TransactionArgs,
+        actors: []const ActorId,
+        actor_insert: ?PreparedActorInsert,
+        queue_removal: queuemod.PreparedActorBranchRemoval,
+        cache_actor: ?ActorIdx,
+        published: bool = false,
+
+        /// Releases scratch, and dependencies only if publication did not move them.
+        pub fn deinit(self: *PreparedTransactionArgs) void {
+            if (!self.published) self.args.deinit(self.gpa);
+            if (self.actor_insert) |*actor_insert| actor_insert.deinit();
+            self.queue_removal.deinit();
+            self.* = undefined;
+        }
+    };
+
+    /// Reserves all transaction state without publishing actor or queue changes.
+    /// This lets a logged constructor bind its branch before document mutation.
+    pub fn prepareTransactionArgs(
+        self: *Document,
+        gpa: Allocator,
+        heads: ?[]const ChangeHash,
+    ) DocumentError!PreparedTransactionArgs {
+        const choice = if (heads) |at|
+            try self.isolatedActorIndex(gpa, at)
+        else
+            ActorChoice{
+                .actor = self.getActorId(),
+                .index = if (self.ops.lookupActor(self.getActorId())) |idx|
+                    @intCast(idx)
+                else
+                    null,
+                .owned = false,
+            };
+        defer if (choice.owned) gpa.free(choice.actor.bytes);
+        const actor_index = choice.index orelse
+            (std.math.cast(ActorIdx, self.actorSlot(choice.actor)) orelse
+                return error.InvalidIndex);
+        // A new slot still names the old actor until publication; its sequence is one.
+        const seq = if (choice.index) |idx| self.graph.seqForActor(idx) + 1 else 1;
+        var deps: std.ArrayList(ChangeHash) = .empty;
+        errdefer deps.deinit(gpa);
+        try deps.appendSlice(gpa, heads orelse self.graph.getHeads());
+        if (heads == null and seq > 1) {
+            // Resolve this dependency before actor insertion renumbers graph indices.
+            const last = try self.graph.hashForActorSeq(actor_index, seq - 1);
+            if (indexOfHash(deps.items, last) == null) try deps.append(gpa, last);
+        }
+        std.mem.sort(ChangeHash, deps.items, {}, ChangeHash.lessThan);
+
+        var actor_insert: ?PreparedActorInsert = null;
+        errdefer if (actor_insert) |*insert| insert.deinit();
+        if (choice.index == null) {
+            actor_insert = try self.prepareActorInsert(gpa, actor_index, choice.actor);
+        }
+        const actors = if (actor_insert) |insert|
+            insert.ops.actors.items
+        else
+            self.ops.actors.items;
+        var cache_actor: ?ActorIdx = null;
+        if (self.actor == .unused) {
+            const base = self.getActorId();
+            for (actors, 0..) |actor, idx| {
+                if (actor.eql(base)) {
+                    cache_actor = @intCast(idx);
+                    break;
+                }
+            }
+            std.debug.assert(cache_actor != null);
+        }
+        var queue_removal = try self.queue.prepareRemoveActorBranchFrom(
+            gpa,
+            actors[actor_index],
+            seq,
+        );
+        errdefer queue_removal.deinit();
+        const owned_deps = try deps.toOwnedSlice(gpa);
+        return .{
+            .gpa = gpa,
+            .owner = self,
+            .args = .{
+                .actor_index = actor_index,
+                .seq = seq,
+                .start_op = self.graph.maxOp() + 1,
+                .deps = owned_deps,
+                .scope = heads,
+                .author = if (seq == 1) self.author else null,
+            },
+            .actors = actors,
+            .actor_insert = actor_insert,
+            .queue_removal = queue_removal,
+            .cache_actor = cache_actor,
+        };
+    }
+
+    /// Publishes a successful preflight without allocating and moves its arguments.
+    pub fn publishTransactionArgs(
+        self: *Document,
+        prepared: *PreparedTransactionArgs,
+    ) TransactionArgs {
+        std.debug.assert(prepared.owner == self);
+        std.debug.assert(!prepared.published);
+        if (prepared.actor_insert) |*insert| insert.publish(self);
+        if (prepared.cache_actor) |idx| self.actor = .{ .cached = idx };
+        prepared.queue_removal.publish(&self.queue);
+        prepared.published = true;
+        return prepared.args;
+    }
+
+    /// Builds and publishes arguments for current or explicitly scoped transactions.
     pub fn transactionArgs(
         self: *Document,
         gpa: Allocator,
         heads: ?[]const ChangeHash,
     ) DocumentError!TransactionArgs {
-        try self.requireRecovered();
-        var actor_index: ActorIdx = undefined;
-        var seq: u64 = undefined;
-        var deps: std.ArrayList(ChangeHash) = .empty;
-        errdefer deps.deinit(gpa);
-        var scope: ?[]const ChangeHash = null;
-
-        if (heads) |at| {
-            try deps.appendSlice(gpa, at);
-            scope = at;
-            actor_index = try self.isolatedActorIndex(gpa, at);
-            seq = self.graph.seqForActor(actor_index) + 1;
-        } else {
-            actor_index = try self.getOrCreateActorIndex(gpa);
-            seq = self.graph.seqForActor(actor_index) + 1;
-            try deps.appendSlice(gpa, self.graph.getHeads());
-            // A local change always depends on this actor's own previous
-            // change, or a document that received a concurrent change from
-            // another peer would have two heads on one actor's chain
-            // (`automerge.rs:551-556`).
-            if (seq > 1) {
-                const last = try self.graph.hashForActorSeq(actor_index, seq - 1);
-                if (indexOfHash(deps.items, last) == null) try deps.append(gpa, last);
-            }
-        }
-        std.mem.sort(ChangeHash, deps.items, {}, ChangeHash.lessThan);
-
-        // "A local change claims this actor sequence. Any queued change at the
-        // same or a later sequence belongs to an incompatible actor branch"
-        // (`automerge.rs:560-564`).
-        const actor = self.ops.actors.items[actor_index];
-        try self.queue.removeActorBranchFrom(gpa, actor, seq);
-
-        return .{
-            .actor_index = actor_index,
-            .seq = seq,
-            .start_op = self.graph.maxOp() + 1,
-            .deps = try deps.toOwnedSlice(gpa),
-            .scope = scope,
-            .author = if (seq == 1) self.author else null,
-        };
+        var prepared = try self.prepareTransactionArgs(gpa, heads);
+        defer prepared.deinit();
+        return self.publishTransactionArgs(&prepared);
     }
 
-    /// The actor an isolated transaction should use, which is the current one
-    /// when `heads` already covers everything it has done and a fresh
-    /// concurrency actor otherwise
-    /// ([`isolate_actor`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):1259-1281).
+    const ActorChoice = struct {
+        actor: ActorId,
+        index: ?ActorIdx,
+        owned: bool,
+    };
+
+    /// Selects a covered actor or the first absent concurrency actor using the
+    /// original clock and indices; only the chosen absent actor will be staged.
     fn isolatedActorIndex(
         self: *Document,
         gpa: Allocator,
         heads: []const ChangeHash,
-    ) DocumentError!ActorIdx {
-        var index = try self.getOrCreateActorIndex(gpa);
+    ) DocumentError!ActorChoice {
         var clock = try self.graph.clockAt(gpa, heads);
         defer clock.deinit();
-
-        var level: usize = 1;
-        while (true) : (level += 1) {
+        const base = self.getActorId();
+        if (self.ops.lookupActor(base)) |idx| {
+            const index: ActorIdx = @intCast(idx);
             const max_op = self.graph.maxOpForActor(index);
-            const covered = clock.contains(OpId.init(@intCast(max_op), index));
-            if (max_op == 0 or covered) return index;
-            const base = self.getActorId();
-            // `withConcurrency` allocates the forked id's bytes; `insertActor`
-            // **copies** them into the document's arena
-            // (`self.arena.allocator().dupe(u8, actor.bytes)`), so the fork
-            // owns its own bytes and this one has to be released. Upstream
-            // needs no equivalent because its `ActorId` is a `Vec<u8>` it can
-            // drop; the port's is a borrowed slice over a caller-owned
-            // buffer, so the ownership that Rust gets from `drop` is
-            // explicit here. **This leak was one allocation per isolation,
-            // on a path the isolation tests exercise and the load path does
-            // not** — which is why it survived: every document had one actor
-            // and never forked.
-            const forked = try ActorId.withConcurrency(gpa, base, level);
-            defer gpa.free(forked.bytes);
-            index = try self.putActorRef(gpa, forked);
-            // The actor indices just moved, so the clock has to be rebuilt.
-            // The rebuild comes before the free, for the same reason
-            // `OpSet.fromParts` loads before it frees
-            // ([op_set.zig:781-783](opset/op_set.zig)): `Clock.deinit` ends in
-            // `self.* = undefined` (`clock.zig:38`) and the `defer` on line
-            // 2644 is still armed, so a failed rebuild would leave the defer
-            // holding an `undefined` `Clock` and free through an `0xAA` vtable.
-            const rebuilt = try self.graph.clockAt(gpa, heads);
-            clock.deinit();
-            clock = rebuilt;
+            if (max_op == 0 or clock.contains(OpId.init(@intCast(max_op), index))) {
+                return .{ .actor = base, .index = index, .owned = false };
+            }
+        } else {
+            return .{ .actor = base, .index = null, .owned = false };
         }
+        // At most every existing actor can occupy a concurrency level.
+        for (0..self.ops.actors.items.len + 1) |offset| {
+            const candidate = try ActorId.withConcurrency(gpa, base, offset + 1);
+            errdefer gpa.free(candidate.bytes);
+            if (self.ops.lookupActor(candidate)) |idx| {
+                const index: ActorIdx = @intCast(idx);
+                const max_op = self.graph.maxOpForActor(index);
+                if (max_op == 0 or clock.contains(OpId.init(@intCast(max_op), index))) {
+                    return .{ .actor = candidate, .index = index, .owned = true };
+                }
+                gpa.free(candidate.bytes);
+            } else {
+                return .{ .actor = candidate, .index = null, .owned = true };
+            }
+        }
+        unreachable;
     }
 
     /// The current actor's index, interning the actor if the table does not
@@ -3482,7 +3512,7 @@ pub const Document = struct {
     /// recorded log is answered where upstream walks, and a stream that
     /// replays the isolation's transitions comes out where a single walk
     /// patch belongs. [`Document.patchTo`] reads it for the same reason.
-    fn viewHeads(self: *const Document) []const ChangeHash {
+    pub fn viewHeads(self: *const Document) []const ChangeHash {
         return self.isolation orelse self.graph.getHeads();
     }
 
@@ -3583,30 +3613,25 @@ pub const Document = struct {
     /// `withConcurrency` fork of the actor whenever the clock at `heads` does
     /// not cover what that actor has already written
     /// ([`automerge.rs`:1259-1281](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
-    /// Upstream has one door that does all three,
-    /// [`AutoCommit::ensure_transaction_open`]
-    /// ([`autocommit.rs`:445-457](../../github-automerge-automerge/rust/autocommit.rs)),
-    /// and this port has two: `transact.openAuto` and `transact.openAutoHeld`
-    /// read [`Document.isolationHeads`] and are that door, while
-    /// [`Transaction.open`] and [`Transaction.openAt`] are
-    /// `Automerge::transaction` and `Automerge::transaction_at`
-    /// ([`automerge.rs`:476-480](../../github-automerge-automerge/rust/automerge/src/automerge.rs),
-    /// [`:501-509`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-    /// whose `heads` argument is **only** the scope clock. **A caller that
-    /// isolates and then opens through the low-level door gets a sequential
-    /// change**, and no amount of care in [`Document.commit`] can change that
-    /// without writing a change whose header and rows name different actors.
+    /// The separate `AutoCommit` opens its held transaction at these isolation
+    /// heads (`autocommit.rs:445-457`). Raw `Transaction.open` is unscoped;
+    /// `Transaction.openAt` uses its explicit heads (`automerge.rs:476-509`).
+    /// Raw commit never advances the facade isolation.
     pub fn isolate(self: *Document, gpa: Allocator, heads: []const ChangeHash) DiffError!void {
-        try self.requireRecovered();
+        // Prepare the owned head slice before patch publication. A refused copy
+        // must not advance the log/cursor while leaving the old isolation in place.
+        const next = try self.gpa.dupe(ChangeHash, heads);
+        errdefer self.gpa.free(next);
         try self.patchTo(gpa, heads);
-        // **The copy is taken before the old one is released**, and assigning it
-        // is the last thing that can fail. Freeing first left `self.isolation`
-        // naming freed memory for as long as the dupe took to refuse, and
-        // `Document.deinit` frees that field — so an induced allocation failure
-        // here was a double free two calls later, on a path the sweep reaches.
-        const next = try gpa.dupe(ChangeHash, heads);
+        self.installIsolationOwned(next);
+    }
+
+    /// Consumes heads allocated by this document's allocator without allocating.
+    /// Used after the facade has preflighted an isolated commit's new heads.
+    pub fn installIsolationOwned(self: *Document, heads: []ChangeHash) void {
         if (self.isolation) |old| self.gpa.free(old);
-        self.isolation = next;
+        self.isolation = heads;
+        self.invalidateHistoricalScopes();
     }
 
     /// Undoes [`Document.isolate`]
@@ -3627,7 +3652,6 @@ pub const Document = struct {
     /// [`Document.diffIncremental`] answers with a stream that is silently
     /// missing a transition. That is the defect this method exists to fix.
     pub fn integrate(self: *Document) DiffError!void {
-        try self.requireRecovered();
         try self.patchTo(self.gpa, self.graph.getHeads());
         self.dropIsolation();
     }
@@ -3716,7 +3740,6 @@ pub const Document = struct {
     /// word for it (`error.zig:32-33`) and it is the check that makes reading
     /// `dropped` below safe.
     pub fn removeActor(self: *Document, gpa: Allocator, idx: ActorIdx) Error!void {
-        try self.requireRecovered();
         // **Two reads, and both have to happen before the fan runs.** The
         // bound, because the op set's is an assert rather than a check — and
         // because `dropped` reads the slot at all. And the bytes the freed slot
@@ -3738,6 +3761,7 @@ pub const Document = struct {
         if (idx < self.actor_authors.items.len)
             _ = self.actor_authors.orderedRemove(idx);
         self.actor.removeActor(idx, dropped);
+        self.invalidateHistoricalScopes();
     }
 
     /// Drops every actor the change graph holds no change for
@@ -3750,7 +3774,6 @@ pub const Document = struct {
     /// it used to be, and doing it in both places decrements twice for a
     /// cached index two or more slots above the one being dropped.
     pub fn removeUnusedActors(self: *Document, gpa: Allocator) Error!void {
-        try self.requireRecovered();
         while (self.highestUnusedActor()) |idx| {
             try self.removeActor(gpa, idx);
         }
@@ -3770,412 +3793,294 @@ pub const Document = struct {
 
     // ── Loading ────────────────────────────────────────────────────────────
 
-    /// What a load does with input whose tail it could not read
-    /// ([`OnPartialLoad`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):74-81).
-    ///
-    /// **This is a contract, not a flag.** Upstream's two variants differ on
-    /// whether the caller gets a document back *and* on whether a stream that
-    /// stopped early is reported at all, and `Automerge::load` defaults to
-    /// `.error`
-    /// ([`:107-110`](../github-automerge-automerge/rust/automerge/src/automerge.rs), [``:177`](../github-automerge-automerge/rust/automerge/src/automerge.rs)) while `load_incremental`
-    /// passes `.ignore` to its empty-document path
-    /// ([`:1038-1045`](../github-automerge-automerge/rust/automerge/src/automerge.rs)) and **always** ignores the error on
-    /// the non-empty one ([`:1060-1064`](../github-automerge-automerge/rust/automerge/src/automerge.rs)).
-    const PartialLoad = enum {
-        /// Report the truncation.
-        refuse,
-        /// Keep what parsed and say nothing.
-        keep,
-    };
+    /// Loads a new raw document. The encoding is not stored in the file.
+    pub fn load(gpa: Allocator, io: std.Io, bytes: []const u8, encoding: TextEncoding) LoadError!Document {
+        return loadWithOptions(gpa, io, bytes, .{ .text_encoding = encoding });
+    }
 
-    /// A document read from `bytes`
-    /// ([`Automerge::load_with_options`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):883-1000).
-    ///
-    /// Empty input is an **empty document, not an error**
-    /// ([`:911-914`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)), which is upstream's first
-    /// line of the load path.
-    ///
-    /// The encoding is not in the file, so it is an argument: a UTF-16 indexed
-    /// document and a UTF-8 indexed one have identical bytes and different
-    /// text indexes.
-    pub fn load(
+    /// Loads with strict framing, column and checksum checks.
+    /// Ignore discards every tail change after a partial decode, never allocator failures
+    /// (`automerge.rs:974-999`). Migration runs before the supplied author is assigned.
+    pub fn loadWithOptions(gpa: Allocator, io: std.Io, bytes: []const u8, options: LoadOptions) LoadError!Document {
+        return loadConfigured(gpa, io, bytes, options, .check, null);
+    }
+
+    /// Skips only stored-versus-derived head equality, for inspecting damaged metadata.
+    /// Preserves the stored head set, including unknown hashes; other checks remain active.
+    pub fn loadUnverifiedHeads(gpa: Allocator, io: std.Io, bytes: []const u8, options: LoadOptions) LoadError!Document {
+        var unverified = options;
+        unverified.verification_mode = .dont_check;
+        return loadWithOptions(gpa, io, bytes, unverified);
+    }
+
+    /// Best-effort current value rescue. Only MARK order validation is relaxed;
+    /// the returned hydration owns its bytes and no original history is returned
+    /// (`automerge.rs:897-903`).
+    pub fn rescue(gpa: Allocator, io: std.Io, bytes: []const u8) LoadError!@import("hydrate.zig").OwnedValue {
+        var rescued = try loadConfigured(gpa, io, bytes, .{}, .allow_invalid, null);
+        defer rescued.deinit();
+        return .{
+            .gpa = gpa,
+            .value = try @import("hydrate.zig").hydrateMap(Set, &rescued.ops, gpa, .root, null),
+        };
+    }
+
+    /// Replaces this owner only after all loading work succeeds.
+    pub fn loadInto(self: *Document, gpa: Allocator, bytes: []const u8, encoding: TextEncoding) LoadError!void {
+        return self.loadIntoWithOptions(gpa, bytes, .{ .text_encoding = encoding });
+    }
+
+    /// On refusal the existing owner is unchanged. Caller logs are borrowed.
+    pub fn loadIntoWithOptions(self: *Document, gpa: Allocator, bytes: []const u8, options: LoadOptions) LoadError!void {
+        var fresh = try loadConfigured(gpa, self.io, bytes, options, .check, self.patch_identity);
+        errdefer fresh.deinit();
+        if (options.patch_log) |log| {
+            if (log == &self.patch_log) {
+                std.mem.swap(patchesmod.PatchLog, &fresh.patch_log, &self.patch_log);
+            }
+        }
+        self.deinit();
+        self.* = fresh;
+    }
+
+    /// Checks actor compatibility without allocating, binding or modifying the sink.
+    /// Incoming routes instead check the projected table before interning new actors.
+    pub fn validatePatchLog(self: *const Document, log: *const patchesmod.PatchLog) Error!void {
+        try log.validateActors(self.ops.actors.items);
+    }
+
+    fn logCurrentState(
+        self: *Document,
+        gpa: Allocator,
+        log: *patchesmod.PatchLog,
+    ) LoadError!void {
+        if (!log.isActive()) return;
+        var staged = try log.beginBatch();
+        defer staged.deinit();
+        // Current-state logging intentionally bypasses actor migration, as Rust's
+        // automerge.rs:1077-1079 / iter/doc.rs:79-91 does. Only metadata is rebound.
+        staged.identity = self.patch_identity;
+        var view = PatchDoc.init(gpa, self, null);
+        defer view.deinit();
+        const handle = view.handle();
+        var iter = try iterdoc.DiffIter(ChangeOp).init(
+            staged.gpa,
+            &handle,
+            .root,
+            .map,
+            .now(),
+            true,
+        );
+        defer iter.deinit();
+        staged.pathHint(try iter.log(&staged));
+        try staged.preparePublish(log);
+        // Ordinary batch publication invalidates path hints. A snapshot instead
+        // preserves the paths it just walked (automerge.rs:1078-1079,
+        // patch_log.rs:667-670): another rendering owner need not contain these
+        // objects. Move their owned storage only after every allocation succeeds.
+        const path_map = staged.path_map;
+        const path_storage = staged.path_storage;
+        staged.path_map = .{};
+        staged.path_storage = .init(staged.gpa);
+        staged.publish(log);
+        log.path_storage.deinit();
+        log.path_map = path_map;
+        log.path_storage = path_storage;
+        log.path_hint = log.events.items.len;
+    }
+
+    // Loader-only migration: refusal discards the entire fresh document owner.
+    // Enumerate every visible string, including conflicts, before changing any row
+    // (`automerge.rs:1973-2023`). Text and table objects are deliberately excluded.
+    fn convertScalarStringsToText(self: *Document, gpa: Allocator) LoadError!void {
+        const Conversion = struct {
+            obj: ExId,
+            prop: types.Prop,
+            text: []u8,
+            op: OpId,
+            sequence: bool,
+        };
+        var conversions: std.ArrayList(Conversion) = .empty;
+        defer {
+            for (conversions.items) |conversion| gpa.free(conversion.text);
+            conversions.deinit(gpa);
+        }
+        var rows = try self.ops.iter();
+        while (try rows.next()) |op| {
+            if (!op.visible() or op.action() != .set) continue;
+            const scalar_text = switch (op.value()) {
+                .str => |bytes| bytes,
+                else => continue,
+            };
+            const typ = try self.objectType(op.objId());
+            if (typ != .map and typ != .list) continue;
+            const obj = if (op.objId() == .root)
+                ExId.root
+            else
+                self.idToExid(op.objId().opId().?);
+            const prop: types.Prop = switch (op.key()) {
+                .map => |key| .{ .key = key },
+                .seq => .{ .index = 0 },
+            };
+            const copied = try gpa.dupe(u8, scalar_text);
+            conversions.append(gpa, .{
+                .obj = obj,
+                .prop = prop,
+                .text = copied,
+                .op = op.id(),
+                .sequence = typ == .list,
+            }) catch |failure| {
+                gpa.free(copied);
+                return failure;
+            };
+        }
+        for (conversions.items) |*conversion| {
+            if (conversion.sequence) {
+                const found = (try self.ops.seekListOpid(
+                    self.resolve(conversion.obj) orelse return error.InvalidObjId,
+                    conversion.op,
+                    .list,
+                    null,
+                )) orelse return error.InvalidOp;
+                conversion.prop = .{ .index = found.index };
+            }
+        }
+        if (conversions.items.len == 0) return;
+        var tx = try @import("transact.zig").Transaction.open(gpa, self);
+        // No borrowed transaction escapes this private fresh-owner loader path.
+        // Resource-only cleanup is safe because loadConfigured destroys all rows
+        // on every refusal, rather than retaining a partially migrated document.
+        defer tx.deinitClosed();
+        for (conversions.items) |conversion| {
+            const text_object = tx.putObject(conversion.obj, conversion.prop, .text) catch |failure| {
+                return switch (failure) {
+                    error.ChangeType => error.InvalidValueType,
+                    else => failure,
+                };
+            };
+            tx.spliceText(text_object, 0, 0, conversion.text) catch |failure| {
+                return switch (failure) {
+                    error.ChangeType => error.InvalidValueType,
+                    else => failure,
+                };
+            };
+        }
+        var committed = tx.commit() catch |failure| {
+            return switch (failure) {
+                error.ChangeType => error.InvalidValueType,
+                else => failure,
+            };
+        };
+        defer committed.deinit(gpa);
+    }
+
+    fn loadConfigured(
         gpa: Allocator,
         io: std.Io,
         bytes: []const u8,
-        encoding: TextEncoding,
-        mode: Mode,
+        options: LoadOptions,
+        mark_validation: opsetmod.MarkOrderValidation,
+        identity: ?u64,
     ) LoadError!Document {
-        var doc = try Document.initWithEncoding(gpa, io, encoding, mode);
-        errdefer doc.deinit();
-        try doc.loadIntoWith(gpa, bytes, encoding, mode, .refuse, false);
-        return doc;
+        var loaded = try initWithEncoding(gpa, io, options.text_encoding);
+        errdefer loaded.deinit();
+        if (identity) |owner| loaded.patch_identity = owner;
+        try loaded.loadIntoWith(gpa, bytes, options, mark_validation);
+        if (bytes.len != 0 and options.string_migration == .convert_to_text) {
+            try loaded.convertScalarStringsToText(gpa);
+        }
+        // Prepare the author before publishing into a borrowed log: allocator
+        // refusal must not leave logged state for a document that was discarded.
+        if (options.author) |author| try loaded.setAuthor(gpa, author);
+        if (bytes.len != 0) {
+            if (options.patch_log) |log| try loaded.logCurrentState(gpa, log);
+        }
+        return loaded;
     }
 
-    /// Loads `bytes` into this document, **replacing** whatever was in it
-    /// ([`Automerge::load_with_options`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):883-1000).
-    ///
-    /// The first chunk decides the shape: a document chunk is a snapshot and is
-    /// reconstructed in one step; a change, compressed-change or bundle chunk
-    /// is the head of a change stream and is applied, followed by every
-    /// remaining change chunk.
-    pub fn loadInto(
-        self: *Document,
-        gpa: Allocator,
-        bytes: []const u8,
-        encoding: TextEncoding,
-        mode: Mode,
-    ) LoadError!void {
-        return self.loadIntoWith(gpa, bytes, encoding, mode, .refuse, true);
-    }
-
-    /// [`loadInto`], with [`PartialLoad`] spelled out
-    ///
-    /// ([`Automerge::load_with_options`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):883-1000).
-    ///
-    /// **The two policies differ on input that stops in the middle**, and
-    /// upstream's difference is not only the error: on a partial parse
-    /// `load_with_options` **discards the chunks it had already read** as
-    /// well as the ones it had not
-    /// ([`:985-989`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)) — the `Partial` arm never calls
-    /// `apply_changes`. So `.refuse` and `.keep` differ only in whether the
-    /// caller gets a document back, and both drop the tail.
     fn loadIntoWith(
         self: *Document,
         gpa: Allocator,
         bytes: []const u8,
-        encoding: TextEncoding,
-        mode: Mode,
-        on_partial: PartialLoad,
-        replace: bool,
+        options: LoadOptions,
+        mark_validation: opsetmod.MarkOrderValidation,
     ) LoadError!void {
-        try self.requireRecovered();
-        if (bytes.len == 0) {
-            if (replace) try self.reset(gpa, encoding, mode);
-            return;
-        }
-
-        // **The stream, not the list.** `chunk.parseChunks` grew a heap array
-        // of every chunk in the document before a single one of them was looked
-        // at, and that array was the only allocation on this path that scaled
-        // with the input: `@sizeOf(Chunk)` per chunk, doubled as the list grew,
-        // reallocated on every doubling and freed on the way out.
-        // [`chunkmod.ChunkStream`] is the same walk holding none of them, and
-        // nothing after this line holds more than one chunk.
+        if (bytes.len == 0) return;
         var stream = chunkmod.ChunkStream.init(bytes);
-        // **The first chunk is never partial.** Upstream parses it with
-        // `storage::Chunk::parse` and maps the failure straight into the
-        // return, before `on_partial_load` is consulted anywhere
-        // ([`automerge.rs`:916-917](../github-automerge-automerge/rust/automerge/src/automerge.rs)), so a stream whose
-        // *first* chunk is unreadable is a refusal under both policies.
-        //
-        // **It is peeked, not collected.** One [`Chunk`](storage/chunk.zig)
-        // value in a local is what the three `chunks[0].typ` reads further
-        // down answer from: it is a 40-byte struct the stream already built,
-        // not a list behind the seam, and the chunks behind it are never
-        // touched by this line.
+        // The first chunk is strict under both policies (`automerge.rs:916-967`).
         const first = (try stream.next()) orelse return error.UnexpectedEnd;
-
-        // **The tail is framed and verified before anything is applied, and
-        // that is exactly what the list used to buy.** `parseChunks` framed
-        // and checksum-verified the **whole** stream before [`Document.reset`]
-        // ran and before any chunk was applied
-        // ([`:907-917`, `:974-989`](../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-        // so a stream that stops mid-chunk leaves the document holding only
-        // what its **first** chunk built — and on [`Document.loadInto`] the
-        // document is the caller's own, so that order is observable from
-        // outside and not merely internal. A walk that applied each chunk as
-        // it read it would get it wrong: it would apply the chunks in front of
-        // the bad one, and then refuse.
-        //
-        // So the tail is walked first and kept in no list at all.
-        // [`chunkmod.ChunkStream.verify`] frames and verifies every chunk of
-        // it and hands back a cursor over the ones that read. **`.refuse`
-        // returns what stopped that walk; `.keep` records it** — the same pair
-        // the two list spellings were, over the same bytes in the same order,
-        // so the refusal is the same refusal at the same byte either way, and
-        // the list is gone.
-        var tail = switch (on_partial) {
-            .refuse => try stream.verify(),
-            .keep => stream.verifyPartial(),
-        };
-        // **Upstream applies the chunks it read, then decides.** The
-        // `Partial` arm sits beside the `Complete` arm and never reaches
-        // `apply_changes` ([`:974-990`](../github-automerge-automerge/rust/automerge/src/automerge.rs)), so under
-        // `.refuse` a truncated stream leaves the document holding only what
-        // its **first** chunk built, and under `.keep` it holds the same. The
-        // error is therefore reported *after* the first chunk, not before it,
-        // and the prefix past the first chunk is dropped either way. That is
-        // why the check is here and not at the parse.
-        // `.refuse` reports the truncation; `.keep` swallows it. Under
-        // `.refuse` this is null in any case, because the verify walk above
-        // returned its refusal rather than recording it — the `.refuse` arm
-        // below is the same unreachable arm it was when `parseChunks` fed it.
-        const truncated: ?ParseError = tail.err;
-
-        // **A bundle as the first chunk is a change stream whose head this
-        // port now reads**, which is upstream's bundle arm of the same match
-        // ([`automerge.rs`:945-953](../../github-automerge-automerge/rust/automerge/src/automerge.rs)):
-        // `Bundle::to_changes()` and the result goes into the same `changes`
-        // list the change arm pushes into. The bundle is parsed here because
-        // its columns borrow `bytes`, and the changes it yields are
-        // re-encoded from those columns by [`collectBundleChanges`] — so the
-        // bundle is freed before the first apply and nothing borrows it.
-        var from_bundle: Changes = .{};
-        defer from_bundle.deinit(gpa);
-        if (first.typ == .bundle) {
-            // **The chunk, not its body.** `first.data` is the body alone,
-            // and a bundle is a framed chunk: handing that over is what sent
-            // `loadIncremental` down to `error.InvalidMagic` on the first
-            // byte of a body. `parseFramedChunk` reads the bytes the framing
-            // kept and indexes those, so the bundle is the chunk the stream
-            // carried and the stream is not copied to hold it.
-            var stored = try bundlem.parseFramedChunk(first, gpa);
-            defer stored.deinit(gpa);
-            try collectBundleChanges(gpa, &stored, &from_bundle);
+        const snapshot = first.typ == .document;
+        var changes: Changes = .{};
+        defer changes.deinit(gpa);
+        if (snapshot) {
+            try self.reconstruct(gpa, first, options.text_encoding, options.verification_mode, mark_validation);
+        } else {
+            try self.decodeChunkChanges(gpa, first, &changes, mark_validation);
         }
-
-        if (replace) try self.reset(gpa, encoding, mode);
-        // **A document chunk is a snapshot, not the whole stream, and the
-        // chunks after it are applied too.** Upstream's `load_with_options`
-        // matches the *first* chunk to build `am` and then runs
-        // `load::load_changes(remaining, …)` + `am.apply_changes(changes…)`
-        // **outside** that match ([`automerge.rs:924-975`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-        // with `changes` empty in the document case — so a snapshot followed by
-        // change chunks loads as the snapshot *plus* those changes. This used
-        // to `return` after `reconstruct`, which silently dropped the tail,
-        // and the tail is what a `save()` followed by `save_incremental()`
-        // calls is: `save1 ++ save2 ++ save3` is one document chunk and two
-        // change chunks, and the two changes in it were lost.
-        //
-        // Upstream lets the first chunk be a change, a bundle or a compressed
-        // change and applies what it produced with the rest
-        // ([`automerge.rs`:937-975](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-        // so a bundle-first document is a change stream that happens to start
-        // with a bundle. A chunk **after** the first goes through
-        // [`Document.applyChunk`], which is upstream's
-        // [`load::load_next_change`](../../github-automerge-automerge/rust/automerge/src/storage/load.rs):104-157
-        // and handles all four types.
-        //
-        // **`first_chunk_was_doc`, under upstream's own name**
-        // ([`automerge.rs`:923](../../github-automerge-automerge/rust/automerge/src/automerge.rs):
-        // `let mut first_chunk_was_doc = false;`). It is set to `true` in the
-        // `storage::Chunk::Document` arm alone (`:925-927`); the change
-        // (`:937-943`), bundle (`:945-953`) and compressed-change (`:955-964`)
-        // arms all leave it false, so a compressed change stream and a
-        // **bundle** both reach the missing-deps rule below exactly as a plain
-        // change stream does.
-        //
-        // **This is the branch that was already here, named.** The dispatch
-        // below decides the same question to know where the changes start, so
-        // binding it once and reading it again at the refusal further down is
-        // what keeps the two answers from drifting apart.
-        const first_chunk_was_doc = first.typ == .document;
-        if (first_chunk_was_doc) {
-            try self.reconstruct(gpa, first, encoding);
-        } else if (first.typ != .bundle) {
-            // **A first chunk that is neither a snapshot nor a bundle is a
-            // change, and it goes in front of the tail.** This is the arm
-            // that was `rest = chunks[0..]`: the whole list, starting at the
-            // first chunk, because there is no separate apply for it.
-            try self.applyChunk(gpa, first);
+        while (true) {
+            const next = stream.next() catch |failure| {
+                if (options.on_partial_load == .ignore) return;
+                return failure;
+            };
+            const chunk = next orelse break;
+            self.decodeChunkChanges(gpa, chunk, &changes, mark_validation) catch |failure| {
+                if (failure == error.OutOfMemory) return error.OutOfMemory;
+                if (options.on_partial_load == .ignore) return;
+                return failure;
+            };
         }
-
-        // **The first chunk's changes go first**, which is upstream's
-        // `am.apply_changes(changes.into_iter().chain(c))`
-        // ([`automerge.rs`:975](../../github-automerge-automerge/rust/automerge/src/automerge.rs)):
-        // `changes` is what the first chunk produced and `c` is what the rest of
-        // the stream produced, and the order they are applied in is the order
-        // they are listed. A bundle whose changes are missing dependencies
-        // **queues** them through [`Document.applyChanges`] like any other
-        // change, which is what makes a partial bundle a transfer rather than
-        // a refusal — except here, where the first chunk was not a document,
-        // so the queue is reported as `error.MissingDeps` below. That is
-        // upstream's own answer for a peer-to-peer change stream
-        // ([`automerge.rs`:976-982](../../github-automerge-automerge/rust/automerge/src/automerge.rs))
-        // and the reason [`Document.loadIncremental`] is the door a partial
-        // bundle is meant to come through.
-        if (from_bundle.len() != 0) {
-            const view = try asChanges(gpa, from_bundle.slice());
-            defer gpa.free(view);
-            _ = try self.applyChanges(gpa, view);
+        // No tail change is applied until every tail chunk decoded successfully.
+        if (changes.len() != 0) {
+            const incoming = try asChanges(gpa, changes.slice());
+            defer gpa.free(incoming);
+            _ = try self.applyChanges(gpa, incoming);
         }
-        // **The tail, one chunk at a time.** This is the `for (rest) |c|` that
-        // walked a materialized slice, reading the same chunks in the same
-        // order and applying each exactly once: the cursor hands a chunk over
-        // and keeps only the position of the next one, so a stream of any
-        // length costs what a stream of one chunk costs.
-        while (try tail.next()) |c| try self.applyChunk(gpa, c);
-        if (truncated) |e| switch (on_partial) {
-            .refuse => return e,
-            .keep => {},
-        };
-
-        // **A stream that leaves a change queued is refused unless it started
-        // with a document chunk.** "Only allow missing deps if the first chunk
-        // was a document chunk"
-        // ([`automerge.rs`:976-982](../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-        // citing
-        // [automerge PR 599](https://github.com/automerge/automerge/pull/599#issuecomment-1549667472):
-
-        // ```text
-        // if !am.queue.is_empty()
-        //     && !first_chunk_was_doc
-        //     && options.on_partial_load == OnPartialLoad::Error
-        // { return Err(AutomergeError::MissingDeps); }
-        // ```
-
-        // The reason is that a change-chunk stream **is** a peer-to-peer
-        // stream: a document chunk is a snapshot, so anything the snapshot
-        // could not carry is a change the *sender* holds and the receiver does
-        // not, and a receiver that took such a stream has lost a change rather
-        // than deferred one. `AutomergeError::MissingDeps` says exactly that
-        // ([`error.rs`:66](../github-automerge-automerge/rust/automerge/src/error.rs))
-        // — "change's deps should already be in the document", which is true of
-        // every change in a snapshot and of a *later* chunk in the same stream,
-        // and false of the **first** chunk of a change-only stream.
-        //
-        // **This is the check that was missing, not a call that was.** The
-        // error was already in the set (`error.MissingDeps`, `error.zig`:66) and
-        // nothing raised it: the load applied every chunk and returned a
-        // document holding nothing and a queue holding one change, so the
-        // caller read **success** and could not tell the document was not the
-        // one the bytes describe. That is a wrong answer rather than a crash,
-        // which is the worse of the two.
-        //
-        // **The value was computed and thrown away.** The dispatch above
-        // already asked `chunks[0].typ == .document` to know where the changes
-        // start and discarded the answer, one line above the place that needed
-        // it. **The rule's first conjunct was being evaluated by nobody.**
-        //
-        // That is a third shape, distinct from a missing call and from a dead
-        // branch, and it is the one nothing reports: the code around it reads
-        // as though the question is already being asked, and a compiler has
-        // nothing to say about a value that was true and unused. The fix is
-        // four lines and the defect was invisible, which is the argument for
-        // writing down *how* it was found rather than only *that* it was.
-        //
-        // **The position is upstream's and it is not incidental.** The
-        // condition sits **inside the `Complete` arm** of the `load_changes`
-        // match (`:974-984`) while the `Partial` arm returns at `:985-989`
-        // without ever reaching `apply_changes` (`:975`) — so a truncated
-        // stream is the truncation error and never `MissingDeps`. Checking
-        // *after* the `truncated` branch above is what reproduces that, and it
-        // is why the order is not free: checking first would answer
-        // `MissingDeps` for input upstream answers with a parse error.
-        //
-        // **`on_partial == .refuse` is the gate that keeps this out of
-        // `loadIncremental`**, and it is load-bearing rather than incidental.
-        // Upstream's `load_incremental` reaches the identical check only
-        // through its empty-document arm, which builds
-        // `LoadOptions::new().on_partial_load(OnPartialLoad::Ignore)`
-        // ([`automerge.rs`:1038-1045](../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-        // and its non-empty arm never consults the rule at all
-        // (`:1053-1068`: `load_changes`, `apply_changes_log_patches`, `Ok(delta)`).
-        // **So the two differ upstream and the port now differs the same way:**
-        // `load` refuses an orphan change stream, `loadIncremental` queues it —
-        // which is the whole of what an incremental load is for, since a peer
-        // may send a change before the one it depends on. A peer that sent one
-        // out of order and got a refusal back would be told it sent a stream
-        // that was fine.
-        if (on_partial == .refuse and !first_chunk_was_doc and !self.queue.isEmpty()) {
+        if (options.on_partial_load == .refuse and !snapshot and !self.queue.isEmpty()) {
             return error.MissingDeps;
         }
     }
 
-    /// Applies one chunk of a change stream to this document
-    /// ([`load::load_next_change`](../../github-automerge-automerge/rust/automerge/src/storage/load.rs):104-157).
-    ///
-    /// **All four chunk types, because upstream's loader has all four arms**
-    /// and this is that match: `Document` (`:112-125`), `Bundle` (`:139-147`),
-    /// `Change` (`:127-137`) and `CompressedChange` (`:148-155`). The two load
-    /// entry points share it, which is what upstream shares
-    /// ([`load_changes`](../../github-automerge-automerge/rust/automerge/src/storage/load.rs):75-99
-    /// is one loop over `load_next_change` and both callers reach it).
-    ///
-    /// **A document chunk is skipped when every head it records is one this
-    /// document already has**, which is `load_next_change`'s guard
-    /// (`!d.heads().iter().all(|h| current.has_change(h))`, `:113`) and the
-    /// whole of upstream's
-    /// `make_sure_load_incremental_doesnt_skip_a_load_with_a_common_head`
-    /// ([`test.rs`:3159](../../github-automerge-automerge/rust/automerge/tests/test.rs)):
-    /// a reader that skipped every document chunk it did not already hold would
-    /// never learn a change from a peer that saved after a common head.
-    ///
-    /// **Nothing here is refused for having missing dependencies.** Every arm
-    /// ends in [`Document.applyChanges`], which queues an orphan, and whether a
-    /// queued change is an error is the caller's decision —
-    /// [`Document.load`] makes it and [`Document.loadIncremental`] does not.
-    fn applyChunk(self: *Document, gpa: Allocator, c: chunkmod.Chunk) LoadError!void {
-        switch (c.typ) {
+    fn decodeChunkChanges(
+        self: *Document,
+        gpa: Allocator,
+        chunk: chunkmod.Chunk,
+        out: *Changes,
+        mark_validation: opsetmod.MarkOrderValidation,
+    ) LoadError!void {
+        var decoded: Changes = .{};
+        defer decoded.deinit(gpa);
+        switch (chunk.typ) {
             .document => {
-                var parsed = try docchunk.parseDocumentChunk(c.data, gpa);
+                var parsed = try docchunk.parseDocumentChunk(chunk.data, gpa);
                 defer parsed.deinit(gpa);
                 var all_present = true;
                 for (parsed.heads()) |head| {
                     if (!self.graph.hasChange(head)) all_present = false;
                 }
                 if (all_present) return;
-                var read = try self.readDocChunk(gpa, &parsed, self.textEncoding());
+                var read = try self.readDocChunk(gpa, &parsed, self.textEncoding(), mark_validation);
                 defer read.deinit(gpa);
-                const view = try asChanges(gpa, read.changes.slice());
-                defer gpa.free(view);
-                _ = try self.applyChanges(gpa, view);
+                decoded = read.changes;
+                read.changes = .{};
             },
-            .change, .compressed => {
-                var parsed = try parseOneChange(gpa, c);
-                defer parsed.deinit(gpa);
-                const view = try asChanges(gpa, parsed.slice());
-                defer gpa.free(view);
-                _ = try self.applyChanges(gpa, view);
-            },
+            .change, .compressed => decoded = try parseOneChange(gpa, chunk),
             .bundle => {
-                var stored = try bundlem.parseFramedChunk(c, gpa);
+                var stored = try bundlem.parseFramedChunk(chunk, gpa);
                 defer stored.deinit(gpa);
-                var changes: Changes = .{};
-                defer changes.deinit(gpa);
-                try collectBundleChanges(gpa, &stored, &changes);
-                const view = try asChanges(gpa, changes.slice());
-                defer gpa.free(view);
-                _ = try self.applyChanges(gpa, view);
+                try collectBundleChanges(gpa, &stored, &decoded);
             },
         }
-    }
-
-    /// Replaces this document with an empty one, keeping its allocator and its
-    /// mode. `actor` is reset too, because a document loaded from a file has
-    /// not issued anything as the actor it was built with.
-    ///
-    /// **Neither the actor nor the author moves across, and the reason is the
-    /// `deinit` two lines down.** Both are *borrowed* slices over **this**
-    /// document's arena — [`Actor.unused`] is one (`doc.zig:305-311`) and
-    /// [`Document.setAuthor`] copies its bytes into the same arena
-    /// (`:2664-2666`) — and [`Document.deinit`] frees it (`:2463`). Upstream's
-    /// two survive the same journey: `Actor::Unused` owns a `Vec<u8>`
-    /// ([`automerge.rs:47-50`](../../github-automerge-automerge/rust/automerge/src/automerge.rs))
-    /// and a load ends with the *option's* author, not the old document's
-    /// ([`Ok(am.with_author(options.author))`,
-    /// `:995`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
-    ///
-    /// **What carrying the actor cost.** A document created with actor
-    /// `89abcdef` that received one change from `01234567` reported
-    /// `01234567` as its own actor from then on, because the freed slice was
-    /// handed straight back to [`Document.getActorId`] and
-    /// [`Document.adoptActors`] had already put `01234567` in exactly those
-    /// bytes. The document then minted its next change under the other actor,
-    /// which is a `DuplicateSeqNumber` for any peer that already holds one —
-    /// and a wrong actor on every change the C ABI hands out.
-    ///
-    /// Upstream's load **builds a new `Automerge`** and never carries the old
-    /// one's actor over ([`automerge.rs:922-951`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-    /// so the one caller that wants the actor kept re-establishes it itself,
-    /// by value: [`Document.loadIncremental`].
-    fn reset(self: *Document, gpa: Allocator, encoding: TextEncoding, mode: Mode) InitError!void {
-        // Build before detaching resources: refusal preserves the old owner.
-        var fresh = try initWithEncoding(gpa, self.io, encoding, mode);
-        fresh.isolation = self.isolation;
-        self.isolation = null;
-        self.deinit();
-        self.* = fresh;
+        // Header parsing alone cannot classify a partial operation-column decode.
+        for (decoded.slice()) |built| {
+            const actor_count = built.change.other_actors.len + 1;
+            const actors = try gpa.alloc(ActorIdx, actor_count);
+            defer gpa.free(actors);
+            for (actors, 0..) |*actor, index| actor.* = std.math.cast(ActorIdx, index) orelse return error.TooLarge;
+            const ops = try decodeChangeOps(gpa, built.change, actors);
+            defer freeChangeOps(gpa, ops);
+        }
+        try out.items.appendSlice(gpa, decoded.items.items);
+        decoded.items.clearRetainingCapacity();
     }
 
     /// Seeds `authors`, the change graph's per-actor columns and the author's
@@ -4259,10 +4164,12 @@ pub const Document = struct {
         gpa: Allocator,
         c: chunkmod.Chunk,
         encoding: TextEncoding,
+        verification: VerificationMode,
+        mark_validation: opsetmod.MarkOrderValidation,
     ) LoadError!void {
         var parsed = try docchunk.parseDocumentChunk(c.data, gpa);
         defer parsed.deinit(gpa);
-        var read = try self.readDocChunk(gpa, &parsed, encoding);
+        var read = try self.readDocChunk(gpa, &parsed, encoding, mark_validation);
         defer read.deinit(gpa);
         const derived = try derivedHeads(gpa, &read.changes);
         defer gpa.free(derived);
@@ -4272,21 +4179,7 @@ pub const Document = struct {
         // error rather than a document whose `max_op` disagrees with its
         // history. `headIndexes` are not consulted: the heads are names here, and
         // the indexes are the document's cache of where each sits in the graph.
-        if (!parsed.headsAreCurrent(derived)) {
-            for (parsed.heads(), derived) |stored, got| {
-                std.debug.print("doc: head stored {s} derived {s}\n", .{
-                    fmtHash(stored),
-                    fmtHash(got),
-                });
-            }
-            for (read.changes.items.items, 0..) |*b, i| {
-                std.debug.print("doc: change {d} ops {d}..{d} deps {d}\n", .{
-                    i,                 b.change.start_op, b.change.start_op + b.change.deps.len,
-                    b.change.deps.len,
-                });
-            }
-            return error.MissingHash;
-        }
+        if (verification == .check and !parsed.headsAreCurrent(derived)) return error.MissingHash;
 
         self.ops.deinit();
         self.ops = read.ops;
@@ -4315,34 +4208,20 @@ pub const Document = struct {
 
         for (read.changes.items.items, 0..) |*built, i| {
             const node = read.nodes[i];
-            // **The message is copied, like the footer.** A `GraphNode`'s
-            // slices borrow the chunk body, and `parseDocumentChunk` frees it
-            // when this function returns, so a message handed to the graph as a
-            // borrow would be read out of freed memory on the next `save`. The
-            // arena is where the document puts the things it outlives — see
-            // `Document.arena`.
             const owned_extra = self.arena.allocator().dupe(u8, node.extra) catch return error.OutOfMemory;
-            const owned_message = self.arena.allocator().dupe(u8, node.message) catch return error.OutOfMemory;
-            // **Staged above the two fallible steps and written below them.**
-            // `node_info.append` and `graph.addChange` both allocate, and an
-            // association written before them would survive their refusal as a
-            // name in the set for a change this load never linked — while one
-            // written after them could not survive at all: the change would be
-            // in the graph at `seq == 1` with nothing to fill its slot, and no
-            // later change from that actor ever stamps a footer. See
-            // [`Document.StagedAuthor`].
+            // Reserve the sidecar before publishing history, then append it
+            // without a fallible tail. A refusal must not leave an extra
+            // sidecar that could shift every later node's footer.
             const staged = try self.stageAuthor(gpa, node.actor, node.extra);
-            try self.node_info.append(gpa, .{ .start_op = read.metas[i].start_op, .extra = owned_extra });
-            try self.graph.addChange(gpa, &self.authors, .{
-                .actor = read.actors[node.actor],
-                .deps = built.change.deps,
-                .hash = built.change.hash,
-                .time = node.time,
-                .message = owned_message,
-                .seq = node.seq,
-                .start_op = node.max_op,
-                .max_op = node.max_op,
-                .other_actors = built.change.other_actors,
+            try self.node_info.ensureUnusedCapacity(gpa, 1);
+            try self.graph.addChange(
+                gpa,
+                &self.authors,
+                try .fromChange(gpa, built.change),
+            );
+            self.node_info.appendAssumeCapacity(.{
+                .start_op = read.metas[i].start_op,
+                .extra = owned_extra,
             });
             if (staged) |association| self.linkAuthor(association);
             // **The table grows in one place.** The old code appended `null`
@@ -4356,6 +4235,11 @@ pub const Document = struct {
         // decides whether its answer is `null` or whatever was in the buffer
         // before (`Document.growActorAuthors`).
         try self.growActorAuthors(gpa);
+        // Rust's unchecked loader preserves the stored head set, including
+        // unknown hashes, rather than substituting the reconstructed graph heads.
+        if (verification == .dont_check) {
+            try self.graph.installStoredHeads(gpa, parsed.heads());
+        }
     }
 
     /// A document chunk read into op rows and the changes it implies, with no
@@ -4372,12 +4256,13 @@ pub const Document = struct {
         gpa: Allocator,
         parsed: *docchunk.Document,
         encoding: TextEncoding,
+        mark_validation: opsetmod.MarkOrderValidation,
     ) LoadError!Reconstructed {
         // Ownership is taken in one step at a time and handed to `out`, whose
         // `deinit` is the only thing that frees it: an `errdefer` per step
         // would double-free on any failure after the struct exists.
         const actors = try self.adoptActors(gpa, parsed.actors());
-        var ops = Set.load(gpa, parsed.block.ops, actors, encoding, self.strings.table()) catch |e| {
+        var ops = Set.loadWithMarkValidation(gpa, parsed.block.ops, actors, encoding, self.strings.table(), mark_validation) catch |e| {
             gpa.free(actors);
             return e;
         };
@@ -4492,103 +4377,59 @@ pub const Document = struct {
         return out;
     }
 
-    /// Appends `bytes` to a non-empty document rather than replacing it
-    /// ([`Automerge::load_incremental`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):1027-1069).
-    ///
-    /// Returns the number of rows the load added, which is upstream's return
-    /// value. **An empty document is loaded whole**, through
-    /// [`Document.loadInto`], and keeps its own actor
-    /// ([`:1038-1051`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)) — a document that has
-    /// nothing in it and one that was created locally are the same state, and
-    /// re-reading a save into a document that already has it must not
-    /// re-derive a different actor.
-    ///
-    /// A change chunk the document cannot use is **queued, not refused**,
-    /// which is the whole point of an incremental load: a peer may send a change
-    /// before the one it depends on.
-    pub fn loadIncremental(
-        self: *Document,
-        gpa: Allocator,
-        bytes: []const u8,
-    ) LoadError!usize {
-        try self.requireRecovered();
+    /// Appends a fully decoded prefix and ignores a malformed tail. Allocation
+    /// failures and application failures remain errors (`automerge.rs:1027-1069`).
+    pub fn loadIncremental(self: *Document, gpa: Allocator, bytes: []const u8) LoadError!usize {
+        return self.loadIncrementalToLog(gpa, bytes, null);
+    }
+
+    /// Borrows the log. Nonempty targets preflight the decoded projected actor table;
+    /// empty targets log the loaded snapshot directly (`automerge.rs:1038-1051`).
+    pub fn loadIncrementalWithPatchLog(self: *Document, gpa: Allocator, bytes: []const u8, log: *patchesmod.PatchLog) LoadError!usize {
+        return self.loadIncrementalToLog(gpa, bytes, log);
+    }
+
+    fn loadIncrementalToLog(self: *Document, gpa: Allocator, bytes: []const u8, log: ?*patchesmod.PatchLog) LoadError!usize {
         if (self.isEmpty()) {
-            // **The actor's bytes, taken by value — not the `Actor` union.**
-            // `self.actor`'s `Unused` arm is a *borrowed* slice over this
-            // document's arena ([`Actor.unused`], `doc.zig:305-311`), and the
-            // load below frees that arena (`reset` → `deinit`, `:2463`).
-            // Upstream takes the **id** and re-establishes it on the document
-            // it just built —
-            // `doc = doc.with_actor(self.actor_id().clone())`
-            // ([`automerge.rs:1040`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-            // which is `set_actor` and so **resolves the actor against the new
-            // actor table** ([`:359-366`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)):
-            // `Cached` the index when the table holds it, `Unused` the bytes
-            // otherwise. Upstream can hand a copied union across because
-            // `Actor::Unused` owns a `Vec<u8>`
-            // ([`:47-50`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)); this port
-            // borrows on both counts, so the copy is explicit and the
-            // re-establishment is [`Document.setActorId`] over bytes this
-            // document's **new** arena owns.
-            //
-            // Restoring the union instead is what put the wrong actor on every
-            // change a peer received and then handed on: the slice named freed
-            // memory, and the actor the load interned next landed in it. See
-            // [`Document.reset`].
-            const mine = self.getActorId();
-            const kept = try gpa.dupe(u8, mine.bytes);
-            defer gpa.free(kept);
-            // **`.keep`, and this is the whole of upstream's `Ignore` here.**
-            // `load_incremental` on an empty document builds a fresh
-            // `LoadOptions` with `.on_partial_load(OnPartialLoad::Ignore)`
-            // and `.verification_mode(VerificationMode::Check)`
-            // ([`automerge.rs`:1038-1045](../github-automerge-automerge/rust/automerge/src/automerge.rs)), so a save with
-            // rubbish appended is a document, not a refusal — and
-            // `load_incremental_with_corrupted_tail` is exactly that
-            // ([`test.rs`:2118-2134](../github-automerge-automerge/rust/automerge/tests/test.rs)).
-            try self.loadIntoWith(gpa, bytes, self.textEncoding(), self.mode, .keep, true);
-            const owned = self.arena.allocator().dupe(u8, kept) catch return error.OutOfMemory;
-            self.setActorId(.{ .bytes = owned });
-            return self.ops.len();
+            // Prepare the actor in the replacement arena before releasing the old
+            // owner; failure cannot leave a dangling actor or destroy the old state.
+            var fresh = try loadConfigured(gpa, self.io, bytes, .{
+                .on_partial_load = .ignore,
+                .text_encoding = self.textEncoding(),
+            }, .check, self.patch_identity);
+            errdefer fresh.deinit();
+            const actor_bytes = try fresh.arena.allocator().dupe(u8, self.getActorId().bytes);
+            fresh.setActorId(.{ .bytes = actor_bytes });
+            const target_log = log orelse &self.patch_log;
+            try fresh.logCurrentState(gpa, target_log);
+            if (target_log == &self.patch_log) {
+                std.mem.swap(patchesmod.PatchLog, &fresh.patch_log, &self.patch_log);
+            }
+            const added = fresh.ops.len();
+            self.deinit();
+            self.* = fresh;
+            return added;
         }
-        // **A truncated tail is applied, not reported.** `load_changes`
-        // returns `LoadedChanges::Partial { loaded, remaining, error }`
-        // ([`storage/load.rs`:87-92](../github-automerge-automerge/rust/automerge/src/storage/load.rs)) and
-        // `load_incremental_log_patches` takes `loaded` and carries on,
-        // logging the error rather than returning it
-        // ([`automerge.rs`:1053-1064](../github-automerge-automerge/rust/automerge/src/automerge.rs)). There is no
-        // `on_partial_load` on this path to opt out of: a peer that sends a
-        // good change followed by a bad one still sent a good change.
-
-        // **A walk, not a list, and no verify pass either.** This path has no
-        // all-or-nothing to buy: the prefix that read is applied and the
-        // refusal that stopped it is thrown away, so framing each chunk as the
-        // walk reaches it is the whole of what upstream does
-        // ([`storage/load.rs`:75-99](../../github-automerge-automerge/rust/automerge/src/storage/load.rs),
-        // one loop over one `load_next_change` over the bytes still to come).
-        // The list this replaced was built for a caller that wanted to look at
-        // the stream twice, and this one walks it once.
+        var changes: Changes = .{};
+        defer changes.deinit(gpa);
         var stream = chunkmod.ChunkStream.init(bytes);
-
-        const start = self.ops.len();
-        // **One dispatch, shared with [`Document.loadIntoWith`]**, because
-        // upstream's `load_changes` is one loop over one `load_next_change`
-        // ([`storage/load.rs`:75-99](../../github-automerge-automerge/rust/automerge/src/storage/load.rs))
-        // and both callers reach it. **A bundle chunk is one of its four arms**
-        // ([`load.rs`:139-147](../../github-automerge-automerge/rust/automerge/src/storage/load.rs)),
-        // and it is here — not on [`Document.load`] alone — that a bundle whose
-        // dependencies are missing becomes a **queue** rather than a refusal.
-        //
-        // **A framing refusal stops the walk and is swallowed**, which is what
-        // `LoadedChanges::Partial`'s error was for on this path: the chunks in
-        // front of it are applied and the ones behind it are never read, which
-        // is the same set the partial list held and the same count the row
-        // difference below reports. Only an `applyChunk` refusal reaches the
-        // caller, and it did before too.
         while (true) {
             const next = stream.next() catch break;
-            const c = next orelse break;
-            try self.applyChunk(gpa, c);
+            const chunk = next orelse break;
+            self.decodeChunkChanges(gpa, chunk, &changes, .check) catch |failure| {
+                if (failure == error.OutOfMemory) return error.OutOfMemory;
+                break;
+            };
+        }
+        const start = self.ops.len();
+        if (changes.len() != 0 or log != null) {
+            const incoming = try asChanges(gpa, changes.slice());
+            defer gpa.free(incoming);
+            if (log) |borrowed| {
+                _ = try self.applyChangesWithPatchLog(gpa, incoming, borrowed);
+            } else {
+                _ = try self.applyChanges(gpa, incoming);
+            }
         }
         return self.ops.len() - start;
     }
@@ -4647,6 +4488,7 @@ pub const Document = struct {
         options: SaveOptions,
     ) LoadError![]u8 {
         const out = try self.saveChunk(gpa, options);
+        errdefer gpa.free(out);
         // **Only a non-empty save moves the cursor** (`:538`). The guard is
         // upstream's, and dropping it would advance the cursor past changes
         // no caller was ever handed.
@@ -4670,7 +4512,6 @@ pub const Document = struct {
         gpa: Allocator,
         options: SaveOptions,
     ) LoadError![]u8 {
-        try self.requireRecovered();
         var ops = try self.ops.exportColumns(gpa);
         defer ops.deinit(gpa);
         var changes = try encodeGraphCols(self, gpa);
@@ -4746,6 +4587,7 @@ pub const Document = struct {
     /// Caller owns the returned bytes and frees them with the supplied `gpa`.
     pub fn saveIncremental(self: *Document, gpa: Allocator) LoadError![]u8 {
         const out = try self.saveAfter(gpa, self.save_cursor.items);
+        errdefer gpa.free(out);
         // **And only a non-empty save advances it** (`:593-595`). The guard
         // is load-bearing in the other direction too: advancing on an empty
         // answer would move the cursor over changes the caller never
@@ -4762,8 +4604,11 @@ pub const Document = struct {
     /// reason [`Document.diff_cursor`] gives: a cursor is the heads *as of
     /// the last save*, and the next change moves them.
     fn setSaveCursor(self: *Document, gpa: Allocator) Allocator.Error!void {
+        _ = gpa;
+        const heads = self.graph.getHeads();
+        try self.save_cursor.ensureTotalCapacity(self.gpa, heads.len);
         self.save_cursor.clearRetainingCapacity();
-        try self.save_cursor.appendSlice(gpa, self.graph.getHeads());
+        self.save_cursor.appendSliceAssumeCapacity(heads);
     }
 
     // ── Applying changes ───────────────────────────────────────────────────
@@ -4786,139 +4631,235 @@ pub const Document = struct {
     /// otherwise the orphan a queue holds would be a dangling pointer the next
     /// `save` would read.
     pub fn applyChanges(self: *Document, gpa: Allocator, incoming: []const Change) LoadError!usize {
-        try self.requireRecovered();
-        if (incoming.len == 0) return 0;
+        if (self.patch_log.isActive()) {
+            return self.applyChangesWithPatchLog(gpa, incoming, &self.patch_log);
+        }
+        var log: batchmod.NullLog = .{};
+        return self.applyChangesToSink(batchmod.NullLog, gpa, incoming, &log, null);
+    }
 
+    /// Borrows a compatible log, including this document's own log.
+    /// Actor mismatch preserves the entire document and log; other refusals preserve
+    /// history, operation rows, author associations and log events. Canonical actor
+    /// interning may leave a usable prefix on allocation refusal.
+    pub fn applyChangesWithPatchLog(
+        self: *Document,
+        gpa: Allocator,
+        incoming: []const Change,
+        log: *patchesmod.PatchLog,
+    ) LoadError!usize {
+        // Even inactive Rust logs migrate their actor table (batch.rs:870-872).
+        return self.applyChangesToSink(patchesmod.PatchLog, gpa, incoming, log, null);
+    }
+
+    // Borrow actor bytes from the parsed changes for this call only. No target
+    // actor/mirror or log changes before the exact Rust prefix comparison.
+    fn validateProjectedPatchLog(
+        self: *const Document,
+        gpa: Allocator,
+        incoming: []const Change,
+        log: *const patchesmod.PatchLog,
+    ) LoadError!void {
+        if (log.actors.items.len == 0) return;
+        var has_new_actor = false;
+        for (incoming) |change| {
+            if (self.ops.lookupActor(change.actor) == null) has_new_actor = true;
+            for (change.other_actors) |actor| {
+                if (self.ops.lookupActor(actor) == null) has_new_actor = true;
+            }
+        }
+        if (!has_new_actor) return self.validatePatchLog(log);
+        var projected: std.ArrayList(ActorId) = .empty;
+        defer projected.deinit(gpa);
+        try projected.appendSlice(gpa, self.ops.actors.items);
+        for (incoming) |change| {
+            if (self.ops.lookupActor(change.actor) == null) {
+                try projected.append(gpa, change.actor);
+            }
+            for (change.other_actors) |actor| {
+                if (self.ops.lookupActor(actor) == null) try projected.append(gpa, actor);
+            }
+        }
+        const Sort = struct {
+            fn lessThan(_: void, a: ActorId, b: ActorId) bool {
+                return ActorId.order(a, b) == .lt;
+            }
+        };
+        std.mem.sort(ActorId, projected.items, {}, Sort.lessThan);
+        var count: usize = 0;
+        for (projected.items) |actor| {
+            if (count == 0 or !ActorId.eql(projected.items[count - 1], actor)) {
+                projected.items[count] = actor;
+                count += 1;
+            }
+        }
+        try log.validateActors(projected.items[0..count]);
+    }
+
+    fn applyChangesToSink(
+        self: *Document,
+        comptime L: type,
+        gpa: Allocator,
+        incoming: []const Change,
+        log: *L,
+        output_heads: ?*[]ChangeHash,
+    ) LoadError!usize {
+        if (L == patchesmod.PatchLog) {
+            try self.validateProjectedPatchLog(gpa, incoming, log);
+        }
+        if (incoming.len == 0) {
+            const heads = if (output_heads != null) try self.getHeads(gpa) else null;
+            errdefer if (heads) |owned_heads| gpa.free(owned_heads);
+            if (L == patchesmod.PatchLog) {
+                // Rust runs BatchApply even without changes (batch.rs:1103-1105).
+                // bind's actor insertion is failure-atomic; there is no fallible
+                // work afterward, and existing path hints stay intact.
+                try log.bind(self.patch_identity, self.ops.actors.items);
+            }
+            if (output_heads) |out| out.* = heads.?;
+            return 0;
+        }
         const owned = try gpa.alloc(Change, incoming.len);
-        // **Ownership moves to the queue on success and comes back on refusal.**
-        // `applyChangesBatchLogPatches` takes the changes by value and consumes
-        // every one of them on every path
-        // ([`batch.zig`:2321-2334](opset/batch.zig)): the accepted ones move
-        // into the queue and out of it into the batch, the ones the screen
-        // skips are released there, and a refusal releases the rest. So from the
-        // moment that call is made this function owns **the array and nothing
-        // in it**, and `consumed` is what says so. Before it, every failure is
-        // this function's own and the `errdefer` has to unwind it.
-        //
-        // **The skip is what made this leak.** A change the document already
-        // holds is accepted by no queue and no batch, so before the screen
-        // released it, the one that reached `adoptChange` and nowhere else was
-        // one actor array per change already applied — and a bundle re-sent
-        // over a link, or a change chunk that follows the bundle naming it,
-        // is exactly that shape.
-        //
-        // **The array is ours on every path**, so the `errdefer` frees it
-        // whichever way this leaves; a second `defer` doing the same job is how
-        // this file got a double free it spent a round chasing.
-        // **`adopted` is the half of the array that exists.** `gpa.alloc` hands
-        // back uninitialised memory, and a `Change` whose `other_actors` slot
-        // was never written frees whatever is in it — so a release that walks
-        // all of `owned` is a wild free on the slots the loop never reached.
-        // The count is the fix and the inner `catch` goes with it: that arm
-        // released `owned[0..i]` and then let this `errdefer` run over the same
-        // slots, which is the double free this file's own module doc warns
-        // about, reached from the inside.
+        defer gpa.free(owned);
         var consumed = false;
         var adopted: usize = 0;
-        errdefer {
-            if (!consumed) {
-                for (owned[0..adopted]) |*c| c.deinit(gpa);
-            }
-            gpa.free(owned);
-        }
-        for (incoming) |c| {
-            owned[adopted] = self.adoptChange(gpa, c) catch |e| return e;
+        defer if (!consumed) {
+            for (owned[0..adopted]) |*change| change.deinit(gpa);
+        };
+        for (incoming) |change| {
+            owned[adopted] = try self.adoptChange(gpa, change);
             adopted += 1;
         }
-        // **The actors of a first change are interned before the screen runs.**
-        // `BatchApply::insert_new_actors` would intern them from a change the
-        // queue frees as soon as the batch is applied, and the op set keeps the
-        // `ActorId` value — so the bytes would dangle. Interning here copies
-        // them into this document's arena and fans the insertion out to both
-        // actor tables, so the batch finds every actor already there.
-        for (owned) |c| {
-            if (self.ops.lookupActor(c.actor) == null) _ = try self.putActorRef(gpa, c.actor);
-            for (c.other_actors) |other| {
-                if (self.ops.lookupActor(other) == null) _ = try self.putActorRef(gpa, other);
+        for (owned) |change| {
+            if (self.ops.lookupActor(change.actor) == null) {
+                _ = try self.putActorRef(gpa, change.actor);
+            }
+            for (change.other_actors) |actor| {
+                if (self.ops.lookupActor(actor) == null) {
+                    _ = try self.putActorRef(gpa, actor);
+                }
             }
         }
 
-        // **Armed before the call, not after it**: the screen consumes the
-        // array whether it answers or refuses, so a refusal that unwound here
-        // would release changes the screen has already released.
+        // Project only queue metadata. Unchanged orphan bodies remain borrowed
+        // until nofail publication transfers their original arena owner.
+        var queue = try self.queue.prepareProjection(gpa);
+        defer queue.deinit(gpa);
         consumed = true;
-        var batch = try batchmod.applyChangesBatchLogPatches(
+        var batch = batchmod.applyChangesBatchLogPatches(
             gpa,
             &self.ops,
             &self.graph,
-            &self.queue,
+            &queue.view,
             self.authorLookup(),
             owned,
-        );
+        ) catch |failure| {
+            // Upstream batch.rs:1074-1075 deliberately prunes a queued actor's
+            // later branch on DuplicateSeqNumber. Other refusals preserve it.
+            if (failure == error.DuplicateSeqNumber) {
+                queue.publish(&self.queue);
+            }
+            return failure;
+        };
         defer batch.deinit();
-
-        // Step 3 of `BatchApply::apply`, `import_ops` (`batch.rs:857-863`):
-        // decode each change and update the history, in change order, before
-        // any row moves.
         var ops: std.ArrayList(ChangeOp) = .empty;
         defer {
             for (ops.items) |*op| op.deinit(gpa);
             ops.deinit(gpa);
         }
-        // **The release is a `catch` arm on each step, not an `errdefer` in the
-        // loop.** An `errdefer` here is armed once per iteration and fires on
-        // *any* later error return, so iteration 2's refusal released
-        // iteration 1's `decoded` a second time — after those ops had already
-        // moved into `ops` and been freed with it. That is the module doc's
-        // "an `errdefer` covers failure" rule read from the other side: the
-        // window it is meant to cover is two lines long, and it was covering
-        // the whole rest of the function.
-        for (batch.slice()) |c| {
-            const decoded = try self.importOps(gpa, c);
-            // The header does not carry the op count, so it is filled in from
-            // what the decode found (`Change.withOpCount`, `change.zig`).
-            const filled = c.withOpCount(decoded.len) catch |e| {
+        const metas = try gpa.alloc(changerec.ChangeMetadata, batch.len());
+        defer gpa.free(metas);
+        const sidecars = try gpa.alloc(NodeInfo, batch.len());
+        defer gpa.free(sidecars);
+        const associations = try gpa.alloc(?StagedAuthor, batch.len());
+        defer gpa.free(associations);
+        try self.node_info.ensureUnusedCapacity(gpa, batch.len());
+        try self.author_names.ensureUnusedCapacity(gpa, batch.len());
+        for (batch.slice(), 0..) |change, index| {
+            const decoded = try self.importOps(gpa, change);
+            const filled = change.withOpCount(decoded.len) catch |failure| {
                 freeChangeOps(gpa, decoded);
-                return e;
+                return failure;
             };
-            // **A move, not a copy.** A `ChangeOp` owns its predecessor list, so
-            // copying the struct and then freeing the original frees that list
-            // twice; only the array is released here, because the ops themselves
-            // now belong to `ops`.
-            ops.appendSlice(gpa, decoded) catch |e| {
+            ops.appendSlice(gpa, decoded) catch |failure| {
                 freeChangeOps(gpa, decoded);
-                return e;
+                return failure;
             };
             gpa.free(decoded);
-            try self.addToHistory(gpa, filled);
+            metas[index] = try .fromChange(gpa, filled);
+            const footer = self.changeFooterOf(filled) orelse &.{};
+            sidecars[index] = .{
+                .start_op = filled.start_op,
+                .extra = try self.arena.allocator().dupe(u8, footer),
+            };
+            const actor = self.ops.lookupActor(filled.actor) orelse return error.MissingActor;
+            associations[index] = try self.stageAuthor(gpa, @intCast(actor), footer);
         }
+        const heads = if (output_heads != null)
+            try self.projectBatchHeads(gpa, metas)
+        else
+            null;
+        errdefer if (heads) |owned_heads| gpa.free(owned_heads);
+        var graph = try self.graph.prepareChanges(gpa, &self.authors, metas);
+        defer graph.deinit();
+        var staged_log = try log.beginBatch();
+        defer staged_log.deinit();
+        if (L == patchesmod.PatchLog) {
+            try staged_log.bind(self.patch_identity, self.ops.actors.items);
+        }
+        var prepared: Set.PreparedBatch = undefined;
+        try batchmod.prepareChangesBatchToSink(
+            L,
+            gpa,
+            &staged_log,
+            &self.ops,
+            batch.slice(),
+            ops.items,
+            &prepared,
+        );
+        defer prepared.deinit();
+        try staged_log.preparePublish(log);
 
-        // **The sink is the document's own log, and only while it is active.**
-        // `AutoCommit::apply_changes` branches on exactly this
-        // (`autocommit.rs:495-499`: `if self.patch_log.is_active() { …log…
-        // } else { …PatchLog::null()… }`), and the branch is the whole cost
-        // story: [`patchesmod.PatchLog`]'s twelve sink methods record
-        // unconditionally — upstream's do too, and `transaction/inner.rs:794`,
-        // `:867`, `:1005` and `:1507` are where the *caller* tests
-        // `is_active` — so an inactive log fed anyway would allocate an event
-        // per applied row for a document nobody is watching.
-        if (self.patch_log.isActive()) {
-            try batchmod.applyChangesBatchToSink(
-                patchesmod.PatchLog,
-                gpa,
-                &self.patch_log,
-                &self.ops,
-                batch.slice(),
-                ops.items,
-            );
-        } else {
-            try batchmod.applyChangesBatch(gpa, &self.ops, batch.slice(), ops.items);
+        // No allocation or refusal is permitted after this publication boundary.
+        prepared.publish(&self.ops);
+        graph.publish(&self.graph);
+        self.node_info.appendSliceAssumeCapacity(sidecars);
+        for (associations) |association| {
+            if (association) |author| self.linkAuthor(author);
         }
-        // The screen succeeded, so the changes are the queue's and the batch's
-        // now and the `errdefer` above will not run: the array is ours, and this
-        // is the only line that releases it on the success path.
-        gpa.free(owned);
+        queue.publish(&self.queue);
+        staged_log.publish(log);
+        self.invalidateHistoricalScopes();
+        if (output_heads) |out| out.* = heads.?;
         return batch.len();
+    }
+
+    fn projectBatchHeads(
+        self: *const Document,
+        gpa: Allocator,
+        metas: []const changerec.ChangeMetadata,
+    ) Allocator.Error![]ChangeHash {
+        var heads: std.ArrayList(ChangeHash) = .empty;
+        defer heads.deinit(gpa);
+        try heads.appendSlice(gpa, self.graph.getHeads());
+        for (metas) |meta| {
+            for (meta.deps) |dep| {
+                for (heads.items, 0..) |head, index| {
+                    if (head.eql(dep)) {
+                        _ = heads.swapRemove(index);
+                        break;
+                    }
+                }
+            }
+            try heads.append(gpa, meta.hash);
+        }
+        const Sort = struct {
+            fn lessThan(_: void, a: ChangeHash, b: ChangeHash) bool {
+                return std.mem.order(u8, &a.bytes, &b.bytes) == .lt;
+            }
+        };
+        std.mem.sort(ChangeHash, heads.items, {}, Sort.lessThan);
+        return heads.toOwnedSlice(gpa);
     }
 
     /// Copies a change into this document's arena and re-parses it, so every
@@ -4971,57 +4912,6 @@ pub const Document = struct {
         return decodeChangeOps(gpa, change, actors);
     }
 
-    /// Links one change into the graph
-    /// ([`Automerge::update_history`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):1287-1299).
-    ///
-    /// Upstream expects the change's actor to be interned already and unwraps
-    /// both lookups; here [`ChangeGraph.addChange`] interns it, so the
-    /// op-set table and the graph's stay in step by construction.
-    ///
-    /// `num_ops` is what the decode found, and the header does not carry it
-    /// ([`Change.withOpCount`](change.zig)), so it is filled in here.
-    ///
-    /// **The footer is copied into the arena, not dropped.** `node_info` is
-    /// what `collectByHashes` re-encodes the change from, and the bytes after a
-    /// change's op data are part of what the hash covers
-    /// ([`change.rs:119-125`](../../github-automerge-automerge/rust/automerge/src/storage/change.rs)).
-    /// Recording an empty footer for a change that carried one is silent: the
-    /// change still loads, and the first reader to ask for it by hash is handed
-    /// bytes with a different hash from the one it asked for.
-    fn addToHistory(self: *Document, gpa: Allocator, filled: Change) LoadError!void {
-        const footer = self.changeFooterOf(filled) orelse &.{};
-        // **Staged above the two fallible steps and written below them**, for
-        // the reason [`Document.StagedAuthor`] gives: an association written
-        // first would outlive their refusal as a name for a change this
-        // document never linked, and one written afterwards could not be
-        // recorded at all, because the change would already be in the graph at
-        // `seq == 1` and no later change from that actor stamps a footer.
-        //
-        // `@intCast` for the same reason [`Document.importOps`] casts at
-        // `:4033`: `lookupActor` answers a position in the actor table and the
-        // parameter is an [`ActorIdx`]. **A change whose actor this document
-        // does not have stages nothing at all**, so no name is recorded for a
-        // change the actor table cannot answer for.
-        const staged = if (self.ops.lookupActor(filled.actor)) |idx|
-            try self.stageAuthor(gpa, @intCast(idx), footer)
-        else
-            null;
-        try self.graph.addChange(gpa, &self.authors, .fromChange(filled));
-        _ = try self.node_info.append(gpa, .{
-            .start_op = filled.start_op,
-            .extra = self.arena.allocator().dupe(u8, footer) catch return error.OutOfMemory,
-        });
-        // **And the actor's author, from the change's own footer.** A change
-        // applied from a peer reaches this document on this path, so it is the
-        // path a *remote* actor's author arrives by, and upstream reaches the
-        // same table from the same place: `add_changes` reads
-        // `change.author()` and calls `assign_author` only when it is `Some`
-        // ([`change_graph.rs`:563-566](../../github-automerge-automerge/rust/automerge/src/change_graph.rs)).
-        // The footer is borrowed from `filled`, which the caller frees, so the
-        // copy is [`Document.stageAuthor`]'s.
-        if (staged) |association| self.linkAuthor(association);
-    }
-
     /// Every change in `other` this document does not have
     /// ([`Automerge::get_changes_added`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):1532-1552).
     ///
@@ -5034,11 +4924,9 @@ pub const Document = struct {
         gpa: Allocator,
         other: *Document,
     ) DocumentError!Changes {
-        try self.requireRecovered();
-        try other.requireRecovered();
         const hashes = try self.graph.getChangesAdded(&other.graph, gpa, other.graph.getHeads());
         defer gpa.free(hashes);
-        return other.collectByHashes(gpa, hashes);
+        return other.getChangesByHashes(gpa, hashes);
     }
 
     /// Takes every change in `other` this document does not have, and returns
@@ -5053,16 +4941,50 @@ pub const Document = struct {
         gpa: Allocator,
         other: *Document,
     ) DocumentError![]ChangeHash {
-        try self.requireRecovered();
-        try other.requireRecovered();
+        return self.mergeToLog(gpa, other, null);
+    }
+
+    /// Borrows a compatible patch log and preflights the returned head array.
+    pub fn mergeWithPatchLog(
+        self: *Document,
+        gpa: Allocator,
+        other: *Document,
+        log: *patchesmod.PatchLog,
+    ) DocumentError![]ChangeHash {
+        return self.mergeToLog(gpa, other, log);
+    }
+
+    fn mergeToLog(
+        self: *Document,
+        gpa: Allocator,
+        other: *Document,
+        external: ?*patchesmod.PatchLog,
+    ) DocumentError![]ChangeHash {
         var changes = try self.getChangesAdded(gpa, other);
         defer changes.deinit(gpa);
-        if (!changes.isEmpty()) {
-            const view = try asChanges(gpa, changes.slice());
-            defer gpa.free(view);
-            _ = try self.applyChanges(gpa, view);
+        const incoming = try asChanges(gpa, changes.slice());
+        defer gpa.free(incoming);
+        var heads: []ChangeHash = undefined;
+        const log = external orelse &self.patch_log;
+        if (external != null or log.isActive()) {
+            _ = try self.applyChangesToSink(
+                patchesmod.PatchLog,
+                gpa,
+                incoming,
+                log,
+                &heads,
+            );
+        } else {
+            var inactive: batchmod.NullLog = .{};
+            _ = try self.applyChangesToSink(
+                batchmod.NullLog,
+                gpa,
+                incoming,
+                &inactive,
+                &heads,
+            );
         }
-        return self.getHeads(gpa);
+        return heads;
     }
 
     // ── Committing ─────────────────────────────────────────────────────────
@@ -5130,63 +5052,10 @@ pub const Document = struct {
         message: ?[]const u8,
         time: ?i64,
     ) LoadError!ChangeHash {
-        try self.requireRecovered();
         if (args.start_op == 0 or args.start_op > std.math.maxInt(u32)) return error.Overflow;
         // `automerge.rs:568` — one actor has one author, and it rides that
         // actor's *first* change and no other.
         const author: ?[]const u8 = if (args.seq == 1) self.author else null;
-
-        // **The patch log is fed here, and only while it is recording.** This
-        // is the half of the diff surface that was missing: the log's only
-        // other feeder is [`Document.applyChanges`], so an incremental diff
-        // read an empty log and answered "nothing changed" for a change that
-        // had just been committed — correct for remote changes, silently empty
-        // for a consumer's own edits.
-        //
-        // Upstream's shape is [`AutoCommit::ensure_transaction_open`]
-        // (`autocommit.rs:445-457`) opening with `patch_log.begin_transaction`
-        // and [`AutoCommit::commit_with`] closing with
-        // `patch_log.finish_transaction` (`autocommit.rs:734`), with the
-        // transaction's own branch log merged in between (`:732`). Both halves
-        // of that are here. **The middle half is not, and cannot be**: upstream
-        // records *events* as `TransactionInner` inserts each op
-        // ([`inner.rs:308-328`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)),
-        // and the port's transaction writes its rows with no log in hand and
-        // hands this function the finished ops, by which time they are already
-        // rows — there is no insert-time moment left to record against. So the
-        // change's patches are built here with [`Document.diff`] over exactly
-        // the range this change spans (`args.deps` to the new heads) and
-        // handed to [`patchesmod.PatchLog.appendCompleted`]. Both routes end in
-        // the same [`patchesmod.PatchBuilder`], so a consumer cannot tell them
-        // apart; only the cost differs.
-        //
-        // **Why this cannot disturb the commit's bytes, hash or heads.** The
-        // gate is `patch_log.isActive()`, the same gate
-        // [`Document.applyChanges`] branches on (`autocommit.rs:495-499`), so a
-        // document nobody is diffing runs byte-for-byte the code it ran before:
-        // two conditionals and a `defer` that does nothing. What is left when
-        // the log *is* recording is, in order — `begin_transaction`, the
-        // existing body untouched, the diff, `finish_transaction` — and the
-        // three that touch the change (`begin_transaction`, the diff,
-        // `finish_transaction`) all read it and write only the log. The
-        // encoder, `ChangeGraph.addChange`, `node_info` and `actor_authors`
-        // are not on that path and get the same arguments they always got.
-        //
-        // **`beginTransaction` sits before the first fallible step** so that
-        // its own refusals leave the document exactly as an allocation failure
-        // in `encodeAuthorFooter` already does, rather than adding a new way to
-        // fail after the rows are in the op set.
-        const recording = self.patch_log.isActive();
-        if (recording) {
-            try self.patch_log.beginTransaction(
-                self.ops.actors.items,
-                args.seq,
-                args.actor_index,
-            );
-        }
-        // Settle the speculative actor on every exit, including refusal.
-        // Otherwise the next beginTransaction would return error.Invariant.
-        defer if (recording) self.patch_log.finishTransaction(self.ops.actors.items);
 
         var footer: std.ArrayList(u8) = .empty;
         defer footer.deinit(gpa);
@@ -5281,49 +5150,12 @@ pub const Document = struct {
         const counted = try built.change.withOpCount(ops.len);
         try self.node_info.ensureUnusedCapacity(gpa, 1);
         const extra = try self.arena.allocator().dupe(u8, footer.items);
-        const next_isolation = if (self.isolation != null) blk: {
-            const next = try gpa.alloc(ChangeHash, 1);
-            next[0] = built.change.hash;
-            break :blk next;
-        } else null;
-        errdefer if (next_isolation) |next| gpa.free(next);
-
-        // The rows already exist. Build the change's exact cone clock without
-        // linking it: deps plus this actor's new maximum counter. Preserve
-        // the isolated range (`autocommit.rs:297-302`).
-        var local: ?patchesmod.StagedLocal = null;
-        errdefer if (local) |*pending| pending.deinit();
-        if (recording) {
-            var before_clock = try self.clockAtHeads(gpa, args.deps);
-            defer before_clock.deinit();
-            var after_clock = try before_clock.clone();
-            defer after_clock.deinit();
-            try after_clock.ensureSize(@as(usize, args.actor_index) + 1);
-            _ = after_clock.include(args.actor_index, std.math.cast(u32, counted.max_op) orelse return error.Overflow);
-            // **The change's own hash, and [`PatchDoc.clockAt`] never looks it
-            // up** — it answers with the clock this route built, which is why
-            // an uncommitted hash is safe here where a graph lookup would not
-            // find it. The walk below is scoped to `after_clock` for the same
-            // reason, and the two halves have to name the same point:
-            // `after_clock` is `deps` plus this actor's new maximum op
-            // (`autocommit.rs`:297-302`), which is the state this change leaves
-            // the document in.
-            const here = [_]ChangeHash{built.change.hash};
-            var patches = try self.diffClocks(gpa, .root, before_clock, after_clock, &here, true);
-            defer patches.deinit();
-            local = try self.patch_log.prepareLocal(&patches);
-        }
-
         // Last fallible step. All publication below is infallible; a refused
         // commit still has an intact transaction undo path.
-        try self.graph.addChange(gpa, &self.authors, .fromChange(counted));
+        try self.graph.addChange(gpa, &self.authors, try .fromChange(gpa, counted));
         self.node_info.appendAssumeCapacity(.{ .start_op = args.start_op, .extra = extra });
         if (staged) |association| self.linkAuthor(association);
-        if (local) |pending| self.patch_log.commitLocal(pending);
-        if (next_isolation) |next| {
-            self.gpa.free(self.isolation.?);
-            self.isolation = next;
-        }
+        self.invalidateHistoricalScopes();
         return built.change.hash;
     }
 
@@ -5417,10 +5249,9 @@ pub const Document = struct {
         gpa: Allocator,
         have: []const ChangeHash,
     ) DocumentError!Changes {
-        try self.requireRecovered();
         const hashes = try self.graph.getChanges(gpa, have);
         defer gpa.free(hashes);
-        return self.collectByHashes(gpa, hashes);
+        return self.getChangesByHashes(gpa, hashes);
     }
 
     /// The change with this hash, or null when the document does not hold it
@@ -5436,12 +5267,127 @@ pub const Document = struct {
         gpa: Allocator,
         hash: ChangeHash,
     ) DocumentError!?Built {
-        try self.requireRecovered();
         if (!self.graph.hasChange(hash)) return null;
-        var changes = try self.collectByHashes(gpa, &.{hash});
+        var changes = try self.getChangesByHashes(gpa, &.{hash});
         defer changes.deinit(gpa);
         if (changes.items.items.len != 1) return error.Fail;
         return changes.items.orderedRemove(0);
+    }
+
+    /// Metadata for changes not covered by `have`, each dependency before its dependents
+    /// (`automerge.rs:1516-1522`, `change/collector.rs:665-690`).
+    ///
+    /// Unknown hashes are ignored; empty `have` selects all committed changes.
+    /// Reads history without mutating the document or rebuilding operation bytes.
+    /// The caller owns the result and releases it once with `deinit(gpa)`.
+    /// Allocation refusal releases every partial copy and leaves history unchanged.
+    pub fn getChangesMeta(
+        self: *const Document,
+        gpa: Allocator,
+        have: []const ChangeHash,
+    ) Error!ChangeMetas {
+        var result: ChangeMetas = .{};
+        errdefer result.deinit(gpa);
+        if (have.len == 0) {
+            try result.items.ensureTotalCapacity(gpa, self.graph.nodes.items.len);
+            for (self.graph.nodes.items, 0..) |_, i| {
+                result.items.appendAssumeCapacity(try self.copyChangeMeta(gpa, @intCast(i)));
+            }
+            return result;
+        }
+
+        // Walk the immutable, topologically stored graph into caller scratch.
+        // Graph clock helpers stamp/cache the graph, which a const reader must not do.
+        const covered = try gpa.alloc(bool, self.graph.nodes.items.len);
+        defer gpa.free(covered);
+        @memset(covered, false);
+        const seqs = try gpa.alloc(u64, self.ops.actors.items.len);
+        defer gpa.free(seqs);
+        @memset(seqs, 0);
+        for (have) |known| {
+            if (self.graph.hashToIndex(known)) |index| covered[index] = true;
+        }
+        var remaining = covered.len;
+        while (remaining > 0) {
+            remaining -= 1;
+            if (!covered[remaining]) continue;
+            const node = self.graph.nodes.items[remaining];
+            seqs[node.actor] = @max(seqs[node.actor], node.meta.seq);
+            for (node.meta.deps) |dep| {
+                if (self.graph.hashToIndex(dep)) |index| covered[index] = true;
+            }
+        }
+        for (self.graph.nodes.items, 0..) |node, i| {
+            if (node.meta.seq <= seqs[node.actor]) continue;
+            try result.items.ensureUnusedCapacity(gpa, 1);
+            result.items.appendAssumeCapacity(try self.copyChangeMeta(gpa, @intCast(i)));
+        }
+        return result;
+    }
+
+    /// Owned metadata for `hash`, or `null` when it is not committed in this document
+    /// (`automerge.rs:1525-1528`, `change/collector.rs:693-720`).
+    ///
+    /// No field borrows the document; release a non-null result once with `deinit(gpa)`.
+    /// Allocation refusal releases every partial copy and leaves history unchanged.
+    pub fn getChangeMetaByHash(
+        self: *const Document,
+        gpa: Allocator,
+        hash: ChangeHash,
+    ) Error!?ChangeMetadata {
+        const index = self.graph.hashToIndex(hash) orelse return null;
+        return try self.copyChangeMeta(gpa, index);
+    }
+
+    fn copyChangeMeta(self: *const Document, gpa: Allocator, index: NodeIdx) Allocator.Error!ChangeMetadata {
+        const node = self.graph.nodes.items[index];
+        const info = self.nodeInfo(index);
+        const actor = try gpa.dupe(u8, self.ops.actors.items[node.actor].bytes);
+        errdefer gpa.free(actor);
+        // Metadata's author comes from the actor mapping, not this change's footer.
+        // A later change omits its footer but retains its actor's author (:707).
+        const mapped_author = if (node.actor < self.actor_authors.items.len)
+            self.actor_authors.items[node.actor]
+        else
+            null;
+        const author = if (mapped_author) |bytes|
+            try gpa.dupe(u8, bytes)
+        else
+            null;
+        errdefer if (author) |bytes| gpa.free(bytes);
+        const message = if (node.meta.message.len != 0)
+            try gpa.dupe(u8, node.meta.message)
+        else
+            null;
+        errdefer if (message) |bytes| gpa.free(bytes);
+        const deps = try gpa.dupe(ChangeHash, node.meta.deps);
+        errdefer gpa.free(deps);
+        const extra = try gpa.dupe(u8, info.extra);
+        errdefer gpa.free(extra);
+        return .{
+            .actor = .{ .bytes = actor },
+            .author = author,
+            .seq = node.meta.seq,
+            .start_op = info.start_op,
+            .max_op = node.meta.max_op,
+            .timestamp = node.meta.time,
+            .message = message,
+            .deps = deps,
+            .hash = node.meta.hash,
+            .extra = extra,
+        };
+    }
+
+    /// Hash of the committed change containing `id` (`automerge.rs:1554-1567`).
+    /// Allocates nothing. Root, unknown actors/counters and pending operations return
+    /// `null`; deleting an operation does not erase its originating change.
+    /// Compact `ExId` actor indices are document-local. Named ids resolve actor
+    /// bytes to repair cached slots after insertion (`automerge.rs:744-758`).
+    pub fn hashForOpid(self: *const Document, id: ExId) ?ChangeHash {
+        const resolved = self.resolve(id) orelse return null;
+        const op = resolved.opId() orelse return null;
+        if (op.actor >= self.ops.actors.items.len) return null;
+        return self.graph.opidToHash(op);
     }
 
     // ── Bundles and fragments ─────────────────────────────────────────────
@@ -5527,7 +5473,6 @@ pub const Document = struct {
         gpa: Allocator,
         hashes: []const ChangeHash,
     ) DocumentError!Bundle {
-        try self.requireRecovered();
         // **The dependency block outlives the builder**, because every
         // `deps` window is interior to it and `Builder.init` reads them all
         // while it resolves them to bundle indices. The two are therefore
@@ -5644,7 +5589,7 @@ pub const Document = struct {
     /// from the node table alone.** Upstream computes it as
     /// `max_op - num_ops + 1` from a `num_ops` column; this port keeps the same
     /// number in [`NodeInfo.start_op`], which is where every other route that
-    /// re-encodes a change reads it from ([`Document.collectByHashes`]) — so
+    /// re-encodes a change reads it from ([`Document.getChangesByHashes`]) — so
     /// there is one answer and not two derivations of it.
     ///
     /// The result is the metadata **and** the block its `deps` windows point
@@ -5780,7 +5725,6 @@ pub const Document = struct {
         gpa: Allocator,
         wanted: []const Fragment,
     ) DocumentError![][]u8 {
-        try self.requireRecovered();
         var out: std.ArrayList([]u8) = .empty;
         errdefer {
             for (out.items) |buffer| gpa.free(buffer);
@@ -5857,28 +5801,55 @@ pub const Document = struct {
 
     /// Rebuilds the changes named by `hashes`, in that order
     /// ([`ChangeCollector::for_hashes`](../../github-automerge-automerge/rust/automerge/src/op_set2/change/collector.rs):724-734).
-    fn collectByHashes(
+    ///
+    /// Preserves every requested occurrence, including repeated and empty
+    /// changes, with independently owned bodies and actor metadata. Each unique
+    /// change is reconstructed once from the authoritative op set. An empty
+    /// request returns an empty owned list.
+    /// This mutable reader reuses shared successor scratch and invalidates
+    /// outstanding borrowed successor views; it does not mutate history.
+    /// An unknown hash returns `error.MissingDeps`; reconstruction and allocation
+    /// failures release every partial result and leave history unchanged.
+    /// The result borrows nothing from the document or `hashes` and survives
+    /// source mutation or teardown. Release it once with `Changes.deinit(gpa)`.
+    pub fn getChangesByHashes(
         self: *Document,
         gpa: Allocator,
         hashes: []const ChangeHash,
     ) DocumentError!Changes {
-        const metas = try gpa.alloc(BuildMeta, hashes.len);
-        defer freeMetas(gpa, metas);
-        // **One allocation for every change's dependencies, not one per
-        // change.** A `defer` inside the loop body would free each slice when
-        // that iteration ended, and the metas below would point at freed memory
-        // for the rest of the walk.
+        if (hashes.len == 0) return .{};
+        const Selection = struct { meta: usize, first: usize };
+        var selected: std.AutoHashMapUnmanaged(NodeIdx, Selection) = .empty;
+        defer selected.deinit(gpa);
+        var unique_len: usize = 0;
         var deps_total: usize = 0;
-        for (hashes) |hash| {
+        for (hashes, 0..) |hash, i| {
             const index = self.graph.hashToIndex(hash) orelse return error.MissingDeps;
             const node = self.graph.nodeAt(index) orelse return error.MissingDeps;
+            // A singleton needs no selection map. Larger batches preserve the
+            // first occurrence while avoiding competing builders for one range.
+            if (hashes.len > 1) {
+                const entry = try selected.getOrPut(gpa, index);
+                if (entry.found_existing) continue;
+                entry.value_ptr.* = .{ .meta = unique_len, .first = i };
+            }
+            unique_len += 1;
             deps_total += node.meta.deps.len;
         }
+        const metas = try gpa.alloc(BuildMeta, unique_len);
+        defer freeMetas(gpa, metas);
+        // One backing allocation keeps every unique change's dependencies live
+        // until the collector has finished reading its metadata.
         const deps_all = try gpa.alloc(NodeIdx, deps_total);
         defer gpa.free(deps_all);
         var at: usize = 0;
         for (hashes, 0..) |hash, i| {
             const index = self.graph.hashToIndex(hash) orelse return error.MissingDeps;
+            const selection: Selection = if (hashes.len == 1)
+                .{ .meta = 0, .first = 0 }
+            else
+                selected.get(index).?;
+            if (selection.first != i) continue;
             const node = self.graph.nodeAt(index) orelse return error.MissingDeps;
             const info = self.nodeInfo(index);
             const deps = deps_all[at..][0..node.meta.deps.len];
@@ -5891,7 +5862,7 @@ pub const Document = struct {
                 0
             else
                 node.meta.max_op - start_op + 1;
-            metas[i] = .{
+            metas[selection.meta] = .{
                 .actor = node.actor,
                 .seq = node.meta.seq,
                 .start_op = start_op,
@@ -5902,82 +5873,132 @@ pub const Document = struct {
                 .footer = info.extra,
             };
         }
-        var changes: Changes = .{};
-        errdefer changes.deinit(gpa);
-        try collectChanges(gpa, &self.ops, self.ops.actors.items, metas, .{ .graph = &self.graph }, &changes);
-        return changes;
+        var changes = blk: {
+            var collected: Changes = .{};
+            errdefer collected.deinit(gpa);
+            try collectChanges(gpa, &self.ops, self.ops.actors.items, metas, .{ .graph = &self.graph }, &collected);
+            break :blk collected;
+        };
+        // The unique hot path returns the collector's owners without another
+        // output vector, parse or body copy.
+        if (unique_len == hashes.len) return changes;
+
+        var moved: usize = 0;
+        defer {
+            // First occurrences move in metadata order. Only this suffix still
+            // belongs to the collector if an output allocation is refused.
+            for (changes.items.items[moved..]) |*built| built.deinit(gpa);
+            changes.items.deinit(gpa);
+        }
+        var out: Changes = .{};
+        errdefer out.deinit(gpa);
+        try out.items.ensureTotalCapacity(gpa, hashes.len);
+        for (hashes, 0..) |hash, i| {
+            const index = self.graph.hashToIndex(hash) orelse return error.MissingDeps;
+            const selection = selected.get(index).?;
+            if (selection.first == i) {
+                out.items.appendAssumeCapacity(changes.items.items[selection.meta]);
+                moved += 1;
+            } else {
+                const original = out.items.items[selection.first];
+                const body = try gpa.dupe(u8, original.body);
+                errdefer gpa.free(body);
+                var change = try changerec.parseChangeWithHash(body, gpa, original.change.hash);
+                errdefer change.deinit(gpa);
+                const num_ops = if (original.change.max_op < original.change.start_op)
+                    0
+                else
+                    original.change.max_op - original.change.start_op + 1;
+                change = try change.withOpCount(num_ops);
+                out.items.appendAssumeCapacity(.{ .body = body, .change = change });
+            }
+        }
+        return out;
     }
 
     /// What the document recorded about the node at `index`.
     fn nodeInfo(self: *const Document, index: NodeIdx) NodeInfo {
         const i: usize = index;
-        if (i >= self.node_info.items.len) return .{ .start_op = 1, .extra = &.{} };
+        std.debug.assert(i < self.node_info.items.len);
         return self.node_info.items[i];
     }
 
     // ── The document algebra ───────────────────────────────────────────────
 
-    /// A deep, independent copy
-    /// (upstream's `#[derive(Clone)]` on `Automerge`,
-    /// [`automerge.rs:248`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
-    ///
-    /// **Nothing mutable is shared.** The op set is rebuilt from the exported
-    /// columns — which re-runs the index rebuild and so produces a fresh
-    /// [`opsetmod.OpSet`] — the graph is rebuilt by re-encoding every change,
-    /// and the queue's changes are re-parsed from fresh copies of their bytes.
-    /// The actor and author are carried over, which is what distinguishes a
-    /// clone from a [`Document.fork`].
-    ///
-    /// **"Deep" includes the two borrows, and this is where the copy is.** A
-    /// `.unused` actor and [`Document.author`] are slices over **the source's**
-    /// arena — [`Document.setAuthor`] dupes the name into it, and
-    /// `ActorId.random`'s bytes go there too — and [`Document.deinit`] frees
-    /// that arena. Assigning them straight across put a pointer to freed heap
-    /// in the clone: `src.setAuthor(gpa, "ada"); var copy = src.clone(gpa,
-    /// .manual); src.deinit();` left `copy.getAuthor()` and
-    /// `copy.getActorId()` reading freed memory, and the next `commit` copied
-    /// those bytes into the change's author footer and actor header, so the
-    /// garbage reached the wire and the change named an actor no peer has. A
-    /// `.unused` arm is also a **caller's** borrow the clone has no handle on
-    /// at all: `setActorId(.{ .bytes = buf })`, clone, reuse `buf`.
-    ///
-    /// Upstream has nothing to copy the wrong way round: `#[derive(Clone)]`
-    /// deep-copies `Option<Author<'static>>` and `Actor::Unused(Vec<u8>)`
-    /// ([`automerge.rs`:47-50, :248](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-    /// because both own their bytes. A `.cached` arm is a **number**, not a
-    /// borrow, and the clone's table is the same sorted table, so the index
-    /// means the same actor in both.
-    pub fn clone(self: *Document, gpa: Allocator, mode: Mode) LoadError!Document {
-        return self.cloneWithActor(gpa, mode, true);
+    /// Deep independent copy, including pending op rows, actor, author and queue.
+    /// This does not close a transaction or publish pending rows into history.
+    /// The caller owns the result and releases it with `deinit`; errors leave
+    /// the source unchanged (upstream's derived `Clone`, `automerge.rs:248`).
+    pub fn clone(self: *Document, gpa: Allocator) LoadError!Document {
+        return self.cloneImpl(gpa, true);
     }
 
-    fn cloneWithActor(self: *Document, gpa: Allocator, mode: Mode, preserve_actor: bool) LoadError!Document {
-        // The save is the clone's *input*, not its result: it is the bytes the
-        // load reads, and both go away here. Handing it straight into `load`
-        // would leak it, because `load` copies what it needs and never frees
-        // what it was handed. **`saveChunk`, not `saveWithOptions`**: a clone
-        // is `Automerge`'s `#[derive(Clone)]` and upstream's `Automerge` has
-        // no save cursor, so a clone must leave the source's where it was.
-        // Moving it would make the source's next `saveIncremental` skip the
-        // whole history this call just read — silently, and only in the byte
-        // count.
-        const bytes = try self.saveChunk(gpa, .{
-            .deflate = false,
-            .retain_orphans = true,
-        });
-        defer gpa.free(bytes);
-        var out = try initOwned(gpa, self.io, self.textEncoding(), mode, if (preserve_actor) self.getActorId() else null);
+    /// Copies pending document state without closing its source transaction.
+    /// This copies rows, not the transaction journal; the transaction owner
+    /// must clone its journal into the result's final stable address.
+    /// Ownership and error behaviour are the same as `clone`.
+    pub fn clonePending(self: *Document, gpa: Allocator) LoadError!Document {
+        return self.cloneImpl(gpa, true);
+    }
+
+    fn cloneImpl(self: *Document, gpa: Allocator, preserve_actor: bool) LoadError!Document {
+        var out = try initOwned(gpa, self.io, self.textEncoding(), if (preserve_actor) self.getActorId() else null);
         errdefer out.deinit();
-        try out.loadIntoWith(gpa, bytes, self.textEncoding(), mode, .refuse, false);
+        const arena = out.arena.allocator();
+        // Preserve every actor slot, including actors present only in pending
+        // rows. The op set borrows bytes, so the destination arena owns them.
+        const actors = try arena.alloc(ActorId, self.ops.actors.items.len);
+        for (self.ops.actors.items, actors) |actor, *copied| {
+            copied.* = .{ .bytes = try arena.dupe(u8, actor.bytes) };
+        }
+        // Keep string ids stable for a pending transaction's cloned journal,
+        // even when column traversal interns keys in a different order.
+        for (self.strings.map.keys()) |bytes| {
+            _ = try Strings.intern(out.strings, bytes, gpa);
+        }
+        var exported = try self.ops.exportColumns(gpa);
+        defer exported.deinit(gpa);
+        const ops = try Set.load(gpa, exported.cols, actors, self.textEncoding(), out.strings.table());
+        out.ops.deinit();
+        out.ops = ops;
+        const graph = try self.graph.clone(gpa);
+        out.graph.deinit();
+        out.graph = graph;
+        const queue = try self.queue.clone(gpa);
+        out.queue.deinit();
+        out.queue = queue;
+        try out.authors.items.appendSlice(gpa, actors);
+        try out.authors.remap_buf.appendSlice(gpa, self.authors.remap_buf.items);
+        try out.node_info.ensureTotalCapacity(gpa, self.node_info.items.len);
+        for (self.node_info.items) |info| {
+            out.node_info.appendAssumeCapacity(.{
+                .start_op = info.start_op,
+                .extra = try arena.dupe(u8, info.extra),
+            });
+        }
+        try out.actor_authors.ensureTotalCapacity(gpa, self.actor_authors.items.len);
+        for (self.actor_authors.items) |author| {
+            out.actor_authors.appendAssumeCapacity(if (author) |bytes| try arena.dupe(u8, bytes) else null);
+        }
+        try out.author_names.ensureTotalCapacity(gpa, self.author_names.items.len);
+        for (self.author_names.items) |author| {
+            out.author_names.appendAssumeCapacity(try arena.dupe(u8, author));
+        }
         if (preserve_actor) switch (self.actor) {
             .unused => {},
             .cached => |idx| out.actor = .{ .cached = idx },
         };
-        out.author = if (self.author) |name|
-            (out.arena.allocator().dupe(u8, name) catch return error.OutOfMemory)
-        else
-            null;
+        out.author = if (self.author) |bytes| try arena.dupe(u8, bytes) else null;
         out.isolation = if (self.isolation) |heads| try gpa.dupe(ChangeHash, heads) else null;
+        if (preserve_actor) {
+            try out.diff_cursor.appendSlice(gpa, self.diff_cursor.items);
+            try out.save_cursor.appendSlice(gpa, self.save_cursor.items);
+            const patch_log = try self.patch_log.cloneAndRebind(gpa, out.patch_identity);
+            out.patch_log.deinit();
+            out.patch_log = patch_log;
+        }
+        // Read clocks are derived caches. Rebuilding them on demand avoids
+        // borrowing the source's clocks or its historical iterator storage.
         return out;
     }
 
@@ -5987,9 +6008,8 @@ pub const Document = struct {
     /// A clone with a secure random actor from the retained `io` provider.
     /// Refusal returns no fork and preserves the source. The new actor lives
     /// in the fork's arena (`automerge.rs:702-706`).
-    pub fn fork(self: *Document, gpa: Allocator, mode: Mode) LoadError!Document {
-        const out = try self.cloneWithActor(gpa, mode, false);
-        return out;
+    pub fn fork(self: *Document, gpa: Allocator) LoadError!Document {
+        return self.cloneImpl(gpa, false);
     }
 
     /// A new document that holds exactly the changes `heads` reaches
@@ -6004,7 +6024,6 @@ pub const Document = struct {
         self: *Document,
         gpa: Allocator,
         heads: []const ChangeHash,
-        mode: Mode,
     ) LoadError!Document {
         var seen: std.AutoHashMapUnmanaged(ChangeHash, void) = .empty;
         defer seen.deinit(gpa);
@@ -6031,12 +6050,12 @@ pub const Document = struct {
         }
         std.mem.reverse(ChangeHash, hashes.items);
 
-        var changes = try self.collectByHashes(gpa, hashes.items);
+        var changes = try self.getChangesByHashes(gpa, hashes.items);
         defer changes.deinit(gpa);
 
         // The fork measures text the way the document it was forked from does,
         // because the changes it is about to apply index text in it.
-        var out = try Document.initWithEncoding(gpa, self.io, self.textEncoding(), mode);
+        var out = try Document.initWithEncoding(gpa, self.io, self.textEncoding());
         errdefer out.deinit();
         const view = try asChanges(gpa, changes.slice());
         defer gpa.free(view);
@@ -6053,7 +6072,143 @@ pub const Document = struct {
             .num_changes = @intCast(self.graph.len()),
             .num_ops = @intCast(self.ops.len()),
             .num_actors = @intCast(self.ops.actors.items.len),
+            .package_name = @import("build_options").package_name,
+            .package_version = @import("build_options").package_version,
+            .compiler_version = @import("builtin").zig_version_string,
         };
+    }
+
+    /// Initializes root keys in one transaction and commits one batch.
+    /// Existing keys absent from `map` remain unchanged (`automerge.rs:297-304`).
+    /// Opening errors return directly. Later failures preserve the primary error
+    /// in the outcome; a refused rollback also returns the live transaction.
+    /// Release the outcome's patch log once. A returned recovery transaction
+    /// borrows this document, which must remain address-stable until recovery closes.
+    pub fn initFromHydrate(
+        self: *Document,
+        gpa: Allocator,
+        map: *const @import("hydrate.zig").Map,
+    ) @import("transaction.zig").TransactionError!@import("transaction.zig").Outcome(
+        void,
+        @import("transaction.zig").TransactionError,
+    ) {
+        const transaction = @import("transaction.zig");
+        const Body = struct {
+            fn run(
+                input_map: *const @import("hydrate.zig").Map,
+                tx: *@import("transact.zig").Transaction,
+            ) transaction.TransactionError!void {
+                try tx.initRootFromHydrate(input_map);
+            }
+        };
+        return transaction.enclose(void, gpa, self, map, Body.run);
+    }
+
+    /// Whether the peer shares exactly the ordered, full committed heads.
+    /// This ignores isolation and neither allocates nor changes the document.
+    pub fn hasOurChanges(self: *const Document, state: *const @import("sync/state.zig").State) bool {
+        return sameHashList(state.shared_heads, self.graph.getHeads());
+    }
+
+    /// Parses a stable object ID and resolves its actor against this document.
+    /// Syntax failures are `InvalidObjIdFormat`; unknown actors are `InvalidObjId`.
+    /// The result borrows actor bytes until the next document mutation.
+    pub fn importObj(self: *const Document, gpa: Allocator, spelling: []const u8) DocumentError!ExId {
+        var parsed = ExId.parse(gpa, spelling) catch |failure| switch (failure) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidObjIdFormat,
+        };
+        defer parsed.deinitOwned(gpa);
+        if (parsed == .root) return .root;
+        const actor = parsed.actorBytes() orelse return error.InvalidObjId;
+        const index = self.ops.lookupActor(actor) orelse return error.InvalidObjId;
+        const live_actor = self.ops.getActor(@intCast(index)) orelse return error.InvalidObjId;
+        const counter = std.math.cast(u32, parsed.counter() orelse return error.InvalidObjId) orelse
+            return error.InvalidObjId;
+        return ExId.withActor(.{
+            .counter = counter,
+            .actor = @intCast(index),
+        }, live_actor);
+    }
+
+    /// Imports a live object, rejecting scalar-operation and nonexistent IDs.
+    /// The returned identity has the same borrowed lifetime as `importObj`.
+    pub fn import(self: *const Document, gpa: Allocator, spelling: []const u8) DocumentError!ImportedObject {
+        const id = try self.importObj(gpa, spelling);
+        const object_type = self.objectType(id) catch return error.InvalidObjId;
+        return .{ .id = id, .object_type = object_type };
+    }
+
+    /// Writes the complete exported op columns and actor table for inspection.
+    /// The document is unchanged; a writer failure may leave a diagnostic prefix.
+    pub fn dump(
+        self: *const Document,
+        gpa: Allocator,
+        writer: *std.Io.Writer,
+    ) (ParseError || std.Io.Writer.Error)!void {
+        var exported = try self.ops.exportColumns(gpa);
+        defer exported.deinit(gpa);
+        try writer.print("OpSet\n  len: {d}\n  actors: {d}\n", .{
+            self.ops.len(), self.ops.actors.items.len,
+        });
+        for (self.ops.actors.items, 0..) |actor, index| {
+            try writer.print("actor {d}: {x}\n", .{ index, actor.bytes });
+        }
+        for (exported.cols.columns) |column| {
+            try writer.print("column {x}: {x}\n", .{
+                column.spec.raw, try column.range.slice(exported.data),
+            });
+        }
+    }
+
+    /// Writes differing exported op columns, including columns absent on either side.
+    /// Equal column payloads produce no output. Neither document is changed.
+    /// This is the writer equivalent of upstream `automerge.rs:798-830`.
+    pub fn diffOpSet(
+        self: *const Document,
+        gpa: Allocator,
+        other: *const Document,
+        writer: *std.Io.Writer,
+    ) (ParseError || std.Io.Writer.Error)!void {
+        var left = try self.ops.exportColumns(gpa);
+        defer left.deinit(gpa);
+        var right = try other.ops.exportColumns(gpa);
+        defer right.deinit(gpa);
+        var left_index: usize = 0;
+        var right_index: usize = 0;
+        while (left_index < left.cols.columns.len or right_index < right.cols.columns.len) {
+            const left_column = if (left_index < left.cols.columns.len)
+                left.cols.columns[left_index]
+            else
+                null;
+            const right_column = if (right_index < right.cols.columns.len)
+                right.cols.columns[right_index]
+            else
+                null;
+            const order: std.math.Order = if (left_column) |column|
+                if (right_column) |other_column|
+                    column.spec.compare(other_column.spec)
+                else
+                    .lt
+            else
+                .gt;
+            const spec = if (order == .gt) right_column.?.spec else left_column.?.spec;
+            const left_bytes = if (order != .gt)
+                try left_column.?.range.slice(left.data)
+            else
+                &.{};
+            const right_bytes = if (order != .lt)
+                try right_column.?.range.slice(right.data)
+            else
+                &.{};
+            if (!std.mem.eql(u8, left_bytes, right_bytes)) {
+                try writer.print("column {x}\n  left: {x}\n  right: {x}\n", .{
+                    spec.raw, left_bytes, right_bytes,
+                });
+            }
+            if (order != .gt) left_index += 1;
+            if (order != .lt) right_index += 1;
+        }
     }
 
     /// How every text width in this document is measured
@@ -6100,8 +6255,10 @@ pub const Document = struct {
     /// them — [`Document.idToExid`] is the only way one is made — so this is
     /// the path for an id built by [`ExId.fromParts`] from a caller that has
     /// only an actor index, and the reference is exactly the old behaviour.
+    /// Public named counters wider than resident OpId storage are unresolved.
     pub fn resolve(self: *const Document, ex: ExId) ?ExId {
-        const op = ex.opId() orelse return ex;
+        if (ex == .root) return .root;
+        const op = ex.opId() orelse return null;
         const who = ex.actorBytes() orelse return ex;
         if (self.ops.getActor(op.actor)) |here| {
             if (here.eql(who)) return ex;
@@ -6331,7 +6488,7 @@ pub const Document = struct {
     ///
     /// The caller owns the result.
     pub fn diffIncremental(self: *Document, gpa: Allocator) DiffError!patchesmod.Patches {
-        const patches = try self.diffInner(
+        var patches = try self.diffInner(
             gpa,
             .root,
             self.diff_cursor.items,
@@ -6342,6 +6499,7 @@ pub const Document = struct {
             self.viewHeads(),
             true,
         );
+        errdefer patches.deinit();
         try self.updateDiffCursor();
         return patches;
     }
@@ -6366,10 +6524,10 @@ pub const Document = struct {
     /// not a cursor, and setting one would make the next incremental diff
     /// report the empty state as an addition.
     pub fn updateDiffCursor(self: *Document) Error!void {
-        try self.requireRecovered();
         // **`viewHeads` for the same reason**, `autocommit.rs:202`.
         const heads = self.viewHeads();
         if (heads.len == 0) return;
+        try self.diff_cursor.ensureTotalCapacity(self.gpa, heads.len);
         // `autocommit.rs:203-205`, in order: the log is turned **on** first, and
         // `truncate` clears what was there and leaves it on. Upstream does both
         // because `truncate` sets the flag itself; keeping the pair means the
@@ -6377,7 +6535,7 @@ pub const Document = struct {
         self.patch_log.setActive(true);
         self.patch_log.truncate();
         self.diff_cursor.clearRetainingCapacity();
-        try self.diff_cursor.appendSlice(self.gpa, heads);
+        self.diff_cursor.appendSliceAssumeCapacity(heads);
     }
 
     /// Forgets the cursor and stops recording
@@ -6400,11 +6558,24 @@ pub const Document = struct {
     /// **`log` is the caller's and not `self.patch_log`**, exactly as upstream:
     /// this is the escape hatch for a log fed by
     /// [`batchmod.applyChangesBatchToSink`] directly. The caller owns the
-    /// result.
+    /// result. Rendering does not migrate or reject the actor table, matching
+    /// Rust `patch_log.rs:505-529`; indexed IDs are exported through this document.
     pub fn makePatches(self: *const Document, log: *patchesmod.PatchLog) patchesmod.MakeError!patchesmod.Patches {
-        var view = PatchDoc.init(self.gpa, self, null);
+        var view = PatchDoc.init(log.gpa, self, null);
         defer view.deinit();
         return log.makePatches(PatchDoc, &view);
+    }
+
+    /// Materializes the borrowed log's current view through the private patch
+    /// reader before the log begins recording at another head set.
+    pub fn finishCurrentPatchView(
+        self: *const Document,
+        log: *patchesmod.PatchLog,
+        heads: []const ChangeHash,
+    ) patchesmod.MakeError!void {
+        var view = PatchDoc.init(log.gpa, self, null);
+        defer view.deinit();
+        try log.finishCurrentView(PatchDoc, &view, heads);
     }
 
     /// The clock a set of heads names ([`Automerge::clock_range`](../../github-automerge-automerge/rust/automerge/src/automerge.rs),
@@ -6417,154 +6588,45 @@ pub const Document = struct {
         return @constCast(&self.graph).clockAt(gpa, heads);
     }
 
-    /// The clock a **read** on this document is scoped to, or null for an
-    /// unscoped read of the present
-    /// ([`AutoCommit::get_scope`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs):794-814).
-    ///
-    /// **This is the one place the isolation reaches the read path, and every
-    /// reader goes through it.** Upstream's `AutoCommit` has no un-isolated
-    /// read: `get`, `text`, `length`, `marks`, `hydrate` and the rest all
-    /// resolve their scope through `get_scope(None)`, whose second arm is
-    /// `(Some(i), None) => self.doc.clock_at(i)` — "then look at clock for
-    /// isolation (no transaction is open, so isolation at the current heads
-    /// can read unscoped)". `can_isolate` reads `size` as 100 at
-    /// [`test.rs`:2564](../github-automerge-automerge/rust/automerge/tests/test.rs) for exactly this reason: `put(size,
-    /// 150)` is pending when `isolate(&heads1)` runs, `isolate` closes the
-    /// transaction and commits it
-    /// ([`:433-437`](../github-automerge-automerge/rust/automerge/src/autocommit.rs)), and the read that follows cannot see
-    /// it.
-    ///
-    /// **A transaction's own scope is not this.** A write path opens through
-    /// [`transactionArgs`] with [`isolationHeads`], and a `Transaction`
-    /// builds its scope clock once
-    /// ([`transact.zig`](../src/transact.zig)); a read taken *through* a
-    /// transaction sees the transaction's uncommitted ops, and a read taken
-    /// through the document sees the isolation. Upstream keeps those apart in
-    /// `get_scope`'s two arms (`autocommit.rs:806-813`) and so does this.
-    ///
-    /// **The answer is borrowed and lives on the document, so no reader frees
-    /// it.** Upstream hands out an owned `Clock` and drops it at the end of
-    /// the call (`autocommit.rs:806-813`), which Rust can do because the
-    /// clock is *moved* into whatever reads it — and what reads it here is a
-    /// **walk the reader hands back to its caller**: [`OpSet.topOps`](opset/op_set.zig)
-    /// stores a `?Clock` by value ([`top_op.zig`](opset/top_op.zig)), and
-    /// [`Parents`](opset/parents.zig), [`MapRange`](iter/map_range.zig),
-    /// [`ListRange`](iter/list_range.zig) and [`Spans`](iter/spans.zig) each
-    /// document theirs as "borrowed from the caller". So the clock has to
-    /// outlive the reader, which is what [`read_scope`](Document) is for.
-    ///
-    /// **A borrow, and so valid until the next mutation** — the same rule as
-    /// every other slice into a document's storage
-    /// ([AGENTS.md](AGENTS.md)). A new isolation, an applied change or a new
-    /// actor all rebuild it, and a walk handed out before one of those is
-    /// over, exactly as a borrowed key would be.
-    ///
-    /// **`*Document` rather than `*const Document`,** because caching is a
-    /// write. [read.zig](read.zig)'s readers reach it through its existing
-    /// `mutableDoc` helper, for the same reason and with the same caveat:
-    /// **nothing here writes a row, an object or a head** — the only thing
-    /// written is a memo of a value derived from the graph.
-    /// Returns `error.InvalidOp` while native automatic recovery is pending;
-    /// a validation refusal with no producer or rollback work does not block it.
+    /// The facade's isolated read cone, or null for the unscoped present
+    /// (`autocommit.rs:794-814`). Transaction reads use their own write clock.
+    /// Clock buffers are document-owned and remain valid until mutation; selecting
+    /// a different historical cone does not release a previously returned walk.
     pub fn readScope(self: *Document, gpa: Allocator) Error!?*const clockmod.Clock {
-        try self.requireRecovered();
         const at = self.isolation orelse return null;
-        return self.scopedClock(gpa, at);
+        if (self.graph.headsAreCurrent(at)) return null;
+        return try self.clockAtScope(gpa, at);
     }
 
-    /// The clock a historical read at caller-named `heads` runs at, or null
-    /// for an unscoped read of the present
-    /// ([`Automerge::clock_at`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):1236-1247).
-    ///
-    /// **This is [`readScope`] with the caller's heads in place of the
-    /// isolation's, and upstream keeps the two apart the same way.** Every
-    /// `*_at` on `Automerge` is `let clock = self.clock_at(heads);` and then
-    /// the unsuffixed body with that clock
-    /// ([`automerge.rs`:2078-2280](../../github-automerge-automerge/rust/automerge/src/automerge.rs));
-    /// `clock_at` and not `change_graph::clock_at` is the name those
-    /// wrappers use, because **it carries the shortcut the next section is
-    /// about and the graph's entry point does not.**
-    /// [read.zig](read.zig)'s `*At` readers are exactly those wrappers: each
-    /// takes `heads: []const ChangeHash`, calls this, and hands the answer to
-    /// the same body its unsuffixed sibling uses.
-    ///
-    /// **The cache is shared with the isolation's clock, which is why no
-    /// second pair of fields exists.** [`readScope`] and this both answer with
-    /// a clock for a set of heads, so both key [`read_scope`] on the heads
-    /// they were handed. Alternating between an isolation read and an `_at`
-    /// read at different heads therefore rebuilds each time — correct, and no
-    /// slower than building fresh, which is the alternative.
-    ///
-    /// **Borrowed, owned by the document, freed by [`Document.deinit`]** — see
-    /// the fields' own section. A walk built from the answer outlives this
-    /// call and must not outlive the next scoped read at other heads.
+    /// The committed cone at explicit `heads`, even when they equal current heads.
+    /// Keys and clock buffers are document-owned and reused without allocation on
+    /// repeated reads. Selecting other heads preserves previously returned walks;
+    /// mutation invalidates both clocks and walks. Pool growth preserves pointers.
     pub fn clockAtScope(
         self: *Document,
         gpa: Allocator,
         heads: []const ChangeHash,
-    ) Error!?*const clockmod.Clock {
-        try self.requireRecovered();
-        return self.scopedClock(gpa, heads);
-    }
-
-    /// The cached clock for `at`, or null when `at` names the present
-    /// ([`Automerge::clock_at`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):1241-1247).
-    fn scopedClock(
-        self: *Document,
-        gpa: Allocator,
-        at: []const ChangeHash,
-    ) Error!?*const clockmod.Clock {
-        // **The heads-are-current shortcut, and it is upstream's own line**
-        // ([`automerge.rs`:1242-1249](../github-automerge-automerge/rust/automerge/src/automerge.rs)):
-        // `clock_at` returns `None` — an unscoped read of the present — "so
-        // `*_at(doc.get_heads())` takes the same indexed fast paths as the
-        // un-suffixed methods". `get_scope`'s middle arm calls `clock_at`, so
-        // this port's middle arm calls this, shortcut included.
-        //
-        // **It is reachable and it is not a corner.** [`Document.commit`]
-        // advances the isolation to the change it just committed, and that
-        // change is the document's only head whenever the write was not
-        // concurrent — which is every `isolate(&heads)` followed by a write
-        // with nothing else landing in between. For [`clockAtScope`] it is
-        // reached by naming `getHeads()` explicitly, and upstream says that
-        // spelling is the same read as the unsuffixed one.
-        if (self.graph.headsAreCurrent(at)) return null;
-        if (self.read_scope == null or
-            !sameHashList(self.read_scope_heads, at) or
-            self.read_scope_ops != self.ops.len() or
-            self.read_scope_actors != self.graph.numActors())
-        {
-            if (self.read_scope) |*stale| stale.deinit();
-            self.gpa.free(self.read_scope_heads);
-            self.read_scope_heads = &.{};
-            // The heads are copied before the clock is built, so a failed
-            // rebuild leaves the fields consistent with each other rather
-            // than with a half-written key.
-            const heads = try self.gpa.dupe(ChangeHash, at);
-            errdefer self.gpa.free(heads);
-            self.read_scope = try self.clockAtHeads(gpa, at);
-            self.read_scope_heads = heads;
-            self.read_scope_ops = self.ops.len();
-            self.read_scope_actors = self.graph.numActors();
+    ) Error!*const clockmod.Clock {
+        _ = gpa;
+        for (self.historical_scopes.items) |*scope| {
+            if (sameHashList(scope.heads, heads)) return scope.clock;
         }
-        return &self.read_scope.?;
+        const copied = try self.gpa.dupe(ChangeHash, heads);
+        errdefer self.gpa.free(copied);
+        const clock = try self.gpa.create(clockmod.Clock);
+        errdefer self.gpa.destroy(clock);
+        clock.* = try self.clockAtHeads(self.gpa, heads);
+        errdefer clock.deinit();
+        try self.historical_scopes.append(self.gpa, .{ .heads = copied, .clock = clock });
+        return clock;
     }
 
     /// The three cases [`diffIncremental`] and [`diff`] resolve between
     /// ([`AutoCommit::diff_inner`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs),
     /// `autocommit.rs:259-305`).
     ///
-    /// **Upstream's fourth case is not here**: `diff_cache`
-    /// (`autocommit.rs:262-269`) memoises the last `(range, obj, recursive,
-    /// patches)` and answers a repeat of the same question with a clone. It is
-    /// a pure speed-up over a function this one already computes, and the
-    /// port's [`patchesmod.Patches`] is an arena that a cache would have to
-    /// deep-copy anyway — [`patchesmod.Patches.appendFrom`] is that copy — so
-    /// porting it would trade an allocation on every repeated diff for one on
-    /// every cached hit and cache the answer to a question nobody asked twice.
-    ///
-    /// The three that remain are in upstream's order and each is a different
-    /// **source** of patches, not a different shape:
+    /// The facade owns its separate single-entry diff cache. This shared helper
+    /// resolves the remaining patch sources without creating another cache:
     ///
     /// 1. **the recorded log** — `after` is the present, `before` is the cursor
     ///    and the log is active (`autocommit.rs:276-286`);
@@ -6572,7 +6634,7 @@ pub const Document = struct {
     ///    present (`autocommit.rs:288-296`), which reads **unscoped** because
     ///    `patch_log.heads` is left `None` (`autocommit.rs:293`);
     /// 3. **the general walk** — [`diffObj`] (`autocommit.rs:297-302`).
-    fn diffInner(
+    pub fn diffInner(
         self: *Document,
         gpa: Allocator,
         obj: ExId,
@@ -6580,7 +6642,6 @@ pub const Document = struct {
         after: []const ChangeHash,
         recursive: bool,
     ) DiffError!patchesmod.Patches {
-        try self.requireRecovered();
         if (self.graph.headsAreCurrent(after) and
             sameHashList(before, self.diff_cursor.items) and
             self.patch_log.isActive())
@@ -6655,19 +6716,11 @@ fn patchReadError(e: itermap.ReadError) Error {
     };
 }
 
-/// The nine names [`patchesmod.PatchLog`] reads off a document
-/// ([`patchesmod.assertDoc`]), over a [`Document`].
+/// The private patch-reader adapter over a raw Document.
 ///
-/// **An adapter and not the [`Document`] itself, and one name is the whole
-/// reason.** [`Document.objectType`] answers `Error!ObjType` — upstream's
-/// `Automerge::object_type` is `Result<ObjType, AutomergeError>`
-/// (`automerge.rs:2282-2287`) and an id that names no object is a refusal —
-/// while the patch layer reads `doc.objectType(id) orelse return null`
-/// (`patches.zig`:1892`): for [`patchesmod.ExposeQueue`] an object it cannot
-/// name is an **empty queue**, not a failure, because the ids in that queue
-/// came from a log and a log can name an object this document does not have.
-/// A `Document` that answered `?ObjType` would break the `ReadDoc` surface
-/// [API.md](../API.md) §Read declares; this one answers both.
+/// Supplies indexed patch walks without adding patch-specific getters to the
+/// public ReadDoc interface. Object type resolution remains Error!ObjType; the
+/// expose queue may treat only NotAnObject as absent and propagates other errors.
 ///
 /// **The arena is the whole of the lifetime story.** Every payload the patch
 /// layer reads is *borrowed* here and *owned* by the reader that produced it:
@@ -6689,16 +6742,9 @@ const PatchDoc = struct {
     /// Every borrowed payload the patch layer reads lives here, and dies in
     /// [`deinit`](PatchDoc.deinit).
     arena: std.heap.ArenaAllocator,
-    /// The clock for the log's `heads`, or null when the log has none.
-    ///
-    /// **Built by the caller and not here**, because
-    /// [`patchesmod.PatchLog`] asks for it in a `const` method
-    /// (`patches.zig`:2454) and a lazy build would have nowhere to record a
-    /// refusal. [`Document.diffClocks`] already builds this clock for the
-    /// [`clockmod.ClockRange`] and hands the same one over: **the log's
-    /// `heads` and this clock are the same point in history by construction**,
-    /// which is the invariant upstream's `patch_log.heads` exists to hold
-    /// (`patch_log.rs`:511-512`).
+    /// Borrowed cone supplied by a diff caller. Its buffers outlive this adapter.
+    /// With no supplied cone, explicit heads resolve through the document's
+    /// stable historical pool; the adapter never invents an empty clock.
     clock: ?clockmod.Clock,
 
     fn init(gpa: Allocator, doc: *const Document, clock: ?clockmod.Clock) PatchDoc {
@@ -6719,32 +6765,32 @@ const PatchDoc = struct {
         return self.doc.textEncoding();
     }
 
-    pub fn idToExid(self: *const PatchDoc, id: OpId) ExId {
+    /// Exports through the document's actor table. Retained log suffixes can
+    /// name a missing slot; report it at rendering rather than inventing an actor
+    /// or rejecting the successful application (`op_set2/op_set.rs:1054-1060`).
+    pub fn exportPatchId(self: *const PatchDoc, id: OpId) Error!ExId {
+        if (id.eql(OpId.root)) return .root;
+        if (id.actor >= self.doc.ops.actors.items.len) return error.InvalidActorIndex;
         return self.doc.idToExid(id);
     }
 
-    /// **Optional, where [`Document.objectType`] is not** — see this type's
-    /// doc comment. The root is a map whether or not a row created it, which is
-    /// what `Document.objectType` answers for it too.
-    pub fn objectType(self: *const PatchDoc, id: ExId) ?ObjType {
-        if (id == .root) return .map;
-        return self.doc.ops.objectType(id);
+    /// Uses the raw document's typed, byte-authoritative object resolution.
+    pub fn objectType(self: *const PatchDoc, id: ExId) Error!ObjType {
+        return self.doc.objectType(id);
     }
 
     pub fn objectParent(self: *const PatchDoc, id: ExId) ?ExId {
         return self.doc.objectParent(id);
     }
 
-    /// **Never null in practice**, and the empty clock is what it answers with
-    /// when it is: the patch layer asks only when the log names `heads`
-    /// (`patches.zig`:2454), and every log that does here is
-    /// [`Document.diffClocks`]'s, which passes the clock for exactly those
-    /// heads. **The `heads` themselves are not read**: this adapter has
-    /// already resolved them, and the argument is kept for the shape
-    /// [`patchesmod.assertDoc`] checks.
-    pub fn clockAt(self: *const PatchDoc, heads: []const ChangeHash) clockmod.Clock {
-        _ = heads;
-        return self.clock orelse clockmod.Clock.initEmpty(self.gpa);
+    /// Borrows the caller's resolved cone or a stable document-owned head clock.
+    pub fn clockAtScope(
+        self: *const PatchDoc,
+        gpa: Allocator,
+        heads: []const ChangeHash,
+    ) Error!*const clockmod.Clock {
+        if (self.clock) |*clock| return clock;
+        return @constCast(self.doc).clockAtScope(gpa, heads);
     }
 
     pub fn actorList(self: *const PatchDoc) []const ActorId {
@@ -6909,7 +6955,7 @@ const PatchDoc = struct {
 /// put `automerge-c`'s indices in the wrong unit**; see
 /// [`c.doc.cTextEncoding`](../c/doc.zig), which is what the C ABI uses.
 pub fn defaultTextEncoding() TextEncoding {
-    return .unicode_code_point;
+    return TextEncoding.platformDefault();
 }
 
 /// Turns a parser's refusal into the document API's, so an entry point whose
@@ -7415,7 +7461,7 @@ fn addKeyChange(
 /// actor that inserts into the first actor's list and writes into its map — so
 /// the change-op columns carry more than one actor.
 fn buildSample(gpa: Allocator) !Document {
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     const a = try doc.putActorRef(gpa, .{ .bytes = actor_a });
     const b = try doc.putActorRef(gpa, .{ .bytes = actor_b });
@@ -7517,7 +7563,7 @@ fn buildSample(gpa: Allocator) !Document {
 /// fork from, in upstream's `make_sure_load_incremental_doesnt_skip_a_load_with_a_common_head`
 /// (`tests/test.rs:3159-3192`).
 fn buildBase(gpa: Allocator) !Document {
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     const a = try doc.putActorRef(gpa, .{ .bytes = actor_a });
     const specs = [_]OpSpec{
@@ -7611,7 +7657,7 @@ test "every corpus fixture loads or is refused exactly as the manifest records" 
     for (corpus) |case| {
         const bytes = try dir.readFileAlloc(io, case.name, gpa, .limited(max_fixture_bytes));
         defer gpa.free(bytes);
-        if (Document.load(gpa, std.testing.io, bytes, defaultTextEncoding(), .auto)) |loaded| {
+        if (Document.load(gpa, std.testing.io, bytes, defaultTextEncoding())) |loaded| {
             var doc = loaded;
             defer doc.deinit();
             if (!case.must_load) {
@@ -7646,7 +7692,7 @@ test "every corpus fixture loads or is refused exactly as the manifest records" 
 /// whole point of the helper: the loop that calls it has to survive a cut to
 /// reach the next one.
 fn loadAndRelease(gpa: Allocator, bytes: []const u8) LoadError!usize {
-    var doc = try Document.load(gpa, std.testing.io, bytes, defaultTextEncoding(), .auto);
+    var doc = try Document.load(gpa, std.testing.io, bytes, defaultTextEncoding());
     defer doc.deinit();
     return doc.ops.len();
 }
@@ -7775,7 +7821,7 @@ test "a change chunk the reference wrote re-encodes to the reference's own bytes
     const expected = try err.hexFrom(gpa, reference_change_1_hash);
     defer gpa.free(expected);
 
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     try expectRoundTripped(&doc, gpa, framed, expected);
 }
@@ -7789,7 +7835,7 @@ test "a compressed change chunk the reference wrote re-encodes to the same bytes
     const expected = try err.hexFrom(gpa, reference_change_0_hash);
     defer gpa.free(expected);
 
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     try expectRoundTripped(&doc, gpa, framed, expected);
 }
@@ -7877,7 +7923,7 @@ test "the reference document's changes come back with the reference's hashes" {
         else => base_chunk.data,
     };
 
-    var doc = try Document.load(gpa, std.testing.io, bytes, defaultTextEncoding(), .auto);
+    var doc = try Document.load(gpa, std.testing.io, bytes, defaultTextEncoding());
     defer doc.deinit();
     // The base change, and two concurrent changes the fork made.
     try testing.expectEqual(@as(usize, 3), doc.graph.len());
@@ -7918,7 +7964,7 @@ test "the reference document's changes come back with the reference's hashes" {
     // equivalence is measured: not byte for byte, but materialized.
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var reloaded = try Document.load(gpa, std.testing.io, saved, defaultTextEncoding(), .auto);
+    var reloaded = try Document.load(gpa, std.testing.io, saved, defaultTextEncoding());
     defer reloaded.deinit();
     try doc.debugCmp(&reloaded);
 }
@@ -7934,10 +7980,9 @@ test "a document built here saves, reloads, and compares equal; one more row doe
     // ([`columns.rs:426-427`](opset/columns.zig)). Fifteen would be a count that
     // confuses a delete with a tombstone row.
     try testing.expectEqual(@as(usize, 14), doc.len());
-    try testing.expectEqual(
-        Stats{ .num_changes = 2, .num_ops = 14, .num_actors = 2 },
-        doc.stats(),
-    );
+    try testing.expectEqual(@as(usize, 2), doc.stats().num_changes);
+    try testing.expectEqual(@as(usize, 14), doc.stats().num_ops);
+    try testing.expectEqual(@as(usize, 2), doc.stats().num_actors);
     try testing.expectEqual(ObjType.text, try doc.objectType(.{ .id = OpId.init(2, 0) }));
     try testing.expectEqual(ObjType.list, try doc.objectType(.{ .id = OpId.init(1, 0) }));
     try testing.expectEqual(ObjType.map, try doc.objectType(.root));
@@ -7968,7 +8013,7 @@ test "a document built here saves, reloads, and compares equal; one more row doe
 
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var reloaded = try Document.load(gpa, std.testing.io, saved, defaultTextEncoding(), .auto);
+    var reloaded = try Document.load(gpa, std.testing.io, saved, defaultTextEncoding());
     defer reloaded.deinit();
     try doc.debugCmp(&reloaded);
 
@@ -7993,7 +8038,7 @@ test "a document is still readable after the bytes it was loaded from are gone" 
     defer doc.deinit();
     const saved = try doc.save(gpa);
 
-    var loaded = try Document.load(gpa, std.testing.io, saved, defaultTextEncoding(), .auto);
+    var loaded = try Document.load(gpa, std.testing.io, saved, defaultTextEncoding());
     defer loaded.deinit();
     // **The buffer the document was read from is gone before every read below.**
     gpa.free(saved);
@@ -8065,7 +8110,7 @@ test "loadIncremental into a non-empty document equals loading the same bytes wh
     // So the base is a **prefix** of `whole`: actor_a's first change, forked
     // at, which `buildSample` applies before actor_b's.
     const mid = try whole.graph.hashForActorSeq(0, 1);
-    var base = try whole.forkAt(gpa, &.{mid}, .auto);
+    var base = try whole.forkAt(gpa, &.{mid});
     defer base.deinit();
     const added = try base.loadIncremental(gpa, bytes);
     try testing.expect(added > 0);
@@ -8074,7 +8119,7 @@ test "loadIncremental into a non-empty document equals loading the same bytes wh
     // document the incremental result has to be equal to — the *materialised*
     // op set, not the heads, because two documents can share heads and still
     // read differently.
-    var direct = try Document.load(gpa, std.testing.io, bytes, defaultTextEncoding(), .auto);
+    var direct = try Document.load(gpa, std.testing.io, bytes, defaultTextEncoding());
     defer direct.deinit();
     try base.debugCmp(&direct);
 }
@@ -8118,7 +8163,7 @@ test "a snapshot followed by change chunks loads as the snapshot plus those chan
     }
     try testing.expectEqual(@as(usize, 4), doc.graph.len());
 
-    var loaded = try Document.load(gpa, std.testing.io, stream.items, defaultTextEncoding(), .auto);
+    var loaded = try Document.load(gpa, std.testing.io, stream.items, defaultTextEncoding());
     defer loaded.deinit();
     // **All four changes, not the snapshot's two.**
     try testing.expectEqual(@as(usize, 4), loaded.graph.len());
@@ -8150,7 +8195,7 @@ test "load refuses a change stream that leaves a change queued, and loadIncremen
     // the one it depends on**, which is the one thing an incremental load is
     // for.
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
 
     // **Two changes of one actor, the second naming the first as a
@@ -8186,7 +8231,7 @@ test "load refuses a change stream that leaves a change queued, and loadIncremen
     // the refusal assertion below and fail here — and that is not upstream's
     // rule, because the condition is `!am.queue.is_empty() && …`: an empty
     // queue is half of it and the chunk type is the other half.
-    var alone = try Document.load(gpa, std.testing.io, first, defaultTextEncoding(), .auto);
+    var alone = try Document.load(gpa, std.testing.io, first, defaultTextEncoding());
     defer alone.deinit();
     try testing.expectEqual(@as(usize, 1), alone.graph.len());
     try testing.expectEqual(@as(usize, 0), alone.queue.len());
@@ -8204,7 +8249,7 @@ test "load refuses a change stream that leaves a change queued, and loadIncremen
     // without a `deinit`, so a port that wrongly accepts the stream buries
     // the one line naming the fault under the allocator's report of every
     // allocation it made.
-    if (Document.load(gpa, std.testing.io, second, defaultTextEncoding(), .auto)) |accepted| {
+    if (Document.load(gpa, std.testing.io, second, defaultTextEncoding())) |accepted| {
         var wrongly = accepted;
         wrongly.deinit();
         return error.OrphanStreamAccepted;
@@ -8218,7 +8263,7 @@ test "load refuses a change stream that leaves a change queued, and loadIncremen
     // *dropped* and a nonzero row count would mean it was not an orphan at
     // all. Either of those is a document that is not the one the bytes
     // describe.
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     try testing.expectEqual(@as(usize, 0), try peer.loadIncremental(gpa, second));
     try testing.expectEqual(@as(usize, 0), peer.graph.len());
@@ -8246,7 +8291,7 @@ test "a truncated change stream is a parse error under load, and is tolerated un
     // sent a stream that was fine to send. This test is the half that pins the
     // position; the test above pins the rule.
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
 
     const h1 = try doc.getHeads(gpa);
@@ -8282,7 +8327,7 @@ test "a truncated change stream is a parse error under load, and is tolerated un
     // **What is asserted is what the error is *not*.** Naming the variant
     // would pin the framing helper's answer rather than this function's
     // position, and the position is the thing under test.
-    if (Document.load(gpa, std.testing.io, stream.items, defaultTextEncoding(), .auto)) |accepted| {
+    if (Document.load(gpa, std.testing.io, stream.items, defaultTextEncoding())) |accepted| {
         var wrongly = accepted;
         wrongly.deinit();
         return error.TruncatedStreamAccepted;
@@ -8290,16 +8335,26 @@ test "a truncated change stream is a parse error under load, and is tolerated un
         try testing.expect(e != error.MissingDeps);
     }
 
-    // **`loadIncremental` keeps it**, which is the case that would actually
-    // change if the check were misplaced: its empty-document arm is the
-    // `OnPartialLoad::Ignore` path (`:1038-1045`), the orphan is queued, and
-    // the truncation is swallowed. The caller gets a document, the queued
-    // change is **still queued**, and neither fact is an error.
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    // Empty receivers use the full-load Ignore policy, which discards the
+    // entire change stream on a partial tail (`automerge.rs:985-989,1038-1045`).
+    // No prefix is applied or queued, unlike a nonempty incremental receiver.
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     try testing.expectEqual(@as(usize, 0), try peer.loadIncremental(gpa, stream.items));
-    try testing.expectEqual(@as(usize, 1), peer.queue.len());
+    try testing.expectEqual(@as(usize, 0), peer.queue.len());
     try testing.expectEqual(@as(usize, 0), peer.graph.len());
+
+    // A real nonempty baseline takes the incremental Partial prefix instead
+    // (`automerge.rs:1053-1064`), so the orphan is queued rather than discarded.
+    var existing = try Document.init(gpa, std.testing.io);
+    defer existing.deinit();
+    _ = try addKeyChange(&existing, gpa, actor_b, 1, 1, "baseline", &.{});
+    try testing.expectEqual(@as(usize, 0), try existing.loadIncremental(gpa, stream.items));
+    try testing.expectEqual(@as(usize, 1), existing.graph.len());
+    try testing.expectEqual(@as(usize, 1), existing.queue.len());
+    try testing.expectEqual(@as(usize, 2), try existing.loadIncremental(gpa, first));
+    try testing.expectEqual(@as(usize, 3), existing.graph.len());
+    try testing.expectEqual(@as(usize, 0), existing.queue.len());
 }
 
 test "a corrupt tail refuses the load before it touches the caller's document" {
@@ -8334,7 +8389,7 @@ test "a corrupt tail refuses the load before it touches the caller's document" {
     // **The control: a fresh document refuses, and for the framing reason.**
     // This is the same walk a caller who only wants a document back takes, and
     // it is what says the tail's checksum was the refusal taken.
-    if (Document.load(gpa, std.testing.io, stream.items, defaultTextEncoding(), .auto)) |accepted| {
+    if (Document.load(gpa, std.testing.io, stream.items, defaultTextEncoding())) |accepted| {
         var wrongly = accepted;
         wrongly.deinit();
         return error.CorruptTailAccepted;
@@ -8349,7 +8404,7 @@ test "a corrupt tail refuses the load before it touches the caller's document" {
     // the key. The counts alone would not catch it — the snapshot holds
     // exactly the rows this document already had, being a save of a document
     // built the same way — so the key is read back through the read path.
-    var target = try Document.init(gpa, std.testing.io, .auto);
+    var target = try Document.init(gpa, std.testing.io);
     defer target.deinit();
     const none = try target.getHeads(gpa);
     defer gpa.free(none);
@@ -8362,14 +8417,14 @@ test "a corrupt tail refuses the load before it touches the caller's document" {
 
     try testing.expectError(
         error.InvalidChecksum,
-        target.loadInto(gpa, stream.items, defaultTextEncoding(), .auto),
+        target.loadInto(gpa, stream.items, defaultTextEncoding()),
     );
 
     try testing.expectEqual(before_ops, target.ops.len());
     try testing.expectEqual(before_graph, target.graph.len());
     try testing.expectEqual(@as(usize, 0), target.queue.len());
-    // **`Document.reset` mints a new actor**, so this is the check a rebuild
-    // cannot pass by accident.
+    // Empty-owner replacement preserves the caller's actor rather than keeping
+    // the fresh loader's randomly minted actor.
     try testing.expectEqualStrings(actor_before, target.getActorId().bytes);
     const readonly = @import("read.zig");
     if ((try readonly.get(&target, ExId.root, .{ .key = "mine" })) == null) {
@@ -8379,7 +8434,7 @@ test "a corrupt tail refuses the load before it touches the caller's document" {
 
 test "an incremental load applies the prefix of a stream that stops mid-chunk" {
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
 
     const h1 = try doc.getHeads(gpa);
@@ -8410,31 +8465,34 @@ test "an incremental load applies the prefix of a stream that stops mid-chunk" {
     // queued — the truncation is swallowed and the prefix is not lost with it,
     // which is what the chunk list this path used to build first existed to
     // get right.
-    var peer = try Document.load(gpa, std.testing.io, first, defaultTextEncoding(), .auto);
+    var peer = try Document.load(gpa, std.testing.io, first, defaultTextEncoding());
     defer peer.deinit();
     try testing.expectEqual(@as(usize, 1), peer.graph.len());
     try testing.expectEqual(@as(usize, 1), try peer.loadIncremental(gpa, stream.items));
     try testing.expectEqual(@as(usize, 2), peer.graph.len());
     try testing.expectEqual(@as(usize, 0), peer.queue.len());
 
-    // **The `.keep` arm of [`Document.loadIntoWith`]**, which is the door an
-    // empty document reaches through [`Document.loadIncremental`]: the same
-    // walk, the same prefix, the same swallowed refusal, and the one change in
-    // it **queued** rather than dropped, because a document with nothing in it
-    // cannot hold a change whose dependency it does not have. This is the
-    // `OnPartialLoad::Ignore` path upstream reaches at `:1038-1045`.
-    var fresh = try Document.init(gpa, std.testing.io, .auto);
+    // Empty receivers use full-load Ignore, not the nonempty prefix walk.
+    // The Partial arm discards both the first chunk and the decoded tail
+    // (`automerge.rs:985-989,1038-1045`), even when the prefix is an orphan.
+    var fresh = try Document.init(gpa, std.testing.io);
     defer fresh.deinit();
     try testing.expectEqual(@as(usize, 0), try fresh.loadIncremental(gpa, stream.items));
     try testing.expectEqual(@as(usize, 0), fresh.graph.len());
+    try testing.expectEqual(@as(usize, 0), fresh.queue.len());
+    // Ignore only discards partial streams: the complete orphan is queued.
+    try testing.expectEqual(@as(usize, 0), try fresh.loadIncremental(gpa, second));
     try testing.expectEqual(@as(usize, 1), fresh.queue.len());
+    try testing.expectEqual(@as(usize, 2), try fresh.loadIncremental(gpa, first));
+    try testing.expectEqual(@as(usize, 2), fresh.graph.len());
+    try testing.expectEqual(@as(usize, 0), fresh.queue.len());
 
     // **And the whole load refuses the very same bytes**, which is the other
     // half of the same walk: the prefix is dropped with the tail and the
     // truncation is the answer. Matched by hand and the document freed first,
     // because `expectError` drops a `Document` on the passing path and the
     // allocator would then bury the assertion under its report.
-    if (Document.load(gpa, std.testing.io, stream.items, defaultTextEncoding(), .auto)) |accepted| {
+    if (Document.load(gpa, std.testing.io, stream.items, defaultTextEncoding())) |accepted| {
         var wrongly = accepted;
         wrongly.deinit();
         return error.TruncatedStreamAccepted;
@@ -8458,7 +8516,7 @@ test "the same bytes, three ways, materialise one document" {
 
     // 1. **Whole.** The bytes read into an empty document, which is what
     //    [`Document.load`] does and the path every fixture in the corpus takes.
-    var via_load = try Document.load(gpa, std.testing.io, bytes, defaultTextEncoding(), .auto);
+    var via_load = try Document.load(gpa, std.testing.io, bytes, defaultTextEncoding());
     defer via_load.deinit();
 
     // 2. **Incremental.** A document that already holds a prefix, told to read
@@ -8467,12 +8525,12 @@ test "the same bytes, three ways, materialise one document" {
     // 3. **Direct.** The same document handed the changes one at a time
     //    ([`Automerge::apply_changes`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):1090-1106),
     //    which is the route a sync message's change list takes.
-    var via_load_incremental = try whole.forkAt(gpa, &.{mid}, .auto);
+    var via_load_incremental = try whole.forkAt(gpa, &.{mid});
     defer via_load_incremental.deinit();
     const added = try via_load_incremental.loadIncremental(gpa, bytes);
     try testing.expect(added > 0);
 
-    var via_changes = try whole.forkAt(gpa, &.{mid}, .auto);
+    var via_changes = try whole.forkAt(gpa, &.{mid});
     defer via_changes.deinit();
     var tail = try whole.getChanges(gpa, &.{mid});
     defer tail.deinit(gpa);
@@ -8521,7 +8579,7 @@ test "the index a document is built with is the index its bytes rebuild" {
     defer built.deinit();
     const saved = try built.save(gpa);
     defer gpa.free(saved);
-    var reloaded = try Document.load(gpa, std.testing.io, saved, defaultTextEncoding(), .auto);
+    var reloaded = try Document.load(gpa, std.testing.io, saved, defaultTextEncoding());
     defer reloaded.deinit();
 
     // **Soundness first, on both sides, and separately.** `debugCmp` computes
@@ -8576,7 +8634,9 @@ test "the index a document is built with is the index its bytes rebuild" {
         const heads = try doc.getHeads(gpa);
         defer gpa.free(heads);
         try testing.expectEqual(@as(usize, 1), heads.len);
-        try testing.expectEqual(Stats{ .num_changes = 2, .num_ops = 14, .num_actors = 2 }, doc.stats());
+        try testing.expectEqual(@as(usize, 2), doc.stats().num_changes);
+        try testing.expectEqual(@as(usize, 14), doc.stats().num_ops);
+        try testing.expectEqual(@as(usize, 2), doc.stats().num_actors);
     }
 }
 
@@ -8676,12 +8736,12 @@ test "the same operations committed the same way produce the same hash" {
     // re-derive the very same change from its own op set.
     const gpa = testing.allocator;
 
-    var d1 = try Document.init(gpa, std.testing.io, .auto);
+    var d1 = try Document.init(gpa, std.testing.io);
     defer d1.deinit();
     d1.setActorId(.{ .bytes = actor_a });
-    var d2 = try d1.clone(gpa, .auto);
+    var d2 = try d1.clone(gpa);
     defer d2.deinit();
-    var d3 = try d1.clone(gpa, .auto);
+    var d3 = try d1.clone(gpa);
     defer d3.deinit();
 
     const a = try d1.putActorRef(gpa, .{ .bytes = actor_a });
@@ -8725,7 +8785,7 @@ test "the same operations committed the same way produce the same hash" {
 
 test "an empty commit is a change the document can hand back unchanged" {
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = actor_a });
 
@@ -8758,23 +8818,23 @@ test "a merge equals the same changes applied to this document directly" {
     defer base.deinit();
     const common = try onlyHead(&base, gpa);
 
-    var left = try base.clone(gpa, .auto);
+    var left = try base.clone(gpa);
     defer left.deinit();
-    var right = try base.clone(gpa, .auto);
+    var right = try base.clone(gpa);
     defer right.deinit();
     _ = try addKeyChange(&left, gpa, actor_b, 1, 2, "from_b", &.{common});
     _ = try addKeyChange(&right, gpa, actor_c, 1, 2, "from_c", &.{common});
 
     // Through the merge: the changes are re-derived from the *other* document's
     // op set, decoded, and merged as a batch.
-    var merged = try left.clone(gpa, .auto);
+    var merged = try left.clone(gpa);
     defer merged.deinit();
     const heads = try merged.merge(gpa, &right);
     defer gpa.free(heads);
     try testing.expectEqual(@as(usize, 2), heads.len);
 
     // Directly: the same changes, handed over one at a time.
-    var direct = try left.clone(gpa, .auto);
+    var direct = try left.clone(gpa);
     defer direct.deinit();
     // **`getChangesAdded` answers "the changes in the argument that `self`
     // does not have"** — upstream's "Get changes in `other` that are not in
@@ -8848,7 +8908,7 @@ test "a change that repeats a sequence number is refused through applyChanges an
     // **The same refusal through a merge**, which is how a caller reaches it:
     // `other` holds a *different* change at (actor a, 1), and `doc` holds its
     // own, so the screen sees a second claim on one slot.
-    var other = try Document.init(gpa, std.testing.io, .auto);
+    var other = try Document.init(gpa, std.testing.io);
     defer other.deinit();
     const oa = try other.putActorRef(gpa, .{ .bytes = actor_a });
     const ops2 = try buildOps(gpa, oa, &specs);
@@ -8872,7 +8932,7 @@ test "a change that repeats a sequence number is refused through applyChanges an
 
 test "two changes claiming one author are refused, through applyChanges and through merge" {
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     const c = try doc.putActorRef(gpa, .{ .bytes = actor_c });
 
@@ -8934,7 +8994,7 @@ test "two changes claiming one author are refused, through applyChanges and thro
     // to exist, which is the `(actor, seq)` the target already holds. The
     // sequence check ([`:1073-1077`](../../github-automerge-automerge/rust/automerge/src/op_set2/change/batch.rs))
     // fires first, and that is a different rule with its own test above.
-    var fresh = try Document.init(gpa, std.testing.io, .auto);
+    var fresh = try Document.init(gpa, std.testing.io);
     defer fresh.deinit();
     const fc = try fresh.putActorRef(gpa, .{ .bytes = actor_c });
     const f1 = try buildOps(gpa, fc, &first_specs);
@@ -8962,7 +9022,7 @@ test "a clone shares nothing mutable with the document it was cloned from" {
     const gpa = testing.allocator;
     var doc = try buildSample(gpa);
     defer doc.deinit();
-    var copy = try doc.clone(gpa, .auto);
+    var copy = try doc.clone(gpa);
     defer copy.deinit();
 
     // The clone starts equal, carries the same actor, and answers every reader
@@ -8993,14 +9053,14 @@ test "forkAt reads back the state at the heads it was given, and refuses a head 
     const common = try onlyHead(&doc, gpa);
     const later = try addKeyChange(&doc, gpa, actor_a, 2, 2, "later", &.{common});
 
-    var at_common = try doc.forkAt(gpa, &.{common}, .auto);
+    var at_common = try doc.forkAt(gpa, &.{common});
     defer at_common.deinit();
     try testing.expectEqual(@as(usize, 1), at_common.len());
     var common_heads = try at_common.getHeads(gpa);
     defer gpa.free(common_heads);
     try testing.expectEqualSlices(u8, &common.bytes, &common_heads[0].bytes);
 
-    var at_later = try doc.forkAt(gpa, &.{later}, .auto);
+    var at_later = try doc.forkAt(gpa, &.{later});
     defer at_later.deinit();
     try testing.expectEqual(@as(usize, 2), at_later.len());
     var later_heads = try at_later.getHeads(gpa);
@@ -9014,19 +9074,17 @@ test "forkAt reads back the state at the heads it was given, and refuses a head 
     const unknown = ChangeHash.fromChecksum(.{ 0xde, 0xad, 0xbe, 0xef });
     try testing.expectError(
         error.InvalidHash,
-        doc.forkAt(gpa, &.{unknown}, .auto),
+        doc.forkAt(gpa, &.{unknown}),
     );
 }
 
 test "an empty document answers every entry point rather than trapping" {
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
 
-    try testing.expectEqual(Mode.auto, doc.documentMode());
     try testing.expect(doc.isEmpty());
     try testing.expectEqual(@as(usize, 0), doc.len());
-    try testing.expectEqual(Stats{ .num_changes = 0, .num_ops = 0, .num_actors = 0 }, doc.stats());
     try testing.expectEqual(defaultTextEncoding(), doc.textEncoding());
     try testing.expectEqual(ObjType.map, try doc.objectType(.root));
     try testing.expectEqual(@as(?ObjId, null), doc.objectParent(.{ .id = OpId.init(1, 0) }));
@@ -9072,7 +9130,7 @@ test "an empty document answers every entry point rather than trapping" {
     // document.
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var reloaded = try Document.load(gpa, std.testing.io, saved, defaultTextEncoding(), .auto);
+    var reloaded = try Document.load(gpa, std.testing.io, saved, defaultTextEncoding());
     defer reloaded.deinit();
     try reloaded.debugCmp(&doc);
     try testing.expect(reloaded.isEmpty());
@@ -9096,7 +9154,7 @@ test "a change's actor list is mapped, not copied: a second actor that sorts fir
     const first = "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0";
     const second = "1111111111111111111111111111111111";
 
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     _ = try doc.putActorRef(gpa, .{ .bytes = first });
     const b = try doc.putActorRef(gpa, .{ .bytes = second });
@@ -9141,7 +9199,7 @@ test "a change's actor list is mapped, not copied: a second actor that sorts fir
 
 test "an uncommitted document's last local change is the commit it just made" {
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = actor_a });
     const a = try doc.putActorRef(gpa, .{ .bytes = actor_a });
@@ -9167,40 +9225,13 @@ test "an uncommitted document's last local change is the commit it just made" {
     try testing.expectEqualSlices(u8, &hash.bytes, &last.change.hash.bytes);
 }
 
-test "the two flavours are one type with a flag, and behave the same" {
-    const gpa = testing.allocator;
-    var manual = try Document.init(gpa, std.testing.io, .manual);
-    defer manual.deinit();
-    var auto = try Document.init(gpa, std.testing.io, .auto);
-    defer auto.deinit();
-    try testing.expectEqual(Mode.manual, manual.documentMode());
-    try testing.expectEqual(Mode.auto, auto.documentMode());
-    manual.setMode(.auto);
-    try testing.expectEqual(Mode.auto, manual.documentMode());
-
-    // Every entry point in this file is the same in both modes, so the flag
-    // only decides what the transaction slice may do.
-    for ([_]*Document{ &manual, &auto }) |doc| {
-        doc.setActorId(.{ .bytes = actor_a });
-        const hash = try doc.emptyCommit(gpa, "same", 3);
-        const saved = try doc.save(gpa);
-        defer gpa.free(saved);
-        var reloaded = try Document.load(gpa, std.testing.io, saved, defaultTextEncoding(), doc.documentMode());
-        defer reloaded.deinit();
-        try doc.debugCmp(&reloaded);
-        var got = (try doc.getChangeByHash(gpa, hash)).?;
-        defer got.deinit(gpa);
-        try testing.expectEqualSlices(u8, &hash.bytes, &got.change.hash.bytes);
-    }
-}
-
 test "a local commit's message and author footer survive the collector's re-encoding" {
     // **The bytes a change is hashed over include its message and its footer.**
     // `node_info` is the only record of either, and the collector rebuilds the
     // change from it, so dropping either produced a document that loaded, held
     // the right hash, and handed a peer different bytes under it.
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     doc.setAuthor(gpa, "a person") catch |e| return e;
     doc.setActorId(.{ .bytes = actor_a });
@@ -9302,7 +9333,7 @@ fn commitAllocBytes(gpa: Allocator, n: usize, prior: usize) !usize {
     // of two readings wants.
     var failing: testing.FailingAllocator = .init(gpa, .{});
     const inner = failing.allocator();
-    var doc = try Document.init(inner, std.testing.io, .auto);
+    var doc = try Document.init(inner, std.testing.io);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = actor_a });
     const a = try doc.putActorRef(inner, .{ .bytes = actor_a });
@@ -9401,7 +9432,7 @@ test "an actor that sorts before one already in the table lands in the middle" {
     // The property is the *table*, because the renumbering is invisible in a
     // single document with one actor.
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     const high = "ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00";
     const low = "0011001100110011001100110011001100110011001100110011";
@@ -9452,14 +9483,15 @@ test "a no-op commit survives a merge: the cached actor index is rewritten with 
     const trans = @import("transact.zig");
     const readonly = @import("read.zig");
 
-    var doc = try Document.init(gpa, std.testing.io, .manual);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = actor_b });
     {
         var tx = try trans.Transaction.open(gpa, &doc);
-        defer tx.deinit();
+        defer tx.deinit() catch unreachable;
         _ = try tx.put(ExId.root, .{ .key = "a" }, .{ .int = 1 });
-        _ = try tx.commit(null, null);
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
     }
     try testing.expectEqual(@as(usize, 1), doc.numActors());
 
@@ -9470,18 +9502,20 @@ test "a no-op commit survives a merge: the cached actor index is rewritten with 
     // fork** so the commit's actor slots *after* the document's: the removal
     // then hits the cached index exactly, which is the case that used to
     // rename the document's actor.
-    var doc2 = try doc.forkAt(gpa, forkHeads, .manual);
+    var doc2 = try doc.forkAt(gpa, forkHeads);
     defer doc2.deinit();
     doc2.setActorId(.{ .bytes = actor_c });
     const actor_before = doc2.getActorId();
     try testing.expectEqualStrings(actor_c, actor_before.bytes);
     {
         var tx = try trans.Transaction.open(gpa, &doc2);
-        defer tx.deinit();
+        defer tx.deinit() catch unreachable;
         // The transaction interned `actor_c` at the end of the table.
         try testing.expectEqual(@as(ActorIdx, 1), tx.actor);
         try testing.expectEqual(@as(u64, 1), tx.seq);
-        try testing.expectEqual(@as(?ChangeHash, null), try tx.commit(null, null));
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+        try testing.expectEqual(@as(?ChangeHash, null), committed.hash);
     }
     // **The table is back to one actor and the document's actor is the same
     // actor it was.** The index is *not* the same number — that is the point —
@@ -9490,14 +9524,15 @@ test "a no-op commit survives a merge: the cached actor index is rewritten with 
     try testing.expectEqualStrings(actor_c, doc2.getActorId().bytes);
 
     // Step 3: a second fork writes into the document `doc` did not have.
-    var doc3 = try doc.forkAt(gpa, forkHeads, .manual);
+    var doc3 = try doc.forkAt(gpa, forkHeads);
     defer doc3.deinit();
     doc3.setActorId(.{ .bytes = actor_a });
     {
         var tx = try trans.Transaction.open(gpa, &doc3);
-        defer tx.deinit();
+        defer tx.deinit() catch unreachable;
         _ = try tx.put(ExId.root, .{ .key = "b" }, .{ .int = 2 });
-        _ = try tx.commit(null, null);
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
     }
 
     // Step 4: the merge interns `actor_a`, which sorts **first**, so every
@@ -9540,7 +9575,7 @@ test "a no-op commit survives a merge: the cached actor index is rewritten with 
     // document that merely has more actors in it.
     {
         var tx = try trans.Transaction.open(gpa, &doc2);
-        defer tx.deinit();
+        defer tx.deinit() catch unreachable;
         const b = (try readonly.get(&doc2, ExId.root, .{ .key = "b" })).?;
         try testing.expectEqual(@as(i64, 2), b.value.scalar.int);
         const a = (try readonly.get(&doc2, ExId.root, .{ .key = "a" })).?;
@@ -9574,33 +9609,35 @@ test "a load sizes every actor index from the actor table, not from the changes"
     const gpa = testing.allocator;
     const trans = @import("transact.zig");
 
-    var doc = try Document.init(gpa, std.testing.io, .manual);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = "m" });
     {
         var tx = try trans.Transaction.open(gpa, &doc);
-        defer tx.deinit();
+        defer tx.deinit() catch unreachable;
         _ = try tx.put(ExId.root, .{ .key = "a" }, .{ .int = 1 });
-        _ = try tx.commit(null, null);
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
     }
     // An actor the table holds and no change ever names.
     _ = try doc.putActorRef(gpa, .{ .bytes = "z" });
     try testing.expectEqual(@as(usize, 2), doc.numActors());
 
     // A peer whose actor is `z`, so a change from `z` can arrive later.
-    var peer = try Document.init(gpa, std.testing.io, .manual);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     peer.setActorId(.{ .bytes = "z" });
     {
         var tx = try trans.Transaction.open(gpa, &peer);
-        defer tx.deinit();
+        defer tx.deinit() catch unreachable;
         _ = try tx.put(ExId.root, .{ .key = "b" }, .{ .int = 2 });
-        _ = try tx.commit(null, null);
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
     }
 
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var loaded = try Document.load(gpa, std.testing.io, saved, .unicode_code_point, .auto);
+    var loaded = try Document.load(gpa, std.testing.io, saved, .unicode_code_point);
     defer loaded.deinit();
 
     // **Every table holds both actors.** The first line is the invariant the
@@ -9676,7 +9713,7 @@ test "removing an actor renumbers the cached index without renaming the actor" {
 
     // Below the cached index: untouched.
     {
-        var doc = try Document.init(gpa, std.testing.io, .manual);
+        var doc = try Document.init(gpa, std.testing.io);
         defer doc.deinit();
         _ = try doc.putActorRef(gpa, .{ .bytes = low });
         _ = try doc.putActorRef(gpa, .{ .bytes = mid });
@@ -9691,7 +9728,7 @@ test "removing an actor renumbers the cached index without renaming the actor" {
 
     // Above the cached index: no rewrite owed.
     {
-        var doc = try Document.init(gpa, std.testing.io, .manual);
+        var doc = try Document.init(gpa, std.testing.io);
         defer doc.deinit();
         _ = try doc.putActorRef(gpa, .{ .bytes = low });
         _ = try doc.putActorRef(gpa, .{ .bytes = mid });
@@ -9704,7 +9741,7 @@ test "removing an actor renumbers the cached index without renaming the actor" {
 
     // The cached index's own slot: the actor survives, the index does not.
     {
-        var doc = try Document.init(gpa, std.testing.io, .manual);
+        var doc = try Document.init(gpa, std.testing.io);
         defer doc.deinit();
         _ = try doc.putActorRef(gpa, .{ .bytes = low });
         _ = try doc.putActorRef(gpa, .{ .bytes = mid });
@@ -9756,14 +9793,15 @@ test "a refused removeActor leaves every actor table as it found it" {
     const trans = @import("transact.zig");
     const readonly = @import("read.zig");
 
-    var doc = try Document.init(gpa, std.testing.io, .manual);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = "m" });
     {
         var tx = try trans.Transaction.open(gpa, &doc);
-        defer tx.deinit();
+        defer tx.deinit() catch unreachable;
         _ = try tx.put(ExId.root, .{ .key = "a" }, .{ .int = 1 });
-        _ = try tx.commit(null, null);
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
     }
     // **Two actors, one change.** `z` is the shape [`Document.putActorRef`]
     // makes on its own — interned and never committed, so a save writes it
@@ -9888,7 +9926,7 @@ test "an actor's author survives the changes that carry no footer" {
     }.check;
 
     const author = "a person";
-    var doc = try Document.init(gpa, std.testing.io, .manual);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     // `setAuthor` mints a fresh actor (`automerge.rs:389-396`), and this one
     // is the actor whose footer is written.
@@ -9897,18 +9935,20 @@ test "an actor's author survives the changes that carry no footer" {
 
     {
         var tx = try trans.Transaction.open(gpa, &doc);
-        defer tx.deinit();
+        defer tx.deinit() catch unreachable;
         _ = try tx.put(ExId.root, .{ .key = "a" }, .{ .int = 1 });
-        _ = try tx.commit(null, null);
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
     }
     // `seq == 1`, so this change carries the footer (`automerge.rs:568`).
     try expectAuthor(&doc, actor, author);
 
     {
         var tx = try trans.Transaction.open(gpa, &doc);
-        defer tx.deinit();
+        defer tx.deinit() catch unreachable;
         _ = try tx.put(ExId.root, .{ .key = "a" }, .{ .int = 2 });
-        _ = try tx.commit(null, null);
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
     }
     // **`seq == 2`, so this change carries none — and an absent footer records
     // nothing rather than clearing what the first change recorded.**
@@ -9936,7 +9976,7 @@ test "an actor's author survives the changes that carry no footer" {
     // would pass a spot check.
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var loaded = try Document.load(gpa, std.testing.io, saved, .unicode_code_point, .auto);
+    var loaded = try Document.load(gpa, std.testing.io, saved, .unicode_code_point);
     defer loaded.deinit();
     try expectAuthor(&loaded, actor, author);
     var named_by_a_footer: usize = 0;
@@ -9966,7 +10006,7 @@ test "growing the author table fills every new slot with null" {
     // next allocation reads zeros or leftovers is exactly the thing this test
     // must not depend on.
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .manual);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     _ = try doc.putActorRef(gpa, .{ .bytes = "a" });
     _ = try doc.putActorRef(gpa, .{ .bytes = "b" });
@@ -10020,7 +10060,7 @@ test "an incremental save writes every framed chunk it owes and frees each one" 
     try testing.expect(all.len > 0);
 
     // And the stream round-trips into a document that holds the same changes.
-    var peer = try Document.load(gpa, std.testing.io, all, defaultTextEncoding(), .auto);
+    var peer = try Document.load(gpa, std.testing.io, all, defaultTextEncoding());
     defer peer.deinit();
     try testing.expectEqual(@as(usize, doc.graph.len()), peer.graph.len());
 }
@@ -10095,7 +10135,7 @@ test "an incremental save owes what the last save did not, and then nothing" {
     // cursor excluded; an empty peer would have got nothing and said nothing,
     // because a change whose dependencies are missing is queued rather than
     // applied (`Document.queue`).
-    var peer = try Document.load(gpa, std.testing.io, whole, defaultTextEncoding(), .auto);
+    var peer = try Document.load(gpa, std.testing.io, whole, defaultTextEncoding());
     defer peer.deinit();
     try testing.expectEqual(@as(usize, 2), peer.graph.len());
     _ = try peer.loadIncremental(gpa, third);
@@ -10132,7 +10172,7 @@ test "a fork's save cursor starts empty, and a clone leaves the source's where i
     // does. A clone that saved through the cursor-setting wrapper would mark
     // the whole history as delivered to a caller that never saw it, and the
     // source's next incremental save would be empty for the rest of its life.
-    var copy = try doc.clone(gpa, .auto);
+    var copy = try doc.clone(gpa);
     defer copy.deinit();
     const after_clone = try doc.saveIncremental(gpa);
     defer gpa.free(after_clone);
@@ -10140,7 +10180,7 @@ test "a fork's save cursor starts empty, and a clone leaves the source's where i
 
     // **The fork, by contrast, owes everything**, because its cursor is empty
     // even though its parent's is not.
-    var forked = try doc.fork(gpa, .auto);
+    var forked = try doc.fork(gpa);
     defer forked.deinit();
     const inherited = try forked.saveIncremental(gpa);
     defer gpa.free(inherited);
@@ -10161,7 +10201,7 @@ test "a fork's save cursor starts empty, and a clone leaves the source's where i
 /// `automerge.rs`:568), and a hand-built change is the only way to give the
 /// same name to two different actors.
 fn namedAuthors(gpa: Allocator, names: [3][]const u8) !Document {
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     const actors = [3][]const u8{ actor_a, actor_b, actor_c };
     var hashes: [3]ChangeHash = undefined;
@@ -10206,7 +10246,7 @@ test "the author set is a set of names, and a name joins it on the change that c
     // ([`change_graph.rs`:563-566](../../github-automerge-automerge/rust/automerge/src/change_graph.rs)),
     // so a document that has named itself and has committed nothing reports
     // no authors at all.
-    var quiet = try Document.init(gpa, std.testing.io, .manual);
+    var quiet = try Document.init(gpa, std.testing.io);
     defer quiet.deinit();
     try quiet.setAuthor(gpa, "uncommitted");
     {
@@ -10216,9 +10256,10 @@ test "the author set is a set of names, and a name joins it on the change that c
     }
     {
         var tx = try trans.Transaction.open(gpa, &quiet);
-        defer tx.deinit();
+        defer tx.deinit() catch unreachable;
         _ = try tx.put(.root, .{ .key = "a" }, .{ .int = 1 });
-        _ = try tx.commit(null, null);
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
     }
     {
         const named_here = try quiet.getAuthors(gpa);
@@ -10244,7 +10285,7 @@ test "the author set is a set of names, and a name joins it on the change that c
     // **And the set survives a save and load**, because the footers do.
     const saved = try three.save(gpa);
     defer gpa.free(saved);
-    var reloaded = try Document.load(gpa, std.testing.io, saved, .unicode_code_point, .auto);
+    var reloaded = try Document.load(gpa, std.testing.io, saved, .unicode_code_point);
     defer reloaded.deinit();
     const again = try reloaded.getAuthors(gpa);
     defer gpa.free(again);
@@ -10323,9 +10364,11 @@ test "an actor removed from the table does not withdraw a name from the set" {
 fn commitRootPut(gpa: Allocator, doc: *Document, key: []const u8) !ChangeHash {
     const trans = @import("transact.zig");
     var tx = try trans.Transaction.open(gpa, doc);
-    defer tx.deinit();
+    defer tx.deinit() catch unreachable;
     _ = try tx.put(.root, .{ .key = key }, .{ .int = 1 });
-    return (try tx.commit(null, null)).?;
+    var committed = try tx.commit();
+    defer committed.deinit(gpa);
+    return committed.hash.?;
 }
 
 /// The two author tables agree, read through the public surface.
@@ -10366,16 +10409,16 @@ fn expectAuthorTablesAgree(gpa: Allocator, doc: *const Document) !void {
 
 test "a clone's author and actor are its own after the source is dropped" {
     const gpa = testing.allocator;
-    var src = try Document.init(gpa, std.testing.io, .manual);
+    var src = try Document.init(gpa, std.testing.io);
     try src.setAuthor(gpa, "ada");
     // **The actor is one this document has not interned**, so it is the
     // `.unused` arm: bytes the document borrowed rather than a slot in a
     // table, and the arm a clone has to copy like the author.
     try testing.expectEqual(@as(?ActorIdx, null), src.getActorIndex());
 
-    var copy = try src.clone(gpa, .manual);
+    var copy = try src.clone(gpa);
     defer copy.deinit();
-    var forked = try src.fork(gpa, .manual);
+    var forked = try src.fork(gpa);
     defer forked.deinit();
     // **`ActorId.bytes` is a slice over the source's arena**, so the bytes are
     // taken before it goes.
@@ -10405,7 +10448,7 @@ test "a clone's author and actor are its own after the source is dropped" {
     // than the fields of the document that wrote it.
     const saved = try copy.save(gpa);
     defer gpa.free(saved);
-    var peer = try Document.load(gpa, std.testing.io, saved, copy.textEncoding(), .auto);
+    var peer = try Document.load(gpa, std.testing.io, saved, copy.textEncoding());
     defer peer.deinit();
     const peer_names = try peer.getAuthors(gpa);
     defer gpa.free(peer_names);
@@ -10415,7 +10458,7 @@ test "a clone's author and actor are its own after the source is dropped" {
 
 test "a document's second name joins the set on the change that carries it" {
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .manual);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
 
     try doc.setAuthor(gpa, "alpha");
@@ -10459,18 +10502,15 @@ test "a document's second name joins the set on the change that carries it" {
 
 test "a queued change's footer is recorded only when the change is applied" {
     const gpa = testing.allocator;
-    // **Manual, because the two changes are written through a transaction.**
-    // [`Transaction.open`] refuses a document in autocommit mode with
-    // `error.InvalidOp` (`transact.zig:465`), and the source of the pair is
-    // committed twice here.
-    var src = try Document.init(gpa, std.testing.io, .manual);
+    // Two explicitly committed raw transactions establish the dependency pair.
+    var src = try Document.init(gpa, std.testing.io);
     defer src.deinit();
     try src.setAuthor(gpa, "the-author");
     const first = try commitRootPut(gpa, &src, "a");
     const second = try commitRootPut(gpa, &src, "b");
     const author_actor = src.getActorId().bytes;
 
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     // **The later change first.** It depends on the earlier one, so the screen
     // queues it — and a queued change is in no graph, so nothing has stamped
@@ -10504,13 +10544,13 @@ test "a queued change's footer is recorded only when the change is applied" {
 
 test "a merge brings the other side's names in, and a shared name is one author" {
     const gpa = testing.allocator;
-    var base = try Document.init(gpa, std.testing.io, .manual);
+    var base = try Document.init(gpa, std.testing.io);
     defer base.deinit();
     try base.setAuthor(gpa, "local");
     const base_change = try commitRootPut(gpa, &base, "a");
     const local_actor = base.getActorId().bytes;
 
-    var other = try base.fork(gpa, .manual);
+    var other = try base.fork(gpa);
     defer other.deinit();
     try other.setAuthor(gpa, "remote");
     const other_change = try commitRootPut(gpa, &other, "b");
@@ -10524,7 +10564,7 @@ test "a merge brings the other side's names in, and a shared name is one author"
     // its parent's author and `setAuthor` with the name it already has is the
     // no-op that keeps the actor — so the actor has to change once and the
     // name has to end up back where it started.
-    var same = try base.fork(gpa, .manual);
+    var same = try base.fork(gpa);
     defer same.deinit();
     try same.setAuthor(gpa, "somewhere-else");
     try same.setAuthor(gpa, "local");
@@ -10572,7 +10612,7 @@ test "a merge brings the other side's names in, and a shared name is one author"
 
 test "an empty author name is a name, and clearing the author keeps the names" {
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .manual);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
 
     // **An empty name is not no name.** `encodeAuthorFooter` returns early only
@@ -10624,10 +10664,8 @@ test "an empty author name is a name, and clearing the author keeps the names" {
 
 test "a fork at a head before a name was stamped excludes that name" {
     const gpa = testing.allocator;
-    // **Manual, because both changes are written through a transaction.**
-    // [`Transaction.open`] refuses a document in autocommit mode with
-    // `error.InvalidOp`, so the source commits here twice.
-    var src = try Document.init(gpa, std.testing.io, .manual);
+    // Two explicitly committed raw transactions establish the dependency pair.
+    var src = try Document.init(gpa, std.testing.io);
     defer src.deinit();
     try src.setAuthor(gpa, "first-name");
     // **The actor the first change was written by**, taken before the second
@@ -10639,7 +10677,7 @@ test "a fork at a head before a name was stamped excludes that name" {
     _ = try commitRootPut(gpa, &src, "b");
 
     const heads = [_]ChangeHash{early};
-    var forked = try src.forkAt(gpa, &heads, .auto);
+    var forked = try src.forkAt(gpa, &heads);
     defer forked.deinit();
     // **A fork applies the changes it reaches and nothing else**, and it sets no
     // author of its own ([`automerge.rs`:711-735](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
@@ -10758,7 +10796,7 @@ fn applyNamedRootPut(
 /// fail, so each arm reaches its checks on every index the sweep tries.
 fn applyTwoNamedThenCheck(gpa: Allocator) !void {
     const observer = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     const first = applyNamedRootPut(gpa, &doc, actor_a, 1, "first", &.{}) catch |e| switch (e) {
         error.OutOfMemory => {
@@ -10774,15 +10812,8 @@ fn applyTwoNamedThenCheck(gpa: Allocator) !void {
             // carries it**, because that change went through in full.
             try expectAuthorTablesAgree(observer, &doc);
             try testing.expectEqualStrings("first", doc.getAuthorForActor(.{ .bytes = actor_a }).?);
-            // **The second name is wholly there or wholly absent, and which one
-            // is decided by where the refusal landed.** [`Document.linkAuthor`]
-            // is the last step of [`Document.addToHistory`] and cannot fail, so
-            // a refusal before it leaves both tables untouched; a refusal
-            // after it — the op-set walk that follows the history in
-            // [`Document.applyChanges`] allocates too — leaves the
-            // association standing. What cannot happen is one table moved
-            // without the other, and pinning either single answer would pin
-            // the sweep to one of the two instead of to the pair.
+            // History, rows and both author tables publish together. Refusal
+            // cannot expose a new association without its complete change.
             if (doc.getAuthorForActor(.{ .bytes = actor_b })) |name| {
                 try testing.expectEqualStrings("second", name);
                 const both = try doc.getAuthors(observer);
@@ -10845,7 +10876,7 @@ test "a refused setAuthor leaves the document's author and actor exactly as they
     // so the count covers every step of both.
     const needed = blk: {
         var failing: testing.FailingAllocator = .init(gpa, .{});
-        var doc = try Document.init(failing.allocator(), std.testing.io, .manual);
+        var doc = try Document.init(failing.allocator(), std.testing.io);
         defer doc.deinit();
         try doc.setAuthor(failing.allocator(), held);
         try doc.setAuthor(failing.allocator(), "another-name");
@@ -10867,7 +10898,7 @@ test "a refused setAuthor leaves the document's author and actor exactly as they
         // document has been released too.
         one: {
             const inner = failing.allocator();
-            var doc = Document.init(inner, std.testing.io, .manual) catch break :one;
+            var doc = Document.init(inner, std.testing.io) catch break :one;
             defer doc.deinit();
             doc.setAuthor(inner, held) catch |e| switch (e) {
                 error.OutOfMemory => break :one,
@@ -10953,7 +10984,7 @@ test "a bundle of a whole document loads into an empty document and rebuilds it"
 
     // **Into an empty document**, so nothing about the answer comes from the
     // receiver already holding part of it.
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     const added = try peer.loadIncremental(gpa, written.bytes());
     try testing.expectEqual(source.ops.len(), added);
@@ -10966,7 +10997,7 @@ test "a bundle of a whole document loads into an empty document and rebuilds it"
     // **And again through the whole-load door**, which is a different entry
     // point and a different policy: `load` refuses a queued change and a
     // bundle-first stream carries none, so it takes the same path.
-    var whole = try Document.load(gpa, std.testing.io, written.bytes(), .unicode_code_point, .auto);
+    var whole = try Document.load(gpa, std.testing.io, written.bytes(), .unicode_code_point);
     defer whole.deinit();
     try source.debugCmp(&whole);
 
@@ -10993,7 +11024,7 @@ test "a bundle of a subset names the changes it does not carry, and queues them 
     // **Nothing is applied and everything is queued.** That is the whole
     // contract of a partial bundle: the receiver holds the change it was sent
     // and nothing else, and the change it is missing is not an error.
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     _ = try peer.loadIncremental(gpa, written.bytes());
     try testing.expectEqual(@as(usize, 0), peer.ops.len());
@@ -11023,7 +11054,7 @@ test "a bundle of no hashes carries nothing, and a hash the document does not ho
     defer empty.deinit(gpa);
     try testing.expect(empty.checksumValid());
     try testing.expectEqual(@as(usize, 0), empty.depsList().len);
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     try testing.expectEqual(@as(usize, 0), try peer.loadIncremental(gpa, empty.bytes()));
 
@@ -11071,7 +11102,7 @@ test "a bundle and a change chunk in one stream both land" {
     @memcpy(stream[0..on_disk.len], on_disk);
     @memcpy(stream[on_disk.len..], framed);
 
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     _ = try peer.loadIncremental(gpa, stream);
     // **The change chunk is the one the bundle already named**, so it is
@@ -11146,7 +11177,7 @@ test "a bundle behind a document chunk is applied, and the receiver reads the se
     const stream = try concatChunks(gpa, &.{ snapshot, written.bytes() });
     defer gpa.free(stream);
 
-    var peer = try Document.load(gpa, std.testing.io, stream, defaultTextEncoding(), .auto);
+    var peer = try Document.load(gpa, std.testing.io, stream, defaultTextEncoding());
     defer peer.deinit();
     try source.debugCmp(&peer);
     // **Nothing queued and nothing applied twice.** The snapshot already
@@ -11200,7 +11231,7 @@ test "a bundle after a change chunk lands, and the two documents are one" {
     const stream = try concatChunks(gpa, &.{ framed, second.bytes() });
     defer gpa.free(stream);
 
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     // **The sender's own row count.** `loadIncremental` into an empty document
     // answers how many rows the document now holds, and the rows are the
@@ -11231,7 +11262,7 @@ test "two bundles in one stream both land" {
     const stream = try concatChunks(gpa, &.{ one.bytes(), two.bytes() });
     defer gpa.free(stream);
 
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     try testing.expectEqual(source.ops.len(), try peer.loadIncremental(gpa, stream));
     try testing.expectEqual(@as(usize, 0), peer.queue.len());
@@ -11260,7 +11291,7 @@ test "the fragments of a document come back oldest first, and each encodes to by
     // the document.** This is the point of the surface: the caller sends
     // history in order, and a receiver that concatenates what it is sent ends
     // up with the document the sender had.
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     // **The outer array is the caller's too**, so it is released after the
     // loop rather than left behind with the buffers it holds.
@@ -11418,7 +11449,7 @@ test "a bundle and its fragment encodings survive every allocation failure" {
         gpa.free(encodings);
     }
     try testing.expectEqual(want_types.len, encodings.len);
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     for (encodings) |bytes| _ = try peer.loadIncremental(gpa, bytes);
     try source.debugCmp(&peer);
@@ -11485,7 +11516,7 @@ test "a fragment the document cannot encode produces no buffer rather than faili
     }
     // **And a reader is left with the same document**, which is what the two
     // surviving buffers are for.
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     for (encodings) |bytes| _ = try peer.loadIncremental(gpa, bytes);
     try source.debugCmp(&peer);
@@ -11564,7 +11595,7 @@ test "a written bundle walks its own columns after the writer's scratch is gone"
 fn loadBundleChunkThenDeinit(gpa: Allocator, doc: *Document, hashes: []const ChangeHash) !void {
     var written = try doc.bundle(gpa, hashes);
     defer written.deinit(gpa);
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     try testing.expectEqual(doc.ops.len(), try peer.loadIncremental(gpa, written.bytes()));
 }
@@ -11602,7 +11633,7 @@ fn loadTwoBundleChunksThenDeinit(
     defer two.deinit(gpa);
     const stream = try concatChunks(gpa, &.{ one.bytes(), two.bytes() });
     defer gpa.free(stream);
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     try testing.expectEqual(doc.ops.len(), try peer.loadIncremental(gpa, stream));
 }
@@ -11690,7 +11721,7 @@ test "a bundle whose change claims ops its rows do not fill is refused" {
     try whole.processOp(one_row);
     var consistent = try whole.finish(gpa);
     defer consistent.deinit(gpa);
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     try testing.expectEqual(@as(usize, 1), try peer.loadIncremental(gpa, consistent.bytes()));
     try testing.expectEqual(@as(usize, 1), peer.graph.len());
@@ -11747,7 +11778,7 @@ test "a bundle whose change claims ops its rows do not fill is refused" {
 /// a caller cannot reach, and a test that names one stops being a test of the
 /// refusal when either half of the pipeline moves.
 fn loadMalformedThenRefuse(gpa: Allocator, bytes: []const u8) !void {
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     if (peer.loadIncremental(gpa, bytes)) |applied| {
         std.debug.print("doc: the malformed bundle applied {d} changes\n", .{applied});
@@ -11843,7 +11874,7 @@ fn expectStream(
 /// first register writes `1@1` — which is what the reference writes, because
 /// op counters are per actor (`op_set2/types.rs`:659-668`).
 fn oneKeyDoc(gpa: Allocator) !Document {
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     _ = try applySpec(&doc, gpa, actor_a, 1, 1, &.{}, &.{
         .{ .ctr = 1, .key = KeyRef.fromStr("a"), .value = .{ .str = "one" } },
@@ -11884,7 +11915,7 @@ test "a diff over a mutated document names the register that changed, and nothin
 
 test "a diff descends into an object the root's own diff does not name" {
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
 
     // The base change makes a list and **does not fill it**, so the second
@@ -11991,7 +12022,7 @@ test "an empty document's cursor is not a cursor, and resetting one stops the re
     // `if !heads.is_empty()`): a cursor at "nothing" would make the next
     // incremental diff report the empty state as an addition, and the log would
     // be on for a document that has nothing to record.
-    var empty = try Document.init(gpa, std.testing.io, .auto);
+    var empty = try Document.init(gpa, std.testing.io);
     defer empty.deinit();
     try empty.updateDiffCursor();
     try testing.expectEqual(@as(usize, 0), empty.diff_cursor.items.len);
@@ -12037,25 +12068,20 @@ test "an empty document's cursor is not a cursor, and resetting one stops the re
 }
 
 test "a local commit reaches the incremental diff, and the cursor then empties it" {
-    // **The hole this closes.** [`Document.applyChanges`] was the only thing
-    // that ever fed `patch_log`, so the fast path in [`Document.diffInner`]
-    // read an empty log after a local commit and answered "nothing changed"
-    // for a change that had just happened — correct for a peer's change,
-    // silently empty for a consumer's own edits. Upstream's local commit
-    // feeds the log through `patch_log.begin_transaction` and
-    // `patch_log.finish_transaction` around the commit
-    // ([`autocommit.rs:445-457`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs),
-    // [`:734`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)).
+    // A logged raw transaction returns the eager operation log to its caller.
+    // Installing that result is explicit; raw commit never reconstructs a diff
+    // (`autocommit.rs:728-739` merges the transaction branch at the facade).
     const trans = @import("transact.zig");
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .manual);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = &oracle_actor });
 
     var setup = try trans.Transaction.open(gpa, &doc);
     _ = try setup.put(.root, .{ .key = "a" }, .{ .str = "one" });
-    _ = (try setup.commit(null, oracle_time)).?;
-    setup.deinit();
+    var setup_result = try setup.commitWith(.{ .time = oracle_time });
+    defer setup_result.deinit(gpa);
+    setup.deinitClosed();
 
     // **The cursor goes down before the edit**, so the log is recording and
     // the fast path is the arm under test rather than the walk
@@ -12064,10 +12090,13 @@ test "a local commit reaches the incremental diff, and the cursor then empties i
     defer gpa.free(base);
     try doc.updateDiffCursor();
 
-    var t = try trans.Transaction.open(gpa, &doc);
+    var t = try trans.Transaction.openWithPatchLog(gpa, &doc, &doc.patch_log, null);
     _ = try t.put(.root, .{ .key = "b" }, .{ .str = "two" });
-    const local = (try t.commit(null, oracle_time)).?;
-    t.deinit();
+    var local_result = try t.commitWith(.{ .time = oracle_time });
+    defer local_result.deinit(gpa);
+    const local = local_result.hash.?;
+    std.mem.swap(patchesmod.PatchLog, &doc.patch_log, &local_result.patch_log);
+    t.deinitClosed();
     const after = try doc.getHeads(gpa);
     defer gpa.free(after);
     // **The commit really did move the document**, which the rest of the test
@@ -12117,18 +12146,8 @@ test "a local commit reaches the incremental diff, and the cursor then empties i
 }
 
 test "recording a commit does not change the change it made" {
-    // **The risk the feed adds, stated as a test.** [`Document.commit`] now
-    // reads the patch log and writes to it, and a change's hash is SHA-256
-    // over the bytes `encodeOneChange` produced ([AGENTS.md](../AGENTS.md)) —
-    // so anything the recording did that reached those bytes would change
-    // every hash the port has ever produced, and a fix that perturbs the
-    // commit path is far worse than the hole it fills.
-    //
-    // **The gate is `patch_log.isActive()`**, the same one
-    // [`Document.applyChanges`] branches on (`autocommit.rs:495-499`), so a
-    // document nobody is diffing runs exactly the code it ran before. That is
-    // a claim; this is the assertion — the same script run both ways, compared
-    // on the change bytes, the change hashes and the document's heads.
+    // Logging records eager operation events in the same transaction kernel.
+    // The requested log must not alter encoded bytes, hashes or committed heads.
     const trans = @import("transact.zig");
     const gpa = testing.allocator;
 
@@ -12140,24 +12159,29 @@ test "recording a commit does not change the change it made" {
         /// Two commits by one actor, the second made with `watching` deciding
         /// whether the diff cursor is down first.
         fn run(alloc: Allocator, watching: bool) !Scripted {
-            var doc = try Document.init(alloc, std.testing.io, .manual);
+            var doc = try Document.init(alloc, std.testing.io);
             defer doc.deinit();
             doc.setActorId(.{ .bytes = &oracle_actor });
 
             var t = try trans.Transaction.open(alloc, &doc);
             _ = try t.put(.root, .{ .key = "a" }, .{ .str = "one" });
-            _ = (try t.commit("base", oracle_time)).?;
-            t.deinit();
+            var base_result = try t.commitWith(.{ .message = "base", .time = oracle_time });
+            defer base_result.deinit(alloc);
+            t.deinitClosed();
 
             // **The cursor only takes on a document that has a head**
             // (`autocommit.rs:202`'s `if !heads.is_empty()`), which is why
             // there is a first commit before it.
             if (watching) try doc.updateDiffCursor();
 
-            var t2 = try trans.Transaction.open(alloc, &doc);
+            var t2 = if (watching)
+                try trans.Transaction.openWithPatchLog(alloc, &doc, &doc.patch_log, null)
+            else
+                try trans.Transaction.open(alloc, &doc);
             _ = try t2.put(.root, .{ .key = "b" }, .{ .str = "two" });
-            _ = (try t2.commit("second", oracle_time)).?;
-            t2.deinit();
+            var second_result = try t2.commitWith(.{ .message = "second", .time = oracle_time });
+            defer second_result.deinit(alloc);
+            t2.deinitClosed();
 
             // **Collected before `doc.deinit`**: the bodies are this
             // document's own copies, and they have to outlive it.
@@ -12238,7 +12262,7 @@ fn buildOracleDocument(gpa: Allocator) !Document {
     // does not. Nothing outside these tests needs the write surface.
     const trans = @import("transact.zig");
 
-    var doc = try Document.init(gpa, std.testing.io, .manual);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = &oracle_actor });
 
@@ -12259,13 +12283,15 @@ fn buildOracleDocument(gpa: Allocator) !Document {
     _ = try t.put(map, .{ .key = "drop" }, .{ .str = "dropped" });
     try t.increment(map, .{ .key = "counter" }, 5);
     _ = try t.delete(map, .{ .key = "drop" });
-    _ = (try t.commit("base", oracle_time)).?;
-    t.deinit();
+    var first_result = try t.commitWith(.{ .message = "base", .time = oracle_time });
+    defer first_result.deinit(gpa);
+    t.deinitClosed();
 
     var t2 = try trans.Transaction.open(gpa, &doc);
     _ = try t2.put(.root, .{ .key = "extra" }, .{ .int = 1 });
-    _ = (try t2.commit("extra", oracle_time)).?;
-    t2.deinit();
+    var second_result = try t2.commitWith(.{ .message = "extra", .time = oracle_time });
+    defer second_result.deinit(gpa);
+    t2.deinitClosed();
     return doc;
 }
 
@@ -12285,7 +12311,9 @@ test "a locally built document saves, reloads, and comes back with the same chan
     const gpa = testing.allocator;
     var doc = try buildOracleDocument(gpa);
     defer doc.deinit();
-    try testing.expectEqual(Stats{ .num_changes = 2, .num_ops = 25, .num_actors = 1 }, doc.stats());
+    try testing.expectEqual(@as(usize, 2), doc.stats().num_changes);
+    try testing.expectEqual(@as(usize, 25), doc.stats().num_ops);
+    try testing.expectEqual(@as(usize, 1), doc.stats().num_actors);
 
     const heads_before = try doc.getHeads(gpa);
     defer gpa.free(heads_before);
@@ -12293,7 +12321,7 @@ test "a locally built document saves, reloads, and comes back with the same chan
 
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var reloaded = try Document.load(gpa, std.testing.io, saved, defaultTextEncoding(), .auto);
+    var reloaded = try Document.load(gpa, std.testing.io, saved, defaultTextEncoding());
     defer reloaded.deinit();
 
     // **The head hash is equal on both sides.** That is the sentence this test
@@ -12312,7 +12340,7 @@ test "a locally built document saves, reloads, and comes back with the same chan
     // the same heads again, or the load fixed something rather than agreeing.
     const again = try reloaded.save(gpa);
     defer gpa.free(again);
-    var twice = try Document.load(gpa, std.testing.io, again, defaultTextEncoding(), .auto);
+    var twice = try Document.load(gpa, std.testing.io, again, defaultTextEncoding());
     defer twice.deinit();
     const heads_twice = try twice.getHeads(gpa);
     defer gpa.free(heads_twice);
@@ -12335,14 +12363,16 @@ test "a change chunk the document hands out by hash is one change to an empty do
     // one row out, so a skipped change is a zero and an applied one is a one.
     const trans = @import("transact.zig");
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .manual);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = &oracle_actor });
 
     var t = try trans.Transaction.open(gpa, &doc);
     _ = try t.put(.root, .{ .key = "k" }, .{ .str = "v" });
-    const hash = (try t.commit(null, oracle_time)).?;
-    t.deinit();
+    var commit_result = try t.commitWith(.{ .time = oracle_time });
+    defer commit_result.deinit(gpa);
+    const hash = commit_result.hash.?;
+    t.deinitClosed();
 
     // **The document's only head is the change it just made**, so asking for
     // that head by hash is asking for the change itself.
@@ -12362,7 +12392,7 @@ test "a change chunk the document hands out by hash is one change to an empty do
     const chunk = try built.change.encode(gpa);
     defer gpa.free(chunk);
 
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     try testing.expectEqual(@as(usize, 0), peer.graph.len());
     const applied = try peer.loadIncremental(gpa, chunk);
@@ -12403,14 +12433,16 @@ test "a change chunk the document hands out names the op its last operation has"
     // `AMchangeSize == 1`).
     const trans = @import("transact.zig");
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .manual);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = &oracle_actor });
 
     var t = try trans.Transaction.open(gpa, &doc);
     _ = try t.put(.root, .{ .key = "a" }, .{ .str = "b" });
-    const first = (try t.commit(null, oracle_time)).?;
-    t.deinit();
+    var first_result = try t.commitWith(.{ .time = oracle_time });
+    defer first_result.deinit(gpa);
+    const first = first_result.hash.?;
+    t.deinitClosed();
 
     // The graph's own answer, which is what the *next* transaction starts from:
     // `start_op = max_op + 1` ([`automerge.rs:566-567`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
@@ -12440,8 +12472,10 @@ test "a change chunk the document hands out names the op its last operation has"
     _ = try t2.put(.root, .{ .key = "k" }, .{ .str = "v" });
     _ = try t2.put(.root, .{ .key = "j" }, .{ .int = 7 });
     _ = try t2.put(.root, .{ .key = "i" }, .{ .uint = 9 });
-    const second = (try t2.commit(null, oracle_time)).?;
-    t2.deinit();
+    var second_result = try t2.commitWith(.{ .time = oracle_time });
+    defer second_result.deinit(gpa);
+    const second = second_result.hash.?;
+    t2.deinitClosed();
 
     // The second change starts above the first one's last op and ends three
     // counters further on. **A commit that restarted at counter 1 answers `1`
@@ -12489,14 +12523,16 @@ test "a change chunk the document hands out names the op its last operation has"
     // on a different actor — which is what makes the two concurrent rather
     // than sequential.
     const fork_actor = [_]u8{0x5c} ** 15;
-    var fork = try Document.init(gpa, std.testing.io, .manual);
+    var fork = try Document.init(gpa, std.testing.io);
     defer fork.deinit();
     fork.setActorId(.{ .bytes = &fork_actor });
     var t3 = try trans.Transaction.open(gpa, &fork);
     _ = try t3.put(.root, .{ .key = "n" }, .{ .int = 5 });
     _ = try t3.put(.root, .{ .key = "m" }, .{ .int = 6 });
-    const theirs = (try t3.commit(null, oracle_time)).?;
-    t3.deinit();
+    var theirs_result = try t3.commitWith(.{ .time = oracle_time });
+    defer theirs_result.deinit(gpa);
+    const theirs = theirs_result.hash.?;
+    t3.deinitClosed();
 
     // The change a peer is handed by `AMgetLastLocalChange` goes through
     // `getLastLocalChange` — the collector, not the commit path — and it must
@@ -12507,7 +12543,7 @@ test "a change chunk the document hands out names the op its last operation has"
     try testing.expectEqual(@as(u64, 1), theirs_built.change.start_op);
     try testing.expectEqual(@as(u64, 2), theirs_built.change.max_op);
 
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     // **Both of this document's changes, in order.** The second depends on the
     // first, so a peer handed only the second screens it into the change
@@ -12567,7 +12603,7 @@ test "a document that applied a peer's changes rebuilds them by hash" {
     defer changes.deinit(gpa);
     try testing.expectEqual(@as(usize, 2), changes.items.items.len);
 
-    var receiver = try Document.init(gpa, std.testing.io, .auto);
+    var receiver = try Document.init(gpa, std.testing.io);
     defer receiver.deinit();
     var rows: usize = 0;
     for (changes.items.items) |*sent| {
@@ -12624,7 +12660,7 @@ test "a change that overwrites two ops is rebuilt with both predecessor lists" {
         .{ .ctr = 4, .key = KeyRef.fromStr("k"), .value = .{ .str = "v4" }, .pred = &.{o2} },
     };
 
-    var sender = try Document.init(gpa, std.testing.io, .auto);
+    var sender = try Document.init(gpa, std.testing.io);
     defer sender.deinit();
     const a = try sender.putActorRef(gpa, .{ .bytes = actor_a });
     const ops = try buildOps(gpa, a, &specs);
@@ -12636,7 +12672,7 @@ test "a change that overwrites two ops is rebuilt with both predecessor lists" {
     const chunk = try sent.change.encode(gpa);
     defer gpa.free(chunk);
 
-    var peer = try Document.init(gpa, std.testing.io, .auto);
+    var peer = try Document.init(gpa, std.testing.io);
     defer peer.deinit();
     try testing.expectEqual(@as(usize, specs.len), try peer.loadIncremental(gpa, chunk));
 
@@ -12723,9 +12759,10 @@ fn collectRegister(
     obj: ExId,
     key: KeyRef,
 ) !void {
+    const internal_obj = doc.ops.resolveObjId(obj) orelse return error.InvalidObjId;
     var walk = try doc.ops.iter();
     while (try walk.next()) |op| {
-        if (!op.objId().eql(obj)) continue;
+        if (!op.objId().eql(internal_obj)) continue;
         if (!op.elemidOrKey().eql(key)) continue;
         switch (op.value()) {
             .str => |s| try out.append(gpa, s),
@@ -12775,18 +12812,19 @@ test "two writers who edited one object load, and the conflict comes back whole"
     const trans = @import("transact.zig");
     const gpa = testing.allocator;
 
-    var a = try Document.init(gpa, std.testing.io, .manual);
+    var a = try Document.init(gpa, std.testing.io);
     defer a.deinit();
     a.setActorId(.{ .bytes = actor_a });
     const m = blk: {
         var t = try trans.Transaction.open(gpa, &a);
-        defer t.deinit();
+        defer t.deinit() catch @panic("testing allocator cannot refuse rollback");
         const made = try t.putObject(.root, .{ .key = "m" }, .map);
-        _ = (try t.commit(null, null)).?;
+        var committed = try t.commit();
+        defer committed.deinit(gpa);
         break :blk made;
     };
 
-    var b = try Document.init(gpa, std.testing.io, .manual);
+    var b = try Document.init(gpa, std.testing.io);
     defer b.deinit();
     b.setActorId(.{ .bytes = actor_b });
     {
@@ -12797,15 +12835,17 @@ test "two writers who edited one object load, and the conflict comes back whole"
     // the walk that rebuilds the changes has to place both.
     {
         var t = try trans.Transaction.open(gpa, &b);
-        defer t.deinit();
+        defer t.deinit() catch @panic("testing allocator cannot refuse rollback");
         _ = try t.put(m, .{ .key = "k" }, .{ .str = "from b" });
-        _ = (try t.commit(null, null)).?;
+        var committed = try t.commit();
+        defer committed.deinit(gpa);
     }
     {
         var t = try trans.Transaction.open(gpa, &a);
-        defer t.deinit();
+        defer t.deinit() catch @panic("testing allocator cannot refuse rollback");
         _ = try t.put(m, .{ .key = "k" }, .{ .str = "from a" });
-        _ = (try t.commit(null, null)).?;
+        var committed = try t.commit();
+        defer committed.deinit(gpa);
     }
     {
         const heads = try a.merge(gpa, &b);
@@ -12817,7 +12857,7 @@ test "two writers who edited one object load, and the conflict comes back whole"
     const saved = try a.save(gpa);
     defer gpa.free(saved);
 
-    var loaded = try Document.load(gpa, std.testing.io, saved, defaultTextEncoding(), .auto);
+    var loaded = try Document.load(gpa, std.testing.io, saved, defaultTextEncoding());
     defer loaded.deinit();
 
     // **The conflict, and both of its values.** The load rebuilt every change
@@ -12843,6 +12883,132 @@ test "two writers who edited one object load, and the conflict comes back whole"
     try a.debugCmp(&loaded);
 }
 
+test "snapshot physical map order is refused despite unchanged history heads" {
+    // The public before probe accepted b@2,a@1 with the original change hash,
+    // but binary lookup missed b. Permute complete rows with the real column
+    // exporter; framing, graph columns, actor identities and heads stay valid.
+    const gpa = testing.allocator;
+    const Tx = @import("transact.zig").Transaction;
+    var source = try Document.init(gpa, testing.io);
+    defer source.deinit();
+    source.setActorId(.{ .bytes = "snapshot-physical-order" });
+    var tx = try Tx.open(gpa, &source);
+    defer tx.deinitClosed();
+    _ = try tx.put(.root, .{ .key = "a" }, .{ .int = 1 });
+    _ = try tx.put(.root, .{ .key = "b" }, .{ .int = 2 });
+    var committed = try tx.commitWith(.{ .time = 0 });
+    defer committed.deinit(gpa);
+    const expected_head = committed.hash orelse return error.TestUnexpectedResult;
+    const valid = try source.saveWithOptions(gpa, .{ .deflate = false });
+    defer gpa.free(valid);
+
+    const reversed = blk: {
+        var walk = try source.ops.iter();
+        const a = (try walk.next()) orelse return error.TestUnexpectedResult;
+        const b = (try walk.next()) orelse return error.TestUnexpectedResult;
+        try testing.expect((try walk.next()) == null);
+        try testing.expectEqualStrings("a", a.keyStr().?);
+        try testing.expectEqualStrings("b", b.keyStr().?);
+        try testing.expectEqual(@as(u32, 1), a.id().counter);
+        try testing.expectEqual(@as(u32, 2), b.id().counter);
+        try testing.expectEqual(@as(usize, 0), a.succCount());
+        try testing.expectEqual(@as(usize, 0), b.succCount());
+        break :blk [_]opmod.Op{ b, a };
+    };
+    // This raw construction deliberately violates only the ordered-row
+    // precondition, to produce hostile input rather than exercise a producer.
+    var reordered = try opsetmod.OpSet(opmod.Op).fromDocOps(
+        gpa,
+        source.ops.actors.items,
+        &reversed,
+        source.textEncoding(),
+        source.strings.table(),
+    );
+    defer reordered.deinit();
+    var exported = try reordered.exportColumns(gpa);
+    defer exported.deinit(gpa);
+    var stream = chunkmod.ChunkStream.init(valid);
+    var parsed = try docchunk.parseFramedChunk((try stream.next()).?, gpa);
+    defer parsed.deinit(gpa);
+    var block = parsed.block;
+    block.ops = exported.cols;
+    const malformed = try docchunk.encode(gpa, block, .none);
+    defer gpa.free(malformed);
+
+    try snapshotPhysicalOrderRefusal(gpa, valid, malformed, expected_head);
+    try testing.checkAllAllocationFailures(
+        gpa,
+        snapshotPhysicalOrderRefusal,
+        .{ valid, malformed, expected_head },
+    );
+}
+
+fn snapshotPhysicalOrderRefusal(
+    gpa: Allocator,
+    valid: []const u8,
+    malformed: []const u8,
+    expected_head: ChangeHash,
+) !void {
+    const readonly = @import("read.zig");
+    var control = try Document.load(gpa, testing.io, valid, defaultTextEncoding());
+    defer control.deinit();
+    try testing.expectEqual(@as(i64, 1), (try readonly.get(&control, .root, .{ .key = "a" })).?.value.scalar.int);
+    try testing.expectEqual(@as(i64, 2), (try readonly.get(&control, .root, .{ .key = "b" })).?.value.scalar.int);
+    const heads = try control.getHeads(gpa);
+    defer gpa.free(heads);
+    try testing.expectEqualSlices(ChangeHash, &.{expected_head}, heads);
+    const saved = try control.saveWithOptions(gpa, .{ .deflate = false });
+    defer gpa.free(saved);
+    try testing.expectEqualSlices(u8, valid, saved);
+
+    // Recovery relaxes marks only; it cannot expose unordered map columns.
+    for ([_]opsetmod.MarkOrderValidation{ .check, .allow_invalid }) |validation| {
+        if (Document.loadConfigured(gpa, testing.io, malformed, .{}, validation, null)) |owner| {
+            var unexpected = owner;
+            defer unexpected.deinit();
+            return error.TestUnexpectedResult;
+        } else |failure| {
+            if (failure != error.InvalidValue) return failure;
+        }
+    }
+    if (Document.loadUnverifiedHeads(gpa, testing.io, malformed, .{})) |owner| {
+        var unexpected = owner;
+        defer unexpected.deinit();
+        return error.TestUnexpectedResult;
+    } else |failure| {
+        if (failure != error.InvalidValue) return failure;
+    }
+    if (Document.rescue(gpa, testing.io, malformed)) |owner| {
+        var unexpected = owner;
+        defer unexpected.deinit();
+        return error.TestUnexpectedResult;
+    } else |failure| {
+        if (failure != error.InvalidValue) return failure;
+    }
+
+    var stream = chunkmod.ChunkStream.init(malformed);
+    var parsed = try docchunk.parseFramedChunk((try stream.next()).?, gpa);
+    defer parsed.deinit(gpa);
+    var strings = Strings.init(gpa);
+    defer strings.deinit();
+    for ([_]opsetmod.MarkOrderValidation{ .check, .allow_invalid }) |validation| {
+        if (Set.loadWithMarkValidation(
+            gpa,
+            parsed.opColumns(),
+            control.ops.actors.items,
+            control.textEncoding(),
+            strings.table(),
+            validation,
+        )) |owner| {
+            var unexpected = owner;
+            defer unexpected.deinit();
+            return error.TestUnexpectedResult;
+        } else |failure| {
+            if (failure != error.InvalidValue) return failure;
+        }
+    }
+}
+
 test "a load the collector refuses releases every row it had read" {
     // **The leak, on the path that reached it.** `readDocChunk` builds a
     // `Reconstructed` — the op set, the actor table, the change block and the
@@ -12854,7 +13020,7 @@ test "a load the collector refuses releases every row it had read" {
     // `loadFilled`/`loadInterned` → `hexane.Column.load` → `Slab.splice` —
     // which is where those blocks were born, not where they were lost.
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     _ = try applySpec(&doc, gpa, actor_a, 1, 1, &.{}, &.{
         .{ .ctr = 1, .key = KeyRef.fromStr("m"), .action = .make_map },
@@ -12873,7 +13039,7 @@ test "a load the collector refuses releases every row it had read" {
 
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    try testing.expectError(error.Fail, Document.load(gpa, std.testing.io, saved, defaultTextEncoding(), .auto));
+    try testing.expectError(error.Fail, Document.load(gpa, std.testing.io, saved, defaultTextEncoding()));
     // **The rest of the assertion is the allocator.** Every block the load
     // allocated is freed before the error leaves `readDocChunk`; if one is not,
     // this test fails here rather than aborting a run forty tests later.
@@ -12920,7 +13086,7 @@ test "a change whose predecessor counter is negative is refused, not wrapped" {
         .{ .ctr = 2, .key = KeyRef.fromStr("k"), .value = .{ .str = "v2" } },
         .{ .ctr = 3, .key = KeyRef.fromStr("k"), .value = .{ .str = "v3" }, .pred = &.{o1} },
     };
-    var sender = try Document.init(gpa, std.testing.io, .auto);
+    var sender = try Document.init(gpa, std.testing.io);
     defer sender.deinit();
     const a = try sender.putActorRef(gpa, .{ .bytes = actor_a });
     const ops = try buildOps(gpa, a, &specs);
@@ -12935,7 +13101,7 @@ test "a change whose predecessor counter is negative is refused, not wrapped" {
     // **The control, first.** The change as the writer produced it loads, so
     // every refusal below is the mutation's doing and not the fixture's.
     {
-        var peer = try Document.init(gpa, std.testing.io, .auto);
+        var peer = try Document.init(gpa, std.testing.io);
         defer peer.deinit();
         try testing.expectEqual(@as(usize, specs.len), try peer.loadIncremental(gpa, framed));
     }
@@ -12968,7 +13134,7 @@ test "a change whose predecessor counter is negative is refused, not wrapped" {
         body[idx] = 0x7f;
         mutated.clearRetainingCapacity();
         try chunkmod.writeChunk(&mutated, gpa, .change, body);
-        var peer = try Document.init(gpa, std.testing.io, .auto);
+        var peer = try Document.init(gpa, std.testing.io);
         defer peer.deinit();
         if (peer.loadIncremental(gpa, mutated.items)) |applied| {
             std.debug.print("doc: byte {d} of the predecessor counter applied {d} ops\n", .{ k, applied });
@@ -13039,7 +13205,7 @@ test "a graph decode refused on a later row releases the rows it had read" {
     // dependency indices are 0 and 1, whose deltas are 0 and 1 and therefore
     // distinct: one payload byte each, belonging to rows 1 and 2 respectively.
     const gpa = testing.allocator;
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     try chainedOverwrites(gpa, &doc);
 
@@ -13052,7 +13218,7 @@ test "a graph decode refused on a later row releases the rows it had read" {
     // **The control, first.** The document as saved loads and holds all three
     // changes, so every refusal below is the mutation's doing.
     {
-        var peer = try Document.init(gpa, std.testing.io, .auto);
+        var peer = try Document.init(gpa, std.testing.io);
         defer peer.deinit();
         try testing.expectEqual(@as(usize, 3), try peer.loadIncremental(gpa, saved));
         try testing.expectEqual(@as(usize, 3), peer.graph.len());
@@ -13090,7 +13256,7 @@ test "a graph decode refused on a later row releases the rows it had read" {
         body[idx] = 0x40;
         mutated.clearRetainingCapacity();
         try chunkmod.writeChunk(&mutated, gpa, .document, body);
-        var peer = try Document.init(gpa, std.testing.io, .auto);
+        var peer = try Document.init(gpa, std.testing.io);
         defer peer.deinit();
         if (peer.loadIncremental(gpa, mutated.items)) |applied| {
             std.debug.print("doc: byte {d} of the dependency index applied {d} ops\n", .{ k, applied });
@@ -13132,7 +13298,7 @@ test "an incremental load into an empty document re-establishes that document's 
     // the borrowed slice across the reset is wrong, and so is carrying an index
     // into the table the reset replaced.
     const gpa = testing.allocator;
-    var source = try Document.init(gpa, std.testing.io, .auto);
+    var source = try Document.init(gpa, std.testing.io);
     defer source.deinit();
     _ = try applySpec(&source, gpa, actor_a, 1, 1, &.{}, &.{
         .{ .ctr = 1, .key = KeyRef.fromStr("x"), .value = .{ .str = "one" } },
@@ -13141,7 +13307,7 @@ test "an incremental load into an empty document re-establishes that document's 
     defer gpa.free(saved);
 
     // An actor the loaded document does **not** have: the bytes, and no index.
-    var doc = try Document.init(gpa, std.testing.io, .auto);
+    var doc = try Document.init(gpa, std.testing.io);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = doc.arena.allocator().dupe(u8, "fedcba9876543210") catch unreachable });
     _ = try doc.loadIncremental(gpa, saved);
@@ -13149,7 +13315,7 @@ test "an incremental load into an empty document re-establishes that document's 
     try testing.expectEqual(@as(?ActorIdx, null), doc.getActorIndex());
 
     // An actor it **does** have: the same actor, and an index that names it.
-    var same = try Document.init(gpa, std.testing.io, .auto);
+    var same = try Document.init(gpa, std.testing.io);
     defer same.deinit();
     same.setActorId(.{ .bytes = same.arena.allocator().dupe(u8, actor_a) catch unreachable });
     _ = try same.loadIncremental(gpa, saved);
@@ -13213,40 +13379,9 @@ test "an incremental load into an empty document re-establishes that document's 
 //   `mark_tests.c:80`, `:109` are what caught it. **The comment was the
 //   bug's only evidence in the tree and it pointed the wrong way.**
 //
-// * **`Document.commit` feeds `patch_log`, and it is the only second thing
-//   besides `applyChanges` that does.** Upstream's `AutoCommit` fills the log
-//   with *events* as `TransactionInner` inserts each op
-//   ([`inner.rs:308-328`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)),
-//   merges the transaction's branch log into its own on the way out
-//   ([`autocommit.rs:728-739`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)),
-//   and brackets the whole thing with `begin_transaction` /
-//   `finish_transaction` ([`:445-457`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs),
-//   [`:734`](../../github-automerge-automerge/rust/automerge/src/autocommit.rs)).
-//   **The port's transaction writes its rows with no log in hand**, and
-//   `Document.commit` receives ops that are already rows — so there is no
-//   insert-time moment left to record against, and the events cannot be
-//   replayed from the ops afterwards either, because an event's *index* is a
-//   position in the object as it was when the op went in. The brackets are
-//   therefore ported as they are, and the middle is done the only other way
-//   there is: the change's patches are built with `Document.diff` over exactly
-//   the range the change spans and handed to
-//   [`PatchLog.appendCompleted`](patches.zig).
-//
-//   **Same patches either way, different cost.** Both routes end in the same
-//   [`patchesmod.PatchBuilder`](patches.zig), so a consumer cannot tell them
-//   apart; the recorded route pays a walk over the change's own range where
-//   upstream pays one event per op. The walk is over a `ClockRange`'s two
-//   states and [`iter/map_range.zig`](iter/map_range.zig)'s
-//   `DiffSkipper.past` skips the rows both states agree on, so the walk is
-//   over what changed and not over the document.
-//
-//   **Everything is behind `patch_log.isActive()`** — the same gate
-//   [`Document.applyChanges`] branches on (`autocommit.rs:495-499`), which is
-//   also how upstream turns it off for a caller that has reset the cursor
-//   (`autocommit.rs:185-189`). A document nobody is diffing runs the commit
-//   path it ran before, and the change bytes, the hash and the heads are the
-//   same ones it produced before — which is asserted rather than assumed, by
-//   the test *recording a commit does not change the change it made*.
+// Raw Document.commit only encodes and publishes history. The transaction owns
+// eager operation events and returns the sole branch log on commit; AutoCommit
+// merges that log (`autocommit.rs:728-739`). No final-diff replay engine remains.
 //
 // * **`loadIncremental` refuses a save that forks the document, and that is
 //   upstream's answer and not a port decision.** The screen is `has_actor_seq`
@@ -13451,25 +13586,10 @@ test "an incremental load into an empty document re-establishes that document's 
 //   ([`automerge.rs`:568](../../github-automerge-automerge/rust/automerge/src/automerge.rs))
 //   and is derived here.
 //
-//   **One thing about that fix is a caller, and the caller is the other half
-//   of the story.** `Document.transactionArgs` reads `heads` for *both* the
-//   dependency set and the actor, so which actor a change gets is decided when
-//   the transaction is **opened**, not when it is committed. The port has two
-//   doors and both are faithful to a different upstream one:
-//   `transact.openAuto` and `transact.openAutoHeld` read
-//   [`Document.isolationHeads`] and are `AutoCommit`'s, while
-//   [`Transaction.open`] and [`Transaction.openAt`] are `Automerge::transaction`
-//   and `Automerge::transaction_at`
-//   ([`automerge.rs`:476-480](../../github-automerge-automerge/rust/automerge/src/automerge.rs),
-//   [`:501-509`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-//   whose `heads` argument is only the scope clock and whose `null` means
-//   "unscoped". **A caller that isolates and then opens through the low-level
-//   door gets a sequential change, and that is now visible rather than
-//   masked**: `isolate_actor` never forks, so the change depends on the heads
-//   the document already had. The fixture in
-//   [`test/upstream_text_more.zig`](../../test/upstream_text_more.zig) did
-//   exactly that, and the symptom was the `color` branch missing from the
-//   stream.
+// Scope and actor selection happen when the transaction opens. AutoCommit owns
+// one held transaction opened at its isolation heads (`autocommit.rs:445-457`);
+// raw Transaction.open/openAt take their own unscoped/explicit-head semantics
+// (`automerge.rs:476-509`). No automatic raw transaction helpers remain.
 //
 // * **`integrate` is now `DiffError!void` where it was `void`, and the
 //   reference's infallibility is a panic rather than a property.**
@@ -13532,17 +13652,13 @@ test "an incremental load into an empty document re-establishes that document's 
 //   `doc = doc.with_actor(self.actor_id().clone())` (`:1040`) — and
 //   `set_actor` (`:359-366`) **resolves it against that document's actor
 //   table**, caching the index when the table holds the actor and keeping the
-//   bytes when it does not. `Document.reset` now resets the actor, and
-//   `Document.loadIncremental` copies the bytes and re-establishes them through
-//   [`Document.setActorId`], which is the same rule on borrowed storage.
+//   bytes when it does not. The incremental loader stages the copied actor in
+//   the fresh arena before releasing the old owner, then calls setActorId.
 
-// ── Diff against the reference, for the read-scope cache ─────────────────────
-//
-// | Zig 0.16.0 | upstream | Rust | port | does not / is / this |
-// | --- | --- | --- | --- | --- |
-// | `readScope(gpa) Error!?*const Clock` | `AutoCommit::get_scope(None)`, `autocommit.rs:794-814` | `fn get_scope(&mut self, heads: Option<&[ChangeHash]>) -> Option<Clock>` | `pub fn readScope(self: *Document, gpa: Allocator) Error!?*const clockmod.Clock` | **is** the middle arm only — the *isolation's* heads — and **does not** take a caller's; **borrows** where upstream moves, so a walk it built outlives the call |
-// | `clockAtScope(gpa, heads) Error!?*const Clock` | `Automerge::clock_at`, `automerge.rs:1236-1247` | `pub(crate) fn clock_at(&self, heads: &[ChangeHash]) -> Option<Clock>` | `pub fn clockAtScope(self: *Document, gpa: Allocator, heads: []const ChangeHash) Error!?*const clockmod.Clock` | **is** upstream's resolution for every `*_at`, the heads-are-current shortcut included; **does not** own the clock — the caller reads it after this returns, which is why the answer is a borrow |
-// | `scopedClock(gpa, at)` (private) | — | — | — | **is** the cache, and **is** one pair of `read_scope` fields keyed on `(heads, rows, actors)` that **both** doors above use: they answer the same question with the same shape, so a second pair would be a second copy of the same memo |
+// Historical read clocks are retained by owned head keys. Their heap buffers
+// survive pool growth and subsequent head selection until document mutation.
+// Explicit transaction heads always use this pool, including current graph heads
+// (`manual_transaction.rs:113-122`), so pending rows cannot leak into that view.
 
 // ── Diff against the reference, for the actor table and its mirrors ──────────
 //
@@ -13560,15 +13676,1890 @@ test "independent default documents merge both histories" {
     const gpa = testing.allocator;
     const trans = @import("transact.zig");
     const readonly = @import("read.zig");
-    var left = try Document.init(gpa, testing.io, .auto);
+    var left = try Document.init(gpa, testing.io);
     defer left.deinit();
-    var right = try Document.init(gpa, testing.io, .auto);
+    var right = try Document.init(gpa, testing.io);
     defer right.deinit();
-    _ = try trans.put(&left, .root, .{ .key = "left" }, .{ .int = 1 });
-    _ = try trans.put(&right, .root, .{ .key = "right" }, .{ .int = 2 });
+    {
+        var tx = try trans.Transaction.open(gpa, &left);
+        defer tx.deinit() catch unreachable;
+        _ = try tx.put(.root, .{ .key = "left" }, .{ .int = 1 });
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+    }
+    {
+        var tx = try trans.Transaction.open(gpa, &right);
+        defer tx.deinit() catch unreachable;
+        _ = try tx.put(.root, .{ .key = "right" }, .{ .int = 2 });
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+    }
     const heads = try left.merge(gpa, &right);
     defer gpa.free(heads);
     try testing.expectEqual(@as(i64, 1), (try readonly.get(&left, .root, .{ .key = "left" })).?.value.scalar.int);
     try testing.expectEqual(@as(i64, 2), (try readonly.get(&left, .root, .{ .key = "right" })).?.value.scalar.int);
     try testing.expectEqual(@as(usize, 2), left.graph.len());
+}
+
+test "incoming authored opaque footer history remains readable after every apply OOM" {
+    // Build peer bytes without the failing allocator, then observe each refused owner.
+    const observer = testing.allocator;
+    var peer = try Document.init(observer, testing.io);
+    defer peer.deinit();
+    const actor = try peer.putActorRef(observer, .{ .bytes = actor_b });
+    const specs = [_]OpSpec{
+        .{ .ctr = 17, .key = KeyRef.fromStr("incoming"), .value = .{ .str = "value" } },
+    };
+    const ops = try buildOps(observer, actor, &specs);
+    defer freeChangeOps(observer, ops);
+    var footer: std.ArrayList(u8) = .empty;
+    defer footer.deinit(observer);
+    try encodeAuthorFooter(observer, &footer, "incoming author");
+    try footer.appendSlice(observer, &.{ 0xfd, 0x00, 0x81, 0x7f });
+    var incoming = try encodeOneChange(observer, peer.ops.actors.items, .{
+        .actor = actor,
+        .seq = 1,
+        .start_op = 17,
+        .max_op = 17,
+        .time = 123,
+        .message = "opaque history",
+        .deps = &.{},
+        .footer = footer.items,
+    }, ops);
+    defer incoming.deinit(observer);
+
+    var reached_success = false;
+    for (0..2048) |fail_index| {
+        var failing = testing.FailingAllocator.init(observer, .{ .fail_index = fail_index });
+        const gpa = failing.allocator();
+        var target = Document.init(gpa, testing.io) catch |failure| switch (failure) {
+            error.OutOfMemory => continue,
+            else => return failure,
+        };
+        defer target.deinit();
+        const applied = target.applyChanges(gpa, &.{incoming.change});
+        // The owner retains gpa, so disable failure before every public observer.
+        failing.fail_index = std.math.maxInt(usize);
+        var refused = false;
+        if (applied) |_| {} else |failure| {
+            switch (failure) {
+                error.OutOfMemory => refused = true,
+                else => return failure,
+            }
+        }
+        var metas = try target.getChangesMeta(observer, &.{});
+        defer metas.deinit(observer);
+        for (metas.items.items) |meta| {
+            try testing.expectEqualSlices(u8, incoming.change.hash.bytes[0..], meta.hash.bytes[0..]);
+            try testing.expectEqual(@as(u64, 17), meta.start_op);
+            try testing.expectEqualSlices(u8, footer.items, meta.extra);
+            try testing.expectEqualStrings("incoming author", meta.author.?);
+            var single = (try target.getChangeMetaByHash(observer, meta.hash)).?;
+            defer single.deinit(observer);
+            try testing.expectEqual(@as(u64, 17), single.start_op);
+            try testing.expectEqualSlices(u8, footer.items, single.extra);
+            try testing.expectEqualStrings("incoming author", single.author.?);
+            var rebuilt = (try target.getChangeByHash(observer, meta.hash)).?;
+            defer rebuilt.deinit(observer);
+            try testing.expectEqualSlices(u8, meta.hash.bytes[0..], rebuilt.change.hash.bytes[0..]);
+            try testing.expectEqualSlices(u8, footer.items, changeFooter(rebuilt.change).?);
+        }
+        const saved = try target.save(observer);
+        defer observer.free(saved);
+        var reloaded = try Document.load(observer, testing.io, saved, .unicode_code_point);
+        defer reloaded.deinit();
+        const before = try target.getHeads(observer);
+        defer observer.free(before);
+        const after = try reloaded.getHeads(observer);
+        defer observer.free(after);
+        try testing.expectEqual(before.len, after.len);
+        for (before, after) |left, right| {
+            try testing.expectEqualSlices(u8, left.bytes[0..], right.bytes[0..]);
+        }
+        _ = try target.putActorRef(observer, .{ .bytes = &.{0} });
+        for (metas.items.items) |meta| {
+            var remapped = (try target.getChangeByHash(observer, meta.hash)).?;
+            defer remapped.deinit(observer);
+            try testing.expectEqualSlices(u8, meta.hash.bytes[0..], remapped.change.hash.bytes[0..]);
+        }
+        if (!refused) {
+            reached_success = true;
+            break;
+        }
+    }
+    try testing.expect(reached_success);
+}
+
+test "load options ignore discards complete tail before a partial change" {
+    const gpa = testing.allocator;
+    var source = try buildSample(gpa);
+    defer source.deinit();
+    const snapshot = try source.save(gpa);
+    defer gpa.free(snapshot);
+    const snapshot_heads = try source.getHeads(gpa);
+    defer gpa.free(snapshot_heads);
+    _ = try addKeyChange(&source, gpa, actor_a, 2, 16, "tail", snapshot_heads);
+    const complete_tail = try source.saveIncremental(gpa);
+    defer gpa.free(complete_tail);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(gpa);
+    try bytes.appendSlice(gpa, snapshot);
+    try bytes.appendSlice(gpa, complete_tail);
+    try bytes.appendSlice(gpa, complete_tail[0 .. complete_tail.len - 1]);
+    var loaded = try Document.loadWithOptions(gpa, testing.io, bytes.items, .{
+        .on_partial_load = .ignore,
+    });
+    defer loaded.deinit();
+    const heads = try loaded.getHeads(gpa);
+    defer gpa.free(heads);
+    try testing.expectEqual(snapshot_heads.len, heads.len);
+    for (snapshot_heads, heads) |expected, actual| {
+        try testing.expectEqualSlices(u8, expected.bytes[0..], actual.bytes[0..]);
+    }
+    const readonly = @import("read.zig");
+    try testing.expect((try readonly.get(&loaded, .root, .{ .key = "tail" })) == null);
+
+    var change_first = try Document.loadWithOptions(gpa, testing.io, bytes.items[snapshot.len..], .{ .on_partial_load = .ignore });
+    defer change_first.deinit();
+    const no_heads = try change_first.getHeads(gpa);
+    defer gpa.free(no_heads);
+    try testing.expectEqual(@as(usize, 0), no_heads.len);
+}
+
+test "raw hasOurChanges compares exact full committed heads" {
+    const gpa = testing.allocator;
+    var document = try buildSample(gpa);
+    defer document.deinit();
+    var state = @import("sync/state.zig").State.new(gpa);
+    defer state.deinit();
+    try testing.expect(!document.hasOurChanges(&state));
+    state.shared_heads = try document.getHeads(gpa);
+    try testing.expect(document.hasOurChanges(&state));
+    const other = try gpa.alloc(ChangeHash, state.shared_heads.len + 1);
+    @memcpy(other[0..state.shared_heads.len], state.shared_heads);
+    other[other.len - 1] = ChangeHash.zero;
+    gpa.free(state.shared_heads);
+    state.shared_heads = other;
+    try testing.expect(!document.hasOurChanges(&state));
+}
+
+test "load string migration commits before assigning arbitrary author bytes" {
+    const gpa = testing.allocator;
+    var source = try Document.init(gpa, testing.io);
+    defer source.deinit();
+    {
+        var tx = try @import("transact.zig").Transaction.open(gpa, &source);
+        defer tx.deinit() catch unreachable;
+        _ = try tx.put(.root, .{ .key = "before" }, .{ .str = "migrate me" });
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+    }
+    const bytes = try source.save(gpa);
+    defer gpa.free(bytes);
+    const author = [_]u8{ 0xff, 0x00, 0x80 };
+    var loaded = try Document.loadWithOptions(gpa, testing.io, bytes, .{
+        .string_migration = .convert_to_text,
+        .author = &author,
+    });
+    defer loaded.deinit();
+    try testing.expectEqualSlices(u8, &author, loaded.getAuthor().?);
+    var migrated = try loaded.getChangesMeta(gpa, &.{});
+    defer migrated.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), migrated.items.items.len);
+    try testing.expect(migrated.items.items[1].author == null);
+    try testing.expectEqual(@as(usize, 0), migrated.items.items[1].extra.len);
+    const next = try commitRootPut(gpa, &loaded, "after");
+    var authored = (try loaded.getChangeByHash(gpa, next)).?;
+    defer authored.deinit(gpa);
+    try testing.expectEqualSlices(u8, &author, (try decodeAuthorFooter(changeFooter(authored.change))).?);
+}
+
+test "unverified heads bypasses head equality but never checksum validation" {
+    const gpa = testing.allocator;
+    var source = try buildSample(gpa);
+    defer source.deinit();
+    const saved = try source.saveWithOptions(gpa, .{
+        .deflate = false,
+        .retain_orphans = true,
+    });
+    defer gpa.free(saved);
+    const framed = try chunkmod.parseChunk(saved);
+    const body = try gpa.dupe(u8, framed.data);
+    defer gpa.free(body);
+    var cursor = Input.init(body);
+    const actors = try cursor.takeUleb();
+    for (0..actors) |_| {
+        const length = try cursor.takeUleb();
+        _ = try cursor.take(@intCast(length));
+    }
+    const head_count = try cursor.takeUleb();
+    try testing.expect(head_count > 0);
+    body[cursor.pos] ^= 0x01;
+    var changed: std.ArrayList(u8) = .empty;
+    defer changed.deinit(gpa);
+    try chunkmod.writeChunk(&changed, gpa, .document, body);
+    const strict = Document.loadWithOptions(gpa, testing.io, changed.items, .{});
+    if (strict) |loaded_doc| {
+        var unexpected = loaded_doc;
+        unexpected.deinit();
+        return error.ExpectedRefusal;
+    } else |_| {}
+    var inspected = try Document.loadUnverifiedHeads(gpa, testing.io, changed.items, .{});
+    defer inspected.deinit();
+    try source.debugCmp(&inspected);
+    changed.items[changed.items.len - 1] ^= 0x01;
+    const damaged = Document.loadUnverifiedHeads(gpa, testing.io, changed.items, .{});
+    if (damaged) |loaded_doc| {
+        var unexpected = loaded_doc;
+        unexpected.deinit();
+        return error.ExpectedRefusal;
+    } else |_| {}
+}
+
+test "external apply log is borrowed across compatible document actor tables" {
+    const gpa = testing.allocator;
+    var source = try buildSample(gpa);
+    defer source.deinit();
+    var incoming = try source.getChanges(gpa, &.{});
+    defer incoming.deinit(gpa);
+    const changes = try asChanges(gpa, incoming.slice());
+    defer gpa.free(changes);
+    var first = try Document.init(gpa, testing.io);
+    defer first.deinit();
+    var second = try Document.init(gpa, testing.io);
+    defer second.deinit();
+    var log = patchesmod.PatchLog.active(gpa);
+    defer log.deinit();
+    _ = try first.applyChangesWithPatchLog(gpa, changes, &log);
+    var patches = try first.makePatches(&log);
+    defer patches.deinit();
+    try testing.expect(patches.len() > 0);
+    const recorded = log.events.items.len;
+    _ = try second.applyChangesWithPatchLog(gpa, changes, &log);
+    try first.debugCmp(&second);
+    const second_heads = try second.getHeads(gpa);
+    defer gpa.free(second_heads);
+    try testing.expect(sameHashList(second_heads, first.graph.getHeads()));
+    try testing.expectEqual(recorded * 2, log.events.items.len);
+    var again = try first.makePatches(&log);
+    defer again.deinit();
+    try testing.expect(again.len() >= patches.len());
+}
+
+test "empty incremental load retains nested snapshot paths in a borrowed log" {
+    // Mirror api_parity.rs:506-532 with real public transactions. Rust retains
+    // the loaded snapshot's paths (automerge.rs:1048,1078-1079), even when the
+    // caller renders against the previous owner, which has no nested objects.
+    const gpa = testing.allocator;
+    const Transaction = @import("transact.zig").Transaction;
+    var owner = try Document.init(gpa, testing.io);
+    defer owner.deinit();
+    owner.setActorId(.{ .bytes = actor_a });
+    var initial = patchesmod.PatchLog.active(gpa);
+    defer initial.deinit();
+    var owner_tx = try Transaction.openWithPatchLog(gpa, &owner, &initial, null);
+    defer owner_tx.deinitClosed();
+    const owned_id = try owner_tx.put(.root, .{ .key = "owned" }, .{ .bool_value = true });
+    try testing.expect(owned_id != null);
+    var owned = try owner_tx.commitWith(.{ .time = 0 });
+    defer owned.deinit(gpa);
+    var source = try Document.init(gpa, testing.io);
+    defer source.deinit();
+    source.setActorId(.{ .bytes = actor_a });
+    var tx = try Transaction.open(gpa, &source);
+    defer tx.deinitClosed();
+    const map = try tx.putObject(.root, .{ .key = "map" }, .map);
+    const key_id = try tx.put(map, .{ .key = "k" }, .{ .int = 7 });
+    try testing.expect(key_id != null);
+    const list = try tx.putObject(.root, .{ .key = "list" }, .list);
+    const first_id = try tx.insert(list, 0, .{ .bool_value = true });
+    const second_id = try tx.insert(list, 1, .{ .str = "two" });
+    const text = try tx.putObject(.root, .{ .key = "text" }, .text);
+    try tx.spliceText(text, 0, 0, "a😀b");
+    var committed = try tx.commitWith(.{ .time = 0 });
+    defer committed.deinit(gpa);
+    const bytes = try source.save(gpa);
+    defer gpa.free(bytes);
+    var foreign = try Document.init(gpa, testing.io);
+    defer foreign.deinit();
+    foreign.setActorId(.{ .bytes = actor_b });
+    var offered = try owned.patch_log.cloneAndRebind(gpa, owner.patchIdentity());
+    defer offered.deinit();
+    try testing.expectEqual(source.len(), try foreign.loadIncrementalWithPatchLog(
+        gpa,
+        bytes,
+        &offered,
+    ));
+    try source.debugCmp(&foreign);
+    // Exercise the same snapshot observers as api_parity_common.expectSnapshot
+    // before the first retained-log render; none may consume its cached paths.
+    const AutoSerde = @import("autoserde.zig").AutoSerde(Document);
+    const expected_json = try AutoSerde.from(&source).toJson(gpa);
+    defer gpa.free(expected_json);
+    const actual_json = try AutoSerde.from(&foreign).toJson(gpa);
+    defer gpa.free(actual_json);
+    try testing.expectEqualStrings(expected_json, actual_json);
+    const heads = try foreign.getHeads(gpa);
+    defer gpa.free(heads);
+    const expected_heads = try source.getHeads(gpa);
+    defer gpa.free(expected_heads);
+    try testing.expect(sameHashList(expected_heads, heads));
+    var reloaded = try Document.load(gpa, testing.io, bytes, foreign.textEncoding());
+    defer reloaded.deinit();
+    const reloaded_json = try AutoSerde.from(&reloaded).toJson(gpa);
+    defer gpa.free(reloaded_json);
+    try testing.expectEqualStrings(expected_json, reloaded_json);
+    const reloaded_heads = try reloaded.getHeads(gpa);
+    defer gpa.free(reloaded_heads);
+    try testing.expect(sameHashList(expected_heads, reloaded_heads));
+    const observed_save = try foreign.save(gpa);
+    defer gpa.free(observed_save);
+    var saved = try Document.load(gpa, testing.io, observed_save, foreign.textEncoding());
+    defer saved.deinit();
+    try source.debugCmp(&saved);
+    var retained = try owner.makePatches(&offered);
+    defer retained.deinit();
+    const stream = retained.slice();
+    try testing.expectEqual(@as(usize, 7), stream.len);
+    const expected_puts = [_]patchesmod.PatchAction{
+        .{ .put_map = .{
+            .key = "owned",
+            .value = .{ .scalar = .{ .bool_value = true } },
+            .obj = owner.idToExid(owned_id.?),
+            .conflict = false,
+        } },
+        .{ .put_map = .{
+            .key = "list",
+            .value = .{ .object = .list },
+            .obj = list,
+            .conflict = false,
+        } },
+        .{ .put_map = .{
+            .key = "map",
+            .value = .{ .object = .map },
+            .obj = map,
+            .conflict = false,
+        } },
+        .{ .put_map = .{
+            .key = "text",
+            .value = .{ .object = .text },
+            .obj = text,
+            .conflict = false,
+        } },
+        .{ .put_map = .{
+            .key = "k",
+            .value = .{ .scalar = .{ .int = 7 } },
+            .obj = source.idToExid(key_id.?),
+            .conflict = false,
+        } },
+    };
+    for (expected_puts, stream[0..5]) |expected, patch| {
+        try testing.expect(expected.eql(patch.action));
+    }
+    for (stream[0..4]) |patch| {
+        try testing.expect(patch.obj.eql(.root));
+        try testing.expectEqual(@as(usize, 0), patch.path.len);
+    }
+    for ([_]ExId{ map, list, text }, [_][]const u8{ "map", "list", "text" }, stream[4..7]) |object, key, patch| {
+        try testing.expect(patch.obj.eql(object));
+        try testing.expectEqual(@as(usize, 1), patch.path.len);
+        try testing.expect(patch.path[0].obj.eql(.root));
+        try testing.expect(patch.path[0].prop == .key);
+        try testing.expectEqualStrings(key, patch.path[0].prop.key);
+    }
+    try testing.expect(stream[5].action == .insert);
+    const insert = stream[5].action.insert;
+    try testing.expectEqual(@as(usize, 0), insert.index);
+    try testing.expectEqual(@as(usize, 2), insert.values.len());
+    var inserted = insert.values.iter();
+    const first = inserted.next().?;
+    try testing.expect(first.value.eql(.{ .scalar = .{ .bool_value = true } }));
+    try testing.expect(first.obj.eql(source.idToExid(first_id)));
+    try testing.expect(!first.conflict);
+    const second = inserted.next().?;
+    try testing.expect(second.value.eql(.{ .scalar = .{ .str = "two" } }));
+    try testing.expect(second.obj.eql(source.idToExid(second_id)));
+    try testing.expect(!second.conflict);
+    try testing.expect(stream[6].action == .splice_text);
+    const splice = stream[6].action.splice_text;
+    try testing.expectEqual(@as(usize, 0), splice.index);
+    try testing.expect(splice.marks == null);
+    const rendered = try splice.value.makeString(gpa);
+    defer gpa.free(rendered);
+    try testing.expectEqualStrings("a😀b", rendered);
+}
+
+test "empty incremental snapshot path publication is atomic at every log OOM" {
+    // Refuse each allocation in the retained log, including copied path keys,
+    // and exercise both a borrowed sink and the exact internal log address.
+    const observer = testing.allocator;
+    const Transaction = @import("transact.zig").Transaction;
+    var owner = try Document.init(observer, testing.io);
+    defer owner.deinit();
+    owner.setActorId(.{ .bytes = actor_a });
+    var initial = patchesmod.PatchLog.active(observer);
+    defer initial.deinit();
+    var owner_tx = try Transaction.openWithPatchLog(observer, &owner, &initial, null);
+    defer owner_tx.deinitClosed();
+    _ = try owner_tx.put(.root, .{ .key = "owned" }, .{ .bool_value = true });
+    var owned = try owner_tx.commitWith(.{ .time = 0 });
+    defer owned.deinit(observer);
+    var source = try Document.init(observer, testing.io);
+    defer source.deinit();
+    source.setActorId(.{ .bytes = actor_a });
+    var tx = try Transaction.open(observer, &source);
+    defer tx.deinitClosed();
+    const map = try tx.putObject(.root, .{ .key = "map" }, .map);
+    _ = try tx.put(map, .{ .key = "k" }, .{ .int = 7 });
+    var committed = try tx.commitWith(.{ .time = 0 });
+    defer committed.deinit(observer);
+    const bytes = try source.save(observer);
+    defer observer.free(bytes);
+    for ([_]bool{ false, true }) |self_alias| {
+        var completed = false;
+        var refused = false;
+        for (0..128) |offset| {
+            var failing = testing.FailingAllocator.init(observer, .{
+                .fail_index = std.math.maxInt(usize),
+            });
+            const log_gpa = failing.allocator();
+            var target = try Document.init(observer, testing.io);
+            defer target.deinit();
+            target.setActorId(.{ .bytes = actor_b });
+            var external = try owned.patch_log.cloneAndRebind(log_gpa, owner.patchIdentity());
+            defer external.deinit();
+            if (self_alias) {
+                std.mem.swap(patchesmod.PatchLog, &target.patch_log, &external);
+            }
+            const log = if (self_alias) &target.patch_log else &external;
+            const before = try target.save(observer);
+            defer observer.free(before);
+            const events = log.events.items.len;
+            const identity = log.identity;
+            const path_hint = log.path_hint;
+            failing.fail_index = failing.alloc_index + offset;
+            const attempted = target.loadIncrementalWithPatchLog(observer, bytes, log);
+            failing.fail_index = std.math.maxInt(usize);
+            if (attempted) |added| {
+                try testing.expectEqual(source.len(), added);
+                try source.debugCmp(&target);
+                try testing.expectEqual(events + 2, log.events.items.len);
+                try testing.expectEqual(log.events.items.len, log.path_hint);
+                var retained = try owner.makePatches(log);
+                defer retained.deinit();
+                try testing.expectEqual(@as(usize, 3), retained.len());
+                completed = true;
+                break;
+            } else |failure| {
+                try testing.expectEqual(error.OutOfMemory, failure);
+                refused = true;
+            }
+            const after = try target.save(observer);
+            defer observer.free(after);
+            try testing.expectEqualSlices(u8, before, after);
+            try testing.expectEqualStrings(actor_b, target.getActorId().bytes);
+            try testing.expectEqual(events, log.events.items.len);
+            try testing.expectEqual(identity, log.identity);
+            try testing.expectEqual(path_hint, log.path_hint);
+            try testing.expect(log.gpa.ptr == log_gpa.ptr);
+            var retained = try owner.makePatches(log);
+            defer retained.deinit();
+            try testing.expectEqual(@as(usize, 1), retained.len());
+        }
+        try testing.expect(completed);
+        try testing.expect(refused);
+    }
+}
+
+test "external log actor mismatch preflights every incoming route without mutation" {
+    // A sorts before B and C. Refusal must not intern the incoming C actor either.
+    const gpa = testing.allocator;
+    var owner = try Document.init(gpa, testing.io);
+    defer owner.deinit();
+    owner.setActorId(.{ .bytes = actor_a });
+    _ = try commitRootPut(gpa, &owner, "owned");
+    var source = try Document.init(gpa, testing.io);
+    defer source.deinit();
+    source.setActorId(.{ .bytes = actor_b });
+    _ = try commitRootPut(gpa, &source, "base");
+    var target = try source.clone(gpa);
+    defer target.deinit();
+    _ = try commitRootPut(gpa, &source, "incoming");
+    _ = try addKeyChange(&source, gpa, actor_c, 1, 3, "new actor", source.graph.getHeads());
+    var all = try source.getChanges(gpa, &.{});
+    defer all.deinit(gpa);
+    const incoming = try asChanges(gpa, all.slice());
+    defer gpa.free(incoming);
+    const bytes = try source.save(gpa);
+    defer gpa.free(bytes);
+    var log = patchesmod.PatchLog.active(gpa);
+    defer log.deinit();
+    try log.bind(owner.patchIdentity(), owner.ops.actors.items);
+    try owner.logCurrentState(gpa, &log);
+    const before = try target.save(gpa);
+    defer gpa.free(before);
+    const before_heads = try target.getHeads(gpa);
+    defer gpa.free(before_heads);
+    const events = log.events.items.len;
+    const identity = log.identity;
+    for (0..5) |route| {
+        switch (route) {
+            0 => try testing.expectError(error.PatchLogMismatch, target.applyChangesWithPatchLog(gpa, incoming, &log)),
+            1 => try testing.expectError(error.PatchLogMismatch, target.loadIncrementalWithPatchLog(gpa, bytes, &log)),
+            2 => try testing.expectError(error.PatchLogMismatch, target.mergeWithPatchLog(gpa, &source, &log)),
+            3 => try testing.expectError(error.PatchLogMismatch, target.applyChangesWithPatchLog(gpa, &.{}, &log)),
+            4 => try testing.expectError(error.PatchLogMismatch, target.loadIncrementalWithPatchLog(gpa, &.{}, &log)),
+            else => unreachable,
+        }
+        const after = try target.save(gpa);
+        defer gpa.free(after);
+        try testing.expectEqualSlices(u8, before, after);
+        try testing.expect(sameHashList(before_heads, target.graph.getHeads()));
+        try testing.expectEqual(@as(usize, 1), target.ops.actors.items.len);
+        try testing.expectEqualStrings(actor_b, target.ops.actors.items[0].bytes);
+        try testing.expectEqual(@as(usize, 1), log.actors.items.len);
+        try testing.expectEqualStrings(actor_a, log.actors.items[0].bytes);
+        try testing.expectEqual(events, log.events.items.len);
+        try testing.expectEqual(identity, log.identity);
+        var retained = try owner.makePatches(&log);
+        defer retained.deinit();
+        try testing.expectEqual(@as(usize, 1), retained.len());
+    }
+}
+
+test "retained actor suffix applies successfully and refuses only missing render slots" {
+    // Rust accepts this prefix migration, then panics while exporting the old B ID.
+    // Native preserves application semantics and returns a checked renderer error.
+    const gpa = testing.allocator;
+    var owner = try Document.init(gpa, testing.io);
+    defer owner.deinit();
+    owner.setActorId(.{ .bytes = actor_b });
+    _ = try commitRootPut(gpa, &owner, "owned");
+    var source = try Document.init(gpa, testing.io);
+    defer source.deinit();
+    source.setActorId(.{ .bytes = actor_a });
+    _ = try commitRootPut(gpa, &source, "incoming");
+    var changes = try source.getChanges(gpa, &.{});
+    defer changes.deinit(gpa);
+    const incoming = try asChanges(gpa, changes.slice());
+    defer gpa.free(incoming);
+    var log = patchesmod.PatchLog.active(gpa);
+    defer log.deinit();
+    try log.bind(owner.patchIdentity(), owner.ops.actors.items);
+    try owner.logCurrentState(gpa, &log);
+    var target = try Document.init(gpa, testing.io);
+    defer target.deinit();
+    try testing.expectEqual(@as(usize, 1), try target.applyChangesWithPatchLog(gpa, incoming, &log));
+    try source.debugCmp(&target);
+    try testing.expectEqual(@as(usize, 1), target.ops.actors.items.len);
+    try testing.expectEqualStrings(actor_a, target.ops.actors.items[0].bytes);
+    try testing.expectEqual(@as(usize, 2), log.actors.items.len);
+    try testing.expectEqualStrings(actor_a, log.actors.items[0].bytes);
+    try testing.expectEqualStrings(actor_b, log.actors.items[1].bytes);
+    const events = log.events.items.len;
+    const before = try target.save(gpa);
+    defer gpa.free(before);
+    try testing.expectError(error.InvalidActorIndex, target.makePatches(&log));
+    const after = try target.save(gpa);
+    defer gpa.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+    try testing.expectEqual(events, log.events.items.len);
+    try testing.expectEqual(@as(usize, 2), log.actors.items.len);
+}
+
+test "snapshot replacement preserves borrowed and self-aliased logs at every log OOM" {
+    // Inject only the caller log allocator and observe both owners after every refusal.
+    const observer = testing.allocator;
+    var owner = try Document.init(observer, testing.io);
+    defer owner.deinit();
+    owner.setActorId(.{ .bytes = actor_a });
+    _ = try commitRootPut(observer, &owner, "owned");
+    var source = try Document.init(observer, testing.io);
+    defer source.deinit();
+    source.setActorId(.{ .bytes = actor_b });
+    _ = try commitRootPut(observer, &source, "loaded");
+    const bytes = try source.save(observer);
+    defer observer.free(bytes);
+    for ([_]bool{ false, true }) |self_alias| {
+        var completed = false;
+        var refused = false;
+        for (0..128) |offset| {
+            var failing = testing.FailingAllocator.init(observer, .{
+                .fail_index = std.math.maxInt(usize),
+            });
+            const log_gpa = failing.allocator();
+            var target = try owner.clone(observer);
+            defer target.deinit();
+            var external = patchesmod.PatchLog.active(log_gpa);
+            defer external.deinit();
+            if (self_alias) {
+                target.patch_log.deinit();
+                target.patch_log = .active(log_gpa);
+            }
+            const log = if (self_alias) &target.patch_log else &external;
+            try log.bind(owner.patchIdentity(), owner.ops.actors.items);
+            try owner.logCurrentState(observer, log);
+            const before = try target.save(observer);
+            defer observer.free(before);
+            const events = log.events.items.len;
+            const identity = log.identity;
+            const path_hint = log.path_hint;
+            // Equal-table empty apply preflights but must not allocate a stage
+            // or discard the cached path hint.
+            failing.fail_index = failing.alloc_index;
+            try testing.expectEqual(@as(usize, 0), try owner.applyChangesWithPatchLog(log_gpa, &.{}, log));
+            try testing.expectEqual(events, log.events.items.len);
+            try testing.expectEqual(path_hint, log.path_hint);
+            failing.fail_index = failing.alloc_index + offset;
+            const attempted = target.loadIntoWithOptions(observer, bytes, .{ .patch_log = log });
+            failing.fail_index = std.math.maxInt(usize);
+            if (attempted) |_| {
+                try source.debugCmp(&target);
+                try testing.expectEqual(events + 1, log.events.items.len);
+                try testing.expect(log.gpa.ptr == log_gpa.ptr);
+                completed = true;
+                break;
+            } else |failure| {
+                try testing.expectEqual(error.OutOfMemory, failure);
+                refused = true;
+            }
+            const after = try target.save(observer);
+            defer observer.free(after);
+            try testing.expectEqualSlices(u8, before, after);
+            try testing.expectEqual(events, log.events.items.len);
+            try testing.expectEqual(identity, log.identity);
+            try testing.expectEqual(path_hint, log.path_hint);
+            try testing.expectEqual(@as(usize, 1), log.actors.items.len);
+            try testing.expectEqualStrings(actor_a, log.actors.items[0].bytes);
+            try testing.expectEqual(@as(usize, 0), log.completed.len());
+            try testing.expect(log.gpa.ptr == log_gpa.ptr);
+            var retained = try owner.makePatches(log);
+            defer retained.deinit();
+            try testing.expectEqual(@as(usize, 1), retained.len());
+        }
+        try testing.expect(completed);
+        try testing.expect(refused);
+    }
+}
+
+test "snapshot loading bypasses actor migration while empty full load bypasses logging" {
+    // Rust automerge.rs:911-914,994-997,1038-1051 logs indexed state directly.
+    const gpa = testing.allocator;
+    var owner = try Document.init(gpa, testing.io);
+    defer owner.deinit();
+    owner.setActorId(.{ .bytes = actor_a });
+    _ = try commitRootPut(gpa, &owner, "owned");
+    var source = try Document.init(gpa, testing.io);
+    defer source.deinit();
+    source.setActorId(.{ .bytes = actor_b });
+    _ = try commitRootPut(gpa, &source, "loaded");
+    const bytes = try source.save(gpa);
+    defer gpa.free(bytes);
+    var log = patchesmod.PatchLog.active(gpa);
+    defer log.deinit();
+    try log.bind(owner.patchIdentity(), owner.ops.actors.items);
+    try owner.logCurrentState(gpa, &log);
+    const events = log.events.items.len;
+    var empty = try Document.loadWithOptions(gpa, testing.io, &.{}, .{ .patch_log = &log });
+    defer empty.deinit();
+    try testing.expectEqual(events, log.events.items.len);
+    try testing.expectEqual(owner.patchIdentity(), log.identity.?);
+    var loaded = try Document.loadWithOptions(gpa, testing.io, bytes, .{ .patch_log = &log });
+    defer loaded.deinit();
+    try source.debugCmp(&loaded);
+    try testing.expectEqual(events + 1, log.events.items.len);
+    try testing.expectEqualStrings(actor_a, log.actors.items[0].bytes);
+    // Rendering itself has no actor-compatibility gate in Rust (patch_log.rs:505-529).
+    var rendered = try loaded.makePatches(&log);
+    defer rendered.deinit();
+    try testing.expectEqual(@as(usize, 2), rendered.len());
+    try empty.loadIntoWithOptions(gpa, bytes, .{ .patch_log = &log });
+    try source.debugCmp(&empty);
+    try testing.expectEqual(events + 2, log.events.items.len);
+    var incremental = try Document.init(gpa, testing.io);
+    defer incremental.deinit();
+    try testing.expectEqual(source.len(), try incremental.loadIncrementalWithPatchLog(gpa, bytes, &log));
+    try source.debugCmp(&incremental);
+    try testing.expectEqual(events + 3, log.events.items.len);
+    try testing.expectEqualStrings(actor_a, log.actors.items[0].bytes);
+}
+
+test "raw hydrate initialization commits one batch and preserves absent existing keys" {
+    const gpa = testing.allocator;
+    const hydration = @import("hydrate.zig");
+    var document = try Document.init(gpa, testing.io);
+    defer document.deinit();
+    _ = try commitRootPut(gpa, &document, "keep");
+    var map = hydration.Map.init(gpa, .root);
+    defer map.deinit();
+    try map.putOwned("first", .init(hydration.Value.fromScalar(.{ .int = 2 }), false));
+    try map.putOwned("second", .init(hydration.Value.fromScalar(.{ .bool_value = true }), false));
+    var initialized = try document.initFromHydrate(gpa, &map);
+    switch (initialized) {
+        .success => |*success| {
+            defer success.patch_log.deinit();
+            try testing.expect(success.hash != null);
+        },
+        .failure => |*failure| {
+            failure.patch_log.deinit();
+            if (failure.transaction) |*transaction| {
+                _ = transaction.rollback() catch unreachable;
+                var retained_log = transaction.takePatchLog();
+                retained_log.deinit();
+                transaction.deinitClosed();
+            }
+            return failure.err;
+        },
+    }
+    var metadata = try document.getChangesMeta(gpa, &.{});
+    defer metadata.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), metadata.items.items.len);
+    const readonly = @import("read.zig");
+    const keep = (try readonly.get(&document, .root, .{ .key = "keep" })) orelse
+        return error.TestUnexpectedResult;
+    const first = (try readonly.get(&document, .root, .{ .key = "first" })) orelse
+        return error.TestUnexpectedResult;
+    const second = (try readonly.get(&document, .root, .{ .key = "second" })) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 1), keep.value.scalar.int);
+    try testing.expectEqual(@as(i64, 2), first.value.scalar.int);
+    try testing.expect(second.value.scalar.bool_value);
+    try testing.expect(try document.ops.validateOpOrder());
+    try testing.expect((try document.ops.validateTopIndex()) == null);
+}
+
+test "raw object import distinguishes syntax from unresolved identity" {
+    const gpa = testing.allocator;
+    var document = try Document.init(gpa, testing.io);
+    defer document.deinit();
+    const root_obj = try document.importObj(gpa, "_root");
+    try testing.expect(root_obj == .root);
+    const resolved_root = try document.import(gpa, "_root");
+    try testing.expect(resolved_root.id == .root);
+    try testing.expectEqual(ObjType.map, resolved_root.object_type);
+    try testing.expectError(error.InvalidObjIdFormat, document.importObj(gpa, "invalid"));
+    try testing.expectError(error.InvalidObjIdFormat, document.importObj(gpa, "1@zz"));
+    try testing.expectError(error.InvalidObjId, document.importObj(gpa, "1@ffff"));
+    const Tx = @import("transact.zig").Transaction;
+    const object = blk: {
+        var tx = try Tx.open(gpa, &document);
+        defer tx.deinit() catch @panic("testing allocator cannot refuse rollback");
+        const made = try tx.putObject(.root, .{ .key = "list" }, .list);
+        _ = try tx.put(.root, .{ .key = "scalar" }, .{ .int = 7 });
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+        break :blk made;
+    };
+    const spelling = try object.toString(gpa);
+    defer gpa.free(spelling);
+    const imported = try document.import(gpa, spelling);
+    try testing.expect(imported.id.eql(object));
+    try testing.expectEqual(ObjType.list, imported.object_type);
+    const actor = document.ops.lookupActor(document.getActorId()).?;
+    const scalar = document.idToExid(OpId.init(2, @intCast(actor)));
+    const scalar_spelling = try scalar.toString(gpa);
+    defer gpa.free(scalar_spelling);
+    try testing.expectError(error.InvalidObjId, document.import(gpa, scalar_spelling));
+}
+
+test "diagnostic writers expose actors and changed scalar columns" {
+    const gpa = testing.allocator;
+    const Tx = @import("transact.zig").Transaction;
+    var left = try Document.init(gpa, testing.io);
+    defer left.deinit();
+    left.setActorId(.{ .bytes = actor_a });
+    {
+        var tx = try Tx.open(gpa, &left);
+        defer tx.deinit() catch unreachable;
+        _ = try tx.put(.root, .{ .key = "value" }, .{ .int = 1 });
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+    }
+
+    var equal = try left.clone(gpa);
+    defer equal.deinit();
+    var equal_buffer: [128]u8 = undefined;
+    var equal_writer: std.Io.Writer = .fixed(&equal_buffer);
+    try left.diffOpSet(gpa, &equal, &equal_writer);
+    try testing.expectEqual(@as(usize, 0), std.Io.Writer.buffered(&equal_writer).len);
+
+    var dump_buffer: [4096]u8 = undefined;
+    var dump_writer: std.Io.Writer = .fixed(&dump_buffer);
+    try left.dump(gpa, &dump_writer);
+    const dump_bytes = std.Io.Writer.buffered(&dump_writer);
+    var actor_buffer: [128]u8 = undefined;
+    var actor_writer: std.Io.Writer = .fixed(&actor_buffer);
+    try actor_writer.print("{x}", .{actor_a});
+    try testing.expect(std.mem.indexOf(u8, dump_bytes, std.Io.Writer.buffered(&actor_writer)) != null);
+    var left_columns = try left.ops.exportColumns(gpa);
+    defer left_columns.deinit(gpa);
+    for (left_columns.cols.columns) |column| {
+        const bytes = try column.range.slice(left_columns.data);
+        var column_buffer: [512]u8 = undefined;
+        var column_writer: std.Io.Writer = .fixed(&column_buffer);
+        try column_writer.print("{x}", .{column.spec.raw});
+        try testing.expect(std.mem.indexOf(u8, dump_bytes, std.Io.Writer.buffered(&column_writer)) != null);
+        var value_buffer: [512]u8 = undefined;
+        var value_writer: std.Io.Writer = .fixed(&value_buffer);
+        try value_writer.print("{x}", .{bytes});
+        try testing.expect(std.mem.indexOf(u8, dump_bytes, std.Io.Writer.buffered(&value_writer)) != null);
+    }
+
+    var right = try Document.init(gpa, testing.io);
+    defer right.deinit();
+    right.setActorId(.{ .bytes = actor_a });
+    {
+        var tx = try Tx.open(gpa, &right);
+        defer tx.deinit() catch unreachable;
+        _ = try tx.put(.root, .{ .key = "value" }, .{ .int = 2 });
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+    }
+    var right_columns = try right.ops.exportColumns(gpa);
+    defer right_columns.deinit(gpa);
+    try testing.expectEqual(left_columns.cols.columns.len, right_columns.cols.columns.len);
+    var diff_buffer: [2048]u8 = undefined;
+    var diff_writer: std.Io.Writer = .fixed(&diff_buffer);
+    try left.diffOpSet(gpa, &right, &diff_writer);
+    const diff_bytes = std.Io.Writer.buffered(&diff_writer);
+    var changed_columns: usize = 0;
+    for (left_columns.cols.columns, right_columns.cols.columns) |left_column, right_column| {
+        try testing.expectEqual(left_column.spec.raw, right_column.spec.raw);
+        const left_bytes = try left_column.range.slice(left_columns.data);
+        const right_bytes = try right_column.range.slice(right_columns.data);
+        if (std.mem.eql(u8, left_bytes, right_bytes)) continue;
+        changed_columns += 1;
+        try testing.expect(left_bytes.len > 0 and right_bytes.len > 0);
+        var id_buffer: [128]u8 = undefined;
+        var id_writer: std.Io.Writer = .fixed(&id_buffer);
+        try id_writer.print("{x}", .{left_column.spec.raw});
+        try testing.expect(std.mem.indexOf(u8, diff_bytes, std.Io.Writer.buffered(&id_writer)) != null);
+        var left_buffer: [256]u8 = undefined;
+        var left_writer: std.Io.Writer = .fixed(&left_buffer);
+        try left_writer.print("{x}", .{left_bytes});
+        try testing.expect(std.mem.indexOf(u8, diff_bytes, std.Io.Writer.buffered(&left_writer)) != null);
+        var right_buffer: [256]u8 = undefined;
+        var right_writer: std.Io.Writer = .fixed(&right_buffer);
+        try right_writer.print("{x}", .{right_bytes});
+        try testing.expect(std.mem.indexOf(u8, diff_bytes, std.Io.Writer.buffered(&right_writer)) != null);
+    }
+    try testing.expectEqual(@as(usize, 1), changed_columns);
+    var tiny_buffer: [0]u8 = .{};
+    var tiny_writer: std.Io.Writer = .fixed(&tiny_buffer);
+    try testing.expectError(error.WriteFailed, left.dump(gpa, &tiny_writer));
+    var empty = try Document.init(gpa, testing.io);
+    defer empty.deinit();
+    var absent_buffer: [4096]u8 = undefined;
+    var absent_writer: std.Io.Writer = .fixed(&absent_buffer);
+    try left.diffOpSet(gpa, &empty, &absent_writer);
+    const absent = std.Io.Writer.buffered(&absent_writer);
+    try testing.expect(absent.len != 0);
+}
+
+test "load options logs current snapshot into caller owned log" {
+    const gpa = testing.allocator;
+    var source = try buildSample(gpa);
+    defer source.deinit();
+    const bytes = try source.save(gpa);
+    defer gpa.free(bytes);
+    var log = patchesmod.PatchLog.active(gpa);
+    defer log.deinit();
+    var loaded = try Document.loadWithOptions(gpa, testing.io, bytes, .{ .patch_log = &log });
+    defer loaded.deinit();
+    var patches = try loaded.makePatches(&log);
+    defer patches.deinit();
+    try testing.expect(patches.len() > 0);
+    // Log ownership stays with the caller and its events can be read again.
+    var again = try loaded.makePatches(&log);
+    defer again.deinit();
+    try testing.expectEqual(patches.len(), again.len());
+    try source.debugCmp(&loaded);
+}
+
+test "combined multi object incoming apply stays usable after every allocation refusal" {
+    // Concurrent map winners, counter edges and separated sequence runs share one publication.
+    const observer = testing.allocator;
+    const Tx = @import("transact.zig").Transaction;
+    const readonly = @import("read.zig");
+    var base = try Document.init(observer, testing.io);
+    defer base.deinit();
+    base.setActorId(.{ .bytes = actor_a });
+    var list: ExId = undefined;
+    var text: ExId = undefined;
+    var nested: ExId = undefined;
+    {
+        var tx = try Tx.open(observer, &base);
+        defer tx.deinit() catch unreachable;
+        _ = try tx.put(.root, .{ .key = "winner" }, .{ .int = 0 });
+        _ = try tx.put(.root, .{ .key = "count" }, .{ .counter = value.ScalarValue.Counter.init(10) });
+        list = try tx.putObject(.root, .{ .key = "list" }, .list);
+        for ([_][]const u8{ "a", "b", "c" }, 0..) |entry, index| {
+            _ = try tx.insert(list, index, .{ .str = entry });
+        }
+        text = try tx.putObject(.root, .{ .key = "text" }, .text);
+        try tx.spliceText(text, 0, 0, "abc");
+        nested = try tx.putObject(.root, .{ .key = "nested" }, .map);
+        _ = try tx.put(nested, .{ .key = "old" }, .{ .bool_value = true });
+        var committed = try tx.commit();
+        defer committed.deinit(observer);
+    }
+    const snapshot = try base.save(observer);
+    defer observer.free(snapshot);
+    const base_heads = try base.getHeads(observer);
+    defer observer.free(base_heads);
+    var first = try base.clone(observer);
+    defer first.deinit();
+    first.setActorId(.{ .bytes = "\x00" });
+    {
+        var tx = try Tx.open(observer, &first);
+        defer tx.deinit() catch unreachable;
+        _ = try tx.put(.root, .{ .key = "winner" }, .{ .int = 1 });
+        _ = try tx.increment(.root, .{ .key = "count" }, 7);
+        _ = try tx.insert(list, 0, .{ .str = "early" });
+        _ = try tx.insert(list, 4, .{ .str = "late" });
+        try tx.spliceText(text, 1, 1, "XYZ");
+        try tx.mark(text, 0, 5, "bold", .none, .{ .bool_value = true });
+        try tx.unmark(text, 1, 3, .none, "bold", null);
+        _ = try tx.put(nested, .{ .key = "new" }, .{ .str = "nested value" });
+        var committed = try tx.commit();
+        defer committed.deinit(observer);
+    }
+    var second = try base.clone(observer);
+    defer second.deinit();
+    second.setActorId(.{ .bytes = actor_c });
+    {
+        var tx = try Tx.open(observer, &second);
+        defer tx.deinit() catch unreachable;
+        _ = try tx.put(.root, .{ .key = "winner" }, .{ .int = 2 });
+        var committed = try tx.commit();
+        defer committed.deinit(observer);
+    }
+    var first_changes = try first.getChanges(observer, base_heads);
+    defer first_changes.deinit(observer);
+    var second_changes = try second.getChanges(observer, base_heads);
+    defer second_changes.deinit(observer);
+    var incoming: std.ArrayList(Change) = .empty;
+    defer incoming.deinit(observer);
+    for (first_changes.slice()) |built| try incoming.append(observer, built.change);
+    for (second_changes.slice()) |built| try incoming.append(observer, built.change);
+    var expected = try base.clone(observer);
+    defer expected.deinit();
+    _ = try expected.applyChanges(observer, incoming.items);
+    var finished = false;
+    for (0..4096) |failure_index| {
+        var failing = testing.FailingAllocator.init(observer, .{
+            .fail_index = std.math.maxInt(usize),
+        });
+        const gpa = failing.allocator();
+        var target = try Document.load(gpa, testing.io, snapshot, .unicode_code_point);
+        defer target.deinit();
+        failing.fail_index = failing.alloc_index + failure_index;
+        const applied = target.applyChanges(gpa, incoming.items);
+        failing.fail_index = std.math.maxInt(usize);
+        var refused = false;
+        if (applied) |_| {} else |failure| {
+            switch (failure) {
+                error.OutOfMemory => refused = true,
+                else => return failure,
+            }
+        }
+        var metadata = try target.getChangesMeta(observer, &.{});
+        defer metadata.deinit(observer);
+        for (metadata.items.items) |meta| {
+            var encoded = (try target.getChangeByHash(observer, meta.hash)).?;
+            defer encoded.deinit(observer);
+            try testing.expectEqualSlices(u8, meta.hash.bytes[0..], encoded.change.hash.bytes[0..]);
+        }
+        const saved = try target.save(observer);
+        defer observer.free(saved);
+        var loaded = try Document.load(observer, testing.io, saved, .unicode_code_point);
+        defer loaded.deinit();
+        try target.debugCmp(&loaded);
+        // Retrying the full peer batch must neither lose accepted operations nor duplicate them.
+        _ = try target.applyChanges(observer, incoming.items);
+        try target.debugCmp(&expected);
+        try testing.expectEqual(@as(i64, 17), (try readonly.get(&target, .root, .{ .key = "count" })).?.value.scalar.counter.current);
+        const visible = try readonly.text(&target, text, observer);
+        defer observer.free(visible);
+        try testing.expectEqualStrings("aXYZc", visible);
+        const retry_saved = try target.save(observer);
+        defer observer.free(retry_saved);
+        var retry_loaded = try Document.load(observer, testing.io, retry_saved, .unicode_code_point);
+        defer retry_loaded.deinit();
+        try target.debugCmp(&retry_loaded);
+        const expected_span_texts = [_][]const u8{ "a", "XY", "Zc" };
+        for ([_]*Document{ &target, &expected, &retry_loaded }) |document_with_marks| {
+            const marks = try readonly.marks(document_with_marks, text, observer);
+            defer observer.free(marks);
+            try testing.expectEqual(@as(usize, 2), marks.len);
+            var left_mark = false;
+            var right_mark = false;
+            for (marks) |mark| {
+                try testing.expectEqualStrings("bold", mark.name);
+                try testing.expect(mark.value == .bool_value and mark.value.bool_value);
+                if (mark.start == 0 and mark.end == 1) {
+                    left_mark = true;
+                } else if (mark.start == 3 and mark.end == 5) {
+                    right_mark = true;
+                } else {
+                    return error.UnexpectedMarkRange;
+                }
+            }
+            try testing.expect(left_mark and right_mark);
+
+            var spans = try readonly.spans(document_with_marks, text, observer);
+            defer spans.deinit();
+            var span_index: usize = 0;
+            while (try spans.next()) |next_span| {
+                var span = next_span;
+                defer span.deinit(observer);
+                try testing.expect(span_index < expected_span_texts.len);
+                switch (span) {
+                    .text => |text_span| {
+                        try testing.expectEqualStrings(expected_span_texts[span_index], text_span.text);
+                        if (span_index == 1) {
+                            try testing.expect(text_span.marks == null);
+                        } else {
+                            const span_marks = text_span.marks orelse return error.MissingSpanMarks;
+                            try testing.expectEqual(@as(usize, 1), span_marks.len());
+                            var mark_iter = span_marks.iter();
+                            const span_mark = mark_iter.next() orelse return error.MissingSpanMark;
+                            try testing.expectEqualStrings("bold", span_mark.name);
+                            try testing.expect(span_mark.value == .bool_value and span_mark.value.bool_value);
+                            try testing.expect(mark_iter.next() == null);
+                        }
+                    },
+                    .block => return error.UnexpectedTextBlock,
+                }
+                span_index += 1;
+            }
+            try testing.expectEqual(expected_span_texts.len, span_index);
+
+            var hydrated = try readonly.hydrate(document_with_marks, text, null, observer);
+            defer hydrated.deinit();
+            try testing.expect(hydrated == .object);
+            try testing.expect(hydrated.object == .text);
+            try testing.expectEqual(@as(usize, 1), hydrated.object.text.marks.len());
+            var hydrated_iter = hydrated.object.text.marks.iter();
+            const hydrated_mark = hydrated_iter.next() orelse return error.MissingHydratedMark;
+            try testing.expectEqualStrings("bold", hydrated_mark.name);
+            try testing.expect(hydrated_mark.value == .bool_value and hydrated_mark.value.bool_value);
+            try testing.expect(hydrated_iter.next() == null);
+        }
+        {
+            var tx = try Tx.open(observer, &target);
+            defer tx.deinit() catch unreachable;
+            try tx.mark(text, 0, 5, "bold", .none, .{ .bool_value = true });
+            var committed = try tx.commit();
+            defer committed.deinit(observer);
+        }
+        const extended_marks = try readonly.marks(&target, text, observer);
+        defer observer.free(extended_marks);
+        try testing.expectEqual(@as(usize, 1), extended_marks.len);
+        try testing.expectEqual(@as(usize, 0), extended_marks[0].start);
+        try testing.expectEqual(@as(usize, 5), extended_marks[0].end);
+        try testing.expectEqualStrings("bold", extended_marks[0].name);
+        try testing.expect(extended_marks[0].value == .bool_value and extended_marks[0].value.bool_value);
+        _ = try target.putActorRef(observer, .{ .bytes = "" });
+        _ = try commitRootPut(observer, &target, "later");
+        const later_save = try target.save(observer);
+        defer observer.free(later_save);
+        var later_load = try Document.load(observer, testing.io, later_save, .unicode_code_point);
+        defer later_load.deinit();
+        try target.debugCmp(&later_load);
+        const saved_marks = try readonly.marks(&later_load, text, observer);
+        defer observer.free(saved_marks);
+        try testing.expectEqual(@as(usize, 1), saved_marks.len);
+        try testing.expectEqual(@as(usize, 0), saved_marks[0].start);
+        try testing.expectEqual(@as(usize, 5), saved_marks[0].end);
+        try testing.expectEqualStrings("bold", saved_marks[0].name);
+        try testing.expect(saved_marks[0].value == .bool_value and saved_marks[0].value.bool_value);
+        if (!refused) {
+            finished = true;
+            break;
+        }
+    }
+    try testing.expect(finished);
+}
+
+test "pending clone owns rows and exact committed footer after source teardown" {
+    // A raw clone retains pending rows without publishing a new history node.
+    const gpa = testing.allocator;
+    const Tx = @import("transact.zig").Transaction;
+    const readonly = @import("read.zig");
+    var source = try Document.init(gpa, testing.io);
+    var source_live = true;
+    defer if (source_live) source.deinit();
+    // Seed IDs in an order different from row traversal, including unused keys.
+    const seeded_keys = [_][]const u8{ "pending", "unused\x00key", "", "é", "Pending" };
+    const source_table = source.strings.table();
+    for (seeded_keys, 0..) |key, i| {
+        try testing.expectEqual(@as(u32, @intCast(i)), try source_table.intern(source_table.ctx, key, gpa));
+    }
+    var generated_key: [64]u8 = undefined;
+    for (0..256) |i| {
+        const key = try std.fmt.bufPrint(&generated_key, "unused-common-prefix-{d}", .{i});
+        try testing.expectEqual(
+            @as(u32, @intCast(seeded_keys.len + i)),
+            try source_table.intern(source_table.ctx, key, gpa),
+        );
+    }
+    const actor = try source.putActorRef(gpa, .{ .bytes = actor_b });
+    const specs = [_]OpSpec{
+        .{ .ctr = 17, .key = KeyRef.fromStr("incoming"), .value = .{ .str = "value" } },
+    };
+    const ops = try buildOps(gpa, actor, &specs);
+    defer freeChangeOps(gpa, ops);
+    var footer: std.ArrayList(u8) = .empty;
+    defer footer.deinit(gpa);
+    try encodeAuthorFooter(gpa, &footer, "incoming author");
+    try footer.appendSlice(gpa, &.{ 0xfd, 0x00, 0x81, 0x7f });
+    var incoming = try encodeOneChange(gpa, source.ops.actors.items, .{
+        .actor = actor,
+        .seq = 1,
+        .start_op = 17,
+        .max_op = 17,
+        .time = 123,
+        .message = "opaque history",
+        .deps = &.{},
+        .footer = footer.items,
+    }, ops);
+    defer incoming.deinit(gpa);
+    _ = try source.applyChanges(gpa, &.{incoming.change});
+    // Changing author mints an actor (`automerge.rs:389-396`); choose the
+    // deterministic local actor only after that setter has completed.
+    try source.setAuthor(gpa, "local author");
+    source.setActorId(.{ .bytes = actor_a });
+    var tx = try Tx.open(gpa, &source);
+    defer tx.deinit() catch unreachable;
+    _ = try tx.put(.root, .{ .key = "pending" }, .{ .str = "retained" });
+    _ = try tx.put(.root, .{ .key = "incoming" }, .{ .str = "pending replacement" });
+    const CloneAttempt = struct {
+        fn run(allocator: Allocator, original: *Document) !void {
+            var cloned = try original.clonePending(allocator);
+            defer cloned.deinit();
+            try testing.expectEqual(original.ops.len(), cloned.ops.len());
+            try testing.expectEqual(original.graph.len(), cloned.graph.len());
+            try testing.expectEqual(cloned.graph.len(), cloned.node_info.items.len);
+            try testing.expectEqualStrings(original.getActorId().bytes, cloned.getActorId().bytes);
+            const before = original.strings.table();
+            const after = cloned.strings.table();
+            try testing.expectEqual(original.strings.count(), cloned.strings.count());
+            for (0..original.strings.count()) |i| {
+                const id: u32 = @intCast(i);
+                const key = before.resolve(before.ctx, id);
+                try testing.expectEqualStrings(key, after.resolve(after.ctx, id));
+                try testing.expectEqual(id, try after.intern(after.ctx, key, allocator));
+            }
+            var history = (try cloned.getChangeByHash(allocator, original.graph.getHeads()[0])).?;
+            defer history.deinit(allocator);
+            try testing.expectEqual(@as(u64, 17), history.change.start_op);
+            try testing.expectEqual(@as(u64, 17), history.change.max_op);
+        }
+    };
+    try testing.checkAllAllocationFailures(gpa, CloneAttempt.run, .{&source});
+    var copy = try source.clonePending(gpa);
+    defer copy.deinit();
+    try testing.expectEqual(@as(usize, 1), source.graph.len());
+    try testing.expectEqual(@as(usize, 1), copy.graph.len());
+    try testing.expectEqual(copy.graph.len(), copy.node_info.items.len);
+    try testing.expectEqual(@as(usize, 3), copy.ops.len());
+    try testing.expect(!tx.closed);
+    try testing.expect(source.patch_identity != copy.patch_identity);
+    _ = try tx.rollback();
+    try testing.expect((try readonly.get(&source, .root, .{ .key = "pending" })) == null);
+    try testing.expectEqualStrings(
+        "value",
+        (try readonly.get(&source, .root, .{ .key = "incoming" })).?.value.scalar.str,
+    );
+    source.deinit();
+    source_live = false;
+    const copied_table = copy.strings.table();
+    for (seeded_keys, 0..) |key, i| {
+        const id: u32 = @intCast(i);
+        try testing.expectEqualStrings(key, copied_table.resolve(copied_table.ctx, id));
+        try testing.expectEqual(id, try copied_table.intern(copied_table.ctx, key, gpa));
+    }
+    for (0..256) |i| {
+        const key = try std.fmt.bufPrint(&generated_key, "unused-common-prefix-{d}", .{i});
+        const id: u32 = @intCast(seeded_keys.len + i);
+        try testing.expectEqualStrings(key, copied_table.resolve(copied_table.ctx, id));
+        try testing.expectEqual(id, try copied_table.intern(copied_table.ctx, key, gpa));
+    }
+    try testing.expectEqualStrings(actor_a, copy.getActorId().bytes);
+    try testing.expectEqualStrings("local author", copy.getAuthor().?);
+    try testing.expectEqualStrings("retained", (try readonly.get(&copy, .root, .{ .key = "pending" })).?.value.scalar.str);
+    try testing.expectEqualStrings(
+        "pending replacement",
+        (try readonly.get(&copy, .root, .{ .key = "incoming" })).?.value.scalar.str,
+    );
+    try testing.expectEqualStrings(
+        "incoming author",
+        copy.getAuthorForActor(.{ .bytes = actor_b }).?,
+    );
+    var metadata = (try copy.getChangeMetaByHash(gpa, incoming.change.hash)).?;
+    defer metadata.deinit(gpa);
+    try testing.expectEqual(@as(u64, 17), metadata.start_op);
+    try testing.expectEqual(@as(u64, 17), metadata.max_op);
+    try testing.expectEqual(@as(u64, 1), metadata.max_op - metadata.start_op + 1);
+    try testing.expectEqualStrings("incoming author", metadata.author.?);
+    try testing.expectEqualSlices(u8, footer.items, metadata.extra);
+    var rebuilt = (try copy.getChangeByHash(gpa, incoming.change.hash)).?;
+    defer rebuilt.deinit(gpa);
+    try testing.expectEqualSlices(u8, incoming.change.hash.bytes[0..], rebuilt.change.hash.bytes[0..]);
+    try testing.expectEqualSlices(u8, footer.items, changeFooter(rebuilt.change).?);
+    try testing.expectEqualSlices(u8, incoming.change.bytes, rebuilt.change.bytes);
+}
+
+test "historical head cache reuses owned keys without invalidating other walks" {
+    // Repeating a historical read must not allocate. Its key is owned, and
+    // selecting another head set does not release clocks borrowed by readers.
+    const observer = testing.allocator;
+    var failing = testing.FailingAllocator.init(observer, .{
+        .fail_index = std.math.maxInt(usize),
+    });
+    const gpa = failing.allocator();
+    var document = try buildSample(gpa);
+    defer document.deinit();
+    const heads = try document.getHeads(observer);
+    defer observer.free(heads);
+    const first = try document.clockAtScope(gpa, heads);
+    var expected = try document.graph.clockAt(observer, heads);
+    defer expected.deinit();
+    heads[0] = ChangeHash.zero;
+    _ = try document.clockAtScope(gpa, &.{});
+    for (1..65) |index| {
+        var historical = ChangeHash.zero;
+        historical.bytes[0] = @intCast(index);
+        _ = try document.clockAtScope(gpa, &.{historical});
+    }
+    failing.fail_index = failing.alloc_index;
+    const repeated = (try document.clockAtScope(gpa, document.graph.getHeads())).*;
+    try testing.expect(first.*.eql(expected));
+    try testing.expect(repeated.eql(expected));
+}
+
+test "raw logged incremental replacement and merge preserve the internal log owner" {
+    // These borrowed routes deliberately pass the exact internal log address.
+    // Empty-document replacement must transfer that owner before old teardown.
+    const gpa = testing.allocator;
+    const readonly = @import("read.zig");
+    var source = try buildSample(gpa);
+    defer source.deinit();
+    const bytes = try source.save(gpa);
+    defer gpa.free(bytes);
+    var target = try Document.init(gpa, testing.io);
+    defer target.deinit();
+    const identity = target.patchIdentity();
+    target.patch_log.setActive(true);
+    const added = try target.loadIncrementalWithPatchLog(gpa, bytes, &target.patch_log);
+    try testing.expectEqual(source.len(), added);
+    try testing.expectEqual(identity, target.patchIdentity());
+    var snapshot = try target.makePatches(&target.patch_log);
+    defer snapshot.deinit();
+    try testing.expect(snapshot.len() != 0);
+    try testing.expectEqual(@as(usize, 0), try target.loadIncrementalWithPatchLog(gpa, bytes, &target.patch_log));
+    const before = try source.getHeads(gpa);
+    defer gpa.free(before);
+    _ = try addKeyChange(&source, gpa, actor_a, 2, 16, "logged merge", before);
+    const heads = try target.mergeWithPatchLog(gpa, &source, &target.patch_log);
+    defer gpa.free(heads);
+    try testing.expect(sameHashList(heads, source.graph.getHeads()));
+    try testing.expect((try readonly.get(&target, .root, .{ .key = "logged merge" })) != null);
+    var merged = try target.makePatches(&target.patch_log);
+    defer merged.deinit();
+    try testing.expect(merged.len() != 0);
+    var unrelated = try Document.init(gpa, testing.io);
+    defer unrelated.deinit();
+    const reused_heads = try unrelated.mergeWithPatchLog(gpa, &source, &target.patch_log);
+    defer gpa.free(reused_heads);
+    try testing.expect(sameHashList(reused_heads, source.graph.getHeads()));
+    try target.debugCmp(&unrelated);
+    var retained = try target.makePatches(&target.patch_log);
+    defer retained.deinit();
+    try testing.expect(retained.len() >= merged.len());
+}
+
+test "raw hydrate initialization exposes primary refusal and recoverable owner at every OOM" {
+    // Observe the same raw owner after every opening, producer and commit refusal.
+    // Recovery remains explicit; disabling injection allows the retained journal
+    // to complete rollback rather than hiding a secondary refusal.
+    const observer = testing.allocator;
+    const hydration = @import("hydrate.zig");
+    const readonly = @import("read.zig");
+    var map = hydration.Map.init(observer, .root);
+    defer map.deinit();
+    try map.putOwned("first", .init(hydration.Value.fromScalar(.{ .int = 2 }), false));
+    try map.putOwned("second", .init(hydration.Value.fromScalar(.{ .bool_value = true }), false));
+    var completed = false;
+    var saw_refusal = false;
+    for (0..4096) |offset| {
+        var failing = testing.FailingAllocator.init(observer, .{
+            .fail_index = std.math.maxInt(usize),
+        });
+        const gpa = failing.allocator();
+        var document = try Document.init(gpa, testing.io);
+        defer document.deinit();
+        _ = try commitRootPut(gpa, &document, "keep");
+        failing.fail_index = failing.alloc_index + offset;
+        const attempted = document.initFromHydrate(gpa, &map);
+        failing.fail_index = std.math.maxInt(usize);
+        if (attempted) |returned| {
+            var outcome = returned;
+            switch (outcome) {
+                .success => |*success| {
+                    defer success.patch_log.deinit();
+                    try testing.expect(success.hash != null);
+                    try testing.expectEqual(@as(usize, 2), document.graph.len());
+                    try testing.expect((try readonly.get(
+                        &document,
+                        .root,
+                        .{ .key = "second" },
+                    )).?.value.scalar.bool_value);
+                    completed = true;
+                },
+                .failure => |*failure| {
+                    saw_refusal = true;
+                    defer failure.patch_log.deinit();
+                    // Release a retained recovery owner before any assertion
+                    // can return, including commit failures with a body result.
+                    const retained = failure.transaction != null;
+                    var cancelled = failure.cancelled;
+                    if (failure.transaction) |*transaction| {
+                        cancelled = try transaction.rollback();
+                        var log = transaction.takePatchLog();
+                        log.deinit();
+                        transaction.deinitClosed();
+                    }
+                    try testing.expectEqual(error.OutOfMemory, failure.err);
+                    if (failure.result != null) {
+                        // The body completed; the refusal was during commit.
+                        try testing.expectEqual(@as(usize, 2), cancelled);
+                    }
+                    if (retained) {
+                        try testing.expectEqual(
+                            @as(?@import("transaction.zig").TransactionError, error.OutOfMemory),
+                            failure.rollback_error,
+                        );
+                    } else {
+                        try testing.expect(failure.rollback_error == null);
+                    }
+                },
+            }
+        } else |failure| {
+            saw_refusal = true;
+            try testing.expectEqual(error.OutOfMemory, failure);
+        }
+        try testing.expectEqual(@as(i64, 1), (try readonly.get(&document, .root, .{ .key = "keep" })).?.value.scalar.int);
+        try testing.expectEqual(document.graph.len(), document.node_info.items.len);
+        for (0..document.graph.len()) |index| {
+            const node = document.graph.nodeAt(@intCast(index)).?;
+            try testing.expect(document.node_info.items[index].start_op <= node.meta.max_op);
+        }
+        if (completed) break;
+        try testing.expectEqual(@as(usize, 1), document.graph.len());
+        try testing.expect((try readonly.get(&document, .root, .{ .key = "first" })) == null);
+        try testing.expect((try readonly.get(&document, .root, .{ .key = "second" })) == null);
+        const saved = try document.save(observer);
+        defer observer.free(saved);
+        var loaded = try Document.load(observer, testing.io, saved, document.textEncoding());
+        defer loaded.deinit();
+        try document.debugCmp(&loaded);
+        var retry = try document.initFromHydrate(gpa, &map);
+        switch (retry) {
+            .success => |*success| {
+                defer success.patch_log.deinit();
+                try testing.expect(success.hash != null);
+                try testing.expectEqual(@as(usize, 2), document.graph.len());
+                try testing.expectEqual(document.graph.len(), document.node_info.items.len);
+                try testing.expectEqual(
+                    @as(i64, 2),
+                    (try readonly.get(&document, .root, .{ .key = "first" })).?.value.scalar.int,
+                );
+                try testing.expect((try readonly.get(
+                    &document,
+                    .root,
+                    .{ .key = "second" },
+                )).?.value.scalar.bool_value);
+            },
+            .failure => |*failure| {
+                defer failure.patch_log.deinit();
+                if (failure.transaction) |*transaction| {
+                    _ = try transaction.rollback();
+                    var log = transaction.takePatchLog();
+                    log.deinit();
+                    transaction.deinitClosed();
+                }
+                return error.RetryFailedWithoutAllocationRefusal;
+            },
+        }
+    }
+    try testing.expect(saw_refusal);
+    try testing.expect(completed);
+}
+
+test "raw duplicate sequence refusal publishes its prepared queued branch pruning" {
+    const gpa = testing.allocator;
+    var document = try Document.init(gpa, testing.io);
+    defer document.deinit();
+    var original = try handChange(&document, gpa, actor_a, 1, 1, &.{}, null, &.{});
+    defer original.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), try document.applyChanges(gpa, &.{original.change}));
+    var missing = ChangeHash.zero;
+    missing.bytes[0] = 99;
+    var orphan = try handChange(&document, gpa, actor_a, 3, 1, &.{missing}, null, &.{});
+    defer orphan.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), try document.applyChanges(gpa, &.{orphan.change}));
+    try testing.expectEqual(@as(usize, 1), document.queue.len());
+    var duplicate = try handChange(&document, gpa, actor_a, 1, 1, &.{}, "different", &.{});
+    defer duplicate.deinit(gpa);
+    try testing.expectError(error.DuplicateSeqNumber, document.applyChanges(gpa, &.{duplicate.change}));
+    try testing.expectEqual(@as(usize, 0), document.queue.len());
+    try testing.expectEqual(@as(usize, 1), document.graph.len());
+    try testing.expectEqual(@as(usize, 1), document.node_info.items.len);
+    try testing.expectEqual(@as(usize, 0), document.ops.len());
+}
+
+test "caller-owned loader logs retain their own allocator for nested path hints" {
+    const log_gpa = testing.allocator;
+    var source = try buildSample(log_gpa);
+    defer source.deinit();
+    const bytes = try source.save(log_gpa);
+    defer log_gpa.free(bytes);
+    var owner_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer testing.expect(owner_allocator.deinit() == .ok) catch
+        @panic("loader document allocator leaked");
+    const owner_gpa = owner_allocator.allocator();
+    var log = patchesmod.PatchLog.inactive(log_gpa);
+    defer log.deinit();
+    log.setActive(true);
+    var loaded = try Document.loadWithOptions(owner_gpa, testing.io, bytes, .{
+        .patch_log = &log,
+    });
+    defer loaded.deinit();
+    var patches = try loaded.makePatches(&log);
+    defer patches.deinit();
+    try testing.expect(patches.len() != 0);
+    try source.debugCmp(&loaded);
+}
+
+test "stateless allocator merge preserves complete state heads and authored footer cleanup" {
+    const gpa = std.heap.c_allocator;
+    const Tx = @import("transact.zig").Transaction;
+    const reader = @import("read.zig");
+    const count = 1024;
+    var base = try Document.init(gpa, testing.io);
+    defer base.deinit();
+    try base.setAuthor(gpa, "base author");
+    base.setActorId(.{ .bytes = actor_a });
+    {
+        var tx = try Tx.open(gpa, &base);
+        defer tx.deinit() catch @panic("stateless allocator rollback refused");
+        _ = try tx.put(.root, .{ .key = "base" }, .{ .int = 1 });
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+    }
+    const seed = try base.save(gpa);
+    defer gpa.free(seed);
+    var left = try Document.load(gpa, testing.io, seed, base.textEncoding());
+    defer left.deinit();
+    var right = try Document.load(gpa, testing.io, seed, base.textEncoding());
+    defer right.deinit();
+    try left.setAuthor(gpa, "base author");
+    left.setActorId(.{ .bytes = actor_a });
+    try right.setAuthor(gpa, "right author");
+    right.setActorId(.{ .bytes = actor_b });
+    var branch_heads: [2]ChangeHash = undefined;
+    {
+        var tx = try Tx.open(gpa, &left);
+        defer tx.deinit() catch @panic("stateless allocator rollback refused");
+        for (0..count) |index| {
+            var buffer: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&buffer, "left-{d}", .{index});
+            _ = try tx.put(.root, .{ .key = key }, .{ .int = @intCast(index) });
+        }
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+        branch_heads[0] = committed.hash.?;
+    }
+    {
+        var tx = try Tx.open(gpa, &right);
+        defer tx.deinit() catch @panic("stateless allocator rollback refused");
+        for (0..count) |index| {
+            var buffer: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&buffer, "right-{d}", .{index});
+            _ = try tx.put(.root, .{ .key = key }, .{ .int = @intCast(index) });
+        }
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+        branch_heads[1] = committed.hash.?;
+    }
+    const merged = try left.merge(gpa, &right);
+    defer gpa.free(merged);
+    try testing.expectEqual(@as(usize, 2), merged.len);
+    for (branch_heads) |expected| {
+        var found = false;
+        for (merged) |actual| found = found or actual.eql(expected);
+        try testing.expect(found);
+    }
+    try testing.expectEqual(@as(usize, 2 * count + 1), try reader.length(&left, .root));
+    try testing.expectEqual(@as(i64, count - 1), (try reader.get(&left, .root, .{ .key = "right-1023" })).?.value.scalar.int);
+    var metadata = (try left.getChangeMetaByHash(gpa, branch_heads[1])).?;
+    defer metadata.deinit(gpa);
+    try testing.expectEqualStrings("right author", metadata.author.?);
+    const saved = try left.save(gpa);
+    defer gpa.free(saved);
+    var loaded = try Document.load(gpa, testing.io, saved, left.textEncoding());
+    defer loaded.deinit();
+    try left.debugCmp(&loaded);
+}
+
+test "selected history batches preserve request order and own reference bytes after teardown" {
+    // Reverse dependency order is legal for this reader, not an apply order.
+    const gpa = testing.allocator;
+    const expected_hex = [_][]const u8{ reference_change_1, reference_change_0 };
+    var selected = blk: {
+        var source = try buildOracleDocument(gpa);
+        defer source.deinit();
+        const first = try err.hexFrom(gpa, reference_change_0_hash);
+        defer gpa.free(first);
+        const second = try err.hexFrom(gpa, reference_change_1_hash);
+        defer gpa.free(second);
+        var hashes: [2]ChangeHash = undefined;
+        @memcpy(&hashes[0].bytes, second);
+        @memcpy(&hashes[1].bytes, first);
+        break :blk try source.getChangesByHashes(gpa, &hashes);
+    };
+    defer selected.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), selected.len());
+    for (selected.slice(), expected_hex) |built, hex| {
+        const framed = try err.hexFrom(gpa, hex);
+        defer gpa.free(framed);
+        var expected = try changechunk.parseFramedChunk(try chunkmod.parseChunk(framed), gpa);
+        defer expected.deinit(gpa);
+        const change = expected.parsed.change;
+        try testing.expectEqualSlices(u8, change.bytes, built.body);
+        try testing.expect(change.hash.eql(built.change.hash));
+        const actors = try gpa.alloc(ActorIdx, change.other_actors.len + 1);
+        defer gpa.free(actors);
+        for (actors, 0..) |*actor, i| actor.* = @intCast(i);
+        const expected_ops = try decodeChangeOps(gpa, change, actors);
+        defer freeChangeOps(gpa, expected_ops);
+        const actual_ops = try decodeChangeOps(gpa, built.change, actors);
+        defer freeChangeOps(gpa, actual_ops);
+        try testing.expectEqualDeep(expected_ops, actual_ops);
+        try testing.expectEqual(
+            (try change.withOpCount(expected_ops.len)).max_op,
+            built.change.max_op,
+        );
+        const encoded = try built.change.encode(gpa);
+        defer gpa.free(encoded);
+        const expected_encoded = try change.encode(gpa);
+        defer gpa.free(expected_encoded);
+        try testing.expectEqualSlices(u8, expected_encoded, encoded);
+    }
+}
+
+fn selectedHistoryBatchAndFree(
+    gpa: Allocator,
+    source: *Document,
+    hashes: []const ChangeHash,
+) !void {
+    var selected = try source.getChangesByHashes(gpa, hashes);
+    defer selected.deinit(gpa);
+    try testing.expectEqual(hashes.len, selected.len());
+    for (selected.slice(), hashes) |built, hash| {
+        try testing.expect(hash.eql(built.change.hash));
+        const encoded = try built.change.encode(gpa);
+        defer gpa.free(encoded);
+        try testing.expectEqualSlices(u8, built.body, (try chunkmod.parseChunk(encoded)).data);
+    }
+}
+
+test "selected history batches release partial results and remain readable after refusal" {
+    const gpa = testing.allocator;
+    var source = try buildOracleDocument(gpa);
+    defer source.deinit();
+    const hashes = try source.graph.getChanges(gpa, &.{});
+    defer gpa.free(hashes);
+    try selectedHistoryBatchAndFree(gpa, &source, &.{});
+    const absent = ChangeHash{ .bytes = @splat(0x5a) };
+    try testing.expectError(error.MissingDeps, source.getChangesByHashes(gpa, &.{ hashes[0], absent }));
+    try testing.checkAllAllocationFailures(gpa, selectedHistoryBatchAndFree, .{ &source, hashes });
+    try selectedHistoryBatchAndFree(gpa, &source, hashes);
+}
+
+fn duplicateHistoryDocument(gpa: Allocator) !Document {
+    const trans = @import("transact.zig");
+    var source = try buildOracleDocument(gpa);
+    errdefer source.deinit();
+    source.setActorId(.{ .bytes = "duplicate-history-actor" });
+    var tx = try trans.Transaction.open(gpa, &source);
+    defer tx.deinitClosed();
+    _ = try tx.put(.root, .{ .key = "title" }, .{ .str = "replaced" });
+    var committed = try tx.commitWith(.{ .message = "cross-actor", .time = 17 });
+    defer committed.deinit(gpa);
+    _ = try source.emptyCommit(gpa, "empty", 18);
+    return source;
+}
+
+fn expectSelectedHistoryMatches(
+    gpa: Allocator,
+    selected: *const Changes,
+    hashes: []const ChangeHash,
+    expected: *const Changes,
+) !void {
+    try testing.expectEqual(hashes.len, selected.len());
+    for (selected.slice(), hashes) |built, hash| {
+        try testing.expect(hash.eql(built.change.hash));
+        const original = blk: {
+            for (expected.slice()) |candidate| {
+                if (candidate.change.hash.eql(hash)) break :blk candidate;
+            }
+            return error.TestUnexpectedResult;
+        };
+        try testing.expectEqualSlices(u8, original.body, built.body);
+        try testing.expectEqualDeep(original.change.other_actors, built.change.other_actors);
+        try testing.expectEqual(original.change.max_op, built.change.max_op);
+        const actors = try gpa.alloc(ActorIdx, original.change.other_actors.len + 1);
+        defer gpa.free(actors);
+        for (actors, 0..) |*actor, i| actor.* = @intCast(i);
+        const expected_ops = try decodeChangeOps(gpa, original.change, actors);
+        defer freeChangeOps(gpa, expected_ops);
+        const actual_ops = try decodeChangeOps(gpa, built.change, actors);
+        defer freeChangeOps(gpa, actual_ops);
+        try testing.expectEqualDeep(expected_ops, actual_ops);
+        try testing.expectEqual(expected_ops.len, try built.change.len(gpa));
+        try testing.expectEqual(
+            (try original.change.withOpCount(expected_ops.len)).max_op,
+            built.change.max_op,
+        );
+        const encoded = try built.change.encode(gpa);
+        defer gpa.free(encoded);
+        const expected_encoded = try original.change.encode(gpa);
+        defer gpa.free(expected_encoded);
+        try testing.expectEqualSlices(u8, expected_encoded, encoded);
+    }
+}
+
+test "duplicate selected history owns every nonempty and empty occurrence after teardown" {
+    // Mixed request order and cross-actor predecessors exercise body and actor ownership.
+    const gpa = testing.allocator;
+    var expected: Changes = .{};
+    defer expected.deinit(gpa);
+    var requested: [8]ChangeHash = undefined;
+    var selected = blk: {
+        var source = try duplicateHistoryDocument(gpa);
+        defer source.deinit();
+        expected = try source.getChanges(gpa, &.{});
+        const order = [_]usize{ 2, 3, 1, 2, 0, 3, 2, 1 };
+        for (order, &requested) |index, *hash| hash.* = expected.at(index).hash;
+        break :blk try source.getChangesByHashes(gpa, &requested);
+    };
+    defer selected.deinit(gpa);
+    try testing.expectEqual(@as(usize, 4), expected.len());
+    try testing.expect(expected.at(2).other_actors.len != 0);
+    try testing.expectEqual(@as(usize, 0), try expected.at(3).len(gpa));
+    try testing.expectEqual(expected.at(3).start_op - 1, expected.at(3).max_op);
+    for (expected.slice()[0..2], [_][]const u8{ reference_change_0, reference_change_1 }) |built, hex| {
+        const framed = try err.hexFrom(gpa, hex);
+        defer gpa.free(framed);
+        // Normalize compressed framing before comparing the canonical change body.
+        var reference = try changechunk.parseFramedChunk(try chunkmod.parseChunk(framed), gpa);
+        defer reference.deinit(gpa);
+        const change = reference.parsed.change;
+        try testing.expectEqualSlices(u8, change.bytes, built.body);
+        try testing.expect(change.hash.eql(built.change.hash));
+        try testing.expectEqualDeep(change.other_actors, built.change.other_actors);
+        const actors = try gpa.alloc(ActorIdx, change.other_actors.len + 1);
+        defer gpa.free(actors);
+        for (actors, 0..) |*actor, i| actor.* = @intCast(i);
+        const reference_ops = try decodeChangeOps(gpa, change, actors);
+        defer freeChangeOps(gpa, reference_ops);
+        const actual_ops = try decodeChangeOps(gpa, built.change, actors);
+        defer freeChangeOps(gpa, actual_ops);
+        try testing.expectEqualDeep(reference_ops, actual_ops);
+        try testing.expectEqual(
+            (try change.withOpCount(reference_ops.len)).max_op,
+            built.change.max_op,
+        );
+    }
+    try expectSelectedHistoryMatches(gpa, &selected, &requested, &expected);
+    // Releasing one occurrence must not invalidate the later cross-actor copies.
+    var released = selected.items.orderedRemove(0);
+    released.deinit(gpa);
+    try expectSelectedHistoryMatches(gpa, &selected, requested[1..], &expected);
+}
+
+test "duplicate selected history frees partial clones and preserves readable history on refusal" {
+    const gpa = testing.allocator;
+    var source = try duplicateHistoryDocument(gpa);
+    defer source.deinit();
+    var expected = try source.getChanges(gpa, &.{});
+    defer expected.deinit(gpa);
+    const before = try source.save(gpa);
+    defer gpa.free(before);
+    var requested: [8]ChangeHash = undefined;
+    const order = [_]usize{ 2, 3, 1, 2, 0, 3, 2, 1 };
+    for (order, &requested) |index, *hash| hash.* = expected.at(index).hash;
+    try testing.checkAllAllocationFailures(
+        gpa,
+        selectedHistoryBatchAndFree,
+        .{ &source, requested[0..] },
+    );
+    var selected = try source.getChangesByHashes(gpa, &requested);
+    defer selected.deinit(gpa);
+    try expectSelectedHistoryMatches(gpa, &selected, &requested, &expected);
+    const absent = ChangeHash{ .bytes = @splat(0x5a) };
+    try testing.expectError(
+        error.MissingDeps,
+        source.getChangesByHashes(gpa, &.{ requested[0], requested[0], absent }),
+    );
+    const after = try source.save(gpa);
+    defer gpa.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+    var all = try source.getChanges(gpa, &.{});
+    defer all.deinit(gpa);
+    try testing.expectEqual(expected.len(), all.len());
+    for (expected.slice(), all.slice()) |original, actual| {
+        try testing.expect(original.hash().eql(actual.hash()));
+        try testing.expectEqualSlices(u8, original.body, actual.body);
+        try testing.expectEqual(original.change.max_op, actual.change.max_op);
+    }
+}
+
+test "Strings preserves byte-exact owned keys and insertion IDs through high-cardinality growth" {
+    // Reuse mutable input storage, then read retained borrows after many insertions.
+    const gpa = testing.allocator;
+    var strings = Strings.init(gpa);
+    defer strings.deinit();
+    const table = strings.table();
+    const keys = [_][]const u8{ "", "\x00", "a\x00b", "é", "é", "key", "Key", "key-long" };
+    for (keys, 0..) |key, i| {
+        try testing.expectEqual(@as(u32, @intCast(i)), try table.intern(table.ctx, key, gpa));
+    }
+    var input = [_]u8{ 'o', 'w', 'n', 'e', 'd' };
+    const owned_id = try table.intern(table.ctx, &input, gpa);
+    const retained = table.resolve(table.ctx, owned_id);
+    @memset(&input, 'x');
+    try testing.expectEqualStrings("owned", retained);
+    var buffer: [64]u8 = undefined;
+    const first_generated = strings.count();
+    for (0..10_000) |i| {
+        const key = try std.fmt.bufPrint(&buffer, "shared-prefix-key-{d}", .{i});
+        const id: u32 = @intCast(first_generated + i);
+        try testing.expectEqual(id, try table.intern(table.ctx, key, gpa));
+    }
+    try testing.expectEqual(first_generated + 10_000, strings.count());
+    try testing.expectEqualStrings("owned", retained);
+    for (keys, 0..) |key, i| {
+        const id: u32 = @intCast(i);
+        try testing.expectEqualStrings(key, table.resolve(table.ctx, id));
+        try testing.expectEqual(id, try table.intern(table.ctx, key, gpa));
+    }
+    for (0..10_000) |offset| {
+        const i = 9_999 - offset;
+        const key = try std.fmt.bufPrint(&buffer, "shared-prefix-key-{d}", .{i});
+        const id: u32 = @intCast(first_generated + i);
+        try testing.expectEqualStrings(key, table.resolve(table.ctx, id));
+        try testing.expectEqual(id, try table.intern(table.ctx, key, gpa));
+    }
+    try testing.expectEqualStrings("", table.resolve(table.ctx, std.math.maxInt(u32)));
+    try testing.expectEqual(first_generated + 10_000, strings.count());
+}
+
+test "Strings duplicate lookup needs no allocation even when the allocator refuses" {
+    // A duplicate must not reserve capacity or copy bytes, even at a growth boundary.
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var strings = Strings.init(gpa);
+    defer strings.deinit();
+    const table = strings.table();
+    const keys = [_][]const u8{ "", "same\x00key", "é", "shared", "shared-prefix" };
+    for (keys) |key| _ = try table.intern(table.ctx, key, gpa);
+    var buffer: [64]u8 = undefined;
+    for (0..128) |i| {
+        const key = try std.fmt.bufPrint(&buffer, "shared-prefix-{d}", .{i});
+        _ = try table.intern(table.ctx, key, gpa);
+    }
+    const allocations = failing.alloc_index;
+    const allocated_bytes = failing.allocated_bytes;
+    failing.fail_index = allocations;
+    for (keys, 0..) |key, i| {
+        try testing.expectEqual(@as(u32, @intCast(i)), try table.intern(table.ctx, key, gpa));
+    }
+    for (0..128) |i| {
+        const key = try std.fmt.bufPrint(&buffer, "shared-prefix-{d}", .{i});
+        try testing.expectEqual(
+            @as(u32, @intCast(keys.len + i)),
+            try table.intern(table.ctx, key, gpa),
+        );
+    }
+    try testing.expectEqual(allocations, failing.alloc_index);
+    try testing.expectEqual(allocated_bytes, failing.allocated_bytes);
+    try testing.expectEqual(keys.len + 128, strings.count());
+}
+
+test "Strings allocation refusals preserve a readable prefix and retry without consuming IDs" {
+    // Sweep allocations across both ordered-key growth and arena-owned byte copies.
+    // Observe only published IDs and bytes; map capacity and layout are not contracts.
+    const seeds = [_][]const u8{ "", "existing\x00key", "é" };
+    var completed = false;
+    var refused = false;
+    for (0..256) |offset| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var strings = Strings.init(gpa);
+        defer strings.deinit();
+        const table = strings.table();
+        for (seeds) |key| _ = try table.intern(table.ctx, key, gpa);
+        const retained = table.resolve(table.ctx, 1);
+        failing.fail_index = failing.alloc_index + offset;
+        var published: usize = 0;
+        var failure_at: ?usize = null;
+        var input: [4096]u8 = @splat('x');
+        for (0..64) |i| {
+            _ = try std.fmt.bufPrint(input[0..8], "{d:0>8}", .{i});
+            const result = table.intern(table.ctx, &input, gpa);
+            if (result) |id| {
+                try testing.expectEqual(@as(u32, @intCast(seeds.len + i)), id);
+                published += 1;
+            } else |failure| {
+                try testing.expectEqual(error.OutOfMemory, failure);
+                failure_at = i;
+                refused = true;
+                break;
+            }
+        }
+        try testing.expectEqual(seeds.len + published, strings.count());
+        try testing.expectEqualStrings("existing\x00key", retained);
+        for (seeds, 0..) |key, i| {
+            const id: u32 = @intCast(i);
+            try testing.expectEqualStrings(key, table.resolve(table.ctx, id));
+            try testing.expectEqual(id, try table.intern(table.ctx, key, gpa));
+        }
+        for (0..published) |i| {
+            _ = try std.fmt.bufPrint(input[0..8], "{d:0>8}", .{i});
+            const id: u32 = @intCast(seeds.len + i);
+            try testing.expectEqualStrings(&input, table.resolve(table.ctx, id));
+            try testing.expectEqual(id, try table.intern(table.ctx, &input, gpa));
+        }
+        failing.fail_index = std.math.maxInt(usize);
+        if (failure_at) |i| {
+            _ = try std.fmt.bufPrint(input[0..8], "{d:0>8}", .{i});
+            const next_id: u32 = @intCast(seeds.len + published);
+            try testing.expectEqual(next_id, try table.intern(table.ctx, &input, gpa));
+            const retried_bytes = table.resolve(table.ctx, next_id);
+            @memset(&input, 'z');
+            _ = try std.fmt.bufPrint(input[0..8], "{d:0>8}", .{i});
+            try testing.expect(std.mem.allEqual(u8, retried_bytes[8..], 'x'));
+            try testing.expectEqual(next_id + 1, try table.intern(table.ctx, &input, gpa));
+            try testing.expectEqual(seeds.len + published + 2, strings.count());
+        } else {
+            completed = true;
+            break;
+        }
+    }
+    try testing.expect(refused);
+    try testing.expect(completed);
 }

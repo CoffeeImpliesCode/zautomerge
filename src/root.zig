@@ -60,6 +60,7 @@ pub const cursor = @import("cursor.zig");
 pub const patches = @import("patches.zig");
 pub const hydrate = @import("hydrate.zig");
 pub const doc = @import("doc.zig");
+pub const autocommit = @import("autocommit.zig");
 /// Per-peer sync state and protocol drivers.
 pub const sync = struct {
     pub const bloom = @import("sync/bloom.zig");
@@ -111,15 +112,13 @@ pub const Error = error_types.Error;
 pub const ParseError = error_types.ParseError;
 pub const InternalError = error_types.InternalError;
 pub const read = @import("read.zig");
-pub const transaction = @import("transact.zig");
-/// The manual-mode `Transaction`: `Transaction.open` on a document flagged
-/// `.manual`, whose caller calls `commit` itself and gets a hash back
-/// ([`inner.rs:22-33`](https://github.com/automerge/automerge/blob/main/rust/automerge/src/transaction/inner.rs)).
-/// Distinct from `transaction`, which is the autocommit door.
-pub const manual_transaction = @import("transaction.zig");
+/// Manual transactions, owned transactions, commit results, and closure helpers.
+/// `autocommit.AutoCommit` holds the same journal open across writer calls.
+pub const transaction = @import("transaction.zig");
 pub const anonymize = @import("anonymize.zig");
 // Identity and shape.
 pub const ActorId = types.ActorId;
+pub const Author = types.Author;
 pub const ActorIdx = types.ActorIdx;
 pub const OpId = types.OpId;
 pub const ExId = types.ExId;
@@ -132,6 +131,20 @@ pub const Prop = types.Prop;
 pub const SequenceType = types.SequenceType;
 pub const TextEncoding = types.TextEncoding;
 pub const ChangeHash = types.ChangeHash;
+pub const Change = change_record.Change;
+pub const ExpandedChange = change_record.ExpandedChange;
+pub const ExpandedOp = change_record.ExpandedOp;
+pub const ExpandedOpId = change_record.ExpandedOpId;
+pub const LoadOptions = doc.LoadOptions;
+pub const OnPartialLoad = doc.OnPartialLoad;
+pub const VerificationMode = doc.VerificationMode;
+pub const StringMigration = doc.StringMigration;
+pub const Stats = doc.Stats;
+pub const AutoCommit = autocommit.AutoCommit;
+pub const Transaction = transaction.Transaction;
+pub const CommitResult = transaction.CommitResult;
+pub const CommitOptions = transaction.CommitOptions;
+pub const OwnedTransaction = transaction.OwnedTransaction;
 
 /// The object id of the document root map.
 pub const root: ExId = .root;
@@ -145,20 +158,25 @@ pub const ValueMeta = value.ValueMeta;
 pub const Action = value.Action;
 pub const OpType = value.OpType;
 pub const ScalarValueRef = value.ScalarValueRef;
+pub const ValueRef = opset.types.ValueRef;
+pub const OwnedValue = value.OwnedValue;
+pub const OwnedScalarValue = value.OwnedScalarValue;
+pub const DataType = value.ScalarValue.DataType;
 
 // Clocks.
 pub const Clock = clock.Clock;
 pub const SeqClock = clock.SeqClock;
 pub const ClockRange = clock.ClockRange;
 
-/// The version of this port. Tracks the upstream `automerge` crate it targets.
-pub const version = "0.0.0";
+/// The package version declared in `build.zig.zon`.
+pub const version = @import("build_options").package_version;
 
 /// The upstream `automerge` crate version this port is written against.
 pub const upstream_version = "0.12.0";
 
-// Every module is pulled into the test root so its own tests run. A module
-// referenced only by a container-level declaration is not analyzed for tests.
+// Every module is pulled into the test root so its own tests run. The
+// AutoCommit facade uses the shared raw-document kernel; manual transactions
+// are explicit helpers rather than a second per-document mode.
 test {
     _ = @import("error.zig");
     _ = @import("types.zig");
@@ -229,6 +247,7 @@ test {
     _ = @import("cursor.zig");
     _ = @import("hydrate.zig");
     _ = @import("doc.zig");
+    _ = @import("autocommit.zig");
     _ = @import("c/result.zig");
     // `c/doc.zig` and `c/sync.zig` are deliberately NOT in this block: they
     // are `export fn`s over libc, and `zig test` links no libc. They are

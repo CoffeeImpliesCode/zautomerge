@@ -299,6 +299,12 @@ const log_sig_params = .{
 /// a `void` payload; its errors must be compatible with the calling operation.
 /// The call site checks that error-set compatibility.
 ///
+/// A transactional sink also supplies `beginBatch() !L`, which creates an
+/// independent event tail; `preparePublish(target) !void`, which checks any
+/// deferred callback failure and reserves every target allocation; and
+/// `publish(target) void`, which transfers the tail without allocating.
+/// `deinit()` releases an unpublished tail and is safe after publication.
+///
 /// **A sink method that takes a mark set is handed a borrowed one and must copy
 /// whatever it keeps.** [`ValueState.mapFlush`] and
 /// [`ValueState.listFlush`] own the set they export and free it as soon as the
@@ -314,6 +320,11 @@ pub fn assertLog(comptime L: type) void {
             @compileError("patch sink " ++ @typeName(L) ++ " declares " ++ name ++
                 " with parameters the sink contract does not give it; the order and" ++
                 " types are in log_sig_params." ++ name);
+        }
+    }
+    inline for (.{ "beginBatch", "preparePublish", "publish", "deinit" }) |name| {
+        if (!@hasDecl(L, name)) {
+            @compileError("patch sink " ++ @typeName(L) ++ " has no transactional " ++ name);
         }
     }
 }
@@ -500,6 +511,20 @@ pub const NullLog = struct {
     pub fn migrateActors(_: *Self, others: []const ActorId) Error!void {
         _ = .{others};
     }
+
+    /// Starts an independent no-recording batch sink.
+    pub fn beginBatch(_: *Self) Error!Self {
+        return .{};
+    }
+
+    /// No storage is required to publish a no-recording sink.
+    pub fn preparePublish(_: *Self, _: *Self) Error!void {}
+
+    /// Publishing a no-recording sink has no effect.
+    pub fn publish(_: *Self, _: *Self) void {}
+
+    /// A no-recording batch sink owns no storage.
+    pub fn deinit(_: *Self) void {}
 };
 
 // ── Marks in flight ────────────────────────────────────────────────────────
@@ -1199,12 +1224,6 @@ fn propOfOp(op: Op) ?PropRef {
     return .{ .key = key };
 }
 
-/// A borrowed mark set, or null, for a sink that takes `?*const MarkSet`.
-fn marksPtr(marks: ?MarkSet) ?*const MarkSet {
-    if (marks) |*m| return m;
-    return null;
-}
-
 /// A change op's property: the map key it hangs by, or null for a sequence
 /// anchor ([`ChangeOp::prop`](../github-automerge-automerge/rust/automerge/src/op_set2/op.rs):67-73,
 /// which is [`propOf`] over the raw key).
@@ -1397,7 +1416,7 @@ pub const ObjSpan = struct {
 ///
 /// Upstream holds an [`opiter.ObjIdIter`] and calls
 /// `seek_to_value` on it, once per [`ObjSpan`]. **The port calls
-/// [`opsetmod.OpSet.scopeToObj`] instead**, which is the same two-column
+/// [`opsetmod.OpSet.scopeToInternalObj`] instead**, which is the same two-column
 /// descent (`op_set.rs:1246-1251`) and is the one every other reader in the op
 /// set uses, so the merge and [`opsetmod.OpSet.iterObj`] cannot disagree about
 /// where an object's rows begin. That matters more than it looks: the whole
@@ -1405,7 +1424,7 @@ pub const ObjSpan = struct {
 /// row early or late puts every op of that object in the wrong place.
 ///
 /// A single descent per object rather than a walk: [`ObjSpan`]s are in
-/// ascending object order and [`opsetmod.OpSet.scopeToObj`] is O(log n) over
+/// ascending object order and [`opsetmod.OpSet.scopeToInternalObj`] is O(log n) over
 /// the object columns, so there is nothing to amortise and nothing to keep.
 pub const ObjWalker = struct {
     /// The document being merged into.
@@ -1419,7 +1438,7 @@ pub const ObjWalker = struct {
     /// The rows of `obj`, half open
     /// ([`ObjWalker::seek_to_obj`](batch.rs):1029-1031).
     pub fn seekToObj(self: *ObjWalker, obj: ObjId) ParseError!RowRange {
-        return self.set.scopeToObj(obj);
+        return self.set.scopeToInternalObj(obj);
     }
 };
 
@@ -1852,11 +1871,14 @@ pub fn Untangler(comptime L: type) type {
                         else => {
                             var marks = try self.value.marks.current().exportSet(self.gpa);
                             defer if (marks) |*m| m.deinit();
+                            // The sink copies marks synchronously. Borrow this live
+                            // local, not the payload of a by-value helper parameter.
+                            const mark_set: ?*const MarkSet = if (marks) |*m| m else null;
                             log.splice(
                                 self.value.obj,
                                 self.index,
                                 self.change_ops[v].bld.asStr(),
-                                marksPtr(marks),
+                                mark_set,
                             );
                         },
                     }
@@ -2294,18 +2316,72 @@ pub fn BatchApply(comptime L: type) type {
             }
         }
 
-        /// Steps 1, 2 and 4 through 10 ([`BatchApply::apply`](batch.rs):865-951).
-        ///
-        /// Step 3, `import_ops`, is the caller's: the port's decode of a
-        /// change's op columns is `op_set2/change.rs`, a module this file does
-        /// not own, so `ops` arrives already decoded and in change order.
-        /// `changes` is what steps 1 and 2 read.
-        ///
-        /// **The order of the last six steps is load-bearing and is upstream's:**
-        /// *all* the walking happens before *any* mutation, because a walk reads
-        /// the index columns that `conflict`, `expose` and `add_succ` write,
-        /// and because every run's `pos` is relative to the rows that existed
-        /// when the walk read them.
+        /// Prepares all op-set writes without publishing any operation rows.
+        /// `log` must be an independent unpublished sink; its callbacks may
+        /// receive a prefix on refusal. The caller validates/reserves that sink
+        /// before publishing this batch together with history and metadata.
+        /// Actors must already be canonical. Keep `out` at its final address.
+        pub fn prepare(
+            self: *Self,
+            set: *Set,
+            changes: []const Change,
+            log: *L,
+            out: *Set.PreparedBatch,
+        ) WalkError!void {
+            assertLog(L);
+            for (changes) |change| {
+                if (actorSlot(set, change.actor) != null) return error.Invariant;
+            }
+            try log.migrateActors(set.actors.items);
+            var obj_info = try cloneObjIndex(self.gpa, &set.obj_info);
+            var owns_objects = true;
+            defer if (owns_objects) obj_info.deinit();
+            try self.orderOpsForDoc(&obj_info);
+            var succ: std.ArrayList(SuccInsert) = .empty;
+            defer succ.deinit(self.gpa);
+            var conflicts: std.ArrayList(Adjust) = .empty;
+            defer conflicts.deinit(self.gpa);
+            var walker = ObjWalker.init(set);
+            for (self.obj_spans.items) |span| {
+                try self.walkObjSpan(set, &walker, &obj_info, span, &succ, &conflicts, log);
+            }
+            try checkSuccOrder(succ.items);
+            var rows = false;
+            var payloads = false;
+            var successors = succ.items.len != 0;
+            for (self.ops) |op| {
+                if (op.action() != .delete) {
+                    rows = true;
+                    if (optypes.rawLen(op.value()) != 0) payloads = true;
+                    if (op.succCount() != 0) successors = true;
+                }
+            }
+            var visibility = conflicts.items.len != 0;
+            for (succ.items) |edge| {
+                if (edge.inc == null) visibility = true;
+            }
+            try set.beginPreparedBatch(out, obj_info, .{
+                .rows = rows,
+                .successors = successors,
+                .visibility = visibility,
+                .payloads = payloads,
+            });
+            owns_objects = false;
+            errdefer out.deinit();
+            for (conflicts.items) |adjust| {
+                switch (adjust) {
+                    .conflict => |index| try out.view.conflict(index),
+                    .expose => |index| try out.view.expose(index),
+                }
+            }
+            try out.view.addSucc(succ.items);
+            try self.insertRunsOfOps(&out.view);
+        }
+
+        /// Atomically publishes operation rows and a transactional sink tail.
+        /// Actor interning may leave a usable canonical-table prefix on refusal;
+        /// document callers preflight their actor mirrors before entering here.
+        /// Every other fallible step precedes row and sink-tail publication.
         pub fn apply(
             self: *Self,
             set: *Set,
@@ -2313,50 +2389,15 @@ pub fn BatchApply(comptime L: type) type {
             log: *L,
         ) WalkError!void {
             assertLog(L);
-            try self.insertNewActors(set, changes); // :870
-            try log.migrateActors(set.actors.items); // :872
-
-            var obj_info = try cloneObjIndex(self.gpa, &set.obj_info); // :876
-            defer obj_info.deinit();
-            try self.orderOpsForDoc(&obj_info); // :878
-
-            var succ: std.ArrayList(SuccInsert) = .empty;
-            defer succ.deinit(self.gpa);
-            var conflicts: std.ArrayList(Adjust) = .empty;
-            defer conflicts.deinit(self.gpa);
-            var walker = ObjWalker.init(set); // :882
-            for (self.obj_spans.items) |span| { // :886
-                try self.walkObjSpan(set, &walker, &obj_info, span, &succ, &conflicts, log);
-            }
-
-            try checkSuccOrder(succ.items); // :924-936
-            for (conflicts.items) |a| { // :938-943
-                switch (a) {
-                    .conflict => |index| try set.conflict(index),
-                    .expose => |index| try set.expose(index),
-                }
-            }
-            try set.addSucc(succ.items); // :945
-            try self.insertRunsOfOps(set); // :947
-            // :949 — upstream's `debug_assert!(doc.ops.validate_op_order())`.
-            //
-            // **Left disabled, and that is a finding, not an oversight.**
-            // `validate_op_order` has exactly one call site in the whole
-            // reference crate and this is it (`op_set.rs:167-175`), so this
-            // line is the *only* place the row-order invariant is checked
-            // after an apply, and `if (false and …)` is a checker that cannot
-            // fire. It was measured to pass — all 260 of this slice's tests
-            // are green with it enabled — so the merge path is sound and the
-            // guard is free. It is **not** enabled here because turning a
-            // `merge` into a failure is a behaviour change at the merge door,
-            // and this session has other agents landing changes in the same
-            // tree, so the blast radius cannot be measured from inside this
-            // slice. Until it is enabled the row order of an applied op set is
-            // still checked at every comparison point:
-            // [`opsetmod.OpSet.debugCmp`] and [`opsetmod.OpSet.debugDiff`] both
-            // run [`opsetmod.OpSet.validateOpOrder`] on **each** side, and
-            // `debugDiff` reports which side and which row.
-            if (false and !try set.validateOpOrder()) return error.Invariant; // :949
+            try self.insertNewActors(set, changes);
+            var staged_log = try log.beginBatch();
+            defer staged_log.deinit();
+            var prepared: Set.PreparedBatch = undefined;
+            try self.prepare(set, changes, &staged_log, &prepared);
+            defer prepared.deinit();
+            try staged_log.preparePublish(log);
+            prepared.publish(set);
+            staged_log.publish(log);
         }
 
         /// Step 9 ([`BatchApply::insert_runs_of_ops`](batch.rs):953-970).
@@ -2565,6 +2606,11 @@ pub fn applyChangesBatchLogPatches(
     authors: AuthorLookup,
     incoming: []Change,
 ) Error!ChangeBatch {
+    // Incoming ownership begins before queue bookkeeping can allocate.
+    var screening_owns_incoming = false;
+    errdefer if (!screening_owns_incoming) {
+        for (incoming) |*c| c.deinit(gpa);
+    };
     // `seen`, `batch.rs:1053`: every hash the queue holds.
     var seen: std.AutoHashMapUnmanaged(ChangeHash, void) = .empty;
     defer seen.deinit(gpa);
@@ -2598,6 +2644,7 @@ pub fn applyChangesBatchLogPatches(
             for (accepted.items) |*c| c.deinit(gpa);
             for (incoming[at..]) |*c| c.deinit(gpa);
         }
+        screening_owns_incoming = true;
         for (incoming, 0..) |c, i| {
             at = i;
             if (graph.hasChange(c.hash) or seen.contains(c.hash)) {
@@ -2693,6 +2740,25 @@ fn freeSlots(gpa: Allocator, slots: *Slots) void {
     var values = slots.valueIterator();
     while (values.next()) |v| v.deinit(gpa);
     slots.deinit(gpa);
+}
+
+/// Prepares a batch into an independent unpublished sink and caller storage.
+/// Refusal leaves source operation rows unchanged, but may change the sink.
+/// Actor indices must already be canonical. The caller owns `out` on success
+/// and must dispose it or publish it after every other participant is prepared.
+pub fn prepareChangesBatchToSink(
+    comptime L: type,
+    gpa: Allocator,
+    log: *L,
+    set: *Set,
+    changes: []const Change,
+    ops: []ChangeOp,
+    out: *Set.PreparedBatch,
+) WalkError!void {
+    assertLog(L);
+    var batch = BatchApply(L).init(gpa, ops);
+    defer batch.deinit();
+    try batch.prepare(set, changes, log, out);
 }
 
 /// A merge nobody is watching
@@ -3319,13 +3385,19 @@ const Recorder = struct {
     /// outlives the walk that borrowed them. [`deinit`](Recorder.deinit) frees
     /// every one.
     owned: std.ArrayList([]u8) = .empty,
+    /// A refused allocation makes this recorder unpublishable.
+    oom: bool = false,
 
     /// A copy of `bytes` this recorder frees in
     /// [`deinit`](Recorder.deinit), or null when it could not allocate.
     fn own(self: *Recorder, bytes: []const u8) ?[]const u8 {
-        const copy = self.gpa.dupe(u8, bytes) catch return null;
+        const copy = self.gpa.dupe(u8, bytes) catch {
+            self.oom = true;
+            return null;
+        };
         self.owned.append(self.gpa, copy) catch {
             self.gpa.free(copy);
+            self.oom = true;
             return null;
         };
         return copy;
@@ -3370,6 +3442,26 @@ const Recorder = struct {
         const set = m orelse return 0;
         return set.len();
     }
+    /// Starts a fresh stage unless this recorder has already refused allocation.
+    pub fn beginBatch(self: *Recorder) Error!Recorder {
+        if (self.oom) return error.OutOfMemory;
+        return .{ .gpa = self.gpa };
+    }
+
+    /// Reserves publication room without changing either recorder's entries.
+    pub fn preparePublish(self: *Recorder, target: *Recorder) Error!void {
+        if (self.oom or target.oom) return error.OutOfMemory;
+        try target.items.ensureUnusedCapacity(target.gpa, self.items.items.len);
+        try target.owned.ensureUnusedCapacity(target.gpa, self.owned.items.len);
+    }
+
+    /// Transfers staged entries and payload ownership after preparePublish succeeds.
+    pub fn publish(self: *Recorder, target: *Recorder) void {
+        target.items.appendSliceAssumeCapacity(self.items.items);
+        target.owned.appendSliceAssumeCapacity(self.owned.items);
+        self.items.items.len = 0;
+        self.owned.items.len = 0;
+    }
 
     /// Frees the copied payloads and the events. Once only.
     fn deinit(self: *Recorder) void {
@@ -3380,7 +3472,9 @@ const Recorder = struct {
 
     pub fn insert(self: *Recorder, _: ObjId, index: usize, val: PatchValue, id_: OpId, conflict: bool) void {
         const value = self.ownValue(val) orelse return;
-        self.items.append(self.gpa, .{ .insert = .{ .index = index, .value = value, .id = id_, .conflict = conflict } }) catch {};
+        self.items.append(self.gpa, .{ .insert = .{ .index = index, .value = value, .id = id_, .conflict = conflict } }) catch {
+            self.oom = true;
+        };
     }
 
     pub fn putMap(
@@ -3394,7 +3488,9 @@ const Recorder = struct {
     ) void {
         const k = self.own(key) orelse return;
         const value = self.ownValue(val) orelse return;
-        self.items.append(self.gpa, .{ .put_map = .{ .key = k, .value = value, .id = id_, .conflict = conflict, .expose = expose } }) catch {};
+        self.items.append(self.gpa, .{ .put_map = .{ .key = k, .value = value, .id = id_, .conflict = conflict, .expose = expose } }) catch {
+            self.oom = true;
+        };
     }
 
     pub fn putSeq(
@@ -3407,35 +3503,49 @@ const Recorder = struct {
         expose: bool,
     ) void {
         const value = self.ownValue(val) orelse return;
-        self.items.append(self.gpa, .{ .put_seq = .{ .index = index, .value = value, .id = id_, .conflict = conflict, .expose = expose } }) catch {};
+        self.items.append(self.gpa, .{ .put_seq = .{ .index = index, .value = value, .id = id_, .conflict = conflict, .expose = expose } }) catch {
+            self.oom = true;
+        };
     }
 
     pub fn deleteMap(self: *Recorder, _: ObjId, key: []const u8) void {
         const k = self.own(key) orelse return;
-        self.items.append(self.gpa, .{ .delete_map = .{ .key = k } }) catch {};
+        self.items.append(self.gpa, .{ .delete_map = .{ .key = k } }) catch {
+            self.oom = true;
+        };
     }
 
     pub fn deleteSeq(self: *Recorder, _: ObjId, index: usize, num: usize) void {
-        self.items.append(self.gpa, .{ .delete_seq = .{ .index = index, .num = num } }) catch {};
+        self.items.append(self.gpa, .{ .delete_seq = .{ .index = index, .num = num } }) catch {
+            self.oom = true;
+        };
     }
 
     pub fn flagConflict(self: *Recorder, _: ObjId, prop: Prop) void {
         const p = self.ownProp(prop) orelse return;
-        self.items.append(self.gpa, .{ .flag_conflict = .{ .prop = p } }) catch {};
+        self.items.append(self.gpa, .{ .flag_conflict = .{ .prop = p } }) catch {
+            self.oom = true;
+        };
     }
 
     pub fn incrementMap(self: *Recorder, _: ObjId, key: []const u8, n: i64, id_: OpId) void {
         const k = self.own(key) orelse return;
-        self.items.append(self.gpa, .{ .increment_map = .{ .key = k, .n = n, .id = id_ } }) catch {};
+        self.items.append(self.gpa, .{ .increment_map = .{ .key = k, .n = n, .id = id_ } }) catch {
+            self.oom = true;
+        };
     }
 
     pub fn incrementSeq(self: *Recorder, _: ObjId, index: usize, n: i64, id_: OpId) void {
-        self.items.append(self.gpa, .{ .increment_seq = .{ .index = index, .n = n, .id = id_ } }) catch {};
+        self.items.append(self.gpa, .{ .increment_seq = .{ .index = index, .n = n, .id = id_ } }) catch {
+            self.oom = true;
+        };
     }
 
     pub fn splice(self: *Recorder, _: ObjId, index: usize, text: []const u8, m: ?*const MarkSet) void {
         const t = self.own(text) orelse return;
-        self.items.append(self.gpa, .{ .splice = .{ .index = index, .text = t, .marks = marksOf(m) } }) catch {};
+        self.items.append(self.gpa, .{ .splice = .{ .index = index, .text = t, .marks = marksOf(m) } }) catch {
+            self.oom = true;
+        };
     }
 
     pub fn replaceSeq(
@@ -3461,15 +3571,22 @@ const Recorder = struct {
             .conflict = conflict,
             .expose = expose,
             .marks = marksOf(m),
-        } }) catch {};
+        } }) catch {
+            self.oom = true;
+        };
     }
 
     pub fn mark(self: *Recorder, _: ObjId, index: usize, len: usize, m: *const MarkSet) void {
-        self.items.append(self.gpa, .{ .mark = .{ .index = index, .len = len, .marks = m.len() } }) catch {};
+        self.items.append(self.gpa, .{ .mark = .{ .index = index, .len = len, .marks = m.len() } }) catch {
+            self.oom = true;
+        };
     }
 
     pub fn migrateActors(self: *Recorder, actors: []const ActorId) Error!void {
-        try self.items.append(self.gpa, .{ .migrated = actors.len });
+        self.items.append(self.gpa, .{ .migrated = actors.len }) catch {
+            self.oom = true;
+            return error.OutOfMemory;
+        };
     }
 };
 
@@ -4280,12 +4397,13 @@ test "a batch anchored at an element the walk never reaches is refused" {
     defer rec.deinit();
     try testing.expectError(error.Invariant, f.mergeRecorded(&batch, &changes, &rec));
 
-    // The refusal came from the walk, which runs before any mutation
-    // (`batch.rs:865-951`: every write is step 7 or later), so the document
-    // is exactly what it was.
+    // The native batch stages both rows and sink callbacks before publication.
+    // The walk still rejects the unreachable anchor (batch.rs:136), but unlike
+    // Rust's in-place migration at batch.rs:872, a refused native batch must
+    // not publish even the staged actor migration.
     try expectRowIds(gpa, &f.set, &.{ opId(1, 0), opId(2, 0) });
     try expectBothCheckers(&f.set);
-    try expectEvents(gpa, &rec, &.{"migrate 3"});
+    try expectEvents(gpa, &rec, &.{});
 }
 
 // ── Map bases the hand-built merges start from ─────────────────────────────
@@ -5215,40 +5333,9 @@ test "and one by the lesser actor lands before it too" {
 
 // ── 7. The screen in front of the merge ────────────────────────────────────
 
-/// A hash of `tag`, which is how a test names a change.
+/// A hash absent from the fixture's real encoded change history.
 fn hashOf(tag: u8) ChangeHash {
     return .{ .bytes = [_]u8{tag} ** 32 };
-}
-
-/// A change the queue can take ownership of.
-///
-/// **The one allocation a `Change` owns is `other_actors`**, and
-/// [`queuemod.ChangeQueue.clear`] frees it, so a change handed to the queue
-/// needs a real one rather than a zero-length literal. Everything else is
-/// borrowed, which is what a parsed change is.
-fn screenChange(
-    gpa: Allocator,
-    actor: ActorId,
-    seq: u64,
-    start: u64,
-    tag: u8,
-    deps: []const ChangeHash,
-) !Change {
-    const others = try gpa.alloc(ActorId, 1);
-    others[0] = .{ .bytes = actor.bytes };
-    return .{
-        .bytes = &.{},
-        .header_len = 0,
-        .actor = actor,
-        .deps = deps,
-        .hash = hashOf(tag),
-        .time = 0,
-        .message = &.{},
-        .seq = seq,
-        .start_op = start,
-        .max_op = start,
-        .other_actors = others,
-    };
 }
 
 /// Frees the `other_actors` of a change the screen did **not** take. The array
@@ -5268,13 +5355,17 @@ const Screen = struct {
     queue: ChangeQueue,
     graph: ChangeGraph,
     authors: authorsmod.Authors,
+    gpa: Allocator,
+    bodies: std.ArrayList([]u8) = .empty,
 
     fn init(gpa: Allocator) !Screen {
         var self: Screen = .{
             .queue = ChangeQueue.init(gpa),
             .graph = ChangeGraph.init(gpa),
             .authors = authorsmod.Authors.init(gpa),
+            .gpa = gpa,
         };
+        errdefer self.deinit();
         for (fixture_actors) |a| _ = try self.authors.intern(gpa, a);
         return self;
     }
@@ -5283,6 +5374,39 @@ const Screen = struct {
         self.queue.deinit();
         self.graph.deinit();
         self.authors.deinit();
+        for (self.bodies.items) |body| self.gpa.free(body);
+        self.bodies.deinit(self.gpa);
+    }
+
+    /// The screen consumes parsed changes, so retain genuine wire bodies until
+    /// every queued/extracted header and graph record has been released.
+    fn change(
+        self: *Screen,
+        actor: ActorId,
+        seq: u64,
+        start: u64,
+        tag: u8,
+        deps: []const ChangeHash,
+    ) !Change {
+        const ops = [_]changerec.ExpandedOp{.{
+            .action = .{ .put = .{ .uint = tag } },
+            .obj = .root,
+            .key = .{ .map = "screen-value" },
+            .pred = &.{},
+        }};
+        const expanded: changerec.ExpandedChange = .{
+            .ops = &ops,
+            .actor = actor,
+            .seq = seq,
+            .start_op = start,
+            .time = tag,
+            .message = null,
+            .deps = deps,
+        };
+        var built = try expanded.encode(self.gpa);
+        errdefer built.deinit(self.gpa);
+        try self.bodies.append(self.gpa, built.body);
+        return built.change;
     }
 
     /// Records `c` in the graph, which is what "the document already has it"
@@ -5291,7 +5415,7 @@ const Screen = struct {
     fn applied(self: *Screen, gpa: Allocator, c: Change) !void {
         var owned = c;
         defer owned.deinit(gpa);
-        var meta = try changerec.ChangeMetadata.fromChange(c).intoOwned(gpa);
+        var meta = try (try changerec.ChangeMetadata.fromChange(gpa, c)).intoOwned(gpa);
         defer meta.deinit(gpa);
         try self.graph.addChange(gpa, &self.authors, meta);
     }
@@ -5342,16 +5466,21 @@ test "the screen skips a change the graph holds and one the queue holds" {
 
     const no_deps = [_]ChangeHash{};
     // The graph holds actor 1's first change.
-    try s.applied(gpa, try screenChange(gpa, fixture_actors[1], 1, 1, 0x11, &no_deps));
+    const applied = try s.change(fixture_actors[1], 1, 1, 0x11, &no_deps);
+    const applied_hash = applied.hash;
+    try s.applied(gpa, applied);
     // The queue holds an **orphan**: its dependency is in neither the graph nor
     // the queue, so it can never be popped and stays where it is.
     const missing = [_]ChangeHash{hashOf(0xff)};
-    try s.queue.push(gpa, try screenChange(gpa, fixture_actors[2], 1, 1, 0x31, &missing));
+    const orphan = try s.change(fixture_actors[2], 1, 1, 0x31, &missing);
+    const orphan_hash = orphan.hash;
+    try s.queue.push(gpa, orphan);
 
     const incoming = try gpa.alloc(Change, 3);
-    incoming[0] = try screenChange(gpa, fixture_actors[1], 1, 1, 0x11, &no_deps); // in the graph
-    incoming[1] = try screenChange(gpa, fixture_actors[2], 1, 1, 0x31, &missing); // in the queue
-    incoming[2] = try screenChange(gpa, fixture_actors[1], 2, 2, 0x12, &[_]ChangeHash{hashOf(0x11)});
+    incoming[0] = try s.change(fixture_actors[1], 1, 1, 0x11, &no_deps); // in the graph
+    incoming[1] = try s.change(fixture_actors[2], 1, 1, 0x31, &missing); // in the queue
+    incoming[2] = try s.change(fixture_actors[1], 2, 2, 0x12, &.{applied_hash});
+    const ready_hash = incoming[2].hash;
     // `incoming[2]` is **not** ours any more once the call returns: the
     // accepted changes are moved into the queue, and the ready ones out of it
     // into the batch, which `batch.deinit` frees. The two the screen skipped
@@ -5369,9 +5498,9 @@ test "the screen skips a change the graph holds and one the queue holds" {
     // Only the change that survived both skips is ready, and the orphan is
     // still waiting.
     try testing.expectEqual(@as(usize, 1), batch.len());
-    try testing.expect(batch.at(0).hash.eql(hashOf(0x12)));
+    try testing.expect(batch.at(0).hash.eql(ready_hash));
     try testing.expectEqual(@as(usize, 1), s.queue.len());
-    try testing.expect(s.queue.contains(hashOf(0x31)));
+    try testing.expect(s.queue.contains(orphan_hash));
     // The screen applies nothing, so the document is exactly what it was.
     try expectRowIds(gpa, &f.set, &.{ opId(1, 0), opId(2, 0) });
     try expectBothCheckers(&f.set);
@@ -5389,11 +5518,14 @@ test "a repeated (actor, seq) inside the batch is refused, and the queue is unto
     defer authors.deinit(gpa);
 
     const no_deps = [_]ChangeHash{};
-    try s.queue.push(gpa, try screenChange(gpa, fixture_actors[1], 1, 1, 0x21, &no_deps));
+    const queued = try s.change(fixture_actors[1], 1, 1, 0x21, &no_deps);
+    const queued_hash = queued.hash;
+    try s.queue.push(gpa, queued);
     // Two different changes claiming actor 2's sequence 1.
     const incoming = try gpa.alloc(Change, 2);
-    incoming[0] = try screenChange(gpa, fixture_actors[2], 1, 1, 0x31, &no_deps);
-    incoming[1] = try screenChange(gpa, fixture_actors[2], 1, 1, 0x32, &no_deps);
+    incoming[0] = try s.change(fixture_actors[2], 1, 1, 0x31, &no_deps);
+    incoming[1] = try s.change(fixture_actors[2], 1, 1, 0x32, &no_deps);
+    const rejected_hash = incoming[0].hash;
     defer {
         freeUnscreened(gpa, incoming);
         gpa.free(incoming);
@@ -5408,8 +5540,8 @@ test "a repeated (actor, seq) inside the batch is refused, and the queue is unto
     // refusal half-way leaves no trace. And this arm does not call
     // `remove_actor_branch_from` — only the check against the document does.
     try testing.expectEqual(@as(usize, 1), s.queue.len());
-    try testing.expect(s.queue.contains(hashOf(0x21)));
-    try testing.expect(!s.queue.contains(hashOf(0x31)));
+    try testing.expect(s.queue.contains(queued_hash));
+    try testing.expect(!s.queue.contains(rejected_hash));
     try expectRowIds(gpa, &f.set, &.{ opId(1, 0), opId(2, 0) });
     try expectBothCheckers(&f.set);
 }
@@ -5428,10 +5560,13 @@ test "an author the document already has for an actor is refused, and nothing is
     try authors.document.put(gpa, fixture_actors[2].bytes, {});
 
     const no_deps = [_]ChangeHash{};
-    try s.queue.push(gpa, try screenChange(gpa, fixture_actors[1], 1, 1, 0x21, &no_deps));
+    const queued = try s.change(fixture_actors[1], 1, 1, 0x21, &no_deps);
+    const queued_hash = queued.hash;
+    try s.queue.push(gpa, queued);
     const incoming = try gpa.alloc(Change, 2);
-    incoming[0] = try screenChange(gpa, fixture_actors[1], 2, 2, 0x41, &no_deps);
-    incoming[1] = try screenChange(gpa, fixture_actors[2], 1, 1, 0x42, &no_deps);
+    incoming[0] = try s.change(fixture_actors[1], 2, 2, 0x41, &no_deps);
+    incoming[1] = try s.change(fixture_actors[2], 1, 1, 0x42, &no_deps);
+    const rejected_hash = incoming[0].hash;
     defer {
         freeUnscreened(gpa, incoming);
         gpa.free(incoming);
@@ -5444,8 +5579,8 @@ test "an author the document already has for an actor is refused, and nothing is
     // `0x41` carries no author and passed every check, and it is still not in
     // the queue: the refusal is the whole batch's, not the change's.
     try testing.expectEqual(@as(usize, 1), s.queue.len());
-    try testing.expect(s.queue.contains(hashOf(0x21)));
-    try testing.expect(!s.queue.contains(hashOf(0x41)));
+    try testing.expect(s.queue.contains(queued_hash));
+    try testing.expect(!s.queue.contains(rejected_hash));
     try expectRowIds(gpa, &f.set, &.{ opId(1, 0), opId(2, 0) });
     try expectBothCheckers(&f.set);
 }
@@ -5463,17 +5598,20 @@ test "a queued orphan's conflicting actor sequence rejects the batch and is thro
 
     const no_deps = [_]ChangeHash{};
     // The document has issued actor 1's sequence 1.
-    try s.applied(gpa, try screenChange(gpa, fixture_actors[1], 1, 1, 0x51, &no_deps));
+    const applied = try s.change(fixture_actors[1], 1, 1, 0x51, &no_deps);
+    const applied_hash = applied.hash;
+    try s.applied(gpa, applied);
     // The queue holds the rest of that actor's branch, waiting on the change
     // the document has.
-    const on_51 = [_]ChangeHash{hashOf(0x51)};
-    try s.queue.push(gpa, try screenChange(gpa, fixture_actors[1], 2, 2, 0x52, &on_51));
-    const on_52 = [_]ChangeHash{hashOf(0x52)};
-    try s.queue.push(gpa, try screenChange(gpa, fixture_actors[1], 3, 3, 0x53, &on_52));
+    const second = try s.change(fixture_actors[1], 2, 2, 0x52, &.{applied_hash});
+    const second_hash = second.hash;
+    try s.queue.push(gpa, second);
+    try s.queue.push(gpa, try s.change(fixture_actors[1], 3, 3, 0x53, &.{second_hash}));
 
     // A **different** change claiming the slot the document already issued.
     const incoming = try gpa.alloc(Change, 1);
-    incoming[0] = try screenChange(gpa, fixture_actors[1], 1, 1, 0x54, &no_deps);
+    incoming[0] = try s.change(fixture_actors[1], 1, 1, 0x54, &no_deps);
+    const rejected_hash = incoming[0].hash;
     defer {
         freeUnscreened(gpa, incoming);
         gpa.free(incoming);
@@ -5487,8 +5625,8 @@ test "a queued orphan's conflicting actor sequence rejects the batch and is thro
     // that conflicts with the new change is dropped, so it is not silently
     // kept and it is not silently applied.
     try testing.expectEqual(@as(usize, 0), s.queue.len());
-    try testing.expect(!s.queue.contains(hashOf(0x52)));
-    try testing.expect(!s.queue.contains(hashOf(0x54)));
+    try testing.expect(!s.queue.contains(second_hash));
+    try testing.expect(!s.queue.contains(rejected_hash));
     try expectRowIds(gpa, &f.set, &.{ opId(1, 0), opId(2, 0) });
     try expectBothCheckers(&f.set);
 }

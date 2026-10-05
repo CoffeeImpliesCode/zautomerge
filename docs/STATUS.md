@@ -2,6 +2,397 @@
 
 The plan of record is [plan.md](plan.md); this is the state of it.
 
+## Current API cutover and optimization loop
+
+Reference: Automerge 0.12.0 at `ddbff535407e4d28cd2a82eaf6c6add08caa3bdd`.
+Compiler scope: Zig 0.16.0, x86-64 Linux.
+Package provenance is `0.0.0`; the separate upstream target is `0.12.0`.
+Earlier dated results below do not certify this working tree.
+
+The raw document is mode-less. Native and C automatic consumers now use one
+`AutoCommit` owner with a lazy held transaction, stable open address, declared close barriers,
+owned terminal logs, and retained recovery on refusal.
+Source also implements complete load policies and owned-value rescue, generic nonclosing readers,
+stable historical clocks, full hydrated span blocks, borrowed writer span inputs,
+native encoded text trees, detached row/value output, expanded changes, JSON and token serialization,
+external-log ownership checks, imports and diagnostics, exact shared-head checks, and the diff cache.
+[API.md](../API.md) supplies the complete public contract.
+Presence in source is not a passing compilation or runtime claim.
+
+### Latest observed checkpoint — 2026-10-08
+
+The new source wave implements counted prefix-run splicing and interned byte-string indexing.
+Earlier focused checks, actual consumers, and reference checks passed in their named scope.
+Candidate 4 completed a matched three-sample diagnostic and 24 profiles with 144 offline reports for its earlier frozen snapshot.
+Its binaries and profiles are historical after the RLE parser repair below. It has no final acceptance.
+
+Current source repairs minimum signed RLE literal-count overflow in [src/hexane/column.zig](../src/hexane/column.zig).
+Private `literalCount(i64) ParseError!usize` computes `-(header + 1)` and checked `+1`, avoiding signed-negation overflow.
+All four former `-hdr.value` branches use it: `lastOfRun`, `segmentsOf`, `runAtOrAfter`, and `LoadCursor.next`.
+The permanent regression uses `{0x80 × 9, 0x7f, 0x01}`: a minimum signed `i64` header followed by one `u32` value.
+It expects typed refusal across cursor, segments, last-value, search, and load paths.
+Before repair, the public probe observed `Column.load` refusal but a unary-negation panic in `LoadCursor.next`.
+The expanded permanent regression also reproduced pre-repair panics in `lastOfRun` and `segmentsOf`, not all four old branches.
+
+The post-repair column selection and public refusal probe passed within the scope recorded below.
+Earlier focused checks and eight public workflows certify their earlier snapshot, not this repair or a final candidate freeze.
+No post-repair candidate benchmark build, benchmark, or final acceptance has run. No new performance result follows.
+The pre-loop complete gates and 156-execution matched matrix are frozen baseline evidence, not current-source proof.
+Candidate 3's one-sample diagnostic is historical. It does not establish an isolated percentage gain against candidate 4.
+All 26 final acceptance cells and complete gates remain pending.
+
+| Current observed check | Result and scope |
+| --- | --- |
+| Focused Debug | 52/52 cases passed, no skips, failures, or reported leaks. Wall time: 11.46 seconds. |
+| Focused ReleaseSafe | 52/52 cases passed, no skips, failures, or reported leaks. Wall time: 145.22 seconds. |
+| Rebuilt actual public-API executable | Four workflows passed with allocator cleanup. Wall time: 4.55 seconds. |
+| First candidate compilation | ReleaseFast/native, libc CAllocator. `native-candidate-1` built at `2026-10-08T10:53:10Z` in 122.76 seconds. SHA-256: `f5a2e3712fabce2a2556e26a73664e026044a1d5d62a0be192241db8719c33f0`. |
+| Capture preflight | Failed before any benchmark in 2.09 seconds. The read-only Cargo executable has two legitimate hardlinks. No new timing result exists. |
+| Subsequent broader subsystem Debug compile | Parent observed exit 1 in 8.41 seconds, before any cases. Two new slab tests incorrectly qualified `Slab.fromParts` at lines 1495/3218. The existing `op_iter` catch at line 1676 omitted the new `Overflow` error. This is not broader green evidence. |
+| Earlier broader Debug execution after compile repairs | The 911-case selection aborted after 284.59 seconds at case 896, before completion. Four assertion failures preceded the abort: many-slab `Delta(u32)` decoded-byte budget (189), beyond-data prefix `InvalidValue` (351), alternative `BeLenRle` decoded-byte budget (467), and propagated `OpIter` `UnexpectedEnd` versus `InvalidValue` (602). This aborted run has no completed pass total. |
+| Second candidate compilation | ReleaseFast/native, libc CAllocator. `native-candidate-2` built at `2026-10-08T11:40:58Z` in 122.40 seconds. SHA-256: `ed556169a9defd1ef017a84f3d3e24bce909e319e4a9779a58ef566d4db0992e`. Unmeasured. It predates the confirmed strict-load repair and must not serve as the acceptance candidate. |
+| Expanded Debug compilation | First compile failed in 7.58 seconds because a fixture used nonexistent `types.ObjId` at line 4110. Parent corrected it to `ExId` before the successful expanded run. |
+| Latest expanded Debug selection | Exit zero in 698.07 seconds. Of 921 selected cases, 920 passed and one skipped, with zero failures. Includes the four earlier assertion failures, retained-key regression, new root/reference-hash tests, and allocation-failure cases. This is not a full Debug, slow-path, or ReleaseSafe gate. Parent output: `artifact://852`, 933 lines. |
+| Latest actual public executable checks | Exit zero in 6.37 seconds. `native-hydrate-public-smoke` passed absent/overlap/repeat/child workflows with exact Rust heads and retained conflicts `[1,2]` and `[1,2,2]`. `public-api-wave2` passed the unchanged four public capabilities. Both reported allocator cleanup: eight actual workflows total. |
+| Public strict snapshot-order probe, before repair | Exit zero in 3.85 seconds confirmed the bug, not a passing load contract. Canonical control loaded `a=1,b=2` with the expected head. A normally saved snapshot with two complete valid rows swapped loaded successfully with unchanged history head, but `get[b]` was missing instead of 2. |
+| Public strict snapshot-order probe, after repair | Exit zero in 3.95 seconds. Malformed order rejected with typed `InvalidValue`. Canonical control still loaded `a=1,b=2` and the expected head. |
+| Post-repair focused Debug and ReleaseSafe | Each passed 10/10 cases. Combined wall time: 375.44 seconds. Includes strict/recovery/rescue and `Set` allocation-failure coverage, root ordering/retained ownership, scoped/held automatic paths, four Rust hashes, load control, and retained-key checks. Not a full-suite result. |
+| Second-candidate capture controls | Descriptor completed in 2.07 seconds and preflight in 3.12 seconds, without benchmarks. The runner accepts the actual read-only, two-hardlink Rust executable without modifying it. Candidate 2 remains pre-order-gate and will not be measured. |
+| Third candidate compilation | ReleaseFast/native, libc CAllocator. `native-candidate-3` built at `2026-10-08T12:20:45Z` in 120.17 seconds. SHA-256: `496d2deddc79132b38984619c5dbbd7e3f02b5275c38db4a21059046fae0cb2c`. Frozen for the one-sample diagnostic, not final acceptance. |
+| Candidate-3 conformance and live saves | Exit zero in 11.60 seconds, 32/32 build steps. All 12 vectors matched unchanged goldens exactly. All six live save scenarios verified. Output: `artifact://874`, footer at line 4522. The step count is not a semantic-case count. |
+| Candidate-3 matched diagnostic | All 52 fresh processes and 26 pairs valid, with all 104 user-only counter observations at 100% coverage. Zero errors, stderr, retries, or provenance drift. One sample per engine/cell only. Aggregate subject, process-wall, and best-phase preservation checks are false. No final acceptance. |
+| Profile helper checks and first invocation | Five pure helper tests passed in 0.002 seconds. The first profile invocation failed before benchmarks because outer CPU-2 affinity excluded required entry CPU 0. Zero benchmark processes ran. These checks do not establish successful profiles. |
+| Candidate-3 actual profiles and offline reports | All eight large insert/map/load/merge Native/Rust profiles passed full identity checks with empty benchmark stderr. Offline recovery produced 48 reports, with zero new benchmark/profile processes and no retries. Reports-only exit zero: 151.40 seconds, with nine pure helper tests passed. Diagnostic evidence only. |
+| First new-wave focused Debug run | Of 28 selected cases, 26 passed and two failed in 69.98 seconds. Both composite successor failures came from fixture-borrowed pointers into a function-local runtime array. The owner repaired fixture lifetime, preserving independent successor, all-column, and allocation-failure assertions. Production boolean/string code did not change for these failures. The corrected checks passed within the scope below. |
+| Generalized diagnostic helper | Fifteen pure tests passed in 6.791 seconds, 8.05 seconds total. Extra rounds are test fixtures, not timing data. This does not establish a new candidate's performance. |
+| Verified new-wave focused and bounded consumers | Debug 28/28 and ReleaseSafe 28/28 passed. Command exit zero in 256.45 seconds, including three actual fixed-buffer-allocator proofs. Canonical bytes, cut windows, strict reload and allocator cleanup matched. The [canonical bounded-proof table](../bench/README.md#verified-source-wave-candidate-4-bounded-proofs) records exact scenario sizes and capacities, not a universal memory bound. |
+| Pre-RLE-repair actual public workflows | Exit zero in 6.48 seconds. Four unchanged public capabilities and absent/overlap/repeat/child root workflows passed with allocator cleanup. |
+| Pre-RLE-repair reference conformance and live saves | Exit zero in 11.19 seconds, 32/32 build steps. All 12 goldens remained unchanged and matched exactly. All six live saves verified. Output: `artifact://913`, footer at line 4522. Not 32 semantic cases. |
+| Candidate-4 frozen native build | ReleaseFast/native with libc CAllocator built in 118.23 seconds at `2026-10-08T13:51:34Z`. The 80-file source contents and full provenance matched before/after that historical build. This binary predates the RLE parser repair. [Build hashes and receipt](../bench/README.md#verified-source-wave-candidate-4-bounded-proofs). |
+| Candidate-4 three-sample matched diagnostic | Descriptor/preflight/capture exited zero in 365.92 seconds combined. All 156 processes, 78 pairs, and 312 PMU observations were valid, stable, and retry-free, with 100% counter coverage. Subject, process-wall, and strict best-preservation aggregate checks are all false. [All 26 cells and raw-tail evidence](../bench/README.md#candidate-4-three-sample-diagnostic-not-final-acceptance). Not final five-sample acceptance. |
+| Candidate-4 profiles and offline reports | Eight fresh large insert/map/load/merge profiles and 48 offline reports exited zero in 134.43 seconds. Benchmark stderr was empty. Inputs stayed frozen, with no retries. [Canonical sample/loss table and scope limits](../bench/README.md#candidate-4-large-stack-profiles-diagnostic-only). Incomplete native unwinding remains. |
+| Additional candidate-4 profiles and reports | Sixteen profiles of eight additional cells and 96 offline reports completed in 317.75 seconds, exit zero, without rerunning the first eight profiles. All profiles were valid, inputs stayed equal, and no retries occurred. Benchmark stderr was empty. Full 80-file contents/provenance matched the pre-build snapshot at that capture, before the RLE repair. [Canonical additional-cell table and independent receipt](../bench/README.md#candidate-4-remaining-path-profiles-diagnostic-only). Not medians, phase attribution, or ≤2 acceptance. |
+| Completed helper validation and label repair | Parent observed 10/10 pure checks in 0.039 seconds and 21/21 in 8.067 seconds, 9.67 seconds combined. Current labels reflect actual baseline/current modes and counts. The receipt records an executor-only proof transition. All other source/build/binary/compiler/options proofs stayed equal, without timing/threshold changes or historical receipt rewriting. |
+| Post-RLE-repair formatting | `zig fmt --check src/hexane/column.zig` exited zero with no output. Only this file's formatting was checked. |
+| Post-RLE-repair focused Debug | Direct `zig test` with filter `hexane.column.` passed 329/329 cases in 159.02 seconds, exit zero. Not a complete Debug gate. |
+| Post-RLE-repair focused ReleaseSafe | Direct `zig test` with filter `hexane.column.` passed 329/329 cases in 188.15 seconds, exit zero. Not a complete ReleaseSafe gate. |
+| Post-RLE-repair public refusal probe | The standalone public executable compiled and exited zero. Observed outputs: `public_column_refusal=LengthExceedsInput` and `public_load_cursor_refusal=UnexpectedEnd`. This checks the malformed literal header, not all public workflows. |
+
+Evidence: [integrated-wave1-verified.json](file:///tmp/tmp/zautomerge-perf-loop-tYJOfU/integrated-wave1-verified.json).
+The later builds, checks, and strict-load probe are subsequent parent observations, not results in that integrated ledger.
+Case 896 read null for the retained `keep` key during normal raw hydrate initialization after a successful batch commit.
+The parent observed this at `src/doc.zig:14291`.
+Stale OOM context from earlier allocation tests does not establish OOM at this normal trigger.
+The [benchmark checkpoint](../bench/README.md#current-optimization-loop-checkpoint) records the named algorithms, candidate identity, and full acceptance contract.
+Changes include lexical map bounds/lookahead, codec-aware prefixes, bounded literal maintenance, affected-range weights, and cached tree bases.
+They also include checked tree/Fenwick and prepared raw publication, rebased row/value/successor streams, batched selected-history reconstruction, and strict V2 payload selection.
+Checked short LEB paths and finite unrolling complete the wave.
+Signed tracked columns retain legacy whole-header behavior.
+The checked-column signed panic repair uses private exact cached tree-prefix aggregation, not disabled safety.
+Fixture ownership repairs preserve empty-array disposal and stateless-allocator contracts without inspecting undefined context pointers.
+Change hashes, save interoperability, and private collector meaning remain required.
+
+A pinned Rust probe checked four existing-root hydrate paths and fresh replay of identical-head changes.
+Direct production had broken physical query results. Fresh replay preserved absent keys and retained conflicts `[1,2]` and `[1,2,2]`.
+The native source repair changes only physical publication order.
+It preserves empty predecessors, same-value repeats, sorted/BFS creation order, and encoded hashes.
+Evidence: [reference-hydrate-observations.json](file:///tmp/tmp/zautomerge-perf-loop-tYJOfU/reference-hydrate-observations.json).
+The Rust probe establishes four-path reference behavior, not universal correctness.
+The latest native root executable passed those four workflows with exact Rust heads and allocator cleanup.
+Evidence binaries: `/tmp/tmp/zautomerge-perf-loop-tYJOfU/native-hydrate-public-smoke` and `/tmp/tmp/zautomerge-perf-loop-tYJOfU/public-api-wave2`.
+
+The public standalone `Document.load` probe confirmed the strict snapshot-order gate gap.
+It swapped complete valid `ChangeOp` rows through `Set.fromDocOps` and normal `saveWithOptions(deflate=false)`, preserving each row and graph.
+The loader accepted this malformed order and hid a live key despite an unchanged head.
+Evidence source: [snapshot-order-public-smoke.zig](file:///tmp/tmp/zautomerge-perf-loop-tYJOfU/snapshot-order-public-smoke.zig).
+The repair uses allocation-free `OpStepper` validation in the existing `rebuildIndexWithMarkValidation` iterator before index-builder grouping and processing.
+It adds no scan, error type, or wire change.
+`allow_invalid_marks` does not bypass row-order validation.
+The post-repair standalone probe rejected the same malformed snapshot with `InvalidValue`.
+Ten focused cases passed in each of Debug and ReleaseSafe.
+These checks do not certify a full suite or a final source freeze.
+Candidate 3 completed descriptor/build-record/preflight and the diagnostic on frozen source.
+All eight candidate-3 profiles completed, closing its source freeze.
+Original partial ledgers remain preserved in owned scratch, not public receipts.
+The [canonical profile table and caveats](../bench/README.md#candidate-3-large-stack-profiles-diagnostic-only) retain sample, unwinding, and separate loss-accounting limits.
+Evidence: [allowlisted sanitized profile-ledger.json](file:///tmp/tmp/zautomerge-perf-loop-tYJOfU/evidence/matched-loop-candidate3-reports-20261008T130959Z-7892a1039a1548fdb0a5cdb027809cdc/profile-ledger.json).
+Sampled self symbols do not establish native callers, phases, or timing gains.
+The binary has unwind/DWARF sections. The cause of incomplete native unwinding remains unknown.
+The new source uses counted metadata/boolean writers and an authoritative insertion-ordered byte-string index.
+It preserves stable `u32` IDs, owned keys, clone order, and existing codec/hash contracts.
+The fixture lifetime repair retains all-column, independent successor, and allocation-failure assertions.
+Corrected focused, bounded fixed-buffer, public workflow, and reference checks passed before the later RLE parser repair.
+Evidence: [integrated-wave3-verified.json](file:///tmp/tmp/zautomerge-perf-loop-tYJOfU/integrated-wave3-verified.json).
+Bounded static reviews reported no findings in string/counting scope, with confidence 0.93/0.94, without execution.
+They are not gates or universal correctness proof.
+The 80-file source stayed frozen through candidate 4's build and both completed profile groups.
+That freeze describes the earlier capture only. Current source differs after the RLE parser repair.
+Candidate-4 binaries, diagnostics, and profiles remain historical evidence for that snapshot, not current-source proof.
+Its complete diagnostic has three fresh samples per engine/cell, not the five required for final acceptance.
+It is distinct from both the frozen pre-loop matrix and candidate 3's one-sample diagnostic.
+The [canonical candidate-4 table](../bench/README.md#candidate-4-three-sample-diagnostic-not-final-acceptance) records all 26 cells and both independent sync subjects.
+Only small repeated diff meets both observed strict preservation factors. This is not statistical best-case regression proof.
+Load and merge meet their diagnostic subject/process limits, not final acceptance.
+Use recorded sample counts, not the historical ledger label that mentions five final samples.
+The [additional profiles](../bench/README.md#candidate-4-remaining-path-profiles-diagnostic-only) are complete, with 24 profiles and 144 offline reports across independent receipts.
+Recorded buffer/final-counter losses are zero. Native unwinding remains incomplete, so source callers and benchmark phases are unresolved.
+Sparse small-batch samples do not support quantitative priority claims.
+Native source citations qualify suffix handling: changed signed tracked-prefix totals can require suffix-byte validation.
+Remaining complete gates and all 26 final acceptance cells remain pending.
+Candidate 3's build-record SHA-256 remains `7b322c553aec439bcf3fbaa0b612a968b35271cca7b366bf0b251d9a2415b8b6`.
+The [historical candidate-3 table](../bench/README.md#candidate-3-single-sample-diagnostic-not-final-acceptance) records its separate one-sample diagnostic.
+Evidence: [candidate-3 capture-ledger.json](file:///tmp/tmp/zautomerge-perf-loop-tYJOfU/evidence/matched-loop-diagnostic-20261008T122629Z-fdf3cea06b79405c9c4a62ea7c2339c3/capture-ledger.json).
+Neither shared-host diagnostic proves statistical regression, no regression, universal scaling, or CPU/frequency isolation.
+Candidate-2 controls: [descriptor capture](file:///tmp/tmp/zautomerge-perf-loop-tYJOfU/evidence/matched-loop-describe-20261008T114857Z-1752171a010f4cf3a0b8bf446f3ccf1a)
+and [preflight capture](file:///tmp/tmp/zautomerge-perf-loop-tYJOfU/evidence/matched-loop-preflight-20261008T115218Z-8e6a201d22b344479777cc2904743aa7).
+A bounded static maintenance audit reported no findings in column/slab/btree scope, confidence 0.86.
+That audit does not establish runtime correctness.
+
+Ten kernel variants passed 4,014,848 independent differential cases each in Debug, ReleaseSafe, and ReleaseFast.
+The [balanced ledger](file:///tmp/tmp/zautomerge-perf-loop-tYJOfU/kernel-order-balanced-ledger.json) retains 600 timing rows, checksums, order positions, and all tails.
+Actual [codegen evidence](file:///tmp/tmp/zautomerge-perf-loop-tYJOfU/kernel-codegen-observation.json) shows bounded safe/off exports alias in ReleaseSafe and ReleaseFast.
+Scalar production was best on short streams. No unconditional SIMD or production safety-off annotation was merged.
+These finite synthetic checks establish no end-to-end Native/Rust speed gain.
+
+Final acceptance retains all 26 unchanged cells, subject and whole-process Native/Rust wall-time ratios ≤2, and independent sync generation/receipt limits.
+It requires five fresh samples per engine/cell: 260 processes, balanced serial order, CPU 0, runner CPU 2.
+Retain all raw phases, counters, and tails.
+Preserve best cached repeat/subtree diff and sync receipt results in absolute time and relative ratio.
+Complete Debug/slow-path/ReleaseSafe, 119-record API replay, static C 160/dynamic C 18, and all-cell gates remain pending.
+Pre-RLE-repair 12-vector conformance and six live-save checks passed within their named scope.
+No universal-input or CPU/frequency-isolation claim follows.
+
+### Frozen complete gates and matched baseline
+
+The following results precede the current optimization-loop source changes.
+They preserve their original snapshots, numbers, and evidence anchors.
+They do not certify the new candidate.
+The baseline normal root's skipped deep-fuzz case passed in its complete slow-path root.
+The failed roots below remain historical red checkpoints.
+Scope is the named source snapshot, compiler, target, command, and consumer—not universal correctness.
+
+| Frozen baseline check | Result and scope |
+| --- | --- |
+| Full Debug and slow-path gate | `zig build test slow-path -Doptimize=Debug` passed 84/84 build steps and 4386/4387 actual cases, one skip. Normal library: 2046 passes and one skip from 2047 cases. Slow-path library: 2047/2047 passes. All 293 external consumer cases passed. No failure, crash, or leak was reported. |
+| Native typed API replay | Latest run passed all 119 records, consumed once with complete-field comparison, through three root cases. Includes the original target corpus, genuine incompatible-table refusals, and the retained-tail apply-success/checked-render-refusal reference-panic case. |
+| Root declaration sweep | Passed on the current source. This checks reached declarations, not every runtime state. |
+| Standalone public executable | Four non-test workflows passed with allocator cleanup. Executable SHA-256: `8329b0eee1819136fd2bbe7bb8a6627fa930350535f95cd89c452b8c9a67d32f`. Evidence: `standalone-public-api-smoke-proof.json`. |
+| Reference conformance and live save interoperability | All 12 vectors, including the API corpus, and six live save scenarios passed. Build summary: 32/32 steps—not 32 semantic cases. |
+| Static production C and real-header ABI | All 160 cmocka cases across 13 groups passed; 7/7 build steps. The real-header guard includes 187 physical function declarations. |
+| Dynamic production C corpus | All 18 outcomes passed: five valid documents and 13 expected load errors; 9/9 build steps. Each valid document exercised save/reload, commit/hash/value and encoded sync. |
+| Fresh matched CLI correctness smoke | All 26 cells matched Rust heads, checksum, count, schema, and phase names. Source fingerprints were unchanged before and after. Evidence: `native-oom-smoke-20261008T071838Z-231a48cb/native-oom-smoke-ledger.json`. This is correctness, not performance evidence. |
+| Zig formatting | Latest `zig fmt --check .` passed. |
+| Full ReleaseSafe gate | Passed 78/78 build steps and 2339/2340 actual cases, one skip. Library: 2046 passes and one skip from 2047 cases. All 293 external consumer cases passed. No failure, crash, or leak was reported. |
+| Final repeated matched Rust/native matrix | Completed: all 156 executions valid, all 26 cells with six valid executions each, three fresh samples per engine. All 312 user-only counter observations and all schedule records were valid. Zero nonzero exits, errors, stderr, spawn failures, parity mismatches or retries. The source and binary fingerprints were unchanged. |
+
+The measured Native ReleaseFast binary SHA-256 is
+`2fc5d5bfa94e655e44268f910cdca920827c242a2c3c6905739551ed1f08c59f`.
+Its source-file fingerprint is
+`89ba06bf97c489800a423ff421bbcb8d9f21833162d74629d4692fdc0ee9d4f4`.
+Binary/source provenance does not substitute for measured workload counters.
+
+The matrix used the same 80 source-file contents as the correctness smoke.
+Its manifest uses a different serialization and SHA-256:
+`bf5d41912549d696c3983306669d1dd1f681356eafbf66ad8b4462abcc62f13f`.
+All per-file hashes matched; a different manifest hash is not a source change.
+The run covered all workload/size cells on CPU 0 through runner 2,
+with a balanced 39 Native-first and 39 Rust-first schedules.
+Evidence: `matched-final-20261008T075031Z-4c9545c5/matched-final-ledger.json`,
+SHA-256 `0cf553ae68156376672c65ef9dc4b74597d16f3f98ae92a6ad912d7953cba63c`.
+The canonical [matched results and provenance](../bench/README.md#final-matched-results)
+and [all-cell numerical table](../bench/README.md#all-26-cells) live in the benchmark README.
+The comparison is complete, but performance parity is not achieved.
+Large map mutation, sync generation and cold diff are substantially slower in Native.
+Repeated cached full/subtree diff phases are faster; their setup and whole-process costs remain worse.
+Phase gains do not imply whole-process gains.
+
+The bounded ownership audit's final static recheck found no residual finding in its inspected scope.
+It confirmed sidecar reservation before graph/op/log publication and aligned metadata readers
+(`src/doc.zig:4767-4825,5853-5856`), not runtime safety in every source state.
+
+Native diagnostic capture also completed without source-fingerprint changes.
+Its ledger records 16 attempts and 11 unique legacy-default smokes:
+ten exited successfully with `LEAKS 0`; list-width normalization refused 50.39% coverage
+against the unchanged 90% floor, an expected diagnostic refusal.
+The insert guard passed, both direct regions reported `running`, and the profile recorded
+318 samples with none lost. These are native diagnostic observations, not matched Rust results.
+Evidence: `native-profile-20261008-WUTP4o/capture-ledger.json`.
+The original hash-for-op-ID wrapper-path attempt has an unknown exit status.
+The separate corrected-wrapper attempt captured child exit zero, hash `95791aa42f3360a0`,
+and `LEAKS 0`; it does not retrospectively certify the original attempt.
+
+The final production-C-allocator large-map and large-sync diagnostic profiles also completed
+successfully, matched their frozen matrix outputs, and left source/binary fingerprints unchanged.
+They are single whole-process profiles—not new matrix timings, speedups, or phase/caller attribution.
+Counters exclude kernel execution; unresolved `[k]`/`[other]` labels do not establish kernel cost or resolved callers.
+The [canonical benchmark results](../bench/README.md#final-matched-results) retain the profile detail.
+Evidence: `matched-diagnostic-20261008-vuHQOy/capture-ledger.json`.
+
+Earlier merge/sync CLI crashes exposed an invalid empty-array free and unsafe allocator-context comparisons.
+A valid stateless allocator can leave its context pointer undefined.
+The source repairs use the actual allocator/owner contract rather than inspect that undefined pointer.
+The baseline correctness smoke and public allocator regression passed.
+Native test roots intentionally link libc for the real `std.heap.c_allocator` fixture.
+The production CRDT remains a Zig implementation.
+
+Retained-log replay required two separate repairs: publish the prepared path map with its owned storage,
+and canonicalize cached resident IDs through the same checked selected-document export used for events.
+The seven-patch first-render record now passes.
+The frozen complete Debug gate passed, but specific consumer fixes do not prove every failure path.
+Inherent automatic `getMissingDeps` and `getChangeByHash` close pending work.
+Their generic `ReadDoc` routes do not close. The Rust oracle now records the explicit trait route, not a mislabeled inherent call.
+Malformed individual author decoding returns null; corrupt footer column encoding still returns typed `ParseError`.
+Opaque footer bytes remain authoritative across reconstruction.
+
+cmocka discovery is a development gate through the declared package environment.
+The Rust oracle declares `sha2` directly rather than rely on an undeclared transitive dependency.
+Checksum-corrupt fixtures are deliberate parser-refusal inputs, not damaged goldens to silently repair.
+
+The target native public API is implemented.
+The complete correctness gates and matched comparison above apply only to the frozen baseline, not the new candidate.
+This is not an all-target build, complete case-for-case integration proof,
+universal allocation-refusal or leak-safety proof, or blanket performance-parity claim.
+The bounded static ownership review has no residual finding in its inspected scope.
+The earlier native RLE before/after result is not a Rust speedup.
+
+### Historical red checkpoints — superseded by the Debug gate above
+
+The earlier full normal root had 2040 cases: 1991 passes, one skip, 44 failures, four crashes, and 209 leaks.
+The earlier slow-path root had 2040 cases: 1990 passes, 46 failures, four crashes, and 209 leaks.
+An intermediate root run still reported five leaks.
+Those snapshots motivated production ownership repairs and stale-fixture corrections.
+They do not describe the frozen complete Debug run. Focused failure-set runs also passed on earlier snapshots.
+Their filtered helper-case counts are not complete-root counts or proof for the new optimization candidate.
+
+## Historical round records
+
+The following dated rounds preserve their original source, command, and measurement scope.
+They are not the current API cutover's result.
+
+## API, coverage, and uniform-splice round (2026-10-08)
+
+Reference: Automerge 0.12.0 at `ddbff535407e4d28cd2a82eaf6c6add08caa3bdd`. Compiler: Zig 0.16.0.
+`doc.ChangeMetadata` and `ChangeMetas` own their bytes, with explicit `deinit(gpa)` contracts.
+`Document.getChangesMeta`, `getChangeMetaByHash`, and `hashForOpid` expose the reference reader surface.
+Named operation lookup now repairs actor slots. The owned public consumer passed after document teardown.
+
+The metadata consumer checks six Rust changes, seven frontier sets, ownership, allocation failures, and actor renumbering.
+The clock consumer checks seven subsets, 49 coverage pairs, and 49 merge pairs.
+Three upstream regressions now cover marked bundles, losing text iteration, and UTF-16 incremental bundle loading.
+Six splice regressions cover canonical boundaries, fallback, borrowed bytes, bounds, and allocation failure.
+The existing real recovery case also checks metadata refusal and resumed reads.
+
+The general uniform-run splice keeps eligible data compressed instead of materializing and re-encoding it.
+Default insertion used 46.8% fewer whole-process instructions across three accepted processes per build.
+Full-size growth failures remain recorded. They do not support an accepted full-size median.
+The [measured round](../bench/README.md#10-measured-uniform-splice-round--2026-10-08) records fingerprints, profiles, guards, and raw evidence.
+The separate post-verification full-size control still rejected all three baseline runs and one of three final runs.
+It provides no accepted paired full-size median. No guard changed and no process was rerun.
+
+| Exercised check | Result |
+|---|---|
+| Full native Debug suite | 74/74 steps. 2,105 pass, one skip. |
+| Full native ReleaseSafe suite | 74/74 steps. 2,105 pass, one skip. |
+| Forced slow-path ReleaseSafe suite | 6/6 steps. 1,832/1,832 pass. |
+| Reference conformance and live save interoperability | 30/30 steps. All 11 vectors and six live save cases pass. |
+| Production shared C corpus and header ABI gate | 9/9 steps. 18 fixtures, five valid, no failures. |
+| ReleaseFast production install | 4/4 steps. |
+| Zig formatting | `zig fmt --check .` passed. |
+
+At that snapshot, held native lifecycle, full load options, rescue, and the shared-head predicate were absent.
+Those prerequisites now exist in source; current public parity remains unchecked.
+The [integration ledger](#integration-coverage-ledger-2026-10-08) replaces unsupported total-coverage claims with exact cases and prerequisites.
+
+## List traversal region measurement
+
+`--region-instructions list-width` now counts the existing `read-list` region through Linux `perf_event_open`.
+It keeps the original element counts, walk counts, correctness checks, and default-mode 90% guard.
+The separate `REGION` record does not qualify a whole-process `perf stat` count.
+The counter excludes setup, separate verification, teardown, kernel execution, and child threads.
+Missing permissions, unavailable counters, short reads, and incomplete scheduling coverage fail without a metric.
+
+Three independent ReleaseFast processes passed at each size on logical CPU 0.
+The [region measurement table](../bench/README.md#measured-region-counts) records paired counts, elapsed times, load, and binary hash.
+Instruction cost was nearly proportional to element visits at these two points.
+No traversal algorithm changed, and no speedup or general complexity bound is claimed.
+
+`zig build bench-test` and its ReleaseSafe variant each passed 5/5 steps and 3/3 deterministic cases.
+Those cases also participate in `zig build test`.
+The focused ReleaseSafe held-cursor control passed 3/3 cases including root declarations.
+The default ReleaseFast static build passed 4/4 steps.
+The full benchmark passed a compile-only `x86_64-windows-gnu` check.
+`zig fmt --check .` passed.
+
+Three- and four-repeat traces confirmed that each reported count belongs to the selected elapsed-time median.
+The odd-repeat check selected a non-last sample and compared its count directly with the kernel read.
+Child-only seccomp checks denied open, enable, disable, and read calls.
+All four checks failed without a metric. Failure traces confirmed counter-descriptor cleanup.
+CLI checks rejected missing, different, mixed, and duplicate workload selections.
+Help/list behavior and a normal `BENCH segmentation` run still passed.
+
+The stderr `ms/iter` diagnostic previously printed the entire sample's elapsed time.
+An arithmetic smoke failed before the repair.
+The diagnostic now divides by the iteration count.
+All six final region samples passed that check without a new wording-pinned test.
+
+## GitHub issue repair (2026-10-07)
+
+The clean local parent and fetched GitHub `main` both resolved to `1e9f6a1e`.
+GitHub had six open issues and no open pull requests.
+
+- **#1:** remeasured all four scaling workloads at default and full sizes.
+  [The fresh benchmark table](../bench/README.md#fresh-process-counts-and-guard-results--2026-10-07)
+  records instruction counts, load averages, phases, and guard results.
+  Both list runs rejected subject attribution. The full insert run rejected its growth ratio.
+  The guards and workload sizes remain unchanged. Rejected counts are not accepted subject measurements.
+- **#2:** removed the incorrect fixed chunk size from `src/doc.zig`.
+  Its issue body duplicates #3, but its title describes this separate comment.
+- **#3:** both sync `splitStream` fixture helpers now use `ChunkStream`.
+  The helpers are test-only, not production message readers.
+  Their allocation witnesses failed before the fix: six required output allocations versus seven actual allocations.
+  Both pass after the fix, including allocation-failure sweeps and cleanup after a malformed later header.
+  No live sync performance gain is claimed.
+- **#4:** `src/hydrate.zig` records why `winnerKey` retains sequence formatting.
+  Valid map hydration uses map keys. The direct helper test checks the sequence buffer's ownership.
+  The issue's op-module citation does not identify this helper.
+- **#5:** no code change. The optional cross-check deliberately walks the object.
+  Historical reads also use the slow algorithm independently of `-Dslow-path`.
+  The existing source contract in `OpSet.seekListOpid` records both decisions.
+- **#6:** `zig build ctest-shared` passed all 18 corpus entries.
+  All five valid documents passed save/reload, commit/hash/value checks, and bidirectional encoded sync.
+  The consumer has a `libzautomerge.so` dependency and a build-generated RUNPATH.
+  Its fixture table comes from the canonical Zig manifest through a deferred host generator.
+  The package-only build passed without `test/` and installed only the static library and header.
+
+The focused Debug command passed seven cases.
+It covered both allocation witnesses, both fixture callers, the hydration key test, and two root declarations.
+The forced slow-path command passed five cases, including the invariant cross-check and both allocation witnesses.
+The new shared C gate passed nine build steps. It requires libc but not cmocka or the Rust oracle.
+These checks do not certify the existing cmocka suite.
+
+### Mark borrow repair found during verification
+
+The first integrated ReleaseSafe run passed 2087/2089 cases, with one skip and one failure.
+The failing patch replay case lost `bold`: the mirror had no marks while the document had one.
+An isolated Debug run passed. The isolated ReleaseSafe run reproduced the failure.
+
+`src/opset/batch.zig` returned a mark-set pointer from a by-value optional parameter.
+That pointer did not refer to the caller's live set.
+The repair removes the helper and borrows the caller's local payload until the sink finishes its synchronous copy.
+The existing replay regression and two mark controls now pass in ReleaseSafe, five cases including root declarations.
+
+A public ReleaseSafe consumer also passed merge, active incremental diff, and mirror replay with exact text `ab` and `bold=true`.
+It destroyed the receiver before replay to check the returned patches' ownership.
+No new permanent test duplicates the existing failing consumer-visible regression.
+
+The final `test ctest-shared -Doptimize=ReleaseSafe` run passed 70/70 build steps.
+It passed 2088/2089 tests, with one skip and no failures.
+The shared C consumer passed all 18 fixtures, including all five valid documents.
+
+After the repair, `conformance save-interop -Doptimize=ReleaseSafe` passed 28/28 build steps.
+All ten golden vectors matched. Live save interop verified all six cases.
+The final default static build passed 4/4 steps, and `zig fmt --check .` passed.
+
 ## P2/P5 repair evidence (2026-10-04)
 
 Scope: Zig 0.16.0, x86-64 Linux, reference commit
@@ -54,13 +445,11 @@ result.** The two changes are real but aimed elsewhere:
   **Two corrections, recorded 2026-10-06 (round 5).** The entry is
   `@sizeOf(chunk.Chunk)` = **72 bytes**, not 40: two `[]const u8` (`data` and
   `frame`), a 33-byte `?ChangeHash`, four checksum bytes and the type byte
-  (`src/storage/chunk.zig:97-131`). And the streaming is `Document.load`'s, not
-  the format's: `chunk.parseChunks` (`src/storage/chunk.zig:497`) is still the
-  reader in four places — `src/storage/totality_test.zig:312`, `splitStream` in
-  `src/sync/protocol.zig:1245` and in `src/v1.zig:789`, and `chunk.zig`'s own
-  tests — and `splitStream` runs **per sync message**, so a message still
-  materialises a chunk list. "No chunk list is materialised" is true of
-  `Document.load` and of nothing else.
+  (`src/storage/chunk.zig:97-131`). The earlier claim that `splitStream`
+  materialized a list per live sync message was incorrect: both callers are fixture tests.
+  The 2026-10-07 repair streams those helpers too.
+  `parseChunks` remains in its own tests, their allocation comparisons, and the storage totality harness.
+  This does not establish a production sync allocation reduction.
 * **`rebuildAggs` no longer slack-fills.** `shrinkRetainingCapacity`
   (`std/array_list.zig:1186-1189`) is the length assignment plus
   `@memset(slack, undefined)`, and nothing reads past the length. The removed
@@ -417,12 +806,10 @@ The header guard checks 187 physical function signatures, 37 enum names across f
 Only `AMbyteSpan` and `AMitems` cross by value.
 It does not check semantic pointer constness, nullability, sentinels, nominal enum identity, or reordered same-typed parameters.
 
-**Text red/green evidence:** before the range repair, the new tests observed suffix loss,
-split-surrogate acceptance, partial deletion after allocation refusal, and index overflow.
-The focused run passes after the repair.
-`ConcreteTextValue` remains UTF-8-backed. It refuses split scalar boundaries and recomputes current grapheme segmentation.
-Rust's native-unit trees and lossy rendering have a different contract.
-See [survey/05](survey/05-iter-query-patch.md#traits-and-generics) for the cited representation gap.
+**Historical text red/green evidence:** the range repair's focused run passed on that snapshot.
+It covered the then-current UTF-8-buffer representation and its split-boundary refusal.
+That owner has since been replaced with native-unit trees and owned lossy rendering.
+The old refusal observations are not the current text contract or verification evidence.
 
 **Package snapshot:** the final source archive has package hash
 `zautomerge-0.0.0-FlN8sAVekAAUKQiHaBhEAd2noutJSvO2t5tLnDbwjqsJ`.
@@ -560,49 +947,109 @@ module, so `-Dcmocka-prefix=../cmocka-prefix` works and the historical advice to
 pass an absolute path is belt-and-braces rather than a requirement.
 
 
-**The instrument, stated first because a ranking whose instrument is unstated is
-not a measurement.** Count coverage by this port's own
-`test "<upstream file>: <English name>"` convention: one such block per upstream
-case, and **no upstream-name-based measure is sound here**, because the port
-renames every ported case into English. Name-presence under-counted this tree by
-a factor of three — `diff_marks` read 13 of 36 by name and is 36 of 36 by
-convention — and counting blocks that cite the upstream file failed the other
-way, reporting 9 of 36 for `diff_marks` and 25 for `text.rs` when upstream has
-15. **Both instruments were used to rank the gates here, both were wrong, and
-the ranking they produced was retracted.** The convention is the only one of the
-three that measures this tree; a name match remains a floor rather than proof —
-it says a case exists, not that it asserts upstream's expectations.
+## Integration coverage ledger (2026-10-08)
 
-| Upstream file | `#[test]` | Ported | |
+Count coverage from each case's operations and assertions, not names or declaration counts.
+A declaration can omit an upstream assertion, replace a prerequisite, or occur inside a comment.
+The earlier name-based and citation-based rankings were wrong and remain retracted.
+The English-name convention helps locate cases. It does not prove case-for-case parity.
+
+**Historical inventory, 2026-10-01.** The table below preserves the earlier count report.
+Its ported totals are unvalidated as behavioral totals. They are not current gate proof.
+
+| Upstream file | Reported upstream count | Reported port count | Source location |
 | --- | --- | --- | --- |
-| `tests/test.rs` | 140 | **140** | `test/upstream_doc_test.zig` and others |
-| `tests/batch_insert.rs` | 46 | **46** | one file, two row-order assertions |
-| `tests/diff_marks.rs` | 36 | **36** | `src/marks.zig`, prefix `diff_marks:` |
-| `tests/text.rs` | 21 | **26 blocks** | prefix `text:`, in `src/read.zig`, `src/iter/spans.zig`, `test/upstream_text_more.zig` |
-| `tests/text_encoding.rs` | 15 | **16 blocks** | prefix `text_encoding:`, in `src/read.zig` |
-| `tests/block_tests.rs` | 19 | **19** | `test/upstream_block_tests.zig`, all green |
-| `tests/convert_string_to_text.rs` | 3 | **3** | `test/upstream_convert_string.zig` |
-| `tests/rich_text_fuzz_crash.rs` | 9 | **9** | `test/upstream_rich_text_fuzz.zig` |
-| `tests/test_mark_patches.rs` | 1 | **1** | `test/mark_patches_test.zig` |
-| `tests/test_save_load_orphans.rs` | 3 | **3** | `test/upstream_save_load_orphans.zig` |
+| `tests/test.rs` | 140 | 140, unvalidated | `test/upstream_doc_test.zig` and others |
+| `tests/batch_insert.rs` | 46 | 46, unvalidated | one file, two row-order assertions |
+| `tests/diff_marks.rs` | 36 | 36, unvalidated | `src/marks.zig`, prefix `diff_marks:` |
+| `tests/text.rs` | 21 | 26 blocks, not a case total | `src/read.zig`, `src/iter/spans.zig`, `test/upstream_text_more.zig` |
+| `tests/text_encoding.rs` | 15 | 16 blocks, not a case total | `src/read.zig`, prefix `text_encoding:` |
+| `tests/block_tests.rs` | 19 | 19, unvalidated | `test/upstream_block_tests.zig` |
+| `tests/convert_string_to_text.rs` | 3 | 3, unvalidated | `test/upstream_convert_string.zig` |
+| `tests/rich_text_fuzz_crash.rs` | 9 | 9, incorrect | That snapshot omitted the rescue case. Its source prerequisite now exists; exact current case coverage remains unchecked. |
+| `tests/test_mark_patches.rs` | 1 | 1, unvalidated | `test/mark_patches_test.zig` |
+| `tests/test_save_load_orphans.rs` | 3 | 3, unvalidated | `test/upstream_save_load_orphans.zig` |
 
-**Every one of the ten upstream integration files is ported, every case** —
-re-measured 2026-10-01, `FAIL=0`.
+The claim that all ten integration files cover every case is retracted.
+The old `FAIL=0` report does not prove absent cases or unported API prerequisites.
+One nominal `test.rs` case, `conflicting_unicode_text_with_different_widths`, is inside an upstream block comment.
+Do not infer a new total by subtracting gaps from the historical 140.
 
-**And one of them had a recorded gap whose blocker landed later in the same
-session, which is the pattern worth keeping.** `update_spans_uses_expand_config`
-(upstream `block_tests.rs:676-726`) was recorded as blocked on
-`UpdateSpansConfig`; that type arrived afterwards, for a different reason and a
-different slice, and the recorded gap became stale rather than closing itself.
-**A recorded gap whose blocker is later fixed is a gap that must be revisited,
-and nothing in the gap announces that its reason has expired.** This one was
-caught only because the table above was re-measured rather than assumed — the
-same reason the retracted ranking was worth keeping visible. Neither announced
-itself.
+### Selected proof from the 2026-10-08 round
 
-**A record whose reason has expired is a defect, so expired records are deleted
-rather than amended.** The next reader who needs this one will not be the one
-who finds it today, and the reason it existed is already in the history.
+The following three exact upstream regressions passed in that selected ReleaseSafe run.
+Their assertion scope is described below. These are not current cutover gate results.
+
+| Upstream case | Asserted behavior |
+| --- | --- |
+| `bundle_with_mark_columns_decodes_from_fuzz_trace` (`test.rs:135-152`) | A one-character text with a bold `ExpandMark::Both` mark bundles, decodes, and retains text, marks, and heads. |
+| `doc_iter_spans_skip_losing_conflicting_text_overwrites_after_object_shift` (`test.rs:722-755`) | After concurrent text overwrites and merge, root-to-text iteration excludes the losing text and matches `text()`. |
+| `incremental_load_preserves_text_encoding_for_all_change_chunk_types` (`test.rs:4144-4178`) | Uncompressed change, compressed change, and bundle loads retain UTF-16 encoding, heads, and materialized state. |
+
+Bundle creation, document iteration, and compressed change loading are implemented.
+They are not missing API prerequisites. The compressed-change case also has assertions in `upstream_doc_more.zig`, case 8.
+That source evidence is separate from the three selected runtime results above.
+
+The public Zig clock consumer passed 1/1 in ReleaseSafe.
+`test/upstream_clock_test.zig` reads the Rust-generated `test/golden/clock.jsonl`.
+It checks all seven dependency-closed subsets, 49 `covers` pairs, and 49 `merge` pairs.
+It also checks heads and missing dependencies through the public document API.
+
+The Rust metadata oracle generated six change rows and seven frontier-query rows.
+`metadata` is registered as the eleventh golden vector.
+The native metadata consumer passed 5/5 in ReleaseSafe.
+It checks fields, frontier sets, independent ownership, allocation failures, and named-id actor-slot repair.
+The standalone public consumer also passed after document teardown, including author bytes and an empty operation interval.
+
+The first metadata run failed during fixture setup: Rust `raw_bytes()` includes framing, but `parseChange` expects the body.
+The test now parses the chunk before its change body (`change.rs:118-120`).
+The first smoke check assumed `setAuthor` retained the previous actor.
+It now captures the author-associated actor that `setAuthor` selects (`automerge.rs:381-396`).
+Neither failure required a production field-mapping change.
+Review did find a production lookup defect: named operation ids bypassed actor-slot repair.
+`Document.hashForOpid` now resolves those ids before graph lookup (`automerge.rs:744-758,1554-1567`).
+
+The earlier automatic-recovery consumer passed its selected run on the old lifecycle.
+It checked metadata refusal during retained recovery and follow-on committed history.
+The current held-journal lifecycle replaces that recovery route.
+Its actual current consumer result must be recorded separately.
+
+### Behavioral coverage pending after source migration
+
+These source prerequisites are implemented. Only execution of each full upstream case closes its coverage gap.
+
+| Case or surface | Current prerequisite and remaining proof |
+| --- | --- |
+| External patch-log compatibility | The original four foreign-document cases are actor-compatible successes, not mismatches. Added incompatible-table cases require `PatchLogMismatch` with unchanged caller state. Sorted insertion/prefix rules can retain a trailing actor suffix; rendering through a shorter selected document must then return checked `InvalidActorIndex`, not fabricate an identity. |
+| `current_state_diff_with_block_applies_to_hydrated_value_from_fuzz_trace` | `SpanInput.block` accepts a full borrowed hydrated map; emitted `Span.block` owns its full map. Verify nested content and ordered mirror replay. |
+| `test_change_encoding_expanded_change_round_trip` | Owned structured decode, JSON and production wire encoding exist. Verify every upstream operation and independent hash/body agreement. |
+| `save_and_load_incremented_counter` | Expanded changes and scalar datatype JSON codecs exist. Verify the full change-list round trip, not just native save/reload. |
+| `round_trip_change_with_extra_bytes` | Structured encoding preserves complete authoritative `extra_bytes`. Verify both distinct opaque footers from the upstream case. |
+| `has_our_changes` | Raw exact ordered shared-head equality and closing automatic predicate exist. Execute the predicate's full protocol scenario, not just convergence. |
+| Rich-text rescue | The lenient mark-order loader returns owned hydration. Verify the exact upstream rescue map and disposal; strict parser rejection is not rescue proof. |
+| AutoCommit lifecycle | One held transaction spans writer calls. Verify pending reads, close barriers, no-write commit, isolated writes, refusal recovery, and final-address clone. |
+| Native load options | Partial-load, verification, migration, borrowed log, encoding, and author options exist. Verify policy combinations and follow-on state through real loaders. |
+
+Fixture inventory checks, generic loads, and exact upstream cases are different evidence.
+`test/fixtures_test.zig` checks inventory and magic.
+`src/doc.zig` also loads all 18 manifest fixtures and checks outcomes, invariants, and recorded heads.
+`upstream_doc_more.zig`, cases 10–13, adds the upstream-specific refusals and `ROOT.a.a == "b"` assertions.
+Neither inventory nor generic fixture loading alone proves those exact assertions.
+
+Rich-text mutation also has a fixed-seed model sweep in `src/read.zig` (`marks_are_okay`, 64 scenarios).
+It checks text and consolidated spans across three compatible encodings.
+This is property coverage, not arbitrary Unicode-offset coverage or a substitute for the exact rescue case.
+
+**Historical expired blocker.** `update_spans_uses_expand_config` (`block_tests.rs:676-726`) once lacked `UpdateSpansConfig`.
+That type arrived later in the same session.
+The old record did not close itself when its prerequisite changed.
+Reviewers found the stale blocker through source review.
+The same rule applies to bundle, iterator, and compressed-change records.
+Only the exact case's assertions close a behavioral gap.
+
+Remove an expired blocker from the current ledger.
+Retain a real missing assertion or API prerequisite with its source.
+Keep dated evidence separate from the current coverage claim.
 
 The port declares **1541 test blocks** in total (1316 under `src/`, 225 under
 `test/`) — **not re-measured for this revision and therefore not to be relied
@@ -712,92 +1159,45 @@ documents**, and the 5/11/2 split is the whole of the eighteen. The old
 artefact of reading a `sent` split as if `sent` were the record's only
 discriminator.
 
-## What is done and verified
+## Current phase ledger
 
-"Verified" means a test or an execution in this tree demonstrated it, not that
-the file exists.
+"Verified" requires an observed execution of the named gate on the current source.
+Source implementation and previous dated success remain separate.
 
-| Phase | State | Evidence |
+| Phase | Current state | Proof limits |
 | --- | --- | --- |
-| P0 conformance harness | done | 18 corpus files, a manifest of what loading each must do, and a Rust oracle that drives the reference. The manifest/corpus agreement test passes (6/6). |
-| P1 foundation | done | `error.zig`, `types.zig`, `value.zig`, `clock.zig`, `leb128.zig`, `unicode.zig`. |
-| P2 hexane | **done; gate met 2026-10-04** | The final Debug gate passed all test roots and the forced slow-path root: 3722 passed, one default skip, no failures. The source ledger accounts for all 286 upstream occurrences: 272 covered, 14 reasoned exclusions, no missing occurrence. All five private BeLen cases run; the seed-799 vector replays Rust's actual 19-row, ten-splice fixture. All 1989 codec records match the reference; 1966 are native encoder byte cases. The existing exhaustive boolean test caught and now protects the merged-true-tail repair. See [plan.md](plan.md#p2--hexane) and [hexane-cases.json](hexane-cases.json). |
-| P3 columnar and format | done | `parse.zig`, `chunk.zig`, `column_spec.zig`, `columnar/encoding.zig`, `columnar/columns.zig`, `storage/change_chunk.zig`, `storage/document_chunk.zig`. The document chunk reproduces the oracle's 446-byte `save()` output byte for byte. |
-| P4 change graph and encoding | done | `change.zig`, `author.zig`, `change_graph.zig`, `change_queue.zig`, `storage/change_chunk.zig`. |
-| P5 op set and merge | **done; gate met 2026-10-04** | The two named upstream files are ported: `tests/test.rs` 140/140 and `tests/batch_insert.rs` 46/46. The eight native save tests pass. The strengthened `zig build save-interop` passed 7/7 steps and verified six deterministic scripts: map, list, text, marks, conflicts, merge. Zig saves load in Rust; Rust re-saves load in Zig. Zig compares both the re-save and the independently built Rust save from `reference_hex`, byte for byte after column inflation. This caught and fixed the change-extra metadata tag (`0x56`: Null `0` instead of Bytes `7`). Actor/head order, column IDs/order/data, and the head-index suffix remain in the comparison. Values, heads, hashes, change metadata, and raw change bytes also match. The list case requires actual on-wire DEFLATE on both sides. |
-| P6 document API | **done; signatures changed this revision** | `doc.zig` (the document, actor table, change graph, op set, `load`/`save`/`commit`/`merge`/`applyChanges`/`fork`/`forkAt`/`clone`/`isolate`, the diff surface, the bundle and fragment surface), `read.zig` (the whole `ReadDoc` surface — the unsuffixed readers, the eleven `_at` readers, `iter`/`iterAt`, the three cursor readers and `getCursorPositionFor`), `transact.zig` (the `Transactable` bodies and the manual `Transaction`), `transaction.zig` (`CommitOptions`, `Success`/`Failure`/`Outcome`, `enclose`/`encloseWith`, the accessors). **This row said "`read.zig` (twenty methods)"; that count was a snapshot and is not maintained** — the list of names is in `API.md` §Read, which is the thing to read. The crate-root address-book example **compiled and passed** (3/3, measured 2026-10-01) — the "`src/c/sync.zig` does not compile" claim this row used to carry is false. **Every constructor on this surface now takes a borrowed `std.Io`**, which is a signature change across the whole row and the reason every count in *Test state* is dated rather than current. |
-| P7 iteration | **done; gate clause re-measured 2026-10-01 and met bar two named cases** | `sequence_tree.zig` and all six of upstream's iterators: `iter/tools.zig` (`Unshift`, `PeekShift`, `SkipIter`, `Diff`, `DiffKernel`, `Shiftable`), `iter/map_range.zig`, `iter/list_range.zig`, `iter/spans.zig`, `iter/keys.zig`, `iter/values.zig`, `iter/doc.zig` (`ObjIdIter`, `DiffIter`) and `iter/slice.zig`. The claim that "one of the ported text tests fails" is **false**: the library suite is **1469 passed, 1 skipped, 0 failed**. **This row said the gate's other clause was not met, on a name-presence count of 8 for `tests/text.rs` and 10 for `tests/text_encoding.rs`, and that count was wrong** — it is the same instrument this file has already retracted once, and the port renames every ported case into English. Verified case by case against both upstream files: **all 21 `text.rs` cases and all 15 `text_encoding.rs` cases are in the tree**, and the instrument that settles it is that case-by-case comparison rather than any name match. **34 of the 36 run under all four `TextEncoding`s**, so the gate's "the 15 tests each run under 4 encodings" holds for 34, and the two exceptions are named: `empty_marks_before_block_marker_dont_repeat_text` (`text.rs:321-348`) and the `marks_are_okay` proptest driver (`text.rs:658-710`). **Both build their model in ASCII-plus-`'\n'`, and a block marker is three units wide under `utf8_code_unit`** — upstream measures every non-`Set(Str)` action as `text_encoding.width("\u{fffc}")` (`op_set2/op_set.rs:443-447`) — so a `'\n'`-wide model does not describe that document. `src/read.zig:7971-7981` is the port's own record of the same two. |
-| P8 sync | **done, measured 2026-10-01** | `sync/bloom.zig`, `sync/message.zig`, `sync/state.zig`, `sync/protocol.zig` and `sync/v1.zig`: the message codec, the peer state, the document-side state machine and the frozen v1 path. The gate's third clause names "the five round-trip tests from `sync/v1_compat_test/`"; upstream has **three** (`src/sync/v1_compat_test/mod.rs:473`, `:496`, `:519` — `bloom.rs` and `state.rs` declare none), and the directory is **907** lines as the plan says. The port's `src/sync/v1.zig` carries 9 tests, covering both directions and a v1-only peer. |
-| P9 patches, marks, cursors, text diff, hydrate | **done; gate met** | `marks.zig`, `textdiff.rs` (the vendored Myers diff, byte-identical to upstream's), `patches.zig` (all nine `PatchAction` variants, the expose queue's ordering asserted as a property), `cursor.zig` (the v1 codec pinned as literal bytes in both directions, plus the legacy v0 parser), `hydrate.zig` (the round trip), and both `anonymize.zig` and `autoserde.zig`. **Both named files are ported: `tests/diff_marks.rs` 36 of 36** (`src/marks.zig`, one `test "diff_marks: …"` block per upstream case, all green) **and `tests/test_mark_patches.rs` 1 of 1** (`test/mark_patches_test.zig`, wired). The hydrate clause holds. **This row said "partly met, the weakest gate in the plan" until 2026-10-01, on a name-presence count of 12/36 that was measuring the wrong thing — the port renames every case into English.** **The hydrate dispatch arms are now measured, and the measurement is what closed the defect `plan.md` §1.1a records.** That section had one mutation: three tests all hydrating `.root`, a root is a map, so the `text` and `list` arms were never reached, and rewriting the `.text` arm to build an empty string left all three green. **It is now a sweep — 25 mutations applied at once, one per candidate arm, over the whole suite reachable from `src/hydrate.zig` — and 23 of the 25 arms were invisible to the entire tree while 2 were detected.** What closed it is the **nine tests now covering the uncovered arms**. `plan.md` §1.1a still carries the single-mutation account and has not been amended. |
-| P10 C ABI | **current API-design evidence above** | `include/automerge.h`, production root `src/c/root.zig`, separate ABI check `test/c/cabi.zig`, and the C result/document/sync modules. The historical run passed 153 cmocka cases. The current guard reflects 187 physical function signatures, 37 enum names across five enums, and five exposed struct layouts. `AMbyteSpan` and `AMitems` cross by value. `zig build` installs `libzautomerge.a` and `automerge.h`. The suite links that artifact, not the check library. |
-| bundle engine | **done, and the two halves are now both present** | **The bundle chunk codec works and is proved against the reference.** `storage/bundle.zig` carries **9** test blocks, among them `a bundle the reference wrote reads field by field, at literal offsets` and `a written bundle is byte for byte the bundle the reference wrote`, and the file is in the library suite through `src/root.zig`'s test block. **This row said the fragment API did not exist; it does.** `Fragment` is `src/change_graph.zig`'s, and the document surface `Document.bundle(gpa, hashes)`, `Document.fragments(gpa, levels)`, `Document.getFragment(gpa, head)` and `Document.bundleFragments(gpa, wanted)` are all declared, alongside the graph's own `cacheFragment` and `looseCommit`. `Automerge::get_fragment` / `Automerge::fragments` / `Automerge::bundle_fragments` are ported. |
+| P0 conformance harness | Current reference vectors and native API replay pass | Corpus scope is explicit; it is not proof of every possible input. |
+| P1 foundation | Current Debug, slow-path and ReleaseSafe gates pass | Malformed inputs retain operation-specific obligations; passing roots do not prove all states. |
+| P2 hexane | Current Debug, slow-path and ReleaseSafe gates and final comparison pass; historical source ledger retained | Preserve the ledger's reasoned exclusions. Native before/after improvements are not Rust-relative gains. |
+| P3 columnar and format | Current full roots, corpus and live interoperability checks pass | Named corpus/scenario scope is not total format proof. |
+| P4 change graph and encoding | Current full roots, reference vectors and API replay pass | Preserve independent hashes and authoritative footer bytes. |
+| P5 op set and merge | Complete Debug, slow-path and ReleaseSafe roots and current public consumers pass | Case-for-case integration scope remains bounded by the consumer ledgers. |
+| P6 document API | Current native target replay, standalone consumer and full roots pass | Passing target consumers do not imply universal input/state coverage. |
+| P7 iteration | Current complete Debug, slow-path and ReleaseSafe consumers pass | Preserve encoding exceptions and borrowed/owned item boundaries. |
+| P8 sync | Current full roots, reference/C consumers and fresh matched CLI correctness pass | Correctness smoke does not establish performance. |
+| P9 patches, marks, cursors, hydrate, serde | Current replay, complete roots and final comparison pass | Corpus, encoding, ownership and reference-panic exceptions stay explicit. Cache-phase gains do not imply whole-process gains. |
+| P10 C ABI | Current static/header and dynamic runtime gates pass | Exact C case and corpus scope is recorded above, not broadened to every C behavior. |
+| Bundle and fragments | Current Debug, reference and public consumer checks pass | Existing case ledgers define behavior coverage; no universal integration total is inferred. |
+| Matched performance comparison | Final matrix completed with valid correctness, scheduling and counters | Results establish measured differences, not performance parity. See the benchmark README's current comparison. |
 
 ## The API contract
 
-`API.md` is the target public surface. It was audited against the tree on
-2026-09-30, re-measured against both trees on 2026-10-01, and **re-audited for
-this revision**. Its
-[audit table](../API.md#audit-every-declaration-in-this-file-against-the-port)
-records, for every declaration, whether it is present, renamed, absent or
-deliberately different. **The Location column is now symbol-based, not a line
-number** — four separate re-measurements found the numeric locators stale
-because the port grew under them, and a locator that must be re-derived every
-release is not a locator. Rust citations keep their `path:line` form, because
-the reference checkout is pinned and read-only. The short version of
-what the audit found:
+[API.md](../API.md) records the current source contracts and full declaration ledger.
+Its ledger groups every reader, writer, document, transaction, sync, patch, and value surface.
+It does not claim that a source declaration passed its consumer.
+Port anchors use file and symbol; pinned Rust citations retain `path:line`.
 
-- `Automerge::diff` and its five siblings were missing from `API.md` entirely,
-  for a method thirteen upstream tests need.
-- The manual `Transaction` surface was one sentence and no names.
-- `getMarks` was documented as upstream's single-index `MarkSet` read and is in
-  fact a half-open window over `[]Mark`. **Upstream's single-index read is now
-  ported** — `read.markSetAtIndex` / `read.markSetAtScope` — and the window
-  stays as `API.md`'s own method with its audit row saying which is which;
-  `Transaction.get` and `Transaction.markSetAtIndex` are ported beside it. The
-  gap that replaced the first two was "a transaction opened at historical heads
-  does not always read at them"; **that gap is closed** — the transcription in
-  `test/upstream_doc_test.zig:3126` asserts upstream's own values at every line
-  and passes. The last recorded gap there — **a missing method**, the `_at`
-  historical variants — **is closed too** (2026-10-01): `src/read.zig` carries
-  all fourteen upstream spellings. **That sentence counted a second name the
-  upstream crate does not have.** Upstream carries `at` on the three cursor
-  methods themselves (`read.rs:203`, `:228`, `:241`), so the port's
-  `getCursorAt` / `getCursorMovingAt` / `getCursorPositionAt` were a port-only
-  split and **have been removed**; `getCursor`, `getCursorMoving` and
-  `getCursorPosition` now carry `heads: ?[]const ChangeHash` in upstream's own
-  argument position, and `API.md` § Conventions, §Read and §Known gaps item 2
-  record the cutover. The same fold relabelled one refusal —
-  `getCursorPosition` answers `error.InvalidCursor` where it used to answer
-  `error.InvalidIndex` unscoped (`automerge.rs:1778-1781`).
-- The actor block (`getAuthors`, `setActor`, `getActor`,
-  `getAuthorForActor`, `getActorForAuthor`) was wrong against the **Rust** as
-  well as against the port.
-- `split` matched nothing at all, upstream or here; `rollback` is a
-  transaction's method upstream and here, not a document's; `bundle` upstream
-  takes a hash list and **there is now a document-level one** —
-  `Document.bundle(gpa, hashes)`. **That sentence was correct when written and
-  is wrong now**: the method was added to the tree and this file kept the old
-  verdict.
+The migration removes deprecated lifecycle flags, per-call automatic free writers,
+obsolete transaction aliases, object-ID scalar values, incomplete span blocks,
+and UTF-8-buffer ownership examples.
+Raw, transaction, automatic, closure, owned-value, and parser owners have distinct disposal rules.
+`CommitOptions` contains message and time. Logged transaction opening, not an invented options field,
+transfers an external log on successful construction.
 
-- **Re-measured 2026-10-01, three more declarations wrong against the Rust, not
-  only against the port.** `parents` was declared as
-  `pub fn parents(doc, obj) Parents` — upstream `read.rs:35` returns a
-  `Result<Parents<'_>, AutomergeError>` and the port's own `read.parents`
-  returns `ReadError!Parents`, so the contract dropped an error union that
-  *both* implementations have. §Write's "twenty … one for one" counts
-  **twenty-one** declarations against upstream's **twenty** methods, and
-  `mark` / `unmark` do not match `transactable.rs:103-117` in arity or order.
-  All three are fixed in `API.md` with the upstream `path:line` beside them.
-- **The numeric locators are gone rather than refreshed.** `API.md` cited
-  `path:line` into this repository in 184 places, and 149 of them were wrong at
-  the 2026-10-01 re-measurement. This revision replaces every one with the
-  declaration's symbol, so there is no count of correct line citations left to
-  keep in step.
-- **Three known gaps were closed in the tree while the gap list still carried
-  them** — `read.iter` / `read.iterAt`, `Document.getAuthors`, and
-  `Document.bundle` with the fragment API beside it. **A gap the tree has
-  already answered is a defect in the contract**, because the alternative is a
-  caller declining to use a declaration that is sitting right there.
+Historical changes explain defects; they are not alternate supported caller contracts.
+Use root `transaction`, `sync.state.State`, `sync.message.Message`, and `change_record`.
+The complete public signature and barrier definitions belong in API.md.
+Current execution limits belong at the top of this file, not in an inferred aggregate parity count.
 
 ## The slab merge budget, and why the previous account of it was wrong
 
@@ -1356,13 +1756,10 @@ a cursor naming a row of another object where it used to answer
 `error.InvalidIndex` unscoped, which is upstream's own
 `.ok_or_else(|| InvalidCursor(cursor.clone()))` on the seek's empty answer
 (`automerge.rs:1778-1781`) and is what the same cursor already answered with a
-clock. The one thing that did need building is
-`Document.clockAtScope` (`src/doc.zig`), upstream's `Automerge::clock_at`
-(`automerge.rs:1236-1247`): the unsuffixed readers resolve their clock through
-`readScope`, which reads the **isolation's** heads, and six of the new readers
-hand a walk back — and a walk copies the `Clock` by value and borrows only its
-`slots`, so the clock has to outlive the call. It shares the document's one
-existing cache rather than adding a second.
+clock. `Document.clockAtScope` supplies committed historical clocks (`automerge.rs:1236-1247`).
+The current implementation retains heap-stable clock slots across other head selections.
+Returned walks borrow those slots until document mutation invalidates them.
+It no longer shares one replaceable scope clock across all returned historical walks.
 
 ### 3. Case accounting
 

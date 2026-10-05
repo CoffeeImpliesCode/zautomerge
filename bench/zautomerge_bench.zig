@@ -15,27 +15,31 @@
 //!
 //! A data-oriented audit of the port named four costs that no case measures,
 //! so no change to them could be honestly accepted or rejected. They are the
-//! sorted insert into `sent_hashes` on every generated sync message
-//! (`src/sync/protocol.zig:572` over `src/sync/state.zig:368-382`), the linear
-//! `hashForOpid` scan (`src/transaction.zig:411-423`), the five column cursors
-//! `elementWidth` builds per list element (`src/iter/list_range.zig:884-901`
-//! over `src/opset/op_set.zig:3500-3503`), and the per-change arena in
-//! `anonymize`, whose gate is peak RSS rather than instructions and which
-//! `bench/README.md` §8 gives as a standalone command line. The three that can
+//! sync message generation's growing `sent_hashes` set, `hashForOpid` lookup,
+//! and list element-width traversal. Their current subjects are a bulk sorted
+//! merge, an actor-change binary search and one held element cursor, not the
+//! original per-hash memmove, node-table scan or fresh cursors. The fourth
+//! finding is the per-change arena in `anonymize`, whose gate is peak RSS rather
+//! than instructions and which `bench/README.md` §8 gives as a standalone
+//! command line. The three that can
 //! be gated through the public surface are three of the last four workloads
 //! here; the fourth, `insert-loop`, is a fifth gate and not one of the audit's
 //! four — it measures a cost the audit did not name, which another gate here
 //! found by accident while measuring its own fixture.
 //!
-//! Every workload prints one machine-readable line on **stdout**:
+//! By default, every successful workload prints one machine-readable line on **stdout**:
 //!
 //!     BENCH <name> <iters> <total_ns> <ns_per_iter>
 //!
-//! and nothing else goes to stdout, so `grep '^BENCH '` over a run is the
-//! complete result set. Everything else — the shape of the input, the phase
-//! breakdown, warnings, the leak count — goes to **stderr**, where
+//! and nothing else goes to stdout in default mode, so `grep '^BENCH '` over a
+//! default run is the complete result set. Everything else — the input shape,
+//! phase breakdown, warnings, the leak count — goes to **stderr**, where
 //! `std.debug.print` already puts it in this repository's idiom
 //! ([`test/save_interop.zig`](../test/save_interop.zig)).
+//!
+//! With `--region-instructions list-width`, the only stdout metric is instead:
+//!
+//!     REGION list-width read-list <elements> <walks> <element_visits> <read_ns> <instructions> <time_enabled_ns> <time_running_ns>
 //!
 //! ONE LINE IS NOT ENOUGH ON ITS OWN
 //!
@@ -59,23 +63,27 @@
 //! `bench/README.md` §7 — `-O ReleaseFast` goes **before** the first `-M`, or
 //! the binary comes out `Debug` — and call it directly.
 //!
-//! **An instruction count belongs to the process, not to the timed region.**
-//! `list-width` prints what share of the process its subject had and fails the
-//! run if that share falls under `list_width_subject_floor_pct`; read that
-//! line before quoting the count for any workload that times a region.
+//! **A `perf stat` instruction count belongs to the process, not the timed region.**
+//! By default, `list-width` refuses runs below `list_width_subject_floor_pct`.
+//! `--region-instructions list-width` instead counts only the complete read-list
+//! loop on the calling thread, including range setup, validation and checksum.
+//! It excludes fixture construction, independent verification and teardown.
+//! Counter control/read overhead remains in wall time; small user-space counter
+//! boundary overhead remains in the unadjusted instruction count.
 //!
 //! USAGE
 //!
-//!     zautomerge_bench [--repeat N] [--full] [--list] [workload ...]
+//!     zautomerge_bench [--repeat N] [--full] [--list] [--region-instructions] [workload ...]
 //!
 //! With no workload named, every workload runs. `--repeat N` runs each one N
-//! times and reports the **median** sample; `--full` swaps every reduced size
-//! for the exact size the test case uses, which is slow enough to want a
-//! filter. See `bench/README.md` for which sizes are reduced and why the
-//! reduced shape is the same shape.
+//! times and reports the **median** sample. `--full` uses the original test-case
+//! sizes for the seven case-derived workloads and larger documented scaling
+//! points for the four added workloads, which have no corresponding test case.
+//! See `bench/README.md` for the size pairs and their shapes.
 
 const std = @import("std");
 const builtin = @import("builtin");
+const perf_instructions = @import("perf_instructions.zig");
 
 /// The module under test, imported by the name a consumer imports it by.
 const am = @import("zautomerge");
@@ -93,15 +101,19 @@ const ChangeHash = am.ChangeHash;
 const stdout_buffer_len = 8 * 1024;
 
 const usage =
-    \\usage: zautomerge_bench [--repeat N] [--full] [--list] [workload ...]
+    \\usage: zautomerge_bench [--repeat N] [--full] [--list] [--region-instructions] [workload ...]
     \\
     \\  --repeat N   run each named workload N times and report the median
     \\               sample (default 1). Wall clock on a busy host moves a few
     \\               percent between samples; the median is the least-bad
     \\               summary and `perf stat -e instructions` is the good one.
-    \\  --full       use the exact input sizes the port's own test cases use
-    \\               instead of the reduced defaults. Several workloads become
-    \\               one to two orders of magnitude slower; see bench/README.md.
+    \\  --full       use original test-case sizes for the seven case-derived
+    \\               workloads and larger scaling points for the four added
+    \\               workloads; see bench/README.md for sizes and pass counts.
+    \\  --region-instructions
+    \\               count user-space instructions in the complete read-list
+    \\               loop; requires list-width as the sole named workload.
+    \\               Emit REGION, not BENCH; fail if an exact count is unavailable.
     \\  --list       print the workload names and exit
     \\
     \\workloads, all of which are optional positionally:
@@ -148,6 +160,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var repeat: usize = 1;
     var full = false;
+    var region_instructions = false;
     var names: std.ArrayList([]const u8) = .empty;
 
     var i: usize = 1;
@@ -166,6 +179,10 @@ pub fn main(init: std.process.Init) !u8 {
         }
         if (std.mem.eql(u8, arg, "--full")) {
             full = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--region-instructions")) {
+            region_instructions = true;
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--repeat=")) {
@@ -202,8 +219,23 @@ pub fn main(init: std.process.Init) !u8 {
         try names.append(arena, arg);
     }
 
+    if (region_instructions and
+        (names.items.len != 1 or !std.mem.eql(u8, names.items[0], "list-width")))
+    {
+        std.debug.print(
+            "zautomerge_bench: --region-instructions requires list-width as the sole named workload\n",
+            .{},
+        );
+        return 2;
+    }
+
     const sizes = if (full) Sizes.full else Sizes.default;
-    const ctx: Ctx = .{ .gpa = gpa, .io = init.io, .sizes = sizes };
+    const ctx: Ctx = .{
+        .gpa = gpa,
+        .io = init.io,
+        .sizes = sizes,
+        .region_instructions = region_instructions,
+    };
 
     std.debug.print(
         "zautomerge_bench: optimize={s} sizes={s} repeat={d}\n",
@@ -233,20 +265,17 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
 
-    // **These two come out of `init.arena`, not out of the leak arbiter.**
-    // `detectLeaks` runs at the bottom of `main`, before any `defer` in this
-    // function has fired, so a buffer allocated from the arbiter and freed by
-    // a `defer` would still be live at the check and be reported as a leak of
-    // the benchmark's own. The arena is freed by `std.start` after `main`
-    // returns and is page-backed, so it costs nothing to hand it two small
-    // arrays and it keeps the arbiter's answer about the *port*.
-    const samples = try arena.alloc(u64, repeat);
-    const sorted = try arena.alloc(u64, repeat);
+    // Repeat storage belongs to `init.arena`, not the leak arbiter: the leak
+    // check runs before main's defers. Keep each sample's metadata paired with
+    // its wall time, but allocate nothing for the default single sample.
+    const samples: []Result = if (repeat > 1) try arena.alloc(Result, repeat) else &.{};
+    const sorted: []u64 = if (repeat > 1) try arena.alloc(u64, repeat) else &.{};
 
     // Every byte of work every workload did is folded into one running total
     // and printed at the end, so nothing below can be optimised away on the
     // grounds that the answer is unused.
     var sink: u64 = 0;
+    var region_result: Result = .{};
 
     for (selected.items) |w| {
         std.debug.print("\n# {s}\n#   reproduces: {s}\n", .{ w.name, w.case });
@@ -258,8 +287,12 @@ pub fn main(init: std.process.Init) !u8 {
             if (w.run(ctx)) |ran| {
                 var r = ran;
                 if (!r.measures_own_time) r.ns = started.stop();
-                samples[rep] = r.ns;
-                last = r;
+                if (repeat > 1) {
+                    samples[rep] = r;
+                    sorted[rep] = r.ns;
+                } else {
+                    last = r;
+                }
             } else |err| {
                 std.debug.print("# FAILED on repeat {d}: {s}\n", .{ rep, @errorName(err) });
                 ok = false;
@@ -271,20 +304,32 @@ pub fn main(init: std.process.Init) !u8 {
         // The median, by the lower-middle convention: for an even number of
         // samples the smaller of the two central ones, which is a real
         // observation rather than an average of two.
-        @memcpy(sorted, samples);
-        std.mem.sort(u64, sorted, {}, lessThanU64);
-        const median = sorted[(repeat - 1) / 2];
+        if (repeat > 1) {
+            std.mem.sort(u64, sorted, {}, lessThanU64);
+            const median = sorted[(repeat - 1) / 2];
+            for (samples) |sample| {
+                if (sample.ns != median) continue;
+                last = sample;
+                break;
+            }
+        }
+        const median = last.ns;
         const iters: u64 = @intCast(last.iters);
         const per_iter = if (iters == 0) 0 else median / iters;
 
         sink +%= last.checksum;
 
-        try out.print("BENCH {s} {d} {d} {d}\n", .{ w.name, last.iters, median, per_iter });
-        try out.flush();
+        if (region_instructions) {
+            // Publish only after the independent checks and leak check pass.
+            region_result = last;
+        } else {
+            try out.print("BENCH {s} {d} {d} {d}\n", .{ w.name, last.iters, median, per_iter });
+            try out.flush();
+        }
 
         std.debug.print(
             "#   {d} iteration(s), median {d} ns over {d} sample(s), {d:.3} ms/iter\n",
-            .{ last.iters, median, repeat, @as(f64, @floatFromInt(median)) / std.time.ns_per_ms },
+            .{ last.iters, median, repeat, @as(f64, @floatFromInt(per_iter)) / std.time.ns_per_ms },
         );
         for (last.phases[0..last.phase_count]) |p| {
             std.debug.print(
@@ -313,6 +358,23 @@ pub fn main(init: std.process.Init) !u8 {
             .{},
         );
         return 1;
+    }
+    if (region_instructions) {
+        const reading = region_result.counter_reading orelse return error.MissingRegionReading;
+        const elements = ctx.sizes.list_width_elements;
+        try out.print(
+            "REGION list-width read-list {d} {d} {d} {d} {d} {d} {d}\n",
+            .{
+                elements,
+                region_result.iters,
+                elements * region_result.iters,
+                region_result.ns,
+                reading.instructions,
+                reading.time_enabled_ns,
+                reading.time_running_ns,
+            },
+        );
+        try out.flush();
     }
     return 0;
 }
@@ -360,6 +422,7 @@ const Result = struct {
     /// call, which is how `update-object` times the hot call without its
     /// fixture.
     measures_own_time: bool = false,
+    counter_reading: ?perf_instructions.Reading = null,
     phases: [phase_max]Phase = @splat(.{ .name = "", .ns = 0 }),
     phase_count: u8 = 0,
 
@@ -394,6 +457,7 @@ const Ctx = struct {
     gpa: Allocator,
     io: Io,
     sizes: Sizes,
+    region_instructions: bool = false,
 };
 
 /// Every size every workload takes, in one place, so `bench/README.md`'s table
@@ -421,29 +485,27 @@ const Sizes = struct {
     mark_queries: usize,
     /// How many times the record is repeated to make the long text.
     text_reps: usize,
-    /// Rounds of the two-peer sync exchange. Each round is one
-    /// `generateSyncMessage` that carries `sync_chunk` fresh hashes into a
-    /// `sent_hashes` set that grows by exactly `sync_chunk` a round and ends
-    /// at the document's whole change count, so the insert loop's memmove arm
-    /// grows across the run. The set only grows because the peer receives
-    /// every message and answers none of them until the run is over: an
-    /// answer is an acknowledgement, and an acknowledgement empties the set.
+    /// Rounds of the two-peer sync exchange. Each generation bulk-sorts its
+    /// payload hashes and merges them into the growing `sent_hashes` set.
+    /// The first round adds `sync_chunk + 1` hashes, later rounds `sync_chunk`.
+    /// The peer receives every message but withholds acknowledgements until
+    /// the measured rounds end, so the set is not pruned between rounds.
     sync_rounds: usize,
     /// Changes the local document gains, and the peer is sent, per round.
     sync_chunk: usize,
-    /// Committed changes in the change graph `hashForOpid` scans. This is the
-    /// `C` in its O(C) scan, and it is what makes one call cost something.
+    /// One-put committed changes in the actor's change list searched by
+    /// `hashForOpid`. Graph construction is outside the lookup timer.
     opid_changes: usize,
     /// How many `hashForOpid` calls each arm is timed over.
     opid_calls: usize,
-    /// Elements in the list `list-width` walks. **Neither size changed.** The
-    /// fixture used to cost about 1011 s at 50 000 against a 16.1 s subject;
-    /// it is now one batched splice, so the walk is the cost and the element
-    /// count is the thing being measured rather than the thing being paid for.
+    /// Elements in the list `list-width` walks. Neither size changed; the
+    /// fixture is one batched splice rather than the old per-element inserts.
+    /// The phase timings show whether the subject clears the process-wide
+    /// attribution floor; a cheaper fixture does not guarantee that it does.
     list_width_elements: usize,
-    /// Times that walk runs. One pass over 50 000 elements is already 8 s, so
-    /// this lifts nothing at the default size; it exists so the `--full` point
-    /// and the default point are the same shape.
+    /// Complete held-cursor walks. The larger `--full` point uses one pass
+    /// instead of the default's two; element count and pass count both matter
+    /// when interpreting a whole-process instruction ratio.
     list_width_passes: usize,
 
     /// Ascending `Transaction.insert` calls in ONE transaction and ONE commit:
@@ -510,11 +572,9 @@ const Sizes = struct {
         .opid_changes = 50_000,
         .opid_calls = 1_000,
         .list_width_elements = 200_000,
-        // **One** pass, not four. The walk is quadratic in the element count —
-        // that is the finding this gate exists for — so one pass over 200 000
-        // elements is already about 128 s and a second would buy no second
-        // point and cost another 128 s. `--full` is the larger *size*, not the
-        // larger sample count.
+        // One pass at the larger element count, rather than the default's two.
+        // `--full` increases fixture size, not the number of walk samples.
+        // Do not transfer the old fresh-cursor runtime to this held-cursor path.
         .list_width_passes = 1,
         .insert_small = 5_000,
         .insert_large = 20_000,
@@ -861,7 +921,7 @@ fn prefixBool(ctx: Ctx) !Result {
 //
 // The case is `test/upstream_doc_test.zig:1403`, "rollback after a save and
 // load of a deep hydrated root map", and 47 s of its 66 s is inside
-// `am.transaction.updateObject` over the root a `fuzzMap(0, 42)` builds.
+// `AutoCommit.updateObject` over the root a `fuzzMap(0, 42)` builds.
 //
 // **This is the one workload that times a region rather than a whole call.**
 // Building the hydrated mirror and creating the document are setup and sit
@@ -881,16 +941,19 @@ fn updateObject(ctx: Ctx) !Result {
     var out: Result = .{ .measures_own_time = true };
 
     // ── setup, untimed ──
-    var root_value = try fuzzMap(gpa, 0, ctx.sizes.hydrate_depth);
+    var root_value: am.hydrate.Value = .{
+        .object = .{ .map = try fuzzMap(gpa, 0, ctx.sizes.hydrate_depth) },
+    };
     defer root_value.deinit();
 
-    var doc = try Document.init(gpa, ctx.io, .auto);
+    var doc = try am.AutoCommit.init(gpa, ctx.io);
     defer doc.deinit();
-    doc.setActorId(.{ .bytes = "bench-update-object" });
+    try doc.setActorId(.{ .bytes = "bench-update-object" });
 
     // ── the hot call, timed ──
     const started = Timer.start(ctx.io);
-    try am.transaction.updateObject(&doc, am.root, root_value);
+    try doc.updateObject(am.root, &root_value);
+    _ = try doc.commitWith(.none);
     const hot = started.stop();
     out.addPhase("updateObject", hot);
     out.ns = hot;
@@ -1230,11 +1293,13 @@ fn markAtEnd(ctx: Ctx) !Result {
 
     // ── fixture ──
     const build_started = Timer.start(ctx.io);
-    var doc = try Document.initWithEncoding(gpa, ctx.io, enc, .auto);
+    var doc = try am.AutoCommit.initWithEncoding(gpa, ctx.io, enc);
     defer doc.deinit();
-    doc.setActorId(.{ .bytes = "bench-mark-at-end" });
-    const text = try am.transaction.putObject(&doc, am.root, .{ .key = "text" }, .text);
-    try am.transaction.spliceText(&doc, text, 0, 0, body.items);
+    try doc.setActorId(.{ .bytes = "bench-mark-at-end" });
+    const text = try doc.putObject(am.root, .{ .key = "text" }, .text);
+    _ = try doc.commitWith(.none);
+    try doc.spliceText(text, 0, 0, body.items);
+    _ = try doc.commitWith(.none);
     const len = try am.read.length(&doc, text);
     if (len != body.items.len) return error.UnexpectedLength;
     out.mix(len);
@@ -1242,7 +1307,8 @@ fn markAtEnd(ctx: Ctx) !Result {
 
     // ── the mark ──
     const mark_started = Timer.start(ctx.io);
-    try am.transaction.mark(&doc, text, len - 4, len, "bold", .none, .{ .bool_value = true });
+    try doc.mark(text, len - 4, len, "bold", .none, .{ .bool_value = true });
+    _ = try doc.commitWith(.none);
     out.addPhase("write-mark", mark_started.stop());
 
     // ── the reads ──
@@ -1289,25 +1355,19 @@ fn markAtEnd(ctx: Ctx) !Result {
     return out;
 }
 
-// ── Workload 8: a sync round trip, and the `sent_hashes` insert ──────────────
+// ── Workload 8: sync generation and the `sent_hashes` bulk merge ─────────────
 //
-// The line the audit names is `src/sync/protocol.zig:572`,
-//
-//     for (builder.payloadHashes()) |hash| try state.insertSent(hash);
-//
-// which is `State.insertSent` at `src/sync/state.zig:368-382`: a binary search
-// over an ascending, duplicate-free list and then an `ArrayList.insert`
-// memmove — **once per hash, per generated message**. Nothing on the generate
-// path takes a hash back out, so the list grows by exactly what each message
-// carried and the memmove arm is quadratic in the changes a peer has been sent
-// over a session. Two things elsewhere do empty it, and both are on the
-// receive path: `clearSent` (`src/sync/state.zig:385-387`) and the
-// acknowledgement prune. The next section is about the second one.
+// `generateSyncMessage` calls `State.extendSent(builder.payloadHashes())`:
+// one sort of the message's hashes and one merge with the ascending,
+// duplicate-free set. This replaces the original per-hash `insertSent`
+// binary search and memmove. With acknowledgements withheld, the set grows
+// across rounds, so the subject includes merging into an accumulated session.
+// Receive-side reset and acknowledgement pruning can shrink that set.
 //
 // ── WHY THE PEER DOES NOT ANSWER DURING THE RUN ──
 //
-// A peer that answers every message empties the list every round, and that is
-// the one thing that stops this workload from measuring anything.
+// A peer that answers every message empties the set every round, so it would
+// not exercise merging into an accumulated session.
 // `receiveSyncMessage` **is** the acknowledgement — there is no ack message at
 // this commit — and it keeps only the hashes the peer's advertised heads do
 // not cover (`src/sync/protocol.zig:708-713`, `sync.rs:430-431`). A peer that
@@ -1317,9 +1377,7 @@ fn markAtEnd(ctx: Ctx) !Result {
 //     generate -> the set holds this round's chunk -> receive the answer ->
 //     the set is empty again
 //
-// and the insert loop then only ever runs over a list no longer than one
-// chunk. The memmove arm does not grow, the quadratic does not show, and the
-// run is indistinguishable from one that measured nothing at all.
+// and the merge then only ever sees one chunk, rather than a growing set.
 //
 // So the measured rounds below are the **push** side of a session the peer
 // has not answered yet, which is a real path — a `SyncSession` that only ever
@@ -1338,31 +1396,32 @@ fn markAtEnd(ctx: Ctx) !Result {
 //   * `am.sync.protocol.receiveSyncMessage`  (`src/sync/protocol.zig:658`)
 //
 // No private is reached, including for the check below: **`sent_hashes` is a
-// public field** (`src/sync/state.zig:156`), so the set the insert loop is
-// supposed to maintain can be inspected from outside.
+// public field** (`src/sync/state.zig:156`), so the set the merge maintains
+// can be inspected from outside.
 fn syncRoundtrip(ctx: Ctx) !Result {
     const gpa = ctx.gpa;
     const rounds = ctx.sizes.sync_rounds;
     const chunk = ctx.sizes.sync_chunk;
     // `iters` is the number of generated messages that carried changes, which
-    // is the unit the insert loop runs in. `measures_own_time` because the
+    // is the unit the bulk merge runs in. `measures_own_time` because the
     // subject is one `generateSyncMessage`, not the whole round: the fixture
     // growth and the peer's half of the exchange are phases, not the clock.
     var out: Result = .{ .iters = rounds, .measures_own_time = true };
 
-    var local = try Document.init(gpa, ctx.io, .auto);
+    var local = try am.AutoCommit.init(gpa, ctx.io);
     defer local.deinit();
-    local.setActorId(.{ .bytes = "bench-sync-roundtrip-local" });
-    var peer = try Document.init(gpa, ctx.io, .auto);
+    try local.setActorId(.{ .bytes = "bench-sync-roundtrip-local" });
+    var peer = try am.AutoCommit.init(gpa, ctx.io);
     defer peer.deinit();
-    peer.setActorId(.{ .bytes = "bench-sync-roundtrip-peer" });
+    try peer.setActorId(.{ .bytes = "bench-sync-roundtrip-peer" });
 
     var ls: am.sync.state.State = am.sync.state.State.new(gpa);
     defer ls.deinit();
     var rs: am.sync.state.State = am.sync.state.State.new(gpa);
     defer rs.deinit();
 
-    const list = try am.transaction.putObject(&local, am.root, .{ .key = "l" }, .list);
+    const list = try local.putObject(am.root, .{ .key = "l" }, .list);
+    _ = try local.commitWith(.none);
 
     // ── the handshake, once, outside every clock ──
     //
@@ -1377,8 +1436,8 @@ fn syncRoundtrip(ctx: Ctx) !Result {
     //   2. the local side answers. Before it, `buildPayload` answers an empty
     //      payload because `State.their()` is null
     //      (`src/sync/protocol.zig:962`), so this is the first message that
-    //      can carry anything, and every hash it carries goes through the
-    //      insert loop;
+    //      can carry anything, and its payload hashes go through the bulk
+    //      merge;
     //   3. the peer applies it, so the peer is a document with history rather
     //      than a stub;
     //   4. the peer answers. **This message empties `sent_hashes`**
@@ -1390,21 +1449,21 @@ fn syncRoundtrip(ctx: Ctx) !Result {
     // acknowledgement taking all of it back out is the whole reason the
     // rounds below do not feed the peer's answers in.
     {
-        const advertised = try am.sync.protocol.generateSyncMessage(gpa, &peer, &rs);
+        const advertised = try peer.generateSyncMessage(gpa, &rs);
         const hello = advertised orelse return error.PeerWentQuietOnFirstMessage;
-        try am.sync.protocol.receiveSyncMessage(gpa, &local, &ls, hello);
+        try local.receiveSyncMessage(gpa, &ls, hello);
 
-        const offered = try am.sync.protocol.generateSyncMessage(gpa, &local, &ls);
+        const offered = try local.generateSyncMessage(gpa, &ls);
         const snapshot = offered orelse return error.LocalWentQuietInHandshake;
         // A whole document, so every hash the document holds is a hash the
-        // insert loop just inserted. If this ever stops holding, message 2
+        // bulk merge just recorded. If this ever stops holding, message 2
         // stopped being the message the comment above describes.
-        if (ls.sent_hashes.items.len != local.graph.len()) return error.HandshakeCarriedNoHashes;
-        try am.sync.protocol.receiveSyncMessage(gpa, &peer, &rs, snapshot);
+        if (ls.sent_hashes.items.len != local.doc.graph.len()) return error.HandshakeCarriedNoHashes;
+        try peer.receiveSyncMessage(gpa, &rs, snapshot);
 
-        const answered = try am.sync.protocol.generateSyncMessage(gpa, &peer, &rs);
+        const answered = try peer.generateSyncMessage(gpa, &rs);
         const ack = answered orelse return error.PeerWentQuietInHandshake;
-        try am.sync.protocol.receiveSyncMessage(gpa, &local, &ls, ack);
+        try local.receiveSyncMessage(gpa, &ls, ack);
     }
     if (ls.sent_hashes.items.len != 0) return error.HandshakeDidNotPrune;
 
@@ -1424,11 +1483,12 @@ fn syncRoundtrip(ctx: Ctx) !Result {
         // (`src/sync/protocol.zig:992-996`), which is rounds 0 and 1 at these
         // sizes. Either way the hashes are the fixture's own.
         for (0..chunk) |_| {
-            _ = try am.transaction.insert(&local, list, written, .{ .int = @intCast(written) });
+            _ = try local.insert(list, written, .{ .int = @intCast(written) });
+            _ = try local.commitWith(.none);
             written += 1;
         }
 
-        // ── the subject: `generateSyncMessage`, insert loop included ──
+        // ── the subject: `generateSyncMessage`, bulk merge included ──
         //
         // `in_flight` is latched from this message on and nothing in the
         // measured run clears it, which is safe for one reason and one
@@ -1438,7 +1498,7 @@ fn syncRoundtrip(ctx: Ctx) !Result {
         // did not move the heads would get `NoMessageFromLocal` below rather
         // than a quiet zero-length payload.
         const gen_started = Timer.start(ctx.io);
-        const generated = try am.sync.protocol.generateSyncMessage(gpa, &local, &ls);
+        const generated = try local.generateSyncMessage(gpa, &ls);
         const this_gen = gen_started.stop();
         gen_ns += this_gen;
         const message = generated orelse return error.NoMessageFromLocal;
@@ -1452,16 +1512,14 @@ fn syncRoundtrip(ctx: Ctx) !Result {
         // a payload of more than a third of the graph is cheaper as one
         // snapshot (`src/sync/protocol.zig:992-996`) — records it again. Every
         // round after it carries exactly its own chunk. The same
-        // `sent_hashes.items.len == local.graph.len()` the run ends on
+        // `sent_hashes.items.len == local.doc.graph.len()` the run ends on
         // depends on that one hash being back, so the two checks are two ends
         // of the same fact.
         //
-        // The equality is the point. The only way to arrive at it is one
-        // `insertSent` call per carried hash (`src/sync/protocol.zig:572`)
-        // with no prune, no `clearSent` and no duplicate between them.
-        // Without it this workload could "measure" a run in which the insert
-        // loop never ran, which is the one way it could pass while measuring
-        // nothing.
+        // Exact growth checks that every payload hash was recorded, with no
+        // prune or clear between rounds. Counting the first snapshot's
+        // already-advertised hash again is intentional; subsequent rounds
+        // add only their own fresh chunk.
         const want = if (round == 0) chunk + 1 else chunk;
         const sent_now = ls.sent_hashes.items.len;
         if (sent_now != sent_before + want) return error.NoHashesRecorded;
@@ -1473,7 +1531,7 @@ fn syncRoundtrip(ctx: Ctx) !Result {
         // check. It is a phase, not the clock, and it is deliberately not
         // answered: see the note at the head of this workload.
         const recv_started = Timer.start(ctx.io);
-        try am.sync.protocol.receiveSyncMessage(gpa, &peer, &rs, message);
+        try peer.receiveSyncMessage(gpa, &rs, message);
         peer_ns += recv_started.stop();
     }
 
@@ -1482,12 +1540,10 @@ fn syncRoundtrip(ctx: Ctx) !Result {
 
     // ── correctness ──
     //
-    // **The set, not just the count.** `insertSent` is what makes the list a
-    // `BTreeSet`: ascending and duplicate-free, which is what `State.encode`
-    // asserts and what `sentContains` binary-searches
-    // (`src/sync/protocol.zig:1023-1027`). An insert that got cheaper by
-    // appending and never sorting, or by dropping the duplicate check, passes
-    // a length assertion and fails this one.
+    // **The set, not just the count.** The bulk merge must preserve the
+    // ascending, duplicate-free `BTreeSet` invariant that `State.encode`
+    // asserts and `sentContains` binary-searches. Appending unsorted hashes
+    // or dropping deduplication can pass a length check and fail this one.
     const sent = ls.sent_hashes.items;
     for (sent, 0..) |hash, i| {
         if (i == 0) continue;
@@ -1495,7 +1551,7 @@ fn syncRoundtrip(ctx: Ctx) !Result {
     }
     // Every change the document holds went on the wire exactly once, which is
     // the whole point of a set: the count is the graph's, not a running tally.
-    if (sent.len != local.graph.len()) return error.SentHashCountDiffers;
+    if (sent.len != local.doc.graph.len()) return error.SentHashCountDiffers;
 
     // ── convergence ──
     //
@@ -1521,13 +1577,13 @@ fn syncRoundtrip(ctx: Ctx) !Result {
     // send, the next generate is null
     // (`src/sync/protocol.zig:556-559`).
     {
-        const final_advertised = try am.sync.protocol.generateSyncMessage(gpa, &peer, &rs);
+        const final_advertised = try peer.generateSyncMessage(gpa, &rs);
         const final_hello = final_advertised orelse return error.PeerWentQuietAtTheEnd;
-        try am.sync.protocol.receiveSyncMessage(gpa, &local, &ls, final_hello);
+        try local.receiveSyncMessage(gpa, &ls, final_hello);
     }
     // A `var` optional so the capture is a mutable pointer and `deinit` has a
     // message it can actually free (`test/upstream_doc_test.zig:5444-5445`).
-    var leftover = try am.sync.protocol.generateSyncMessage(gpa, &local, &ls);
+    var leftover = try local.generateSyncMessage(gpa, &ls);
     if (leftover) |*spare| {
         spare.deinit();
         return error.LocalStillHasChangesToSend;
@@ -1537,22 +1593,21 @@ fn syncRoundtrip(ctx: Ctx) !Result {
     return out;
 }
 
-// ── Workload 9: `hashForOpid`'s linear scan ──────────────────────────────────
+// ── Workload 9: `hashForOpid` actor-change binary search ──────────────────────
 //
-// `src/transaction.zig:411-423` walks the change graph's node table from row
-// zero and returns the first node whose actor and counter range cover the
-// operation, where upstream binary-searches the actor's own change list
-// (`ChangeGraph::opidToHash`). The whole question is the `C` in that O(C): a
-// document with few changes answers in constant time whatever the algorithm,
-// so the gate has to hold a document with many.
+// `hashForOpid` delegates to `ChangeGraph.opidToHash`, which binary-searches
+// the actor's own change list by operation-counter interval, like upstream
+// `ChangeGraph::opidToHash`. The fixture holds many one-operation changes;
+// newest and oldest operation queries exercise both ends of that same search.
+// The former whole-node-table linear scan is not the current subject.
 //
 // **Public surface, reached the way `src/transaction.zig:1446-1472` reaches
-// it** — a `.manual` document, `Transaction.open`, and the module-level
-// `hashForOpid` that `src/root.zig:119` re-exports as `am.manual_transaction`:
+// it** — a raw document, `Transaction.open`, and the module-level
+// `hashForOpid` exported in the canonical `am.transaction` namespace:
 //
-//   * `am.manual_transaction.Transaction.open` (`src/transact.zig:480`)
-//   * `am.manual_transaction.commitWith`      (`src/transaction.zig:553`)
-//   * `am.manual_transaction.hashForOpid`     (`src/transaction.zig:411`)
+//   * `am.Transaction.open`
+//   * `Transaction.commitWith`
+//   * `am.transaction.hashForOpid`
 //   * `doc.ops.idToExid`                      (`src/opset/op_set.zig:3240`)
 
 /// The first eight bytes of a change hash, big-endian, so the checksum folds
@@ -1570,20 +1625,20 @@ fn hashForOpidWorkload(ctx: Ctx) !Result {
     // fail rather than report a clean zero.
     if (changes == 0 or calls == 0) return error.NothingToMeasure;
     // `iters` is one `hashForOpid` call. `measures_own_time` because the
-    // subject is the call and not the graph it walks: building the graph is
-    // the fixture, and the O(1) arm is the contrast that makes the O(C) one
-    // readable.
+    // subject is the lookup, not graph construction. Both endpoint arms use
+    // the same actor-change binary search; the legacy phase names are retained
+    // for comparison with earlier benchmark output.
     var out: Result = .{ .iters = calls, .measures_own_time = true };
 
-    var doc = try Document.init(gpa, ctx.io, .manual);
+    var doc = try Document.init(gpa, ctx.io);
     defer doc.deinit();
     doc.setActorId(.{ .bytes = "bench-hash-for-opid" });
 
     // ── fixture: `changes` committed changes, one operation each ──
     //
     // The cheapest shape a change can have, and deliberately so: the cost
-    // under test is one pass over the node table, so every extra operation in
-    // the graph is work the fixture does that the real question does not.
+    // under test is one actor-change interval query, so every extra operation
+    // would be fixture work the question does not require.
     const build_started = Timer.start(ctx.io);
     var first_hash: ?ChangeHash = null;
     var last_hash: ChangeHash = undefined;
@@ -1591,17 +1646,16 @@ fn hashForOpidWorkload(ctx: Ctx) !Result {
     var last_id: OpId = undefined;
     var key_buf: [24]u8 = undefined;
     for (0..changes) |i| {
-        var tx = try am.manual_transaction.Transaction.open(gpa, &doc);
-        defer tx.deinit();
+        var tx = try am.Transaction.open(gpa, &doc);
+        defer tx.deinitClosed(); // The entire document dies on error.
         const key = try std.fmt.bufPrint(&key_buf, "k{d}", .{i});
         // `Transaction.put` answers `?OpId` (`src/transact.zig:935`): null for
         // a repeated put on the same register, and every key here is new, so
         // a null would be the port refusing to write what it was asked to.
         const id = (try tx.put(am.root, .{ .key = key }, .{ .int = @intCast(i) })).?;
-        const hash = (try am.manual_transaction.commitWith(
-            &tx,
-            am.manual_transaction.CommitOptions.none,
-        )) orelse return error.EmptyCommit;
+        var result = try tx.commitWith(.none);
+        defer result.deinit(gpa);
+        const hash = result.hash orelse return error.EmptyCommit;
         if (first_hash == null) {
             first_hash = hash;
             first_id = id;
@@ -1618,13 +1672,13 @@ fn hashForOpidWorkload(ctx: Ctx) !Result {
     // A transaction to ask through. It writes nothing; `hashForOpid` reads
     // `tx.doc.graph` (`src/transaction.zig:413`) and nothing else on the
     // transaction, so an open one is all the call needs.
-    var probe = try am.manual_transaction.Transaction.open(gpa, &doc);
-    defer probe.deinit();
+    var probe = try am.Transaction.open(gpa, &doc);
+    defer probe.deinitClosed(); // Read-only journal; the document dies with it.
 
-    // ── the O(C) arm: the last operation lives in the last node ──
+    // ── newest operation: query the actor's last change interval ──
     const last_started = Timer.start(ctx.io);
     for (0..calls) |_| {
-        const got = am.manual_transaction.hashForOpid(&probe, last_exid) orelse
+        const got = am.transaction.hashForOpid(&probe, last_exid) orelse
             return error.NoHashForTheLastOperation;
         if (!got.eql(last_hash)) return error.WrongHashForTheLastOperation;
         out.mix(hashFold(got));
@@ -1632,29 +1686,28 @@ fn hashForOpidWorkload(ctx: Ctx) !Result {
     const last_ns = last_started.stop();
     out.addPhase("scan-last-op", last_ns);
 
-    // ── the O(1) arm: node zero answers immediately ──
+    // ── oldest operation: query the actor's first change interval ──
     //
-    // Same call, same document, same code — the only difference is which end
-    // of the scan the answer is at. The ratio between the two phases is the
-    // finding, and it costs nothing to report.
+    // Same call, document and search; only the queried interval differs.
+    // Compare these timed phases, not whole-process setup instructions.
     const first_started = Timer.start(ctx.io);
     for (0..calls) |_| {
-        const got = am.manual_transaction.hashForOpid(&probe, first_exid) orelse
+        const got = am.transaction.hashForOpid(&probe, first_exid) orelse
             return error.NoHashForTheFirstOperation;
         if (!got.eql(first_hash.?)) return error.WrongHashForTheFirstOperation;
         out.mix(hashFold(got));
     }
     out.addPhase("scan-first-op", first_started.stop());
 
-    // ── the three nulls, which are what make the scan's contract ──
-    if (am.manual_transaction.hashForOpid(&probe, am.root) != null) {
+    // ── absent-id checks and a repeated valid lookup ──
+    if (am.transaction.hashForOpid(&probe, am.root) != null) {
         return error.RootNamedAChange;
     }
     const absent = am.ExId.fromParts(9_000_000, probe.actor) orelse return error.BadExId;
-    if (am.manual_transaction.hashForOpid(&probe, absent) != null) {
+    if (am.transaction.hashForOpid(&probe, absent) != null) {
         return error.AbsentIdNamedAChange;
     }
-    if (am.manual_transaction.hashForOpid(&probe, last_exid) == null) {
+    if (am.transaction.hashForOpid(&probe, last_exid) == null) {
         return error.LostHashForTheLastOperation;
     }
 
@@ -1662,26 +1715,16 @@ fn hashForOpidWorkload(ctx: Ctx) !Result {
     return out;
 }
 
-// ── Workload 10: the five column cursors per list element ────────────────────
+// ── Workload 10: list traversal with one held element cursor ────────────────
 //
-// The chain, all of it public and none of it reached by importing a private:
-//
-//   `am.read.listRange`          `src/read.zig:2280`
-//     → `ListRange.next`         `src/iter/list_range.zig:984`
-//       → `ListDiffItem.exportItem` `src/iter/list_range.zig:603`
-//         → `elementWidth`       `src/iter/list_range.zig:884`
-//           → `OpSet.elemidAt`   `src/opset/op_set.zig:3500`
-//             → `OpSet.elemCursor` `src/opset/op_set.zig:3524` — five cursors
-//               (`insert`, `id_ctr`, `id_actor`, `key_ctr`, `key_actor`)
-//             → `ElemWalk.at`    `src/opset/op_set.zig:5707`, whose `seek`
-//               (`:5738`) **rebuilds all five** because a fresh `elemCursor` is
-//               never `placed` (`:5670`)
-//
-// So one visible list element builds the five twice, and `key_ctr` and
-// `id_ctr` are delta columns whose `iterRange` folds their wire to reach the
-// row asked for (`src/opset/op_set.zig:3488-3492`). `mark-at-end` walks a text
-// through the same `ListRange`; this one walks a **list**, which is the object
-// `elementWidth` is written for and the shape the audit named.
+// The public chain is `am.read.listRange` → `ListRange.next` →
+// `ListDiffItem.exportItem` → `elementWidth` → the held `ListRange.elems`.
+// Each walk owns one element cursor; it advances its five columns instead of
+// rebuilding fresh cursors for every element. The two delta columns still
+// carry encoded counter data, but the former ten-cursors-per-element account
+// does not describe this implementation.
+// `mark-at-end` walks text through the same `ListRange`; this workload walks
+// the integer list that `elementWidth` is written for.
 //
 // ── And the fixture is not what this gate measures ──────────────────────────
 //
@@ -1702,10 +1745,9 @@ fn hashForOpidWorkload(ctx: Ctx) !Result {
 // step `i` the list holds `i` elements, so `i` is the last index. The obvious
 // cheaper build was the one already in the file.
 //
-// **The lever is one call instead of `n`.** `am.transaction.spliceHeld`
-// (`src/transact.zig:2854`) is the door upstream's `Transactable::splice`
-// goes through (`src/transact.zig:2820-2821`, `inner.rs:673-799`), and it
-// reaches `Transaction.spliceListValues` (`src/transact.zig:1328`): **one**
+// **The lever is one call instead of `n`.** `Transaction.splice` is the door
+// upstream's `Transactable::splice` goes through (`inner.rs:673-799`), and it
+// reaches the list batch kernel: **one**
 // `queryInsertAt` for the whole run and one `Batch.finish`
 // (`src/transact.zig:1343`, `:1373`), against **one** `queryInsertAt` and
 // **one** `insertLocalOp` per element for the loop, which goes through
@@ -1728,11 +1770,11 @@ const list_width_sample = "h\u{e9}llo w\u{f6}rld";
 
 /// **The floor the subject has to clear, as a percentage of everything this
 /// workload measured.** `perf stat -e instructions` counts the whole process,
-/// so a run whose fixture outweighs its subject reports the fixture whatever
-/// the `BENCH` line says, and the only way to stop that is to refuse the run.
-/// Ninety is far under the measured share and far over the ~1.5% the old
-/// fixture left, so an ordinary host cannot trip it by accident and a
-/// regression cannot pass by getting slower somewhere else.
+/// so default runs below this subject-share floor are refused. A region count
+/// does not use this guard to qualify its instruction attribution.
+/// Ninety is well above the old fixture's ~1.5% subject share. This measured
+/// wall-time share is not an instruction attribution or a guarantee against
+/// scheduler noise; inspect the phase split for each accepted run.
 const list_width_subject_floor_pct = 90;
 
 /// How many elements the two fixture builders are compared over. Sixty-four is
@@ -1755,10 +1797,10 @@ fn sharePct(part: u64, whole: u64) f64 {
 
 /// **Proves the batched fixture reads back as the sequential one.**
 ///
-/// Two `.manual` documents of `elements` integers under key `"l"`: one built
+/// Two raw documents of `elements` integers under key `"l"`: one built
 /// by `elements` `Transaction.insert` calls at ascending positions — what this
 /// workload used to do, and what a consumer that appends one element at a time
-/// still does — and one built by a single `am.transaction.spliceHeld`. Both
+/// still does — and one built by a single `Transaction.splice`. Both
 /// are read back through the same `am.read.listRange` the subject uses, and
 /// every element has to agree: its index, a width of exactly 1, no conflict,
 /// not an object, and the integer written at that position. So a batch that
@@ -1778,37 +1820,36 @@ fn listFixtureAgreement(
     enc: TextEncoding,
     elements: usize,
 ) !u64 {
-    var seq = try Document.initWithEncoding(gpa, io, enc, .manual);
+    var seq = try Document.initWithEncoding(gpa, io, enc);
     defer seq.deinit();
     seq.setActorId(.{ .bytes = list_width_fixture_actor });
-    var seq_tx = try am.manual_transaction.Transaction.open(gpa, &seq);
+    var seq_tx = try am.Transaction.open(gpa, &seq);
     var seq_tx_live = true;
-    defer if (seq_tx_live) seq_tx.deinit();
+    defer if (seq_tx_live) seq_tx.deinitClosed();
     const seq_list = try seq_tx.putObject(am.root, .{ .key = "l" }, .list);
     for (0..elements) |i| _ = try seq_tx.insert(seq_list, i, .{ .int = @intCast(i) });
-    if ((try am.manual_transaction.commitWith(
-        &seq_tx,
-        am.manual_transaction.CommitOptions.none,
-    )) == null) return error.EmptyCommit;
-    seq_tx.deinit();
+    var seq_result = try seq_tx.commitWith(.none);
+    const seq_has_hash = seq_result.hash != null;
+    seq_result.deinit(gpa);
+    if (!seq_has_hash) return error.EmptyCommit;
+    seq_tx.deinitClosed();
     seq_tx_live = false;
 
-    var batch = try Document.initWithEncoding(gpa, io, enc, .manual);
+    var batch = try Document.initWithEncoding(gpa, io, enc);
     defer batch.deinit();
     batch.setActorId(.{ .bytes = list_width_fixture_actor });
-    var batch_tx = try am.manual_transaction.Transaction.open(gpa, &batch);
-    defer batch_tx.deinit();
+    var batch_tx = try am.Transaction.open(gpa, &batch);
+    defer batch_tx.deinitClosed();
     const batch_list = try batch_tx.putObject(am.root, .{ .key = "l" }, .list);
     {
         const values = try gpa.alloc(am.hydrate.Value, elements);
         defer gpa.free(values);
         for (values, 0..) |*slot, i| slot.* = .{ .int = @intCast(i) };
-        try am.transaction.spliceHeld(&batch_tx, batch_list, 0, 0, gpa, values);
+        try batch_tx.splice(batch_list, 0, 0, values);
     }
-    if ((try am.manual_transaction.commitWith(
-        &batch_tx,
-        am.manual_transaction.CommitOptions.none,
-    )) == null) return error.EmptyCommit;
+    var batch_result = try batch_tx.commitWith(.none);
+    defer batch_result.deinit(gpa);
+    if (batch_result.hash == null) return error.EmptyCommit;
 
     var seq_walk = try am.read.listRange(&seq, seq_list, am.read.IndexRange.all());
     var batch_walk = try am.read.listRange(&batch, batch_list, am.read.IndexRange.all());
@@ -1866,10 +1907,9 @@ fn listWidth(ctx: Ctx) !Result {
     // Same rule as the workload above: a zero is a broken measurement, not a
     // fast one.
     if (n == 0 or passes == 0) return error.NothingToMeasure;
-    // `measures_own_time` because the subject is the walk and not the
-    // fixture. **That is only honest while the floor below holds**, which is
-    // why the fixture is one batched splice and why the workload refuses to
-    // report a run whose fixture outweighs its subject.
+    // The subject wall timer is independent of the process-share guard.
+    // Default mode still requires that guard; region mode directly counts the
+    // complete read-list loop without claiming whole-process attribution.
     var out: Result = .{ .iters = passes, .measures_own_time = true };
     // The guard's own denominator: every region below, fixture and teardown
     // included.
@@ -1881,14 +1921,14 @@ fn listWidth(ctx: Ctx) !Result {
 
     // ── fixture ──
     const build_started = Timer.start(ctx.io);
-    var doc = try Document.initWithEncoding(gpa, ctx.io, enc, .manual);
+    var doc = try Document.initWithEncoding(gpa, ctx.io, enc);
     var doc_live = true;
     defer if (doc_live) doc.deinit();
     doc.setActorId(.{ .bytes = "bench-list-width" });
 
-    var tx = try am.manual_transaction.Transaction.open(gpa, &doc);
+    var tx = try am.Transaction.open(gpa, &doc);
     var tx_live = true;
-    defer if (tx_live) tx.deinit();
+    defer if (tx_live) tx.deinitClosed();
     const list = try tx.putObject(am.root, .{ .key = "l" }, .list);
     const probe_text = try tx.putObject(am.root, .{ .key = "t" }, .text);
     try tx.spliceText(probe_text, 0, 0, list_width_sample);
@@ -1899,17 +1939,26 @@ fn listWidth(ctx: Ctx) !Result {
         const values = try gpa.alloc(am.hydrate.Value, n);
         defer gpa.free(values);
         for (values, 0..) |*slot, i| slot.* = .{ .int = @intCast(i) };
-        try am.transaction.spliceHeld(&tx, list, 0, 0, gpa, values);
+        try tx.splice(list, 0, 0, values);
     }
-    if ((try am.manual_transaction.commitWith(
-        &tx,
-        am.manual_transaction.CommitOptions.none,
-    )) == null) return error.EmptyCommit;
+    var commit_result = try tx.commitWith(.none);
+    var commit_result_live = true;
+    defer if (commit_result_live) commit_result.deinit(gpa);
+    if (commit_result.hash == null) return error.EmptyCommit;
     const build_ns = build_started.stop();
     out.addPhase("build-list", build_ns);
 
+    // Open a fresh disabled event per sample so enabled/running times cannot
+    // accumulate across repeats. Closing also stops it on any loop error.
+    var counter: ?perf_instructions.Counter = if (ctx.region_instructions)
+        try perf_instructions.Counter.open()
+    else
+        null;
+    defer if (counter) |*event| event.deinit();
+
     // ── the subject ──
     const read_started = Timer.start(ctx.io);
+    if (counter) |*event| try event.enable();
     for (0..passes) |_| {
         var walk = try am.read.listRange(&doc, list, am.read.IndexRange.all());
         var seen: usize = 0;
@@ -1939,6 +1988,7 @@ fn listWidth(ctx: Ctx) !Result {
         if (seen != n) return error.ElementCountDiffers;
         out.mix(seen);
     }
+    if (counter) |*event| out.counter_reading = try event.finish();
     const read_ns = read_started.stop();
     out.addPhase("read-list", read_ns);
 
@@ -1968,7 +2018,9 @@ fn listWidth(ctx: Ctx) !Result {
     // Freeing a document this size is work the instruction count sees, so it
     // belongs in the denominator the guard divides by rather than outside it.
     const free_started = Timer.start(ctx.io);
-    tx.deinit();
+    commit_result.deinit(gpa);
+    commit_result_live = false;
+    tx.deinitClosed();
     tx_live = false;
     doc.deinit();
     doc_live = false;
@@ -1992,11 +2044,21 @@ fn listWidth(ctx: Ctx) !Result {
     );
     if (read_ns * 100 < list_width_subject_floor_pct * total_ns) {
         std.debug.print(
-            "#   list-width: the fixture outweighs the subject, so this run measures the fixture" ++
-                " and not `elementWidth`; refusing to report it\n",
+            "#   list-width: subject share is below the {d}% floor; " ++
+                "process-wide instruction attribution is not qualified\n",
+            .{list_width_subject_floor_pct},
+        );
+        if (!ctx.region_instructions) {
+            std.debug.print("#   refusing to report a BENCH result\n", .{});
+            return error.SubjectIsNotTheCost;
+        }
+    }
+    if (ctx.region_instructions) {
+        std.debug.print(
+            "#   region count covers read-list only; no BENCH or accepted whole-process attribution\n" ++
+                "#   wall time includes counter control/read overhead; instruction boundary overhead is not subtracted\n",
             .{},
         );
-        return error.SubjectIsNotTheCost;
     }
 
     out.ns = read_ns;
@@ -2028,9 +2090,9 @@ fn listWidth(ctx: Ctx) !Result {
 // **The public chain**, all of it reachable from `@import("zautomerge")` and
 // none of it a private import:
 //
-//   * `am.manual_transaction.Transaction.open`     `src/transact.zig:480`
-//   * `am.manual_transaction.Transaction.putObject` `src/transact.zig:954`
-//   * `am.manual_transaction.Transaction.insert`    `src/transact.zig:975`
+//   * `am.Transaction.open`                        `src/transact.zig`
+//   * `am.Transaction.putObject`                   `src/transact.zig`
+//   * `am.Transaction.insert`                      `src/transact.zig`
 //     → `Transaction.doInsert`                     `src/transact.zig:866`
 //       → `OpSet.queryInsertAt`                    `src/opset/op_set.zig:4213`
 //         → `OpSet.queryInsertAtSlow`              `src/opset/op_set.zig:4297`,
@@ -2039,7 +2101,7 @@ fn listWidth(ctx: Ctx) !Result {
 //       → `Transaction.insertLocalOp`              `src/transact.zig:632`
 //         → `OpSet.splice` → `Column.splice` → `Column.rebuildAggs`
 //                                                `src/hexane/column.zig:6776`
-//   * `am.manual_transaction.commitWith`           `src/transaction.zig:553`
+//   * `Transaction.commitWith`                     `src/transact.zig`
 //
 // `hash-for-opid` (`:1530-1533`) opens and commits the same way, so the three
 // manual-transaction doors a consumer uses are all in this file.
@@ -2114,7 +2176,7 @@ fn insertLoopShape(
 ) !InsertLoopTiming {
     var t: InsertLoopTiming = .{ .build_ns = 0, .verify_ns = 0, .free_ns = 0 };
 
-    var doc = try Document.init(gpa, io, .manual);
+    var doc = try Document.init(gpa, io);
     var doc_live = true;
     defer if (doc_live) doc.deinit();
     doc.setActorId(.{ .bytes = insert_loop_actor });
@@ -2127,9 +2189,9 @@ fn insertLoopShape(
     // change. Document creation is O(1) and the verification below is a phase,
     // so neither is inside this region.
     const started = Timer.start(io);
-    var tx = try am.manual_transaction.Transaction.open(gpa, &doc);
+    var tx = try am.Transaction.open(gpa, &doc);
     var tx_live = true;
-    defer if (tx_live) tx.deinit();
+    defer if (tx_live) tx.deinitClosed();
     const list = try tx.putObject(am.root, .{ .key = insert_loop_key }, .list);
 
     // **Every insert is an operation of its own, in order.** `insert` answers
@@ -2154,10 +2216,10 @@ fn insertLoopShape(
     // **One commit.** A null hash is `Transaction.commit`'s answer for a
     // transaction with nothing pending (`src/transact.zig:1418-1421`), so a
     // null here would be the port refusing to write what it was asked to.
-    const hash = (try am.manual_transaction.commitWith(
-        &tx,
-        am.manual_transaction.CommitOptions.none,
-    )) orelse return error.EmptyCommit;
+    var commit_result = try tx.commitWith(.none);
+    var commit_result_live = true;
+    defer if (commit_result_live) commit_result.deinit(gpa);
+    const hash = commit_result.hash orelse return error.EmptyCommit;
     t.build_ns = started.stop();
 
     // ── the transaction's final state ──
@@ -2174,7 +2236,7 @@ fn insertLoopShape(
     // Comparing the error union against the error literal is the door refusing
     // in one line: a closed transaction answers `error.InvalidOp` and nothing
     // else (`src/transaction.zig:379-380`).
-    if (am.manual_transaction.maxOp(&tx) != error.InvalidOp) {
+    if (am.transaction.maxOp(&tx) != error.InvalidOp) {
         return error.ClosedTransactionStillAnswersMaxOp;
     }
 
@@ -2201,7 +2263,7 @@ fn insertLoopShape(
     const bytes = try doc.save(gpa);
     var bytes_live = true;
     defer if (bytes_live) gpa.free(bytes);
-    var loaded = try Document.load(gpa, io, bytes, am.read.textEncoding(&doc), .manual);
+    var loaded = try Document.load(gpa, io, bytes, am.read.textEncoding(&doc));
     var loaded_live = true;
     defer if (loaded_live) loaded.deinit();
     if (loaded.graph.len() != 1) return error.ReloadHasADifferentChangeCount;
@@ -2262,7 +2324,9 @@ fn insertLoopShape(
     loaded_live = false;
     gpa.free(bytes);
     bytes_live = false;
-    tx.deinit();
+    commit_result.deinit(gpa);
+    commit_result_live = false;
+    tx.deinitClosed();
     tx_live = false;
     doc.deinit();
     doc_live = false;
@@ -2290,10 +2354,9 @@ fn insertLoop(ctx: Ctx) !Result {
     // says whether that cost grows with `n`.
     var out: Result = .{ .iters = large, .measures_own_time = true };
 
-    // **The small arm first, on purpose.** Whichever arm runs second inherits a
-    // warm allocator and a warm code path, and the one that runs second here is
-    // the large one, so the reported growth ratio is biased *downward* — the
-    // direction that cannot turn a regression into a pass.
+    // The small arm runs first; allocator and code-path warming can bias the
+    // large arm's per-insert cost downward. The guard checks this run's timing,
+    // not a proof that every regression or scheduling effect is excluded.
     const small_arm = try insertLoopShape(gpa, ctx.io, small, &out);
     out.addPhase("insert-small", small_arm.build_ns);
     const large_arm = try insertLoopShape(gpa, ctx.io, large, &out);
@@ -2378,22 +2441,22 @@ const workloads = [_]Workload{
     },
     .{
         .name = "sync-roundtrip",
-        .case = "src/sync/protocol.zig:572 `for (builder.payloadHashes()) |hash| try state.insertSent(hash);` over src/sync/state.zig:368-382 — no test case; added as a gate",
+        .case = "generateSyncMessage → State.extendSent: bulk sort and sorted merge into accumulated sent_hashes — no test case; added as a gate",
         .run = syncRoundtrip,
     },
     .{
         .name = "hash-for-opid",
-        .case = "src/transaction.zig:411-423 `hashForOpid` — no test case; added as a gate",
+        .case = "hashForOpid → ChangeGraph.opidToHash: actor-change interval binary search — no test case; added as a gate",
         .run = hashForOpidWorkload,
     },
     .{
         .name = "list-width",
-        .case = "src/iter/list_range.zig:884-901 `elementWidth` over src/opset/op_set.zig:3500-3503 `elemidAt` — no test case; added as a gate",
+        .case = "listRange → elementWidth: one held element cursor per walk over a batched list fixture — no test case; added as a gate",
         .run = listWidth,
     },
     .{
         .name = "insert-loop",
-        .case = "src/opset/op_set.zig:4264 `check_slow_paths` around `OpSet.queryInsertAtSlow` (:4297), and src/hexane/column.zig:6776 `Column.rebuildAggs`, both reached by src/transact.zig:975 `Transaction.insert` — no test case; added as a gate",
+        .case = "Transaction.insert: ascending single-element appends in one transaction and commit per arm; 4x arm sizes with per-insert growth guard — no test case; added as a gate",
         .run = insertLoop,
     },
 };

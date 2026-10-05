@@ -357,8 +357,12 @@ pub const OpIdIter = struct {
     /// *first* row of the range — and the caller reads from there with
     /// [`shiftNext`] or [`seekTo`]. Both id cursors move together.
     pub fn shift(self: *OpIdIter, range: RowRange) ParseError!void {
-        try self.actor.shift(range);
-        try self.ctr.shift(range);
+        var actor = self.actor;
+        var ctr = self.ctr;
+        try actor.shift(range);
+        try ctr.shift(range);
+        self.actor = actor;
+        self.ctr = ctr;
     }
 
     /// Repositions onto `range` and reads the row at its start
@@ -470,11 +474,12 @@ pub const InsertIter = struct {
     /// Moves the walk onto `range`: the window follows the range **and** the
     /// walk lands on its start (`Shiftable::shift`, `shift.rs:50-55`).
     ///
-    /// Infallible on this type — `setMax` and `advanceTo` over a run-encoded
-    /// boolean cannot fail — and it reads nothing, so the caller follows it
-    /// with [`shiftNext`] or [`seekTo`].
-    pub fn shift(self: *InsertIter, range: RowRange) void {
-        self.iter.shift(range);
+    /// Returns column parse errors without changing the cursor or its window.
+    /// The caller follows it with [`shiftNext`] or [`seekTo`].
+    pub fn shift(self: *InsertIter, range: RowRange) ParseError!void {
+        var iter = self.iter;
+        try iter.shift(range);
+        self.iter = iter;
     }
 
     /// Repositions onto `range` and reads the row at its start
@@ -593,14 +598,19 @@ pub const KeyIter = struct {
     /// Moves the walk onto `range`: the window follows the range **and** the
     /// walk lands on its start (`Shiftable::shift`, `shift.rs:50-55`).
     ///
-    /// Reads nothing. All three key cursors move together — the window is one
-    /// window over three columns — and the caller follows with [`shiftNext`]
-    /// or [`seekTo`]. Infallible here for the same reason
-    /// [`InsertIter.shift`] is.
-    pub fn shift(self: *KeyIter, range: RowRange) void {
-        self.key_str.shift(range);
-        self.key_actor.shift(range);
-        self.key_ctr.shift(range);
+    /// All three key cursors move together — the window is one window over
+    /// three columns. A parse error leaves all cursors and windows unchanged.
+    /// The caller follows with [`shiftNext`] or [`seekTo`].
+    pub fn shift(self: *KeyIter, range: RowRange) ParseError!void {
+        var key_str = self.key_str;
+        var key_actor = self.key_actor;
+        var key_ctr = self.key_ctr;
+        try key_str.shift(range);
+        try key_actor.shift(range);
+        try key_ctr.shift(range);
+        self.key_str = key_str;
+        self.key_actor = key_actor;
+        self.key_ctr = key_ctr;
     }
 
     /// Repositions onto `range`, reads the row at its start, and assembles it
@@ -731,12 +741,15 @@ pub const ObjIdIter = struct {
     /// Moves the walk onto `range`: the window follows the range **and** the
     /// walk lands on its start (`Shiftable::shift`, `shift.rs:50-55`).
     ///
-    /// Reads nothing; both object cursors move together, and the caller
-    /// follows with [`shiftNext`] or [`seekTo`]. Infallible for the reason
-    /// [`InsertIter.shift`] is.
-    pub fn shift(self: *ObjIdIter, range: RowRange) void {
-        self.obj_actor.shift(range);
-        self.obj_ctr.shift(range);
+    /// Both object cursors move together. A parse error leaves both cursors
+    /// and windows unchanged. The caller follows with [`shiftNext`] or [`seekTo`].
+    pub fn shift(self: *ObjIdIter, range: RowRange) ParseError!void {
+        var obj_actor = self.obj_actor;
+        var obj_ctr = self.obj_ctr;
+        try obj_actor.shift(range);
+        try obj_ctr.shift(range);
+        self.obj_actor = obj_actor;
+        self.obj_ctr = obj_ctr;
     }
 
     /// Repositions onto `range`, reads the row at its start, and assembles it
@@ -802,12 +815,22 @@ pub const ObjIdIter = struct {
     /// Repositioning only moves forward, as upstream's `advance_to` does, so
     /// a seek to an object before the one the cursor stands on leaves it
     /// where it is. Every seek in the op set is forward.
+    ///
+    /// Only the root or an op-set-resolved `.id` may reach these resident
+    /// columns. Named IDs require the op set's authoritative actor table;
+    /// without it, even a u32 counter and cached actor hint are insufficient.
+    /// They return `error.InvalidValue` before either cursor or window changes.
     pub fn seekToValue(self: *ObjIdIter, obj: ObjId) ParseError!RowRange {
+        const id: ?OpId = switch (obj) {
+            .root => null,
+            .id => |value| value,
+            .named => return error.InvalidValue,
+        };
         const all = RowRange{ .start = 0, .end = std.math.maxInt(usize) };
         var ctr_probe = try rangedCursor(self.obj_ctr.col, all);
-        const cr = try ctr_probe.sortedScanToValue(obj.counter());
+        const cr = try ctr_probe.sortedScanToValue(if (id) |value| value.counter else null);
         var actor_probe = try rangedCursor(self.obj_actor.col, cr);
-        const range = try actor_probe.sortedScanToValue(obj.actor());
+        const range = try actor_probe.sortedScanToValue(if (id) |value| value.actor else null);
         // op_iter.rs:622 — the counter cursor is moved onto the actor
         // column's answer; the actor cursor is already there, and upstream
         // reaches both through the same `advance_to`.
@@ -905,12 +928,15 @@ pub const MarkInfoIter = struct {
     /// walk lands on its start (`Shiftable::shift`, `shift.rs:50-55`; the
     /// kernel's own `shift`, `column.rs:542-545`).
     ///
-    /// Reads nothing; both mark cursors move together. Fallible here, unlike
-    /// [`InsertIter.shift`], because the `mark_name` column's shift is a
-    /// nullable one.
+    /// Both mark cursors move together. A parse error leaves both cursors
+    /// and windows unchanged.
     pub fn shift(self: *MarkInfoIter, range: RowRange) ParseError!void {
-        try self.name.shift(range);
-        try self.expand.shift(range);
+        var name = self.name;
+        var expand = self.expand;
+        try name.shift(range);
+        try expand.shift(range);
+        self.name = name;
+        self.expand = expand;
     }
 
     /// Repositions onto `range` and reads the row at its start
@@ -1026,11 +1052,13 @@ pub const ActionIter = struct {
     /// Moves the walk onto `range`: the window follows the range **and** the
     /// walk lands on its start (`Shiftable::shift`, `shift.rs:50-55`).
     ///
-    /// Reads nothing — it does not decode — and so it cannot raise
-    /// `error.InvalidAction`. The caller follows it with [`shiftNext`] or
-    /// [`seekTo`].
-    pub fn shift(self: *ActionIter, range: RowRange) void {
-        self.iter.shift(range);
+    /// Does not decode the action, so it cannot raise `error.InvalidAction`.
+    /// Column parse errors leave the cursor and window unchanged.
+    /// The caller follows it with [`shiftNext`] or [`seekTo`].
+    pub fn shift(self: *ActionIter, range: RowRange) ParseError!void {
+        var iter = self.iter;
+        try iter.shift(range);
+        self.iter = iter;
     }
 
     /// Repositions onto `range`, reads the row at its start and decodes its
@@ -1078,21 +1106,16 @@ pub const ActionIter = struct {
 /// length is the row's width in the value arena (`op_set2/meta.rs:40-42`),
 /// and the running sum of the lengths is a row's offset in it.
 ///
-/// **Every method that reads a row places the byte cursor on that row**, so a
-/// read is always in step with the row cursor. Two methods are the exception
-/// and are documented as such: [`shift`](ValueIter.shift) moves only the row
-/// cursor, and [`setMax`](ValueIter.setMax) moves only the window — neither
-/// reads, so neither places it. The byte cursor never moves on its own
-/// otherwise; there is no method that advances it without a row read behind
-/// it.
+/// Sequential reads consume the raw cursor in place. Jumps and shifts align it
+/// from the metadata cursor's codec-defined prefix before the next read.
+/// `setMax` changes only the row window and does not move either cursor.
 ///
 /// The values handed out borrow the raw column, so the `RawColumn` must
 /// outlive every [`ScalarValue`] this produces.
 ///
 /// **Row space and byte space are different spaces.** [`pos`] and
-/// [`maxPos`](ValueIter.maxPos) are rows; [`landedAt`](ValueIter.landedAt) is
-/// a byte offset; and the two are related only by the prefix sum the metadata
-/// column keeps. Nothing here converts one into the other by arithmetic.
+/// [`maxPos`](ValueIter.maxPos) are rows; metadata prefixes are byte offsets.
+/// A rebased cursor adds its checked `base` before using a prefix as an offset.
 pub const ValueIter = struct {
     /// `value_meta`, one length-and-type word per row
     /// (`op_set2/columns.rs:30`).
@@ -1114,34 +1137,6 @@ pub const ValueIter = struct {
         return .{ .meta = meta, .raw = raw };
     }
 
-    /// The byte offset of the row the metadata cursor has just landed on,
-    /// read from the *column* rather than from the cursor's running sum.
-    ///
-    /// Asking the column is belt-and-braces against a class of defect this
-    /// column layer once had: `PrefixIter.nth` adding only the landed row's
-    /// own width to its running sum and not the widths of the rows it
-    /// skipped inside its own slab, so `pv.prefix()` and `pv.total()` were
-    /// right only for the first row a cursor read. `PrefixIter.nth` carries
-    /// the sum over every run the jump crosses, through `sameSlabNth`
-    /// ([`column.zig:2138-2158`](../../src/hexane/column.zig),
-    /// [`column.zig:2160-2176`](../../src/hexane/column.zig)) — the shape
-    /// upstream's `nth` and `same_slab_nth` have
-    /// ([`hexane/src/prefix.rs:810-836`](../../github-automerge-automerge/rust/hexane/src/prefix.rs),
-    /// `:847-859`) — and it is pinned by `test "a prefix cursor over many
-    /// slabs keeps its sums"`
-    /// ([`column.zig:5484`](../../src/hexane/column.zig)).
-    ///
-    /// The guard stays because the property is worth stating where the
-    /// offset is used: the number this returns is the sum the metadata
-    /// cursor reports, and `getPrefix` is the index lookup that sum itself
-    /// comes from, so asking the column is the same cost and cannot drift
-    /// from it.
-    fn landedAt(self: *const ValueIter) ParseError!usize {
-        const at = self.meta.pos();
-        if (at == 0) return 0;
-        return prefixAt(self.meta.col, at - 1);
-    }
-
     /// The **row** this cursor stands on — that is, how many rows have been
     /// consumed (`Shiftable::pos`, `shift.rs:56-58`). It is the metadata
     /// cursor's position, and it is a row, not a byte offset.
@@ -1161,10 +1156,8 @@ pub const ValueIter = struct {
     /// Closes the metadata window at `at` (`Shiftable::set_max`,
     /// `shift.rs:62-66`), in rows.
     ///
-    /// **Only the row window moves.** The byte cursor is left exactly where
-    /// the last read put it, which is sound because every read re-seeks it;
-    /// see the type doc. The cursor does not rewind, and `at` past the end of
-    /// the column is clamped to its length.
+    /// Only the row window moves; the raw cursor retains the next row's offset.
+    /// The cursor does not rewind, and `at` past the column is clamped.
     pub fn setMax(self: *ValueIter, at: usize) void {
         self.meta.setMax(at);
     }
@@ -1175,14 +1168,13 @@ pub const ValueIter = struct {
     /// Reads nothing and returns no value: the byte placement is bookkeeping
     /// so that a later read starts from the right place. A target behind the
     /// cursor is a no-op, as everywhere else in the kernel, and `target` past
-    /// the window is `error.UnexpectedEnd`. The offset comes from
-    /// `prefixAt` — the column's own sum — not from the cursor's, which is
-    /// what [`landedAt`](ValueIter.landedAt) is about.
+    /// the window is `error.UnexpectedEnd`. The offset is the checked absolute
+    /// inclusive prefix of the last row skipped.
     pub fn advanceTo(self: *ValueIter, target: usize) ParseError!void {
         const at = self.meta.pos();
         if (target <= at) return;
-        _ = (try self.meta.nth(target - at - 1)) orelse return error.UnexpectedEnd;
-        try self.raw.seekTo(try prefixAt(self.meta.col, target));
+        const pv = (try self.meta.nth(target - at - 1)) orelse return error.UnexpectedEnd;
+        try self.raw.seekTo(try absolutePrefix(pv.total(), self.meta.base));
     }
 
     /// Consumes `amount` more rows, saturating rather than wrapping
@@ -1195,16 +1187,15 @@ pub const ValueIter = struct {
     /// Moves the walk onto `range`: the window follows the range **and** the
     /// walk lands on its start (`Shiftable::shift`, `shift.rs:50-55`).
     ///
-    /// **Only `meta` moves; `raw` does not.** This is the one method on this
-    /// type that would otherwise contradict the type doc's promise, and the
-    /// promise is narrower than it looks: what a *read* guarantees is that
-    /// the byte cursor is on the row being read, and this is not a read. A
-    /// caller that calls `shift` and then reads through [`seekTo`] gets a
-    /// correctly placed byte cursor, because [`seekTo`] seeks it; a caller
-    /// that calls `shift` and then calls `raw` itself does not, which is why
-    /// `raw` is not a published accessor.
-    pub fn shift(self: *ValueIter, range: RowRange) void {
-        self.meta.shift(range);
+    /// Both cursors move together. Staging leaves them unchanged on a typed
+    /// refusal, and a following sequential read starts at the new row's bytes.
+    pub fn shift(self: *ValueIter, range: RowRange) ParseError!void {
+        var meta = self.meta;
+        var raw = self.raw;
+        try meta.shift(range);
+        try raw.seekTo(try absolutePrefix(meta.sum, meta.base));
+        self.meta = meta;
+        self.raw = raw;
     }
 
     /// Repositions onto `range` and reads the row at its start
@@ -1217,7 +1208,7 @@ pub const ValueIter = struct {
     pub fn shiftNext(self: *ValueIter, range: RowRange) ReadOpError!?ScalarValue {
         const pv = (try self.meta.shiftNext(range)) orelse return null;
         const meta = ValueMeta.fromRaw(pv.value);
-        try self.raw.seekTo(try self.landedAt());
+        try self.raw.seekTo(try absolutePrefix(pv.prefix(), self.meta.base));
         return try optypes.fromRaw(meta, try self.raw.take(try meta.length()));
     }
 
@@ -1264,7 +1255,7 @@ pub const ValueIter = struct {
         if (n == 0) return self.tryNext();
         const pv = (try self.meta.nth(n)) orelse return error.MissingValue;
         const meta = ValueMeta.fromRaw(pv.value);
-        try self.raw.seekTo(try self.landedAt());
+        try self.raw.seekTo(try absolutePrefix(pv.prefix(), self.meta.base));
         return try optypes.fromRaw(meta, try self.raw.take(try meta.length()));
     }
 };
@@ -1341,21 +1332,6 @@ pub const SuccIterIter = struct {
         };
     }
 
-    /// The flattened position the row the count cursor has just landed on
-    /// starts at, read from the *column* rather than from the cursor's
-    /// running sum.
-    ///
-    /// The same guard, for the same class of defect and with the same fix
-    /// behind it, as [`ValueIter.landedAt`]: a prefix cursor's running sum
-    /// is not trusted as an absolute index. What it buys here is that the
-    /// three successor columns — which *are* indexed by that number — are
-    /// moved onto a position `succ_count` agrees with.
-    fn landedAt(self: *const SuccIterIter) ParseError!usize {
-        const at = self.count.pos();
-        if (at == 0) return 0;
-        return prefixAt(self.count.col, at - 1);
-    }
-
     /// Moves the three flattened cursors onto `want`. It never moves back:
     /// a `want` behind the cursor means the count column and the successor
     /// columns disagree about how many successors came before, which
@@ -1382,7 +1358,7 @@ pub const SuccIterIter = struct {
             const inc = (try self.incs.next()) orelse return error.InvalidValue;
             self.scratch[i] = .{ .id = OpId.init(c, a), .inc = inc };
         }
-        self.flat = start + want;
+        self.flat = std.math.add(usize, start, want) catch return error.Overflow;
         return SuccCursors.fromSpan(self.scratch[0..want], start);
     }
 
@@ -1405,9 +1381,8 @@ pub const SuccIterIter = struct {
     /// Closes the count column's window at `at` (`Shiftable::set_max`,
     /// `shift.rs:62-66`), in rows.
     ///
-    /// Only the count cursor moves. The three flattened cursors and [`flat`]
-    /// are left where they are, which is sound because every row read moves
-    /// them from the count column's own prefix sum; see the type doc.
+    /// Only the row window changes; the flattened cursors keep the next row's
+    /// successor position.
     pub fn setMax(self: *SuccIterIter, at: usize) void {
         self.count.setMax(at);
     }
@@ -1424,8 +1399,8 @@ pub const SuccIterIter = struct {
     pub fn advanceTo(self: *SuccIterIter, target: usize) ParseError!void {
         const at = self.count.pos();
         if (target <= at) return;
-        _ = (try self.count.nth(target - at - 1)) orelse return error.UnexpectedEnd;
-        try self.advanceFlat(try prefixAt(self.count.col, target));
+        const pv = (try self.count.nth(target - at - 1)) orelse return error.UnexpectedEnd;
+        try self.advanceFlat(try absolutePrefix(pv.total(), self.count.base));
     }
 
     /// Consumes `amount` more rows, saturating rather than wrapping
@@ -1438,18 +1413,13 @@ pub const SuccIterIter = struct {
     /// Moves the walk onto `range`: the window follows the range **and** the
     /// walk lands on its start (`Shiftable::shift`, `shift.rs:50-55`).
     ///
-    /// **Only the count cursor moves — not the three flattened cursors, and
-    /// not [`flat`].** This is the one method on this type that would
-    /// otherwise look like it breaks the type doc's invariant, and it does
-    /// not: the invariant is re-established by the next read, and every read
-    /// — [`shiftNext`], [`tryNext`](SuccIterIter.tryNext),
-    /// [`tryNth`](SuccIterIter.tryNth) — places all three from
-    /// `succ_count`'s prefix sum before it reads. A caller that calls `shift`
-    /// and then reads through one of them is correct; a caller that calls
-    /// `shift` and then advances the flattened columns itself is not, which
-    /// is why they are not published.
-    pub fn shift(self: *SuccIterIter, range: RowRange) void {
-        self.count.shift(range);
+    /// Count and flattened cursors move together. Staging leaves the walk
+    /// unchanged on refusal and keeps a following sequential read aligned.
+    pub fn shift(self: *SuccIterIter, range: RowRange) ParseError!void {
+        var staged = self.*;
+        try staged.count.shift(range);
+        try staged.advanceFlat(try absolutePrefix(staged.count.sum, staged.count.base));
+        self.* = staged;
     }
 
     /// Repositions onto `range` and reads the successors of the row at its
@@ -1462,7 +1432,7 @@ pub const SuccIterIter = struct {
     /// rather than a truncated read for the reason the type doc gives.
     pub fn shiftNext(self: *SuccIterIter, range: RowRange) ReadOpError!?SuccCursors {
         const pv = (try self.count.shiftNext(range)) orelse return null;
-        const start = try self.landedAt();
+        const start = try absolutePrefix(pv.prefix(), self.count.base);
         try self.actor.advanceTo(start);
         try self.ctr.advanceTo(start);
         try self.incs.advanceTo(start);
@@ -1510,7 +1480,7 @@ pub const SuccIterIter = struct {
         // :1059-1066 — the flattened cursors are moved past the successors
         // of every row before this one, which the count's own running sum
         // names.
-        try self.advanceFlat(try self.landedAt());
+        try self.advanceFlat(try absolutePrefix(pv.prefix(), self.count.base));
         return try self.window(pv.value);
     }
 };
@@ -1524,11 +1494,9 @@ pub const SuccIterIter = struct {
 ///
 /// It composes rather than re-implements: [`ActionIter`] and [`ValueIter`]
 /// are stored whole, [`pos`] is the action cursor's, and every method here
-/// moves both and reads through them. That is what makes its `shift` the one
-/// that reaches into a type with two spaces — `ValueIter.shift` leaves the
-/// byte cursor where it was — and what makes its reads safe anyway: every
-/// read goes through [`ValueIter.tryNext`] or [`ValueIter.tryNth`], which
-/// place the byte cursor on the row they read.
+/// moves both and reads through them. A shift stages action, metadata and raw
+/// placement together; sequential reads then consume aligned streams, while
+/// nonzero jumps reposition from the codec-defined absolute byte prefix.
 pub const ActionValueIter = struct {
     /// The action column.
     action: ActionIter,
@@ -1604,12 +1572,15 @@ pub const ActionValueIter = struct {
     /// Moves the walk onto `range`: the window follows the range **and** the
     /// walk lands on its start (`Shiftable::shift`, `shift.rs:50-55`).
     ///
-    /// Reads nothing. The action window moves and the value *row* window
-    /// moves with it; the value *byte* cursor does not, on the terms
-    /// [`ValueIter.shift`] states, and the next read here places it.
-    pub fn shift(self: *ActionValueIter, range: RowRange) void {
-        self.action.shift(range);
-        self.value.shift(range);
+    /// The action and value windows move together, including raw placement.
+    /// A typed refusal leaves all three cursor states unchanged.
+    pub fn shift(self: *ActionValueIter, range: RowRange) ParseError!void {
+        var action = self.action;
+        var value = self.value;
+        try action.shift(range);
+        try value.shift(range);
+        self.action = action;
+        self.value = value;
     }
 
     /// Repositions onto `range` and reads the row at its start
@@ -1705,6 +1676,7 @@ pub const CtrWalker = struct {
         const outer = col.findByRange(lo, hi - 1) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidIndex => return error.UnexpectedEnd,
+            error.Overflow => return error.Overflow,
         };
         return .{
             .col = col,
@@ -1747,7 +1719,7 @@ pub const CtrWalker = struct {
                 if (wide >= self.lo and wide < self.hi) return row;
                 continue;
             }
-            const hit = self.outer.next() orelse return null;
+            const hit = (try self.outer.next()) orelse return null;
             const slab = self.col.slabAt(hit.slab) orelse continue;
             const from = hit.items_before;
             const to = from + slab.len;
@@ -1829,16 +1801,8 @@ pub fn SuccWalker(comptime O: type) type {
         /// believed, so a column that disagrees with itself is
         /// `error.InvalidValue` rather than a wrong row.
         ///
-        /// Asking the column rather than the cursor is belt-and-braces
-        /// against the class of defect [`ValueIter.landedAt`] names: a
-        /// prefix cursor whose running sum was only right for the first row
-        /// it read. That class is fixed and pinned upstream of here
-        /// ([`column.zig:2138-2158`](../../src/hexane/column.zig), and
-        /// `test "a prefix cursor over many slabs keeps its sums"` at
-        /// [`column.zig:5484`](../../src/hexane/column.zig)); the guard
-        /// stays because the property worth stating at this one call site is
-        /// that every successor position the walk consumes has been passed
-        /// by the count column's own running sum.
+        /// The indexed answer is checked against both bounding prefixes so every
+        /// flattened successor consumed is owned by the count row returned.
         ///
         /// Three index lookups per yielded row; upstream notes its own
         /// `advance_prefix` is an index lookup too
@@ -2163,23 +2127,22 @@ pub fn OpIter(comptime O: type) type {
             return self.advanceTo(self.row +| amount);
         }
 
-        /// Moves the walk's window to `range`: the rows up to `range.end`
-        /// and then stop.
+        /// Repositions all eight sub-iterators onto `rows`: the window ends
+        /// at `rows.end`, and the next read is at `rows.start` unless the
+        /// forward-only walk has already passed it. This adapter follows the
+        /// column shift contract (`hexane/src/column.rs:537-545`).
         ///
-        /// The window only, not the position — which is the kernel's own
-        /// reading ([`Column.Iterator.shift`](../../src/hexane/column.zig),
-        /// which is likewise `setMax` alone), and the reason
-        /// [`shiftNext`] exists: a range whose start is behind the walk
-        /// cannot be reached by a `void` method, so the move and the read
-        /// have to be one. Upstream's `Iter::shift` does move the position
-        /// ([`column.rs:959-963`](../../github-automerge-automerge/rust/hexane/src/column.rs)),
-        /// which its infallible `advance_to` allows; the port's is fallible
-        /// and the kernel's `shift` is not.
+        /// A parse error leaves the walk, every cursor, and their windows
+        /// unchanged. The checkpoint borrows the same columns and successor
+        /// scratch; repositioning does not write that scratch.
         ///
         /// [`window`] is the range the walk was *constructed* over and does
         /// not change; [`range`] is the effective one and does.
-        pub fn shift(self: *Self, rows: RowRange) void {
-            self.setMax(rows.end);
+        pub fn shift(self: *Self, rows: RowRange) ParseError!void {
+            var shifted = self.*;
+            shifted.setMax(rows.end);
+            try shifted.advanceTo(rows.start);
+            self.* = shifted;
         }
 
         /// Repositions the walk onto `range` and reads the row at its start
@@ -2256,6 +2219,13 @@ fn prefixAt(col: anytype, row: usize) ParseError!usize {
     const sum = try col.getPrefix(row);
     if (sum < 0) return error.Overflow;
     return std.math.cast(usize, sum) orelse error.Overflow;
+}
+
+/// Converts a codec prefix to absolute coordinates, including rebased windows.
+fn absolutePrefix(sum: i64, base: i64) ParseError!usize {
+    const absolute = std.math.add(i64, sum, base) catch return error.Overflow;
+    if (absolute < 0) return error.Overflow;
+    return std.math.cast(usize, absolute) orelse error.Overflow;
 }
 
 /// A cursor over the rows of `range` in `col`, clamped to the column
@@ -3256,6 +3226,39 @@ test "an anchor read back from the two key columns is the head it was written as
     }
 }
 
+test "ObjIdIter.seekToValue refuses unresolved named IDs without changing either cursor" {
+    // Actor bytes must be resolved by the op set before a resident-column seek.
+    const gpa = testing.allocator;
+    var actor_col = try opcols.ActorOptColumn.init(gpa);
+    defer actor_col.deinit();
+    try actor_col.extend(gpa, &.{ null, 1 });
+    var ctr_col = try opcols.UintOptColumn.init(gpa);
+    defer ctr_col.deinit();
+    try ctr_col.extend(gpa, &.{ null, 1 });
+
+    var it = ObjIdIter.init(try actor_col.iterator(), try ctr_col.iterator());
+    try it.shift(.{ .start = 1, .end = 2 });
+    const named_ids = [_]ObjId{
+        ObjId.withActor(OpId.init(1, 0), types.ActorId.init("unresolved")),
+        .{ .named = .{
+            .op = .{ .counter = @as(u64, std.math.maxInt(u32)) + 1, .actor = 1 },
+            .actor = types.ActorId.init("unresolved"),
+        } },
+        .{ .named = .{
+            .op = .{ .counter = std.math.maxInt(u64), .actor = 1 },
+            .actor = types.ActorId.init("unresolved"),
+        } },
+    };
+    for (named_ids) |obj| {
+        try testing.expectError(error.InvalidValue, it.seekToValue(obj));
+        try testing.expectEqual(@as(usize, 1), it.obj_actor.pos());
+        try testing.expectEqual(@as(usize, 1), it.obj_ctr.pos());
+        try testing.expectEqual(@as(usize, 2), it.obj_actor.maxPos());
+        try testing.expectEqual(@as(usize, 2), it.obj_ctr.maxPos());
+    }
+    try testing.expect((try it.tryNext()).eql(.{ .id = OpId.init(1, 1) }));
+}
+
 test "ObjIdIter.seekToValue finds each object's rows and leaves the cursor on them" {
     const gpa = testing.allocator;
     const r = ObjId.root;
@@ -3272,7 +3275,7 @@ test "ObjIdIter.seekToValue finds each object's rows and leaves the cursor on th
     defer gpa.free(ctrs);
     for (objs, 0..) |o, i| {
         actors[i] = o.actor();
-        ctrs[i] = o.counter();
+        ctrs[i] = if (o.opId()) |id| id.counter else null;
     }
     var actor_col = try opcols.ActorOptColumn.init(gpa);
     defer actor_col.deinit();
@@ -3540,15 +3543,27 @@ test "a walk is repositionable into a later window" {
     // A target behind the walk cannot be served.
     try testing.expectEqual(@as(?Op, null), try it.seekTo(0));
 
-    // `shift` moves the window; the position is `shiftNext`'s to move,
-    // because a `void` method cannot report that it could not.
-    it.shift(.{ .start = 6, .end = 9 });
-    try testing.expectEqual(@as(usize, 9), it.maxPos());
+    // A failed reposition preserves the original row and all cursor windows.
+    try testing.expectError(error.UnexpectedEnd, it.shift(.{
+        .start = cols.len() + 1,
+        .end = cols.len() + 2,
+    }));
     try testing.expectEqual(@as(usize, 4), it.pos());
+    try testing.expectEqual(@as(usize, 5), it.maxPos());
+    try testing.expectEqual(@as(usize, 4), it.id.pos());
+    try testing.expectEqual(@as(usize, 4), it.obj.pos());
+    try testing.expectEqual(@as(usize, 4), it.key.pos());
+    try testing.expectEqual(@as(usize, 4), it.succ.pos());
+    try testing.expectEqual(@as(usize, 4), it.insert.pos());
+    try testing.expectEqual(@as(usize, 4), it.action.pos());
+    try testing.expectEqual(@as(usize, 4), it.value.pos());
+    try testing.expectEqual(@as(usize, 4), it.marks.pos());
 
-    // A shift onto a later window, forward only, and the value and
-    // successor cursors follow it rather than being read stale.
-    const at6 = (try it.shiftNext(.{ .start = 6, .end = 9 })).?;
+    // A reposition followed by an ordinary read yields the requested row,
+    // including its payload and successors, not the row before the window.
+    try it.shift(.{ .start = 6, .end = 9 });
+    const at6 = (try it.next()).?;
+    try testing.expectEqual(@as(usize, 6), at6.pos);
     try testing.expectEqual(OpId.init(5, 0), at6.id());
     try testing.expectEqualStrings("v5", at6.value().str);
     try testing.expectEqual(@as(usize, 3), at6.succCount());
@@ -3569,7 +3584,7 @@ test "a walk is repositionable into a later window" {
 
     // A truncated walk stops where it was told to, not at the column end.
     var cut = try OpIter(Row).init(cols, fx.strings(), .{ .start = 0, .end = cols.len() }, &scratch);
-    cut.shift(.{ .start = 0, .end = 2 });
+    try cut.shift(.{ .start = 0, .end = 2 });
     var seen: usize = 0;
     while (try cut.next()) |_| seen += 1;
     try testing.expectEqual(@as(usize, 2), seen);
@@ -3708,4 +3723,211 @@ test "every sub-iterator's kernel lands a shift on the row it names" {
     try testing.expectEqual(rich[2].succCount(), (try succs.shiftNext(one)).?.len());
     try testing.expectEqual(@as(usize, 3), succs.pos());
     try testing.expectEqual(@as(usize, 3), succs.maxPos());
+}
+
+test "value and successor jumps preserve rebased offsets and shifted streams" {
+    // Every range begins after nonzero payload and successor prefixes.
+    const gpa = testing.allocator;
+    const rows = [_]Row{
+        .{ .op_id = OpId.init(1, 0), .v = .{ .str = "prefix" }, .succs = &.{OpId.init(10, 0)}, .incs = &.{null} },
+        .{ .op_id = OpId.init(2, 0), .v = .null_value },
+        .{ .op_id = OpId.init(3, 0), .v = .{ .str = "two" }, .succs = &.{ OpId.init(11, 0), OpId.init(12, 0) }, .incs = &.{ null, 4 } },
+        .{ .op_id = OpId.init(4, 0), .v = .{ .int = -129 } },
+        .{ .op_id = OpId.init(5, 0), .v = .{ .str = "tail" }, .succs = &.{OpId.init(13, 0)}, .incs = &.{null} },
+    };
+    var fx = try Fixture.init(gpa, &rows);
+    defer fx.deinit();
+    const cols = &fx.cols;
+    const range = RowRange{ .start = 1, .end = rows.len };
+    var values = ValueIter.init(
+        try rangedPrefix(&cols.value_meta, range),
+        try cols.value.iteratorAt(try prefixAt(&cols.value_meta, range.start)),
+    );
+    try testing.expect(rows[2].v.eql(try values.tryNth(1)));
+    try testing.expect(rows[3].v.eql(try values.tryNext()));
+    try testing.expect(rows[4].v.eql((try values.shiftNext(.{ .start = 4, .end = 5 })).?));
+    try testing.expectError(error.MissingValue, values.tryNext());
+
+    var shifted = ValueIter.init(try cols.value_meta.prefixIter(), cols.value.iterator());
+    try shifted.shift(.{ .start = 2, .end = 4 });
+    try testing.expect(rows[2].v.eql(try shifted.tryNext()));
+    try testing.expect(rows[3].v.eql(try shifted.tryNext()));
+    try testing.expectError(error.MissingValue, shifted.tryNext());
+    var pair = ActionValueIter.init(
+        ActionIter.init(try cols.action.iterator()),
+        ValueIter.init(try cols.value_meta.prefixIter(), cols.value.iterator()),
+    );
+    try pair.shift(.{ .start = 2, .end = 4 });
+    try testing.expect(rows[2].v.eql((try pair.tryNext()).value));
+    try testing.expect(rows[3].v.eql((try pair.tryNext()).value));
+
+    var scratch: [2]SuccEntry = undefined;
+    const flat = try prefixAt(&cols.succ_count, range.start);
+    var succs = SuccIterIter.init(
+        try rangedPrefix(&cols.succ_count, range),
+        try cols.succ_actor.iterRange(.{ .start = flat, .end = cols.succ_actor.len() }),
+        try cols.succ_ctr.iterRange(.{ .start = flat, .end = cols.succ_ctr.len() }),
+        try cols.index.inc.iterRange(.{ .start = flat, .end = cols.index.inc.len() }),
+        flat,
+        &scratch,
+    );
+    var got = try succs.tryNth(1);
+    try testing.expectEqual(@as(usize, 1), got.pos());
+    try testing.expectEqual(@as(usize, 2), got.len());
+    try testing.expectEqual(OpId.init(11, 0), got.next().?);
+    try testing.expectEqual(OpId.init(12, 0), got.next().?);
+    try testing.expectEqual(@as(usize, 0), (try succs.tryNext()).len());
+    const tail = (try succs.shiftNext(.{ .start = 4, .end = 5 })).?;
+    try testing.expectEqual(@as(usize, 3), tail.pos());
+    try testing.expectEqual(@as(usize, 1), tail.len());
+    try testing.expectError(error.MissingValue, succs.tryNext());
+}
+
+test "rebased value and successor reads agree across bounded slabs" {
+    const gpa = testing.allocator;
+    var rows: [48]Row = undefined;
+    var words: [rows.len]u64 = undefined;
+    var counts: [rows.len]u32 = undefined;
+    const successors = [_]OpId{ OpId.init(100, 0), OpId.init(101, 0) };
+    const increments = [_]?i64{ null, 7 };
+    for (&rows, &words, &counts, 0..) |*r, *word, *count, i| {
+        const value: ScalarValue = switch (i % 4) {
+            0 => .null_value,
+            1 => .{ .str = "a" },
+            2 => .{ .str = "three" },
+            3 => .{ .int = -129 },
+            else => unreachable,
+        };
+        const n = i % 3;
+        r.* = .{
+            .op_id = OpId.init(@intCast(i + 1), 0),
+            .v = value,
+            .succs = successors[0..n],
+            .incs = increments[0..n],
+        };
+        word.* = optypes.metaOf(value).raw;
+        count.* = @intCast(n);
+    }
+    var fx = try Fixture.init(gpa, &rows);
+    defer fx.deinit();
+    const meta = blk: {
+        var prepared = try opcols.MetaColumn.initWithBudget(gpa, 2);
+        errdefer prepared.deinit();
+        try prepared.extend(gpa, &words);
+        break :blk prepared;
+    };
+    fx.cols.value_meta.deinit();
+    fx.cols.value_meta = meta;
+    const count_col = blk: {
+        var prepared = try opcols.CountColumn.initWithBudget(gpa, 2);
+        errdefer prepared.deinit();
+        try prepared.extend(gpa, &counts);
+        break :blk prepared;
+    };
+    fx.cols.succ_count.deinit();
+    fx.cols.succ_count = count_col;
+    const range = RowRange{ .start = 5, .end = rows.len };
+    var values = ValueIter.init(
+        try rangedPrefix(&fx.cols.value_meta, range),
+        try fx.cols.value.iteratorAt(try prefixAt(&fx.cols.value_meta, range.start)),
+    );
+    var positional = values;
+    for (range.start..range.end) |i| {
+        try testing.expect(rows[i].v.eql(try values.tryNext()));
+        try testing.expect(rows[i].v.eql((try positional.shiftNext(.{
+            .start = i,
+            .end = range.end,
+        })).?));
+    }
+    try testing.expectError(error.MissingValue, values.tryNext());
+    var jumped = ValueIter.init(
+        try rangedPrefix(&fx.cols.value_meta, range),
+        try fx.cols.value.iteratorAt(try prefixAt(&fx.cols.value_meta, range.start)),
+    );
+    try testing.expect(rows[range.start].v.eql(try jumped.tryNext()));
+    jumped.meta.resetPrefix();
+    try testing.expect(rows[37].v.eql(try jumped.tryNth(37 - range.start - 1)));
+    try testing.expect(rows[38].v.eql(try jumped.tryNext()));
+
+    var scratch: [2]SuccEntry = undefined;
+    const flat = try prefixAt(&fx.cols.succ_count, range.start);
+    var succs = SuccIterIter.init(
+        try rangedPrefix(&fx.cols.succ_count, range),
+        try fx.cols.succ_actor.iterRange(.{ .start = flat, .end = fx.cols.succ_actor.len() }),
+        try fx.cols.succ_ctr.iterRange(.{ .start = flat, .end = fx.cols.succ_ctr.len() }),
+        try fx.cols.index.inc.iterRange(.{ .start = flat, .end = fx.cols.index.inc.len() }),
+        flat,
+        &scratch,
+    );
+    var got = try succs.tryNth(37 - range.start);
+    try testing.expectEqual(try prefixAt(&fx.cols.succ_count, 37), got.pos());
+    try testing.expectEqual(@as(usize, counts[37]), got.len());
+    for (successors[0..counts[37]]) |id| try testing.expectEqual(id, got.next().?);
+    succs.count.resetPrefix();
+    try succs.shift(.{ .start = 40, .end = rows.len });
+    var shifted = try succs.tryNext();
+    try testing.expectEqual(try prefixAt(&fx.cols.succ_count, 40), shifted.pos());
+    try testing.expectEqual(@as(usize, counts[40]), shifted.len());
+    for (successors[0..counts[40]]) |id| try testing.expectEqual(id, shifted.next().?);
+}
+
+test "value jumps retain raw bounds and failed shifts retain the unread row" {
+    const gpa = testing.allocator;
+    var raw = try rawcol.RawColumn.init(gpa);
+    defer raw.deinit();
+    try raw.spliceSlice(0, 0, "abc");
+    var meta = try opcols.MetaColumn.init(gpa);
+    defer meta.deinit();
+    try meta.extend(gpa, &.{
+        optypes.metaOf(.{ .str = "abc" }).raw,
+        optypes.metaOf(.{ .str = "def" }).raw,
+        optypes.metaOf(.{ .str = "g" }).raw,
+    });
+    var jumped = ValueIter.init(try meta.prefixIter(), raw.iterator());
+    try testing.expectError(error.InvalidValue, jumped.tryNth(1));
+    var positional = ValueIter.init(try meta.prefixIter(), raw.iterator());
+    try testing.expectError(error.InvalidValue, positional.shiftNext(.{ .start = 1, .end = 3 }));
+    var shifted = ValueIter.init(try meta.prefixIter(), raw.iterator());
+    try testing.expectError(error.InvalidValue, shifted.shift(.{ .start = 2, .end = 3 }));
+    try testing.expectEqual(@as(usize, 0), shifted.pos());
+    try testing.expectEqualStrings("abc", (try shifted.tryNext()).str);
+    try testing.expectError(error.InvalidValue, shifted.tryNext());
+}
+
+test "successor positional and nth reads reject short flattened columns" {
+    const gpa = testing.allocator;
+    var count = try opcols.CountColumn.init(gpa);
+    defer count.deinit();
+    try count.extend(gpa, &.{ 1, 2 });
+    var actor = try opcols.ActorColumn.init(gpa);
+    defer actor.deinit();
+    try actor.extend(gpa, &.{0});
+    var ctr = try opcols.CounterColumn.init(gpa);
+    defer ctr.deinit();
+    try ctr.extend(gpa, &.{10});
+    var inc = try opcols.IncColumn.init(gpa);
+    defer inc.deinit();
+    try inc.extend(gpa, &.{null});
+    var scratch: [2]SuccEntry = undefined;
+    var jumped = SuccIterIter.init(
+        try count.prefixIter(),
+        try actor.iterator(),
+        try ctr.iterator(),
+        try inc.iterator(),
+        0,
+        &scratch,
+    );
+    var positional = jumped;
+    try testing.expectError(error.InvalidValue, jumped.tryNth(1));
+    try testing.expectError(error.InvalidValue, positional.shiftNext(.{ .start = 1, .end = 2 }));
+    var shifted = SuccIterIter.init(
+        try count.prefixIter(),
+        try actor.iterator(),
+        try ctr.iterator(),
+        try inc.iterator(),
+        0,
+        &scratch,
+    );
+    try shifted.shift(.{ .start = 1, .end = 2 });
+    try testing.expectError(error.InvalidValue, shifted.tryNext());
 }

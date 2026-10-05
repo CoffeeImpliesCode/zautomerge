@@ -54,17 +54,10 @@
 const std = @import("std");
 const btree = @import("btree.zig");
 
-/// What the two position-checked operations refuse: a slab position outside
-/// the index, which upstream treats as a panic, and the allocator. Local,
-/// like `btree.zig`'s `TreeError`.
-///
-/// Only `updateSlab` and `splice` use it, because only they take a position
-/// the caller could get wrong. Everything else here either allocates or
-/// answers, and answers with `std.mem.Allocator.Error` so a caller that only
-/// builds and queries — the byte arena, whose every index operation is a
-/// rebuild or a lookup — can return the parser's set without carrying a slab
-/// error it can never produce.
-pub const IndexError = error{ InvalidIndex, OutOfMemory };
+/// Position validation, allocation refusal, and unrepresentable weight arithmetic.
+/// Builds and queries omit `InvalidIndex` because they do not validate a slab
+/// position. Arithmetic refusal leaves the published index unchanged.
+pub const IndexError = error{ InvalidIndex, OutOfMemory, Overflow };
 /// The weight of a byte-arena slab: its byte length, which is also its item
 /// count. Upstream's is `usize` itself (`column.rs:65-70`); this is the same
 /// number with the weight contract attached.
@@ -83,14 +76,14 @@ pub const Bytes = struct {
         /// The weight of no slabs at all.
         pub const identity: Bytes = .zero;
         /// The weight of two adjacent spans, in order.
-        pub fn merge(l: Bytes, r: Bytes) Bytes {
-            return .{ .n = l.n + r.n };
+        pub fn merge(l: Bytes, r: Bytes) error{Overflow}!Bytes {
+            return .{ .n = try std.math.add(usize, l.n, r.n) };
         }
         /// `a - b`. A Fenwick tree needs it and a B-tree does not, which is
         /// why it lives here and not in the shared contract: see the module
         /// docs.
-        pub fn sub(a: Bytes, b: Bytes) Bytes {
-            return .{ .n = a.n - b.n };
+        pub fn sub(a: Bytes, b: Bytes) error{Overflow}!Bytes {
+            return .{ .n = try std.math.sub(usize, a.n, b.n) };
         }
         /// How many column rows the weight covers. For a byte slab that is
         /// its byte length, so it is both counts at once.
@@ -121,6 +114,13 @@ fn weightOfSlice(comptime W: type) fn ([]const W, usize) W {
             return weights[i];
         }
     }.f;
+}
+
+/// Normalize legacy infallible subtraction and checked weight providers.
+fn subtract(comptime W: type, a: W, b: W) error{Overflow}!W {
+    const result = W.Aggregate.sub(a, b);
+    if (comptime @typeInfo(@TypeOf(result)) == .error_union) return try result;
+    return result;
 }
 
 /// A Fenwick tree over per-slab weights: the array a byte arena indexes
@@ -189,7 +189,7 @@ pub fn Fenwick(comptime W: type) type {
         /// because the lift accepts a node whose running total still does not
         /// reach `index` — the same condition the B-tree's
         /// `remaining < count` loop uses (`btree.rs:1203-1212`).
-        pub fn findSlab(self: *const Self, index: usize) SlabPos {
+        pub fn findSlab(self: *const Self, index: usize) error{Overflow}!SlabPos {
             const n = self.len();
             if (n == 0) return .{ .slab = 0, .offset = 0 };
             // The highest power of two that fits in `n`. Computed against
@@ -200,12 +200,13 @@ pub fn Fenwick(comptime W: type) type {
             var pos: usize = 0;
             var idx: usize = 0;
             while (step > 0) {
-                const next = idx + step;
-                if (next <= n) {
-                    // `pos` and this node's count are disjoint prefixes and
-                    // suffixes of the same weights, so the sum cannot exceed
-                    // the total the tree was built from.
-                    const acc = pos + W.Aggregate.itemCount(self.items.items[next]);
+                if (step <= n - idx) {
+                    const next = idx + step;
+                    const acc = try std.math.add(
+                        usize,
+                        pos,
+                        W.Aggregate.itemCount(self.items.items[next]),
+                    );
                     if (acc <= index) {
                         pos = acc;
                         idx = next;
@@ -223,11 +224,11 @@ pub fn Fenwick(comptime W: type) type {
         /// past the end answers the total, which is what the walk runs out
         /// of; upstream asserts it never happens (`index.rs:100`), and the
         /// port clamps so both backends answer a past-end query alike.
-        pub fn prefixQuery(self: *const Self, count: usize) usize {
+        pub fn prefixQuery(self: *const Self, count: usize) error{Overflow}!usize {
             var acc: usize = 0;
             var i = @min(count, self.len());
             while (i > 0) : (i -= i & (0 -% i)) {
-                acc += W.Aggregate.itemCount(self.items.items[i]);
+                acc = try std.math.add(usize, acc, W.Aggregate.itemCount(self.items.items[i]));
             }
             return acc;
         }
@@ -240,23 +241,75 @@ pub fn Fenwick(comptime W: type) type {
         /// slabs — rather than a weight cache — reads it off the slab it just
         /// rewrote (`raw.rs:255`).
         ///
-        /// `si` has to name a slab the tree holds, `si < len()`. There is no
-        /// error channel: a position at or past the end has no ancestor
-        /// node to fold the change into, so the walk never runs and the call
-        /// is a silent no-op that leaves the tree describing the old weight.
-        /// [`BitIndex.updateSlab`](BitIndex) checks the bound first and
-        /// reports `error.InvalidIndex` for the same mistake, so a caller
-        /// holding an index should go through it. The one caller that keeps
-        /// the tree on its own — the byte arena's splice, which rewrote the
-        /// slab it is naming — is inside that bound by construction.
-        pub fn pointUpdate(self: *Self, si: usize, old: W, new: W) void {
-            // A precondition, not validation of hostile input: a released
-            // caller is a bug, and `si + 1` below must stay in range.
+        /// `si` must name an existing slab. All ancestor values and the exact
+        /// total item count are checked before any node is written.
+        pub fn pointUpdate(self: *Self, si: usize, old: W, new: W) error{Overflow}!void {
+            const prepared = try self.preparePointUpdate(si, old, new);
+            self.publishPointUpdate(&prepared);
+        }
+
+        /// Stack-owned replacements produced only by `preparePointUpdate`.
+        /// Keep its fields unchanged. It borrows the index storage, owns no
+        /// allocation, and needs no cleanup if abandoned. Any index mutation,
+        /// storage relocation, or teardown invalidates it; publish at most once.
+        pub const PreparedPointUpdate = struct {
+            storage: [*]const W,
+            slab_count: usize,
+            start: usize,
+            count: usize,
+            weights: [@bitSizeOf(usize)]W,
+        };
+
+        /// Checks and prepares a replacement without allocation or mutation.
+        /// `si < len()` and `old` must be the indexed slab's current weight.
+        /// `Overflow` leaves the index unchanged. Keep the index and its
+        /// storage unchanged until `publishPointUpdate`, or discard the value.
+        pub fn preparePointUpdate(
+            self: *const Self,
+            si: usize,
+            old: W,
+            new: W,
+        ) error{Overflow}!PreparedPointUpdate {
             std.debug.assert(si < self.len());
-            var i = si + 1; // the tree is one-indexed
-            while (i < self.items.items.len) {
-                self.items.items[i] = W.Aggregate.sub(W.Aggregate.merge(self.items.items[i], new), old);
-                i += i & (0 -% i);
+            const total = try self.prefixQuery(self.len());
+            const retained = try std.math.sub(usize, total, W.Aggregate.itemCount(old));
+            _ = try std.math.add(usize, retained, W.Aggregate.itemCount(new));
+
+            var prepared = PreparedPointUpdate{
+                .storage = self.items.items.ptr,
+                .slab_count = self.len(),
+                .start = si + 1,
+                .count = 0,
+                .weights = undefined,
+            };
+            var i = prepared.start;
+            while (i <= self.len()) {
+                prepared.weights[prepared.count] = try btree.compose(
+                    W,
+                    try subtract(W, self.items.items[i], old),
+                    new,
+                );
+                prepared.count += 1;
+                const step = i & (0 -% i);
+                if (step > self.len() - i) break;
+                i += step;
+            }
+            return prepared;
+        }
+
+        /// Publishes a plan from this unchanged index without allocation or
+        /// fallible arithmetic. Caller-established freshness is a precondition,
+        /// not release-mode validation; storage identity and length are asserted.
+        /// The plan is invalid after publication and must not be reused.
+        pub fn publishPointUpdate(self: *Self, prepared: *const PreparedPointUpdate) void {
+            std.debug.assert(prepared.storage == self.items.items.ptr);
+            std.debug.assert(prepared.slab_count == self.len());
+            var i = prepared.start;
+            for (prepared.weights[0..prepared.count]) |weight| {
+                self.items.items[i] = weight;
+                const step = i & (0 -% i);
+                if (step > self.len() - i) break;
+                i += step;
             }
         }
 
@@ -269,39 +322,48 @@ pub fn Fenwick(comptime W: type) type {
         /// (`column.rs:144-146`). Reading one weight at a time keeps that
         /// shape without a temporary array.
         ///
-        /// **Failure leaves the tree as it was.** The whole new tree is
-        /// reserved before the old one is dropped, so `error.OutOfMemory`
-        /// cannot leave a tree that is shorter than the weights it was built
-        /// from — which would make every later query answer as though the
-        /// index held fewer slabs than it does. Nothing is allocated after
-        /// that point, and `gpa` has to be the tree's own allocator: the
-        /// storage reserved here is released by `deinit` with `self.gpa`.
+        /// Failure leaves the tree unchanged. Construction uses candidate
+        /// storage so an arithmetic refusal, including a late ancestor
+        /// overflow, cannot expose a partially rebuilt index. `gpa` must be
+        /// the tree's allocator, which releases the replacement at teardown.
         pub fn rebuildFrom(
             self: *Self,
             gpa: std.mem.Allocator,
             ctx: anytype,
             n: usize,
             comptime weightOf: fn (@TypeOf(ctx), usize) W,
-        ) std.mem.Allocator.Error!void {
-            try self.items.ensureTotalCapacity(gpa, n + 1);
-            self.items.clearRetainingCapacity();
-            self.items.appendAssumeCapacity(W.Aggregate.identity);
-            var i: usize = 0;
-            while (i < n) : (i += 1) self.items.appendAssumeCapacity(weightOf(ctx, i));
-            // Standard O(n) construction: every node hands its total to its
-            // parent, so each node ends up holding the sum of its span.
+        ) (std.mem.Allocator.Error || error{Overflow})!void {
+            const size = try std.math.add(usize, n, 1);
+            var candidate = try std.ArrayList(W).initCapacity(gpa, size);
+            errdefer candidate.deinit(gpa);
+            candidate.appendAssumeCapacity(W.Aggregate.identity);
+            var total: usize = 0;
+            for (0..n) |i| {
+                const weight = weightOf(ctx, i);
+                total = try std.math.add(usize, total, W.Aggregate.itemCount(weight));
+                candidate.appendAssumeCapacity(weight);
+            }
+            // Each node hands its checked total to its parent. The full
+            // count above also covers a total spanning disjoint BIT roots.
             var j: usize = 1;
             while (j <= n) : (j += 1) {
-                const parent = j + (j & (0 -% j));
-                if (parent <= n) {
-                    self.items.items[parent] = W.Aggregate.merge(self.items.items[parent], self.items.items[j]);
+                const step = j & (0 -% j);
+                if (step <= n - j) {
+                    const parent = j + step;
+                    candidate.items[parent] = try btree.compose(
+                        W,
+                        candidate.items[parent],
+                        candidate.items[j],
+                    );
                 }
             }
+            self.items.deinit(gpa);
+            self.items = candidate;
         }
 
         /// Rebuilds the tree from a slice of weights, in O(S). As
         /// `rebuildFrom`, failure leaves the tree as it was.
-        pub fn rebuild(self: *Self, gpa: std.mem.Allocator, weights: []const W) std.mem.Allocator.Error!void {
+        pub fn rebuild(self: *Self, gpa: std.mem.Allocator, weights: []const W) (std.mem.Allocator.Error || error{Overflow})!void {
             return self.rebuildFrom(gpa, weights, weights.len, weightOfSlice(W));
         }
     };
@@ -347,8 +409,14 @@ pub fn BitIndex(comptime W: type) type {
 
         /// An index over `weights`, in slab order (`from_weights`,
         /// `index.rs:84-88`).
-        pub fn fromWeights(gpa: std.mem.Allocator, weights: []const W) std.mem.Allocator.Error!Self {
-            var self = try Self.init(gpa);
+        pub fn fromWeights(gpa: std.mem.Allocator, weights: []const W) (std.mem.Allocator.Error || error{Overflow})!Self {
+            // The candidate rebuild supplies the unused slot; do not allocate
+            // an empty tree that would immediately be replaced.
+            var self = Self{
+                .gpa = gpa,
+                .weights = .empty,
+                .bit = .{ .gpa = gpa, .items = .empty },
+            };
             errdefer self.deinit();
             try self.weights.appendSlice(gpa, weights);
             try self.bit.rebuild(gpa, weights);
@@ -367,13 +435,13 @@ pub fn BitIndex(comptime W: type) type {
 
         /// The slab holding the `index`-th item, and that item's offset
         /// inside it. At the total it answers `(len(), 0)`.
-        pub fn findSlab(self: *const Self, index: usize) SlabPos {
+        pub fn findSlab(self: *const Self, index: usize) error{Overflow}!SlabPos {
             return self.bit.findSlab(index);
         }
 
         /// The number of items in the slabs before `slab_idx` — the inverse
         /// of `findSlab` (`index.rs:97-108`).
-        pub fn itemsBefore(self: *const Self, slab_idx: usize) usize {
+        pub fn itemsBefore(self: *const Self, slab_idx: usize) error{Overflow}!usize {
             return self.bit.prefixQuery(slab_idx);
         }
 
@@ -382,35 +450,49 @@ pub fn BitIndex(comptime W: type) type {
         pub fn updateSlab(self: *Self, slab_idx: usize, new_weight: W) IndexError!void {
             if (slab_idx >= self.weights.items.len) return error.InvalidIndex;
             const old = self.weights.items[slab_idx];
+            try self.bit.pointUpdate(slab_idx, old, new_weight);
             self.weights.items[slab_idx] = new_weight;
-            self.bit.pointUpdate(slab_idx, old, new_weight);
         }
 
         /// Replaces the weights of slabs `start..end` with `new_weights`
         /// (`splice`, `index.rs:116-119`). Time is O(S + N), where S and N
         /// are the old and resulting slab counts: replacement shifts the
         /// cache's suffix and the whole resulting Fenwick tree is rebuilt.
-        /// Growth reserves O(N) storage; neither buffer is cloned.
-        ///
-        /// `start > end` or `end > len()` returns `error.InvalidIndex`.
-        /// An unrepresentable storage size or a refused allocation returns
-        /// `error.OutOfMemory`. On error, weights, slab counts and all
-        /// positional answers remain unchanged, but capacity may grow and
-        /// storage may move. Both buffers are reserved before replacement,
-        /// so publication and the capacity-guaranteed rebuild cannot fail.
-        /// `new_weights` is copied and must not alias the index's storage.
+        /// A candidate tree is checked before the cache is changed; source
+        /// weights, slab counts, and positional answers remain unchanged on
+        /// allocation or arithmetic refusal. `new_weights` is copied and
+        /// must not alias the index's storage.
         pub fn splice(self: *Self, start: usize, end: usize, new_weights: []const W) IndexError!void {
             if (start > end or end > self.weights.items.len) return error.InvalidIndex;
             const kept = self.weights.items.len - (end - start);
-            const new_len = std.math.add(usize, kept, new_weights.len) catch return error.OutOfMemory;
-            const tree_len = std.math.add(usize, new_len, 1) catch return error.OutOfMemory;
+            const new_len = try std.math.add(usize, kept, new_weights.len);
+            const source = SplicedWeights{
+                .old = self.weights.items,
+                .replacement = new_weights,
+                .start = start,
+                .end = end,
+            };
+            var candidate = Fenwick(W){ .gpa = self.gpa, .items = .empty };
+            try candidate.rebuildFrom(self.gpa, source, new_len, SplicedWeights.at);
+            defer candidate.deinit();
             try self.weights.ensureTotalCapacity(self.gpa, new_len);
-            try self.bit.items.ensureTotalCapacity(self.gpa, tree_len);
             self.weights.replaceRangeAssumeCapacity(start, end - start, new_weights);
-            // The rebuild's reservation is already satisfied; no allocation
-            // remains after the cache publishes the new weight sequence.
-            self.bit.rebuild(self.gpa, self.weights.items) catch unreachable;
+            std.mem.swap(Fenwick(W), &self.bit, &candidate);
         }
+
+        const SplicedWeights = struct {
+            old: []const W,
+            replacement: []const W,
+            start: usize,
+            end: usize,
+
+            fn at(source: @This(), i: usize) W {
+                if (i < source.start) return source.old[i];
+                const offset = i - source.start;
+                if (offset < source.replacement.len) return source.replacement[offset];
+                return source.old[source.end + (offset - source.replacement.len)];
+            }
+        };
     };
 }
 
@@ -421,7 +503,7 @@ const testing = std.testing;
 /// A slab of `len` items reaching prefix `total`, the weight a monotonic
 /// column stores. `itemCount` is the same `len`, so the two backends answer
 /// the same queries for the same sequence of slabs.
-fn agg(len: usize, total: usize) btree.SlabAgg {
+fn agg(len: usize, total: usize) error{Overflow}!btree.SlabAgg {
     return btree.SlabAgg.monotone(len, total);
 }
 
@@ -450,8 +532,8 @@ test "a fresh tree is empty and answers the past-end sentinel" {
     try testing.expect(bit.isEmpty());
     try testing.expectEqual(@as(usize, 0), bit.len());
     // Nothing is indexed, so a query cannot land anywhere (`column.rs:302-304`).
-    try testing.expectEqual(SlabPos{ .slab = 0, .offset = 0 }, bit.findSlab(0));
-    try testing.expectEqual(@as(usize, 0), bit.prefixQuery(0));
+    try testing.expectEqual(SlabPos{ .slab = 0, .offset = 0 }, try bit.findSlab(0));
+    try testing.expectEqual(@as(usize, 0), try bit.prefixQuery(0));
 }
 
 test "the tree answers every item boundary of its slabs" {
@@ -466,12 +548,12 @@ test "the tree answers every item boundary of its slabs" {
     try testing.expectEqual(weights.len, bit.len());
     const total: usize = 22;
     for (0..total + 1) |index| {
-        try testing.expectEqual(referencePos(&bytes, index), bit.findSlab(index));
+        try testing.expectEqual(referencePos(&bytes, index), try bit.findSlab(index));
     }
     // The last byte belongs to the last non-empty slab, and the byte at the
     // total is the past-end sentinel.
-    try testing.expectEqual(SlabPos{ .slab = 6, .offset = 6 }, bit.findSlab(21));
-    try testing.expectEqual(SlabPos{ .slab = 7, .offset = 0 }, bit.findSlab(22));
+    try testing.expectEqual(SlabPos{ .slab = 6, .offset = 6 }, try bit.findSlab(21));
+    try testing.expectEqual(SlabPos{ .slab = 7, .offset = 0 }, try bit.findSlab(22));
 }
 
 test "the prefix query answers the running total of the slabs before it" {
@@ -484,11 +566,11 @@ test "the prefix query answers the running total of the slabs before it" {
     try bit.rebuild(gpa, &bytes);
 
     for (0..weights.len + 1) |slab_idx| {
-        try testing.expectEqual(referenceBefore(&bytes, slab_idx), bit.prefixQuery(slab_idx));
+        try testing.expectEqual(referenceBefore(&bytes, slab_idx), try bit.prefixQuery(slab_idx));
     }
     // A slab count past the end answers the total rather than reading out of
     // the tree; upstream asserts it never happens (`index.rs:100`).
-    try testing.expectEqual(@as(usize, 21), bit.prefixQuery(weights.len + 3));
+    try testing.expectEqual(@as(usize, 21), try bit.prefixQuery(weights.len + 3));
 }
 
 test "a point update lands where a rebuild would put it" {
@@ -503,8 +585,8 @@ test "a point update lands where a rebuild would put it" {
     var changed = [_]usize{ 4, 6, 2, 8, 1, 3, 5 };
     changed[3] = 11;
     changed[0] = 1;
-    bit.pointUpdate(3, .{ .n = 8 }, .{ .n = 11 });
-    bit.pointUpdate(0, .{ .n = 4 }, .{ .n = 1 });
+    try bit.pointUpdate(3, .{ .n = 8 }, .{ .n = 11 });
+    try bit.pointUpdate(0, .{ .n = 4 }, .{ .n = 1 });
 
     var fresh_bytes: [weights.len]Bytes = undefined;
     for (changed, 0..) |w, i| fresh_bytes[i] = .{ .n = w };
@@ -516,9 +598,9 @@ test "a point update lands where a rebuild would put it" {
     // right at the root.
     try testing.expectEqualSlices(Bytes, fresh.items.items, bit.items.items);
     for (0..changed.len + 1) |index| {
-        try testing.expectEqual(referencePos(&fresh_bytes, index), bit.findSlab(index));
+        try testing.expectEqual(referencePos(&fresh_bytes, index), try bit.findSlab(index));
     }
-    try testing.expectEqual(referenceBefore(&fresh_bytes, changed.len), bit.prefixQuery(changed.len));
+    try testing.expectEqual(referenceBefore(&fresh_bytes, changed.len), try bit.prefixQuery(changed.len));
 }
 
 test "a slab that shrinks and one that grows both adjust the tree" {
@@ -533,8 +615,8 @@ test "a slab that shrinks and one that grows both adjust the tree" {
     // Shrinking to nothing and growing past every other slab, in one tree, so
     // a subtraction that ran the wrong way or an addition that ran twice
     // would show up as a total that is wrong rather than as a wrong slab.
-    bit.pointUpdate(0, .{ .n = 4 }, .{ .n = 0 });
-    bit.pointUpdate(6, .{ .n = 5 }, .{ .n = 100 });
+    try bit.pointUpdate(0, .{ .n = 4 }, .{ .n = 0 });
+    try bit.pointUpdate(6, .{ .n = 5 }, .{ .n = 100 });
     var fresh_bytes: [weights.len]Bytes = undefined;
     for (weights, 0..) |w, i| fresh_bytes[i] = .{ .n = w };
     fresh_bytes[0] = .{ .n = 0 };
@@ -543,7 +625,7 @@ test "a slab that shrinks and one that grows both adjust the tree" {
     defer fresh.deinit();
     try fresh.rebuild(gpa, &fresh_bytes);
     try testing.expectEqualSlices(Bytes, fresh.items.items, bit.items.items);
-    try testing.expectEqual(@as(usize, 120), bit.prefixQuery(weights.len));
+    try testing.expectEqual(@as(usize, 120), try bit.prefixQuery(weights.len));
 }
 
 test "the bit index keeps its cache and its tree in step" {
@@ -556,24 +638,24 @@ test "the bit index keeps its cache and its tree in step" {
 
     try testing.expectEqual(weights.len, idx.len());
     try testing.expect(!idx.isEmpty());
-    try testing.expectEqual(@as(usize, 20), idx.itemsBefore(4));
-    try testing.expectEqual(SlabPos{ .slab = 2, .offset = 1 }, idx.findSlab(11));
+    try testing.expectEqual(@as(usize, 20), try idx.itemsBefore(4));
+    try testing.expectEqual(SlabPos{ .slab = 2, .offset = 1 }, try idx.findSlab(11));
 
     try idx.updateSlab(2, .{ .n = 9 });
     try testing.expectEqual(Bytes{ .n = 9 }, idx.weights.items[2]);
-    try testing.expectEqual(@as(usize, 10), idx.itemsBefore(2));
-    try testing.expectEqual(SlabPos{ .slab = 2, .offset = 5 }, idx.findSlab(15));
+    try testing.expectEqual(@as(usize, 10), try idx.itemsBefore(2));
+    try testing.expectEqual(SlabPos{ .slab = 2, .offset = 5 }, try idx.findSlab(15));
 
     // A structural change rebuilds the tree, because a Fenwick has no way to
     // absorb one in O(log S) (`index.rs:116-119`).
     try idx.splice(0, 3, &.{ .{ .n = 2 }, .{ .n = 2 } });
     try testing.expectEqual(weights.len - 1, idx.len());
-    try testing.expectEqual(@as(usize, 2), idx.itemsBefore(1));
-    try testing.expectEqual(@as(usize, 4), idx.itemsBefore(2));
+    try testing.expectEqual(@as(usize, 2), try idx.itemsBefore(1));
+    try testing.expectEqual(@as(usize, 4), try idx.itemsBefore(2));
     // The tree still answers positions, not just totals, after a rebuild.
     const total = referenceBefore(idx.weights.items, idx.len());
     for (0..total + 1) |index| {
-        try testing.expectEqual(referencePos(idx.weights.items, index), idx.findSlab(index));
+        try testing.expectEqual(referencePos(idx.weights.items, index), try idx.findSlab(index));
     }
 
     try testing.expectError(error.InvalidIndex, idx.updateSlab(idx.len(), .{ .n = 1 }));
@@ -599,7 +681,7 @@ test "both index backends answer a positional query the same way" {
         for (bytes, aggs) |*b, *a| {
             b.* = .{ .n = random.intRangeAtMost(usize, 0, 9) };
             running += b.n;
-            a.* = agg(b.n, running);
+            a.* = try agg(b.n, running);
         }
 
         var bit = try BitIndex(Bytes).fromWeights(gpa, bytes);
@@ -610,7 +692,7 @@ test "both index backends answer a positional query the same way" {
         try testing.expectEqual(tree.len(), bit.len());
         for (0..running + 1) |index| {
             const want = referencePos(bytes, index);
-            const via_bit = bit.findSlab(index);
+            const via_bit = try bit.findSlab(index);
             try testing.expectEqual(want.slab, via_bit.slab);
             try testing.expectEqual(want.offset, via_bit.offset);
 
@@ -626,7 +708,7 @@ test "both index backends answer a positional query the same way" {
             }
         }
         for (0..n + 2) |slab_idx| {
-            try testing.expectEqual(tree.itemsBeforeSlab(@min(slab_idx, n)), bit.itemsBefore(slab_idx));
+            try testing.expectEqual(tree.itemsBeforeSlab(@min(slab_idx, n)), try bit.itemsBefore(slab_idx));
         }
     }
 }
@@ -642,12 +724,12 @@ test "a zero-weight slab is stepped over, not landed on" {
     defer bit.deinit();
     try bit.rebuild(gpa, &bytes);
 
-    try testing.expectEqual(SlabPos{ .slab = 0, .offset = 0 }, bit.findSlab(0));
-    try testing.expectEqual(SlabPos{ .slab = 0, .offset = 1 }, bit.findSlab(1));
-    try testing.expectEqual(SlabPos{ .slab = 2, .offset = 0 }, bit.findSlab(2));
-    try testing.expectEqual(SlabPos{ .slab = 2, .offset = 2 }, bit.findSlab(4));
+    try testing.expectEqual(SlabPos{ .slab = 0, .offset = 0 }, try bit.findSlab(0));
+    try testing.expectEqual(SlabPos{ .slab = 0, .offset = 1 }, try bit.findSlab(1));
+    try testing.expectEqual(SlabPos{ .slab = 2, .offset = 0 }, try bit.findSlab(2));
+    try testing.expectEqual(SlabPos{ .slab = 2, .offset = 2 }, try bit.findSlab(4));
     // And the B-tree steps over it the same way.
-    var aggs = [_]btree.SlabAgg{ agg(2, 2), agg(0, 2), agg(3, 5) };
+    var aggs = [_]btree.SlabAgg{ try agg(2, 2), try agg(0, 2), try agg(3, 5) };
     var tree = try btree.SlabBTree.fromSlice(gpa, &aggs);
     defer tree.deinit();
     try testing.expectEqual(@as(?usize, 2), if (tree.findByPrefix(2)) |hit| hit.slab else null);
@@ -701,7 +783,7 @@ test "index_items_before_parity" {
         try lens.append(gpa, n);
         try weights.append(gpa, .{ .n = n });
         running += n;
-        try aggs.append(gpa, agg(n, running));
+        try aggs.append(gpa, try agg(n, running));
     }
 
     var bit = try BitIndex(Bytes).fromWeights(gpa, weights.items);
@@ -714,11 +796,11 @@ test "index_items_before_parity" {
     // the B-tree's is the items before the slab a descent reaches
     // (`index.rs:135-140`).
     for (0..lens.items.len) |i| {
-        try testing.expectEqual(referenceBefore(weights.items, i), bit.itemsBefore(i));
+        try testing.expectEqual(referenceBefore(weights.items, i), try bit.itemsBefore(i));
         try testing.expectEqual(referenceBefore(weights.items, i), tree.itemsBeforeSlab(i));
     }
     // And one past the end is the total, which is upstream's last line.
-    try testing.expectEqual(running, bit.itemsBefore(lens.items.len));
+    try testing.expectEqual(running, try bit.itemsBefore(lens.items.len));
     try testing.expectEqual(running, tree.itemsBeforeSlab(lens.items.len));
 }
 
@@ -756,18 +838,18 @@ test "a refused growing splice leaves the weight cache and the tree unchanged" {
                 committed = false;
                 refusals += 1;
             },
-            error.InvalidIndex => return error.TestUnexpectedResult,
+            error.InvalidIndex, error.Overflow => return error.TestUnexpectedResult,
         };
         const expected: []const Bytes = if (committed) &spliced else &before;
         try testing.expectEqualSlices(Bytes, expected, idx.weights.items);
         try testing.expectEqual(expected.len, idx.len());
         try testing.expectEqual(expected.len, idx.bit.len());
         for (0..expected.len + 1) |i| {
-            try testing.expectEqual(referenceBefore(expected, i), idx.itemsBefore(i));
+            try testing.expectEqual(referenceBefore(expected, i), try idx.itemsBefore(i));
         }
         const total = referenceBefore(expected, expected.len);
         for (0..total + 1) |k| {
-            try testing.expectEqual(referencePos(expected, k), idx.findSlab(k));
+            try testing.expectEqual(referencePos(expected, k), try idx.findSlab(k));
         }
         if (committed) break;
     }
@@ -802,28 +884,216 @@ test "a refused rebuild leaves the tree whole" {
         defer bit.deinit();
         bit.rebuild(arm, &before) catch continue;
 
-        // `OutOfMemory` is the only error a rebuild can report, so a refusal
-        // is the only way it can leave. The two lists have different slab
-        // counts, which is what tells a committed rebuild from a refused
-        // one; the value sequence below then pins what the tree really holds.
+        // These small weights cannot overflow. The different slab counts
+        // distinguish a committed rebuild from an allocation refusal; the
+        // positional sweep then checks the entire published result.
         var committed = true;
-        bit.rebuild(arm, &after) catch {
-            committed = false;
+        bit.rebuild(arm, &after) catch |err| switch (err) {
+            error.OutOfMemory => committed = false,
+            error.Overflow => return error.TestUnexpectedResult,
         };
         const expected: []const Bytes = if (committed) after[0..] else before[0..];
 
         try testing.expectEqual(expected.len, bit.len());
         for (0..expected.len + 1) |i| {
-            try testing.expectEqual(referenceBefore(expected, i), bit.prefixQuery(i));
+            try testing.expectEqual(referenceBefore(expected, i), try bit.prefixQuery(i));
         }
         const total = referenceBefore(expected, expected.len);
         for (0..total + 1) |k| {
-            try testing.expectEqual(referencePos(expected, k), bit.findSlab(k));
+            try testing.expectEqual(referencePos(expected, k), try bit.findSlab(k));
         }
         // Teardown is `testing.allocator`'s to check: a tree whose reserve
         // was refused has to keep the bytes it already held and give them
         // back.
     }
+}
+
+test "byte weight arithmetic refuses overflow and underflow" {
+    const max = std.math.maxInt(usize);
+    try testing.expectError(error.Overflow, Bytes.Aggregate.merge(.{ .n = max }, .{ .n = 1 }));
+    try testing.expectError(error.Overflow, Bytes.Aggregate.sub(.{ .n = 0 }, .{ .n = 1 }));
+    try testing.expectEqual(Bytes{ .n = max }, try Bytes.Aggregate.merge(.{ .n = max }, .zero));
+    try testing.expectEqual(Bytes.zero, try Bytes.Aggregate.sub(.{ .n = max }, .{ .n = max }));
+}
+
+test "an overflowing rebuild preserves every published positional answer" {
+    const gpa = testing.allocator;
+    const before = [_]Bytes{ .{ .n = 2 }, .{ .n = 0 }, .{ .n = 3 } };
+    var bit = try Fenwick(Bytes).init(gpa);
+    defer bit.deinit();
+    try bit.rebuild(gpa, &before);
+    // The total can overflow even when each individual Fenwick node fits.
+    const after = [_]Bytes{ .{ .n = std.math.maxInt(usize) }, .zero, .{ .n = 1 } };
+    try testing.expectError(error.Overflow, bit.rebuild(gpa, &after));
+    try testing.expectEqual(before.len, bit.len());
+    for (0..before.len + 1) |i| {
+        try testing.expectEqual(referenceBefore(&before, i), try bit.prefixQuery(i));
+    }
+    for (0..6) |i| {
+        try testing.expectEqual(referencePos(&before, i), try bit.findSlab(i));
+    }
+    try testing.expectError(error.Overflow, BitIndex(Bytes).fromWeights(gpa, &after));
+}
+
+test "an overflowing point update preserves the cache and all ancestors" {
+    const max = std.math.maxInt(usize);
+    const before = [_]Bytes{ .{ .n = 1 }, .zero, .{ .n = max - 1 } };
+    var idx = try BitIndex(Bytes).fromWeights(testing.allocator, &before);
+    defer idx.deinit();
+    try testing.expectError(error.Overflow, idx.updateSlab(0, .{ .n = 2 }));
+    try testing.expectEqualSlices(Bytes, &before, idx.weights.items);
+    try testing.expectEqual(@as(usize, 1), try idx.itemsBefore(1));
+    try testing.expectEqual(max, try idx.itemsBefore(3));
+    try testing.expectEqual(SlabPos{ .slab = 2, .offset = max - 2 }, try idx.findSlab(max - 1));
+    // Removing the old weight first avoids rejecting a representable replacement.
+    try idx.updateSlab(2, .{ .n = max - 1 });
+    try idx.updateSlab(2, .{ .n = max - 2 });
+    try testing.expectEqual(max - 1, try idx.itemsBefore(3));
+}
+
+test "an overflowing splice preserves the source and published index" {
+    const before = [_]Bytes{ .{ .n = 2 }, .{ .n = 3 } };
+    const replacement = [_]Bytes{.{ .n = std.math.maxInt(usize) }};
+    var idx = try BitIndex(Bytes).fromWeights(testing.allocator, &before);
+    defer idx.deinit();
+    try testing.expectError(error.Overflow, idx.splice(1, 2, &replacement));
+    try testing.expectEqualSlices(Bytes, &before, idx.weights.items);
+    try testing.expectEqual(std.math.maxInt(usize), replacement[0].n);
+    for (0..6) |i| {
+        try testing.expectEqual(referencePos(&before, i), try idx.findSlab(i));
+    }
+    try testing.expectEqual(@as(usize, 5), try idx.itemsBefore(2));
+}
+
+test "Fenwick accepts legacy infallible weight composition and subtraction" {
+    const Legacy = struct {
+        n: usize,
+        const Weight = @This();
+        pub const Aggregate = struct {
+            pub const identity: Weight = .{ .n = 0 };
+            pub fn merge(a: Weight, b: Weight) Weight {
+                return .{ .n = a.n + b.n };
+            }
+            pub fn sub(a: Weight, b: Weight) Weight {
+                return .{ .n = a.n - b.n };
+            }
+            pub fn itemCount(a: Weight) usize {
+                return a.n;
+            }
+            pub fn eql(a: Weight, b: Weight) bool {
+                return a.n == b.n;
+            }
+        };
+    };
+    var idx = try BitIndex(Legacy).fromWeights(testing.allocator, &.{ .{ .n = 3 }, .{ .n = 4 } });
+    defer idx.deinit();
+    try idx.updateSlab(0, .{ .n = 5 });
+    try idx.splice(1, 2, &.{ .{ .n = 1 }, .{ .n = 2 } });
+    try testing.expectEqual(@as(usize, 8), try idx.itemsBefore(3));
+    try testing.expectEqual(SlabPos{ .slab = 2, .offset = 1 }, try idx.findSlab(7));
+}
+
+const CheckedTestWeight = struct {
+    n: usize = 0,
+    sum: i64 = 0,
+
+    pub const Aggregate = struct {
+        pub const identity: CheckedTestWeight = .{};
+        pub fn merge(a: CheckedTestWeight, b: CheckedTestWeight) error{Overflow}!CheckedTestWeight {
+            return .{
+                .n = try std.math.add(usize, a.n, b.n),
+                .sum = try std.math.add(i64, a.sum, b.sum),
+            };
+        }
+        pub fn sub(a: CheckedTestWeight, b: CheckedTestWeight) error{Overflow}!CheckedTestWeight {
+            return .{
+                .n = try std.math.sub(usize, a.n, b.n),
+                .sum = try std.math.sub(i64, a.sum, b.sum),
+            };
+        }
+        pub fn itemCount(a: CheckedTestWeight) usize {
+            return a.n;
+        }
+        pub fn eql(a: CheckedTestWeight, b: CheckedTestWeight) bool {
+            return a.n == b.n and a.sum == b.sum;
+        }
+    };
+};
+
+test "late ancestor overflow refuses a point update without partial publication" {
+    const max = std.math.maxInt(i64);
+    var idx = try BitIndex(CheckedTestWeight).fromWeights(testing.allocator, &.{
+        .{ .n = 1 }, .{ .n = 1 }, .{ .n = 1, .sum = max }, .{ .n = 1 },
+    });
+    defer idx.deinit();
+    // Only the final ancestor overflows; earlier computed replacements fit.
+    try testing.expectError(error.Overflow, idx.updateSlab(0, .{ .n = 1, .sum = 1 }));
+    try testing.expectEqual(CheckedTestWeight{ .n = 1 }, idx.weights.items[0]);
+    try testing.expectEqual(@as(usize, 4), try idx.itemsBefore(4));
+    try testing.expectEqual(SlabPos{ .slab = 3, .offset = 0 }, try idx.findSlab(3));
+    // A later representable update succeeds only if the refused operation
+    // did not leave an extra contribution in any ancestor.
+    try idx.updateSlab(2, .{ .n = 1, .sum = max - 1 });
+    try idx.updateSlab(0, .{ .n = 1, .sum = 1 });
+}
+
+test "a refused aggregate rebuild preserves the source and published tree" {
+    const gpa = testing.allocator;
+    const before = [_]CheckedTestWeight{ .{ .n = 2, .sum = 3 }, .{ .n = 4, .sum = 5 } };
+    var bit = try Fenwick(CheckedTestWeight).init(gpa);
+    defer bit.deinit();
+    try bit.rebuild(gpa, &before);
+    const source = [_]CheckedTestWeight{
+        .{ .n = 1, .sum = std.math.maxInt(i64) }, .{ .n = 1, .sum = 1 },
+    };
+    try testing.expectError(
+        error.Overflow,
+        bit.rebuildFrom(gpa, @as([]const CheckedTestWeight, &source), source.len, weightOfSlice(CheckedTestWeight)),
+    );
+    try testing.expectEqual(@as(usize, 2), bit.len());
+    try testing.expectEqual(@as(usize, 2), try bit.prefixQuery(1));
+    try testing.expectEqual(@as(usize, 6), try bit.prefixQuery(2));
+    try testing.expectEqual(SlabPos{ .slab = 1, .offset = 3 }, try bit.findSlab(5));
+    try testing.expectEqual(std.math.maxInt(i64), source[0].sum);
+    try testing.expectEqual(@as(i64, 1), source[1].sum);
+    // Subsequent updates also observe the original aggregate, not a partial
+    // candidate from the refused reader-driven rebuild.
+    try bit.pointUpdate(1, before[1], .{ .n = 4, .sum = 6 });
+}
+
+test "prepared point updates can abort or publish without allocation" {
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    const before = [_]Bytes{ .{ .n = 2 }, .{ .n = 3 }, .{ .n = 4 } };
+    var bit = try Fenwick(Bytes).init(gpa);
+    defer bit.deinit();
+    try bit.rebuild(gpa, &before);
+    // Refuse any allocation from here on: preparation and publication must
+    // both work with the index's existing storage.
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    const abandoned = try bit.preparePointUpdate(1, before[1], .{ .n = 6 });
+    _ = abandoned;
+    try testing.expectEqual(@as(usize, 9), try bit.prefixQuery(3));
+    try testing.expectEqual(SlabPos{ .slab = 2, .offset = 0 }, try bit.findSlab(5));
+    const prepared = try bit.preparePointUpdate(1, before[1], .{ .n = 1 });
+    try testing.expectEqual(@as(usize, 9), try bit.prefixQuery(3));
+    bit.publishPointUpdate(&prepared);
+    try testing.expectEqual(@as(usize, 7), try bit.prefixQuery(3));
+    try testing.expectEqual(SlabPos{ .slab = 2, .offset = 0 }, try bit.findSlab(3));
+}
+
+test "refused point update preparation leaves the index available for later publication" {
+    const before = [_]Bytes{ .{ .n = 1 }, .zero, .{ .n = std.math.maxInt(usize) - 1 } };
+    var bit = try Fenwick(Bytes).init(testing.allocator);
+    defer bit.deinit();
+    try bit.rebuild(testing.allocator, &before);
+    try testing.expectError(error.Overflow, bit.preparePointUpdate(0, before[0], .{ .n = 2 }));
+    try testing.expectEqual(std.math.maxInt(usize), try bit.prefixQuery(3));
+    const prepared = try bit.preparePointUpdate(0, before[0], .zero);
+    bit.publishPointUpdate(&prepared);
+    try testing.expectEqual(std.math.maxInt(usize) - 1, try bit.prefixQuery(3));
+    try testing.expectEqual(SlabPos{ .slab = 2, .offset = 0 }, try bit.findSlab(0));
 }
 
 // Zig 0.16.0 / upstream / Rust / port

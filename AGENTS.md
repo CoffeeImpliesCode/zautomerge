@@ -93,6 +93,11 @@ upstream behaviour *executed*, extend the oracle crate.
   re-saves each one, and also returns an independently built Rust save. The
   port compares both normalized bodies. It reads no committed file and needs
   the oracle and reference checkout, so it is a step rather than a test.
+- `zig build ctest-shared` links a C consumer against a separate dynamic
+  production library and checks all 18 corpus outcomes. Each valid document
+  exercises save/reload, transaction commit, and bidirectional encoded sync.
+  It requires libc, but not cmocka or the Rust reference. The default installed
+  C artifact remains static.
 - Every test root runs through `test/verification_runner.zig`. It speaks the
   build runner's own `std.zig.Server` protocol message for message, so the
   counts in `Build Summary: N/M tests passed` and the per-case

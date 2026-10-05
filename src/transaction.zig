@@ -1,108 +1,11 @@
-//! The manual door: a transaction the caller opens, writes through, and
-//! finishes.
+//! Manual transactions, owned commit logs, closure outcomes and in-place ownership.
 //!
-//! Upstream is four files, and this is the two of them that are about
-//! *finishing* a transaction rather than about making the operations in it:
-//!
-//! | what | upstream |
-//! |------|----------|
-//! | `Transaction<'a>`, `commit`, `commit_with`, `rollback`, `Drop` | [`transaction/manual_transaction.rs:20-145`](../../github-automerge-automerge/rust/automerge/src/transaction/manual_transaction.rs) |
-//! | `commit_transaction`, `Result<O, E>` | [`transaction.rs:18-31`](../../github-automerge-automerge/rust/automerge/src/transaction.rs), [`:16`](../../github-automerge-automerge/rust/automerge/src/transaction.rs) |
-//! | `CommitOptions` and its four builders | [`transaction/commit.rs:1-34`](../../github-automerge-automerge/rust/automerge/src/transaction/commit.rs) |
-//! | `Success<O>`, `Failure<E>` | [`transaction/result.rs:4-21`](../../github-automerge-automerge/rust/automerge/src/transaction/result.rs) |
-//! | `Automerge::transact`, `transact_with`, `transact_with_impl` | [`automerge.rs:584-629`](../../github-automerge-automerge/rust/automerge/src/automerge.rs) |
-//!
-//! The bodies of the operations are [`transact.zig`](transact.zig)'s. This
-//! file reimplements none of them, and its last section says which method of
-//! `API.md`'s `## Write` cannot be reached from here and why.
-//!
-//! # `transaction.rs` declares no trait, and neither does this file
-//!
-//! Upstream's `transaction.rs` is a **module root**: seven `mod` lines, four
-//! re-exports, a `Result` alias, one private function and two `macro_rules!`
-//! ([`transaction.rs:1-31`](../../github-automerge-automerge/rust/automerge/src/transaction.rs),
-//! [`:36-528`](../../github-automerge-automerge/rust/automerge/src/transaction.rs)).
-//! There is no `Transaction` trait. The two macros — which *are* the `ReadDoc`
-//! and `Transactable` implementations for two types, and so are public API —
-//! are the only thing `transaction.rs` "declares". Upstream therefore reaches
-//! one write surface through two types and two macro expansions; this port
-//! reaches one through one type and a [`Mode`](doc.zig) flag, and the flavour
-//! is checked where the caller walks through the door.
-//!
-//! # `transact.Transaction` *is* the manual transaction, and is not wrapped
-//!
-//! Upstream has two types here.
-//! [`TransactionInner`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):22-33
-//! is the state and every write body; [`Transaction<'a>`](../../github-automerge-automerge/rust/automerge/src/transaction/manual_transaction.rs):21-27
-//! is `Option<TransactionInner>` plus `&'a mut Automerge`, and it exists for
-//! two reasons: the borrow has to be held somewhere, and the `Option` is what
-//! lets `commit`, `rollback` and `Drop` each apply exactly once.
-//!
-//! **This port's [`transact.Transaction`](transact.zig) is both of those at
-//! once** — it holds the `*Document`, and its `closed` flag
-//! ([`transact.zig:315-319`](transact.zig)) stands in for the `Option`. A
-//! wrapper here would be twenty forwarding methods and a second name for each,
-//! which is the defect [`docs/STATUS.md`](../docs/STATUS.md) records as the
-//! port's most transferable lesson. So this file **re-exports** the type and
-//! adds what `transact.zig` deliberately does not own:
-//!
-//! * [`CommitOptions`], [`Success`], [`Failure`] and [`Outcome`], which are
-//!   [`transaction.rs`](../../github-automerge-automerge/rust/automerge/src/transaction.rs)'s
-//!   own vocabulary and appear nowhere else in the port;
-//! * [`enclose`] and [`encloseWith`], the closure form, which is the one way
-//!   upstream reaches a manual transaction through a function rather than
-//!   through a value;
-//! * [`abort`], the `Drop` rule made explicit, because Zig has no `Drop`;
-//! * [`commitWith`], the commit path, and the one place where this port and
-//!   upstream part company — see its own doc comment;
-//! * the accessors [`actorId`], [`maxOp`], [`heads`], [`hashForOpid`],
-//!   [`changeMeta`], [`depIndices`] and [`authorFooter`].
-//!
-//! # The two decisions this file inherits
-//!
-//! **A pending operation is [`opmod.TxOp`](opset/op.zig) and nothing else**,
-//! because a rollback needs the row, the successor edges and the register
-//! range, and a `ChangeOp` carries none of the three
-//! ([`inner.rs:22-33`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs),
-//! [`op_set.rs:246-257`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)).
-//! **The transaction writes rows as it goes; `commit` only encodes and links**
-//! ([`inner.rs:308-328`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)),
-//! so every operation [`enclose`] produces is already a row in the document
-//! before [`commitWith`] is reached — and the test
-//! `test "the commit path on a manual document: the change's bytes hash to the
-//! hash commit returned, and the transaction's operations are the document's"`
-//! is the one that would catch a re-introduced duplicate splice.
-//!
-//! # The commit path, and the one place the port is visibly different
-//!
-//! Upstream's `commit_impl` exports **this transaction's** pending operations
-//! and links the change built from them
-//! ([`inner.rs:157-170`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)),
-//! and `export` resolves **this transaction's** `deps`
-//! ([`inner.rs:197-207`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)).
-//! `Document.commit` uses the transaction's original actor, sequence, start
-//! counter and dependencies. `commitWith` temporarily installs its read scope
-//! for patch generation; it does not re-derive change metadata.
-//!
-//! # Ownership
-//!
-//! * [`enclose`], [`encloseWith`] and [`heads`] take the allocator the caller
-//!   funds. [`commitWith`] takes **none**, because
-//!   [`Document.integrate`](doc.zig) frees the isolation with
-//!   [`Document.gpa`](doc.zig) and a caller cannot fund a buffer this
-//!   document will free.
-//! * [`heads`], [`depIndices`] and [`authorFooter`] return **caller-owned**
-//!   arrays; the caller frees them with the allocator it was given.
-//! * [`changeMeta`] **allocates nothing**. Its `message` borrows the
-//!   transaction's own borrowed message and is valid until
-//!   [`Transaction.deinit`](transact.zig); its `footer` is empty and
-//!   [`authorFooter`] is the separate upstream function that fills it.
-//! * The lifecycle — [`commitWith`], [`abort`] — makes no allocation.
-//!   [`Transaction.deinit`](transact.zig) is still the one free, and it still
-//!   does **not** roll back
-//!   ([`transact.zig:349-353`](transact.zig)): upstream's `Drop` does
-//!   ([`manual_transaction.rs:135-145`](../../github-automerge-automerge/rust/automerge/src/transaction/manual_transaction.rs)),
-//!   and [`abort`] is how a Zig caller says which.
+//! `Transaction` is the existing operation journal from `transact.zig`; this
+//! module does not implement a second write engine. Commit results own their
+//! patch log. Closure failures preserve the primary callback or commit error
+//! separately from rollback failure and transfer the journal only when recovery
+//! is required. `OwnedTransaction` must stay at its initialized address until
+//! commit, rollback or disposal returns successfully.
 
 const std = @import("std");
 
@@ -131,19 +34,8 @@ const testing = std.testing;
 
 // ── The vocabulary `transaction.rs` owns ─────────────────────────────────────
 
-/// The manual transaction: upstream's `Transaction<'a>`
-/// ([`manual_transaction.rs:21-27`](../../github-automerge-automerge/rust/automerge/src/transaction/manual_transaction.rs))
-/// and its [`TransactionInner`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs):22-33
-/// in one type, which is what [`transact.zig`](transact.zig) already has.
-///
-/// **The door is [`Transaction.open`](transact.zig)**, and it refuses a
-/// document in [`Mode.auto`](doc.zig) with `error.InvalidOp`. An isolated
-/// transaction is [`Transaction.openAt`](transact.zig), which is upstream's
-/// `Automerge::transaction_at`
-/// ([`automerge.rs:501-509`](../../github-automerge-automerge/rust/automerge/src/automerge.rs))
-/// and, through it, `isolate_actor`
-/// ([`:1259-1281`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
-/// which this port is [`Document.isolatedActorIndex`](doc.zig).
+/// The borrowed-document journal. Open it, write through it, then commit or
+/// roll back. Fallible disposal rolls back an unfinished journal.
 pub const Transaction = transact.Transaction;
 
 /// Everything a write through this file can raise.
@@ -215,55 +107,131 @@ pub const CommitOptions = struct {
     }
 };
 
-/// A committed transaction's result
-/// ([`Success<O>`](../../github-automerge-automerge/rust/automerge/src/transaction/result.rs):6-12).
-///
-/// The document retains its patch log; this result owns only `result`.
-/// Disposal of `result` follows `O`'s contract.
+/// A terminal commit transfers its log even when no operations were written.
+/// This is one owner: copying it does not clone the log.
+pub const CommitResult = struct {
+    hash: ?ChangeHash,
+    patch_log: @import("patches.zig").PatchLog,
+
+    /// Releases the owned log; `gpa` is retained for uniform result disposal.
+    pub fn deinit(self: *CommitResult, gpa: Allocator) void {
+        _ = gpa;
+        self.patch_log.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Owns the callback result and committed log, including a no-write success.
+/// The caller disposes `result` according to O and `patch_log` exactly once.
 pub fn Success(comptime O: type) type {
     return struct {
-        /// Whatever the closure returned.
         result: O,
-        /// The hash of the change this transaction committed, or null when it
-        /// wrote no operations
-        /// ([`result.rs:9-10`](../../github-automerge-automerge/rust/automerge/src/transaction/result.rs)).
         hash: ?ChangeHash,
+        patch_log: @import("patches.zig").PatchLog,
     };
 }
 
-/// Body or commit refusal, with rollback progress and recovery ownership.
-/// `err` always names the primary refusal; `rollback_error` never replaces it.
-/// If rollback fails, this value owns `transaction`. Retry its rollback and
-/// dispose it exactly once before disposing or mutating the borrowed document.
-/// `result` is the body's owned result when only commit failed, otherwise null.
-pub fn Failure(comptime O: type) type {
+/// Primary refusal and its recovery resources. On failed rollback, only
+/// `transaction` owns the log; otherwise `patch_log` owns the returned log.
+/// A successful callback result survives a subsequent commit refusal.
+pub fn Failure(comptime O: type, comptime E: type) type {
     return struct {
-        /// Primary body or commit error.
-        err: TransactionError,
-        /// Operations successfully undone, including partial rollback progress.
+        err: (E || TransactionError),
         cancelled: usize,
-        /// Secondary rollback refusal, or null after complete rollback.
         rollback_error: ?TransactionError = null,
-        /// Recovery owner after rollback refusal; null on complete rollback.
         transaction: ?Transaction = null,
-        /// Body result retained after a refused commit; dispose as required by O.
         result: ?O = null,
+        patch_log: @import("patches.zig").PatchLog,
     };
 }
 
-/// What [`enclose`] answers: upstream's
-/// `Result<O, E> = Result<Success<O>, Failure<E>>`
-/// ([`transaction.rs:16`](../../github-automerge-automerge/rust/automerge/src/transaction.rs)),
-/// as a tagged union, because an error union cannot carry a value and the whole
-/// point of this form is that it does.
-pub fn Outcome(comptime O: type) type {
+/// Callback success or refusal with independently owned recovery resources.
+pub fn Outcome(comptime O: type, comptime E: type) type {
     return union(enum) {
-        /// The closure returned; the transaction committed.
         success: Success(O),
-        /// Body or commit refused; inspect rollback progress and recovery owner.
-        failure: Failure(O),
+        failure: Failure(O, E),
     };
 }
+
+/// Owns a raw document and the same transaction journal used by borrowed
+/// transactions. Initialize at the final address and do not copy or move while
+/// open. All ReadDoc and Transactable operations are exposed by `transaction`.
+pub const OwnedTransaction = struct {
+    transaction: Transaction,
+    document: Document,
+    owns_document: bool,
+
+    pub const Committed = struct { document: Document, result: CommitResult };
+    pub const RolledBack = struct {
+        document: Document,
+        cancelled: usize,
+        patch_log: @import("patches.zig").PatchLog,
+    };
+
+    /// Consumes `doc` only after open succeeds. Refusal leaves `doc` untouched
+    /// and `self` uninitialized. `heads == null` selects the current scope.
+    pub fn init(self: *OwnedTransaction, gpa: Allocator, doc: *Document, at: ?[]const ChangeHash) TransactionError!void {
+        const tx = try Transaction.openAt(gpa, doc, at);
+        self.adoptOpened(doc, tx);
+    }
+
+    /// Consumes both `doc` and `log` only after logged opening succeeds.
+    /// Refusal preserves both source owners and leaves `self` uninitialized.
+    /// `at == null` selects the current scope; initialize at the final address.
+    pub fn initWithPatchLog(
+        self: *OwnedTransaction,
+        gpa: Allocator,
+        doc: *Document,
+        log: *@import("patches.zig").PatchLog,
+        at: ?[]const ChangeHash,
+    ) TransactionError!void {
+        const tx = try Transaction.openWithPatchLog(gpa, doc, log, at);
+        self.adoptOpened(doc, tx);
+    }
+
+    fn adoptOpened(self: *OwnedTransaction, doc: *Document, tx: Transaction) void {
+        self.* = .{ .transaction = tx, .document = doc.*, .owns_document = true };
+        self.transaction.doc = &self.document;
+        doc.* = undefined;
+    }
+
+    /// Transfers the document and log on success; refusal retains this owner.
+    pub fn commit(self: *OwnedTransaction, options: CommitOptions) TransactionError!Committed {
+        if (!self.owns_document) return error.InvalidOp;
+        const result = try self.transaction.commitWith(options);
+        self.transaction.deinitClosed();
+        self.owns_document = false;
+        return .{ .document = self.document, .result = result };
+    }
+
+    /// Transfers the restored document and log. Failed rollback retains this
+    /// owner, including partial progress, for retry.
+    pub fn rollback(self: *OwnedTransaction) TransactionError!RolledBack {
+        if (!self.owns_document) return error.InvalidOp;
+        const cancelled = try self.transaction.rollback();
+        const log = self.transaction.takePatchLog();
+        self.transaction.deinitClosed();
+        self.owns_document = false;
+        return .{ .document = self.document, .cancelled = cancelled, .patch_log = log };
+    }
+
+    /// Rolls back before destroying the document. Refusal retains all ownership.
+    pub fn deinit(self: *OwnedTransaction) TransactionError!void {
+        if (!self.owns_document) return;
+        try self.transaction.deinit();
+        self.document.deinit();
+        self.owns_document = false;
+    }
+
+    /// Destroys the entire owned raw document, so no unfinished journal survives.
+    /// After a terminal transfer this is a no-op.
+    pub fn deinitClosed(self: *OwnedTransaction) void {
+        if (!self.owns_document) return;
+        self.transaction.deinitClosed();
+        self.document.deinit();
+        self.owns_document = false;
+    }
+};
 
 // ── The accessors ────────────────────────────────────────────────────────────
 
@@ -364,7 +332,7 @@ pub fn actorId(tx: *const Transaction) ?ActorId {
 /// `closed` is true in all three spent states and false in every live one.
 ///
 /// **A caller who wants the other two rows reads them.** After a commit the
-/// hash [`commitWith`] returned names the change, and `change.max_op` is its
+/// hash `Transaction.commitWith` returned names the change, and `change.max_op` is its
 /// answer; [`ChangeGraph.maxOp`](change_graph.zig) is the document's.
 ///
 /// **Not everything on this door refuses when it is closed, and
@@ -403,36 +371,11 @@ pub fn heads(gpa: Allocator, tx: *const Transaction) Error![]ChangeHash {
 /// ([`Transaction::hash_for_opid`](../../github-automerge-automerge/rust/automerge/src/transaction/manual_transaction.rs):44-46,
 /// over [`Automerge::hash_for_opid`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):1554-1567).
 ///
-/// Null for the three cases upstream lists
-/// ([`manual_transaction.rs:41-43`](../../github-automerge-automerge/rust/automerge/src/transaction/manual_transaction.rs)):
-/// the root object id, an id the document does not hold, and **an operation
-/// this transaction has written and not yet committed** — which is the third
-/// of the three and the one only the manual door reaches.
-///
-/// **This is upstream's own call, and it is a delegation.**
-/// [`Automerge::hash_for_opid`](../../github-automerge-automerge/rust/automerge/src/automerge.rs):1559-1567
-/// is the `ExId::Root` arm and then `self.change_graph.opid_to_hash(opid)`
-/// (`:1563-1564`), and [`ChangeGraph::opid_to_hash`](../../github-automerge-automerge/rust/automerge/src/change_graph.rs):300-318
-/// binary-searches `seq_index[actor]` for the change whose
-/// `[start_op, max_op]` holds the counter. This port's
-/// [`ChangeGraph.opidToHash`](change_graph.zig) **is** that function, already
-/// `pub` and already the port of `change_graph.rs:300-320`, so this is the same
-/// answer the reference gives at the same cost: **`O(log` changes by that
-/// actor)`, not `O(changes in the document)`.**
-///
-/// **It used to walk the node table**, and the reason is worth keeping: this
-/// file was written before `opidToHash` had a `pub` door, so it reimplemented
-/// the interval test over `nodes` — `O(C)` in the whole graph, where `C` is
-/// every change the document has ever seen rather than the ones this actor
-/// wrote. The two agree on every counter because both reduce to "the node whose
-/// `[start_op, max_op]` contains the counter, and there is at most one", which
-/// is why the rewiring changes no answer. The test
-/// `test "hashForOpid answers a many-change document as the graph's own
-/// interval query does, and answers every null upstream lists"` is the witness
-/// that they still agree, over two hundred changes and two alternating actors.
+/// Null for the root, an unknown id, or an operation written but not committed.
+/// Delegates to the document's indexed historical lookup. Compact actor indices
+/// are document-local; named ids repair cached slots through their actor bytes.
 pub fn hashForOpid(tx: *const Transaction, id: ExId) ?ChangeHash {
-    const op = id.opId() orelse return null; // ExId::Root
-    return tx.doc.graph.opidToHash(op);
+    return tx.doc.hashForOpid(id);
 }
 
 /// This transaction's dependencies as **node indices**, **caller-owned** and
@@ -531,151 +474,107 @@ pub fn authorFooter(gpa: Allocator, tx: *const Transaction) Allocator.Error![]u8
 
 // ── Finishing ────────────────────────────────────────────────────────────────
 
-/// Commits what this transaction has done, with `options`
-/// ([`Transaction::commit_with`](../../github-automerge-automerge/rust/automerge/src/transaction/manual_transaction.rs):91-96).
-///
-/// **This was where the port and upstream parted company, and the parting is
-/// over.** Upstream exports *this transaction's* pending operations under
-/// *this transaction's* metadata
-/// ([`inner.rs:157-170`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs),
-/// [`:197-207`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs)),
-/// and [`Transaction.commit`](transact.zig) now hands those four facts to
-/// [`Document.commit`](doc.zig) rather than having the document re-derive
-/// them from `Document.isolation`.
-///
-/// **So the scope swap below is no longer what makes a scoped commit
-/// correct, and it is not what it was for.** It used to be the only thing
-/// standing between a scoped transaction and a change that named the wrong
-/// actor and the document refused to read back — and it was here because
-/// [`Document.commit`](doc.zig) could not be edited from this file. What
-/// remains is the part that is genuinely this function's: **it leaves the
-/// document's isolation exactly as it found it**, which
-/// [`Document.dropIsolation`](doc.zig) alone cannot promise.
-///
-/// **The document's own allocator, and no parameter for one**:
-/// [`Document.integrate`](doc.zig) frees the isolation with
-/// [`Document.gpa`](doc.zig), so a caller cannot fund those buffers.
-///
-/// **Null for a transaction that wrote nothing**, which is upstream's answer
-/// ([`inner.rs:135-142`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs))
-/// and not a degenerate case: an empty `put` writes no operation
-/// ([`op_set.rs:1489-1492`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)).
-/// Such a transaction never reaches the scope handling at all, because there
-/// is nothing for the scope to be applied to and upstream returns before
-/// `commit_impl` too.
-pub fn commitWith(tx: *Transaction, options: CommitOptions) TransactionError!?ChangeHash {
-    if (tx.scope_heads == null and tx.doc.isolationHeads() == null) {
-        return tx.commit(options.message, options.time);
-    }
-    if (tx.pending.items.len == 0) {
-        return tx.commit(options.message, options.time);
-    }
-
-    const doc = tx.doc;
-    const gpa = doc.gpa;
-    const saved: ?[]ChangeHash = blk: {
-        const at = doc.isolationHeads() orelse break :blk null;
-        break :blk try gpa.dupe(ChangeHash, at);
-    };
-    // **`dropIsolation`, not `integrate`, on both sides of the swap** — this is
-    // a scope swap and not a caller's isolate/integrate round trip. Upstream
-    // has no such dance (`AutoCommit` scopes a transaction when it opens it,
-    // `autocommit.rs:447`, rather than rewinding the document to do it), so
-    // there is no upstream `patch_to` here to mirror and routing it through
-    // [`Document.integrate`](doc.zig) would put a spurious view transition
-    // into the log of every isolated commit. The `try doc.isolate` below is
-    // still [`Document.isolate`](doc.zig) and still replays a transition: that
-    // one *is* a caller-visible scope change.
-    doc.dropIsolation();
-    defer {
-        doc.dropIsolation();
-        if (saved) |back| doc.isolation = back;
-    }
-    if (tx.scope_heads) |at| try doc.isolate(gpa, at);
-    return tx.commit(options.message, options.time);
-}
-
-/// Idempotent rollback: closed transactions are unchanged.
-/// On refusal, retry before disposal. Unlike Rust's `Drop`, disposal does not
-/// imply rollback (`manual_transaction.rs:135-145`). Dispose after abort:
-/// `defer tx.deinit();` then an explicit fallible `abort(&tx)` before return.
+/// Idempotent explicit rollback; refusal retains the journal for retry.
 pub fn abort(tx: *Transaction) TransactionError!void {
     if (tx.closed) return;
     _ = try tx.rollback();
 }
 
-/// Runs `body` synchronously on the calling thread. The context and document
-/// remain borrowed through return. `body` may use the supplied transaction;
-/// it must not reenter the document through another write entry point or retain
-/// the transaction pointer. A manual-mode document is required.
-///
-/// Success commits. Body or commit refusal returns `Outcome.failure` without
-/// losing the primary error. Complete rollback disposes the transaction;
-/// rollback refusal transfers it to the failure result for caller recovery.
-/// Opening the transaction can itself return an error without invoking `body`.
-/// Pending native automatic recovery is refused with `error.InvalidOp` before
-/// `body` runs; finish it through `Document.recoverAuto` first.
-/// Upstream closure contract: `automerge.rs:603-629`.
-pub fn enclose(
-    comptime O: type,
-    gpa: Allocator,
-    doc: *Document,
-    ctx: anytype,
-    body: *const fn (@TypeOf(ctx), *Transaction) TransactionError!O,
-) TransactionError!Outcome(O) {
+fn BodyError(comptime B: type) type {
+    const F = switch (@typeInfo(B)) {
+        .pointer => |p| p.child,
+        .@"fn" => B,
+        else => @compileError("body must be fn(ctx, *Transaction) E!O"),
+    };
+    const R = @typeInfo(F).@"fn".return_type.?;
+    return @typeInfo(R).error_union.error_set;
+}
+
+/// Runs `body(ctx, tx)` synchronously without reentrancy. The callback pointer
+/// and context are borrowed for the call, and any callback error is preserved.
+/// Opening errors return directly without invoking the callback.
+pub fn enclose(comptime O: type, gpa: Allocator, doc: *Document, ctx: anytype, body: anytype) TransactionError!Outcome(O, BodyError(@TypeOf(body))) {
     return encloseWith(O, gpa, doc, ctx, body, null);
 }
 
-/// `enclose`, with options derived synchronously after body success and before
-/// commit, on the calling thread. Null selects `CommitOptions.none`.
-/// The callback borrows `ctx` and `result` only during the call; it must not
-/// mutate/reenter the document. Message bytes must remain live through commit.
+/// Derives options from a borrowed result on the calling thread; null selects
+/// no metadata. Neither callback may retain the transaction/result pointer or
+/// reenter the document. Message bytes must stay live until commit returns.
 pub fn encloseWith(
     comptime O: type,
     gpa: Allocator,
     doc: *Document,
     ctx: anytype,
-    body: *const fn (@TypeOf(ctx), *Transaction) TransactionError!O,
-    options: ?*const fn (@TypeOf(ctx), O) CommitOptions,
-) TransactionError!Outcome(O) {
+    body: anytype,
+    options: ?*const fn (@TypeOf(ctx), *const O) CommitOptions,
+) TransactionError!Outcome(O, BodyError(@TypeOf(body))) {
     var tx = try Transaction.open(gpa, doc);
-    var transferred = false;
-    defer if (!transferred) tx.deinit();
-    const result = body(ctx, &tx) catch |primary| {
-        const cancelled = tx.rollback() catch |secondary| {
-            transferred = true;
-            return .{ .failure = .{
-                .err = primary,
-                .cancelled = tx.cancelled,
-                .rollback_error = secondary,
-                .transaction = tx,
-            } };
-        };
-        return .{ .failure = .{ .err = primary, .cancelled = cancelled } };
+    return closeOpened(O, &tx, ctx, body, options);
+}
+
+/// Logged closure form; `log` transfers only after opening succeeds.
+/// Callback lifetime, error and recovery rules are identical to `encloseWith`.
+pub fn encloseWithPatchLog(
+    comptime O: type,
+    gpa: Allocator,
+    doc: *Document,
+    log: *@import("patches.zig").PatchLog,
+    ctx: anytype,
+    body: anytype,
+    options: ?*const fn (@TypeOf(ctx), *const O) CommitOptions,
+) TransactionError!Outcome(O, BodyError(@TypeOf(body))) {
+    var tx = try Transaction.openWithPatchLog(gpa, doc, log, null);
+    return closeOpened(O, &tx, ctx, body, options);
+}
+
+fn closeOpened(
+    comptime O: type,
+    tx: *Transaction,
+    ctx: anytype,
+    body: anytype,
+    options: ?*const fn (@TypeOf(ctx), *const O) CommitOptions,
+) Outcome(O, BodyError(@TypeOf(body))) {
+    const result: O = body(ctx, tx) catch |primary| {
+        return rollbackFailure(O, BodyError(@TypeOf(body)), tx, primary, null);
     };
-    const opts = if (options) |derive| derive(ctx, result) else CommitOptions.none;
-    const hash = commitWith(&tx, opts) catch |primary| {
-        const cancelled = tx.rollback() catch |secondary| {
-            transferred = true;
-            return .{ .failure = .{
-                .err = primary,
-                .cancelled = tx.cancelled,
-                .rollback_error = secondary,
-                .transaction = tx,
-                .result = result,
-            } };
-        };
-        return .{ .failure = .{ .err = primary, .cancelled = cancelled, .result = result } };
+    const opts = if (options) |derive| derive(ctx, &result) else CommitOptions.none;
+    const committed = tx.commitWith(opts) catch |primary| {
+        return rollbackFailure(O, BodyError(@TypeOf(body)), tx, primary, result);
     };
-    return .{ .success = .{ .result = result, .hash = hash } };
+    tx.deinitClosed();
+    return .{ .success = .{
+        .result = result,
+        .hash = committed.hash,
+        .patch_log = committed.patch_log,
+    } };
+}
+
+fn rollbackFailure(comptime O: type, comptime E: type, tx: *Transaction, primary: (E || TransactionError), result: ?O) Outcome(O, E) {
+    const cancelled = tx.rollback() catch |secondary| {
+        return .{ .failure = .{
+            .err = primary,
+            .cancelled = tx.cancelled,
+            .rollback_error = secondary,
+            .transaction = tx.*,
+            .result = result,
+            .patch_log = @import("patches.zig").PatchLog.inactive(tx.gpa),
+        } };
+    };
+    const log = tx.takePatchLog();
+    tx.deinitClosed();
+    return .{ .failure = .{
+        .err = primary,
+        .cancelled = cancelled,
+        .result = result,
+        .patch_log = log,
+    } };
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
-/// A document in [`Mode.manual`] with a fixed actor, which is the only flavour
-/// [`Transaction.open`](transact.zig) accepts.
+/// A raw document with a deterministic actor for transaction tests.
 fn manual(gpa: Allocator) !Document {
-    var doc = try Document.init(gpa, std.testing.io, .manual);
+    var doc = try Document.init(gpa, std.testing.io);
     errdefer doc.deinit();
     doc.setActorId(.{ .bytes = "0123456789abcdef" });
     return doc;
@@ -690,9 +589,12 @@ fn commitPut(
     value: ScalarValue,
 ) !ChangeHash {
     var tx = try Transaction.open(gpa, doc);
-    defer tx.deinit();
+    // Helpers require their caller to destroy the raw document on error.
+    defer tx.deinitClosed();
     _ = try tx.put(.root, .{ .key = key }, value);
-    return (try commitWith(&tx, CommitOptions.none)).?;
+    var committed = try tx.commitWith(CommitOptions.none);
+    defer committed.deinit(gpa);
+    return committed.hash.?;
 }
 
 /// Every one of this transaction's queued operations, read back out of the
@@ -762,7 +664,8 @@ test "the commit path on a manual document: the change's bytes hash to the hash 
     defer doc.deinit();
 
     var tx = try Transaction.open(gpa, &doc);
-    defer tx.deinit();
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer tx.deinit() catch unreachable;
     const rows_at_open = doc.ops.len();
 
     _ = try tx.put(.root, .{ .key = "name" }, .{ .str = "ada" });
@@ -805,7 +708,9 @@ test "the commit path on a manual document: the change's bytes hash to the hash 
     const max_op = try maxOp(&tx);
     try testing.expectEqual(@as(u64, 16), max_op);
 
-    const hash = (try commitWith(&tx, CommitOptions.none.withMessage("m").withTime(7))).?;
+    var committed_result = try tx.commitWith(CommitOptions.none.withMessage("m").withTime(7));
+    defer committed_result.deinit(gpa);
+    const hash = committed_result.hash.?;
     try testing.expectEqual(@as(usize, 0), tx.pending.items.len);
 
     // **The commit linked a change and spliced nothing.** A re-introduced
@@ -858,13 +763,16 @@ test "the committed change survives a save and a load with the same bytes" {
     defer doc.deinit();
 
     var tx = try Transaction.open(gpa, &doc);
-    defer tx.deinit();
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer tx.deinit() catch unreachable;
     _ = try tx.put(.root, .{ .key = "k" }, .{ .str = "v" });
     const list = try tx.putObject(.root, .{ .key = "l" }, .list);
     _ = try tx.insert(list, 0, .{ .int = 7 });
     const text = try tx.putObject(.root, .{ .key = "t" }, .text);
     try tx.spliceText(text, 0, 0, "hi");
-    const hash = (try commitWith(&tx, CommitOptions.none.withMessage("m"))).?;
+    var committed_result = try tx.commitWith(CommitOptions.none.withMessage("m"));
+    defer committed_result.deinit(gpa);
+    const hash = committed_result.hash.?;
 
     var before = (try doc.getChangeByHash(gpa, hash)).?;
     defer before.deinit(gpa);
@@ -875,7 +783,7 @@ test "the committed change survives a save and a load with the same bytes" {
     // thing a commit can be held to that does not need the reference.
     const saved = try doc.save(gpa);
     defer gpa.free(saved);
-    var reloaded = try Document.load(gpa, std.testing.io, saved, doc.textEncoding(), .manual);
+    var reloaded = try Document.load(gpa, std.testing.io, saved, doc.textEncoding());
     defer reloaded.deinit();
 
     try reloaded.ops.debugCmp(&doc.ops);
@@ -902,14 +810,15 @@ test "a rollback on a manual document is checked against OpSet.debugCmp, not aga
     var text_row = try doc.ops.seekOpsByMapKey(gpa, .root, "t", null);
     defer text_row.deinit(gpa);
     const text = doc.ops.idToExid(text_row.ops.items[0].id());
-    var before = try doc.clone(gpa, .manual);
+    var before = try doc.clone(gpa);
     defer before.deinit();
     const before_rows = before.ops.len();
     const before_nodes = before.graph.len();
     const before_heads = before.graph.getHeads();
 
     var tx = try Transaction.open(gpa, &doc);
-    defer tx.deinit();
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer tx.deinit() catch unreachable;
     _ = try tx.put(.root, .{ .key = "gone" }, .{ .int = 1 });
     try tx.increment(.root, .{ .key = "hits" }, 1);
     _ = try tx.insert(list, 0, .{ .int = 99 });
@@ -956,7 +865,8 @@ test "a rollback on a manual document is checked against OpSet.debugCmp, not aga
 /// list. The objects the test needs after this are read out of the document.
 fn commitFixture(gpa: Allocator, doc: *Document) !ExId {
     var tx = try Transaction.open(gpa, doc);
-    defer tx.deinit();
+    // Helpers require their caller to destroy the raw document on error.
+    defer tx.deinitClosed();
     const list = try tx.putObject(.root, .{ .key = "l" }, .list);
     _ = try tx.insert(list, 0, .{ .int = 1 });
     _ = try tx.insert(list, 1, .{ .int = 2 });
@@ -964,7 +874,8 @@ fn commitFixture(gpa: Allocator, doc: *Document) !ExId {
     try tx.spliceText(text, 0, 0, "hello");
     try tx.mark(text, 1, 3, "em", .both, .{ .bool_value = true });
     _ = try tx.put(.root, .{ .key = "hits" }, .{ .counter = .init(5) });
-    _ = try commitWith(&tx, CommitOptions.none);
+    var committed_result = try tx.commitWith(CommitOptions.none);
+    defer committed_result.deinit(gpa);
     return list;
 }
 
@@ -977,7 +888,8 @@ test "an isolated transaction commits with its own dependencies and its own acto
     _ = try commitPut(gpa, &doc, "b", .{ .int = 2 });
 
     var tx = try Transaction.openAt(gpa, &doc, &.{first});
-    defer tx.deinit();
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer tx.deinit() catch unreachable;
 
     // **The heads moved on from the first change, so the two sets are different
     // sets.** That is the whole point of the case: an isolated transaction's
@@ -1010,7 +922,9 @@ test "an isolated transaction commits with its own dependencies and its own acto
     defer gpa.free(footer);
     try testing.expectEqual(@as(usize, 0), footer.len);
 
-    const hash = (try commitWith(&tx, CommitOptions.none)).?;
+    var committed_result = try tx.commitWith(CommitOptions.none);
+    defer committed_result.deinit(gpa);
+    const hash = committed_result.hash.?;
     try testing.expect(!hash.eql(first));
 
     // **The change names the isolation heads, not the document's**, and is
@@ -1061,10 +975,13 @@ test "a scoped transaction committed through the engine alone produces a change 
         _ = try commitPut(gpa, &doc, "b", .{ .int = 2 });
 
         var tx = try Transaction.openAt(gpa, &doc, &.{first});
-        defer tx.deinit();
+        // The testing allocator does not inject allocation failure during cleanup.
+        defer tx.deinit() catch unreachable;
         _ = try tx.put(.root, .{ .key = "iso" }, .{ .int = 3 });
 
-        const claimed = (try tx.commit(null, null)).?;
+        var committed_result = try tx.commit();
+        defer committed_result.deinit(gpa);
+        const claimed = committed_result.hash.?;
         // **Readable, and it names the transaction's own actor and the
         // isolation heads as its dependencies** — the two facts that used to
         // disagree with the rows the change carried.
@@ -1077,13 +994,8 @@ test "a scoped transaction committed through the engine alone produces a change 
         try testing.expect(built.change.actor.eql(author));
     }
 
-    // **And `commitWith` still produces a readable change with the
-    // transaction's own dependencies — and restores the document's isolation
-    // to what it was**, which is the part of it that is still its own and not
-    // a workaround. The readability used to be the reason the function
-    // existed; it is now a property of every commit
-    // ([`Transaction.commit`](transact.zig)), and this block is here to say
-    // the two paths still agree.
+    // Explicit commit options preserve the document's existing isolation and
+    // encode the journal's original actor and dependency heads.
 
     {
         var doc = try manual(gpa);
@@ -1093,9 +1005,12 @@ test "a scoped transaction committed through the engine alone produces a change 
         try doc.isolate(gpa, &.{first});
 
         var tx = try Transaction.openAt(gpa, &doc, &.{first});
-        defer tx.deinit();
+        // The testing allocator does not inject allocation failure during cleanup.
+        defer tx.deinit() catch unreachable;
         _ = try tx.put(.root, .{ .key = "iso" }, .{ .int = 3 });
-        const hash = (try commitWith(&tx, CommitOptions.none)).?;
+        var committed_result = try tx.commitWith(CommitOptions.none);
+        defer committed_result.deinit(gpa);
+        const hash = committed_result.hash.?;
 
         // **The document's isolation is what it was**, not the transaction's and
         // not nothing.
@@ -1127,10 +1042,10 @@ test "enclose commits on a returned value and rolls back on a raised one" {
     }.run;
 
     const derive = struct {
-        fn options(_: Ctx, result: i64) CommitOptions {
+        fn options(_: Ctx, result: *const i64) CommitOptions {
             var opts = CommitOptions{};
             opts.setMessage("from result");
-            opts.setTime(result);
+            opts.setTime(result.*);
             return opts;
         }
     }.options;
@@ -1139,9 +1054,10 @@ test "enclose commits on a returned value and rolls back on a raised one" {
         var doc = try manual(gpa);
         defer doc.deinit();
 
-        const ok = try encloseWith(i64, gpa, &doc, Ctx{ .key = "k", .value = 21, .fail = false }, body, derive);
+        var ok = try encloseWith(i64, gpa, &doc, Ctx{ .key = "k", .value = 21, .fail = false }, body, derive);
         switch (ok) {
-            .success => |s| {
+            .success => |*s| {
+                defer s.patch_log.deinit();
                 try testing.expectEqual(@as(i64, 42), s.result);
                 // **A hash, and the message and the time the options derived
                 // from the result.**
@@ -1156,21 +1072,25 @@ test "enclose commits on a returned value and rolls back on a raised one" {
         // **One change, and the two operations the closure wrote are in it.**
         try testing.expectEqual(@as(usize, 1), doc.graph.len());
         try testing.expectEqual(@as(usize, 2), doc.ops.len());
-        // **And the document is left with no transaction in it**, which is
-        // what upstream gets by moving the inner into `commit`.
-        try testing.expectEqual(@as(usize, 0), transact.pendingOps(&doc));
+        // A fresh journal is empty and the document remains writable.
+        var reopened = try Transaction.open(gpa, &doc);
+        // The testing allocator does not inject allocation failure during cleanup.
+        defer reopened.deinit() catch unreachable;
+        try testing.expectEqual(@as(usize, 0), reopened.count());
+        _ = try reopened.rollback();
     }
 
     {
         var doc = try manual(gpa);
         defer doc.deinit();
-        var before = try doc.clone(gpa, .manual);
+        var before = try doc.clone(gpa);
         defer before.deinit();
 
-        const bad = try enclose(i64, gpa, &doc, Ctx{ .key = "k", .value = 1, .fail = true }, body);
+        var bad = try enclose(i64, gpa, &doc, Ctx{ .key = "k", .value = 1, .fail = true }, body);
         switch (bad) {
             .success => return error.ExpectedFailure,
-            .failure => |f| {
+            .failure => |*f| {
+                defer f.patch_log.deinit();
                 try testing.expectEqual(error.InvalidValueType, f.err);
                 // **Both operations the closure wrote are cancelled.**
                 try testing.expectEqual(@as(usize, 2), f.cancelled);
@@ -1188,12 +1108,13 @@ test "abort is idempotent, and it is what a scope that can fail defers" {
     var doc = try manual(gpa);
     defer doc.deinit();
     _ = try commitPut(gpa, &doc, "a", .{ .int = 1 });
-    var before = try doc.clone(gpa, .manual);
+    var before = try doc.clone(gpa);
     defer before.deinit();
 
     {
         var tx = try Transaction.open(gpa, &doc);
-        defer tx.deinit();
+        // The testing allocator does not inject allocation failure during cleanup.
+        defer tx.deinit() catch unreachable;
         // **`abort` is deferred *after* `deinit`, so it runs first.** The order
         // of these two lines is the whole of the difference between a
         // transaction that gives its work back and one that leaks it into the
@@ -1210,9 +1131,11 @@ test "abort is idempotent, and it is what a scope that can fail defers" {
         // **Abort on a committed transaction is a no-op, and so is a second
         // abort.** That is the whole difference from `rollback`, which refuses.
         var tx = try Transaction.open(gpa, &doc);
-        defer tx.deinit();
+        // The testing allocator does not inject allocation failure during cleanup.
+        defer tx.deinit() catch unreachable;
         _ = try tx.put(.root, .{ .key = "b" }, .{ .int = 2 });
-        _ = try commitWith(&tx, CommitOptions.none);
+        var committed_result = try tx.commitWith(CommitOptions.none);
+        defer committed_result.deinit(gpa);
         try abort(&tx);
         try abort(&tx);
     }
@@ -1230,7 +1153,8 @@ test "maxOp is this transaction's last counter, one below its start when it has 
     defer doc.deinit();
 
     var tx = try Transaction.open(gpa, &doc);
-    defer tx.deinit();
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer tx.deinit() catch unreachable;
     try testing.expectEqual(@as(u64, 1), tx.start_op);
     // **An empty transaction's max op is one below its start**, which is the
     // value upstream's `change_meta` computes over an empty `pending`
@@ -1253,7 +1177,9 @@ test "maxOp is this transaction's last counter, one below its start when it has 
     // agree to the digit. Read after the commit the first of them is a read of
     // a spent transaction and refuses.
     const max_op = try maxOp(&tx);
-    const hash = (try commitWith(&tx, CommitOptions.none)).?;
+    var committed_result = try tx.commitWith(CommitOptions.none);
+    defer committed_result.deinit(gpa);
+    const hash = committed_result.hash.?;
     var built = (try doc.getChangeByHash(gpa, hash)).?;
     defer built.deinit(gpa);
     try testing.expectEqual(max_op, built.change.max_op);
@@ -1295,9 +1221,12 @@ test "maxOp refuses a closed transaction however it was closed, and a rollback i
     // transaction answers.
     {
         var tx = try Transaction.open(gpa, &doc);
-        defer tx.deinit();
+        // The testing allocator does not inject allocation failure during cleanup.
+        defer tx.deinit() catch unreachable;
         try testing.expectEqual(tx.start_op - 1, try maxOp(&tx));
-        try testing.expect((try commitWith(&tx, CommitOptions.none)) == null);
+        var committed_result = try tx.commitWith(CommitOptions.none);
+        defer committed_result.deinit(gpa);
+        try testing.expect(committed_result.hash == null);
         try testing.expectError(error.InvalidOp, maxOp(&tx));
         try testing.expectEqual(@as(usize, 0), doc.graph.len());
     }
@@ -1312,7 +1241,8 @@ test "maxOp refuses a closed transaction however it was closed, and a rollback i
     // apart, and this is the one that is not.
     {
         var tx = try Transaction.open(gpa, &doc);
-        defer tx.deinit();
+        // The testing allocator does not inject allocation failure during cleanup.
+        defer tx.deinit() catch unreachable;
         _ = try tx.put(.root, .{ .key = "a" }, .{ .int = 1 });
         try testing.expectEqual(tx.start_op, try maxOp(&tx));
         try testing.expectEqual(@as(usize, 1), try tx.rollback());
@@ -1332,7 +1262,8 @@ test "changeMeta and authorFooter predict the header and the footer the commit w
     try doc.setAuthor(gpa, "ada@example.com");
 
     var tx = try Transaction.open(gpa, &doc);
-    defer tx.deinit();
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer tx.deinit() catch unreachable;
     try testing.expectEqual(@as(u64, 1), tx.seq);
     _ = try tx.put(.root, .{ .key = "a" }, .{ .int = 1 });
     _ = try tx.put(.root, .{ .key = "b" }, .{ .int = 2 });
@@ -1346,7 +1277,9 @@ test "changeMeta and authorFooter predict the header and the footer the commit w
     // **The first change of an actor carries the author, and it is not empty.**
     try testing.expect(footer.len > 0);
 
-    const hash = (try commitWith(&tx, CommitOptions.none.withMessage("hello"))).?;
+    var committed_result = try tx.commitWith(CommitOptions.none.withMessage("hello"));
+    defer committed_result.deinit(gpa);
+    const hash = committed_result.hash.?;
     var built = (try doc.getChangeByHash(gpa, hash)).?;
     defer built.deinit(gpa);
 
@@ -1393,17 +1326,20 @@ test "an actor's second change carries no author, because one actor has one auth
 
     {
         var tx = try Transaction.open(gpa, &doc);
-        defer tx.deinit();
+        // The testing allocator does not inject allocation failure during cleanup.
+        defer tx.deinit() catch unreachable;
         try testing.expectEqual(@as(u64, 1), tx.seq);
         const footer = try authorFooter(gpa, &tx);
         defer gpa.free(footer);
         try testing.expect(footer.len > 0);
         _ = try tx.put(.root, .{ .key = "a" }, .{ .int = 1 });
-        _ = try commitWith(&tx, CommitOptions.none);
+        var committed_result = try tx.commitWith(CommitOptions.none);
+        defer committed_result.deinit(gpa);
     }
     {
         var tx = try Transaction.open(gpa, &doc);
-        defer tx.deinit();
+        // The testing allocator does not inject allocation failure during cleanup.
+        defer tx.deinit() catch unreachable;
         try testing.expectEqual(@as(u64, 2), tx.seq);
         // **`automerge.rs:568` — the author is set only when `seq == 1`,**
         // so the second change of an actor has no footer at all.
@@ -1411,7 +1347,9 @@ test "an actor's second change carries no author, because one actor has one auth
         defer gpa.free(footer);
         try testing.expectEqual(@as(usize, 0), footer.len);
         _ = try tx.put(.root, .{ .key = "b" }, .{ .int = 2 });
-        const hash = (try commitWith(&tx, CommitOptions.none)).?;
+        var committed_result = try tx.commitWith(CommitOptions.none);
+        defer committed_result.deinit(gpa);
+        const hash = committed_result.hash.?;
         var built = (try doc.getChangeByHash(gpa, hash)).?;
         defer built.deinit(gpa);
         // **The second change's op columns are its own and carry no footer**,
@@ -1431,7 +1369,8 @@ test "depIndices resolves this transaction's dependencies, and drops one the gra
     const second = try commitPut(gpa, &doc, "b", .{ .int = 2 });
 
     var tx = try Transaction.open(gpa, &doc);
-    defer tx.deinit();
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer tx.deinit() catch unreachable;
     // **The actor's own last change is already a head, so it is the only
     // dependency** ([`automerge.rs:551-556`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)
     // adds it only when it is not already there).
@@ -1462,7 +1401,8 @@ test "hashForOpid names the change that carries an operation, and nothing for a 
     defer doc.deinit();
 
     var tx = try Transaction.open(gpa, &doc);
-    defer tx.deinit();
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer tx.deinit() catch unreachable;
     const id = (try tx.put(.root, .{ .key = "k" }, .{ .int = 1 })).?;
     const made = try tx.putObject(.root, .{ .key = "m" }, .map);
     const exid = doc.ops.idToExid(id);
@@ -1475,7 +1415,9 @@ test "hashForOpid names the change that carries an operation, and nothing for a 
     try testing.expect(hashForOpid(&tx, exid) == null);
     try testing.expect(hashForOpid(&tx, made_exid) == null);
 
-    const hash = (try commitWith(&tx, CommitOptions.none)).?;
+    var committed_result = try tx.commitWith(CommitOptions.none);
+    defer committed_result.deinit(gpa);
+    const hash = committed_result.hash.?;
     // **After the commit both name it.**
     try testing.expect(hashForOpid(&tx, exid).?.eql(hash));
     try testing.expect(hashForOpid(&tx, made_exid).?.eql(hash));
@@ -1504,10 +1446,13 @@ test "hashForOpid answers a many-change document as the graph's own interval que
         // disagree, and a single actor could not produce it.
         doc.setActorId(if (i % 2 == 0) first else second);
         var tx = try Transaction.open(gpa, &doc);
-        defer tx.deinit();
+        // The testing allocator does not inject allocation failure during cleanup.
+        defer tx.deinit() catch unreachable;
         const key = try std.fmt.bufPrint(&key_buf, "k{d}", .{i});
         const id = (try tx.put(.root, .{ .key = key }, .{ .int = @intCast(i) })).?;
-        last_hash = (try commitWith(&tx, CommitOptions.none)).?;
+        var committed_result = try tx.commitWith(CommitOptions.none);
+        defer committed_result.deinit(gpa);
+        last_hash = committed_result.hash.?;
         last_exid = doc.ops.idToExid(id);
     }
     // **Two actors and two hundred changes**, so the answer for the last
@@ -1520,7 +1465,8 @@ test "hashForOpid answers a many-change document as the graph's own interval que
     // A transaction to ask through. `hashForOpid` reads `tx.doc.graph` and
     // nothing else on the transaction, so an open one is all the call needs.
     var probe = try Transaction.open(gpa, &doc);
-    defer probe.deinit();
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer probe.deinit() catch unreachable;
 
     // **The last change's operation, which is the one the old scan had to walk
     // the whole table to reach.** The head of the graph is that change, so this
@@ -1584,7 +1530,9 @@ test "hashForOpid answers a many-change document as the graph's own interval que
     try testing.expect(hashForOpid(&probe, doc.ops.idToExid(pending)) == null);
     // **And it names the change once that transaction commits**, which is the
     // whole of the pending/committed distinction.
-    const committed = (try commitWith(&probe, CommitOptions.none)).?;
+    var committed_result = try probe.commitWith(CommitOptions.none);
+    defer committed_result.deinit(gpa);
+    const committed = committed_result.hash.?;
     try testing.expect(hashForOpid(&probe, doc.ops.idToExid(pending)).?.eql(committed));
 }
 
@@ -1594,13 +1542,10 @@ test "the whole write surface of API.md's ## Write, driven from manual transacti
     defer doc.deinit();
 
     var tx = try Transaction.open(gpa, &doc);
-    defer tx.deinit();
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer tx.deinit() catch unreachable;
 
-    // **Every method of `API.md`'s `## Write` that the manual door can reach,
-    // through the manual door**, so the assertions at the end are about the
-    // surface and not about one method. `splice` and `init_root_from_hydrate`
-    // are named in the diff block below: the first cannot be reached from this
-    // module, and the second needs a root nothing has been written to.
+    // Drive writes through the same journal and check their materialized effects.
     _ = try tx.put(.root, .{ .key = "name" }, .{ .str = "ada" });
     _ = try tx.put(.root, .{ .key = "hits" }, .{ .counter = .init(0) });
     try tx.increment(.root, .{ .key = "hits" }, 2);
@@ -1621,19 +1566,15 @@ test "the whole write surface of API.md's ## Write, driven from manual transacti
     const batched = try tx.batchCreateObject(.root, .{ .key = "batched" }, .map);
     _ = try tx.put(batched, .{ .key = "x" }, .{ .float = 0.5 });
     const hydrated = try tx.putObject(.root, .{ .key = "hydrated" }, .map);
-    // **The map outlives the commit**, and that is a rule rather than a habit:
-    // `updateMapValue` puts the caller's own key slices into the pending
-    // operations, and the commit encodes the pending operations. Upstream
-    // copies them ([`op.rs:187`](../../github-automerge-automerge/rust/automerge/src/op_set2/op.rs)
-    // owns a `PropRef::Map(String)`); this port's op set borrows.
+    // Hydrated inputs remain caller-owned; the journal copies their payloads.
     const map = try hydratedMap(gpa);
     defer {
         map.deinit();
         gpa.destroy(map);
     }
     try tx.updateMapValue(hydrated, map);
-    try testing.expectEqual(@as(usize, 1), tx.delete(.root, .{ .key = "name" }));
-    try testing.expectEqual(@as(usize, 1), tx.delete(list, .{ .index = 0 }));
+    try testing.expectEqual(@as(usize, 1), try tx.delete(.root, .{ .key = "name" }));
+    try testing.expectEqual(@as(usize, 1), try tx.delete(list, .{ .index = 0 }));
 
     // **`base_heads` and `pending_ops` are `Transactable` methods on this door
     // too** ([`transaction.rs:319-321`](../../github-automerge-automerge/rust/automerge/src/transaction.rs),
@@ -1644,7 +1585,8 @@ test "the whole write surface of API.md's ## Write, driven from manual transacti
     try testing.expectEqual(tx.pending.items.len, (try maxOp(&tx)) - tx.start_op + 1);
 
     const rows_before = doc.ops.len();
-    _ = try commitWith(&tx, CommitOptions.none);
+    var committed_result = try tx.commitWith(CommitOptions.none);
+    defer committed_result.deinit(gpa);
     try testing.expectEqual(rows_before, doc.ops.len());
     try testing.expectEqual(@as(usize, 1), doc.graph.len());
 
@@ -1698,269 +1640,818 @@ fn hydratedMap(gpa: Allocator) !*hydmod.Map {
     return box;
 }
 
-test "the wrong door is an error: a manual document is the only one a transaction opens on" {
+test "a transaction opening refusal does not invoke the closure or mutate the document" {
     const gpa = testing.allocator;
-    var auto = try Document.init(gpa, std.testing.io, .auto);
-    defer auto.deinit();
-    auto.setActorId(.{ .bytes = "0123456789abcdef" });
-
-    // **`Transaction.open` refuses an autocommit document**, and this module's
-    // entry points reach it, so `enclose` refuses one too.
-    try testing.expectError(error.InvalidOp, Transaction.open(gpa, &auto));
-    try testing.expectError(error.InvalidOp, Transaction.openAt(gpa, &auto, null));
-    try testing.expectError(
-        error.InvalidOp,
-        enclose(void, gpa, &auto, {}, struct {
-            fn run(_: void, _: *Transaction) TransactionError!void {
-                return error.Fail;
-            }
-        }.run),
-    );
-
-    // **And nothing was written on the refusal**, which is the half that
-    // matters: an error that leaves a document half-changed is worse than a
-    // trap in a file that has already been read.
-    try testing.expectEqual(@as(usize, 0), auto.graph.len());
-    try testing.expectEqual(@as(usize, 0), auto.ops.len());
+    var failing = testing.FailingAllocator.init(gpa, .{});
+    var doc = try manual(failing.allocator());
+    defer doc.deinit();
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, enclose(void, failing.allocator(), &doc, {}, struct {
+        fn run(_: void, _: *Transaction) error{Invoked}!void {
+            return error.Invoked;
+        }
+    }.run));
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(@as(usize, 0), doc.graph.len());
+    try testing.expectEqual(@as(usize, 0), doc.ops.len());
 }
-
-// ── Port differences ─────────────────────────────────────────────────────────
-//
-// What this file does differently from upstream's `transaction.rs`,
-// `manual_transaction.rs`, `commit.rs` and `result.rs`, and why.
-//
-// 1. **The names in the slice brief are not upstream's, and this file follows
-//    upstream's.** The brief describes a `Transaction` *trait* carrying
-//    `enclose`, `isolate`, `commit`, `rollback`, `abort`, `actorId`,
-//    `startOp`, `maxOp`, `heads` and `changeMeta`. Upstream `transaction.rs`
-//    declares no trait at all — it is a module root with two `macro_rules!`
-//    (`:1-31`, `:36-528`) — and of those ten names upstream has `commit`
-//    (`manual_transaction.rs:67`), `rollback` (`:100`) and `change_meta`
-//    (`inner.rs:174`). The other seven are nowhere in the reference. What this
-//    file does, name by name:
-//      * `enclose` is upstream's `Automerge::transact` / `transact_with`
-//        (`automerge.rs:584-629`). The brief's name is a good one and is kept;
-//        the behaviour is upstream's.
-//      * `abort` is upstream's `impl Drop for Transaction`
-//        (`manual_transaction.rs:135-145`). Zig has no `Drop`, so the rule is a
-//        method, and idempotence is what makes it a `Drop`.
-//      * `actorId` is upstream's `TransactionInner.actor` (`inner.rs:24`),
-//        which is an actor *index*; the id is the same question
-//        `Change::actor_id` (`change.rs:52`) asks. The index is still readable
-//        as `Transaction.actor`.
-//      * `startOp` is upstream's `start_op` field (`inner.rs:26`), already a
-//        public field on the engine, so this file adds no function for it.
-//      * `maxOp` is upstream's `max_op` as `change_meta` computes it
-//        (`inner.rs:182`).
-//      * `heads` is upstream's `Transaction::get_heads`
-//        (`manual_transaction.rs:61-63`), which is **not** `base_heads`
-//        (`transaction.rs:455-460`); the two are documented apart.
-//      * `isolate` is upstream's `AutoCommit::isolate` (`autocommit.rs:433-437`),
-//        already `Document.isolate` (`doc.zig:2646-2649`). For the *manual*
-//        door it is `Transaction.openAt` — upstream's
-//        `Automerge::transaction_at` (`automerge.rs:501-509`) over
-//        `isolate_actor` (`:1259-1281`), which this port is
-//        `Document.isolatedActorIndex` (`doc.zig:2596-2617`). **This file
-//        declares no `isolate`**: a second door onto `Document.isolation`
-//        would be a second source of truth for it, and `doc.zig` already owns
-//        the state.
-//
-// 2. **`API.md`'s `## Write` names twenty methods, all of them
-//    `doc: *Document`, and not one of them is a manual-transaction method.**
-//    It says in a sentence that "a manual `Transaction` is a separate type that
-//    borrows the document and commits or rolls back explicitly" and then lists
-//    the autocommit door, which `transact.zig` has. Every one of the twenty is
-//    a `Transactable` method, so every one is reachable on the manual door
-//    through the engine's own methods — the port has no `Transactable` trait
-//    and one type serves both flavours, which is [plan §3.2](../docs/plan.md)'s
-//    answer to the macro question. The test `test "the whole write surface of
-//    API.md's ## Write, driven from one manual transaction"` drives them
-//    through the manual door so that the claim is checked rather than asserted.
-//
-// 3. **`splice` reaches the manual door through `transact.spliceHeld`, and it
-//    took a fix to get there.** Upstream's `Transactable::splice` for a
-//    `Transaction` is `TransactionInner::splice` (`inner.rs:606-645`) over a
-//    batched `BatchInsertion` (`:1435-1520`). The engine has that body —
-//    `Transaction.spliceListValues` — and the module-level
-//    `transact.spliceHeld` now calls it — **but the `.list` arm was empty**, so
-//    a splice of hydrated values into a *list* reported success and wrote no
-//    operation and no change at all. Two tests said so: this tree's
-//    `transact.test."a spliced list of hydrated values is written in two
-//    batches"` failed on `expected 2, found 1` at its `doc.graph.len()`
-//    assertion, and `upstream_doc_test."concurrent insertions at different list
-//    positions"` was missing the element it had spliced. `inner.rs:633-642` is
-//    the branch that takes them, and it is the engine's to take: a second
-//    implementation of the splice walk in this file would be a second source
-//    of truth for it. Every other method of `## Write` is exercised by the
-//    test named in (2).
-//
-// 4. **`update_text` is not in that walk, because committing after it reads
-//    freed memory — a defect in [`textdiff.zig`](textdiff.zig), not here.**
-//    `TxHook::insert` and `TxHook::replace`
-//    ([`textdiff.zig:771-783`](textdiff.zig)) join the new graphemes into a
-//    freshly allocated buffer, hand it to `spliceText` — which records the
-//    queued operations with slices **into** it, because
-//    [`textUnits`](transact.zig) hands out sub-slices of its argument — and
-//    free the buffer when the call returns (`defer self.gpa.free(new_chars)`).
-//    The operations are encoded by the **commit**, so every operation
-//    `update_text` writes points at freed memory from the moment the hook
-//    returns. Reproduced: a transaction that calls `updateText` and then does
-//    other work before committing **segfaults** in
-//    `columnar/encoding.zig:1395` (`appendPayload`, `.str`) while encoding the
-//    change; with the diff as the transaction's last write before the commit it
-//    survives, which is why [`transact.zig`'s own `updateText` test]
-//    (transact.zig:3255) does. **The fix is to stop freeing the joined buffer
-//    there** — upstream's `TxHook::insert` builds a `String` and passes it
-//    down by value, so there is no shared buffer to free
-//    ([`text_diff.rs:122-133`](../../github-automerge-automerge/rust/automerge/src/text_diff.rs)).
-//    Until that is fixed this file cannot test `update_text` on the manual
-//    door without taking the whole test binary down with it, which is why the
-//    walk in (2) stops short of it and the engine's own test stands in.
-//
-// 5. **`init_root_from_hydrate` is not in that walk either.** Upstream's
-//    `batch_init_root_map` (`inner.rs:1334-1380`) writes the *root* map, so it
-//    needs a root nothing has been written to, and the walk in (2) has already
-//    written to it. The engine's `initRootFromHydrate` (`transact.zig:1405`)
-//    carries upstream's test for it (`transact.zig:3208`).
-//
-// 6. `Success` contains the body result and change hash; the document retains
-//    its patch log. `Failure(O)` preserves the primary error, a successful
-//    body's result after commit refusal, and an owning recovery transaction
-//    if rollback refuses.
-//
-// 7. **`CommitOptions.message` is borrowed, not owned.** Upstream holds an
-//    `Option<String>` (`commit.rs:5`); the port's rule is that a borrow is valid
-//    until the next mutation, and the caller's bytes go straight into the
-//    encoded change, so they must outlive the call. `setMessage` and `setTime`
-//    return `void` rather than a builder, because a Zig struct literal is the
-//    mutation.
-//
-// 8. **The commit path takes the transaction's scope from the document and puts
-//    it back.** Upstream's `export` resolves *the transaction's* `deps`
-//    (`inner.rs:197-207`) and `commit_impl` exports *the transaction's* ops
-//    (`:157-170`). This port's `Document.commit` (`doc.zig:3419-3477`) is handed
-//    the operations and re-derives the metadata from a fresh
-//    `transactionArgs` call scoped by `Document.isolation`, so a scoped
-//    transaction committed through the engine alone produces a change that
-//    claims another actor's operations and the document refuses it
-//    (`error.Fail`). `commitWith` works around that by moving the scope for the
-//    duration of the commit. **The fix belongs in `Document.commit`**, which
-//    this file may not edit; the test `test "a scoped transaction's own commit
-//    path: the engine's commit is refused, and commitWith restores the
-//    isolation"` pins both halves so the workaround cannot be dropped silently.
-//
-// 9. **`hashForOpid` used to walk the node table; it is upstream's binary
-//    search now.** Upstream's `ChangeGraph::opid_to_hash`
-//    (`change_graph.rs:300-318`) binary-searches `seq_index[actor]`, and
-//    `change_graph.zig` has carried that as the `pub` `opidToHash` since it
-//    was written — the round-3 audit's "no public entry point" was wrong, and
-//    so was the note here that `seq_index` is private. This file scanned
-//    `nodes` instead, which is `O(C)` in the whole graph where upstream is
-//    `O(log` changes by that actor `)`, and answered the same question. It now
-//    delegates (`transaction.zig:433-436`), so **this is no longer a
-//    divergence**; the note stays because the scan is the shape a reader
-//    comparing the two files will still expect to find.
-//
-// 10. **`changeMeta` cannot carry the author footer, so `authorFooter` is
-//    separate.** Upstream folds it in through `extra_bytes`
-//    (`inner.rs:193-195`), which reads `TransactionInner.author` — a field
-//    `TransactionArgs` computes at `seq == 1` (`automerge.rs:568`) and the
-//    engine does not retain (`transact.zig:334-347` takes the other six fields
-//    and lets the seventh go). `Document.commit` re-derives it from the same
-//    rule (`doc.zig:2438`, `:3430-3432`), so `authorFooter` reproduces the same
-//    bytes and the test asserts they are the ones the document stored.
-//
-// 11. **`enclose` takes a function and a context, not a closure.** Upstream
-//     takes `F: FnOnce(&mut Transaction<'_>) -> Result<O, E>`
-//     (`automerge.rs:588`). A Zig closure captures by value, and `encloseWith`'s
-//     options function runs on the *result* while the transaction is still
-//     open, so a capturing body would hand a context whose lifetime the caller
-//     cannot see. The caller owns the context and must keep it alive across the
-//     call.
-//
-// 12. **`OwnedTransaction` is not here.** Upstream's (`owned_transaction.rs:17-116`)
-//     takes the document by value, and it has **no `Drop` impl** — the survey
-//     records that an abandoned one leaks its pending operations into the op
-//     set (`docs/survey/02-transaction-opset.md`, §1 *Drop*). Reproducing that
-//     is a defect to copy, and the type needs the engine to point at a
-//     `Document` the same struct owns, which the engine's `doc: *Document`
-//     field cannot express. It is named here so it is not lost.
-//
-// 13. **`maxOp` is fallible, and the refusal is a decision rather than a
-//     match.** Upstream's `Transaction` has **no `max_op` accessor at all**:
-//     its public surface is `hash_for_opid` (`manual_transaction.rs:44-46`),
-//     `get_heads` (`:61-63`), `commit` (`:67`), `commit_with` (`:91`) and
-//     `rollback` (`:100`), plus `Transactable::pending_ops`
-//     (`transactable.rs:11-12`) — a count. `change_meta` (`inner.rs:174`) is
-//     `pub(crate)`, so this function renders a private field and the
-//     signature is the port's to pick.
-//
-//     **The post-commit read cannot be asked upstream at all.** `commit`,
-//     `commit_with` and `rollback` take `self` by value
-//     (`manual_transaction.rs:67`, `:91`, `:100`; `inner.rs:129-130`,
-//     `:211-212`) and each moves the inner out of its `Option`
-//     (`manual_transaction.rs:68`, `:92`, `:102`), so a spent transaction does
-//     not exist. Here it does, and the arithmetic has an answer to give that
-//     is not one: `commit` drains `pending` (`transact.zig:1344-1346`) and
-//     `start_op + pending.len() - 1` then reads `start_op - 1`.
-//
-//     **So a closed transaction refuses with `error.InvalidOp`**, the same
-//     answer `requireOpen` (`transact.zig:545-547`) gives a write and
-//     `rollback` (`transact.zig:1357-1358`) gives a second application.
-//     `pending.len()` is the wrong key to refuse on and not only because a
-//     commit empties it: **a rollback does not**, and leaves the list full of
-//     operations it has just taken back
-//     ([`transact.zig:1356-1368`](transact.zig)) — so the arithmetic after a
-//     rollback claims a counter the document has withdrawn and will never
-//     hand out again. `closed` is the one flag that is true in all three
-//     spent states and false in every live one.
-//
-//     **This is not the "one concept, two derivations" shape** the other
-//     defects in this port have, and that is worth saying. The three
-//     `max_op`s — the transaction's (`inner.rs:182`), the change's
-//     (`change.rs:74-76`) and the graph's (`change_graph.rs:204-206`) — are
-//     three questions upstream already names separately, and this port has
-//     all three, derived once each. What the two failing tests had was a
-//     **read at a time the question is not asked**: the transaction's answer
-//     taken after the transaction was spent, and compared against the change's
-//     answer, which is a different question with a real number. The two
-//     numbers drifted apart by exactly the drained `pending` because one of
-//     them was read in a state where it did not mean anything.
 
 test "enclose preserves primary error and transfers failed rollback ownership" {
     const Context = struct {
         failing: *testing.FailingAllocator,
         body_fails: bool,
 
-        fn body(ctx: *@This(), tx: *Transaction) TransactionError!usize {
+        fn body(ctx: *@This(), tx: *Transaction) (TransactionError || error{Rejected})!usize {
             _ = try tx.put(.root, .{ .key = "one" }, .{ .int = 1 });
             _ = try tx.put(.root, .{ .key = "two" }, .{ .int = 2 });
             ctx.failing.fail_index = ctx.failing.alloc_index;
-            if (ctx.body_fails) return error.InvalidValueType;
+            if (ctx.body_fails) return error.Rejected;
             return 77;
         }
     };
     for ([_]bool{ true, false }) |body_fails| {
         var failing = testing.FailingAllocator.init(testing.allocator, .{});
         const gpa = failing.allocator();
-        var doc = try Document.init(gpa, testing.io, .manual);
+        var doc = try Document.init(gpa, testing.io);
         defer doc.deinit();
         var ctx = Context{ .failing = &failing, .body_fails = body_fails };
-        var outcome = try enclose(usize, gpa, &doc, &ctx, Context.body);
+        var log = @import("patches.zig").PatchLog.active(gpa);
+        defer log.deinit();
+        var outcome = try encloseWithPatchLog(usize, gpa, &doc, &log, &ctx, Context.body, null);
         failing.fail_index = std.math.maxInt(usize);
         switch (outcome) {
             .success => return error.ExpectedFailure,
             .failure => |*failure| {
-                try testing.expectEqual(if (body_fails) error.InvalidValueType else error.OutOfMemory, failure.err);
+                try testing.expectEqual(if (body_fails) error.Rejected else error.OutOfMemory, failure.err);
                 try testing.expectEqual(@as(?TransactionError, error.OutOfMemory), failure.rollback_error);
                 try testing.expectEqual(if (body_fails) @as(?usize, null) else @as(?usize, 77), failure.result);
                 const tx = &failure.transaction.?;
-                defer tx.deinit();
+                // Failure injection was disabled before retrying recovery.
+                defer tx.deinit() catch unreachable;
+                defer failure.patch_log.deinit();
                 try testing.expectEqual(@as(usize, 2), try tx.rollback());
+                var recovered_log = tx.takePatchLog();
+                defer recovered_log.deinit();
+                try testing.expect(recovered_log.recording);
+                try testing.expect(!failure.patch_log.recording);
                 try testing.expectEqual(@as(usize, 0), doc.graph.len());
                 try testing.expect((try @import("read.zig").get(&doc, .root, .{ .key = "one" })) == null);
                 try testing.expect((try @import("read.zig").get(&doc, .root, .{ .key = "two" })) == null);
             },
         }
+    }
+}
+
+test "parity transaction explicit heads exclude pending writes and walks retain their clock" {
+    // Historical reads must not take the current-head shortcut while a journal is open.
+    const gpa = testing.allocator;
+    var doc = try manual(gpa);
+    defer doc.deinit();
+    const first = try commitPut(gpa, &doc, "old", .{ .int = 1 });
+    var tx = try Transaction.openAt(gpa, &doc, &.{first});
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer tx.deinit() catch unreachable;
+    _ = try tx.put(.root, .{ .key = "pending" }, .{ .int = 2 });
+    try testing.expect((try tx.get(.root, .{ .key = "pending" })) != null);
+    try testing.expect((try tx.getAt(.root, .{ .key = "pending" }, &.{first})) == null);
+    var keys = try tx.keysAt(.root, &.{first});
+    defer keys.deinit(gpa);
+    _ = try tx.getAt(.root, .{ .key = "old" }, &.{});
+    try testing.expectEqualStrings("old", (try keys.next()).?);
+    try testing.expect((try keys.next()) == null);
+    _ = try tx.rollback();
+}
+
+test "parity transaction updateObject dispatches list text and rejects mismatched input" {
+    // Public hydrated updates select their target by object kind, not a map-only door.
+    const gpa = testing.allocator;
+    var doc = try manual(gpa);
+    defer doc.deinit();
+    var tx = try Transaction.open(gpa, &doc);
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer tx.deinit() catch unreachable;
+    const list = try tx.putObject(.root, .{ .key = "list" }, .list);
+    _ = try tx.insert(list, 0, .{ .int = 3 });
+    var empty = hydmod.Value.list(gpa);
+    defer empty.deinit();
+    try tx.updateObject(list, &empty);
+    try testing.expectEqual(@as(usize, 0), try tx.length(list));
+    const text = try tx.putObject(.root, .{ .key = "text" }, .text);
+    var replacement = try hydmod.Value.text(gpa, tx.textEncoding(), "new");
+    defer replacement.deinit();
+    try tx.updateObject(text, &replacement);
+    const rendered = try tx.text(text, gpa);
+    defer gpa.free(rendered);
+    try testing.expectEqualStrings("new", rendered);
+    try testing.expectError(error.ChangeType, tx.updateObject(list, &replacement));
+    _ = try tx.rollback();
+}
+
+test "parity transaction external log moves only on successful open and returns on commit" {
+    // A caller can keep an externally funded log after a refused constructor.
+    const patches = @import("patches.zig");
+    const gpa = testing.allocator;
+    var failing = testing.FailingAllocator.init(gpa, .{});
+    var doc = try manual(failing.allocator());
+    defer doc.deinit();
+    var log = patches.PatchLog.active(gpa);
+    defer log.deinit();
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, Transaction.openWithPatchLog(failing.allocator(), &doc, &log, null));
+    try testing.expect(log.recording);
+    failing.fail_index = std.math.maxInt(usize);
+    var tx = try Transaction.openWithPatchLog(failing.allocator(), &doc, &log, null);
+    // Failure injection was disabled before this successful open.
+    defer tx.deinit() catch unreachable;
+    _ = try tx.put(.root, .{ .key = "logged" }, .{ .int = 4 });
+    var result = try tx.commit();
+    defer result.deinit(gpa);
+    try testing.expect(result.hash != null);
+    var published = try doc.makePatches(&result.patch_log);
+    defer published.deinit();
+    try testing.expectEqual(@as(usize, 1), published.len());
+}
+
+test "parity transaction close rolls back pending rows before releasing its journal" {
+    // Closing a borrowed owner must leave the document usable, with no abandoned row.
+    const gpa = testing.allocator;
+    var doc = try manual(gpa);
+    defer doc.deinit();
+    var tx = try Transaction.open(gpa, &doc);
+    _ = try tx.put(.root, .{ .key = "abandoned" }, .{ .int = 8 });
+    try tx.deinit();
+    try testing.expect((try readmod.get(&doc, .root, .{ .key = "abandoned" })) == null);
+    _ = try commitPut(gpa, &doc, "later", .{ .int = 9 });
+    try testing.expect((try readmod.get(&doc, .root, .{ .key = "later" })) != null);
+}
+
+test "parity transaction closure preserves arbitrary user errors" {
+    // Application errors are not restricted to the CRDT write error vocabulary.
+    const Body = struct {
+        fn run(_: void, tx: *Transaction) (TransactionError || error{Rejected})!usize {
+            _ = try tx.put(.root, .{ .key = "temporary" }, .{ .int = 1 });
+            return error.Rejected;
+        }
+    };
+    const gpa = testing.allocator;
+    var doc = try manual(gpa);
+    defer doc.deinit();
+    var log = @import("patches.zig").PatchLog.active(gpa);
+    defer log.deinit();
+    var outcome = try encloseWithPatchLog(usize, gpa, &doc, &log, {}, Body.run, null);
+    switch (outcome) {
+        .success => return error.ExpectedFailure,
+        .failure => |*failure| {
+            defer failure.patch_log.deinit();
+            try testing.expectEqual(error.Rejected, failure.err);
+            try testing.expect(failure.transaction == null);
+            try testing.expect(failure.patch_log.recording);
+            try testing.expectEqual(@as(usize, 1), failure.cancelled);
+        },
+    }
+    try testing.expect((try readmod.get(&doc, .root, .{ .key = "temporary" })) == null);
+}
+
+test "parity owned transaction returns its document and committed log owner" {
+    // In-place construction keeps the journal's raw-document pointer stable.
+    const gpa = testing.allocator;
+    var doc = try manual(gpa);
+    var owned: @import("transaction.zig").OwnedTransaction = undefined;
+    try owned.init(gpa, &doc, null);
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer owned.deinit() catch unreachable;
+    _ = try owned.transaction.put(.root, .{ .key = "owned" }, .{ .int = 6 });
+    var completed = try owned.commit(CommitOptions.none);
+    defer completed.document.deinit();
+    defer completed.result.deinit(gpa);
+    try testing.expect(completed.result.hash != null);
+    const item = (try readmod.get(&completed.document, .root, .{ .key = "owned" })).?;
+    try testing.expectEqual(@as(i64, 6), item.value.scalar.int);
+    _ = try commitPut(gpa, &completed.document, "after transfer", .{ .int = 7 });
+    try testing.expect((try readmod.get(&completed.document, .root, .{ .key = "after transfer" })) != null);
+}
+
+test "parity transaction pending clone rolls back independently without closing source" {
+    // The cloned raw rows and journal form one independent recovery owner.
+    const gpa = testing.allocator;
+    var doc = try manual(gpa);
+    defer doc.deinit();
+    var source = try Transaction.open(gpa, &doc);
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer source.deinit() catch unreachable;
+    _ = try source.put(.root, .{ .key = "pending" }, .{ .str = "copied" });
+    var copied_doc = try doc.clonePending(gpa);
+    defer copied_doc.deinit();
+    var copied = try source.cloneInto(gpa, &copied_doc);
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer copied.deinit() catch unreachable;
+    _ = try copied.rollback();
+    try testing.expect((try readmod.get(&copied_doc, .root, .{ .key = "pending" })) == null);
+    const item = (try source.get(.root, .{ .key = "pending" })).?;
+    try testing.expectEqualStrings("copied", item.value.scalar.str);
+    try testing.expect(!source.closed);
+    _ = try source.rollback();
+}
+
+test "parity transaction hydrate null bypasses write scope but explicit heads do not" {
+    // Rust delegates hydrate to the raw reader rather than selecting transaction scope.
+    const gpa = testing.allocator;
+    var doc = try manual(gpa);
+    defer doc.deinit();
+    const first = try commitPut(gpa, &doc, "version", .{ .int = 1 });
+    _ = try commitPut(gpa, &doc, "version", .{ .int = 2 });
+    var tx = try Transaction.openAt(gpa, &doc, &.{first});
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer tx.deinit() catch unreachable;
+    try testing.expectEqual(@as(i64, 1), (try tx.get(.root, .{ .key = "version" })).?.value.scalar.int);
+    var current = try tx.hydrate(.root, null, gpa);
+    defer current.deinit();
+    var old = try tx.hydrate(.root, &.{first}, gpa);
+    defer old.deinit();
+    try testing.expectEqual(@as(i64, 2), current.object.map.get("version").?.int);
+    try testing.expectEqual(@as(i64, 1), old.object.map.get("version").?.int);
+    _ = try tx.rollback();
+}
+
+test "parity transaction refused cleanup retains journal for rollback retry" {
+    // OOM during undo must keep one live recovery owner, not discard undo records.
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var doc = try manual(gpa);
+    defer doc.deinit();
+    var tx = try Transaction.open(gpa, &doc);
+    _ = try tx.put(.root, .{ .key = "one" }, .{ .int = 1 });
+    _ = try tx.put(.root, .{ .key = "two" }, .{ .int = 2 });
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, tx.deinit());
+    try testing.expect(!tx.closed);
+    try testing.expect(tx.count() != 0);
+    failing.fail_index = std.math.maxInt(usize);
+    try tx.deinit();
+    try testing.expect((try readmod.get(&doc, .root, .{ .key = "one" })) == null);
+    try testing.expect((try readmod.get(&doc, .root, .{ .key = "two" })) == null);
+    _ = try commitPut(gpa, &doc, "usable", .{ .int = 3 });
+}
+
+test "parity transaction journal owns caller string payload until commit" {
+    // A put borrows input only for its call; later caller reuse cannot change the encoded change.
+    const gpa = testing.allocator;
+    var doc = try manual(gpa);
+    defer doc.deinit();
+    var tx = try Transaction.open(gpa, &doc);
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer tx.deinit() catch unreachable;
+    var input = [_]u8{ 'o', 'l', 'd' };
+    _ = try tx.put(.root, .{ .key = "value" }, .{ .str = &input });
+    @memset(&input, 'x');
+    var result = try tx.commit();
+    defer result.deinit(gpa);
+    var change = (try doc.getChangeByHash(gpa, result.hash.?)).?;
+    defer change.deinit(gpa);
+    var loaded = try manual(gpa);
+    defer loaded.deinit();
+    _ = try loaded.applyChanges(gpa, &.{change.change});
+    const item = (try readmod.get(&loaded, .root, .{ .key = "value" })).?;
+    try testing.expectEqualStrings("old", item.value.scalar.str);
+}
+
+test "parity transaction log preserves insert then overwrite instead of final state diff" {
+    // Local event order is observable even when a later put shadows an earlier insert.
+    const patches = @import("patches.zig");
+    const gpa = testing.allocator;
+    var doc = try manual(gpa);
+    defer doc.deinit();
+    var seed = try Transaction.open(gpa, &doc);
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer seed.deinit() catch unreachable;
+    const list = try seed.putObject(.root, .{ .key = "list" }, .list);
+    var seeded = try seed.commit();
+    defer seeded.deinit(gpa);
+    var log = patches.PatchLog.active(gpa);
+    defer log.deinit();
+    var tx = try Transaction.openWithPatchLog(gpa, &doc, &log, null);
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer tx.deinit() catch unreachable;
+    _ = try tx.insert(list, 0, .{ .int = 1 });
+    _ = try tx.put(list, .{ .index = 0 }, .{ .int = 2 });
+    var result = try tx.commit();
+    defer result.deinit(gpa);
+    var published = try doc.makePatches(&result.patch_log);
+    defer published.deinit();
+    try testing.expectEqual(@as(usize, 2), published.len());
+    try testing.expect(published.items.items[0].action == .insert);
+    try testing.expect(published.items.items[1].action == .put_seq);
+    try testing.expectEqual(@as(i64, 1), published.items.items[0].action.insert.values.get(0).?.value.scalar.int);
+    try testing.expectEqual(@as(i64, 2), published.items.items[1].action.put_seq.value.scalar.int);
+}
+
+test "borrowed options observe an owned callback result and no-write success owns its log" {
+    const Output = struct { message: [5]u8 };
+    const Context = struct {
+        observed: bool = false,
+        fn body(_: *@This(), _: *Transaction) error{Rejected}!Output {
+            return .{ .message = "owned".* };
+        }
+        fn options(ctx: *@This(), result: *const Output) CommitOptions {
+            ctx.observed = std.mem.eql(u8, &result.message, "owned");
+            return .{ .message = &result.message, .time = 17 };
+        }
+    };
+    const gpa = testing.allocator;
+    var doc = try manual(gpa);
+    defer doc.deinit();
+    var log = @import("patches.zig").PatchLog.active(gpa);
+    defer log.deinit();
+    var ctx = Context{};
+    var outcome = try encloseWithPatchLog(Output, gpa, &doc, &log, &ctx, Context.body, Context.options);
+    switch (outcome) {
+        .failure => return error.ExpectedSuccess,
+        .success => |*success| {
+            defer success.patch_log.deinit();
+            try testing.expect(success.hash == null);
+            try testing.expect(success.patch_log.recording);
+            try testing.expectEqualStrings("owned", &success.result.message);
+        },
+    }
+    try testing.expect(ctx.observed);
+    try testing.expect(!log.recording);
+}
+
+test "owned rollback returns a movable restored document and independent log" {
+    const gpa = testing.allocator;
+    var doc = try manual(gpa);
+    _ = try commitPut(gpa, &doc, "kept", .{ .int = 1 });
+    var owned: @import("transaction.zig").OwnedTransaction = undefined;
+    try owned.init(gpa, &doc, null);
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer owned.deinit() catch unreachable;
+    try testing.expect(owned.transaction.doc == &owned.document);
+    _ = try owned.transaction.put(.root, .{ .key = "undone" }, .{ .int = 2 });
+    var restored = try owned.rollback();
+    defer restored.document.deinit();
+    defer restored.patch_log.deinit();
+    try testing.expectEqual(@as(usize, 1), restored.cancelled);
+    try testing.expect((try readmod.get(&restored.document, .root, .{ .key = "undone" })) == null);
+    _ = try commitPut(gpa, &restored.document, "new journal", .{ .int = 3 });
+    try testing.expect((try readmod.get(&restored.document, .root, .{ .key = "kept" })) != null);
+}
+
+test "refused owned initialization retains the exact source owner for retry" {
+    const gpa = testing.allocator;
+    var failing = testing.FailingAllocator.init(gpa, .{});
+    var source = try manual(failing.allocator());
+    const before = try source.save(gpa);
+    defer gpa.free(before);
+    var owned: @import("transaction.zig").OwnedTransaction = undefined;
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, owned.init(failing.allocator(), &source, null));
+    failing.fail_index = std.math.maxInt(usize);
+    const after = try source.save(gpa);
+    defer gpa.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+    try testing.expectEqual(@as(usize, 0), source.ops.len());
+    try owned.init(failing.allocator(), &source, null);
+    // Failure injection is disabled for terminal cleanup.
+    defer owned.deinit() catch unreachable;
+    var restored = try owned.rollback();
+    defer restored.document.deinit();
+    defer restored.patch_log.deinit();
+    _ = try commitPut(failing.allocator(), &restored.document, "usable", .{ .int = 4 });
+}
+
+test "owned terminal refusals retain one journal until retry succeeds" {
+    for ([_]enum { commit, rollback, deinit }{ .commit, .rollback, .deinit }) |action| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        const gpa = failing.allocator();
+        var source = try manual(gpa);
+        var owned: @import("transaction.zig").OwnedTransaction = undefined;
+        try owned.init(gpa, &source, null);
+        _ = try owned.transaction.put(.root, .{ .key = "one" }, .{ .int = 1 });
+        _ = try owned.transaction.put(.root, .{ .key = "two" }, .{ .int = 2 });
+        failing.fail_index = failing.alloc_index;
+        switch (action) {
+            .commit => try testing.expectError(error.OutOfMemory, owned.commit(.none)),
+            .rollback => try testing.expectError(error.OutOfMemory, owned.rollback()),
+            .deinit => try testing.expectError(error.OutOfMemory, owned.deinit()),
+        }
+        try testing.expect(owned.owns_document);
+        try testing.expect(!owned.transaction.closed);
+        try testing.expect(owned.transaction.doc == &owned.document);
+        failing.fail_index = std.math.maxInt(usize);
+        switch (action) {
+            .commit => {
+                var completed = try owned.commit(.none);
+                defer completed.document.deinit();
+                defer completed.result.deinit(gpa);
+                try testing.expect(completed.result.hash != null);
+                _ = try commitPut(gpa, &completed.document, "later", .{ .int = 3 });
+            },
+            .rollback => {
+                var restored = try owned.rollback();
+                defer restored.document.deinit();
+                defer restored.patch_log.deinit();
+                try testing.expectEqual(@as(usize, 2), restored.cancelled);
+                try testing.expect((try readmod.get(&restored.document, .root, .{ .key = "one" })) == null);
+                _ = try commitPut(gpa, &restored.document, "later", .{ .int = 3 });
+            },
+            .deinit => try owned.deinit(),
+        }
+        try testing.expect(!owned.owns_document);
+    }
+}
+
+test "borrowed owned result options encode metadata before the result moves" {
+    const Output = struct { message: []u8 };
+    const Context = struct {
+        gpa: Allocator,
+        fn body(ctx: @This(), tx: *Transaction) !Output {
+            _ = try tx.put(.root, .{ .key = "written" }, .{ .int = 1 });
+            return .{ .message = try ctx.gpa.dupe(u8, "owned result metadata") };
+        }
+        fn options(_: @This(), result: *const Output) CommitOptions {
+            return .{ .message = result.message, .time = 23 };
+        }
+    };
+    const gpa = testing.allocator;
+    var doc = try manual(gpa);
+    defer doc.deinit();
+    var outcome = try encloseWith(Output, gpa, &doc, Context{ .gpa = gpa }, Context.body, Context.options);
+    switch (outcome) {
+        .failure => |*failure| {
+            defer failure.patch_log.deinit();
+            if (failure.result) |result| gpa.free(result.message);
+            if (failure.transaction) |*tx| {
+                // The testing allocator does not inject failure in recovery.
+                defer tx.deinit() catch unreachable;
+                _ = try tx.rollback();
+            }
+            return error.ExpectedSuccess;
+        },
+        .success => |*success| {
+            defer success.patch_log.deinit();
+            defer gpa.free(success.result.message);
+            var change = (try doc.getChangeByHash(gpa, success.hash.?)).?;
+            defer change.deinit(gpa);
+            try testing.expectEqualStrings(success.result.message, change.change.message);
+            try testing.expectEqual(@as(i64, 23), change.change.time);
+        },
+    }
+}
+
+test "owned logged construction accepts a separately allocated same actor document" {
+    // Rust compares actor tables, not the identity of the document allocation.
+    const gpa = testing.allocator;
+    var foreign = try manual(gpa);
+    defer foreign.deinit();
+    var foreign_log = @import("patches.zig").PatchLog.active(gpa);
+    defer foreign_log.deinit();
+    var tx = try Transaction.openWithPatchLog(gpa, &foreign, &foreign_log, null);
+    defer tx.deinit() catch unreachable;
+    _ = try tx.put(.root, .{ .key = "foreign" }, .{ .int = 1 });
+    var committed = try tx.commit();
+    defer committed.deinit(gpa);
+    var source = try manual(gpa);
+    var source_owned = true;
+    defer if (source_owned) source.deinit();
+    const identity_before = source.patchIdentity();
+    const log_allocator = committed.patch_log.gpa;
+    var owned: OwnedTransaction = undefined;
+    try owned.initWithPatchLog(gpa, &source, &committed.patch_log, null);
+    source_owned = false;
+    defer owned.deinit() catch unreachable;
+    try testing.expect(!committed.patch_log.recording);
+    try testing.expectEqual(identity_before, owned.document.patchIdentity());
+    try testing.expectEqual(log_allocator.ptr, owned.transaction.patch_log.gpa.ptr);
+    try testing.expectEqual(@as(usize, 1), owned.transaction.patch_log.events.items.len);
+    try testing.expectEqualStrings("foreign", owned.transaction.patch_log.events.items[0].event.put_map.key);
+    _ = try owned.transaction.put(.root, .{ .key = "local" }, .{ .int = 2 });
+    var completed = try owned.commit(.none);
+    defer completed.document.deinit();
+    defer completed.result.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), completed.result.patch_log.events.items.len);
+    try testing.expectEqualStrings("foreign", completed.result.patch_log.events.items[0].event.put_map.key);
+    try testing.expectEqualStrings("local", completed.result.patch_log.events.items[1].event.put_map.key);
+    var published = try completed.document.makePatches(&completed.result.patch_log);
+    defer published.deinit();
+    try testing.expectEqual(@as(usize, 2), published.len());
+    try testing.expectEqual(@as(i64, 2), (try readmod.get(&completed.document, .root, .{ .key = "local" })).?.value.scalar.int);
+}
+
+test "logged constructor actor mismatch preserves both owners for every wrapper" {
+    // The real Rust mismatch is b < c, including when c is not interned yet.
+    const Context = struct {
+        fn body(called: *bool, _: *Transaction) !void {
+            called.* = true;
+        }
+    };
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |nonempty| {
+        for ([_]enum { current, scoped, owned, closure }{
+            .current, .scoped, .owned, .closure,
+        }) |route| {
+            var owner = try manual(gpa);
+            defer owner.deinit();
+            owner.setActorId(.{ .bytes = "bbbbbb" });
+            var log = @import("patches.zig").PatchLog.active(gpa);
+            defer log.deinit();
+            {
+                var tx = try Transaction.openWithPatchLog(gpa, &owner, &log, null);
+                defer tx.deinit() catch unreachable;
+                _ = try tx.put(.root, .{ .key = "owner" }, .{ .int = 1 });
+                var committed = try tx.commit();
+                defer committed.deinit(gpa);
+                log.deinit();
+                log = committed.patch_log.take();
+            }
+            var target = try manual(gpa);
+            defer target.deinit();
+            target.setActorId(.{ .bytes = "cccccc" });
+            if (nonempty) _ = try commitPut(gpa, &target, "base", .{ .int = 3 });
+            const before = try target.saveWithOptions(gpa, .{ .deflate = false, .retain_orphans = true });
+            defer gpa.free(before);
+            const before_heads = try target.getHeads(gpa);
+            defer gpa.free(before_heads);
+            const actor = target.actor;
+            const actor_count = target.numActors();
+            const rows = target.ops.len();
+            const identity = target.patchIdentity();
+            const log_identity = log.identity;
+            const events = log.events.items;
+            const actors = log.actors.items;
+            var called = false;
+            switch (route) {
+                .current => try testing.expectError(error.PatchLogMismatch, Transaction.openWithPatchLog(gpa, &target, &log, null)),
+                .scoped => try testing.expectError(error.PatchLogMismatch, Transaction.openWithPatchLog(gpa, &target, &log, before_heads)),
+                .owned => {
+                    var owned: OwnedTransaction = undefined;
+                    try testing.expectError(error.PatchLogMismatch, owned.initWithPatchLog(gpa, &target, &log, null));
+                },
+                .closure => try testing.expectError(error.PatchLogMismatch, encloseWithPatchLog(void, gpa, &target, &log, &called, Context.body, null)),
+            }
+            try testing.expect(!called);
+            try testing.expectEqualDeep(actor, target.actor);
+            try testing.expectEqual(identity, target.patchIdentity());
+            try testing.expectEqual(actor_count, target.numActors());
+            try testing.expectEqual(rows, target.ops.len());
+            try testing.expectEqualSlices(ChangeHash, before_heads, target.graph.getHeads());
+            const after = try target.saveWithOptions(gpa, .{ .deflate = false, .retain_orphans = true });
+            defer gpa.free(after);
+            try testing.expectEqualSlices(u8, before, after);
+            try testing.expect(log.recording);
+            try testing.expectEqual(log_identity, log.identity);
+            try testing.expectEqual(events.ptr, log.events.items.ptr);
+            try testing.expectEqual(actors.ptr, log.actors.items.ptr);
+            try testing.expectEqual(@as(usize, 1), log.events.items.len);
+            try testing.expectEqual(@as(usize, 1), log.actors.items.len);
+            try testing.expectEqualStrings("bbbbbb", log.actors.items[0].bytes);
+            try testing.expectEqualStrings("owner", log.events.items[0].event.put_map.key);
+            try testing.expectEqual(@as(i64, 1), log.events.items[0].event.put_map.value.scalar.int);
+            try testing.expectEqual(@as(usize, 0), log.completed.len());
+            try testing.expect(log.checkpoint == null);
+            try testing.expect(log.speculative_actor == null);
+            _ = try commitPut(gpa, &target, "still owned", .{ .int = 2 });
+            var published = try owner.makePatches(&log);
+            defer published.deinit();
+            try testing.expectEqual(@as(usize, 1), published.len());
+        }
+    }
+}
+
+test "owned logged commit and rollback return their active log owner" {
+    for ([_]bool{ true, false }) |do_commit| {
+        const gpa = testing.allocator;
+        var source = try manual(gpa);
+        var log = @import("patches.zig").PatchLog.active(gpa);
+        defer log.deinit();
+        var owned: @import("transaction.zig").OwnedTransaction = undefined;
+        try owned.initWithPatchLog(gpa, &source, &log, null);
+        // The testing allocator does not inject allocation failure during cleanup.
+        defer owned.deinit() catch unreachable;
+        try testing.expect(!log.recording);
+        _ = try owned.transaction.put(.root, .{ .key = "logged" }, .{ .int = 3 });
+        if (do_commit) {
+            var completed = try owned.commit(.none);
+            defer completed.document.deinit();
+            defer completed.result.deinit(gpa);
+            try testing.expect(completed.result.patch_log.recording);
+            var published = try completed.document.makePatches(&completed.result.patch_log);
+            defer published.deinit();
+            try testing.expectEqual(@as(usize, 1), published.len());
+            _ = try commitPut(gpa, &completed.document, "new journal", .{ .int = 4 });
+        } else {
+            var restored = try owned.rollback();
+            defer restored.document.deinit();
+            defer restored.patch_log.deinit();
+            try testing.expect(restored.patch_log.recording);
+            try testing.expectEqual(@as(usize, 1), restored.cancelled);
+            try testing.expect((try readmod.get(&restored.document, .root, .{ .key = "logged" })) == null);
+            _ = try commitPut(gpa, &restored.document, "new journal", .{ .int = 4 });
+        }
+    }
+}
+
+test "owned logged allocation refusal leaves document and active log for retry" {
+    const gpa = testing.allocator;
+    var failing = testing.FailingAllocator.init(gpa, .{});
+    var source = try manual(failing.allocator());
+    const identity_before = source.patchIdentity();
+    var log = @import("patches.zig").PatchLog.active(gpa);
+    defer log.deinit();
+    var owned: @import("transaction.zig").OwnedTransaction = undefined;
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, owned.initWithPatchLog(failing.allocator(), &source, &log, null));
+    try testing.expectEqual(identity_before, source.patchIdentity());
+    try testing.expectEqual(@as(usize, 0), source.ops.len());
+    try testing.expect(log.recording);
+    failing.fail_index = std.math.maxInt(usize);
+    try owned.initWithPatchLog(failing.allocator(), &source, &log, null);
+    // Failure injection is disabled for terminal cleanup.
+    defer owned.deinit() catch unreachable;
+    var completed = try owned.commit(.none);
+    defer completed.document.deinit();
+    defer completed.result.deinit(gpa);
+    try testing.expect(completed.result.hash == null);
+    try testing.expect(completed.result.patch_log.recording);
+}
+
+test "retained historical map walk and clock survive more than sixty four other scopes" {
+    // Build all history and pending rows before borrowing either historical
+    // resource. The query storm changes only the scope cache, never raw ops.
+    const gpa = testing.allocator;
+    var doc = try manual(gpa);
+    defer doc.deinit();
+    var history: [70][1]ChangeHash = undefined;
+    for (&history, 0..) |*at, version| {
+        var seed = try Transaction.open(gpa, &doc);
+        // The testing allocator does not inject allocation failure during cleanup.
+        defer seed.deinit() catch unreachable;
+        _ = try seed.put(.root, .{ .key = "version" }, .{ .int = @intCast(version) });
+        if (version == 0) {
+            _ = try seed.put(.root, .{ .key = "oldonly" }, .{ .int = 10 });
+        } else if (version == 1) {
+            _ = try seed.delete(.root, .{ .key = "oldonly" });
+            _ = try seed.put(.root, .{ .key = "newonly" }, .{ .int = 20 });
+        }
+        var committed = try seed.commit();
+        defer committed.deinit(gpa);
+        at.* = .{committed.hash.?};
+    }
+    var tx = try Transaction.openAt(gpa, &doc, &history[0]);
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer tx.deinit() catch unreachable;
+    _ = try tx.put(.root, .{ .key = "pending" }, .{ .int = 30 });
+    const old_item = (try tx.getAt(.root, .{ .key = "version" }, &history[0])).?;
+    const later_item = (try tx.getAt(.root, .{ .key = "version" }, &history[69])).?;
+    const old_op = old_item.id.opId().?;
+    const later_op = later_item.id.opId().?;
+    const borrowed_clock = try doc.clockAtScope(gpa, &history[0]);
+    var retained = try tx.mapRangeAt(.root, .{}, &history[0]);
+    for (history[1..], 1..) |*at, version| {
+        const item = (try tx.getAt(.root, .{ .key = "version" }, at)).?;
+        try testing.expectEqual(@as(i64, @intCast(version)), item.value.scalar.int);
+        try testing.expect((try tx.getAt(.root, .{ .key = "pending" }, at)) == null);
+    }
+    try testing.expect(borrowed_clock.contains(old_op));
+    try testing.expect(!borrowed_clock.contains(later_op));
+    const old_only = (try retained.next()).?;
+    try testing.expectEqualStrings("oldonly", old_only.key);
+    try testing.expectEqual(@as(i64, 10), old_only.value.scalar.int);
+    const old_version = (try retained.next()).?;
+    try testing.expectEqualStrings("version", old_version.key);
+    try testing.expectEqual(@as(i64, 0), old_version.value.scalar.int);
+    try testing.expect((try retained.next()) == null);
+    _ = try tx.rollback();
+}
+
+test "hydrate at current committed heads includes pending rows while getAt excludes them" {
+    // The Rust raw hydration shortcut is intentionally distinct from ordinary
+    // explicit historical reads, even when both receive the same committed head.
+    const gpa = testing.allocator;
+    var doc = try manual(gpa);
+    defer doc.deinit();
+    const committed_head = try commitPut(gpa, &doc, "old", .{ .int = 1 });
+    var tx = try Transaction.open(gpa, &doc);
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer tx.deinit() catch unreachable;
+    _ = try tx.put(.root, .{ .key = "pending" }, .{ .int = 2 });
+    try testing.expect((try tx.getAt(.root, .{ .key = "pending" }, &.{committed_head})) == null);
+    var explicit = try tx.hydrate(.root, &.{committed_head}, gpa);
+    defer explicit.deinit();
+    var current = try tx.hydrate(.root, null, gpa);
+    defer current.deinit();
+    try testing.expectEqual(@as(i64, 1), explicit.object.map.get("old").?.int);
+    try testing.expectEqual(@as(i64, 2), explicit.object.map.get("pending").?.int);
+    try testing.expectEqual(@as(i64, 1), current.object.map.get("old").?.int);
+    try testing.expectEqual(@as(i64, 2), current.object.map.get("pending").?.int);
+    _ = try tx.rollback();
+}
+
+test "scoped pending text insertion is resident before ordinary reads" {
+    const gpa = testing.allocator;
+    var doc = try manual(gpa);
+    defer doc.deinit();
+
+    var seed = try Transaction.open(gpa, &doc);
+    // The testing allocator does not inject allocation failure during cleanup.
+    defer seed.deinit() catch unreachable;
+    const text = try seed.putObject(.root, .{ .key = "text" }, .text);
+    try seed.spliceText(text, 0, 0, "old");
+    var first = try seed.commit();
+    defer first.deinit(gpa);
+    const h1 = first.hash.?;
+
+    var update = try Transaction.open(gpa, &doc);
+    defer update.deinit() catch unreachable;
+    try update.updateText(text, "new");
+    var second = try update.commit();
+    defer second.deinit(gpa);
+    const current_before = try readmod.text(&doc, text, gpa);
+    defer gpa.free(current_before);
+    try testing.expectEqualStrings("new", current_before);
+
+    var scoped = try Transaction.openAt(gpa, &doc, &.{h1});
+    defer scoped.deinit() catch unreachable;
+    try scoped.spliceText(text, 3, 0, "!");
+
+    // Observe the producer boundary before any reader can materialize or
+    // repair the pending insertion, and before any later write or commit.
+    try testing.expectEqual(@as(usize, 1), scoped.pending.items.len);
+    const pending = &scoped.pending.items[0].tx;
+    const pending_id = pending.id();
+    const position = (try doc.ops.getOpIdPos(pending_id)) orelse return error.RowMissing;
+    const row = (try doc.ops.get(position)) orelse return error.RowMissing;
+    try testing.expect(row.id().eql(pending_id));
+    try testing.expect(row.objId().eql(doc.ops.resolveObjId(text).?));
+    try testing.expect(row.objId().eql(pending.objId()));
+    try testing.expect(row.value().eql(.{ .str = "!" }));
+    try testing.expect(row.value().eql(pending.value()));
+    try testing.expect(row.insert());
+    try testing.expectEqual(pending.insert(), row.insert());
+    try testing.expectEqual(pending.action(), row.action());
+    try testing.expect(row.key().eql(pending.key()));
+    try testing.expectEqual(scoped.actor, pending_id.actor);
+    try testing.expectEqual(pending_id.actor, row.id().actor);
+
+    const scoped_text = try scoped.text(text, gpa);
+    defer gpa.free(scoped_text);
+    try testing.expectEqualStrings("old!", scoped_text);
+    try testing.expectEqual(@as(usize, 4), try scoped.length(text));
+    const historical_text = try scoped.textAt(text, &.{h1}, gpa);
+    defer gpa.free(historical_text);
+    try testing.expectEqualStrings("old", historical_text);
+    const current_text = try readmod.text(&doc, text, gpa);
+    defer gpa.free(current_text);
+    // H2 remains present in the raw current view; concurrent insertion order
+    // is not part of this scoped-reader regression.
+    try testing.expect(std.mem.indexOf(u8, current_text, current_before) != null);
+}
+
+test "logged closure reuses a compatible fork log and returns its ordered prefix" {
+    // Wrappers inherit actor compatibility and transfer the original allocator.
+    const Context = struct {
+        fn body(_: void, tx: *Transaction) !void {
+            _ = try tx.put(.root, .{ .key = "local" }, .{ .int = 2 });
+        }
+    };
+    const gpa = testing.allocator;
+    var owner = try manual(gpa);
+    defer owner.deinit();
+    var log = @import("patches.zig").PatchLog.active(gpa);
+    defer log.deinit();
+    {
+        var tx = try Transaction.openWithPatchLog(gpa, &owner, &log, null);
+        defer tx.deinit() catch unreachable;
+        _ = try tx.put(.root, .{ .key = "prefix" }, .{ .int = 1 });
+        var committed = try tx.commit();
+        defer committed.deinit(gpa);
+        log.deinit();
+        log = committed.patch_log.take();
+    }
+    var fork = try owner.fork(gpa);
+    defer fork.deinit();
+    fork.setActorId(owner.getActorId());
+    const allocator = log.gpa;
+    var outcome = try encloseWithPatchLog(void, gpa, &fork, &log, {}, Context.body, null);
+    try testing.expect(!log.recording);
+    switch (outcome) {
+        .success => |*success| {
+            defer success.patch_log.deinit();
+            try testing.expect(success.hash != null);
+            try testing.expectEqual(allocator.ptr, success.patch_log.gpa.ptr);
+            try testing.expectEqual(@as(usize, 2), success.patch_log.events.items.len);
+            try testing.expectEqualStrings("prefix", success.patch_log.events.items[0].event.put_map.key);
+            try testing.expectEqualStrings("local", success.patch_log.events.items[1].event.put_map.key);
+            var published = try fork.makePatches(&success.patch_log);
+            defer published.deinit();
+            try testing.expectEqual(@as(usize, 2), published.len());
+        },
+        .failure => |*failure| {
+            defer failure.patch_log.deinit();
+            if (failure.transaction) |*tx| {
+                defer tx.deinit() catch unreachable;
+                _ = try tx.rollback();
+            }
+            return error.ExpectedSuccess;
+        },
     }
 }

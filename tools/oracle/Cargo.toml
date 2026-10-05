@@ -1,5 +1,6 @@
 [package]
 name = "zautomerge-oracle"
+default-run = "zautomerge-oracle"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -32,3 +33,7 @@ hexane = { path = "vendor/hexane" }
 # test binary was compiled with, so defaults are what is asked for.
 rand = "=0.10.3"
 serde_json = "1"
+# `api-parity` must alter stored heads while preserving a valid chunk checksum,
+# so the reference can distinguish head verification from checksum validation.
+# SHA-256 is already locked for Automerge; this adds no package to the port.
+sha2 = "=0.11.0"

@@ -352,7 +352,7 @@ pub const CursorPosition = union(enum) {
 /// Upstream's three fields are `ctr: u64`, `actor: ActorId` and
 /// `move_cursor`; this is those three plus [`offset`](#OpCursor.offset). The
 /// pair `(ctr, actor)` **is** the element's id: the port's [`ElemId`] is the
-/// *index* form of the same name — a `u32` counter and an actor index into the
+/// *index* form of the same name — a resident `u32` counter and an actor index into the
 /// document's table — while the wire format carries the actor's *bytes*
 /// (`cursor.rs:141`), and the op set resolves an [`OpId`]
 /// (`automerge.rs:775-776`). So the wire form is what is stored and
@@ -372,10 +372,9 @@ pub const CursorPosition = union(enum) {
 pub const OpCursor = struct {
     /// The counter of the element's operation (`ctr`, `cursor.rs:34`).
     ///
-    /// A `u64` and not a `u32` because the grammar's `counter` is an unbounded
-    /// `uleb128` (`cursor.rs:140`) and upstream reads it as one. A value above
-    /// a document's counter range is refused by [`elemId`](#OpCursor.elemId),
-    /// not here.
+    /// A `u64` preserves the grammar's complete `uleb128` counter
+    /// (`cursor.rs:140`). Conversion to a resident element checks its narrower
+    /// counter range and refuses a nonresident value without truncation.
     ctr: u64,
     /// The actor that made the element, as bytes (`actor`, `cursor.rs:35`).
     ///
@@ -411,10 +410,9 @@ pub const OpCursor = struct {
     /// lookup in `op_cursor_to_opid` and refuses the cursor when it misses
     /// (`automerge.rs:775`, `:783-784`).
     ///
-    /// A counter above a row's range is `error.InvalidCursor`, which is the
-    /// same refusal upstream reaches when `seek_list_opid` finds no row
-    /// (`automerge.rs:1778-1781`); the grammar is unbounded and the document
-    /// is not, and this is the earliest total place to say so.
+    /// A counter outside the resident operation range is `error.InvalidCursor`.
+    /// In-range counters with no matching row are refused by
+    /// `getCursorPosition` through `seek_list_opid` (`automerge.rs:1778-1781`).
     pub fn elemId(self: OpCursor, actor_index: ActorIdx) Error!ElemId {
         const ctr = std.math.cast(u32, self.ctr) orelse return error.InvalidCursor;
         return ElemId.fromOpId(OpId.init(ctr, actor_index));
@@ -1639,8 +1637,8 @@ test "the v1 codec is the grammar, byte for byte, in both directions" {
     {
         var twenty: [20]u8 = undefined;
         for (&twenty, 0..) |*b, i| b.* = @intCast(i);
-        // The counter is written by hand because `OpCursor.init` takes the
-        // element's own counter, which is a `u32`.
+        // The largest wire counter survives decoding even when no resident
+        // document operation can carry that counter.
         const c: Cursor = .{ .op = .{
             .ctr = std.math.maxInt(u64),
             .actor = ActorId.init(&twenty),
@@ -1655,9 +1653,6 @@ test "the v1 codec is the grammar, byte for byte, in both directions" {
         try testing.expectEqualSlices(u8, &want, got);
         const back = try fromBytes(&want);
         try testing.expectEqual(std.math.maxInt(u64), back.op.ctr);
-        // A counter no row can carry is refused when it is resolved, not when
-        // it is read, which is what keeps the reader's grammar unbounded.
-        try testing.expectError(error.InvalidCursor, back.op.elemId(0));
     }
 }
 
@@ -2297,6 +2292,33 @@ test "an object that is not there, an actor that is not there, and a clock that 
         getCursorPosition(&doc.set, t_obj, unborn, null),
     );
 
+    // Valid wide cursor codecs must not truncate into a resident operation.
+    for ([_]u64{ @as(u64, std.math.maxInt(u32)) + 1, std.math.maxInt(u64) }) |counter| {
+        const wide_cursor: Cursor = .{ .op = .{
+            .ctr = counter,
+            .actor = solo_actor[0],
+            .move_cursor = .after,
+            .offset = 0,
+        } };
+        const encoded = try toBytes(gpa, wide_cursor);
+        defer gpa.free(encoded);
+        const decoded = try fromBytes(encoded);
+        try testing.expectEqual(counter, decoded.op.ctr);
+        try testing.expectError(
+            error.InvalidCursor,
+            getCursorPosition(&doc.set, t_obj, decoded, null),
+        );
+        const encoded_string = try toStr(gpa, wide_cursor);
+        defer gpa.free(encoded_string);
+        const decoded_string = try fromStr(gpa, encoded_string);
+        defer gpa.free(decoded_string.op.actor.bytes);
+        try testing.expectEqual(counter, decoded_string.op.ctr);
+        try testing.expectError(
+            error.InvalidCursor,
+            getCursorPosition(&doc.set, t_obj, decoded_string, null),
+        );
+    }
+
     // A clock that does not cover the cursor (`automerge.rs:777-780`). This
     // is upstream's "cursors created after heads are invalid"
     // ([automerge/tests.rs:233-240](https://github.com/automerge/automerge/blob/ddbff535407e4d28cd2a82eaf6c6add08caa3bdd/rust/automerge/src/automerge/tests.rs#L233-L240)):
@@ -2871,46 +2893,52 @@ test "constructing a cursor allocates nothing, and the cursor it hands back owns
 // on the way to the answer, so agreement at every position is a statement
 // about the document and not about one function.
 
-const cdoc = @import("doc.zig");
-const cread = @import("read.zig");
-const ctrans = @import("transact.zig");
+const cauto = @import("autocommit.zig");
+const cspans = @import("iter/spans.zig");
 const marksmod = @import("marks.zig");
 
-/// The marks over one position. The **names and any byte a value carries are
-/// the document's**, which is why the document must not be mutated while a
-/// table of these is live — it is not, and the rule is [`src/marks.zig`](marks.zig)'s.
+/// The marks over one position borrow a retained span's owned payload.
+/// The spans stay alive until every independent reader comparison completes.
 const AtPosition = ?marksmod.MarkSet.Entry;
 
 test "a cursor comes back to the position it was taken at, and the mark there is the one the span walk read" {
     const gpa = testing.allocator;
-    var d = try cdoc.Document.init(gpa, std.testing.io, .auto);
+    var d = try cauto.AutoCommit.init(gpa, std.testing.io);
     defer d.deinit();
-    d.setActorId(.{ .bytes = "0123456789abcdef" });
+    try d.setActorId(.{ .bytes = "0123456789abcdef" });
 
-    const text = try ctrans.putObject(&d, .root, .{ .key = "text" }, .text);
-    try ctrans.spliceText(&d, text, 0, 0, "hello world");
+    const text = try d.putObject(.root, .{ .key = "text" }, .text);
+    try d.spliceText(text, 0, 0, "hello world");
     // **Two marks over disjoint spans with a gap between them**, so a reader
     // that answered "the mark" without saying which one has to fail at
     // position 5.
-    try ctrans.mark(&d, text, 0, 5, "link", .after, .{ .str = "https://example.com" });
-    try ctrans.mark(&d, text, 6, 11, "bold", .after, .{ .bool_value = true });
+    try d.mark(text, 0, 5, "link", .after, .{ .str = "https://example.com" });
+    try d.mark(text, 6, 11, "bold", .after, .{ .bool_value = true });
 
     const enc = d.textEncoding();
-    const all = try d.text(gpa, text);
+    const all = try d.text(text, gpa);
     defer gpa.free(all);
     const len = enc.width(all);
     try testing.expectEqual(@as(usize, 11), len);
 
     // Reader one: the span walk, turned into a per-position table.
     var mark_at: [32][2]AtPosition = .{.{ null, null }} ** 32;
+    // Keep the owned mark payloads alive while the position table borrows them.
+    var retained_spans: std.ArrayList(cspans.Span) = .empty;
+    defer {
+        for (retained_spans.items) |*span| span.deinit(gpa);
+        retained_spans.deinit(gpa);
+    }
     {
-        var walk = try cread.spans(&d, text, gpa);
+        var walk = try d.spans(text, gpa);
         defer walk.deinit();
         var idx: usize = 0;
         while (try walk.next()) |found| {
             var span = found;
-            // The walk hands the span over (`Spans.next`, `spans.zig`:1332`).
-            defer span.deinit(gpa);
+            retained_spans.append(gpa, span) catch |append_error| {
+                span.deinit(gpa);
+                return append_error;
+            };
             switch (span) {
                 .text => |t| {
                     // **One mark covers every position of the span**, so each
@@ -2946,15 +2974,15 @@ test "a cursor comes back to the position it was taken at, and the mark there is
         // **`heads` is `null` here**, so this reads at the present. The three
         // cursor readers carry `at` on the method itself, upstream's shape
         // (`read.rs:203`, `:228`, `:241`), not as a second name.
-        const cursor = try cread.getCursor(&d, text, .{ .index = i }, null, gpa);
-        const back = try cread.getCursorPosition(&d, text, cursor, null);
+        const cursor = try d.getCursor(text, .{ .index = i }, null, gpa);
+        const back = try d.getCursorPosition(text, cursor, null);
         if (back != i) {
             std.debug.print("cursor at {d} resolves to {d}\n", .{ i, back });
             return error.TestExpectedEqual;
         }
 
         // Reader two, over the same position.
-        const over = try cread.getMarks(&d, text, i, i + 1, gpa);
+        const over = try d.getMarks(text, i, i + 1, gpa);
         defer gpa.free(over);
 
         const want_n: usize = if (mark_at[i][0] == null) 0 else if (mark_at[i][1] == null) 1 else 2;

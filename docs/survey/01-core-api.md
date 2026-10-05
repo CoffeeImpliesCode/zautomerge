@@ -1954,34 +1954,31 @@ marked `[INFERENCE]`.
   `cfg(test)`. The port must **promote** these to real functions or reimplement the
   property in tests. Promoting them is strictly better: it removes an asymmetry where
   the production build cannot construct a `Clock` at all.
-* **Feature gates** (`Cargo.toml:11-17`): build options in `build.zig`. `utf8-indexing`
-  must be resolved at *comptime* and baked in as a `comptime` value. Rust's precedence
-  is `utf8 > utf16 > codepoint`; Zig must reproduce the *behaviour* when both are set
-  (Rust's `cfg_if` silently picks `utf8`, and the crate never errors).
+* **Feature gates** (`Cargo.toml:11-17`): Rust resolves indexing features with `utf8 > utf16 > codepoint` precedence.
+  Native `TextEncoding.platformDefault()` uses one declared build option.
+  It supports all four modes, including grapheme clusters, and defaults to code points (`src/types.zig:958-970`).
 * **Allocator plumbing**: the Rust code hardcodes the global allocator throughout
   (`Vec::new()`, `String::new()`, `vec![]`); there is no `impl Allocator` in this slice.
   See the numbered list below.
 
 ### Traits → interfaces
 
-* `ReadDoc` → `pub const ReadDoc = struct { ... }` holding function pointers plus a
-  self pointer, or a vtable. Real hazard: `ReadDoc` has 30 methods, `AutoCommit`'s
-  `&mut self` methods auto-commit transactions as a side effect, so a vtable must
-  carry mutability per method (it does) *and* the `self` pointer must be `*AutoCommit`
-  for the `&mut` methods. A `*anyopaque` vtable works only if every mutating method is
-  reached through a documented cast. The alternative — generic dispatch,
-  `fn get(comptime Self_: type, self: *const Self_, …)` — loses the vtable and forces
-  static dispatch. Given `AutoSerde` and the `sync` module both take `&R: ReadDoc`
-  generically, **static generic dispatch is the closer fit**; the trait's
-  `AsRef<ExId>` / `Into<Prop>` generic parameters are the harder part.
+* `ReadDoc` uses compile-time dispatch through `read.ReadDoc(R)`, not a vtable.
+  Bare owners are borrowed. Explicit pointer types retain their constness (`src/read.zig:2261-2274`).
+  Ordinary `AutoCommit` reads preserve the held transaction and see its scoped pending writes.
+  History, save, diff, setters, and sync use closing barriers (`src/autocommit.zig:1-3`, `:121-124`).
+  The adapter's `getMissingDeps` and `getChangeByHash` do not close.
+  The same-named inherent `AutoCommit` methods close first (`src/read.zig:2442-2447`, `src/autocommit.zig:793-802`).
+  `hydrate(null)` reads raw present state, bypassing isolation.
+  Explicit current heads also retain the raw hydration exception with pending writes (`src/read.zig:942-963`).
 * `Transactable: ReadDoc` → same, with the supertrait meaning "the struct also has the
   `ReadDoc` methods". Zig has no trait bounds, so a `Transactable` interface must
   *redeclare* the `ReadDoc` methods or document that the caller must have both.
   Together the two traits are ~50 methods on a Zig struct.
 * `impl SyncDoc for SyncWrapper<'_>` and `AutoCommit::sync() -> impl SyncDoc + '_`
-  (`autocommit.rs:779-782`, `1306-1350`): `impl Trait` in return position maps cleanly
-  to a Zig opaque return type — `fn sync(self: *AutoCommit) SyncDoc` where `SyncDoc` is
-  `anyopaque`-backed, or a public concrete `SyncWrapper` struct.
+  (`autocommit.rs:779-782`, `1306-1350`) map to a concrete borrowed `AutoCommit.Sync`.
+  `AutoCommit.sync()` closes first. The owner must stay live at the same address.
+  Receive uses an inactive log during isolation (`src/autocommit.zig:375-430`).
 * `TextValue` (`text_value.rs:26`) with associated type `Elem` — the one place a
   *generic interface* is the honest mapping: `fn TextValue(comptime Elem: type) type`.
   A single runtime `ConcreteTextValue` union is the other option and matches how the
@@ -2001,16 +1998,12 @@ marked `[INFERENCE]`.
 * `ObjType` → `pub const ObjType = enum { map, table, list, text };` with `map` as the
   default. Rust's `Default` is a derive attribute; Zig has no equivalent, so
   `pub const default: ObjType = .map;` plus an explicit `fn default() ObjType`.
-* `Prop` → a `union(enum) { map: []const u8, seq: usize }` plus a **hand-written**
-  `pub fn order(a, b) std.math.Order` that compares the tag then the payload. Rust
-  derives `Ord` over a mixed key/index space, and `std.meta.order` on a mixed union is
-  not the same. Getting this wrong reorders every sorted key set.
-* `Value<'a>` → `pub const Value = union(enum) { object: ObjType, scalar: ScalarValue };`
-  The lifetime disappears (Zig slices carry their own). `Scalar(Cow<'a, ScalarValue>)`
-  becomes a plain `ScalarValue` — the borrow-vs-own distinction is *lost*, and
-  `Value::into_owned` / `to_owned` (`value.rs:182`, `190`) become no-ops. Acceptable:
-  the public `Value<'a>` in `PatchAction` (`patches/patch.rs:37`) is already
-  `Value<'static>`, so no zero-copy is promised there.
+* Native `Prop` uses `.key` and `.index`, not Rust's `Map` and `Seq` spellings.
+  Its ordering must compare the tag and payload consistently with Rust's `Ord`.
+  Preserve that ordering for sorted key sets.
+* Native `Value` distinguishes object types from scalar payloads.
+  Scalar slices can borrow storage. Ownership conversion must copy those bytes, not return a no-op.
+  Returned patches own their payloads independently of the source document (`src/patches.zig:1258-1293`).
 * `ScalarValue` → `union(enum) { bytes: []u8, str: SmolStr, int: i64, uint: u64, f64: f64,
   counter: Counter, timestamp: i64, boolean: bool, unknown: Unknown, null: void }`.
   `SmolStr` needs a port or `[]const u8` + arena. **The `Counter` payload is the trap**:
@@ -2025,18 +2018,17 @@ marked `[INFERENCE]`.
   break the columnar packing. `Cow<'a, [u8]>` → `[]const u8` with an explicit
   owned/borrowed flag if the borrow distinction is load-bearing (it is, for zero-copy
   reads of the op set).
-* `ExId` → `union(enum) { root, id: struct { counter: u64, actor: ActorId, actor_index:
-  u32 } }`. This makes the field order *explicit and named*, which is a strict
-  improvement over the Rust original and removes the `(id, actor, counter)` vs
-  `(ctr, _, actor)` naming hazard entirely. Keep the serialization order
-  `[tag][leb actor_len][actor bytes][leb actor_index][leb counter]` exactly as proven at
-  `exid.rs:46-66`.
+* Public `ExId` keeps a `u64` counter and a `u32` actor-index hint.
+  Its named identity includes actor bytes (`src/types.zig:500-520`).
+  Resident operation rows remain `u32`. `opId()` checks the public counter before conversion (`src/types.zig:543-549`).
+  Actor bytes define stable identity even after actor-table indices change.
+  Preserve the wire order `[tag][leb actor_len][actor bytes][leb actor_index][leb counter]`
+  established by `exid.rs:46-66`.
 * `PatchAction` → `union(enum)` with the 9 payloads. `SequenceTree<(Value, ObjId, bool)>`
   is a generic container, so a Zig port needs a concrete `SequenceTree` for that tuple.
-  `ConcreteTextValue` is itself a `union(enum)` of 4 sequence trees
-  (`text_value.rs:186-192`) — nested unions with 4 different `SequenceTree<T>`
-  instantiations, which in Zig means a generic `SequenceTree(T)` or an erased
-  representation.
+  Native `ConcreteTextValue` owns four encoding-specific `SequenceTree(T)` variants.
+  UTF-8 and UTF-16 units can remain incomplete. `makeString` renders them lossily into caller-owned UTF-8.
+  Grapheme elements preserve their stored segmentation (`src/patches.zig:386-416`).
 * `ClockRange` → `union(enum) { current: ?Clock, diff: struct { before: Clock, after:
   Clock } }`. `ClockRange::Current(None)` → `.current = null`; the fast path is a
   pointer compare.
@@ -2052,18 +2044,22 @@ marked `[INFERENCE]`.
   The port uses named error sets. Each declaration states its refusal contract.
 * `Result<T, Self>` requires a tagged union with success and failure payloads.
   A Zig error union cannot use an ordinary value type as its error set.
-* The port's `transaction.Outcome(O)` contains `Success(O)` or `Failure(O)`.
-  Success owns the body result and carries the optional change hash.
-  Failure preserves the primary error, rollback progress, and any recovery transaction.
-  A refused commit also retains the successful body result.
-  The document owns its patch log. These result types do not own another log.
+* The port's `transaction.Outcome(O, E)` preserves the callback's error set.
+  Success owns the body result, optional change hash, and returned patch log.
+  Failure preserves the primary error and a separate rollback error.
+  Failed rollback retains the recovery transaction as the sole journal and log owner.
+  A refused commit also retains the successful body result (`src/transaction.zig:124-153`).
 
 ### Ownership and lifetimes
 
-* Rust references map to Zig pointers. The port's transaction borrows `*Document`.
-  Commit or complete rollback before `Transaction.deinit`.
-  Disposal releases transaction storage. It does not undo document rows.
-  A refused rollback retains an owner that the caller must retry and dispose.
+* Rust references map to Zig pointers. A borrowed transaction targets a mode-less `*Document`.
+  `Transaction.deinit` rolls back an open journal and can fail.
+  Refusal retains the journal and its log for retry.
+  `deinitClosed` releases storage only after commit, rollback, or whole-document destruction (`src/transact.zig:321-344`).
+  Commit transfers `{ hash, patch_log }` through `CommitResult`. Release it with `deinit(gpa)` (`src/transaction.zig:110-122`).
+  `OwnedTransaction` owns a document and the same journal engine at its final address (`src/transaction.zig:156-159`).
+  `AutoCommit` retains one transaction, not a fresh transaction per write (`src/autocommit.zig:30-39`, `:114-119`).
+  `cloneInto` copies the document and pending journal without closing the source (`src/autocommit.zig:193-215`).
 * `Document` retains the borrowed `std.Io` supplied to its constructor.
   The provider and allocator must outlive the document.
   `ActorId.random(gpa, io)` draws 16 secure bytes or returns an error.
@@ -2156,25 +2152,25 @@ marked `[INFERENCE]`.
   direct swap.
 * `C: FnOnce(&O) -> CommitOptions` (`automerge.rs:594-601`, `643-652`) → a
   `*const fn (*const O) CommitOptions` function-pointer parameter.
-* `impl Display` → `pub fn format(self, writer: *std.io.Writer) std.io.Writer.Error!void`.
-  Every `Display` here is trivial except `PatchAction::Display`, which is literally
-  `Debug` (`patches/patch.rs:88`) — and Zig has no stdlib equivalent of
-  `std.debug.format`. **This is a real gap**: `PatchAction` has 9 variants with
-  structured payloads. Options: hand-write 9 format functions, or emit JSON via
-  `std.json` (which changes the output format, a visible API change).
+* Rust `PatchAction::Display` uses derived debug output (`patches/patch.rs:88`).
+  Native `PatchAction.format(gpa, out)` explicitly formats every variant and field (`src/patches.zig:999-1006`).
+  This replaces the former formatting gap. It does not promise Rust debug-byte identity.
 * `rand::distr::Distribution<ActorId>` (`types.rs:60-61`) and the `make_rng` test
   helper (`lib.rs:322-333`) → `std.Random.DefaultPrng`.
 * **serde derive surface**: `ObjType` (`types.rs:170`), `ScalarValue`
   `#[serde(untagged)]` (`value.rs:518`), `Counter` (`value.rs:459-468`), `DataType`
   (`value.rs:429`), `ExId` (hand-written, serializes as a string, `exid.rs:156-161`),
-  `legacy::Change` (`legacy/mod.rs:327`), `AutoSerde` (`autoserde.rs:30`). Zig 0.16 has
-  `std.json` with `jsonSerialize`/`jsonParse` methods but **no derive and no
-  untagged-enum support**. `ScalarValue`'s `untagged` + `Counter`-as-i64 means the wire
-  shape is a *bare JSON number with no type tag* — the reader must guess from the value,
-  which is why `DataType` exists internally (`value.rs:616-618`). Reproducing untagged
-  serde in Zig is a substantial separate project; the honest scope call is explicit
-  `toJson`/`fromJson` for `Value`/`ScalarValue`, and accepting that `AutoSerde`'s output
-  cannot be reproduced byte-for-byte without it.
+  `legacy::Change` (`legacy/mod.rs:327`), `AutoSerde` (`autoserde.rs:30`).
+  The native port implements explicit scalar codecs and owned `ExpandedChange` decoding.
+  `Change.decode(gpa)` copies operations and actor payloads (`src/change.zig:349-350`, `:629-648`).
+  It reuses the canonical change encoder rather than a second storage codec.
+  `AutoSerde(R)` borrows any supported `ReadDoc` without closing pending writes.
+  It supports compact JSON and a compile-time non-JSON serializer protocol.
+  It has no deserialization counterpart (`src/autoserde.zig:1-7`, `:25-45`, `:175-212`).
+* Native `Stats` includes change, operation, and actor counts.
+  Its package name, package version, and compiler version identify this Zig build, not Rust's build (`src/doc.zig:426-443`).
+  `AutoCommit.stats()` does not close pending writes (`src/autocommit.zig:947-950`).
+
 
 ### `unsafe`
 
@@ -2253,14 +2249,9 @@ marked `[INFERENCE]`.
     `value.rs`, `clock.rs` and `convert.rs`; `change.rs` needs `sha2`/`flate2` and
     `decoding.rs` needs `std.io`. The crate already supports a wasm target
     (`Cargo.toml:12`, `lib.rs:244`).
-11. **Allocator-generic (`impl Allocator`) plumbing.** The Rust code hardcodes the
-    global allocator throughout. A Zig port must decide whether to thread
-    `std.mem.Allocator` through the ~40 public signatures here (all of which return
-    `Vec<u8>`, `String`, `Vec<Change>`, `Vec<Patch>`, `Vec<ChangeHash>`,
-    `Vec<(Value, ExId)>`) or use the page allocator. Threading it is a large but
-    mechanical diff; not threading it is a real limitation for embedders.
-    **Recommend threading it from the start** — retrofitting an allocator parameter
-    through 40 public signatures is far more expensive than adding it.
+11. **Allocator plumbing is explicit in the native API.**
+    Rust uses its global allocator. Native loaders, readers, transactions, and serializers receive or retain an allocator.
+    The C bridge alone binds libc allocation to preserve fixed ABI signatures (`src/c/result.zig:53-69`).
 12. **`serde` derive surface** — covered in item 7 and the mapping section above.
 
 ---
@@ -2348,14 +2339,10 @@ marked `[INFERENCE]`.
 
 ### Port decisions that must be made, not derived
 
-* Whether to thread `std.mem.Allocator` through the ~40 allocating public signatures
-  (Zig note 11). This is the largest single mechanical decision and is much cheaper to
-  make at the start.
-* Whether to reproduce serde's `untagged` output for `Value`/`ScalarValue`/`ObjType` at
-  all, given no derive and no untagged support in `std.json`. A counter is
-  indistinguishable from an int in the Rust output (`value.rs:460-468`), so a faithful
-  port is lossy in the same way the original is — but only if the untagged writer is
-  hand-built.
+* Native allocating entry points use explicit allocator contracts.
+  The C bridge preserves fixed signatures and documents its separate allocation rules.
+* Serde output uses explicit native codecs and the generic serializer protocol above.
+  A counter remains indistinguishable from an integer in untagged output, matching Rust (`value.rs:460-468`).
 * Whether to delete the 13 `#[deprecated]` methods (recommended) or keep them
   unannotated. There is no middle option in Zig.
 * Whether collapsing `O: AsRef<ExId>` to pass-by-value is acceptable given `ExId`'s size

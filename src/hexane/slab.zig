@@ -62,12 +62,12 @@
 //! # The deviation worth naming
 //!
 //! Upstream re-encodes the middle through an incremental writer that
-//! carries a run across a seam without materialising it (`rle/state.rs`),
-//! so a splice into a slab holding a million copies of one value costs
-//! O(1). This port hands the codec a plain value slice, so that splice
-//! costs O(items in the middle). The values are the same and the bytes are
-//! the same; only the cost differs, and only for a middle made of a very
-//! long run.
+//! carries a run across a seam without materialising it (`rle/state.rs`).
+//! A splice preserving the slab's single constant run uses `wireFill`.
+//! Other RLE and boolean seams stream constant runs by count into their
+//! canonical writers; RLE literals stream their payloads, and boolean
+//! middles preserve the copied prefix's run parity without a decoded array.
+//! Codecs without a counted writer retain materialization.
 //!
 //! `merge` is the exception. Where the two runs it meets are both literal
 //! runs, it rewrites the count header of `a`'s run and copies the runs'
@@ -83,18 +83,16 @@
 //! and a repeat or null run as one (`rle/load.rs:38-39`, `:43-45`,
 //! `:50-52`, and the loader's own copy of the same bookkeeping at
 //! `:132-153`), and its `check_invariants` asserts a slab's cached count is
-//! that number (`column.rs:1316-1319`). This port counts wire runs, every
-//! run one. So a slab whose every literal run holds a single value counts
-//! the same on both sides and any other slab does not, and the budget
-//! below is spent in runs here and in segments there.
-//!
-//! Nothing in the compatibility contract depends on it — a change's column
-//! bytes come from a fresh encoder over the range's values
-//! (`columnar/column_range/rle.rs:102-113`), never from slab bytes — and
-//! no read depends on it either, which the differential gate at the foot of
-//! this file checks over the whole corpus. What it does change is where a
-//! load cuts and how much a slab can hold; the diff block there has the
-//! citations and the numbers.
+//! that number (`column.rs:1316-1319`). This port keeps `segments` in wire
+//! headers and computes the maintenance metric with `decodeBudget`: literal
+//! rows cost one each; repeats, absent runs and boolean pads cost one.
+//! `partitionToBudget` cuts literal runs at row boundaries without expanding
+//! repeats. Each piece is independently canonical; the column encoder rejoins
+//! their seams, preserving global wire bytes and change hashes.
+//! Signed tracked codecs retain their wire-run policy: arbitrary literal cuts
+//! can turn a valid global signed prefix into an unrepresentable local span.
+//! `usesLiteralBudget` states that exception; ordinary signed RLE still uses
+//! the literal-row budget.
 
 const std = @import("std");
 const err = @import("../error.zig");
@@ -143,15 +141,9 @@ fn wireRangeWithSegs(
     return E.wireRange(gpa, bytes, from, to);
 }
 
-/// The default number of runs one slab may hold (`column.rs:21`).
-///
-/// A load cuts at half this, to leave room for inserts without an overflow
-/// split; a splice runs to the full budget and merges the neighbours back
-/// down afterwards.
-///
-/// **Counted in wire runs, and upstream counts segments** — see the module
-/// comment below and `Slab.segments`. The two budgets are the same number
-/// over different things, so they buy different sizes.
+/// The default maintenance budget per slab (`column.rs:21`).
+/// Literal-budget codecs spend one unit per literal row or compressed run.
+/// A load targets half this budget to leave room for inserts.
 pub const default_max_segments: usize = 64;
 
 /// A zero-length mutable slice: what an empty slab's `data` points at.
@@ -206,10 +198,9 @@ pub const Slab = struct {
     len: usize,
     /// How many runs `data` is cut into.
     ///
-    /// **Wire runs, and not upstream's segments**: a literal run of `n`
-    /// values is one here and `n` there (`rle/load.rs:38-39`). The module
-    /// comment names what that changes; the differential gate at the foot
-    /// of this file pins the number of records the two disagree about.
+    /// A literal run of `n` values remains one wire header here.
+    /// `decodeBudget` supplies the separate literal-row maintenance metric
+    /// (`rust/hexane/src/rle/load.rs:38-52`).
     segments: usize,
     /// Where the last run starts.
     tail: Tail,
@@ -450,9 +441,9 @@ pub fn firstItemRun(comptime E: type, segs: []const Segment(E.Wire)) usize {
 /// side of the cut end, and the values of the cut's own runs.
 ///
 /// This is the `RlePartition` of `rle/splice.rs:79-87`, narrowed to what a
-/// rebuild needs. Upstream's also carries a reader state, because its
-/// cursor resumes reading a slab after the write-back; a one-shot splice
-/// decodes the whole middle instead, so there is nothing to resume.
+/// rebuild needs. Upstream also carries a resumable reader state; this
+/// one-shot partition either streams its middle into the wire writer or
+/// materializes it for codecs without that capability.
 fn Partition(comptime E: type) type {
     return struct {
         const Self = @This();
@@ -564,15 +555,28 @@ fn Partition(comptime E: type) type {
             }
         }
 
-        /// The value the last item of the copied prefix carries, or null
-        /// The value the middle opens with, or null when it is empty.
-        fn midFirst(self: *const Self) ?E.Wire {
-            return if (self.mid.items.len == 0) null else self.mid.items[0];
-        }
-
-        /// The value the middle closes with, or null when it is empty.
-        fn midLast(self: *const Self) ?E.Wire {
-            return if (self.mid.items.len == 0) null else self.mid.items[self.mid.items.len - 1];
+        /// Encodes the cut's middle while old payload borrows remain live.
+        fn rebuildEncoded(self: *const Self) ParseError![]u8 {
+            var writer = if (comptime @hasDecl(E.WireSpliceWriter, "initOpening"))
+                E.WireSpliceWriter.initOpening(self.gpa, (self.prefixRuns() % 2) == 1)
+            else
+                E.WireSpliceWriter.init(self.gpa);
+            defer writer.deinit();
+            const pre = self.preItems();
+            try writer.appendEncodedRange(self.data, self.segs, pre.from, pre.to);
+            try writer.extend(self.insert);
+            const post = self.postItems();
+            const post_len = post.to - post.from;
+            const replaced = if (self.postfix) |p| @min(p.len, post_len) else 0;
+            if (replaced != 0) try writer.extend(self.postfix.?[0..replaced]);
+            try writer.appendEncodedRange(
+                self.data,
+                self.segs,
+                post.from + replaced,
+                post.to,
+            );
+            try writer.finish();
+            return writer.take();
         }
 
         /// How many runs the copied prefix holds: everything before run `L`,
@@ -587,6 +591,76 @@ fn Partition(comptime E: type) type {
             return self.segs.len - @min(self.R + 1, self.segs.len);
         }
     };
+}
+
+/// A single value-bearing run proves uniformity without expanding its count.
+/// A literal proves it only when it has one item. The sole extra run accepted
+/// is the boolean opening false pad (`bool.rs:312-317`, `:988-1002`).
+fn uniformRunValue(
+    comptime E: type,
+    segs: []const Segment(E.Wire),
+    len: usize,
+) ?E.Wire {
+    var first: usize = 0;
+    if (comptime E.Wire == bool) {
+        if (segs.len == 2 and segs[0].kind == .pad and
+            segs[0].itemCount() == 0 and !segs[0].opens_with_true and
+            segs[0].first_value == null and segs[0].byte_start == 0 and
+            segs[1].opens_with_true)
+        {
+            first = 1;
+        }
+    }
+    if (segs.len != first + 1) return null;
+    const run = segs[first];
+    const count = run.itemCount();
+    if (count == 0 or run.item_start != 0 or count != len) return null;
+    switch (run.kind) {
+        .repeat => if (count < 2) return null,
+        .literal => if (count != 1) return null,
+        .absent => {},
+        .pad => return null,
+    }
+    return run.first_value;
+}
+
+fn spliceUniformRun(
+    gpa: std.mem.Allocator,
+    comptime E: type,
+    slab: *Slab,
+    segs: []const Segment(E.Wire),
+    len: usize,
+    insert: []const E.Wire,
+    postfix: ?[]const E.Wire,
+) ParseError!bool {
+    if (comptime !@hasDecl(E, "wireFill")) return false;
+    const value = uniformRunValue(E, segs, slab.len) orelse return false;
+    for (insert) |v| if (!E.sameValue(value, v)) return false;
+    // A postfix is a replacement in the wire domain, not another insertion.
+    // Conservatively require every supplied value to match, even if the
+    // generic partition would consume only a prefix (`delta/mod.rs:1384-1400`).
+    if (postfix) |values| {
+        for (values) |v| if (!E.sameValue(value, v)) return false;
+    }
+    // Encode while old bytes (including borrowed byte payloads) remain live.
+    // Upstream grows matching runs by count (`rle/state.rs:356-374`); wireFill
+    // supplies that same canonical singleton/repeat/absent grouping here.
+    const data = if (len == 0)
+        try gpa.alloc(u8, 0)
+    else
+        try E.wireFill(gpa, len, value, false);
+    errdefer gpa.free(data);
+    const m = try measure(gpa, E, data);
+    if (m.len != len) return error.InvalidValue;
+    const replacement: Slab = .{
+        .data = data,
+        .len = m.len,
+        .segments = m.segments,
+        .tail = m.tail,
+    };
+    if (slab.data.len != 0) gpa.free(slab.data);
+    slab.* = replacement;
+    return true;
 }
 
 /// Replaces the items `[index, index + del)` of `slab` with `insert`.
@@ -612,9 +686,12 @@ pub fn splice(
 ) ParseError!void {
     if (index > slab.len or del > slab.len - index) return error.InvalidValue;
     if (del == 0 and insert.len == 0) return;
+    const new_len = std.math.add(usize, slab.len - del, insert.len) catch
+        return error.Overflow;
 
     const segs = try E.segmentsOf(gpa, slab.data);
     defer gpa.free(segs);
+    if (try spliceUniformRun(gpa, E, slab, segs, new_len, insert, postfix)) return;
 
     var p = Partition(E).start(gpa, slab.data, segs, index, del, insert, postfix);
     defer p.deinit();
@@ -642,8 +719,12 @@ pub fn splice(
     var settled = false;
     var rounds: usize = 0;
     while (!settled and rounds <= segs.len + 1) : (rounds += 1) {
-        try p.rebuild();
-        const next_bytes = try E.wireEncode(gpa, p.mid.items, (p.prefixRuns() % 2) == 1);
+        const next_bytes = if (comptime @hasDecl(E, "WireSpliceWriter"))
+            try p.rebuildEncoded()
+        else blk: {
+            try p.rebuild();
+            break :blk try E.wireEncode(gpa, p.mid.items, (p.prefixRuns() % 2) == 1);
+        };
         gpa.free(mid_bytes);
         mid_bytes = next_bytes;
         const next_segs = try E.segmentsOf(gpa, mid_bytes);
@@ -668,7 +749,7 @@ pub fn splice(
             if (collide(
                 E,
                 try seamValueOf(E, slab.data, prev),
-                p.midFirst(),
+                mid_segs[first].first_value,
                 prev.kind,
                 mid_segs[first].kind,
             )) {
@@ -683,7 +764,13 @@ pub fn splice(
         // cannot fire on a canonical slab: whenever the suffix is non-empty
         // the middle already holds every item of the boundary run, so the
         // two runs that meet are the ones that were already adjacent.
-        if (p.R + 1 < segs.len and collide(E, p.midLast(), segs[p.R + 1].first_value, mid_segs[last].kind, segs[p.R + 1].kind)) {
+        if (p.R + 1 < segs.len and collide(
+            E,
+            try E.lastValueOfRun(mid_bytes, mid_segs[last]),
+            segs[p.R + 1].first_value,
+            mid_segs[last].kind,
+            segs[p.R + 1].kind,
+        )) {
             p.R += 1;
             // The middle now holds every item of run `R`, so the copied
             // suffix resumes after it.
@@ -693,11 +780,14 @@ pub fn splice(
         }
     }
 
-    const data = try gpa.alloc(u8, p.lb + mid_bytes.len + (slab.data.len - p.rb));
+    const middle_end = std.math.add(usize, p.lb, mid_bytes.len) catch return error.Overflow;
+    const data_len = std.math.add(usize, middle_end, slab.data.len - p.rb) catch
+        return error.Overflow;
+    const data = try gpa.alloc(u8, data_len);
     errdefer gpa.free(data);
     @memcpy(data[0..p.lb], slab.data[0..p.lb]);
     @memcpy(data[p.lb..][0..mid_bytes.len], mid_bytes);
-    @memcpy(data[p.lb + mid_bytes.len ..], slab.data[p.rb..]);
+    @memcpy(data[middle_end..], slab.data[p.rb..]);
 
     // The tail is a copy whenever the last run came through in the copied
     // bytes, which is the common case: the suffix if there was one, and the
@@ -713,11 +803,15 @@ pub fn splice(
         try tailAt(E, segs[p.L - 1].byte_end, segs[p.L - 1], try E.litTail(slab.data, segs[p.L - 1]))
     else
         Tail.zero;
+    const prefix_middle = std.math.add(usize, p.prefixRuns(), mid_segs.len) catch
+        return error.Overflow;
+    const segments = std.math.add(usize, prefix_middle, p.suffixRuns()) catch
+        return error.Overflow;
 
     if (slab.data.len != 0) gpa.free(slab.data);
     slab.data = data;
-    slab.len = slab.len - del + insert.len;
-    slab.segments = p.prefixRuns() + mid_segs.len + p.suffixRuns();
+    slab.len = new_len;
+    slab.segments = segments;
     slab.tail = tail;
 }
 
@@ -1047,68 +1141,193 @@ pub fn pieceRuns(
     return max_segments - pad;
 }
 
-/// How many slabs a slab of `segments` runs leaves behind when it is cut at
-/// the budget: the room a caller has to have in its list before the cut puts
-/// them there (`Column.settle`, `Column.spliceOneSlab`,
-/// `Column.spliceAcrossSlabs`, `Column.tryMerge`).
-///
-/// The first piece keeps the slab's own identity (`splitToBudget` below), so
-/// this counts the pieces that spill and not the pieces the cut makes.
-///
-/// **A codec whose pieces cannot gain a pad is bound by the budget alone**,
-/// and `segments / max_segments` is the bound this file already reserved
-/// with — a conservative one, since the cut makes `ceil` pieces. One whose
-/// pieces can has every piece behind the first hold `max_segments - 1`
-/// runs, which is the bound here and the whole difference between the two.
-pub fn splitSpillCount(comptime E: type, segments: usize, max_segments: usize) usize {
-    if (!piecePadsRuns(E)) return segments / max_segments;
-    if (segments <= max_segments) return 0;
-    const behind: usize = max_segments - 1;
-    return (segments - max_segments + behind - 1) / behind;
+/// An allocation-free upper bound on the extra pieces of a greedy partition.
+/// `units` is decode work, not `Slab.segments`. Adjacent non-final pieces
+/// consume more than the effective budget even when a run-boundary cut is
+/// underfilled. Pairing those pieces bounds spills by `(units - 1) / q`,
+/// where `q = ceil(budget/2)`; boolean pieces reserve one opening pad, giving
+/// `q = floor(budget/2)`. This deliberately permits underfilled pieces.
+/// Invalid budgets return the loosest finite bound; partitioning refuses them.
+pub fn splitSpillCount(comptime E: type, units: usize, max_segments: usize) usize {
+    if (units <= max_segments) return 0;
+    if (max_segments == 0 or (piecePadsRuns(E) and max_segments < 2)) return units;
+    const q = max_segments / 2 + @as(usize, if (piecePadsRuns(E)) 0 else max_segments % 2);
+    return (units - 1) / q;
 }
 
-/// Cuts `slab` down to the run budget, returning the pieces that spilled
-/// out. Cuts land on run boundaries, so every piece is itself a canonical
-/// slab and the byte stream they concatenate to is the one `slab` held.
-///
-/// A run is never split, so a slab that is one very long run keeps one
-/// segment however long it is — the same exemption the column's invariant
-/// checker makes for a single oversize value (`column.rs:1311-1318`).
-///
-/// **A piece is cut one run short when it has to open on a `true` run**, and
-/// that is the whole difference between a boolean column and the rest
-/// ([`pieceRuns`](pieceRuns) above). The pad the piece writes is a run the
-/// wire spends and `measure` counts, so a piece cut at the full budget behind
-/// a `true` run lands one run over it — which is the arm the column's
-/// invariant checker refuses (`column.zig:6881-6882`), stated upstream at the
-/// same bound (`column.rs:1310-1315`). Upstream never has to make the
-/// correction because it cuts the run out of the rebuild rather than out of
-/// a finished slab, and the cut it makes is already against the pad
-/// (`bool.rs:312-317`, `:322-326`).
+/// Whether maintenance bounds literal rows rather than wire headers.
+/// Signed tracked columns retain their existing partition policy: cutting a
+/// valid signed prefix can create an unrepresentable slab-local span. Delta
+/// wire values are signed even for unsigned columns, so use its value domain.
+/// Ordinary signed RLE has no running aggregate and remains literal-bounded.
+/// Codecs without a load cursor also retain the wire-header policy.
+pub fn usesLiteralBudget(comptime E: type) bool {
+    if (comptime !@hasDecl(E, "LoadCursor")) return false;
+    if (comptime @hasDecl(E, "tracks_prefix")) {
+        if (comptime E.tracks_prefix) {
+            const Domain = if (@hasDecl(E, "is_delta") and E.is_delta) E.Value else E.Wire;
+            const Payload = switch (@typeInfo(Domain)) {
+                .optional => |optional| optional.child,
+                else => Domain,
+            };
+            return switch (@typeInfo(Payload)) {
+                .int => |integer| integer.signedness != .signed,
+                else => true,
+            };
+        }
+    }
+    return true;
+}
+
+/// Literal rows cost one each; a repeat, absent run or boolean pad costs one
+/// regardless of row count (`rust/hexane/src/rle/load.rs:38-52,132-153`).
+/// No cached field is added: `Slab.segments` remains the wire-header count.
+/// Signed tracked codecs and codecs without a load cursor use the checked
+/// cached wire-header budget. Other codecs retain the cursor's parser checks.
+pub fn decodeBudget(
+    gpa: std.mem.Allocator,
+    comptime E: type,
+    slab: *const Slab,
+) ParseError!usize {
+    _ = gpa;
+    if (comptime !usesLiteralBudget(E)) return slab.segments;
+    var units: usize = 0;
+    if (comptime @hasDecl(E, "LoadCursor")) {
+        var cursor = E.LoadCursor.init(slab.data);
+        while (try cursor.next()) |step| {
+            const cost = if (step.kind == .literal) step.count else 1;
+            units = std.math.add(usize, units, cost) catch return error.Overflow;
+        }
+    } else {
+        return slab.segments;
+    }
+    return units;
+}
+
+fn PartitionWriter(comptime E: type) type {
+    // Weighted codecs can publish only the encoder wrapper over the same
+    // canonical run writer. Both interfaces append in the wire domain.
+    return if (@hasDecl(E, "WireSpliceWriter")) E.WireSpliceWriter else E.StreamEncoder;
+}
+
+/// Returns independently owned, codec-canonical slabs covering `bytes`.
+/// RLE permits budget one; boolean parity pads require at least two.
+/// Literal-budget codecs can cut literal runs at row boundaries; signed tracked
+/// codecs preserve whole wire runs. Input bytes are never modified on refusal.
+/// Canonical column encoding rejoins literal seams, rather than concatenating
+/// independently canonical slabs (`rust/hexane/src/rle/load.rs:300-322`).
+pub fn partitionToBudget(
+    gpa: std.mem.Allocator,
+    comptime E: type,
+    bytes: []const u8,
+    budget: usize,
+) ParseError!std.ArrayList(Slab) {
+    if (budget == 0 or (piecePadsRuns(E) and budget < 2)) return error.InvalidValue;
+    var out: std.ArrayList(Slab) = .empty;
+    errdefer {
+        for (out.items) |*piece| piece.deinit(gpa);
+        out.deinit(gpa);
+    }
+    if (comptime usesLiteralBudget(E) and !piecePadsRuns(E) and @hasDecl(E, "LoadCursor") and
+        (@hasDecl(E, "WireSpliceWriter") or @hasDecl(E, "StreamEncoder")))
+    {
+        var cursor = E.LoadCursor.init(bytes);
+        var writer = PartitionWriter(E).init(gpa);
+        defer writer.deinit();
+        var units: usize = 0;
+        while (try cursor.next()) |step| {
+            // The load cursor serves a literal row at a time and a whole
+            // constant run at once. The canonical writer never expands it.
+            if (step.count == 0 or (step.kind == .literal and step.count != 1))
+                return error.InvalidValue;
+            const value: E.Wire = if (step.value) |v| v else if (comptime @typeInfo(E.Wire) == .optional) null else return error.UnexpectedNull;
+            try writer.appendN(value, step.count);
+            units += 1;
+            if (units == budget) {
+                try appendWriterPiece(gpa, E, &writer, &out);
+                units = 0;
+            }
+        }
+        if (units != 0) try appendWriterPiece(gpa, E, &writer, &out);
+    } else {
+        // Signed tracked codecs and older codecs keep run-boundary wireSlice.
+        // Only a literal-budget codec's partial literal needs encoding.
+        const segs = try E.segmentsOf(gpa, bytes);
+        defer gpa.free(segs);
+        var run: usize = 0;
+        var row: usize = 0;
+        while (run < segs.len) {
+            const first_run = run;
+            const first_row = row;
+            const pad: usize = if (piecePadsRuns(E) and run != 0 and
+                segs[run].opens_with_true) 1 else 0;
+            var room = budget - pad;
+            while (run < segs.len and room != 0) {
+                const seg = segs[run];
+                const literal = usesLiteralBudget(E) and seg.kind == .literal;
+                const left = seg.item_end - row;
+                if (literal and left > room) {
+                    row += room;
+                    room = 0;
+                } else {
+                    room -= if (literal) left else 1;
+                    row = seg.item_end;
+                    run += 1;
+                }
+            }
+            try out.ensureUnusedCapacity(gpa, 1);
+            const end_run = run + @as(usize, @intFromBool(run < segs.len and
+                row > segs[run].item_start));
+            const whole = first_row == segs[first_run].item_start and
+                row == segs[end_run - 1].item_end;
+            const piece = if (whole)
+                try slicePiece(gpa, E, bytes, segs, first_run, end_run)
+            else blk: {
+                const values = try wireRangeWithSegs(E, gpa, bytes, segs, first_row, row);
+                defer gpa.free(values);
+                const encoded = try E.wireEncode(gpa, values, false);
+                errdefer gpa.free(encoded);
+                const m = try measure(gpa, E, encoded);
+                break :blk fromParts(encoded, m.len, m.segments, m.tail);
+            };
+            out.appendAssumeCapacity(piece);
+        }
+    }
+    return out;
+}
+
+fn appendWriterPiece(
+    gpa: std.mem.Allocator,
+    comptime E: type,
+    writer: *PartitionWriter(E),
+    out: *std.ArrayList(Slab),
+) ParseError!void {
+    // Reserve before transferring bytes; every owned buffer has one guard.
+    try out.ensureUnusedCapacity(gpa, 1);
+    try writer.finish();
+    const bytes = try writer.take();
+    errdefer gpa.free(bytes);
+    const m = try measure(gpa, E, bytes);
+    out.appendAssumeCapacity(fromParts(bytes, m.len, m.segments, m.tail));
+}
+
+/// Keeps the first bounded piece in `slab` and returns owned spill pieces.
+/// Every allocation and validation completes before replacing the source.
 pub fn splitToBudget(
     gpa: std.mem.Allocator,
     comptime E: type,
     slab: *Slab,
     max_segments: usize,
 ) ParseError!std.ArrayList(Slab) {
-    var out: std.ArrayList(Slab) = .empty;
+    if (max_segments == 0 or (piecePadsRuns(E) and max_segments < 2))
+        return error.InvalidValue;
+    if ((try decodeBudget(gpa, E, slab)) <= max_segments) return .empty;
+    var out = try partitionToBudget(gpa, E, slab.data, max_segments);
     errdefer {
-        for (out.items) |*p| p.deinit(gpa);
+        for (out.items) |*piece| piece.deinit(gpa);
         out.deinit(gpa);
     }
-    if (slab.segments <= max_segments or slab.segments <= 1) return out;
-
-    const segs = try E.segmentsOf(gpa, slab.data);
-    defer gpa.free(segs);
-    var from: usize = 0;
-    while (from < segs.len) {
-        const to = @min(from + pieceRuns(E, segs, from, max_segments), segs.len);
-        // Reserve before the new piece owns bytes. A refused append must not
-        // abandon a finished slab outside `out`'s cleanup guard.
-        try out.ensureUnusedCapacity(gpa, 1);
-        out.appendAssumeCapacity(try slicePiece(gpa, E, slab.data, segs, from, to));
-        from = to;
-    }
+    if (out.items.len == 0) return error.InvalidValue;
 
     // The first piece keeps the slab's identity.
     const kept = out.orderedRemove(0);
@@ -1127,12 +1346,8 @@ fn slicePiece(
     from: usize,
     to: usize,
 ) ParseError!Slab {
-    // The range is a run range, `from < to <= segs.len`, which is what
-    // `splitToBudget`'s loop hands over and what puts the last run of the
-    // piece at `to - 1`. Stated here so the subtraction below has a bound
-    // the reader and the analyser can both see. A caller that passed
-    // anything else has a bug of its own: `from < segs.len` is the loop's
-    // condition and `to` is `min(from + max_segments, segs.len)`.
+    // Only complete runs reach this path. Guard the last-run subtraction
+    // explicitly; partial literal ranges go through the canonical encoder.
     if (to == 0 or from >= to or to > segs.len) return error.InvalidValue;
     const piece = try E.wireSlice(gpa, data, segs[from].byte_start, segs[to - 1].byte_end, segs[from].opens_with_true);
     errdefer gpa.free(piece);
@@ -1193,6 +1408,785 @@ fn expectValues(comptime E: type, slab: *const Slab, want: []const E.Wire) !void
     const got = try E.wireRange(gpa, slab.data, 0, slab.len);
     defer gpa.free(got);
     try testing.expectEqualSlices(E.Wire, want, got);
+}
+
+test "literal-aware partition bounds decoded rows and preserves canonical column bytes" {
+    // Literal cuts include single-row tails; repeats and absent runs stay compressed.
+    const E = column.RleOption(u64);
+    const gpa = testing.allocator;
+    const values = [_]?u64{ 1, 2, 3, 4, 5, 6, 7, 8, 8, 8, null, null, 9, 10, 11 };
+    const bytes = try E.wireEncode(gpa, &values, false);
+    defer gpa.free(bytes);
+    var source = try init(gpa, E, bytes);
+    defer source.deinit(gpa);
+    try testing.expectEqual(@as(usize, 12), try decodeBudget(gpa, E, &source));
+    try testing.expectEqual(@as(usize, 4), source.segments);
+    for ([_]usize{ 1, 2, 3, 4, 7, 13 }) |budget| {
+        var pieces = try partitionToBudget(gpa, E, bytes, budget);
+        defer {
+            for (pieces.items) |*piece| piece.deinit(gpa);
+            pieces.deinit(gpa);
+        }
+        var all: std.ArrayList(?u64) = .empty;
+        defer all.deinit(gpa);
+        for (pieces.items) |*piece| {
+            try expectSlabSound(E, piece);
+            try testing.expect((try decodeBudget(gpa, E, piece)) <= budget);
+            const decoded = try E.wireRange(gpa, piece.data, 0, piece.len);
+            defer gpa.free(decoded);
+            try all.appendSlice(gpa, decoded);
+        }
+        try testing.expectEqualSlices(?u64, &values, all.items);
+        const joined = try E.wireEncode(gpa, all.items, false);
+        defer gpa.free(joined);
+        try testing.expectEqualSlices(u8, bytes, joined);
+        try testing.expect(pieces.items.len - 1 <= splitSpillCount(E, 12, budget));
+    }
+}
+
+test "literal-aware partition supports borrowed byte payloads and boolean pads" {
+    const gpa = testing.allocator;
+    const E = column.Rle([]const u8);
+    const values = [_][]const u8{ "", "a", "longer", "utf8\xc3\xa9", "tail" };
+    const bytes = try E.wireEncode(gpa, &values, false);
+    defer gpa.free(bytes);
+    var pieces = try partitionToBudget(gpa, E, bytes, 2);
+    defer {
+        for (pieces.items) |*piece| piece.deinit(gpa);
+        pieces.deinit(gpa);
+    }
+    var at: usize = 0;
+    for (pieces.items) |*piece| {
+        try expectSlabSound(E, piece);
+        try testing.expect((try decodeBudget(gpa, E, piece)) <= 2);
+        const decoded = try E.wireRange(gpa, piece.data, 0, piece.len);
+        defer gpa.free(decoded);
+        for (decoded) |value| {
+            try testing.expectEqualStrings(values[at], value);
+            at += 1;
+        }
+    }
+    try testing.expectEqual(values.len, at);
+    const bools = [_]bool{ true, false, true, false, true, false, true };
+    const boolean_bytes = try column.Bool.wireEncode(gpa, &bools, false);
+    defer gpa.free(boolean_bytes);
+    var boolean_pieces = try partitionToBudget(gpa, column.Bool, boolean_bytes, 2);
+    defer {
+        for (boolean_pieces.items) |*piece| piece.deinit(gpa);
+        boolean_pieces.deinit(gpa);
+    }
+    at = 0;
+    for (boolean_pieces.items) |*piece| {
+        try expectSlabSound(column.Bool, piece);
+        try testing.expect((try decodeBudget(gpa, column.Bool, piece)) <= 2);
+        const decoded = try column.Bool.wireRange(gpa, piece.data, 0, piece.len);
+        defer gpa.free(decoded);
+        try testing.expectEqualSlices(bool, bools[at..][0..decoded.len], decoded);
+        at += decoded.len;
+    }
+    try testing.expectEqual(bools.len, at);
+    try testing.expect(boolean_pieces.items.len - 1 <= splitSpillCount(column.Bool, 8, 2));
+}
+
+test "literal-aware partition refuses invalid budgets and malformed wire bytes" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.InvalidValue, partitionToBudget(gpa, column.Rle(u64), &.{}, 0));
+    try testing.expectError(error.InvalidValue, partitionToBudget(gpa, column.Bool, &.{}, 1));
+    // Equal consecutive literal values are invalid even across a proposed cut.
+    try testing.expectError(error.InvalidValue, partitionToBudget(gpa, column.Rle(u64), &.{ 0x7e, 1, 1 }, 1));
+    try testing.expectError(error.UnexpectedNull, partitionToBudget(gpa, column.Rle(u64), &.{ 0, 1 }, 1));
+    const malformed = [_]u8{ 0x7d, 1, 2 };
+    var source = fromParts(@constCast(&malformed), 3, 1, .zero);
+    const before = source;
+    const refusal = splitToBudget(gpa, column.Rle(u64), &source, 1);
+    if (refusal) |result| {
+        var unexpected = result;
+        for (unexpected.items) |*piece| piece.deinit(gpa);
+        unexpected.deinit(gpa);
+        return error.ExpectedMalformedRefusal;
+    } else |_| {}
+    try testing.expectEqual(before.data.ptr, source.data.ptr);
+    try testing.expectEqualSlices(u8, &malformed, source.data);
+    try testing.expectEqual(before.len, source.len);
+    try testing.expectEqual(before.segments, source.segments);
+    try testing.expect(Tail.eql(before.tail, source.tail));
+}
+
+fn literalSplitAllocationFailure(gpa: std.mem.Allocator) !void {
+    const E = column.Rle(u64);
+    var source = try slabOf(E, gpa, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9 });
+    defer source.deinit(gpa);
+    const saved = try gpa.dupe(u8, source.data);
+    defer gpa.free(saved);
+    const before = source;
+    var spilled = splitToBudget(gpa, E, &source, 2) catch |e| {
+        try testing.expectEqual(before.data.ptr, source.data.ptr);
+        try testing.expectEqualSlices(u8, saved, source.data);
+        try testing.expectEqual(before.len, source.len);
+        try testing.expectEqual(before.segments, source.segments);
+        try testing.expect(Tail.eql(before.tail, source.tail));
+        return e;
+    };
+    defer {
+        for (spilled.items) |*piece| piece.deinit(gpa);
+        spilled.deinit(gpa);
+    }
+    try testing.expect((try decodeBudget(gpa, E, &source)) <= 2);
+}
+
+fn literalPartitionAllocationFailure(gpa: std.mem.Allocator) !void {
+    const E = column.Rle(u64);
+    const bytes = try E.wireEncode(gpa, &.{ 1, 2, 3, 4, 5, 6, 7 }, false);
+    defer gpa.free(bytes);
+    var pieces = try partitionToBudget(gpa, E, bytes, 1);
+    defer {
+        for (pieces.items) |*piece| piece.deinit(gpa);
+        pieces.deinit(gpa);
+    }
+    try testing.expectEqual(@as(usize, 7), pieces.items.len);
+}
+
+test "literal-aware split and partition release every partial allocation on refusal" {
+    try testing.checkAllAllocationFailures(testing.allocator, literalSplitAllocationFailure, .{});
+    try testing.checkAllAllocationFailures(testing.allocator, literalPartitionAllocationFailure, .{});
+}
+
+test "literal-aware partition keeps million-row compressed runs within budget one" {
+    const E = column.RleOption(u64);
+    const gpa = testing.allocator;
+    for ([_]?u64{ 7, null }) |value| {
+        const bytes = try E.wireFill(gpa, 1_000_000, value, false);
+        defer gpa.free(bytes);
+        var storage: [4096]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&storage);
+        const bounded = fixed.allocator();
+        var pieces = try partitionToBudget(bounded, E, bytes, 1);
+        defer {
+            for (pieces.items) |*piece| piece.deinit(bounded);
+            pieces.deinit(bounded);
+        }
+        try testing.expectEqual(@as(usize, 1), pieces.items.len);
+        try testing.expectEqual(@as(usize, 1_000_000), pieces.items[0].len);
+        try testing.expectEqual(@as(usize, 1), try decodeBudget(bounded, E, &pieces.items[0]));
+        try testing.expectEqualSlices(u8, bytes, pieces.items[0].data);
+    }
+}
+
+test "literal-aware split handles signed numeric codecs at header boundaries" {
+    inline for (.{ column.Rle(i32), column.Rle(i64), column.Rle(u32), column.Rle(u64) }) |E| {
+        const gpa = testing.allocator;
+        var values: [257]E.Wire = undefined;
+        for (&values, 0..) |*value, i| value.* = @intCast(i + 1);
+        var source = try slabOf(E, gpa, &values);
+        defer source.deinit(gpa);
+        var spills = try splitToBudget(gpa, E, &source, 64);
+        defer {
+            for (spills.items) |*piece| piece.deinit(gpa);
+            spills.deinit(gpa);
+        }
+        try expectSlabSound(E, &source);
+        try testing.expect((try decodeBudget(gpa, E, &source)) <= 64);
+        try expectValues(E, &source, values[0..source.len]);
+        var at = source.len;
+        for (spills.items) |*piece| {
+            try expectSlabSound(E, piece);
+            try testing.expect((try decodeBudget(gpa, E, piece)) <= 64);
+            try expectValues(E, piece, values[at..][0..piece.len]);
+            at += piece.len;
+        }
+        try testing.expectEqual(values.len, at);
+    }
+}
+
+fn booleanSplitAllocationFailure(gpa: std.mem.Allocator) !void {
+    const E = column.Bool;
+    var source = try slabOf(E, gpa, &.{ true, false, true, false, true, false, true });
+    defer source.deinit(gpa);
+    const saved = try gpa.dupe(u8, source.data);
+    defer gpa.free(saved);
+    const before = source;
+    var spills = splitToBudget(gpa, E, &source, 2) catch |e| {
+        try testing.expectEqual(before.data.ptr, source.data.ptr);
+        try testing.expectEqualSlices(u8, saved, source.data);
+        try testing.expectEqual(before.len, source.len);
+        try testing.expectEqual(before.segments, source.segments);
+        try testing.expect(Tail.eql(before.tail, source.tail));
+        return e;
+    };
+    defer {
+        for (spills.items) |*piece| piece.deinit(gpa);
+        spills.deinit(gpa);
+    }
+}
+
+test "literal-aware boolean split leaves source ownership intact on allocation refusal" {
+    try testing.checkAllAllocationFailures(testing.allocator, booleanSplitAllocationFailure, .{});
+}
+
+test "literal-aware partition supports the metadata codec's canonical stream encoder" {
+    const E = @import("../opset/columns.zig").MetaPrefixCodec;
+    const gpa = testing.allocator;
+    const values = [_]u64{ 0x16, 0x26, 0x36, 0x46, 0x56 };
+    const bytes = try E.wireEncode(gpa, &values, false);
+    defer gpa.free(bytes);
+    var pieces = try partitionToBudget(gpa, E, bytes, 2);
+    defer {
+        for (pieces.items) |*piece| piece.deinit(gpa);
+        pieces.deinit(gpa);
+    }
+    var at: usize = 0;
+    for (pieces.items) |*piece| {
+        try expectSlabSound(E, piece);
+        try testing.expect((try decodeBudget(gpa, E, piece)) <= 2);
+        try expectValues(E, piece, values[at..][0..piece.len]);
+        at += piece.len;
+    }
+    try testing.expectEqual(values.len, at);
+}
+
+test "literal-aware split preserves an already bounded slab and refuses zero budget" {
+    const E = column.Rle(u64);
+    const gpa = testing.allocator;
+    var source = try slabOf(E, gpa, &.{ 1, 2, 3 });
+    defer source.deinit(gpa);
+    const before = source;
+    try testing.expectError(error.InvalidValue, splitToBudget(gpa, E, &source, 0));
+    var spills = try splitToBudget(gpa, E, &source, 3);
+    defer spills.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), spills.items.len);
+    try testing.expectEqual(before.data.ptr, source.data.ptr);
+    try testing.expectEqual(before.len, source.len);
+    try testing.expectEqual(before.segments, source.segments);
+    try testing.expect(Tail.eql(before.tail, source.tail));
+}
+
+test "signed prefix default load keeps a valid full-domain literal and repeat together" {
+    const E = column.Prefix(i64);
+    const gpa = testing.allocator;
+    const max = std.math.maxInt(i64);
+    var values: [34]i64 = undefined;
+    values[0] = -max;
+    for (1..32) |i| values[i] = if (i % 2 == 1) 1 else -1;
+    values[32] = max - 1;
+    values[33] = max - 1;
+    const bytes = try E.wireEncode(gpa, &values, false);
+    defer gpa.free(bytes);
+    var source = try init(gpa, E, bytes);
+    defer source.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), try decodeBudget(gpa, E, &source));
+    var pieces = try partitionToBudget(gpa, E, bytes, default_max_segments / 2);
+    defer {
+        for (pieces.items) |*piece| piece.deinit(gpa);
+        pieces.deinit(gpa);
+    }
+    try testing.expectEqual(@as(usize, 1), pieces.items.len);
+    try expectValues(E, &pieces.items[0], &values);
+    var loaded = try column.Column(i64, E).load(gpa, bytes);
+    defer loaded.deinit();
+    const decoded = try loaded.toSlice(gpa);
+    defer gpa.free(decoded);
+    try testing.expectEqualSlices(i64, &values, decoded);
+    const encoded = try loaded.encode(gpa);
+    defer gpa.free(encoded);
+    try testing.expectEqualSlices(u8, bytes, encoded);
+}
+
+test "signed tracked budgets preserve whole literal runs without exempting ordinary signed RLE" {
+    const gpa = testing.allocator;
+    inline for (.{ column.Prefix(i64), column.Prefix(?i64), column.Delta(i64), column.Delta(?i64) }) |E| {
+        var source = try slabOf(E, gpa, &.{ 1, 2, 3, 4, 5 });
+        defer source.deinit(gpa);
+        var pieces = try partitionToBudget(gpa, E, source.data, 1);
+        defer {
+            for (pieces.items) |*piece| piece.deinit(gpa);
+            pieces.deinit(gpa);
+        }
+        try testing.expectEqual(@as(usize, 1), pieces.items.len);
+        try testing.expectEqual(@as(usize, 1), try decodeBudget(gpa, E, &source));
+        try testing.expect(!usesLiteralBudget(E));
+        try testing.expectEqualSlices(u8, source.data, pieces.items[0].data);
+    }
+    try testing.expect(usesLiteralBudget(column.Rle(i64)));
+    try testing.expect(usesLiteralBudget(column.Prefix(u64)));
+    try testing.expect(usesLiteralBudget(column.Delta(u64)));
+    try testing.expect(usesLiteralBudget(@import("../opset/columns.zig").MetaPrefixCodec));
+}
+
+test "compressed nonuniform splice fits a bounded allocator without expanding repeats" {
+    // The old seam contains a million-row repeat; its decoded array cannot fit.
+    const E = @import("column.zig").RleOption(u32);
+    const gpa = testing.allocator;
+    const repeat = try E.wireFill(gpa, 1_000_000, 300, false);
+    defer gpa.free(repeat);
+    const suffix = try E.wireFill(gpa, 2, null, false);
+    defer gpa.free(suffix);
+    var storage: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const bounded = fixed.allocator();
+    const data = try bounded.alloc(u8, repeat.len + suffix.len);
+    @memcpy(data[0..repeat.len], repeat);
+    @memcpy(data[repeat.len..], suffix);
+    const m = try measure(gpa, E, data);
+    var s: Slab = .{ .data = data, .len = m.len, .segments = m.segments, .tail = m.tail };
+    defer s.deinit(bounded);
+    try splice(bounded, E, &s, 500_000, 1, &.{129}, null);
+    try expectSlabSound(E, &s);
+    const left = try E.wireFill(gpa, 500_000, 300, false);
+    defer gpa.free(left);
+    const middle = try E.wireFill(gpa, 1, 129, false);
+    defer gpa.free(middle);
+    const right = try E.wireFill(gpa, 499_999, 300, false);
+    defer gpa.free(right);
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(gpa);
+    try expected.appendSlice(gpa, left);
+    try expected.appendSlice(gpa, middle);
+    try expected.appendSlice(gpa, right);
+    try expected.appendSlice(gpa, suffix);
+    try testing.expectEqualSlices(u8, expected.items, s.data);
+    const window = try E.wireRange(gpa, s.data, 499_999, 500_002);
+    defer gpa.free(window);
+    try testing.expectEqualSlices(?u32, &.{ 300, 129, 300 }, window);
+}
+
+fn exerciseLongCountedPrefixSeam(comptime E: type) !void {
+    const gpa = testing.allocator;
+    const value: E.Wire = if (E.Wire == bool) false else 0x16;
+    const other: E.Wire = if (E.Wire == bool) true else 0x17;
+    const head = try E.wireFill(gpa, 1_000_000, value, false);
+    defer gpa.free(head);
+    const tail = try E.wireFill(gpa, 2, other, true);
+    defer gpa.free(tail);
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(gpa);
+    try input.appendSlice(gpa, head);
+    try input.appendSlice(gpa, tail);
+    var s = try init(gpa, E, input.items);
+    defer s.deinit(gpa);
+    try splice(gpa, E, &s, 500_000, 1, &.{other}, null);
+    try expectSlabSound(E, &s);
+    const left = try E.wireFill(gpa, 500_000, value, false);
+    defer gpa.free(left);
+    const middle = try E.wireFill(gpa, 1, other, true);
+    defer gpa.free(middle);
+    const right = try E.wireFill(gpa, 499_999, value, false);
+    defer gpa.free(right);
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(gpa);
+    try expected.appendSlice(gpa, left);
+    try expected.appendSlice(gpa, middle);
+    try expected.appendSlice(gpa, right);
+    try expected.appendSlice(gpa, tail);
+    try testing.expectEqualSlices(u8, expected.items, s.data);
+    const window = try E.wireRange(gpa, s.data, 499_999, 500_002);
+    defer gpa.free(window);
+    try testing.expectEqualSlices(E.Wire, &.{ value, other, value }, window);
+    var loaded = try column.Column(E.Value, E).load(gpa, s.data);
+    defer loaded.deinit();
+    try testing.expectEqual(@as(usize, 1_000_002), loaded.len());
+    try testing.expectEqual(other, (try loaded.get(500_000)).?);
+    var total: i64 = 0;
+    try E.accumulateRun(value, 999_999, &total);
+    try E.accumulateRun(other, 3, &total);
+    try testing.expectEqual(total, try loaded.getPrefix(loaded.len()));
+    const saved = try loaded.encode(gpa);
+    defer gpa.free(saved);
+    try testing.expectEqualSlices(u8, expected.items, saved);
+}
+
+test "million-row counted prefix seams preserve compressed bytes and strict load" {
+    // Large logical repeats stay compact through a nonuniform interior edit.
+    const prefixes = @import("../opset/columns.zig");
+    try exerciseLongCountedPrefixSeam(prefixes.BoolPrefixCodec);
+    try exerciseLongCountedPrefixSeam(prefixes.MetaPrefixCodec);
+}
+
+fn exerciseCompressedSeam(comptime E: type, value: E.Wire, other: E.Wire) !void {
+    const gpa = testing.allocator;
+    for ([_]usize{ 2, 63, 64, 127, 128 }) |count| {
+        var base: [132]E.Wire = undefined;
+        base[0] = other;
+        base[1] = value;
+        @memset(base[2..][0..count], value);
+        base[count + 2] = other;
+        base[count + 3] = value;
+        const len = count + 4;
+        for ([_]usize{ 0, 1, 2, count / 2 + 2, count + 2, len }) |at| {
+            for ([_]usize{ 0, @min(@as(usize, 2), len - at) }) |del| {
+                var s = try slabOf(E, gpa, base[0..len]);
+                defer s.deinit(gpa);
+                const inserted = [_]E.Wire{ other, value };
+                const postfix = [_]E.Wire{other};
+                const segs = try E.segmentsOf(gpa, s.data);
+                defer gpa.free(segs);
+                const r = runAt(E, segs, at + del);
+                var want: [134]E.Wire = undefined;
+                @memcpy(want[0..at], base[0..at]);
+                @memcpy(want[at..][0..inserted.len], &inserted);
+                @memcpy(want[at + inserted.len ..][0 .. len - at - del], base[at + del .. len]);
+                if (r < segs.len) want[at + inserted.len] = other;
+                const new_len = len - del + inserted.len;
+                try splice(gpa, E, &s, at, del, &inserted, &postfix);
+                const bytes = try E.wireEncode(gpa, want[0..new_len], false);
+                defer gpa.free(bytes);
+                try testing.expectEqualSlices(u8, bytes, s.data);
+                const got = try E.wireRange(gpa, s.data, 0, s.len);
+                defer gpa.free(got);
+                try testing.expectEqual(new_len, got.len);
+                for (got, want[0..new_len]) |actual, expected| {
+                    try testing.expect(E.sameValue(actual, expected));
+                }
+                try expectSlabSound(E, &s);
+            }
+        }
+    }
+}
+
+test "compressed seams preserve canonical literals nulls deltas and counted prefixes" {
+    // Elementwise encoding is the oracle across signed and unsigned count boundaries.
+    const col = @import("column.zig");
+    try exerciseCompressedSeam(col.Rle(u32), 300, 129);
+    try exerciseCompressedSeam(col.RleOption(u32), null, 300);
+    try exerciseCompressedSeam(col.RleOption(u32), 300, null);
+    try exerciseCompressedSeam(col.Rle([]const u8), "payload", "other");
+    try exerciseCompressedSeam(col.Delta(u32), 0, -129);
+    try exerciseCompressedSeam(col.Bool, true, false);
+    try exerciseCompressedSeam(col.Bool, false, true);
+    const prefixes = @import("../opset/columns.zig");
+    try exerciseCompressedSeam(prefixes.BoolPrefixCodec, true, false);
+    try exerciseCompressedSeam(prefixes.MetaPrefixCodec, 0x16, 0x17);
+    try exerciseCompressedSeam(prefixes.MetaPrefixCodec, 0x16, 0x28);
+}
+
+fn compressedSeamAllocationFailure(gpa: std.mem.Allocator) !void {
+    const E = @import("column.zig").RleOption(u32);
+    var base: [132]?u32 = undefined;
+    base[0] = null;
+    @memset(base[1..131], 300);
+    base[131] = null;
+    var s = try slabOf(E, gpa, &base);
+    defer s.deinit(gpa);
+    const old = s;
+    var saved: [32]u8 = undefined;
+    try testing.expect(s.data.len <= saved.len);
+    @memcpy(saved[0..s.data.len], s.data);
+    splice(gpa, E, &s, 64, 1, &.{129}, &.{0}) catch |failure| {
+        try testing.expectEqual(error.OutOfMemory, failure);
+        try testing.expect(s.data.ptr == old.data.ptr);
+        try testing.expectEqual(old.len, s.len);
+        try testing.expectEqual(old.segments, s.segments);
+        try testing.expect(Tail.eql(old.tail, s.tail));
+        try testing.expectEqualSlices(u8, saved[0..old.data.len], s.data);
+        try expectValues(E, &s, &base);
+        return failure;
+    };
+    base[64] = 129;
+    base[65] = 0;
+    try expectValues(E, &s, &base);
+    try expectSlabSound(E, &s);
+}
+
+test "compressed seam allocation failures preserve publication and usability" {
+    // Every acquisition must finish before the original encoded payload is freed.
+    try testing.checkAllAllocationFailures(testing.allocator, compressedSeamAllocationFailure, .{});
+}
+
+fn countedPrefixSeamAllocationFailure(gpa: std.mem.Allocator, comptime E: type) !void {
+    var base: [132]E.Wire = undefined;
+    const value: E.Wire = if (E.Wire == bool) true else 0x16;
+    const other: E.Wire = if (E.Wire == bool) false else 0x17;
+    base[0] = other;
+    @memset(base[1..131], value);
+    base[131] = other;
+    var s = try slabOf(E, gpa, &base);
+    defer s.deinit(gpa);
+    const old = s;
+    var saved: [32]u8 = undefined;
+    try testing.expect(s.data.len <= saved.len);
+    @memcpy(saved[0..s.data.len], s.data);
+    splice(gpa, E, &s, 64, 1, &.{other}, &.{other}) catch |failure| {
+        try testing.expectEqual(error.OutOfMemory, failure);
+        try testing.expectEqual(old.data.ptr, s.data.ptr);
+        try testing.expectEqual(old.len, s.len);
+        try testing.expectEqual(old.segments, s.segments);
+        try testing.expect(Tail.eql(old.tail, s.tail));
+        try testing.expectEqualSlices(u8, saved[0..old.data.len], s.data);
+        try expectValues(E, &s, &base);
+        return failure;
+    };
+    base[64] = other;
+    base[65] = other;
+    const expected = try E.wireEncode(testing.allocator, &base, false);
+    defer testing.allocator.free(expected);
+    try testing.expectEqualSlices(u8, expected, s.data);
+    try expectValues(E, &s, &base);
+    try expectSlabSound(E, &s);
+}
+
+fn countedBooleanPrefixSeamAllocationFailure(gpa: std.mem.Allocator) !void {
+    try countedPrefixSeamAllocationFailure(
+        gpa,
+        @import("../opset/columns.zig").BoolPrefixCodec,
+    );
+}
+
+fn countedMetadataPrefixSeamAllocationFailure(gpa: std.mem.Allocator) !void {
+    try countedPrefixSeamAllocationFailure(
+        gpa,
+        @import("../opset/columns.zig").MetaPrefixCodec,
+    );
+}
+
+test "counted prefix seam allocation failures preserve source bytes and metadata" {
+    // Both swapped weights retain exactly-once ownership through seam widening.
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        countedBooleanPrefixSeamAllocationFailure,
+        .{},
+    );
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        countedMetadataPrefixSeamAllocationFailure,
+        .{},
+    );
+}
+
+test "compressed nonuniform seams retain borrowed byte payloads through publication" {
+    // The replacement borrows from the repeat whose encoded storage is replaced.
+    const gpa = testing.allocator;
+    const E = @import("column.zig").Rle([]const u8);
+    var s = try slabOf(E, gpa, &.{ "other", "payload", "payload", "payload", "tail" });
+    defer s.deinit(gpa);
+    const segs = try E.segmentsOf(gpa, s.data);
+    defer gpa.free(segs);
+    const borrowed = segs[1].first_value.?;
+    try splice(gpa, E, &s, 2, 1, &.{borrowed}, &.{borrowed});
+    const want = try E.wireEncode(
+        gpa,
+        &.{ "other", "payload", "payload", "payload", "tail" },
+        false,
+    );
+    defer gpa.free(want);
+    try testing.expectEqualSlices(u8, want, s.data);
+    try expectSlabSound(E, &s);
+}
+
+test "compressed seams widen through multi-item literals without changing canonical bytes" {
+    // Deletions can pull both neighboring literals into a formerly compressed seam.
+    const gpa = testing.allocator;
+    const E = @import("column.zig").RleOption(u32);
+    var base: [140]?u32 = undefined;
+    for (base[0..6], 0..) |*v, i| v.* = @intCast(i);
+    @memset(base[6..134], 300);
+    for (base[134..], 0..) |*v, i| v.* = @intCast(i + 6);
+    for ([_]usize{ 5, 6, 7, 63, 64, 127, 128, 133, 134 }) |at| {
+        const del = @min(@as(usize, 3), base.len - at);
+        var s = try slabOf(E, gpa, &base);
+        defer s.deinit(gpa);
+        var want: [142]?u32 = undefined;
+        @memcpy(want[0..at], base[0..at]);
+        want[at] = null;
+        want[at + 1] = 300;
+        @memcpy(want[at + 2 ..][0 .. base.len - at - del], base[at + del ..]);
+        const len = base.len - del + 2;
+        try splice(gpa, E, &s, at, del, &.{ null, 300 }, null);
+        const bytes = try E.wireEncode(gpa, want[0..len], false);
+        defer gpa.free(bytes);
+        try testing.expectEqualSlices(u8, bytes, s.data);
+        try expectValues(E, &s, want[0..len]);
+        try expectSlabSound(E, &s);
+    }
+}
+
+test "compressed nonuniform splice bounds preserve bytes and metadata" {
+    // Range validation precedes the compressed writer and replacement publication.
+    const gpa = testing.allocator;
+    const E = @import("column.zig").RleOption(u32);
+    var s = try slabOf(E, gpa, &.{ null, 300, 300, 300, 129 });
+    defer s.deinit(gpa);
+    const old = s;
+    try testing.expectError(error.InvalidValue, splice(gpa, E, &s, 6, 0, &.{1}, null));
+    try testing.expectError(
+        error.InvalidValue,
+        splice(gpa, E, &s, 2, std.math.maxInt(usize), &.{1}, null),
+    );
+    try testing.expect(s.data.ptr == old.data.ptr);
+    try testing.expectEqual(old.len, s.len);
+    try testing.expectEqual(old.segments, s.segments);
+    try testing.expect(Tail.eql(old.tail, s.tail));
+    try expectValues(E, &s, &.{ null, 300, 300, 300, 129 });
+    try expectSlabSound(E, &s);
+}
+
+fn exerciseUniformSplice(comptime E: type, value: E.Wire) !void {
+    const gpa = testing.allocator;
+    const counts = [_]usize{ 1, 2, 63, 64, 127, 128 };
+    for (counts) |count| {
+        for ([_]usize{ 0, count / 2, count }) |at| {
+            var s = try Slab.fill(gpa, E, count, value);
+            defer s.deinit(gpa);
+            const inserted = [_]E.Wire{ value, value };
+            const postfix = [_]E.Wire{value};
+            try splice(gpa, E, &s, at, 0, &inserted, &postfix);
+            try expectUniformSplice(E, &s, count + inserted.len, value);
+
+            // Shrink through repeat/singleton/empty and count-header boundaries.
+            try splice(gpa, E, &s, 1, s.len - 1, &.{}, null);
+            try expectUniformSplice(E, &s, 1, value);
+            try splice(gpa, E, &s, 0, 1, &.{}, null);
+            try expectUniformSplice(E, &s, 0, value);
+        }
+        var s = try Slab.fill(gpa, E, count + 1, value);
+        defer s.deinit(gpa);
+        try splice(gpa, E, &s, count / 2, 1, &.{}, null);
+        try expectUniformSplice(E, &s, count, value);
+    }
+}
+
+fn expectUniformSplice(comptime E: type, s: *const Slab, count: usize, value: E.Wire) !void {
+    const gpa = testing.allocator;
+    const want = try gpa.alloc(E.Wire, count);
+    defer gpa.free(want);
+    @memset(want, value);
+    // The ordinary elementwise encoder is the independent canonical-byte oracle.
+    const bytes = try E.wireEncode(gpa, want, false);
+    defer gpa.free(bytes);
+    try testing.expectEqualSlices(u8, bytes, s.data);
+    const got = try E.wireRange(gpa, s.data, 0, s.len);
+    defer gpa.free(got);
+    try testing.expectEqual(count, got.len);
+    for (got) |v| try testing.expect(E.sameValue(v, value));
+    try expectSlabSound(E, s);
+}
+
+test "uniform slab splices preserve canonical bytes across count and payload boundaries" {
+    // Exercise actual splice publication against elementwise encoding and decoded values.
+    const col = @import("column.zig");
+    try exerciseUniformSplice(col.Rle(u32), 300);
+    try exerciseUniformSplice(col.Rle(i64), -129);
+    try exerciseUniformSplice(col.Rle([]const u8), "constant payload");
+    try exerciseUniformSplice(col.RleOption(u32), null);
+    try exerciseUniformSplice(col.RleOption(u32), 300);
+    try exerciseUniformSplice(col.Bool, false);
+    try exerciseUniformSplice(col.Bool, true);
+}
+
+test "uniform slab splices retain different inserts and delta-domain postfix replacements" {
+    // A matching insert cannot hide a different wire delta at the surviving suffix.
+    const gpa = testing.allocator;
+    const E = @import("column.zig").Delta(u32);
+    var s = try Slab.fill(gpa, E, 5, 2);
+    defer s.deinit(gpa);
+    try splice(gpa, E, &s, 1, 2, &.{2}, &.{7});
+    try expectValues(E, &s, &.{ 2, 2, 7, 2 });
+    const want = try E.wireEncode(gpa, &.{ 2, 2, 7, 2 }, false);
+    defer gpa.free(want);
+    try testing.expectEqualSlices(u8, want, s.data);
+    try expectSlabSound(E, &s);
+    try splice(gpa, E, &s, 0, s.len, &.{ 3, 4 }, null);
+    try expectValues(E, &s, &.{ 3, 4 });
+    try expectSlabSound(E, &s);
+}
+
+test "a multi-item literal and a different constant-run insert retain canonical bytes" {
+    // A literal's first value says nothing about its later values.
+    const gpa = testing.allocator;
+    const E = @import("column.zig").Rle(u32);
+    var literal = try init(gpa, E, &.{ 0x7d, 1, 2, 3 });
+    defer literal.deinit(gpa);
+    try splice(gpa, E, &literal, 1, 0, &.{1}, null);
+    try expectValues(E, &literal, &.{ 1, 1, 2, 3 });
+    const bytes = try E.wireEncode(gpa, &.{ 1, 1, 2, 3 }, false);
+    defer gpa.free(bytes);
+    try testing.expectEqualSlices(u8, bytes, literal.data);
+    try expectSlabSound(E, &literal);
+
+    var repeated = try Slab.fill(gpa, E, 5, 1);
+    defer repeated.deinit(gpa);
+    try splice(gpa, E, &repeated, 2, 1, &.{2}, null);
+    try expectValues(E, &repeated, &.{ 1, 1, 2, 1, 1 });
+    const changed = try E.wireEncode(gpa, &.{ 1, 1, 2, 1, 1 }, false);
+    defer gpa.free(changed);
+    try testing.expectEqualSlices(u8, changed, repeated.data);
+    try expectSlabSound(E, &repeated);
+}
+
+test "uniform byte splices keep borrowed source payloads alive until publication" {
+    // An inserted byte value can borrow the very slab being replaced.
+    const gpa = testing.allocator;
+    const E = @import("column.zig").Rle([]const u8);
+    var s = try Slab.fill(gpa, E, 3, "payload");
+    defer s.deinit(gpa);
+    const borrowed = (try E.firstRunValue(s.data)).?;
+    try splice(gpa, E, &s, 1, 0, &.{borrowed}, &.{borrowed});
+    try expectUniformSplice(E, &s, 4, "payload");
+}
+
+test "uniform slab splice bounds refuse without modifying the slab" {
+    // Check caller-controlled ranges before any new encoding or publication.
+    const gpa = testing.allocator;
+    const E = @import("column.zig").Rle(u32);
+    var s = try Slab.fill(gpa, E, 3, 1);
+    defer s.deinit(gpa);
+    const old = s;
+    try testing.expectError(error.InvalidValue, splice(gpa, E, &s, 4, 0, &.{1}, null));
+    try testing.expectError(
+        error.InvalidValue,
+        splice(gpa, E, &s, 1, std.math.maxInt(usize), &.{1}, null),
+    );
+    try testing.expect(s.data.ptr == old.data.ptr);
+    try expectUniformSplice(E, &s, 3, 1);
+}
+
+fn uniformSpliceAllocationFailure(gpa: std.mem.Allocator, comptime E: type, value: E.Wire) !void {
+    var s = try Slab.fill(gpa, E, 63, value);
+    defer s.deinit(gpa);
+    const old = s;
+    var saved: [64]u8 = undefined;
+    try testing.expect(s.data.len <= saved.len);
+    @memcpy(saved[0..s.data.len], s.data);
+    splice(gpa, E, &s, 31, 0, &.{value}, &.{value}) catch |failure| {
+        try testing.expect(failure == error.OutOfMemory);
+        try testing.expect(s.data.ptr == old.data.ptr);
+        try testing.expectEqual(old.len, s.len);
+        try testing.expectEqual(old.segments, s.segments);
+        try testing.expect(Tail.eql(old.tail, s.tail));
+        try testing.expectEqualSlices(u8, saved[0..old.data.len], s.data);
+        try expectUniformSplice(E, &s, 63, value);
+        return failure;
+    };
+    try expectUniformSplice(E, &s, 64, value);
+}
+
+fn absentUniformSpliceAllocationFailure(gpa: std.mem.Allocator) !void {
+    try uniformSpliceAllocationFailure(gpa, @import("column.zig").RleOption(u32), null);
+}
+
+fn byteUniformSpliceAllocationFailure(gpa: std.mem.Allocator) !void {
+    try uniformSpliceAllocationFailure(gpa, @import("column.zig").Rle([]const u8), "payload");
+}
+
+fn boolUniformSpliceAllocationFailure(gpa: std.mem.Allocator) !void {
+    try uniformSpliceAllocationFailure(gpa, @import("column.zig").Bool, true);
+}
+
+test "uniform slab splice allocation failures preserve bytes metadata and usability" {
+    // Fail every allocation, including metadata measurement after replacement encoding.
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        absentUniformSpliceAllocationFailure,
+        .{},
+    );
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        byteUniformSpliceAllocationFailure,
+        .{},
+    );
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        boolUniformSpliceAllocationFailure,
+        .{},
+    );
 }
 
 test "fill is one run and measures as one segment" {
@@ -2280,133 +3274,11 @@ const slab_boundary_cases = [_][]const u8{
 /// `bool.zig`'s, each asserted there over the same corpus.
 const slab_cases: usize = 890 + 71;
 
-/// How many of those records count runs where the reference counts
-/// segments.
-///
-/// **Pinned, not asserted zero, and the pin is the test.** The two counts
-/// are in different units and neither is a mistake: upstream's
-/// `Slab.segments` costs a literal run its number of values and a repeat
-/// or null run one (`rle/load.rs:38-39`, `:43-45`, `:50-52`, and the
-/// loader's own copy of the same bookkeeping at `:132-153`), and this port
-/// costs every run one — `measure` and `Slab.segments` in this file. So
-/// the two agree on a slab whose every literal run holds exactly one value
-/// and part company on every other one, and the number of those is a fact
-/// about the layout rather than a failure. Every other number in this
-/// family is compared exactly; see the diff block at the foot of this file.
-const pinned_run_count: usize = 670;
-
-/// How many of those records this port cuts where the reference's loader
-/// does not, in the units above.
-const pinned_cut: usize = 140;
-
-/// How many item indices land in a different slab under this port's cut
-/// than under the reference's.
-///
-/// **Deliberately not zero.** The cut really does differ, so a lookup for the
-/// same key really does land in a different slab, and this is how many of
-/// the corpus's items that happens to. The harmless half is checked in the
-/// same pass rather than claimed here: every value of every record is read
-/// back and compared with the reference's own, and every one of these indices
-/// is read again through `get`, which is the path the cut can reach.
-const pinned_slab_choice: usize = 4297;
-
-/// One record that disagrees with the reference, kept so that a pin which
-/// has moved names the case instead of only counting it.
-///
-/// **The three names are owned copies and not the record's own strings.** A
-/// record is parsed into an arena that `eachCase` frees the moment the case
-/// is done with, so a name borrowed from one is dangling by the time the
-/// tally is read — which is the same rule every slice in a document obeys,
-/// one arena in place of a document.
-const Example = struct {
-    codec: []u8,
-    case: []u8,
-    seed: []u8,
-    /// What the reference said, and what this port said.
-    reference: usize,
-    port: usize,
-
-    fn deinit(self: *Example, gpa: std.mem.Allocator) void {
-        gpa.free(self.codec);
-        gpa.free(self.case);
-        gpa.free(self.seed);
-        self.* = undefined;
-    }
-};
-
-/// The numbers this pass counts.
-///
-/// Test-run state: Zig runs a file's tests one at a time in one thread, and
-/// `eachCase`'s callback has no room to carry a pointer, so the count lives
-/// here and the test that reads it resets it first. Counting is also the
-/// only way to see *every* disagreement — a check that returned on the
-/// first of 961 records would say nothing about the other 960, and the byte
-/// comparison the compatibility contract depends on runs in the same pass.
-const Divergence = struct {
-    /// How many records the two families carried.
-    cases: usize = 0,
-    /// Records where the run count is not the reference's segment count.
-    run_count: usize = 0,
-    run_count_first: ?Example = null,
-    /// Records where this port's cut is not the cut the corpus recorded.
-    cut: usize = 0,
-    cut_first: ?Example = null,
-    /// Item indices whose slab this port's cut and the reference's cut do
-    /// not agree on.
-    slab_choice: usize = 0,
-};
-
-var divergence: Divergence = .{};
-
-/// Records the first disagreement of a kind, and only that one.
-fn noteExample(
-    into: *?Example,
-    rec: corpus.Record,
-    reference: usize,
-    port: usize,
-    gpa: std.mem.Allocator,
-) !void {
-    if (into.* != null) return;
-    into.* = .{
-        .codec = try gpa.dupe(u8, rec.codec),
-        .case = try gpa.dupe(u8, rec.case),
-        .seed = try gpa.dupe(u8, rec.seed),
-        .reference = reference,
-        .port = port,
-    };
-}
-
-/// Gives an example's copies back, for the test that reads the tally.
-fn freeExample(into: *?Example, gpa: std.mem.Allocator) void {
-    var e = into.* orelse return;
-    e.deinit(gpa);
-    into.* = null;
-}
-
 /// How many items a partition covers.
 fn totalOf(lens: []const usize) !usize {
     var total: usize = 0;
     for (lens) |n| total = std.math.add(usize, total, n) catch return error.Overflow;
     return total;
-}
-
-/// Whether this port's cut is the reference's cut, as far as the corpus is
-/// able to say.
-///
-/// **The corpus cannot say more than this, and a gate that pretends
-/// otherwise is measuring its own bug.** The reference's loader cuts a slab
-/// the moment its segment count reaches the target and flushes the trailing
-/// one in `finalize` (`rle/load.rs:220-222`, `:259-261`); the oracle drains
-/// with `try_next_run` and never calls `finalize`
-/// (`tools/oracle/src/codec.rs:1146-1156`), so `split.lens` is every slab
-/// the reference made **but the last**. So the claim is that the port's
-/// partition starts with the recorded one and is at most one slab longer.
-fn cutAgrees(recorded: []const usize, port: []const usize) bool {
-    if (port.len < recorded.len or port.len > recorded.len + 1) return false;
-    for (recorded, 0..) |want, i| {
-        if (port[i] != want) return false;
-    }
-    return true;
 }
 
 /// One golden case, read as a slab: the metadata beside the bytes, the cut
@@ -2428,7 +3300,6 @@ fn checkSlab(
     rec: corpus.Record,
     gpa: std.mem.Allocator,
 ) !void {
-    divergence.cases += 1;
     const values = try corpus.expand(gpa, Element, rec);
     defer gpa.free(values);
     const bytes = try corpus.referenceBytes(gpa, rec);
@@ -2464,11 +3335,12 @@ fn checkSlab(
         return error.SlabMetadataMismatch;
     }
 
-    // The run count, counted and not raised. See [`pinned_run_count`].
-    if (m.segments != rec.segments) {
-        divergence.run_count += 1;
-        try noteExample(&divergence.run_count_first, rec, rec.segments, m.segments, gpa);
-    }
+    // The cached metric stays wire headers; maintenance uses literal rows.
+    const borrowed = fromParts(@constCast(bytes), m.len, m.segments, m.tail);
+    try testing.expectEqual(rec.segments, try decodeBudget(gpa, E, &borrowed));
+    const segs = try E.segmentsOf(gpa, bytes);
+    defer gpa.free(segs);
+    try testing.expectEqual(segs.len, m.segments);
 
     // ── The cut ───────────────────────────────────────────────────────────
     //
@@ -2511,17 +3383,10 @@ fn checkSlab(
     try testing.expectEqual(values.len, try totalOf(port.items));
     try testing.expectEqual(values.len, try totalOf(ref.items));
 
-    if (!cutAgrees(split.lens, port.items)) {
-        divergence.cut += 1;
-        try noteExample(&divergence.cut_first, rec, split.lens.len, port.items.len, gpa);
-    }
-
     // ── The reads ─────────────────────────────────────────────────────────
     //
-    // This is the question the byte comparison cannot answer. The cut above
-    // is known to differ on a large share of the corpus, a different cut
-    // does put a lookup for the same key in a different slab, and what a
-    // reader sees must not be what that changes.
+    // Partition choices are not pinned. Sequential reads and positional reads
+    // must agree with the reference across every boundary they introduce.
     //
     // **Every value, through the column's own sequential read.** That walk
     // crosses every slab boundary the layout has, so it is the path a
@@ -2529,6 +3394,9 @@ fn checkSlab(
     const all = try col.toSlice(gpa);
     defer gpa.free(all);
     try testing.expectEqualSlices(Element, values, all);
+    const encoded = try col.encode(gpa);
+    defer gpa.free(encoded);
+    try testing.expectEqualSlices(u8, bytes, encoded);
 
     // **And every index the two cuts disagree about, plus every slab
     // boundary, through `get`** — the index-driven read, which is the only
@@ -2570,7 +3438,6 @@ fn expectReadsAt(
         while (ri + 1 < ref.len and r_left == 0) : (ri += 1) r_left = ref[ri];
         if (pi != ri) {
             try rows.append(gpa, at);
-            divergence.slab_choice += 1;
         }
         p_left -= 1;
         r_left -= 1;
@@ -2649,83 +3516,15 @@ fn slabCase(rec: corpus.Record, gpa: std.mem.Allocator) !void {
     try corpus.dispatch(slab_kinds, slabCaseFor, gpa, rec);
 }
 
-test "a slab's metadata and reads are the reference's, and its run count and cut are a pinned divergence" {
+test "a slab's metadata, canonical bytes and reads match the reference corpus" {
     const gpa = testing.allocator;
     var names = corpus.Names.init(gpa);
     defer names.deinit();
-    // The tally is this test's own, and the two examples in it own their
-    // names: the tally outlives the arena every record was parsed in, so
-    // the `defer` has to be here rather than at the point of the first
-    // disagreement.
-    divergence = .{};
-    defer {
-        freeExample(&divergence.run_count_first, gpa);
-        freeExample(&divergence.cut_first, gpa);
-    }
-
     var cases: usize = 0;
     cases += try corpus.eachCase(gpa, "rle", &names, slabCase);
     cases += try corpus.eachCase(gpa, "bool", &names, slabCase);
-    // Every RLE and boolean record, and not one more: a slab adds no cases
-    // of its own, so a count above the two families' total would mean the
-    // family was answering for something it does not own. The other half
-    // of that claim is the test below, which checks the pairing itself.
     try testing.expectEqual(slab_cases, cases);
-    try testing.expectEqual(slab_cases, divergence.cases);
     try names.expectRequired(&slab_boundary_cases);
-
-    if (divergence.run_count == pinned_run_count and
-        divergence.cut == pinned_cut and
-        divergence.slab_choice == pinned_slab_choice) return;
-
-    std.debug.print(
-        \\
-        \\--- the slab layout pin moved ---------------------------------------------
-        \\  the bytes are the reference's in all {d} of them, and so are the item
-        \\  count, the tail's byte width and the literal-tail width. These three
-        \\  counts are the layout, and they are pinned rather than asserted equal
-        \\  because upstream and this port count a run in different units:
-        \\
-        \\                   this port     pinned
-        \\  run count              {d:>8}     {d:>8}
-        \\  cut                    {d:>8}     {d:>8}
-        \\  items in another slab  {d:>8}     {d:>8}
-        \\
-    , .{
-        cases,
-        divergence.run_count,
-        pinned_run_count,
-        divergence.cut,
-        pinned_cut,
-        divergence.slab_choice,
-        pinned_slab_choice,
-    });
-    printExample("run count", divergence.run_count_first);
-    printExample("cut", divergence.cut_first);
-    std.debug.print(
-        \\
-        \\Upstream's `Slab.segments` costs a literal run its number of values
-        \\(`rle/load.rs:38-39`) and this port costs every run one, so the two
-        \\counts and the two cuts part company on every literal run of more than
-        \\one value. The diff block at the foot of `slab.zig` says what that does
-        \\and does not change.
-        \\
-    , .{});
-    return error.SlabLayoutPinMoved;
-}
-
-fn printExample(what: []const u8, ex: ?Example) void {
-    const e = ex orelse return;
-    std.debug.print(
-        \\
-        \\--- {s} first differs ---------------------------------------------
-        \\  codec      {s}
-        \\  case       {s}
-        \\  seed       {s}
-        \\  reference  {d}
-        \\  this port  {d}
-        \\
-    , .{ what, e.codec, e.case, e.seed, e.reference, e.port });
 }
 
 /// Whether `codec` is one of the names `slabCase` dispatches on.
@@ -2768,58 +3567,15 @@ test "a slab answers for the RLE and boolean families and for nothing else" {
     try testing.expectEqual(@as(usize, 890 + 71 + 540 + 465), try corpus.eachCodecRecord(gpa, ownershipCase));
 }
 
-// ── The diff ─────────────────────────────────────────────────────────────────
-//
-// Upstream is Rust and this is Zig 0.16.0, and on the three numbers beside a
-// slab's bytes the two do not agree. None of it is in the compatibility
-// contract — the document format, the change encoding, the column ids, the
-// column order and the sync message bytes are — and the corpus says so with
-// the bytes: every codec's wire bytes are the reference's, for all of the
-// 1,966 records `test/golden/codec.jsonl` carries.
-//
-// * `Slab.segments` counts wire runs here. Upstream counts a literal run as
-//   its number of values and a repeat or null run as one
-//   (`rle/load.rs:38-39`, `:43-45`, `:50-52`), and its loader's own copy of
-//   that bookkeeping is at `rle/load.rs:132-153`. `check_invariants`
-//   asserts the two are the same number there (`column.rs:1316-1319`), so
-//   upstream has one count and this port has another. 670 of the 961 RLE
-//   and boolean records differ; the pin is `pinned_run_count`.
-//
-// * A load therefore cuts at 32 wire runs where upstream cuts at 32
-//   segments, and on a slab of literal values that is a different place.
-//   `boundary_literal` is 44 distinct values in one literal run, so
-//   upstream cuts it 32 + 12 and this port leaves it whole. The count of
-//   those is the pin `pinned_cut`, and `cutAgrees` is what says how far the
-//   corpus is able to check either cut at all.
-//
-// * The cut is not free to differ. A lookup does land in a different slab —
-//   `pinned_slab_choice` is how many items — and the index is keyed by item
-//   offset and not by `segments` (`column.zig:1764-1780`), so the slab it
-//   selects is the only thing the cut changes. That is checked, not argued:
-//   every value of every record is read through the column's own walk and
-//   compared with the reference's own value, and every index the two cuts
-//   disagree about is read again through `get`.
-//
-// What the difference does cost is size and time: a slab here can hold as
-// many literal runs as the budget names, each of any length, where upstream
-// holds at most 64 segments. A splice into such a slab decodes the whole
-// middle (`Partition.rebuild`), which is the deviation the module comment
-// above already names for a long repeat run.
-//
-// Three things do **not** differ, and are compared exactly rather than
-// pinned: the item count (`rle/load.rs:38`, `:44-45`), the tail's byte width
-// (`rle/load.rs:33-36`, `:52-55`), and the literal-tail width. That last one
-// is upstream's `None` for a repeat or null run (`rle/mod.rs:101-103`), which
-// is `0` in `Tail` here — and now also in the descriptor that fills it
-// (`column.zig:694-721`), which used to hand back the repeated value's width
-// and put 136 of the 961 records out. The descriptor contradicted its own
-// documentation there, and nothing read the field, so the fix is free.
+// The cached wire-header count deliberately differs from upstream's literal
+// row accounting (`rust/hexane/src/rle/load.rs:38-52`). decodeBudget supplies
+// that maintenance metric without changing the slab layout. Partitions may
+// therefore change without changing values, canonical column bytes or tails.
 
 // Zig 0.16.0 / upstream / Rust / port
 //
-// The block above records the run-count and cut divergences. This one records
-// what the nine upstream-named cases added on 2026-10-01 changed, and what
-// they did not.
+// The upstream-named cases below exercise slab operations independently of
+// the column's partition policy.
 //
 // * **Nine `Column`-typed upstream cases are transcribed here against a slab,
 //   and at these sizes the column *is* a slab.** The largest input is
@@ -2888,3 +3644,12 @@ test "a slab answers for the RLE and boolean families and for nothing else" {
 //   owned by `docs/hexane-cases.json`**, and not by a second list here. A
 //   ledger that appears in two files is a ledger that can drift, and the one
 //   this block replaced counted names rather than declarations.
+
+test "legacy codec maintenance budget uses checked metadata without allocating" {
+    const gpa = testing.allocator;
+    var source = try Filler.slabOf(gpa, &.{ 1, 2, 3 });
+    defer source.deinit(gpa);
+    var storage: [0]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    try testing.expectEqual(source.segments, try decodeBudget(fixed.allocator(), Filler, &source));
+}

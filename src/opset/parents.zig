@@ -810,7 +810,11 @@ fn chainPath() [3]PathElem {
 }
 
 fn exid(id: ObjId) ExId {
-    return id;
+    return switch (id) {
+        .root => .root,
+        .id => |op| ExId.withActor(op, fixture_actors[op.actor]),
+        .named => id,
+    };
 }
 
 /// Every level of `chainDoc`'s walk, innermost first.
@@ -832,6 +836,42 @@ fn expectChainLevels(parents: []const Parent) !void {
     try testing.expect(parents[2].prop.eql(.{ .key = "a" }));
     try testing.expectEqual(ObjType.map, parents[2].typ);
     try testing.expect(parents[2].visible);
+}
+
+test "parent walks resolve stable actor identities instead of cached hints" {
+    const gpa = testing.allocator;
+    const doc = try chainDoc(gpa);
+    defer doc.destroy();
+
+    // A stale in-range hint must not select the other actor's operation.
+    try doc.set.insertActor(0, .{ .bytes = "0000" });
+    const copied_actor = try gpa.dupe(u8, actor0.bytes);
+    defer gpa.free(copied_actor);
+    const stale = ExId.withActor(opId(3, 0), .{ .bytes = copied_actor });
+    const parents = try collect(gpa, &doc.set, stale, null, 3);
+    defer gpa.free(parents);
+    try testing.expectEqual(@as(usize, 3), parents.len);
+    try testing.expect(parents[0].obj.eql(ExId.withActor(opId(2, 999), actor0)));
+    try testing.expect(parents[1].obj.eql(ExId.withActor(opId(1, 999), actor0)));
+    try testing.expect(parents[2].obj.isRoot());
+
+    // An out-of-range hint is repairable from bytes, not a panic.
+    const outside = ExId.withActor(opId(3, 999), actor0);
+    const repaired = try collect(gpa, &doc.set, outside, null, 3);
+    defer gpa.free(repaired);
+    try testing.expectEqual(@as(usize, 3), repaired.len);
+    for (parents, repaired) |a, b| try testing.expect(a.obj.eql(b.obj));
+}
+
+test "public parent path equality uses actor bytes and ignores cached hints" {
+    const original = PathElem{ .obj = ExId.withActor(opId(2, 0), actor0), .prop = .{ .key = "child" } };
+    const copied_bytes = try testing.allocator.dupe(u8, actor0.bytes);
+    defer testing.allocator.free(copied_bytes);
+    const moved = PathElem{ .obj = ExId.withActor(opId(2, 7), .{ .bytes = copied_bytes }), .prop = original.prop };
+    try testing.expect(pathElemEqual(original, moved));
+    const other_actor = PathElem{ .obj = ExId.withActor(opId(2, 0), .{ .bytes = "bbbb" }), .prop = original.prop };
+    try testing.expect(!pathElemEqual(original, other_actor));
+    try testing.expect(!pathElemEqual(original, .{ .obj = made(2, 0), .prop = original.prop }));
 }
 
 // ── 1 ───────────────────────────────────────────────────────────────────────
