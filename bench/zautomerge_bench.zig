@@ -11,6 +11,19 @@
 //! `@import("zautomerge")` a downstream project writes — and reports, per
 //! workload, a nanosecond figure that can be diffed between two builds.
 //!
+//! FOUR MORE, FOR WHAT THE SUITE EXERCISES BUT NEVER ISOLATES
+//!
+//! A data-oriented audit of the port named four costs that no case measures,
+//! so no change to them could be honestly accepted or rejected. They are the
+//! sorted insert into `sent_hashes` on every generated sync message
+//! (`src/sync/protocol.zig:572` over `src/sync/state.zig:368-382`), the linear
+//! `hashForOpid` scan (`src/transaction.zig:411-423`), the five column cursors
+//! `elementWidth` builds per list element (`src/iter/list_range.zig:884-901`
+//! over `src/opset/op_set.zig:3500-3503`), and the per-change arena in
+//! `anonymize`, whose gate is peak RSS rather than instructions and which
+//! `bench/README.md` §8 gives as a standalone command line. The three that can
+//! be gated through the public surface are the last three workloads here.
+//!
 //! Every workload prints one machine-readable line on **stdout**:
 //!
 //!     BENCH <name> <iters> <total_ns> <ns_per_iter>
@@ -56,8 +69,9 @@ const Io = std.Io;
 const Document = am.doc.Document;
 const OpId = am.OpId;
 const TextEncoding = am.TextEncoding;
+const ChangeHash = am.ChangeHash;
 
-/// The buffer stdout is written through. Seven short lines would not need one;
+/// The buffer stdout is written through. Ten short lines would not need one;
 /// a reader that wants the file before the process has exited does.
 const stdout_buffer_len = 8 * 1024;
 
@@ -365,8 +379,8 @@ const Ctx = struct {
     sizes: Sizes,
 };
 
-/// Every size the seven workloads take, in one place, so `bench/README.md`'s
-/// table of what is reduced and `Sizes.full` cannot drift apart.
+/// Every size every workload takes, in one place, so `bench/README.md`'s table
+/// of what is reduced and `Sizes.full` cannot drift apart.
 const Sizes = struct {
     /// How many times the record is repeated to make the segmentation body.
     seg_reps: usize,
@@ -390,8 +404,32 @@ const Sizes = struct {
     mark_queries: usize,
     /// How many times the record is repeated to make the long text.
     text_reps: usize,
+    /// Rounds of the two-peer sync exchange. Each round is one
+    /// `generateSyncMessage` that carries `sync_chunk` fresh hashes into a
+    /// `sent_hashes` set that grows by exactly `sync_chunk` a round and ends
+    /// at the document's whole change count, so the insert loop's memmove arm
+    /// grows across the run. The set only grows because the peer receives
+    /// every message and answers none of them until the run is over: an
+    /// answer is an acknowledgement, and an acknowledgement empties the set.
+    sync_rounds: usize,
+    /// Changes the local document gains, and the peer is sent, per round.
+    sync_chunk: usize,
+    /// Committed changes in the change graph `hashForOpid` scans. This is the
+    /// `C` in its O(C) scan, and it is what makes one call cost something.
+    opid_changes: usize,
+    /// How many `hashForOpid` calls each arm is timed over.
+    opid_calls: usize,
+    /// Elements in the list `list-width` walks.
+    list_width_elements: usize,
+    /// Times that walk runs. One pass over a reduced list is close to the
+    /// clock's floor, so this is what lifts it above.
+    list_width_passes: usize,
 
-    /// The reduced sizes. Chosen so one full pass over all seven workloads fits
+    // The three added workloads have **no test case behind them**, so `full`
+    // below is not "the case's exact size" for them; it is a larger documented
+    // size of the same shape. `bench/README.md` §4 says which is which.
+
+    /// The reduced sizes. Chosen so one full pass over every workload fits
     /// well inside a minute on a native ReleaseFast build, with every workload
     /// still long enough to time. `bench/README.md` says which are reduced and
     /// why each reduction measures the same thing.
@@ -406,9 +444,17 @@ const Sizes = struct {
         .mark_count = 1000,
         .mark_queries = 200,
         .text_reps = 10_000,
+        .sync_rounds = 24,
+        .sync_chunk = 200,
+        .opid_changes = 20_000,
+        .opid_calls = 400,
+        .list_width_elements = 50_000,
+        .list_width_passes = 2,
     };
 
-    /// The sizes the port's own test cases use, exactly. `--full`.
+    /// The sizes the port's own test cases use, exactly, for the seven cases
+    /// there are seven test cases for — and a larger documented size of the
+    /// same shape for the three added workloads, which have none. `--full`.
     const full: Sizes = .{
         .seg_reps = 500,
         .seg_single_passes = 1024,
@@ -420,6 +466,12 @@ const Sizes = struct {
         .mark_count = 2500,
         .mark_queries = 200,
         .text_reps = 10_000,
+        .sync_rounds = 48,
+        .sync_chunk = 400,
+        .opid_changes = 50_000,
+        .opid_calls = 1_000,
+        .list_width_elements = 200_000,
+        .list_width_passes = 4,
     };
 };
 
@@ -1191,6 +1243,498 @@ fn markAtEnd(ctx: Ctx) !Result {
     return out;
 }
 
+// ── Workload 8: a sync round trip, and the `sent_hashes` insert ──────────────
+//
+// The line the audit names is `src/sync/protocol.zig:572`,
+//
+//     for (builder.payloadHashes()) |hash| try state.insertSent(hash);
+//
+// which is `State.insertSent` at `src/sync/state.zig:368-382`: a binary search
+// over an ascending, duplicate-free list and then an `ArrayList.insert`
+// memmove — **once per hash, per generated message**. Nothing on the generate
+// path takes a hash back out, so the list grows by exactly what each message
+// carried and the memmove arm is quadratic in the changes a peer has been sent
+// over a session. Two things elsewhere do empty it, and both are on the
+// receive path: `clearSent` (`src/sync/state.zig:385-387`) and the
+// acknowledgement prune. The next section is about the second one.
+//
+// ── WHY THE PEER DOES NOT ANSWER DURING THE RUN ──
+//
+// A peer that answers every message empties the list every round, and that is
+// the one thing that stops this workload from measuring anything.
+// `receiveSyncMessage` **is** the acknowledgement — there is no ack message at
+// this commit — and it keeps only the hashes the peer's advertised heads do
+// not cover (`src/sync/protocol.zig:708-713`, `sync.rs:430-431`). A peer that
+// has just applied what we sent advertises heads that cover all of it, so a
+// fully answered round is
+//
+//     generate -> the set holds this round's chunk -> receive the answer ->
+//     the set is empty again
+//
+// and the insert loop then only ever runs over a list no longer than one
+// chunk. The memmove arm does not grow, the quadratic does not show, and the
+// run is indistinguishable from one that measured nothing at all.
+//
+// So the measured rounds below are the **push** side of a session the peer
+// has not answered yet, which is a real path — a `SyncSession` that only ever
+// pushes, or a peer that has gone quiet for a few rounds — and the only one on
+// which the list grows. The peer still *receives* every message, so the
+// session is a real round trip, the peer really does converge, and the checks
+// at the end still have something to check. The withheld answer is delivered
+// once, after the last round, and "the local side has nothing left to send"
+// then holds for the same reason it always did.
+//
+// Everything below is public and is driven exactly as
+// `test/upstream_doc_test.zig:4955-4969` drives it:
+//
+//   * `am.sync.state.State.new`             (`src/sync/state.zig:181`)
+//   * `am.sync.protocol.generateSyncMessage` (`src/sync/protocol.zig:430`)
+//   * `am.sync.protocol.receiveSyncMessage`  (`src/sync/protocol.zig:658`)
+//
+// No private is reached, including for the check below: **`sent_hashes` is a
+// public field** (`src/sync/state.zig:156`), so the set the insert loop is
+// supposed to maintain can be inspected from outside.
+fn syncRoundtrip(ctx: Ctx) !Result {
+    const gpa = ctx.gpa;
+    const rounds = ctx.sizes.sync_rounds;
+    const chunk = ctx.sizes.sync_chunk;
+    // `iters` is the number of generated messages that carried changes, which
+    // is the unit the insert loop runs in. `measures_own_time` because the
+    // subject is one `generateSyncMessage`, not the whole round: the fixture
+    // growth and the peer's half of the exchange are phases, not the clock.
+    var out: Result = .{ .iters = rounds, .measures_own_time = true };
+
+    var local = try Document.init(gpa, ctx.io, .auto);
+    defer local.deinit();
+    local.setActorId(.{ .bytes = "bench-sync-roundtrip-local" });
+    var peer = try Document.init(gpa, ctx.io, .auto);
+    defer peer.deinit();
+    peer.setActorId(.{ .bytes = "bench-sync-roundtrip-peer" });
+
+    var ls: am.sync.state.State = am.sync.state.State.new(gpa);
+    defer ls.deinit();
+    var rs: am.sync.state.State = am.sync.state.State.new(gpa);
+    defer rs.deinit();
+
+    const list = try am.transaction.putObject(&local, am.root, .{ .key = "l" }, .list);
+
+    // ── the handshake, once, outside every clock ──
+    //
+    // Four messages, and the run below depends on all four:
+    //
+    //   1. the peer advertises its empty document. The flags section is what
+    //      tells the local side that the peer reads V2
+    //      (`State.capabilitiesFor`, `src/sync/state.zig:409-412`), and the
+    //      empty head list is what arms `sendDoc`
+    //      (`src/sync/state.zig:341-344`), so that message 2 answers with
+    //      the document instead of with an empty payload;
+    //   2. the local side answers. Before it, `buildPayload` answers an empty
+    //      payload because `State.their()` is null
+    //      (`src/sync/protocol.zig:962`), so this is the first message that
+    //      can carry anything, and every hash it carries goes through the
+    //      insert loop;
+    //   3. the peer applies it, so the peer is a document with history rather
+    //      than a stub;
+    //   4. the peer answers. **This message empties `sent_hashes`**
+    //      (`src/sync/protocol.zig:709-712`), and it is also what leaves the
+    //      local side holding a non-empty `their_heads`, so `sendDoc` is not
+    //      armed again and every round below computes a delta.
+    //
+    // The set is checked on both sides of that acknowledgement, because the
+    // acknowledgement taking all of it back out is the whole reason the
+    // rounds below do not feed the peer's answers in.
+    {
+        const advertised = try am.sync.protocol.generateSyncMessage(gpa, &peer, &rs);
+        const hello = advertised orelse return error.PeerWentQuietOnFirstMessage;
+        try am.sync.protocol.receiveSyncMessage(gpa, &local, &ls, hello);
+
+        const offered = try am.sync.protocol.generateSyncMessage(gpa, &local, &ls);
+        const snapshot = offered orelse return error.LocalWentQuietInHandshake;
+        // A whole document, so every hash the document holds is a hash the
+        // insert loop just inserted. If this ever stops holding, message 2
+        // stopped being the message the comment above describes.
+        if (ls.sent_hashes.items.len != local.graph.len()) return error.HandshakeCarriedNoHashes;
+        try am.sync.protocol.receiveSyncMessage(gpa, &peer, &rs, snapshot);
+
+        const answered = try am.sync.protocol.generateSyncMessage(gpa, &peer, &rs);
+        const ack = answered orelse return error.PeerWentQuietInHandshake;
+        try am.sync.protocol.receiveSyncMessage(gpa, &local, &ls, ack);
+    }
+    if (ls.sent_hashes.items.len != 0) return error.HandshakeDidNotPrune;
+
+    var gen_ns: u64 = 0;
+    var peer_ns: u64 = 0;
+    var written: usize = 0;
+    var sent_before: usize = 0;
+
+    for (0..rounds) |round| {
+        // ── fixture growth, outside every clock ──
+        //
+        // One autocommit per element, so the local document gains exactly
+        // `chunk` changes the peer has never seen and no hash of this round's
+        // is one an earlier round already recorded. From the third round on
+        // the payload is a change list; the port answers a whole document
+        // instead while the payload is more than a third of the graph
+        // (`src/sync/protocol.zig:992-996`), which is rounds 0 and 1 at these
+        // sizes. Either way the hashes are the fixture's own.
+        for (0..chunk) |_| {
+            _ = try am.transaction.insert(&local, list, written, .{ .int = @intCast(written) });
+            written += 1;
+        }
+
+        // ── the subject: `generateSyncMessage`, insert loop included ──
+        //
+        // `in_flight` is latched from this message on and nothing in the
+        // measured run clears it, which is safe for one reason and one
+        // reason only: the fixture moved the heads, so `heads_unchanged` is
+        // false and the `if (state.in_flight) return null` arm inside it
+        // (`src/sync/protocol.zig:556-564`) is never reached. A round that
+        // did not move the heads would get `NoMessageFromLocal` below rather
+        // than a quiet zero-length payload.
+        const gen_started = Timer.start(ctx.io);
+        const generated = try am.sync.protocol.generateSyncMessage(gpa, &local, &ls);
+        const this_gen = gen_started.stop();
+        gen_ns += this_gen;
+        const message = generated orelse return error.NoMessageFromLocal;
+
+        // **Exactly** one chunk of new hashes, and not one pruned away.
+        //
+        // The first round records `chunk + 1` rather than `chunk`, and the
+        // one is the handshake's: message 2 put that change on the wire as a
+        // whole document and the acknowledgement then took it back out of the
+        // set, so round 0's payload — which is a whole document too, because
+        // a payload of more than a third of the graph is cheaper as one
+        // snapshot (`src/sync/protocol.zig:992-996`) — records it again. Every
+        // round after it carries exactly its own chunk. The same
+        // `sent_hashes.items.len == local.graph.len()` the run ends on
+        // depends on that one hash being back, so the two checks are two ends
+        // of the same fact.
+        //
+        // The equality is the point. The only way to arrive at it is one
+        // `insertSent` call per carried hash (`src/sync/protocol.zig:572`)
+        // with no prune, no `clearSent` and no duplicate between them.
+        // Without it this workload could "measure" a run in which the insert
+        // loop never ran, which is the one way it could pass while measuring
+        // nothing.
+        const want = if (round == 0) chunk + 1 else chunk;
+        const sent_now = ls.sent_hashes.items.len;
+        if (sent_now != sent_before + want) return error.NoHashesRecorded;
+        sent_before = sent_now;
+        out.mix(sent_now);
+
+        // The peer applies every message, so the whole session really is
+        // delivered and the convergence checks at the end have something to
+        // check. It is a phase, not the clock, and it is deliberately not
+        // answered: see the note at the head of this workload.
+        const recv_started = Timer.start(ctx.io);
+        try am.sync.protocol.receiveSyncMessage(gpa, &peer, &rs, message);
+        peer_ns += recv_started.stop();
+    }
+
+    out.addPhase("local-generate", gen_ns);
+    out.addPhase("peer-exchange", peer_ns);
+
+    // ── correctness ──
+    //
+    // **The set, not just the count.** `insertSent` is what makes the list a
+    // `BTreeSet`: ascending and duplicate-free, which is what `State.encode`
+    // asserts and what `sentContains` binary-searches
+    // (`src/sync/protocol.zig:1023-1027`). An insert that got cheaper by
+    // appending and never sorting, or by dropping the duplicate check, passes
+    // a length assertion and fails this one.
+    const sent = ls.sent_hashes.items;
+    for (sent, 0..) |hash, i| {
+        if (i == 0) continue;
+        if (ChangeHash.order(sent[i - 1], hash) != .lt) return error.SentHashesUnsorted;
+    }
+    // Every change the document holds went on the wire exactly once, which is
+    // the whole point of a set: the count is the graph's, not a running tally.
+    if (sent.len != local.graph.len()) return error.SentHashCountDiffers;
+
+    // ── convergence ──
+    //
+    // Both peers hold the same heads and the peer's copy of the list has
+    // every element the local one has. The last check, below, is the one that
+    // would fail if a payload were dropped or truncated.
+    const local_heads = try local.getHeads(gpa);
+    defer gpa.free(local_heads);
+    const peer_heads = try peer.getHeads(gpa);
+    defer gpa.free(peer_heads);
+    if (local_heads.len != peer_heads.len) return error.HeadCountDiffers;
+    for (local_heads, peer_heads) |a, b| {
+        if (!a.eql(b)) return error.HeadsDiffer;
+    }
+    const peer_list = (try am.read.get(&peer, am.root, .{ .key = "l" })) orelse
+        return error.NoListOnPeer;
+    if (try am.read.length(&peer, peer_list.id) != written) return error.PeerListLengthDiffers;
+    out.mix(written);
+
+    // The answer the rounds above withheld, delivered once. Receiving it is
+    // what clears `in_flight` (`src/sync/protocol.zig:664`) and empties the
+    // set, and with the peer's heads now equal to ours and nothing left to
+    // send, the next generate is null
+    // (`src/sync/protocol.zig:556-559`).
+    {
+        const final_advertised = try am.sync.protocol.generateSyncMessage(gpa, &peer, &rs);
+        const final_hello = final_advertised orelse return error.PeerWentQuietAtTheEnd;
+        try am.sync.protocol.receiveSyncMessage(gpa, &local, &ls, final_hello);
+    }
+    // A `var` optional so the capture is a mutable pointer and `deinit` has a
+    // message it can actually free (`test/upstream_doc_test.zig:5444-5445`).
+    var leftover = try am.sync.protocol.generateSyncMessage(gpa, &local, &ls);
+    if (leftover) |*spare| {
+        spare.deinit();
+        return error.LocalStillHasChangesToSend;
+    }
+
+    out.ns = gen_ns;
+    return out;
+}
+
+// ── Workload 9: `hashForOpid`'s linear scan ──────────────────────────────────
+//
+// `src/transaction.zig:411-423` walks the change graph's node table from row
+// zero and returns the first node whose actor and counter range cover the
+// operation, where upstream binary-searches the actor's own change list
+// (`ChangeGraph::opidToHash`). The whole question is the `C` in that O(C): a
+// document with few changes answers in constant time whatever the algorithm,
+// so the gate has to hold a document with many.
+//
+// **Public surface, reached the way `src/transaction.zig:1446-1472` reaches
+// it** — a `.manual` document, `Transaction.open`, and the module-level
+// `hashForOpid` that `src/root.zig:119` re-exports as `am.manual_transaction`:
+//
+//   * `am.manual_transaction.Transaction.open` (`src/transact.zig:480`)
+//   * `am.manual_transaction.commitWith`      (`src/transaction.zig:553`)
+//   * `am.manual_transaction.hashForOpid`     (`src/transaction.zig:411`)
+//   * `doc.ops.idToExid`                      (`src/opset/op_set.zig:3240`)
+
+/// The first eight bytes of a change hash, big-endian, so the checksum folds
+/// an answer rather than its address.
+fn hashFold(h: ChangeHash) u64 {
+    return std.mem.readInt(u64, h.bytes[0..8], .big);
+}
+
+fn hashForOpidWorkload(ctx: Ctx) !Result {
+    const gpa = ctx.gpa;
+    const changes = ctx.sizes.opid_changes;
+    const calls = ctx.sizes.opid_calls;
+    // Zero of either would leave the loop below with nothing to iterate and
+    // `last_hash` uninitialised, and a benchmark that measures nothing must
+    // fail rather than report a clean zero.
+    if (changes == 0 or calls == 0) return error.NothingToMeasure;
+    // `iters` is one `hashForOpid` call. `measures_own_time` because the
+    // subject is the call and not the graph it walks: building the graph is
+    // the fixture, and the O(1) arm is the contrast that makes the O(C) one
+    // readable.
+    var out: Result = .{ .iters = calls, .measures_own_time = true };
+
+    var doc = try Document.init(gpa, ctx.io, .manual);
+    defer doc.deinit();
+    doc.setActorId(.{ .bytes = "bench-hash-for-opid" });
+
+    // ── fixture: `changes` committed changes, one operation each ──
+    //
+    // The cheapest shape a change can have, and deliberately so: the cost
+    // under test is one pass over the node table, so every extra operation in
+    // the graph is work the fixture does that the real question does not.
+    const build_started = Timer.start(ctx.io);
+    var first_hash: ?ChangeHash = null;
+    var last_hash: ChangeHash = undefined;
+    var first_id: OpId = undefined;
+    var last_id: OpId = undefined;
+    var key_buf: [24]u8 = undefined;
+    for (0..changes) |i| {
+        var tx = try am.manual_transaction.Transaction.open(gpa, &doc);
+        defer tx.deinit();
+        const key = try std.fmt.bufPrint(&key_buf, "k{d}", .{i});
+        // `Transaction.put` answers `?OpId` (`src/transact.zig:935`): null for
+        // a repeated put on the same register, and every key here is new, so
+        // a null would be the port refusing to write what it was asked to.
+        const id = (try tx.put(am.root, .{ .key = key }, .{ .int = @intCast(i) })).?;
+        const hash = (try am.manual_transaction.commitWith(
+            &tx,
+            am.manual_transaction.CommitOptions.none,
+        )) orelse return error.EmptyCommit;
+        if (first_hash == null) {
+            first_hash = hash;
+            first_id = id;
+        }
+        last_hash = hash;
+        last_id = id;
+    }
+    out.addPhase("build-graph", build_started.stop());
+    out.mix(doc.graph.len());
+
+    const first_exid = doc.ops.idToExid(first_id);
+    const last_exid = doc.ops.idToExid(last_id);
+
+    // A transaction to ask through. It writes nothing; `hashForOpid` reads
+    // `tx.doc.graph` (`src/transaction.zig:413`) and nothing else on the
+    // transaction, so an open one is all the call needs.
+    var probe = try am.manual_transaction.Transaction.open(gpa, &doc);
+    defer probe.deinit();
+
+    // ── the O(C) arm: the last operation lives in the last node ──
+    const last_started = Timer.start(ctx.io);
+    for (0..calls) |_| {
+        const got = am.manual_transaction.hashForOpid(&probe, last_exid) orelse
+            return error.NoHashForTheLastOperation;
+        if (!got.eql(last_hash)) return error.WrongHashForTheLastOperation;
+        out.mix(hashFold(got));
+    }
+    const last_ns = last_started.stop();
+    out.addPhase("scan-last-op", last_ns);
+
+    // ── the O(1) arm: node zero answers immediately ──
+    //
+    // Same call, same document, same code — the only difference is which end
+    // of the scan the answer is at. The ratio between the two phases is the
+    // finding, and it costs nothing to report.
+    const first_started = Timer.start(ctx.io);
+    for (0..calls) |_| {
+        const got = am.manual_transaction.hashForOpid(&probe, first_exid) orelse
+            return error.NoHashForTheFirstOperation;
+        if (!got.eql(first_hash.?)) return error.WrongHashForTheFirstOperation;
+        out.mix(hashFold(got));
+    }
+    out.addPhase("scan-first-op", first_started.stop());
+
+    // ── the three nulls, which are what make the scan's contract ──
+    if (am.manual_transaction.hashForOpid(&probe, am.root) != null) {
+        return error.RootNamedAChange;
+    }
+    const absent = am.ExId.fromParts(9_000_000, probe.actor) orelse return error.BadExId;
+    if (am.manual_transaction.hashForOpid(&probe, absent) != null) {
+        return error.AbsentIdNamedAChange;
+    }
+    if (am.manual_transaction.hashForOpid(&probe, last_exid) == null) {
+        return error.LostHashForTheLastOperation;
+    }
+
+    out.ns = last_ns;
+    return out;
+}
+
+// ── Workload 10: the five column cursors per list element ────────────────────
+//
+// The chain, all of it public and none of it reached by importing a private:
+//
+//   `am.read.listRange`          `src/read.zig:2280`
+//     → `ListRange.next`         `src/iter/list_range.zig:984`
+//       → `ListDiffItem.exportItem` `src/iter/list_range.zig:603`
+//         → `elementWidth`       `src/iter/list_range.zig:884`
+//           → `OpSet.elemidAt`   `src/opset/op_set.zig:3500`
+//             → `OpSet.elemCursor` `src/opset/op_set.zig:3524` — five cursors
+//               (`insert`, `id_ctr`, `id_actor`, `key_ctr`, `key_actor`)
+//             → `ElemWalk.at`    `src/opset/op_set.zig:5707`, whose `seek`
+//               (`:5738`) **rebuilds all five** because a fresh `elemCursor` is
+//               never `placed` (`:5670`)
+//
+// So one visible list element builds the five twice, and `key_ctr` and
+// `id_ctr` are delta columns whose `iterRange` folds their wire to reach the
+// row asked for (`src/opset/op_set.zig:3488-3492`). `mark-at-end` walks a text
+// through the same `ListRange`; this one walks a **list**, which is the object
+// `elementWidth` is written for and the shape the audit named.
+
+/// Thirteen bytes, eleven code points: the sibling text object's length under
+/// `.unicode_code_point` and under `.utf8_code_unit` are different numbers, so
+/// reading it back proves the document really is under the encoding asked for
+/// rather than under whichever one it defaulted to.
+const list_width_sample = "h\u{e9}llo w\u{f6}rld";
+
+fn listWidth(ctx: Ctx) !Result {
+    const gpa = ctx.gpa;
+    const n = ctx.sizes.list_width_elements;
+    const passes = ctx.sizes.list_width_passes;
+    // Same rule as the workload above: a zero is a broken measurement, not a
+    // fast one.
+    if (n == 0 or passes == 0) return error.NothingToMeasure;
+    // `measures_own_time` because the subject is the walk and not the
+    // fixture: one transaction holding 50 000 inserts costs about as much as
+    // reading them back, so timing the whole call would halve the signal.
+    var out: Result = .{ .iters = passes, .measures_own_time = true };
+
+    // The port's default encoding, and the one `mark-at-end` uses, so the two
+    // list walks are on the same measure.
+    const enc: TextEncoding = .unicode_code_point;
+
+    // ── fixture, outside every clock ──
+    const build_started = Timer.start(ctx.io);
+    var doc = try Document.initWithEncoding(gpa, ctx.io, enc, .manual);
+    defer doc.deinit();
+    doc.setActorId(.{ .bytes = "bench-list-width" });
+
+    var tx = try am.manual_transaction.Transaction.open(gpa, &doc);
+    defer tx.deinit();
+    const list = try tx.putObject(am.root, .{ .key = "l" }, .list);
+    const probe_text = try tx.putObject(am.root, .{ .key = "t" }, .text);
+    try tx.spliceText(probe_text, 0, 0, list_width_sample);
+    // **One transaction, one commit, `n` operations.** A committed change per
+    // element would put `n` changes in the change graph and measure that too;
+    // `mark-at-end` splices 210 000 characters through one `spliceText`, so a
+    // single change this size is already well inside what the port does.
+    for (0..n) |i| _ = try tx.insert(list, i, .{ .int = @intCast(i) });
+    if ((try am.manual_transaction.commitWith(
+        &tx,
+        am.manual_transaction.CommitOptions.none,
+    )) == null) return error.EmptyCommit;
+    out.addPhase("build-list", build_started.stop());
+
+    // ── the encoding, proved rather than assumed ──
+    if (am.read.textEncoding(&doc) != enc) return error.WrongTextEncoding;
+    if (try am.read.length(&doc, probe_text) != enc.width(list_width_sample)) {
+        return error.TextLengthIsNotInThisEncoding;
+    }
+    const sample_bytes = try am.read.text(&doc, probe_text, gpa);
+    defer gpa.free(sample_bytes);
+    if (!std.mem.eql(u8, sample_bytes, list_width_sample)) return error.TextBytesDiffer;
+
+    // ── the subject ──
+    const read_started = Timer.start(ctx.io);
+    for (0..passes) |_| {
+        var walk = try am.read.listRange(&doc, list, am.read.IndexRange.all());
+        var seen: usize = 0;
+        while (try walk.next()) |item| {
+            // The index the element reports must be its position, in order.
+            if (item.index != seen) return error.ElementIndexDiffers;
+            // **Every list element is one unit wide, under every encoding**
+            // (`src/opset/op.zig:2178-2181`), so a width read that reached the
+            // wrong row, or that took the `elemidAt` walk's answer off the
+            // element's first row instead of its last, does not go unnoticed:
+            // it shows up as a count that is not `seen`.
+            if (item.width != 1) return error.ElementWidthDiffers;
+            if (item.conflict) return error.ElementConflicts;
+            switch (item.value) {
+                .object => return error.ElementIsAnObject,
+                .scalar => |v| switch (v) {
+                    .int => |got| {
+                        if (got != @as(i64, @intCast(seen))) return error.ElementValueDiffers;
+                    },
+                    else => return error.ElementIsNotAnInt,
+                },
+            }
+            out.mix(item.index);
+            out.mix(item.width);
+            seen += 1;
+        }
+        if (seen != n) return error.ElementCountDiffers;
+        out.mix(seen);
+    }
+    const read_ns = read_started.stop();
+    out.addPhase("read-list", read_ns);
+
+    // And the independent oracle: `length` counts the object's visible
+    // elements without going anywhere near `elementWidth`, so the walk's own
+    // count agreeing with it is a second, separate statement about the same
+    // document.
+    if (try am.read.length(&doc, list) != n) return error.ListLengthDiffers;
+    out.mix(n);
+
+    out.ns = read_ns;
+    return out;
+}
+
 const workloads = [_]Workload{
     .{
         .name = "segmentation",
@@ -1226,5 +1770,20 @@ const workloads = [_]Workload{
         .name = "mark-at-end",
         .case = "src/read.zig:6537 `a mark at the end of a long text is found at the end`",
         .run = markAtEnd,
+    },
+    .{
+        .name = "sync-roundtrip",
+        .case = "src/sync/protocol.zig:572 `for (builder.payloadHashes()) |hash| try state.insertSent(hash);` over src/sync/state.zig:368-382 — no test case; added as a gate",
+        .run = syncRoundtrip,
+    },
+    .{
+        .name = "hash-for-opid",
+        .case = "src/transaction.zig:411-423 `hashForOpid` — no test case; added as a gate",
+        .run = hashForOpidWorkload,
+    },
+    .{
+        .name = "list-width",
+        .case = "src/iter/list_range.zig:884-901 `elementWidth` over src/opset/op_set.zig:3500-3503 `elemidAt` — no test case; added as a gate",
+        .run = listWidth,
     },
 };

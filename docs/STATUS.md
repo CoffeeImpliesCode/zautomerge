@@ -25,6 +25,76 @@ source path and execution.
 | Fetched native and C consumers, ReleaseFast | 8/8 build steps succeeded; explicit runtime checks remained active. |
 | Final hexane source ledger | All 272 covered declaration anchors resolve; 14 occurrences have explicit exclusion reasons. This is source-review evidence, not runtime proof. |
 
+## Optimization round 3, measured (2026-10-05)
+
+Two library changes and three new gates. Baseline is round 2's post-change
+figure (commit 00569a54), ReleaseSafe `perf stat -e instructions`.
+
+| Workload | Round 2 | Round 3 | Change |
+| --- | --- | --- | --- |
+| update-object | 11.522 B | 11.532 B | -0.09% |
+| slab-merge | 463.2 M | 461.0 M | **+0.48%** |
+| indexed-delta | 1.616 B | 1.615 B | +0.06% |
+| prefix-bool | 656.9 M | 656.5 M | +0.07% |
+| mark-index | 712.4 M | 713.4 M | -0.14% |
+| segmentation | 891.5 M | 891.5 M | flat |
+| mark-at-end | 1019.5 B | 1019.5 B | flat |
+
+**This round bought nothing measurable on instructions, and that is the honest
+result.** The two changes are real but aimed elsewhere:
+
+* **#4, streaming the load chunk list** (implemented this round; it had been
+  dropped in round 2 as "the caller blocks it"). `ChunkStream` frames one chunk
+  at a time and `doc.zig`'s load path adopts it, so a document load no longer
+  holds one 40-byte entry per chunk. It removes **allocations and retained
+  bytes on load**, not instructions on a benchmark that never loads in a loop.
+  Its gate is the `doc.jsonl` conformance vector and the totality cut sweep,
+  both green, not an instruction count.
+* **`rebuildAggs` no longer slack-fills.** `shrinkRetainingCapacity`
+  (`std/array_list.zig:1186-1189`) is the length assignment plus
+  `@memset(slack, undefined)`, and nothing reads past the length. The removed
+  fill was `old` entries — the bases carried INTO the rebuild, one per slab —
+  so about 32 bytes an entry on a delta column: hundreds of bytes per splice,
+  not kilobytes. The round-2 comment claiming it was a high-water mark of the
+  largest slab count ever held was wrong and is corrected in the source.
+
+**And the round found a real defect by the way.** `ChunkStream.verifyPartial`
+handed its `Verified` the cursor position where the verify walk **stopped**
+instead of where it **started**, so every second pass framed a header out of
+the bytes behind the prefix. It broke 35 tests at once and had never been
+exercised, because no committed test used the load path's own shape — take the
+head, verify the remainder, read the remainder. A test for that shape is now in
+`chunk.zig`.
+
+## The new gates, and what one of them found
+
+Three audit findings had no gate and were therefore unmeasurable. All three are
+reachable through the public module surface, so all three are now measured:
+
+| Gate | Instructions | What it measures |
+| --- | --- | --- |
+| `sync-roundtrip` | 119.7 B | the per-hash sorted insert into `State.sent_hashes` |
+| `hash-for-opid` | 627.8 B | the O(C) scan behind `hashForOpid` |
+| `list-width` | **4 690.8 B** | `elementWidth` -> `elemidAt`'s five cursors per element |
+
+**`list-width` is the largest number in this document and it is the next
+round's target.** At 50 000 elements and 2 walks it retires about **4.7e7
+instructions per list element**, which is quadratic behaviour, not a constant
+factor: `elemidAt` is reached once per element and a read of an N-element list
+does not go like the number of elements it returns. That is 3.8 million times
+`update-object`, and it is the same `elemidAt` optimization 8 hoisted the
+five cursors of in round 2 without removing the walk behind them. Round 2's
+change made the cursor reusable; it did not make the position query O(1).
+
+## Round 3 gates on this tree
+
+`zig build test`: 2042/2043 passed, one default skip (62/62 steps).
+`zig build slow-path ctest conformance save-interop`: 1780/1780 passed (40/40
+steps). All ten goldens matched the reference, live save interop 6/6, the C ABI
+suite ran, `zig fmt --check` clean, and the benchmark reports `LEAKS 0` across
+all ten workloads.
+
+
 ## Optimization round 1-8, measured (2026-10-05)
 
 Eight audit findings were dispatched in parallel across disjoint modules. The

@@ -14,20 +14,13 @@ needs.
 
 ## 1. Building it
 
-`build.zig` does not know about this file yet. The orchestrator adds this, next
-to the other `addExecutable` step (`build.zig:777` is the model — it is the
-only existing executable that imports the library by name):
+`zig build bench` builds and runs this file. The step is `build.zig:869-885`,
+and it is worth reading rather than trusting:
 
 ```zig
-    // The end-to-end benchmark. Its own module, `zautomerge` imported by name,
-    // for the same reason every other step does: nothing in it may reach into a
-    // private, so the file can only use the surface a consumer gets. **Reuses
-    // `mod`**, so the library's `build_options` module (and therefore the
-    // `check_slow_paths` gate `-Dslow-path` sets) is the same one the tests see.
-    //
-    // `link_libc` stays off, as it does for every step except `example` and the
-    // C ABI's own: nothing here reaches for a C symbol, and `src/c/**` is only
-    // analyzed if something references `am.c_abi`.
+    // The benchmark is built against the published `zautomerge` module by the
+    // name a consumer imports it by, so it cannot reach a private and cannot
+    // drift from the public surface without failing to build.
     const bench_bin = b.addExecutable(.{
         .name = "zautomerge-bench",
         .root_module = b.createModule(.{
@@ -37,20 +30,35 @@ only existing executable that imports the library by name):
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-
-    const bench_step = b.step("bench", "Run the end-to-end benchmark");
     const run_bench = b.addRunArtifact(bench_bin);
-    // The measurements go to stdout and the narration to stderr, and both have
-    // to reach the operator as they are printed rather than through a pipe the
-    // build runner keeps for a failure report.
     run_bench.has_side_effects = true;
-    run_bench.step.dependOn(&bench_step.step);
+    run_bench.step.dependOn(b.getInstallStep());
+    const bench_step = b.step(
+        "bench",
+        "Measure the seven dominant workloads and print a machine-readable line each",
+    );
+    bench_step.dependOn(&run_bench.step);
 ```
 
+Three of those lines are load-bearing for everything in this file. **`.imports`
+reuses the published `mod`**, so the library's `build_options` module — and
+therefore the `check_slow_paths` gate `-Dslow-path` sets — is the same one the
+tests see, and the only door into the library is the name a consumer imports.
+**`link_libc` stays off**, as it does for every step except `example` and the
+C ABI's own: nothing here reaches for a C symbol. And
+**`run_bench.has_side_effects`**, so the measurements reach the operator as
+they are printed rather than through a pipe the build runner keeps for a
+failure report.
+
 `target` and `optimize` are the existing `b.standardTargetOptions(.{})` and
-`b.standardOptimizeOption(.{})` locals at the top of `build.zig`. **Do not pass
-`.optimize` explicitly** — the whole point is that `-Doptimize=ReleaseFast` on
-the command line reaches this step like it reaches every other one.
+`b.standardOptimizeOption(.{})` locals at the top of `build.zig`, and
+`.optimize` is passed through rather than pinned: the whole point is that
+`-Doptimize=ReleaseFast` on the command line reaches this step like it reaches
+every other one.
+
+**`bench/anonymize_rss.zig` is not in this step**, deliberately: its gate is
+peak RSS, and it is a different kind of program from a `BENCH` workload. §8
+gives the `zig build-exe` line that builds it.
 
 The exact import name is **`zautomerge`**, the same name `b.addModule`
 publishes it under at `build.zig:8` and that `test/example_test.zig:20` and
@@ -62,7 +70,7 @@ publishes it under at `build.zig:8` and that `test/example_test.zig:20` and
 zig build bench -Doptimize=ReleaseFast                       # every workload, reduced sizes
 zig build bench -Doptimize=ReleaseFast -- segmentation       # one workload
 zig build bench -Doptimize=ReleaseFast -- --repeat 5         # five samples, median reported
-zig build bench -Doptimize=ReleaseFast -- --full             # the test cases' exact sizes
+zig build bench -Doptimize=ReleaseFast -- --full             # the cases' exact sizes, §7's larger
 ```
 
 **Use `ReleaseFast`.** The case times this benchmark is derived from are Debug
@@ -117,6 +125,10 @@ Run **one workload per process** and `perf stat`'s instruction count belongs to
 that workload alone. Quote instruction counts, not wall clock. When you do quote
 wall clock, quote the load average next to it.
 
+All ten workload names are what `--list` prints. §7 gives the per-workload
+`perf stat` lines for the three that are here because a specific cost had no
+gate, rather than because a test case was slow.
+
 For attribution:
 
 ```
@@ -124,6 +136,10 @@ perf record -F 999 -g --call-graph dwarf \
     -o /tmp/seg.data ./zig-out/bin/zautomerge-bench segmentation
 perf report -i /tmp/seg.data --stdio
 ```
+
+Write that data file to `"$buildhost_SCRATCH_ROOT"`, not to `/tmp` — this host's
+`/tmp` is shared, and a `perf.data` of a few hundred megabytes does not belong
+there.
 
 ---
 
@@ -230,8 +246,10 @@ after `main` returns, so parsed arguments need no `defer`.
 
 ## 4. The workloads, and which sizes are reduced
 
-Seven workloads, one per expensive case. The table says exactly what is
-different from the test case, and why the reduced shape measures the same thing.
+Seven workloads, one per expensive case, and three more that have no case
+behind them at all. The table below is the first seven: it says exactly what
+is different from the test case, and why the reduced shape measures the same
+thing. §7 is the other three.
 
 | workload | test case | default | test | reduced? |
 |---|---|---|---|---|
@@ -243,7 +261,8 @@ different from the test case, and why the reduced shape measures the same thing.
 | `mark-index` | `src/opset/mark_index.zig:2459` | 40 000 rows, 1000 marks | 100 000 rows, 2500 marks | **2.5× smaller** |
 | `mark-at-end` | `src/read.zig:6537` | 210 000 chars, 1 encoding | 210 000 chars, 4 encodings | **4× fewer encodings** |
 
-`--full` restores every "test" column above.
+`--full` restores every "test" column above, and gives the three of §7 their
+larger documented size.
 
 ### Why each reduction is the same measurement
 
@@ -368,16 +387,338 @@ assert their own results where the case does (`slabCount() >= 2`,
 so a change that made the work cheaper by making it wrong fails instead of
 looking like a speedup.
 
+The three of §7 have no case to copy, so their assertions were written for the
+same purpose and are named there: an ascending duplicate-free `sent_hashes`,
+`element.width == 1` for every list element, and a `hashForOpid` answer that
+equals the commit that wrote the operation.
+
 ---
 
 ## 6. Verifying a run
 
-1. `zig build bench -Doptimize=ReleaseFast` and check every `BENCH` line is
-   preceded by `#   the timed region is the workload's own` **only** for
-   `update-object`; every other workload times its whole iteration.
+1. `zig build bench -Doptimize=ReleaseFast` and check which `#   the timed
+   region is the workload's own` lines appear. **Four** workloads time a
+   region rather than a whole iteration — `update-object`, `sync-roundtrip`,
+   `hash-for-opid` and `list-width` — and for each of those the phases on
+   stderr say how the untimed part was spent. Every other workload times its
+   whole iteration.
 2. Check stderr ends with `# LEAKS 0`. A nonzero count is a bug in the
    benchmark, not in the port.
 3. Compare `#   checksum` before and after. **The checksums must be identical
    across a before/after pair.** If they are not, the optimization changed
    behaviour and the timings mean nothing.
 4. Compare `BENCH` lines with `diff`, and instruction counts with `perf stat`.
+
+---
+
+## 7. The three gates that had no case
+
+A data-oriented audit of the port named three costs the suite exercises but
+never isolates, and therefore three that no change could be honestly accepted
+or rejected against. Each is a workload here, reached **through the public
+module surface only**: nothing in the three imports a private, and where a
+check needed a field the port would otherwise have to expose for the
+benchmark's benefit, the field was already public and is cited.
+
+| workload | subject | default | `--full` |
+|---|---|---|---|
+| `sync-roundtrip` | the sorted insert into `sent_hashes` | 24 rounds × 200 changes | 48 rounds × 400 changes |
+| `hash-for-opid` | `hashForOpid`'s linear scan | 20 000 changes, 400 calls | 50 000 changes, 1000 calls |
+| `list-width` | `elementWidth`'s five cursors per element | 50 000 elements, 2 walks | 200 000 elements, 4 walks |
+
+`--full` for these three is **not** "the test case's exact size" — there is no
+test case. It is a larger size of the same shape, so that a before/after pair
+has a second point on the curve rather than one.
+
+### `sync-roundtrip`
+
+**The line under test** is `src/sync/protocol.zig:572`,
+`for (builder.payloadHashes()) |hash| try state.insertSent(hash);`, which is
+`State.insertSent` at `src/sync/state.zig:368-382`: a binary search over an
+ascending list, then an `ArrayList.insert` memmove, **once per hash per
+generated message**. The list only grows on this path (`clearSent`,
+`src/sync/state.zig:385-387`, is the only thing that empties it), so the
+memmove arm is quadratic in the changes a peer has been sent in one session.
+
+**The public chain**, driven as `test/upstream_doc_test.zig:4955-4969` drives
+it: `am.sync.state.State.new` (`src/sync/state.zig:181`) →
+`am.sync.protocol.generateSyncMessage` (`src/sync/protocol.zig:430`) →
+`am.sync.protocol.receiveSyncMessage` (`src/sync/protocol.zig:658`). The set
+itself is checked through `State.sent_hashes`, which is a **public field**
+(`src/sync/state.zig:156`).
+
+**The shape.** Two `.auto` documents and two sync states, both made by
+`State.new`. The local side gains `sync_chunk` changes per round — one
+autocommit each, so they are real changes with real hashes — and a peer keeps
+up, so each round's payload is a real delta and `sent_hashes` is already
+`round * sync_chunk` long when the insert loop runs. A priming exchange comes
+first, because the peer's *first* message is what tells the local side the peer
+reads V2 and holds nothing, and that is what arms `sendDoc`
+(`src/sync/state.zig:341-344`); without it `buildPayload` answers an empty
+payload while `State.their()` is null (`src/sync/protocol.zig:962`).
+
+**Timed region.** `ns` is the sum of the `local-generate` phases only — one
+`generateSyncMessage` per round, which is the unit the insert loop runs in.
+`peer-exchange` and the fixture growth are phases, not the clock.
+
+**The assertions**, all of which fail a change that got cheaper by being
+wrong:
+
+* `sent_hashes` is **ascending and duplicate-free** — the `BTreeSet` invariant
+  `State.encode` asserts and `sentContains` binary-searches. An append-and-
+  sort-later or duplicate-dropping insert passes a length check and fails this.
+* `sent_hashes.items.len == local.graph.len()` — every change the document
+  holds went on the wire exactly once.
+* every round's payload recorded **at least one** new hash, so the run cannot
+  "measure" a state in which the loop never ran.
+* the two peers hold the same heads, the peer's copy of the list has every
+  element the local one has, and — after one more advertisement, which is what
+  clears the local `in_flight` bit — the local side has nothing left to send.
+
+**Checksum.** the length of `sent_hashes` after every round and the element
+total, through `Result.mix`.
+
+**Runtime.** Order 1–3 s at the default size on this host, under load. The
+default is 4800 changes built and exchanged; `--full` is 19 200.
+
+### `hash-for-opid`
+
+**The line under test** is `src/transaction.zig:411-423`: `hashForOpid` walks
+the change graph's node table from row zero, where upstream binary-searches the
+actor's own change list (`ChangeGraph::opidToHash`). The question is the `C`
+in that O(C), and a document with few changes answers in constant time
+whatever the algorithm — so the fixture is a document with many.
+
+**The public chain**, reached the way `src/transaction.zig:1446-1472` reaches
+it: a `.manual` document, `am.manual_transaction.Transaction.open`
+(`src/transact.zig:480`), `am.manual_transaction.commitWith`
+(`src/transaction.zig:553`), and `am.manual_transaction.hashForOpid`
+(`src/transaction.zig:411`) — the module `src/root.zig:119` re-exports.
+`doc.ops.idToExid` (`src/opset/op_set.zig:3240`) turns the operation ids the
+writes returned into `ExId`s.
+
+**The shape.** `opid_changes` committed changes, one map put each — the
+cheapest shape a change can have, deliberately: the cost under test is one
+pass over the node table, so every extra operation in the graph would be
+fixture work the real question does not do.
+
+**Timed region.** `ns` is the `scan-last-op` phase only: `opid_calls` calls
+for the **last** operation, whose node is the last in the table. The
+`scan-first-op` phase is the same call for the **first** operation, which node
+zero answers immediately, and the ratio between the two phases *is* the
+finding. `build-graph` is the fixture.
+
+**The assertions**: every call returns the change hash the commit returned;
+the root names nothing; an `ExId` past the graph's counters names nothing; and
+the last operation's hash is still there after both scans.
+
+**Checksum.** the graph length, then the first eight bytes of every returned
+hash, big-endian, through `Result.mix`.
+
+**Runtime.** Order 0.5–2 s at the default size, most of it the fixture. The
+`scan-last-op` phase alone is tens of milliseconds, which is why the count is
+400 and not 4.
+
+### `list-width`
+
+**The line under test** is `src/iter/list_range.zig:884-901`, `elementWidth`,
+which calls `OpSet.elemidAt` (`src/opset/op_set.zig:3500-3503`) and so builds
+the five column cursors of `OpSet.elemCursor` (`src/opset/op_set.zig:3524`) —
+then, because a fresh cursor is never `placed`
+(`src/opset/op_set.zig:5670`), has `ElemWalk.seek` (`:5738`) build all five
+**again**. Two of the five are delta columns, and `iterRange` folds their wire
+to reach the row asked for (`src/opset/op_set.zig:3488-3492`).
+
+**The exact public chain**, which is the answer to "which call does this
+measure":
+
+```
+am.read.listRange(doc, list, am.read.IndexRange.all())   src/read.zig:2280
+  → ListRange.next()                                     src/iter/list_range.zig:984
+    → ListDiffItem.exportItem(set, rows)                 src/iter/list_range.zig:603
+      → elementWidth(set, pos, rows.end)                 src/iter/list_range.zig:884
+        → OpSet.elemidAt(pos, end)                       src/opset/op_set.zig:3500
+          → OpSet.elemCursor()   five cursors            src/opset/op_set.zig:3524
+          → ElemWalk.at()                                src/opset/op_set.zig:5707
+            → ElemWalk.seek()   five cursors again       src/opset/op_set.zig:5738
+```
+
+`mark-at-end` walks a **text** through the same `ListRange`; this one walks a
+**list**, which is the object `elementWidth` is written for and the shape the
+audit named.
+
+**The shape.** A `.manual` document under the `.unicode_code_point` encoding
+holding one list of `list_width_elements` integers, built by **one**
+transaction and **one** commit. One change, not one per element: a committed
+change per element would put that many changes in the change graph and measure
+that too. `mark-at-end` splices 210 000 characters through a single
+`spliceText`, so a single change this size is already well inside what the
+port does.
+
+**Timed region.** `ns` is the `read-list` phase — `list_width_passes` complete
+walks. `build-list` is the fixture.
+
+**The assertions**:
+
+* every element reports `index == seen`, in order;
+* every element's `width` is exactly 1 — `Op.width` answers `1` for every list
+  element under every encoding (`src/opset/op.zig:2178-2181`) — so a width
+  read that reached the wrong row, or that took the register's *first* row
+  instead of its last, shows up as a wrong number rather than a right one;
+* every element's value is the integer written at that position, and nothing
+  conflicts;
+* the walk yields exactly `n` elements, and `am.read.length` — a prefix count,
+  and nothing to do with `elementWidth` — independently says `n`;
+* and the sibling text object reads back as `enc.width(sample)` characters and
+  as its own bytes, which is what proves the document really is under the
+  encoding asked for rather than under whichever one it defaulted to.
+
+**Checksum.** each element's `index` and `width`, the per-walk count, and `n`.
+
+**Runtime.** Order 0.5–2 s at the default size, most of it the fixture. The
+default walk is two passes over 50 000 elements, which is why `passes` is 2:
+one pass is close to the clock's floor, the same reason `seg_single_passes`
+exists.
+
+### Running them
+
+One workload per process, because that is what makes `perf stat`'s count
+belong to one workload:
+
+```
+zig build bench -Doptimize=ReleaseFast
+
+perf stat -e instructions ./zig-out/bin/zautomerge-bench sync-roundtrip
+perf stat -e instructions ./zig-out/bin/zautomerge-bench hash-for-opid
+perf stat -e instructions ./zig-out/bin/zautomerge-bench list-width
+
+zig build bench -Doptimize=ReleaseFast -- --repeat 5 sync-roundtrip hash-for-opid list-width
+zig build bench -Doptimize=ReleaseFast -- --full  sync-roundtrip hash-for-opid list-width
+```
+
+For attribution on the first of them, with a scratch file outside `/tmp`:
+
+```
+perf record -F 999 -g --call-graph dwarf \
+    -o "$buildhost_SCRATCH_ROOT/bench-sync.data" ./zig-out/bin/zautomerge-bench sync-roundtrip
+perf report -i "$buildhost_SCRATCH_ROOT/bench-sync.data" --stdio
+```
+
+---
+
+## 8. `anonymize-rss`: the arena gate, on peak resident bytes
+
+The fourth audit finding was that `Anonymize`'s per-change arena never resets,
+so its cost grows with the document. **That no longer holds in this tree**:
+`Anonymize.run` resets `self.arena` at the end of every change
+(`src/anonymize.zig:440`), with the reasoning at `:395-439`. What is missing is
+not the reset but **a gate that would notice it going away** — and that gate
+is peak RSS, not instructions, which is why it is not a `zautomerge_bench`
+workload at all. `bench/anonymize_rss.zig` is a separate small executable that
+builds a document, calls `am.anonymize.anonymize`, and gets out of the way so
+`time -v` can read its peak.
+
+**Why the gate is a ratio.** The reset is per change, so what it bounds is the
+arena, and the arena is small next to the source document. A regression that
+dropped or moved `src/anonymize.zig:440` would make peak RSS roughly
+**double** — once for the source document, once for the arena's copy of all of
+it — but the absolute number depends on the document, so only the *shape* of
+the answer is stable. Build the same shape at two change counts and compare:
+four times the changes must not much move the peak. That is why the change
+count is an argument.
+
+### Building it
+
+The library needs a `build_options` module (`src/hexane/btree.zig:40`,
+`src/opset/op_set.zig:155`) and the `bench` build step is not wired for this
+file, so build it directly and write the one-line stub **outside the repo**:
+
+```
+source ~/.local/lib/host-scratch.sh
+mkdir -p "$buildhost_SCRATCH_ROOT/bench-rss"
+printf 'pub const check_slow_paths = false;\n' \
+    > "$buildhost_SCRATCH_ROOT/bench-rss/build_options.zig"
+
+zig build-exe \
+    --dep zautomerge \
+    -Mroot=bench/anonymize_rss.zig \
+    --dep build_options \
+    -Mzautomerge=src/root.zig \
+    -Mbuild_options="$buildhost_SCRATCH_ROOT/bench-rss/build_options.zig" \
+    -O ReleaseFast \
+    --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
+    --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
+    -femit-bin="$buildhost_SCRATCH_ROOT/bench-rss/anonymize-rss"
+```
+
+Run it from the repository root: `-Mzautomerge=src/root.zig` is relative.
+`--cache-dir` and `--global-cache-dir` keep every cache byte out of the repo
+and off NFS.
+
+### Running the gate
+
+Same shape, two sizes, `--ops` held fixed:
+
+```
+time -v "$buildhost_SCRATCH_ROOT/bench-rss/anonymize-rss" --changes 2000 --ops 20 \
+    2>&1 | grep -E 'Maximum resident set size|# ANONYMIZE_RSS'
+
+time -v "$buildhost_SCRATCH_ROOT/bench-rss/anonymize-rss" --changes 8000 --ops 20 \
+    2>&1 | grep -E 'Maximum resident set size|# ANONYMIZE_RSS'
+```
+
+**Four times the changes should not move the peak much.** The document itself
+grows, so some movement is correct; what a dropped reset adds is a second copy
+of it, which is roughly a factor of two on top. Record both peaks with this
+host's load average next to them — RSS is a page count and moves far less than
+wall clock, but it is not immune to a machine under pressure.
+
+**Do not pass `--check`.** It runs `am.anonymize.checkPrivateDataChanged`, the
+port's own thorough oracle, which re-encodes both documents' changes and
+therefore **dominates peak RSS** — the run would measure the checker. Use it
+once, on a small `--changes`, to confirm the rewrite is right:
+
+```
+"$buildhost_SCRATCH_ROOT/bench-rss/anonymize-rss" --changes 200 --ops 5 --check
+```
+
+### What it asserts without `--check`
+
+Only checks that do not allocate in proportion to the document, because a
+program measuring peak RSS must not set the peak itself:
+
+* `am.read.length` on the root map — a prefix count — says the source has
+  exactly `changes * ops` registers and the anonymized document has the same
+  number;
+* the register at key `k0-0` held `v0-0` before and holds neither that nor the
+  source's bytes after.
+
+It also prints `# ANONYMIZE_RSS changes=… ops=… ns=…` so the marker can be
+paired with the `Maximum resident set size` line beside it.
+
+---
+
+## 9. Visibility: what would have been refused
+
+**All three gates were buildable through the public surface, and none needed a
+workaround.** That is a result about the port, not about the benchmark, so it
+is worth being exact about where the line was:
+
+* `elementWidth` (`src/iter/list_range.zig:884`) and the insert loop
+  (`src/sync/protocol.zig:572`) are **private functions**. Neither is called.
+  They are reached through `ListRange.next` and `generateSyncMessage`, which
+  are public, and the benchmark says so by naming the whole chain.
+* The one field the checks read is `State.sent_hashes`
+  (`src/sync/state.zig:156`), which **is a public field**. Had it been
+  private, `sync-roundtrip` would have been reduced to counting payloads it
+  cannot see the shape of, or refused: a benchmark that reached into
+  `src/sync/**` for it would be measuring the harness rather than the port.
+* `ChangeGraph.opidToHash` — upstream's O(log C) answer, the thing the audit
+  compares `hashForOpid` against — has **no public entry point at all**. The
+  only public door is `am.manual_transaction.hashForOpid`, which is the port's
+  own linear scan. So `hash-for-opid` measures the port, and comparing it
+  against upstream needs a new `pub` in `src/change_graph.zig`, not a
+  benchmark that reaches further.
+* `anonymize`'s arena (`Anonymize.arena`) is a private field. Nothing needed
+  to read it: peak RSS is an observable of the process, not of a struct, which
+  is exactly why that one gate is not a `BENCH` workload.

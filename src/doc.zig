@@ -3854,21 +3854,50 @@ pub const Document = struct {
             return;
         }
 
-        const parsed = switch (on_partial) {
-            .refuse => blk: {
-                const whole = try chunkmod.parseChunks(bytes, gpa);
-                break :blk chunkmod.PartialChunks{ .chunks = whole, .err = null };
-            },
-            .keep => try chunkmod.parseChunksPartial(bytes, gpa),
-        };
-        defer gpa.free(parsed.chunks);
-        const chunks = parsed.chunks;
+        // **The stream, not the list.** `chunk.parseChunks` grew a heap array
+        // of every chunk in the document before a single one of them was looked
+        // at, and that array was the only allocation on this path that scaled
+        // with the input: `@sizeOf(Chunk)` per chunk, doubled as the list grew,
+        // reallocated on every doubling and freed on the way out.
+        // [`chunkmod.ChunkStream`] is the same walk holding none of them, and
+        // nothing after this line holds more than one chunk.
+        var stream = chunkmod.ChunkStream.init(bytes);
         // **The first chunk is never partial.** Upstream parses it with
         // `storage::Chunk::parse` and maps the failure straight into the
         // return, before `on_partial_load` is consulted anywhere
         // ([`automerge.rs`:916-917](../github-automerge-automerge/rust/automerge/src/automerge.rs)), so a stream whose
         // *first* chunk is unreadable is a refusal under both policies.
-        if (chunks.len == 0) return parsed.err orelse error.UnexpectedEnd;
+        //
+        // **It is peeked, not collected.** One [`Chunk`](storage/chunk.zig)
+        // value in a local is what the three `chunks[0].typ` reads further
+        // down answer from: it is a 40-byte struct the stream already built,
+        // not a list behind the seam, and the chunks behind it are never
+        // touched by this line.
+        const first = (try stream.next()) orelse return error.UnexpectedEnd;
+
+        // **The tail is framed and verified before anything is applied, and
+        // that is exactly what the list used to buy.** `parseChunks` framed
+        // and checksum-verified the **whole** stream before [`Document.reset`]
+        // ran and before any chunk was applied
+        // ([`:907-917`, `:974-989`](../github-automerge-automerge/rust/automerge/src/automerge.rs)),
+        // so a stream that stops mid-chunk leaves the document holding only
+        // what its **first** chunk built — and on [`Document.loadInto`] the
+        // document is the caller's own, so that order is observable from
+        // outside and not merely internal. A walk that applied each chunk as
+        // it read it would get it wrong: it would apply the chunks in front of
+        // the bad one, and then refuse.
+        //
+        // So the tail is walked first and kept in no list at all.
+        // [`chunkmod.ChunkStream.verify`] frames and verifies every chunk of
+        // it and hands back a cursor over the ones that read. **`.refuse`
+        // returns what stopped that walk; `.keep` records it** — the same pair
+        // the two list spellings were, over the same bytes in the same order,
+        // so the refusal is the same refusal at the same byte either way, and
+        // the list is gone.
+        var tail = switch (on_partial) {
+            .refuse => try stream.verify(),
+            .keep => stream.verifyPartial(),
+        };
         // **Upstream applies the chunks it read, then decides.** The
         // `Partial` arm sits beside the `Complete` arm and never reaches
         // `apply_changes` ([`:974-990`](../github-automerge-automerge/rust/automerge/src/automerge.rs)), so under
@@ -3877,8 +3906,11 @@ pub const Document = struct {
         // error is therefore reported *after* the first chunk, not before it,
         // and the prefix past the first chunk is dropped either way. That is
         // why the check is here and not at the parse.
-        // `.refuse` reports the truncation; `.keep` swallows it.
-        const truncated = parsed.err;
+        // `.refuse` reports the truncation; `.keep` swallows it. Under
+        // `.refuse` this is null in any case, because the verify walk above
+        // returned its refusal rather than recording it — the `.refuse` arm
+        // below is the same unreachable arm it was when `parseChunks` fed it.
+        const truncated: ?ParseError = tail.err;
 
         // **A bundle as the first chunk is a change stream whose head this
         // port now reads**, which is upstream's bundle arm of the same match
@@ -3890,14 +3922,14 @@ pub const Document = struct {
         // bundle is freed before the first apply and nothing borrows it.
         var from_bundle: Changes = .{};
         defer from_bundle.deinit(gpa);
-        if (chunks[0].typ == .bundle) {
-            // **The chunk, not its body.** `chunks[0].data` is the body alone,
+        if (first.typ == .bundle) {
+            // **The chunk, not its body.** `first.data` is the body alone,
             // and a bundle is a framed chunk: handing that over is what sent
             // `loadIncremental` down to `error.InvalidMagic` on the first
             // byte of a body. `parseFramedChunk` reads the bytes the framing
             // kept and indexes those, so the bundle is the chunk the stream
             // carried and the stream is not copied to hold it.
-            var stored = try bundlem.parseFramedChunk(chunks[0], gpa);
+            var stored = try bundlem.parseFramedChunk(first, gpa);
             defer stored.deinit(gpa);
             try collectBundleChanges(gpa, &stored, &from_bundle);
         }
@@ -3933,17 +3965,20 @@ pub const Document = struct {
         // **bundle** both reach the missing-deps rule below exactly as a plain
         // change stream does.
         //
-        // **This is the branch that was already here, named.** The `rest`
-        // block decides the same question to know where the changes start, so
-        // binding it once and reading it again at the refusal below is what
-        // keeps the two answers from drifting apart.
-        const first_chunk_was_doc = chunks[0].typ == .document;
-        const rest = blk: {
-            if (chunks[0].typ == .bundle) break :blk chunks[1..];
-            if (!first_chunk_was_doc) break :blk chunks[0..];
-            try self.reconstruct(gpa, chunks[0], encoding);
-            break :blk chunks[1..];
-        };
+        // **This is the branch that was already here, named.** The dispatch
+        // below decides the same question to know where the changes start, so
+        // binding it once and reading it again at the refusal further down is
+        // what keeps the two answers from drifting apart.
+        const first_chunk_was_doc = first.typ == .document;
+        if (first_chunk_was_doc) {
+            try self.reconstruct(gpa, first, encoding);
+        } else if (first.typ != .bundle) {
+            // **A first chunk that is neither a snapshot nor a bundle is a
+            // change, and it goes in front of the tail.** This is the arm
+            // that was `rest = chunks[0..]`: the whole list, starting at the
+            // first chunk, because there is no separate apply for it.
+            try self.applyChunk(gpa, first);
+        }
 
         // **The first chunk's changes go first**, which is upstream's
         // `am.apply_changes(changes.into_iter().chain(c))`
@@ -3964,7 +3999,12 @@ pub const Document = struct {
             defer gpa.free(view);
             _ = try self.applyChanges(gpa, view);
         }
-        for (rest) |c| try self.applyChunk(gpa, c);
+        // **The tail, one chunk at a time.** This is the `for (rest) |c|` that
+        // walked a materialized slice, reading the same chunks in the same
+        // order and applying each exactly once: the cursor hands a chunk over
+        // and keeps only the position of the next one, so a stream of any
+        // length costs what a stream of one chunk costs.
+        while (try tail.next()) |c| try self.applyChunk(gpa, c);
         if (truncated) |e| switch (on_partial) {
             .refuse => return e,
             .keep => {},
@@ -4002,7 +4042,7 @@ pub const Document = struct {
         // one the bytes describe. That is a wrong answer rather than a crash,
         // which is the worse of the two.
         //
-        // **The value was computed and thrown away.** The `rest` block above
+        // **The value was computed and thrown away.** The dispatch above
         // already asked `chunks[0].typ == .document` to know where the changes
         // start and discarded the answer, one line above the place that needed
         // it. **The rule's first conjunct was being evaluated by nobody.**
@@ -4519,8 +4559,16 @@ pub const Document = struct {
         // ([`automerge.rs`:1053-1064](../github-automerge-automerge/rust/automerge/src/automerge.rs)). There is no
         // `on_partial_load` on this path to opt out of: a peer that sends a
         // good change followed by a bad one still sent a good change.
-        const stream = try chunkmod.parseChunksPartial(bytes, gpa);
-        defer gpa.free(stream.chunks);
+
+        // **A walk, not a list, and no verify pass either.** This path has no
+        // all-or-nothing to buy: the prefix that read is applied and the
+        // refusal that stopped it is thrown away, so framing each chunk as the
+        // walk reaches it is the whole of what upstream does
+        // ([`storage/load.rs`:75-99](../../github-automerge-automerge/rust/automerge/src/storage/load.rs),
+        // one loop over one `load_next_change` over the bytes still to come).
+        // The list this replaced was built for a caller that wanted to look at
+        // the stream twice, and this one walks it once.
+        var stream = chunkmod.ChunkStream.init(bytes);
 
         const start = self.ops.len();
         // **One dispatch, shared with [`Document.loadIntoWith`]**, because
@@ -4530,7 +4578,18 @@ pub const Document = struct {
         // ([`load.rs`:139-147](../../github-automerge-automerge/rust/automerge/src/storage/load.rs)),
         // and it is here — not on [`Document.load`] alone — that a bundle whose
         // dependencies are missing becomes a **queue** rather than a refusal.
-        for (stream.chunks) |c| try self.applyChunk(gpa, c);
+        //
+        // **A framing refusal stops the walk and is swallowed**, which is what
+        // `LoadedChanges::Partial`'s error was for on this path: the chunks in
+        // front of it are applied and the ones behind it are never read, which
+        // is the same set the partial list held and the same count the row
+        // difference below reports. Only an `applyChunk` refusal reaches the
+        // caller, and it did before too.
+        while (true) {
+            const next = stream.next() catch break;
+            const c = next orelse break;
+            try self.applyChunk(gpa, c);
+        }
         return self.ops.len() - start;
     }
 
@@ -7507,13 +7566,15 @@ fn expectHeadsRecorded(
     name: []const u8,
     bytes: []const u8,
 ) !void {
-    const chunks = try chunkmod.parseChunks(bytes, gpa);
-    defer gpa.free(chunks);
+    // **The first chunk and nothing else**, which is what this is about: the
+    // stream is not walked past a chunk the check has no use for.
+    var stream = chunkmod.ChunkStream.init(bytes);
+    const first = (try stream.next()) orelse return;
     // A change-chunk document records no heads at all: its head set is
     // whatever its changes imply, and `applyChanges` is what checks that.
-    if (chunks.len == 0 or chunks[0].typ != .document) return;
+    if (first.typ != .document) return;
 
-    var parsed = try docchunk.parseDocumentChunk(chunks[0].data, gpa);
+    var parsed = try docchunk.parseDocumentChunk(first.data, gpa);
     defer parsed.deinit(gpa);
     const heads = try doc.getHeads(gpa);
     defer gpa.free(heads);
@@ -7645,13 +7706,14 @@ test "every fixture, cut at every length, is refused cleanly and never leaks" {
         // A fixture the framing layer refuses has no body to cut —
         // `test/fixtures/invalid_deflate_stream.automerge` is one, and the
         // raw-file cuts above are already its whole error surface.
-        const chunks = chunkmod.parseChunks(bytes, gpa) catch {
-            continue;
-        };
-        defer gpa.free(chunks);
-        if (chunks.len == 0) continue;
-        const body = chunks[0].data;
-        const is_document = chunks[0].typ == .document;
+        // **The whole stream has to frame**, exactly as `parseChunks` needed,
+        // and for the same reason: a fixture with an unreadable tail has no
+        // body to cut, and every cut below re-frames the *first* chunk alone.
+        var stream = chunkmod.ChunkStream.init(bytes);
+        _ = stream.verify() catch continue;
+        const first = (stream.next() catch continue) orelse continue;
+        const body = first.data;
+        const is_document = first.typ == .document;
 
         // The row count of the fixture whole, so a cut that loads can be held
         // to it. **The op block is a prefix of the body**, so a body cut short
@@ -7659,7 +7721,7 @@ test "every fixture, cut at every length, is refused cleanly and never leaks" {
         // *more* rows than the fixture itself would be reading past the data
         // it was given.
         framed.clearRetainingCapacity();
-        try chunkmod.writeChunk(&framed, gpa, chunks[0].typ, body);
+        try chunkmod.writeChunk(&framed, gpa, first.typ, body);
         var whole_rows: ?usize = null;
         if (loadAndRelease(gpa, framed.items)) |rows| {
             whole_rows = rows;
@@ -7667,7 +7729,7 @@ test "every fixture, cut at every length, is refused cleanly and never leaks" {
 
         for (0..body.len + 1) |n| {
             framed.clearRetainingCapacity();
-            try chunkmod.writeChunk(&framed, gpa, chunks[0].typ, body[0..n]);
+            try chunkmod.writeChunk(&framed, gpa, first.typ, body[0..n]);
             cuts += 1;
             const loaded = loadAndRelease(gpa, framed.items);
             if (loaded) |rows| {
@@ -8212,9 +8274,9 @@ test "a truncated change stream is a parse error under load, and is tolerated un
     stream.shrinkRetainingCapacity(stream.items.len - 4);
     try testing.expectEqual(@as(u8, 1), stream.items[8]);
 
-    // **`Document.load` is all-or-nothing** — `parseChunks` rather than
-    // `parseChunksPartial` ([`chunk.zig`:257-267](storage/chunk.zig) against
-    // `:301-318`), because upstream's default is `OnPartialLoad::Error`
+    // **`Document.load` is all-or-nothing** — `ChunkStream.verify` rather than
+    // `ChunkStream.verifyPartial`, because upstream's default is
+    // `OnPartialLoad::Error`
     // ([`automerge.rs`:107-110](../github-automerge-automerge/rust/automerge/src/automerge.rs)) —
     // so the truncation is a parse error and the rule is never reached at all.
     // **What is asserted is what the error is *not*.** Naming the variant
@@ -8238,6 +8300,147 @@ test "a truncated change stream is a parse error under load, and is tolerated un
     try testing.expectEqual(@as(usize, 0), try peer.loadIncremental(gpa, stream.items));
     try testing.expectEqual(@as(usize, 1), peer.queue.len());
     try testing.expectEqual(@as(usize, 0), peer.graph.len());
+}
+
+test "a corrupt tail refuses the load before it touches the caller's document" {
+    const gpa = testing.allocator;
+    // **A stream that reads whole until its second chunk.** One document chunk
+    // and then a change chunk, so the refusal lands on a chunk that is not the
+    // first and there is a snapshot ready to apply in front of it. A walk that
+    // applied as it read would rebuild the document from that snapshot before
+    // it refused; the list this path used to build was what ordered those two
+    // the other way round.
+    var source = try buildSample(gpa);
+    defer source.deinit();
+    const snapshot = try source.save(gpa);
+    defer gpa.free(snapshot);
+    const heads = try source.getHeads(gpa);
+    defer gpa.free(heads);
+    _ = try addKeyChange(&source, gpa, actor_a, 2, 16, "third", heads);
+    const third = try source.saveIncremental(gpa);
+    defer gpa.free(third);
+    try testing.expect(third.len > 0);
+
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(gpa);
+    try stream.appendSlice(gpa, snapshot);
+    try stream.appendSlice(gpa, third);
+    try testing.expect(stream.items.len > 12);
+    // **The body is altered and the recorded checksum is not**, so this is
+    // corruption and the refusal is `error.InvalidChecksum` at that chunk's
+    // own header — not a truncation, and not anything a body parser says.
+    stream.items[stream.items.len - 1] ^= 0x01;
+
+    // **The control: a fresh document refuses, and for the framing reason.**
+    // This is the same walk a caller who only wants a document back takes, and
+    // it is what says the tail's checksum was the refusal taken.
+    if (Document.load(gpa, std.testing.io, stream.items, defaultTextEncoding(), .auto)) |accepted| {
+        var wrongly = accepted;
+        wrongly.deinit();
+        return error.CorruptTailAccepted;
+    } else |e| {
+        try testing.expectEqual(error.InvalidChecksum, e);
+    }
+
+    // **The caller's own document is the other half**, because
+    // [`Document.loadInto`] reads into a document somebody else owns and
+    // `replace` resets it. Everything asserted below is what a reset-then-
+    // refuse would have destroyed: the rows, the change graph, the actor and
+    // the key. The counts alone would not catch it — the snapshot holds
+    // exactly the rows this document already had, being a save of a document
+    // built the same way — so the key is read back through the read path.
+    var target = try Document.init(gpa, std.testing.io, .auto);
+    defer target.deinit();
+    const none = try target.getHeads(gpa);
+    defer gpa.free(none);
+    _ = try addKeyChange(&target, gpa, actor_b, 1, 99, "mine", none);
+    const before_ops = target.ops.len();
+    const before_graph = target.graph.len();
+    try testing.expectEqual(@as(usize, 1), before_graph);
+    const actor_before = try gpa.dupe(u8, target.getActorId().bytes);
+    defer gpa.free(actor_before);
+
+    try testing.expectError(
+        error.InvalidChecksum,
+        target.loadInto(gpa, stream.items, defaultTextEncoding(), .auto),
+    );
+
+    try testing.expectEqual(before_ops, target.ops.len());
+    try testing.expectEqual(before_graph, target.graph.len());
+    try testing.expectEqual(@as(usize, 0), target.queue.len());
+    // **`Document.reset` mints a new actor**, so this is the check a rebuild
+    // cannot pass by accident.
+    try testing.expectEqualStrings(actor_before, target.getActorId().bytes);
+    const readonly = @import("read.zig");
+    if ((try readonly.get(&target, ExId.root, .{ .key = "mine" })) == null) {
+        return error.DocumentWasReset;
+    }
+}
+
+test "an incremental load applies the prefix of a stream that stops mid-chunk" {
+    const gpa = testing.allocator;
+    var doc = try Document.init(gpa, std.testing.io, .auto);
+    defer doc.deinit();
+
+    const h1 = try doc.getHeads(gpa);
+    defer gpa.free(h1);
+    _ = try addKeyChange(&doc, gpa, actor_a, 1, 1, "first", h1);
+    const first = try doc.saveIncremental(gpa);
+    defer gpa.free(first);
+
+    const h2 = try doc.getHeads(gpa);
+    defer gpa.free(h2);
+    _ = try addKeyChange(&doc, gpa, actor_a, 2, 2, "second", h2);
+    const second = try doc.saveIncremental(gpa);
+    defer gpa.free(second);
+
+    // **One good chunk and then a tail that stops inside the next chunk's
+    // body.** The refusal is `error.LengthExceedsInput` — the declared length
+    // runs off the end — and the change in front of it is one this peer can
+    // apply, so a walk that stops at the bad chunk and a list that held the
+    // good prefix come to the same document.
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(gpa);
+    try stream.appendSlice(gpa, second);
+    try stream.appendSlice(gpa, first);
+    try testing.expect(stream.items.len > 12);
+    stream.shrinkRetainingCapacity(stream.items.len - 4);
+
+    // **The incremental walk.** One change applied, nothing refused, nothing
+    // queued — the truncation is swallowed and the prefix is not lost with it,
+    // which is what the chunk list this path used to build first existed to
+    // get right.
+    var peer = try Document.load(gpa, std.testing.io, first, defaultTextEncoding(), .auto);
+    defer peer.deinit();
+    try testing.expectEqual(@as(usize, 1), peer.graph.len());
+    try testing.expectEqual(@as(usize, 1), try peer.loadIncremental(gpa, stream.items));
+    try testing.expectEqual(@as(usize, 2), peer.graph.len());
+    try testing.expectEqual(@as(usize, 0), peer.queue.len());
+
+    // **The `.keep` arm of [`Document.loadIntoWith`]**, which is the door an
+    // empty document reaches through [`Document.loadIncremental`]: the same
+    // walk, the same prefix, the same swallowed refusal, and the one change in
+    // it **queued** rather than dropped, because a document with nothing in it
+    // cannot hold a change whose dependency it does not have. This is the
+    // `OnPartialLoad::Ignore` path upstream reaches at `:1038-1045`.
+    var fresh = try Document.init(gpa, std.testing.io, .auto);
+    defer fresh.deinit();
+    try testing.expectEqual(@as(usize, 0), try fresh.loadIncremental(gpa, stream.items));
+    try testing.expectEqual(@as(usize, 0), fresh.graph.len());
+    try testing.expectEqual(@as(usize, 1), fresh.queue.len());
+
+    // **And the whole load refuses the very same bytes**, which is the other
+    // half of the same walk: the prefix is dropped with the tail and the
+    // truncation is the answer. Matched by hand and the document freed first,
+    // because `expectError` drops a `Document` on the passing path and the
+    // allocator would then bury the assertion under its report.
+    if (Document.load(gpa, std.testing.io, stream.items, defaultTextEncoding(), .auto)) |accepted| {
+        var wrongly = accepted;
+        wrongly.deinit();
+        return error.TruncatedStreamAccepted;
+    } else |e| {
+        try testing.expectEqual(error.LengthExceedsInput, e);
+    }
 }
 
 test "the same bytes, three ways, materialise one document" {
@@ -9729,9 +9932,12 @@ test "an incremental save owes what the last save did not, and then nothing" {
     // history; a cursor that moved twice sends nothing. The count says which,
     // and a byte comparison could not: the same three changes framed twice
     // load into the same document.
-    const chunks = try chunkmod.parseChunks(third, gpa);
-    defer gpa.free(chunks);
-    try testing.expectEqual(@as(usize, 1), chunks.len);
+    // **Counted by walking, not by materializing.** The seam the load path
+    // uses now is the one this count is taken with.
+    var counted: usize = 0;
+    var stream = chunkmod.ChunkStream.init(third);
+    while (try stream.next()) |_| counted += 1;
+    try testing.expectEqual(@as(usize, 1), counted);
 
     // **And it is a loadable change, not merely a framed one.** The peer is
     // built from the *earlier* full save, so it holds exactly what this

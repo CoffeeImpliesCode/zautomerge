@@ -112,10 +112,14 @@ pub const Chunk = struct {
     /// This is the hash, not a checksum widened to fill it: the bytes past the
     /// fourth are hash output here and zeros in `ChangeHash.fromChecksum`.
     ///
-    /// **Null means the body was never hashed, and only ever that.** A
-    /// `compressed` chunk's stored checksum covers the inflated body rather
-    /// than the deflated bytes in `data` (`chunk.rs:118-122`), so there is no
-    /// body hash to publish and [`decompressChunk`] is what verifies it.
+    /// **Null means this chunk publishes no change hash, and there are two
+    /// reasons.** A `compressed` chunk's stored checksum covers the *inflated*
+    /// body rather than the deflated bytes in `data` (`chunk.rs:118-122`), so
+    /// its body was never hashed here and [`decompressChunk`] is what verifies
+    /// it. A chunk read out of a [`Verified`] stream **was** hashed — by
+    /// [`ChunkStream.verify`], which compared `checksum` against the first four
+    /// bytes of it and kept nothing. A consumer that needs the hash reads it
+    /// from [`ChunkStream.next`], which is the reader that publishes one.
     hash: ?ChangeHash,
     /// The body as stored, borrowed from the buffer the chunk was parsed
     /// from — still deflated for `ChunkType.compressed`.
@@ -482,8 +486,9 @@ pub fn parseChunk(bytes: []const u8) ParseError!Chunk {
 /// framing — plus `error.OutOfMemory` from the list this grows. Every chunk
 /// that parsed before the refusal is discarded: `errdefer` frees the whole
 /// list, so there is no partial result to recover. A caller that wants the
-/// prefix that did parse uses [`parseChunksPartial`], which is the same walk
-/// with the error captured rather than propagated.
+/// prefix that did parse, and wants to keep no list to hold it in, uses
+/// [`ChunkStream.verifyPartial`] — the same walk with the error captured
+/// rather than propagated, and nothing retained.
 ///
 /// The walk is bounded by the input: a chunk is at least
 /// `magic + checksum + type + uleb128(0)` = 10 bytes, so the loop runs at most
@@ -499,106 +504,194 @@ pub fn parseChunks(bytes: []const u8, gpa: std.mem.Allocator) ParseError![]Chunk
     return out.toOwnedSlice(gpa);
 }
 
-/// A chunk stream that stopped before the input ran out.
+/// A chunk stream walked one chunk at a time, holding no list: the whole of
+/// its state is an [`Input`](parse.zig), which is a slice and an offset.
 ///
-/// Upstream's `LoadedChanges`
-/// ([`storage/load.rs`:51-64](../github-automerge-automerge/rust/automerge/src/storage/load.rs))
-/// is the same shape: `Complete(Vec<Change>)` when the whole stream parsed,
-/// and `Partial { loaded, remaining, error }` when a prefix did.
+/// **This is [`parseChunks`] without the materialization.** That function
+/// grows a heap array of every chunk in the document before a single one of
+/// them is looked at, and that array is the only allocation on the load path
+/// that scales with the input — `@sizeOf(Chunk)` per chunk, doubled as it
+/// grows, reallocated on every doubling, freed on the way out. A caller that
+/// only walks a stream paid for all of it to hold what it was about to consume
+/// one at a time anyway. This holds one chunk, borrows, and allocates nothing:
+/// which is why its refusals are [`readChunk`]'s and no `error.OutOfMemory`
+/// among them.
 ///
-/// The caller owns the result and releases it with [`PartialChunks.deinit`],
-/// exactly once. The value is a plain struct with one owned slice, so copying
-/// it duplicates that slice's pointer: a copy is a second handle on the same
-/// allocation, and deinitializing both frees the bytes twice. Copy a
-/// `PartialChunks` only when exactly one of the copies is deinitialized, and
-/// do not read `chunks` afterwards — the slices inside it borrow the input
-/// buffer the walk read, which outlives this value but not a freed list.
-pub const PartialChunks = struct {
-    /// The chunks that parsed, in order. The caller owns the slice and frees
-    /// it with [`PartialChunks.deinit`]; the chunks inside it borrow the
-    /// input they were read from, which the caller also owns.
-    chunks: []Chunk,
-    /// What stopped the walk, or null when the input ran out cleanly. A null
-    /// here means `chunks` covers the whole of `bytes`; a non-null one names
-    /// the first refusal, of the vocabulary [`parseChunks`] lists.
-    err: ?ParseError,
+/// **Copying one is free and safe**, and that is what makes
+/// [`ChunkStream.verify`] a three-line function: the copy is an independent
+/// cursor over the same bytes and neither has to be released, which is the
+/// property [`Input`](parse.zig) documents for itself.
+pub const ChunkStream = struct {
+    /// Where the walk has read to. A plain [`Input`], so the slice and the
+    /// offset are the whole of it and nothing here owns anything.
+    in: Input,
 
-    /// Frees the slice and nothing else: the chunks borrow the input they
-    /// were read from, so nothing inside `chunks` is owned here.
+    /// A stream over `bytes`, positioned at its first chunk. The buffer is
+    /// borrowed and never copied, so every chunk this hands back borrows the
+    /// caller's own bytes and is valid exactly as long as they are.
+    pub fn init(bytes: []const u8) ChunkStream {
+        return .{ .in = .init(bytes) };
+    }
+
+    /// The next chunk, or null once the input has run out.
     ///
-    /// Called once. The receiver is by value and `chunks` is a plain pointer,
-    /// so a copied `PartialChunks` reaches the same allocation through
-    /// [`PartialChunks.deinit`] twice and frees it twice. After it runs, this
-    /// value and every copy of it are spent, and `chunks` must not be read.
-    pub fn deinit(self: PartialChunks, gpa: std.mem.Allocator) void {
-        gpa.free(self.chunks);
+    /// **This is `parseChunks` element for element**: the same [`readChunk`],
+    /// the same refusals at the same points of the same stream and in the same
+    /// order, the same verification of every body but a compressed one. What
+    /// it does not do is keep what it read — the caller consumes this chunk
+    /// and asks for the next, so a caller that wants only the **first** chunk
+    /// of a document never touches the ones behind it, and one that wants them
+    /// all never holds more than one.
+    pub fn next(self: *ChunkStream) ParseError!?Chunk {
+        if (self.in.isEmpty()) return null;
+        return try readChunk(&self.in);
+    }
+
+    /// Walks the rest of the stream, framing and checksum-verifying every
+    /// chunk, and hands back a [`Verified`] over the ones that read.
+    ///
+    /// **This is what an all-or-nothing load needs, and the list used to stand
+    /// in for it.** A load under `OnPartialLoad::Error` must take the refusal
+    /// for a corrupt chunk **before** it applies the chunks in front of it
+    /// ([`automerge.rs`:907-917, :974-989](../../github-automerge-automerge/rust/automerge/src/automerge.rs)):
+    /// the `Partial` arm discards what it had already read as well as what it
+    /// had not. Framing the whole stream first is what ordered those two. This
+    /// frames it and keeps nothing — the same walk, the same first refusal at
+    /// the same byte — and what it leaves behind is a cursor rather than a heap
+    /// array.
+    ///
+    /// **This stream is not moved, and the [`Verified`] reads from where it
+    /// stands.** The walk covers the rest of `self`, and the value it leaves
+    /// is a cursor over exactly those chunks — read from the position the
+    /// walk *started* at, which is where `self` still stands. So a caller
+    /// that wants the verified prefix reads it off `tail`, and one that does
+    /// not can keep reading `self`.
+    ///
+    /// The walk is bounded by the input, as [`parseChunks`]'s is: a chunk is
+    /// at least `magic + checksum + type + uleb128(0)` = 10 bytes, so it runs
+    /// at most `bytes.len / 10` times, and each declared length is checked
+    /// against what is left before any of the body is taken.
+    pub fn verify(self: *const ChunkStream) ParseError!Verified {
+        const tail = self.verifyPartial();
+        if (tail.err) |e| return e;
+        return tail;
+    }
+
+    /// [`ChunkStream.verify`], keeping the refusal in [`Verified.err`] instead
+    /// of returning it — the same pair [`parseChunks`] and its partial
+    /// spelling were, with the list left out of both.
+    ///
+    /// The [`Verified`] this returns covers the prefix that read and stops
+    /// there, which is what a partial load keeps: upstream's
+    /// `LoadedChanges::Partial`
+    /// ([`storage/load.rs`:51-64](../../github-automerge-automerge/rust/automerge/src/storage/load.rs))
+    /// is `Complete` when the whole stream parsed and
+    /// `Partial { loaded, remaining, error }` when a prefix did.
+    ///
+    /// **The prefix is read from the front, not from where the walk ended.**
+    /// [`Verified.next`] walks forward, so `in` is the position the walk
+    /// started at — the caller's own cursor — and `left` is how many chunks
+    /// follow it. Handing it the position the walk *stopped* at instead
+    /// points the second pass at the bytes behind the prefix: a stream that
+    /// read whole frames its next header out of nothing and refuses with
+    /// `error.UnexpectedEnd`, and one that did not frames the first tail
+    /// chunk out of the failing chunk's bytes.
+    pub fn verifyPartial(self: *const ChunkStream) Verified {
+        var scan = self.*;
+        var left: usize = 0;
+        var refusal: ?ParseError = null;
+        while (true) {
+            const chunk: ?Chunk = scan.next() catch |e| {
+                refusal = e;
+                break;
+            };
+            if (chunk == null) break;
+            left += 1;
+        }
+        return .{ .in = self.in, .left = left, .err = refusal };
     }
 };
 
-/// [`parseChunks`], keeping whatever parsed before the first refusal
-/// ([`load_changes`](../../github-automerge-automerge/rust/automerge/src/storage/load.rs):75-97).
+/// A stream of chunks that has been walked to its end — or to its first
+/// refusal — and holds none of them: every chunk it covers was framed and
+/// checksum-verified. The cursor is the one the walk started from, so the
+/// prefix it covers is read back off those same bytes rather than walked
+/// again.
 ///
-/// **This is the same loop with the error captured instead of propagated.**
-/// `load_changes` builds `changes` chunk by chunk and, on the first `Err`,
-/// returns `LoadedChanges::Partial { loaded: changes, remaining: data, error }`
-/// — the chunks before the bad one are kept, not discarded. A stream that is a
-/// valid save with four bytes of rubbish appended parses every chunk and then
-/// fails on the rubbish, and upstream keeps the document.
-///
-/// `parseChunks` stays the all-or-nothing spelling, because `Document.load`
-/// *is* all-or-nothing: upstream's default is `OnPartialLoad::Error`
-/// ([`automerge.rs`:107-110, :177](../github-automerge-automerge/rust/automerge/src/automerge.rs)).
-///
-/// The signature therefore returns only `error.OutOfMemory`, which the list
-/// this grows can produce; a refusal to parse is not returned but stored in
-/// [`PartialChunks.err`], which names one of the tags [`parseChunks`] lists.
-/// An `error.OutOfMemory` still discards everything: `errdefer` frees the list
-/// and nothing is returned, so this is the one case with no prefix to
-/// recover. On the returned value, `err == null` means the input ran out
-/// cleanly, and a caller that ignores `err` reads a prefix that may stop
-/// mid-stream.
-pub fn parseChunksPartial(
-    bytes: []const u8,
-    gpa: std.mem.Allocator,
-) std.mem.Allocator.Error!PartialChunks {
-    var out: std.ArrayList(Chunk) = .empty;
-    errdefer out.deinit(gpa);
-    var in: Input = .init(bytes);
-    while (!in.isEmpty()) {
-        const chunk = readChunk(&in) catch |e| {
-            return .{
-                .chunks = try out.toOwnedSlice(gpa),
-                .err = e,
-            };
-        };
-        try out.append(gpa, chunk);
-    }
-    return .{ .chunks = try out.toOwnedSlice(gpa), .err = null };
-}
+/// This is what [`ChunkStream.verify`] hands back, and the second half of an
+/// all-or-nothing load: a caller that must know the whole stream is readable
+/// before it touches anything reads it twice, once to verify and once to
+/// consume, and neither pass keeps a list.
+pub const Verified = struct {
+    /// Where the verified prefix **begins**: the cursor the walk started
+    /// from, and the first byte of the first chunk [`Verified.next`] hands
+    /// back. The walk that produced this value did not move the stream it was
+    /// called on, so this is the position that stream still stands at.
+    in: Input,
+    /// How many chunks follow `in` — the verified prefix: the whole of the
+    /// rest of the stream when the input ran out cleanly, and everything in
+    /// front of the refusal when it did not. This is what stops
+    /// [`Verified.next`] at the refusal rather than handing back the chunk
+    /// that failed — the count is the verified prefix, and no reader of a
+    /// cursor can be asked to re-read its way there.
+    left: usize,
+    /// What stopped the verify walk, or null when the input ran out cleanly.
+    /// This is upstream's `LoadedChanges::Partial`'s `error`, and what it
+    /// means is the caller's to decide: `Document.load` refuses it and
+    /// [`Document.loadIncremental`](../doc.zig) swallows it.
+    err: ?ParseError,
 
-/// Consumes one chunk from `in`, leaving the cursor on the first byte after
-/// it. The body is bounded by the declared length, so a chunk can never read
-/// into its successor.
+    /// The next verified chunk, or null once `left` is exhausted.
+    ///
+    /// **No body is hashed here.** [`ChunkStream.verify`] hashed every chunk
+    /// in this stream and compared its first four bytes against the header
+    /// that chunk carried; doing that again over the same bytes is the second
+    /// SHA-256 pass over a document that publishing [`Chunk.hash`] exists to
+    /// remove. So [`Chunk.hash`] is null on everything this returns, and that
+    /// null means *this stream publishes no change hash* rather than *this body
+    /// was never hashed*.
+    ///
+    /// The signature still reports refusals, because the header is read
+    /// through the same bounds-checked readers as any other chunk's. Over
+    /// bytes this value covers none of them can fire — the verify walk read
+    /// every one of these headers on this exact buffer and none of them
+    /// refused — and a caller that would rather be told than trust that is
+    /// told.
+    pub fn next(self: *Verified) ParseError!?Chunk {
+        if (self.left == 0) return null;
+        self.left -= 1;
+        return try readFramed(&self.in);
+    }
+};
+
+/// The part of a chunk that is read before its body is hashed: where the
+/// chunk started, the checksum its header carries, its type and its body.
 ///
-/// **The frame is the window the chunk was read from**, taken from where the
-/// cursor stood before the magic to where it stands after the body. That is
-/// the whole of what preserving it costs: a slice of the caller's own buffer,
-/// with no allocation, no copy, and no arithmetic about how wide the header
-/// turned out to be — the one thing this layer knows exactly and a reader
-/// downstream of it cannot work out.
+/// **Split out of [`readChunk`] so the framing is written once and read
+/// twice** — hashed by the walk that verifies a chunk, unhashed by
+/// [`Verified.next`], which is reading a stream [`ChunkStream.verify`] has
+/// already verified. The two spellings differ in exactly one thing, and it is
+/// the one the second pass has already paid for.
 ///
-/// The refusals are the ones [`parseChunk`] lists: the header reads give
+/// The refusals are the header half of [`parseChunk`]'s: the header reads give
 /// `error.UnexpectedEnd`, `error.InvalidMagic`, `error.InvalidChunkType`,
 /// `error.InvalidLeb128` and `error.Overflow`; the length gives
-/// `error.TooLarge` and `error.LengthExceedsInput`; and the checksum gives
-/// `error.InvalidChecksum` for every type but `compressed`. On any of them the
-/// cursor stands where the refusal found it, and nothing is returned.
-///
-/// On success the hash the body was checked against is published on the
-/// returned chunk as [`Chunk.hash`], all thirty-two bytes of it and not only
-/// the four that were compared. There is no second hash here to save: this is
-/// the one.
-fn readChunk(in: *Input) ParseError!Chunk {
+/// `error.TooLarge` and `error.LengthExceedsInput`. On any of them the cursor
+/// stands where the refusal found it, and nothing is returned. The checksum
+/// comparison is not here: it is the hashing half, and
+/// `error.InvalidChecksum` belongs to whichever reader does it.
+const Header = struct {
+    /// Where the chunk began in the input, which is where its frame begins.
+    start: usize,
+    /// The four header bytes as they were stored, never a recomputation.
+    checksum: [checksum_size]u8,
+    /// What the body holds, as the tag byte read off the wire.
+    typ: ChunkType,
+    /// The body as stored, borrowed from the input.
+    data: []const u8,
+};
+
+fn readHeader(in: *Input) ParseError!Header {
     const start = in.pos;
     if (!std.mem.eql(u8, &try in.takeArray(u32), &magic)) return error.InvalidMagic;
     const checksum = try in.takeArray(u32);
@@ -615,7 +708,36 @@ fn readChunk(in: *Input) ParseError!Chunk {
     // Checked against what is left before any of the body is touched, so a
     // length of 2^40 costs a comparison and not a 2^40-byte read.
     if (data_len > in.remaining()) return error.LengthExceedsInput;
-    const data = (try in.sub(data_len)).rest();
+    return .{
+        .start = start,
+        .checksum = checksum,
+        .typ = typ,
+        .data = (try in.sub(data_len)).rest(),
+    };
+}
+
+/// Consumes one chunk from `in`, leaving the cursor on the first byte after
+/// it. The body is bounded by the declared length, so a chunk can never read
+/// into its successor.
+///
+/// **The frame is the window the chunk was read from**, taken from where the
+/// cursor stood before the magic to where it stands after the body. That is
+/// the whole of what preserving it costs: a slice of the caller's own buffer,
+/// with no allocation, no copy, and no arithmetic about how wide the header
+/// turned out to be — the one thing this layer knows exactly and a reader
+/// downstream of it cannot work out.
+///
+/// The refusals are the ones [`parseChunk`] lists: [`readHeader`]'s, plus
+/// `error.InvalidChecksum` for a body that does not hash to the recorded
+/// checksum, on every type but `compressed`. On any of them the cursor stands
+/// where the refusal found it, and nothing is returned.
+///
+/// On success the hash the body was checked against is published on the
+/// returned chunk as [`Chunk.hash`], all thirty-two bytes of it and not only
+/// the four that were compared. There is no second hash here to save: this is
+/// the one.
+fn readChunk(in: *Input) ParseError!Chunk {
+    const header = try readHeader(in);
 
     // The compressed case is deferred: its checksum is over the inflated body
     // (`chunk.rs:118-122`), and inflating here would make a framing parse
@@ -629,21 +751,39 @@ fn readChunk(in: *Input) ParseError!Chunk {
     // hash to what the header records is `error.InvalidChecksum` before
     // anything is returned; and the compressed case publishes nothing, because
     // its body was never hashed here.
-    const hash: ?ChangeHash = switch (typ) {
+    const hash: ?ChangeHash = switch (header.typ) {
         .compressed => null,
         else => blk: {
-            const h = changeHashOf(typ, data);
+            const h = changeHashOf(header.typ, header.data);
             const sum = h.checksum();
-            if (!std.mem.eql(u8, &checksum, &sum)) return error.InvalidChecksum;
+            if (!std.mem.eql(u8, &header.checksum, &sum)) return error.InvalidChecksum;
             break :blk h;
         },
     };
     return .{
-        .typ = typ,
-        .checksum = checksum,
+        .typ = header.typ,
+        .checksum = header.checksum,
         .hash = hash,
-        .data = data,
-        .frame = in.bytes[start..in.pos],
+        .data = header.data,
+        .frame = in.bytes[header.start..in.pos],
+    };
+}
+
+/// The chunk [`readChunk`] reads with the hash left out: the same framing, the
+/// same refusals short of the checksum, and no body hashed at all.
+///
+/// This is what [`Verified.next`] reads with, and it is sound **only** over a
+/// stream [`ChunkStream.verify`] has already walked, because that walk is what
+/// checked the checksums this skips. It is private and reachable only through
+/// a [`Verified`], which cannot be built without one.
+fn readFramed(in: *Input) ParseError!Chunk {
+    const header = try readHeader(in);
+    return .{
+        .typ = header.typ,
+        .checksum = header.checksum,
+        .hash = null,
+        .data = header.data,
+        .frame = in.bytes[header.start..in.pos],
     };
 }
 
@@ -948,6 +1088,179 @@ test "an empty stream is an empty list" {
     try testing.expectEqual(@as(usize, 0), chunks.len);
 }
 
+test "a chunk stream yields what the list yields, one chunk at a time" {
+    const gpa = testing.allocator;
+    const bodies = [_][]const u8{ "", "one", "two change bodies in a row" };
+    const kinds = [_]ChunkType{ .document, .change, .bundle };
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    for (bodies, kinds) |body, typ| try writeChunk(&out, gpa, typ, body);
+
+    // **The list is the reference, because this is the claim being pinned:**
+    // the stream is `parseChunks` without the materialization, so the two
+    // must agree on every chunk, in order, to the byte.
+    const chunks = try parseChunks(out.items, gpa);
+    defer gpa.free(chunks);
+
+    var stream = ChunkStream.init(out.items);
+    var i: usize = 0;
+    while (try stream.next()) |c| {
+        // **A bound, not an equality.** The stream may yield fewer chunks
+        // than the list, never more, and `chunks[i]` below needs the index to
+        // be in range; that the two counts are *equal* is what the assertion
+        // after this loop says.
+        try testing.expect(i < chunks.len);
+        const want = chunks[i];
+        try testing.expectEqual(want.typ, c.typ);
+        try testing.expectEqualSlices(u8, &want.checksum, &c.checksum);
+        try testing.expectEqualSlices(u8, want.data, c.data);
+        try testing.expectEqualSlices(u8, want.frame, c.frame);
+        // **The hash is published, not dropped.** This is the reader a load
+        // takes its change hashes from, and the one the second pass of
+        // `verify` deliberately does not use.
+        try testing.expect(c.hash != null);
+        i += 1;
+    }
+    try testing.expectEqual(chunks.len, i);
+
+    // **Peeking the head of a stream costs one read.** A load whose first
+    // chunk is a snapshot never has to look at what is behind it, and the
+    // cursor is still where it stood, so the tail reads on from there.
+    var head = ChunkStream.init(out.items);
+    const first = (try head.next()).?;
+    try testing.expectEqual(@as(ChunkType, .document), first.typ);
+    var rest: usize = 0;
+    while (try head.next()) |_| rest += 1;
+    try testing.expectEqual(chunks.len - 1, rest);
+}
+
+test "verify refuses where the list refuses, and hands back the prefix it read" {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try writeChunk(&out, gpa, .change, "first");
+    try writeChunk(&out, gpa, .change, "second");
+    const good_len = out.items.len;
+    try writeChunk(&out, gpa, .change, "third");
+    // The third body is altered and the checksum the header records is not, so
+    // this is corruption rather than truncation: the refusal a body parser must
+    // never be handed.
+    out.items[out.items.len - 1] ^= 0x01;
+
+    // **The same refusal, on the same bytes, at the same point.** The list
+    // walk refuses at the third chunk and so does the verify walk, which kept
+    // nothing at all to say so — that is the whole of what it has to show.
+    try testing.expectError(error.InvalidChecksum, parseChunks(out.items, gpa));
+    var strict = ChunkStream.init(out.items);
+    try testing.expectError(error.InvalidChecksum, strict.verify());
+
+    // **And the partial spelling is the same walk with the answer kept.**
+    var lenient = ChunkStream.init(out.items);
+    var tail = lenient.verifyPartial();
+    try testing.expect(tail.err != null);
+    try testing.expectEqual(error.InvalidChecksum, tail.err.?);
+
+    var got: usize = 0;
+    while (try tail.next()) |c| {
+        try testing.expectEqual(@as(ChunkType, .change), c.typ);
+        try testing.expectEqualSlices(u8, out.items[got..][0..c.frame.len], c.frame);
+        // **Framed exactly as the first pass framed it, and hashed not at
+        // all** — the walk above already hashed every chunk in this prefix and
+        // compared it against the header, so the second pass does not.
+        try testing.expect(c.hash == null);
+        got += c.frame.len;
+    }
+    // **Two chunks, not three.** The one that refused is not part of the
+    // prefix, and the cursor does not hand it over afterwards.
+    try testing.expectEqual(good_len, got);
+    try testing.expect((try tail.next()) == null);
+}
+
+test "the walk needs no allocator, and the list it replaced did" {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    for (0..5) |n| {
+        var body: [16]u8 = @splat(@intCast(n));
+        try writeChunk(&out, gpa, .change, &body);
+    }
+
+    // **The difference in one assertion.** `parseChunks` needs an allocator to
+    // grow the list and to hand the slice over; the walk takes none, so an
+    // allocator that fails its first allocation stops the list and cannot
+    // reach the stream at all.
+    var failing: testing.FailingAllocator = .init(gpa, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, parseChunks(out.items, failing.allocator()));
+
+    var walked: usize = 0;
+    var stream = ChunkStream.init(out.items);
+    while (try stream.next()) |_| walked += 1;
+    try testing.expectEqual(@as(usize, 5), walked);
+
+    // **The verified pass is the same walk and the same answer**, so a caller
+    // that verifies first and reads second sees the stream twice and holds
+    // nothing twice.
+    var whole = ChunkStream.init(out.items);
+    var tail = try whole.verify();
+    try testing.expect(tail.err == null);
+    var read: usize = 0;
+    while (try tail.next()) |_| read += 1;
+    try testing.expectEqual(walked, read);
+}
+
+test "a verified prefix is read from where the walk started, not where it ended" {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    for ([_]ChunkType{ .document, .change, .change, .bundle }, 0..4) |typ, n| {
+        var body: [8]u8 = @splat(@intCast(n));
+        try writeChunk(&out, gpa, typ, &body);
+    }
+
+    // **The load path's own sequence, in order**: take the head, verify what
+    // is left of it, then read what verified. The verified value covers the
+    // chunks *after* the head, so it has to start reading where the stream was
+    // standing when `verify` was called — not at the end the walk reached,
+    // which is the whole of a stream that read clean and one byte past the
+    // refusal when it did not. Both were a header read out of nothing.
+    var stream = ChunkStream.init(out.items);
+    const head = (try stream.next()).?;
+    try testing.expectEqual(@as(ChunkType, .document), head.typ);
+
+    var tail = try stream.verify();
+    try testing.expect(tail.err == null);
+    try testing.expectEqual(@as(usize, 3), tail.left);
+
+    var seen: usize = 0;
+    var at: usize = head.frame.len;
+    while (try tail.next()) |c| {
+        try testing.expectEqualSlices(u8, out.items[at..][0..c.frame.len], c.frame);
+        try testing.expect(c.hash == null);
+        at += c.frame.len;
+        seen += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), seen);
+    try testing.expectEqual(out.items.len, at);
+
+    // **The stream was not moved by the walk.** It still reads from where it
+    // stood when `verify` was called — which is *after* the head, because
+    // `verify` does not rewind. So the next answer is the first chunk of the
+    // verified prefix, and the two after it are the rest of what `tail`
+    // covered. Re-reading the head would be a rewind, which is neither the
+    // property nor what a caller wants.
+    var peeked: usize = 0;
+    at = head.frame.len;
+    while (try stream.next()) |c| {
+        try testing.expectEqualSlices(u8, out.items[at..][0..c.frame.len], c.frame);
+        at += c.frame.len;
+        peeked += 1;
+    }
+    // The same three chunks `tail` walked, read off the stream itself.
+    try testing.expectEqual(@as(usize, 3), peeked);
+    try testing.expectEqual(out.items.len, at);
+}
+
 test "malformed chunks are rejected" {
     const gpa = testing.allocator;
     var out: std.ArrayList(u8) = .empty;
@@ -1000,16 +1313,6 @@ test "malformed chunks are rejected" {
     defer two.deinit(gpa);
     try writeChunk(&two, gpa, .change, "first");
     try writeChunk(&two, gpa, .change, "second");
-    try two.appendSlice(gpa, out.items[0 .. out.items.len - 2]);
-    try testing.expectError(error.LengthExceedsInput, parseChunks(two.items, gpa));
-
-    // A stream that stops inside a header never reaches a length at all.
-    try testing.expectError(error.UnexpectedEnd, parseChunk(out.items[0..7]));
-    try testing.expectError(error.UnexpectedEnd, parseChunk(""));
-}
-
-test "an overlong length prefix is a malformed length, not a short read" {
-    const gpa = testing.allocator;
     // A complete header — magic, checksum, type 1 — and then eleven
     // continuation bytes, one more than the widest legal uleb128. The prefix
     // spends a byte the length did not need, so the strict reader refuses it

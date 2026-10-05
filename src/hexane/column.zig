@@ -6780,7 +6780,37 @@ pub fn Column(comptime T: type, comptime E: type) type {
                 acc = Weight.Aggregate.merge(acc, w);
             }
             self.agg_before.items[n] = acc;
-            self.agg_before.shrinkRetainingCapacity(n + 1);
+            // **The length moves; the slack behind it is left alone.**
+            //
+            // `shrinkRetainingCapacity` is the length assignment *plus* a
+            // `@memset` of everything past the new length with `undefined`
+            // (`std/array_list.zig:1186-1189`). On this array that fill is
+            // the largest `compiler_rt.memset` a single splice of a
+            // prefix-tracking column reaches — the only other is the one
+            // boolean an entry per slab at [`stageSplice`](Column.stageSplice)
+            // — and it is pure waste:
+            //
+            // * **What it writes is the column's own previous bases.** The
+            //   length is `old + n + 1` when the shrink is called, so the
+            //   fill covers the `old` entries in front of it and no further:
+            //   one entry per slab of the list this rebuild replaces, plus
+            //   the whole column's. It is *not* the spare capacity behind
+            //   them, and it is not a high-water mark — a column of `k`
+            //   slabs pays `k + 1` entries every splice, thirty-two bytes an
+            //   entry on a delta column (`btree.SlabAgg`) and sixteen on a
+            //   prefix one (`btree.PrefixWeight`), for bytes nothing reads.
+            // * Nothing in this file reads past the length.
+            //   [`aggWeight`](Column.aggWeight) is the only reader and
+            //   answers the identity for a slab past the end rather than
+            //   indexing; [`checkInvariants`](Column.checkInvariants)
+            //   checks the length before it compares entries; and the loop
+            //   above has just written `[0, n + 1)` in full, so the
+            //   entries that survive the truncation are all real.
+            //
+            // The `errdefer` above keeps its poison: that one is a refusal,
+            // it is cold, and a trap on a half-measured tail is a real
+            // diagnostic rather than a cost.
+            self.agg_before.items.len = n + 1;
         }
 
         /// Room in the slab list for `n` slabs, and in the base array for
@@ -9290,6 +9320,213 @@ test "a staged splice publishes whole, and a refused one moves nothing" {
     const opt_none = [_]?i64{};
     try sweepTwoStages(?i64, Prefix(?i64), &opt_model, &opt_ins, 2, 1, 4, 2);
     try sweepTwoStages(?i64, Prefix(?i64), &opt_model, &opt_none, 2, 3, 4, 2);
+}
+
+/// The per-slab bases a caller could see, copied out with `gpa` and not
+/// with the column's own — so the only refusal this can report is one
+/// inside the stage under test.
+fn snapshotBases(
+    comptime T: type,
+    comptime E: type,
+    gpa: std.mem.Allocator,
+    col: *const Column(T, E),
+) ![]Column(T, E).Weight {
+    return gpa.dupe(Column(T, E).Weight, col.agg_before.items);
+}
+
+/// Holds `col`'s bases to `want`, entry for entry, **length first**. A
+/// weight is a value type with no pointer in it, so `eql` is the whole of
+/// the comparison; the length is checked before any entry is, because a
+/// short array is the failure that does not fail loudly — `aggWeight`
+/// answers the identity past the end, so a base that went missing reads
+/// as zero and decodes every row behind it against zero.
+fn expectBasesEqual(
+    comptime T: type,
+    comptime E: type,
+    col: *const Column(T, E),
+    want: []const Column(T, E).Weight,
+) !void {
+    try testing.expectEqual(want.len, col.agg_before.items.len);
+    for (want, 0..) |w, i| {
+        if (!Column(T, E).Weight.Aggregate.eql(col.agg_before.items[i], w)) {
+            std.debug.print("base {d} of {d} disagrees with the snapshot\n", .{ i, want.len });
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+/// One staged splice on a column, with every base entry checked on both
+/// answers: a refusal has to leave all of them alone, and a publish has to
+/// leave the running merge of the slabs the splice produced.
+fn oomStageThenBases(
+    comptime T: type,
+    comptime E: type,
+    gpa: std.mem.Allocator,
+    model: []const T,
+    ins: []const T,
+    index: usize,
+    del: usize,
+) !void {
+    var col = try Column(T, E).initWithBudget(gpa, 4);
+    defer col.deinit();
+    try col.extend(gpa, model);
+
+    const before = try snapshotBases(T, E, testing.allocator, &col);
+    defer testing.allocator.free(before);
+
+    var s = col.stageSplice(index, del, ins) catch |e| switch (e) {
+        error.OutOfMemory => {
+            try expectBasesEqual(T, E, &col, before);
+            try expectColumn(T, E, &col, model);
+            return;
+        },
+        // Anything else is an answer about the request rather than about
+        // the allocator, and this is a fixed in-range point.
+        else => return e,
+    };
+    s.publish(&col);
+
+    // One slot per slab plus the whole column's — which is the whole of
+    // what a reader may reach. The entries past it are the array's spare
+    // capacity, and this is the length that keeps them out of reach.
+    if (comptime E.tracks_prefix) {
+        if (col.slabCount() != 0) {
+            try testing.expectEqual(col.slabCount() + 1, col.agg_before.items.len);
+        }
+    }
+    var want: std.ArrayList(T) = .empty;
+    defer want.deinit(testing.allocator);
+    try want.appendSlice(testing.allocator, model[0..index]);
+    try want.appendSlice(testing.allocator, ins);
+    try want.appendSlice(testing.allocator, model[index + del ..]);
+    // `expectColumn` decodes every row against its slab's base, and checks
+    // the array against the slabs' running merge, so this is where a base
+    // that was left stale by the rebuild would show.
+    try expectColumn(T, E, &col, want.items);
+}
+
+/// Sweeps every allocation the one stage of `oomStageThenBases` makes.
+fn sweepStageBases(
+    comptime T: type,
+    comptime E: type,
+    model: []const T,
+    ins: []const T,
+    index: usize,
+    del: usize,
+) !void {
+    const gpa = testing.allocator;
+    const needed = blk: {
+        var failing: testing.FailingAllocator = .init(gpa, .{});
+        try oomStageThenBases(T, E, failing.allocator(), model, ins, index, del);
+        break :blk failing.alloc_index;
+    };
+    for (0..needed) |fail_index| {
+        var failing: testing.FailingAllocator = .init(gpa, .{ .fail_index = fail_index });
+        // A refusal in the *setup* says nothing about the stage, so it is
+        // skipped rather than counted as a pass: `fail_index` counts from
+        // the first allocation of the run, and the run's first allocations
+        // are the column's own.
+        oomStageThenBases(T, E, failing.allocator(), model, ins, index, del) catch |e| switch (e) {
+            error.OutOfMemory => continue,
+            else => return e,
+        };
+    }
+}
+
+test "a refused staged splice leaves every per-slab base in place" {
+    // **The base array is the one cache a refusal has to leave whole.** It
+    // is read as a slab's base — a delta or prefix row is a difference
+    // measured against the running value in front of its slab — and the
+    // rebuild behind a splice re-measures every one of them. So this is
+    // the sweep over the rebuild itself: at every allocation the stage
+    // makes, either the column still carries the bases it came in with, or
+    // the stage came back whole and published the merge of the slabs it
+    // produced.
+    //
+    // The rebuild is the step that now moves the array's length without
+    // poisoning the slack behind it, so the length is the thing under
+    // test: `expectBasesEqual` checks it before it compares an entry, and
+    // the success side pins it to `slabCount() + 1`.
+
+    // **Every value stands three times over, and that is the whole of why
+    // this column has slabs at all.** A delta column's runs are runs of equal
+    // *differences* and a run of distinct ones is one literal run however
+    // long it is, so a column whose differences repeat is the only kind that
+    // reaches the budget — the trap `fuzz_indexed_delta_column` states in
+    // full at `column.zig:16013-16022`, and the one the arithmetic
+    // progression this used to carry fell into: `100, 250, 400, …` is the
+    // differences `100, 150, 150, …`, two runs against a budget of four, one
+    // slab, and not a per-slab base for a refusal to leave behind. Three
+    // copies of a value are two differences of zero behind each other, which
+    // is a repeat run, so this is eight runs over twelve rows and the cut
+    // leaves the column with two slabs of six.
+    const model = [_]i64{ 100, 100, 100, 250, 250, 250, 400, 400, 400, 550, 550, 550 };
+    const ins = [_]i64{ -50, -50, 2000, 0, 0, -900 };
+    const none = [_]i64{};
+
+    // Across slabs, and inside one slab, on a delta column: the last cut
+    // starts on the last row of the first slab and ends in the second.
+    try sweepStageBases(i64, Delta(i64), &model, &ins, 3, 2);
+    try sweepStageBases(i64, Delta(i64), &model, &ins, 1, 1);
+    try sweepStageBases(i64, Delta(i64), &model, &none, 5, 3);
+    // A nullable prefix column, where a cut lands past absent rows.
+    const opt_model = [_]?i64{ 100, null, 250, null, 400, 550, null, 700 };
+    const opt_ins = [_]?i64{ null, -50, 2000, null, -900 };
+    try sweepStageBases(?i64, Prefix(?i64), &opt_model, &opt_ins, 2, 1);
+    try sweepStageBases(?i64, Prefix(?i64), &opt_model, &opt_ins, 4, 2);
+    // A plain column keeps no bases at all, so the array stays empty
+    // through the same sweep — the path the rebuild's comptime guard skips.
+    try sweepStageBases(i64, Rle(i64), &model, &ins, 3, 2);
+}
+
+test "a splice that collapses the slab list retires bases the column does not read" {
+    // **The slack behind the length is real, and it is stale on purpose.**
+    // A column that once held many slabs keeps the capacity they needed,
+    // and a rebuild that shortens the array leaves the retired bases in it
+    // rather than poisoning them. Nothing may read them — `aggWeight`
+    // answers the identity past the end instead of indexing, and the
+    // length is what tells it where the end is — so this pins both halves
+    // of that: the slack is present and out of reach, and every row of the
+    // collapsed column still decodes against the bases that are in reach.
+    const T = i64;
+    const E = Delta(i64);
+    const gpa = testing.allocator;
+    // **Triples, because the run count is what the run budget cuts and a
+    // delta column counts runs of equal *differences*.** Distinct
+    // differences are one literal run however many there are, so the
+    // arithmetic progression this used to carry is the differences `100,
+    // 150, 150, …` — two runs against a budget of four, which
+    // `splitToBudget` refuses to cut (`slab.zig:1099`). The column kept one
+    // slab, the collapse below never happened, and the precondition could
+    // not hold. Three copies of a value are two differences of zero behind
+    // each other, which is a repeat run: eight runs, two slabs, and a base
+    // array with a retired entry per slab behind the new length.
+    const model = [_]i64{ 100, 100, 100, 250, 250, 250, 400, 400, 400, 550, 550, 550 };
+    const one = [_]i64{7};
+
+    var col = try Column(T, E).initWithBudget(gpa, 4);
+    defer col.deinit();
+    try col.extend(gpa, &model);
+    const many_slabs = col.slabCount();
+    try testing.expect(many_slabs > 1);
+
+    // Everything the column held, replaced by one value: the slab list
+    // collapses and the array is left with far more capacity than length.
+    try col.splice(gpa, 0, model.len, &one);
+    try expectColumn(T, E, &col, &one);
+    try testing.expect(col.slabCount() < many_slabs);
+    // **One slot per slab plus the whole column's** — the whole of what a
+    // reader may reach, and the length that keeps the retired entries out
+    // of it. `expectColumn` has already checked this against the slabs'
+    // running merge; it is pinned here as well because it is the length,
+    // and not the fill behind it, that the rebuild now relies on.
+    try testing.expectEqual(col.slabCount() + 1, col.agg_before.items.len);
+    try testing.expect(col.agg_before.capacity > col.agg_before.items.len);
+    // The retired entries are the bases of slabs this column no longer
+    // has. They are in the buffer, they are past the length, and the read
+    // above is unaffected by them — `expectColumn` decoded every row
+    // against its slab's base before the comparison — which is the whole
+    // of the contract that lets the rebuild leave them alone.
 }
 
 /// Stages a splice in a frame of its own and hands the stage back **by
