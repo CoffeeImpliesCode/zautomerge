@@ -285,9 +285,15 @@ fn skipWire(comptime E: type, dec: *E.WireDecoder, n: usize, running: *i64) Pars
 /// The fast arm needs a fold that takes a whole run at once, because a
 /// prefix sum over a run of `count` equal lengths is `length * count` — the
 /// one multiplication every codec's accumulator already implies
-/// (`accumulateRun` on `PrefixBase`, `DeltaBase`). A codec that does not
-/// publish one keeps the row-at-a-time walk; that is the case for the op set's
-/// two hand-written prefix codecs, whose declarations live outside this file.
+/// (`accumulateRun` on `PrefixBase`, `DeltaBase`, `BoolPrefixCodec`). A codec
+/// that does not publish one keeps the row-at-a-time walk; that is the case for
+/// the op set's `MetaPrefixCodec`, whose wire is `Rle(u64)`, whose declaration
+/// lives outside this file, and whose literal-run payloads carry refusals a
+/// count-only fold would step over unchecked (`rle.zig:518-531`). The boolean
+/// prefix codec publishes one precisely because a boolean run stores no
+/// payload, so every refusal it can raise comes from its own count varint —
+/// which the fold must read to learn the run's length
+/// (`bool.zig:300-311`).
 fn accumulateWire(comptime E: type, dec: *E.WireDecoder, n: usize, running: *i64) ParseError!bool {
     if (comptime @hasDecl(E, "accumulateRun") and @hasDecl(E.WireDecoder, "nextRunMax")) {
         if (n == 0) return true;
@@ -6278,8 +6284,11 @@ pub fn Column(comptime T: type, comptime E: type) type {
             // split in `settle` below can spill into, and the bases
             // `rebuildAggs` refills afterwards. Every run is at least one
             // byte, so the spliced slab holds no more runs than the ones it
-            // had plus one per inserted value.
-            const spills = (s.segments + values.len) / self.budget;
+            // had plus one per inserted value — and one more for the pad a
+            // boolean mid can write in front of itself when the slab it was cut
+            // out of had none. `splitSpillCount` is what that many runs come
+            // apart into.
+            const spills = slabmod.splitSpillCount(E, s.segments + values.len + 1, self.budget);
             try self.reserveSlabs(self.slabs.items.len + spills + 1);
 
             try self.takeOwnership(si);
@@ -6375,7 +6384,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
             // spill into.
             const placed = pieces.items.len;
             const dropped = s1 + 1 - s0;
-            const head_spill = if (placed == 0) 0 else pieces.items[placed - 1].segments / self.budget;
+            const head_spill = if (placed == 0) 0 else slabmod.splitSpillCount(E, pieces.items[placed - 1].segments, self.budget);
             try self.reserveSlabs(self.slabs.items.len - dropped + placed + head_spill + 1);
             // Drop the slabs the cut spanned and put the pieces in their
             // place, in one non-fallible step. The old slabs are freed by hand
@@ -6427,6 +6436,16 @@ pub fn Column(comptime T: type, comptime E: type) type {
         }
 
         /// Split `wires` into slabs at the run budget and append them.
+        ///
+        /// **A piece behind the first is cut one run short when it has to open
+        /// on a `true` run** — the pad a boolean piece writes is a run the wire
+        /// spends and `measure` counts, so a piece cut at the full budget
+        /// behind one lands a run over it (`slab.zig:1007-1048` for the
+        /// argument, `bool.rs:312-317` for upstream's own). This is the same
+        /// cut [`splitToBudget`](slabmod.splitToBudget) makes and takes the
+        /// same [`pieceRuns`](slabmod.pieceRuns), so a column cannot end a
+        /// splice with a slab the column's invariant checker refuses
+        /// (`column.zig:6881-6882`) on this path and not on that one.
         fn appendBudgeted(
             self: *Self,
             gpa: std.mem.Allocator,
@@ -6440,7 +6459,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
             defer gpa.free(segs);
             var from: usize = 0;
             while (from < segs.len) {
-                const to = @min(from + self.budget, segs.len);
+                const to = @min(from + slabmod.pieceRuns(E, segs, from, self.budget), segs.len);
                 try appendPiece(gpa, pieces, try cutPiece(gpa, E, bytes, segs, from, to));
                 from = to;
             }
@@ -6515,9 +6534,11 @@ pub fn Column(comptime T: type, comptime E: type) type {
             const rebuilt = lo < self.slabs.items.len;
             // Room for the split and for the bases that follow it, taken
             // while the column still holds every value it had. `Slab.segments`
-            // is the run count `splitToBudget` cuts on, so this is the exact
-            // number of pieces that can come out of it, not an estimate.
-            const head_spill = if (rebuilt) self.slabs.items[lo].segments / self.budget else 0;
+            // is the run count `splitToBudget` cuts on, and
+            // `splitSpillCount` is the bound on the pieces that can come out
+            // of that many runs — the pad a boolean piece writes counted
+            // (`slab.zig:1007-1068`), so it is never one short.
+            const head_spill = if (rebuilt) slabmod.splitSpillCount(E, self.slabs.items[lo].segments, self.budget) else 0;
             try self.reserveSlabs(self.slabs.items.len + head_spill);
             // `spilled` has exactly one owner at every point and no guard
             // outlives it. The previous shape armed an `errdefer` that closed
@@ -6584,7 +6605,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
             // that point could only be answered by freeing them. The merge
             // pre-check admits a pair of at most `budget` runs, and its seam
             // costs at most three, so this is a bound and not an estimate.
-            try self.reserveSlabs(self.slabs.items.len + (sa + sb) / self.budget + 1);
+            try self.reserveSlabs(self.slabs.items.len + slabmod.splitSpillCount(E, sa + sb + 1, self.budget) + 1);
             try self.takeOwnership(a);
             try slabmod.merge(self.gpa, E, &self.slabs.items[a], &self.slabs.items[b]);
             var spilled = try slabmod.splitToBudget(self.gpa, E, &self.slabs.items[a], self.budget);

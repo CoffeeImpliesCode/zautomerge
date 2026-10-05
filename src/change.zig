@@ -405,7 +405,38 @@ pub const ChangeMetadata = struct {
 ///   is caught before anything is sized or indexed;
 /// * a `start_op` of zero;
 /// * a commit message that is not UTF-8.
+///
+/// The change hash is taken over the whole of `bytes` here, once, and only
+/// after the header has parsed — so a body that is refused never pays for it.
+/// A caller that already holds that hash hands it to [`parseChangeWithHash`]
+/// and this one pass is not taken at all.
 pub fn parseChange(bytes: []const u8, gpa: Allocator) ParseError!Change {
+    return parseChangeWithHash(bytes, gpa, null);
+}
+
+/// [`parseChange`] with the change hash the caller already holds, which is the
+/// seam between the chunk layer's one SHA-256 and this header reader.
+///
+/// `hash` must be `chunk.changeHashOf(.change, bytes)` — the whole thirty-two
+/// bytes over `bytes` framed as a `change` chunk. That is exactly what
+/// [`Chunk`](storage/chunk.zig)'s `hash` field carries for a chunk of this
+/// type, which is where a chunk-path caller gets it without hashing again,
+/// and what [`parseChange`] would have computed for itself. The change records
+/// it verbatim.
+///
+/// **A null `hash` is not a different answer, it is no answer**: the hash is
+/// taken here instead, in the same place [`parseChange`] takes it. That is
+/// what makes a refused body cost no SHA-256 whichever spelling called this.
+///
+/// **Nothing here compares `hash` against `bytes`.** That check has already
+/// been made, by the checksum comparison in `chunk.readChunk` over these very
+/// bytes before it handed the chunk over (`chunk.rs:293-295` is upstream's
+/// `checksum_valid`), and upstream's `parse_following_header` trusts the
+/// `Header` it is given for the same reason
+/// (`../github-automerge-automerge/rust/automerge/src/storage/change.rs:100-103`).
+/// A caller that hands over the hash of some other body gets a change whose
+/// `hash` is that other hash.
+pub fn parseChangeWithHash(bytes: []const u8, gpa: Allocator, hash: ?ChangeHash) ParseError!Change {
     var in: Input = .init(bytes);
 
     var dep_sink: DepSink = .{ .in = &in };
@@ -428,7 +459,10 @@ pub fn parseChange(bytes: []const u8, gpa: Allocator) ParseError!Change {
         .header_len = in.pos,
         .actor = .{ .bytes = actor_bytes },
         .deps = dep_sink.deps,
-        .hash = chunk.changeHashOf(.change, bytes),
+        // The seam. The hash the caller had, or this one — taken here, after
+        // the header parsed, which is where `parseChange` has always taken it,
+        // so a refused body still costs no SHA-256.
+        .hash = hash orelse chunk.changeHashOf(.change, bytes),
         .time = time,
         .message = message,
         .seq = seq,
@@ -625,6 +659,112 @@ test "a change automerge wrote parses to the fields and hash it has" {
     try testing.expectEqual(expected.bytes, change.hash.bytes);
     try testing.expectEqualSlices(u8, &[_]u8{ 0x9a, 0xc3, 0xd7, 0x30 }, &change.hash.checksum());
     try testing.expect(change.hash.eql(chunk.changeHashOf(.change, &two_change_chunks_body)));
+}
+
+test "a hash the chunk already had is the hash the change records" {
+    const gpa = testing.allocator;
+
+    // The chunk path, which is where the body was hashed once to check the
+    // four checksum bytes in the header and the rest was kept. The change is
+    // handed those same thirty-two bytes.
+    var framed: std.ArrayList(u8) = .empty;
+    defer framed.deinit(gpa);
+    try chunk.writeChunk(&framed, gpa, .change, &two_change_chunks_body);
+    const c = try chunk.parseChunk(framed.items);
+    try testing.expectEqual(chunk.ChunkType.change, c.typ);
+    const known = c.hash orelse return error.TestUnexpectedResult;
+
+    var parsed = try parseChangeWithHash(c.data, gpa, known);
+    defer parsed.deinit(gpa);
+    try testing.expectEqual(known.bytes, parsed.hash.bytes);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x9a, 0xc3, 0xd7, 0x30 }, &parsed.hash.checksum());
+    try testing.expect(parsed.hash.eql(chunk.changeHashOf(.change, c.data)));
+
+    // The self-hashing parse reaches the same change from the same body, so
+    // supplying the hash changed the hash and nothing else.
+    var computed = try parseChange(c.data, gpa);
+    defer computed.deinit(gpa);
+    try testing.expectEqual(computed.hash.bytes, parsed.hash.bytes);
+    try testing.expectEqual(computed.header_len, parsed.header_len);
+    try testing.expectEqualSlices(u8, computed.actor.bytes, parsed.actor.bytes);
+    try testing.expectEqual(computed.deps.len, parsed.deps.len);
+    try testing.expectEqual(computed.seq, parsed.seq);
+    try testing.expectEqual(computed.start_op, parsed.start_op);
+    try testing.expectEqual(computed.time, parsed.time);
+    try testing.expectEqualStrings(computed.message, parsed.message);
+    try testing.expectEqual(computed.other_actors.len, parsed.other_actors.len);
+    for (computed.deps, parsed.deps) |a, b| try testing.expect(a.eql(b));
+
+    // A null hash is "take it here", so all three spellings agree.
+    var absent = try parseChangeWithHash(c.data, gpa, null);
+    defer absent.deinit(gpa);
+    try testing.expectEqual(computed.hash.bytes, absent.hash.bytes);
+}
+
+test "a supplied hash moves no refusal" {
+    const gpa = testing.allocator;
+    // The hash of a body that is not this one. It must not turn a refusal into
+    // a parse, and it must not move one either.
+    const bogus = types.ChangeHash.zero;
+
+    // Every truncation of a valid header, both spellings. Which tag a
+    // truncation gets depends on where it falls — a dependency count the
+    // input cannot back is `LengthExceedsInput`, a missing byte is
+    // `UnexpectedEnd` — so this pins that neither spelling parses it.
+    for (0..built_header.len) |cut| {
+        const body = built_body[0..cut];
+        for ([_]?ChangeHash{ bogus, null }) |hash| {
+            if (parseChangeWithHash(body, gpa, hash)) |change| {
+                var owned = change;
+                owned.deinit(gpa);
+                return error.TestUnexpectedResult;
+            } else |_| {}
+        }
+    }
+
+    // Where a tag is known it is the same one either way.
+    const too_many_deps = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00 };
+    const bad_utf8 = [_]u8{
+        0x00, // 0 dependencies
+        0x01, 0x41, // actor "A"
+        0x01, // seq 1
+        0x01, // start_op 1
+        0x00, // time 0
+        0x02, 0xff, 0xfe, // message, not UTF-8
+        0x00, // 0 other actors
+    };
+    const no_other_actors = [_]u8{
+        0x00, // 0 dependencies
+        0x01, 0x41, // actor "A"
+        0x01, // seq 1
+        0x01, // start_op 1
+        0x00, // time 0
+        0x00, // empty message
+        0x04, // 4 other actors, and no bytes for them
+    };
+    const cases = [_]struct { body: []const u8, tag: ParseError }{
+        .{ .body = &too_many_deps, .tag = error.LengthExceedsInput },
+        .{ .body = &bad_utf8, .tag = error.InvalidUtf8 },
+        .{ .body = &no_other_actors, .tag = error.LengthExceedsInput },
+    };
+    for (cases) |c| {
+        try testing.expectError(c.tag, parseChangeWithHash(c.body, gpa, bogus));
+        try testing.expectError(c.tag, parseChangeWithHash(c.body, gpa, null));
+    }
+
+    // And one that fails late in the header, after the dependencies, the actor
+    // and the sequence number have all been read: a zero `start_op` is refused
+    // with the hash in hand too, so a supplied hash neither short-circuits the
+    // walk nor is walked to the end first.
+    var zero_start_op: [built_body.len]u8 = built_body;
+    var in: Input = .init(&zero_start_op);
+    var dep_sink: DepSink = .{ .in = &in };
+    try in.readCountThen(&dep_sink, hash_size, DepSink.collect);
+    _ = try in.readStrBytes(); // actor
+    _ = try in.takeUleb(); // seq
+    zero_start_op[in.pos] = 0x00;
+    try testing.expectError(error.InvalidLeb128, parseChangeWithHash(&zero_start_op, gpa, bogus));
+    try testing.expectError(error.InvalidLeb128, parseChangeWithHash(&zero_start_op, gpa, null));
 }
 
 test "an encoded change is a chunk that reads back as the same body" {

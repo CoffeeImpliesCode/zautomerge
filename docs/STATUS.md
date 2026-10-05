@@ -12,7 +12,9 @@ source path and execution.
 | --- | --- |
 | Final integrated Debug command | 69/69 steps succeeded; 3722/3723 Zig tests passed, one default-run skip, no failures. Includes `test slow-path ctest conformance save-interop`. |
 | Optimized-tree integrated Debug command | `zig build test`: 2006/2007 Zig tests passed with one default-run skip (62/62 steps). `zig build slow-path ctest conformance save-interop`: 1744/1744 passed (40/40 steps). Includes the ~14 new optimization tests. All ten golden vectors matched the reference; live save interop 6/6; the C ABI suite ran. |
+| Optimization round 1-8 (2026-10-05) | `zig build test`: 2035/2036 passed, one skip (62/62 steps). `zig build slow-path ctest conformance save-interop`: 1773/1773 passed (40/40 steps). All ten goldens matched; live save interop 6/6; the C ABI suite ran. ~35 new tests. |
 | Native benchmark, ReleaseSafe, `perf stat -e instructions` | Seven workloads in `bench/zautomerge_bench.zig`, each reproducing a suite-dominating case. Instructions retired, optimized tree: segmentation 0.89 B (was 10.57 B, **11.85x**); indexed-delta 1.61 B (was 2.54 B, **1.57x**); slab-merge 0.46 B (was 0.58 B, **1.26x**); prefix-bool 0.65 B (was 0.87 B, **1.33x**); update-object 12.47 B (was 18.76 B, **1.50x**). Checksums byte-identical across the pair wherever both were measured. |
+| Four-target cross matrix, optimized tree | `x86_64-linux` 2006 tests `tests_complete`; `powerpc64-linux` 2006 tests `tests_complete`; `x86_64-windows` build pass, run `runtime_unavailable` (no wine64); `aarch64-linux` `per_build_timeout`. The big-endian row is a gain over the pre-optimization run, which timed out there too. |
 | Default native test roots, Debug | 1992 passed, one skipped. The library root passed 1729 with one skip; all 118 upstream document cases passed. |
 | Forced slow-path library root, Debug | 1730/1730 passed, including the case skipped in the default run. |
 | Ten golden vectors and live save interop | Every golden file matched the reference; the live verifier reported 6/6 cases verified. |
@@ -22,6 +24,122 @@ source path and execution.
 | Fetched native and C consumers, Debug | 8/8 build steps succeeded; both executables ran against the final URL-and-hash package. |
 | Fetched native and C consumers, ReleaseFast | 8/8 build steps succeeded; explicit runtime checks remained active. |
 | Final hexane source ledger | All 272 covered declaration anchors resolve; 14 occurrences have explicit exclusion reasons. This is source-review evidence, not runtime proof. |
+
+## Optimization round 1-8, measured (2026-10-05)
+
+Eight audit findings were dispatched in parallel across disjoint modules. The
+result is stated without inflation: **one of the eight moved the instruction
+count and the other seven did not.** Figures are ReleaseSafe
+`perf stat -e instructions`, stable to 0.0002% on this host.
+
+| Workload | Before | After | Change |
+| --- | --- | --- | --- |
+| update-object | 12.464 B | 11.522 B | **-7.6% (1.08x)** |
+| segmentation | 0.892 B | 0.892 B | flat |
+| indexed-delta | 1.615 B | 1.616 B | flat |
+| slab-merge | 0.463 B | 0.463 B | flat |
+| prefix-bool | 0.653 B | 0.657 B | flat |
+| mark-index | 0.712 B | 0.712 B | flat |
+| mark-at-end | 1019.3 B | 1019.5 B | flat |
+
+**Where the win came from.** Optimization 5 — skipping `refitScratch` when the
+successor edge list is empty — is the only change a profile can see:
+`refitScratch` and `maxSuccCount` no longer appear in `update-object` at all,
+and the 7.6% is exactly that.
+
+**And why the other seven did not, which is the useful part.**
+
+* **1, hydrate double-copy.** Removed one copy per map key and one per text.
+  The copies were not what the profile was in, and the borrow that would have
+  removed the second is illegal: `transact.zig` parks mirror maps across a
+  commit that interns new keys into the arena they would point at.
+* **2, batch the update writes. Not implemented, and that is the finding.**
+  `Batch` does preserve DFS — op ids are position in `pending` — but a staged
+  row is invisible to the `seekOpsByMapKey`/`queryInsertAt` that place the next
+  one, so batching would break register row order (R2/R3). The runs it would
+  merge are length 1 on this workload anyway.
+* **3, hash once.** Removed a second SHA-256 per change body **on load**. No
+  benchmark workload loads in a loop, so it cannot show here; its gate is the
+  `change.jsonl` conformance vector, which stays byte-identical.
+* **4, stream the chunk list. Dropped.** The three `chunks[0].typ` reads in
+  `doc.zig` make a pure iterator impossible without restructuring the caller,
+  and the list is 7 allocations per load of which only one scales.
+* **6, anonymize arena.** A retained-bytes win, not an instruction win. Its
+  gate is peak RSS on a doc-building script, which no benchmark here runs.
+* **7 and 8.** Correctness-preserving and effect-neutral here: `prefix-bool`
+  moved -0.7% and `mark-at-end` flat.
+
+**The real remaining cost, for the next round.** `update-object` is still 40.5%
+`compiler_rt.memset`, and that is per **splice**, not per row: `Columns.splice`
+stages 21-22 columns and `Column.stageSplice` does a `tree.clone`,
+`owned.resize(slabs.len+1)` and an `agg_before`/`slabs` `appendSlice` per
+column, after which `rebuildAggs` reweighs every slab from the first touched.
+That belongs to `src/hexane/column.zig` and is not reachable from
+`transact.zig`.
+
+**A latent defect this round found, not by optimizing.** `splitToBudget` cut at
+`max_segments` runs of the run table, so a **boolean** piece cut out of a `true`
+run came one run over budget once its own leading pad was written, and
+`checkInvariants` refused the column. No committed test had ever run a budget
+below default, so nothing had caught it. Upstream counts the pad inside the
+budget (`bool.rs:312-317`, `:322-326`); the cut now spends it. Ledger entry 28.
+
+## Data-oriented audit (2026-10-05)
+
+A read-only audit of the optimized tree: twenty slices across disjoint modules,
+following the `data-oriented-design` skill — workload shape and cardinality,
+access matrix, authority and lifetime per structure, then at most two proposals
+each with a causal mechanism, a countercondition, and a validation gate. Nothing
+was implemented from it. Every number below is either measured on this tree or
+marked as needing a gate that does not exist yet.
+
+**The load-bearing negative result.** A layout rewrite is not available here.
+`Segment` is 56 bytes and already cache-line aligned; `Columns.splice` writes
+every field of all 21 columns, so field order is not a lever; the btree holds two
+to three slabs on every measured workload. SoA and ECS were rejected everywhere:
+these are single-owner, bounded-lifetime structures with no recurring
+cross-cutting scans. One more is ruled out by the port's own tested contract —
+`rle.skipLiterals` may **not** become a length-only walk, because the suite
+documents that this port chose to keep the refusals a full decode raises, and
+upstream's `.unwrap()` only gets away with it on a column validated at load.
+
+**Ranked by measured leverage on the seven benchmark workloads.**
+
+| # | Finding | Mechanism | Countercondition | Gate |
+| --- | --- | --- | --- | --- |
+| 1 | The hydrated mirror copies every map key and every text **twice**; the op set already interns those bytes (`hydrate.zig:1077`, `:1324`) | fewer bytes and fewer dependent loads per hydrated value | `transact.zig` holds `*Map` addresses, so mirror maps must stay stable | `update-object` + instructions |
+| 2 | `updateMapValue`/`updateListValue` bypass the `Batch` layer that already splices in bulk (`transact.zig:1716`, `:1784` vs `:2486`) | one splice per batch instead of per row | DFS→BFS op-id order would change every change hash; forbidden | `update-object` + instructions, hashes byte-identical |
+| 3 | Load SHA-256s the same change body twice — header checksum then change hash (`chunk.zig:531` vs `change.zig:431`); upstream computes it once | one fewer pass over identical bytes | the header keeps 4 bytes, so the hash must be published rather than recomputed | `conformance` `change.jsonl` |
+| 4 | `Document.load` materializes the whole chunk list where upstream streams (`doc.zig:3859`) | less retained memory and fewer reallocs per load | `loadIntoWith` reads `chunks[0].typ` three times | `conformance` `doc.jsonl` + save-interop |
+| 5 | `refitScratch` runs per row from `addSuccWithUndo` even for an empty edge list (`op_set.zig:2487`) | one fewer allocation and pass per row | must keep every path that widens a successor span | `update-object` + instructions |
+| 6 | `Anonymize`'s arena never resets, so high-water is O(all changes) | retained bytes, not instructions | no arena slice may escape `rewriteChange` | peak RSS on a doc-building script — **runnable without the benchmark** |
+| 7 | `bool.Decoder` has no `nextRunMax`; the boolean prefix weight re-runs per item per slab | O(items) → O(runs) per splice | unlike `rle`, bool carries no payload, so the refusal-parity argument does not transfer | `prefix-bool` (0.65 B) + instructions |
+| 8 | `elemidAt` builds five column cursors per call (`op_set.zig:3397`) | fewer dependent loads per element | a hoisted cursor must stay valid across the diff kernel's advance | `mark-at-end` + instructions |
+
+Three more are real but have **no gate today** and stay proposals until one
+exists: the per-hash sorted insert in sync's `sent_hashes`, `hashForOpid`'s
+linear scan, and `listRange`'s six locates per element.
+
+**Limits on this audit.** It is source analysis plus the instruction counts
+already measured; no proposal was built or timed. Every row above is an
+unvalidated hypothesis until its gate runs. The audit also cannot speak to the
+`aarch64-linux` row: that target's evidence is a phase timeout, not a profile.
+
+**The next suite-time win is library code, not test code.** A separate read-only
+slice measured the harness side. The suite's largest case, the segmentation
+oracle, is entirely test code, and the optimization round already took it from
+164.87 s to an inferred floor; what remains is ~100% its own `O(n²)` prefix
+visits (105 132 250 of them), and **no safe faster oracle exists** — the only
+`O(n)` primitive available is the `GraphemeBoundaryIter` the code under test is
+itself built on, so reusing it would make the test tautological. Its slice
+appends are 11 501 steps, 0.011% of that. Two genuine test-side quadratics
+remain and both are small: `fuzz_slab_merge_invariant`
+(`src/hexane/hexane_test.zig:474`) re-slices and re-reads the whole column after
+every operation, and `fuzz_prefix_column_bool`
+(`src/opset/columns.zig:3743-3747`) runs a `Theta(len)` `Column.get` sweep after
+every operation. Meanwhile 88.7% of the rollback case is library (`updateObject`
+is 47.0 s of 52.96 s). So the ranked table above is the right place to spend the
+next round, and no test-cost work is proposed on the strength of this audit.
 
 **Final native/C package snapshot:**
 `zautomerge-0.0.0-FlN8sHVpkgD8pe8q5n02h8J7rKw9D_J7N-YJneM1JmV9`.
@@ -795,6 +913,20 @@ down. Every `path:line` in this list was re-checked against the reference on
     local was the only thing still naming the buffer. The collector's sweep
     found it, and the release belongs on the failure path beside the
     successful one.
+28. **A split at the run budget handed out boolean pieces one run over it.** The
+    leading pad — the zero-count `false` run a slab opening on `true` carries
+    (`bool.rs:988-1002`) — is a run the wire spends and `measure` counts
+    (`src/hexane/column.zig:2584`), and a piece cut out of a `true` run has to
+    write it again. `splitToBudget` cut at `max_segments` runs of the run table
+    either way, so every piece behind the first stood one run over the budget
+    and `Column.checkInvariants` refused the column on it
+    (`src/hexane/column.zig:6881-6882`). Upstream never makes that correction
+    because it cuts the run out of the rebuild rather than out of a finished
+    slab, and the pad is counted there (`bool.rs:312-317`, `:322-326`); the
+    loader is the one place this port already left room for it, by cutting at
+    half the budget. The cut now spends the pad (`slab.zig:1007-1048`), and the
+    room a column reserves before it cuts is that same rule
+    (`slab.zig:1063-1068`, `column.zig:6291`, `:6387`, `:6541`, `:6608`).
 
 ### The pattern under 14 to 18
 

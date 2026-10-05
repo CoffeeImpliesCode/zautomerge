@@ -116,6 +116,7 @@ const chunkmod = @import("../storage/chunk.zig");
 const ids = @import("ids.zig");
 const optypes = @import("types.zig");
 const markidx = @import("mark_index.zig");
+const leb128 = @import("../leb128.zig");
 
 const ParseError = err.ParseError;
 const Allocator = std.mem.Allocator;
@@ -188,14 +189,98 @@ pub const BoolPrefixCodec = struct {
     pub const mustMergeKinds = hexane.Bool.mustMergeKinds;
     pub const canonicalSlab = hexane.Bool.canonicalSlab;
 
+    /// The slab's item count, and the number of true rows in it, the second
+    /// refused as `error.Overflow` rather than wrapped.
+    ///
+    /// **The fold is over runs, and a boolean run is O(1) to read however
+    /// long it is.** A boolean slab is a sequence of counts and holds no
+    /// value bytes at all (`bool.zig:12-15`, `bool.rs:13-25`), so a run of a
+    /// million `true`s costs the same single varint as a run of one, and
+    /// [`nextRunMax`](WireDecoder.nextRunMax) hands back `count` copies of
+    /// `value` in one step (`bool.zig:312-323`, `bool.rs:603-616`). A slab's
+    /// weight is the count of its true rows (`hexane/src/prefix.rs:316-325`),
+    /// and upstream's own fold of a run is
+    /// `target += run.value as usize * run.count` (`prefix.rs:322-324`) —
+    /// which is the addition below, in the type this port keeps: `i64`, where
+    /// upstream keeps `usize` and where a sum that leaves the range is
+    /// refused rather than wrapped.
+    ///
+    /// **This is the walk every reindex pays.** `Column.reindexFrom`
+    /// (`hexane/column.zig:6687-6693`) calls `weightOf` for every slab from
+    /// the first one a splice touched, and `settle` reaches it on every
+    /// splice (`column.zig:6553`), so the row-at-a-time fold this replaces
+    /// charged every edit a row per row from that slab on, however few runs
+    /// those rows were cut into. A boolean slab is the cheapest case for that
+    /// and the most wasteful: a slab of a million `true`s is one varint on
+    /// the wire and a million iterations here.
+    ///
+    /// **Every caller gets it.** There is no second walk to bring over: the
+    /// index rebuild (`hexane/column.zig:6687-6693`, reached from every
+    /// splice at `:6553`), the three slab-append paths that weigh a slab as
+    /// it lands (`:5244`, `:5553`, `:5595`), and the invariant check that
+    /// reweighs every slab against the index (`:6908`) all go through `E.
+    /// weightOf` with this codec, so one change here is the whole of it.
+    ///
+    /// **The refusals are the row walk's, at the same run.** There are two,
+    /// and a third the walk cannot raise at all.
+    ///
+    /// *Exhaustion, `error.InvalidValue`.* Both walks take runs in the same
+    /// order and stop at the first one they cannot have, and `nextRunMax`
+    /// answers null from exactly the state `next` answers null from: no items
+    /// left in the run in hand, and no bytes left to read the next one
+    /// (`bool.zig:320` against `:210`). So `null` while `left != 0` is the
+    /// same condition, at the same run, as the `null` from `next` that today
+    /// becomes `error.InvalidValue` — and the budget makes the two ends of
+    /// the walk agree too, because `count` is capped at `left` exactly as
+    /// `nth`'s is (`bool.zig:316`, `bool.rs:606`): a slab whose bytes hold
+    /// more rows than its `len` counts its first `len`, as the row walk did.
+    ///
+    /// *Overflow, `error.Overflow`.* Today's sum is a running total of `+1`
+    /// per true row, so it never falls: every addition raises it or leaves it
+    /// where it is. With `T` the sum in front of a run, `c` the count of
+    /// `true`s it holds and `M` the largest `i64`, the partial sums inside it
+    /// are `T, T+1, …, T+c` and they are monotone, so the row walk refuses at
+    /// its `(M - T + 1)`-st row exactly when `T + c > M`. That is the
+    /// condition the addition below refuses at, in the same run.
+    /// **A run cannot straddle the boundary**: it adds `c` atomically, and the
+    /// row the row walk refuses at is a member of the run this fold refuses
+    /// at, so the run fold never reads a header the row walk would not have
+    /// read to reach that row. The one sum it cannot even attempt is a run
+    /// wider than `i64` on a 64-bit `usize`; it refuses `error.Overflow` for
+    /// the same reason, since the row walk would have added `M` ones of that
+    /// run before it ran out of room. No slab reaches either refusal — a
+    /// count is at most `slab.len`, and a slab of `maxInt(i64) + 1` true rows
+    /// is not a slab — so the test at the foot of this file shows the fold's
+    /// own refusal through [`accumulateRun`](BoolPrefixCodec.accumulateRun),
+    /// which is the same addition at a sum a caller can reach.
+    ///
+    /// *A run of no rows.* This decoder cannot serve one: `count` is
+    /// `min(remaining, max)` with `remaining > 0` and `max = left > 0`, so
+    /// it is never zero, and a count of zero in the bytes is stepped over
+    /// inside `nextRunMax` rather than handed back (`bool.zig:280-298`).
+    /// **The loop needs no guard for one anyway**, because each iteration
+    /// makes progress whichever way it goes: it either spends rows, which
+    /// takes `left` down, or spends a header, which takes `dec.pos` up by at
+    /// least one byte — `readUnsigned` never returns a length of zero
+    /// (`leb128.zig:146-177` breaks only after reading a byte) — and the
+    /// bytes are finite. The test at the foot of this file walks slabs with
+    /// zero counts in them, which is the shape that would spin a loop that
+    /// spun on the count.
     pub fn weightOf(gpa: Allocator, slab: *const slabmod.Slab) ParseError!Weight {
         _ = gpa;
         var sum: i64 = 0;
         var dec = try WireDecoder.init(slab.data);
-        var i: usize = 0;
-        while (i < slab.len) : (i += 1) {
-            const w = (try dec.next()) orelse return error.InvalidValue;
-            sum = std.math.add(i64, sum, @intFromBool(w)) catch return error.Overflow;
+        var left: usize = slab.len;
+        while (left != 0) {
+            const run = (try dec.nextRunMax(left)) orelse return error.InvalidValue;
+            left -= run.count;
+            if (run.value) {
+                // A count too wide for `i64` refuses here and not at a cast,
+                // which would trap: the row walk would have refused inside
+                // this run, so this is where it refuses too.
+                const each = std.math.cast(i64, run.count) orelse return error.Overflow;
+                sum = std.math.add(i64, sum, each) catch return error.Overflow;
+            }
         }
         return .{ .len = slab.len, .prefix = sum };
     }
@@ -208,6 +293,39 @@ pub const BoolPrefixCodec = struct {
     /// (`hexane/src/prefix.rs:319-320`).
     pub fn accumulate(w: Wire, running: *i64) ParseError!void {
         running.* = std.math.add(i64, running.*, @intFromBool(w)) catch return error.Overflow;
+    }
+
+    /// `accumulate` over `count` rows of one value: a `true` row is one unit
+    /// and a `false` row is none, so a run of `count` `true`s adds `count` in
+    /// one step — upstream's own fold of a run
+    /// (`hexane/src/prefix.rs:322-324`).
+    ///
+    /// **Publishing it is what puts this codec on the fast arm of
+    /// `accumulateWire`** (`hexane/column.zig:291-301`), which dispatches on
+    /// `@hasDecl(E, "accumulateRun")` and takes a whole run at a time when a
+    /// decoder can hand one over. So `Column.runningAt` — and `getPrefix`,
+    /// `prefixIter` and every other prefix question through it — stops
+    /// reading a boolean slab a row at a time, which is the same win
+    /// [`weightOf`](BoolPrefixCodec.weightOf) takes for the index.
+    ///
+    /// **The refusals are the row walk's, at the same run, and no refusal is
+    /// lost to the fold.** The arm refuses `false` — which its caller turns
+    /// into `error.InvalidValue` (`column.zig:3387`) — on exactly the
+    /// exhaustion `accumulate` over rows sees, and it raises this function's
+    /// `error.Overflow` where that walk would. Every other refusal a boolean
+    /// run can carry is its own count varint, which the arm has to read to
+    /// learn how long the run is, so all three of `advanceRun`'s are raised
+    /// at the run that carries them (`bool.zig:300-311`). The sum is monotone
+    /// for the reason `weightOf` gives: a `true` adds one and a `false` adds
+    /// nothing, so with `T` the sum in front of the run, `c` its count and
+    /// `M` the largest `i64`, the row walk refuses at the run's
+    /// `(M - T + 1)`-st row exactly when `T + c > M`.
+    pub fn accumulateRun(w: Wire, count: usize, running: *i64) ParseError!void {
+        if (!w) return;
+        // A count wider than `i64` refuses here, at the same sum the row walk
+        // would have refused after `maxInt(i64)` of its own additions.
+        const each = std.math.cast(i64, count) orelse return error.Overflow;
+        running.* = std.math.add(i64, running.*, each) catch return error.Overflow;
     }
 
     /// The wire entry one value takes, and the running value it leaves
@@ -3867,5 +3985,434 @@ test "next_run_never_yields_adjacent_equal_runs_at_default_config" {
             std.debug.print("{s} (at {d})\n", .{ v.what, v.at });
         }
         return error.TestUnexpectedResult;
+    }
+}
+
+/// The boolean prefix weight walk as it stood before the run-level fold:
+/// one row at a time, with the checked addition per row.
+///
+/// A copy of the code the run fold replaced rather than a description of it,
+/// because the claim the tests below make is a substitution — the fold over
+/// runs answers what the fold over rows answered — and only the replaced
+/// code itself witnesses that.
+fn boolWeightOfRows(slab: *const slabmod.Slab) ParseError!BoolPrefixCodec.Weight {
+    var sum: i64 = 0;
+    var dec = try BoolPrefixCodec.WireDecoder.init(slab.data);
+    var i: usize = 0;
+    while (i < slab.len) : (i += 1) {
+        const w = (try dec.next()) orelse return error.InvalidValue;
+        sum = std.math.add(i64, sum, @intFromBool(w)) catch return error.Overflow;
+    }
+    return .{ .len = slab.len, .prefix = sum };
+}
+
+/// Whether two refusals are the same refusal: both answered, or both the
+/// same error.
+///
+/// This is not `==` on purpose. A `null` optional leaves its payload
+/// uninitialised, and `==`/`!=` on an optional error compare the whole
+/// representation — tag *and* payload — so two answered walks compare
+/// unequal whenever their garbage payloads differ. The comparison below
+/// reads the tag only, which is all a refusal is.
+fn sameRefusal(a: ?ParseError, b: ?ParseError) bool {
+    if (a) |ea| {
+        if (b) |eb| return ea == eb;
+        return false;
+    }
+    return b == null;
+}
+
+/// What one weight walk said about one slab: its weight, or the refusal it
+/// raised, in a shape two walks can be compared with `sameRefusal`.
+const WalkOutcome = struct {
+    weight: BoolPrefixCodec.Weight,
+    refused: ?ParseError,
+};
+
+/// Both folds on one slab, held to each other: the same weight, or the same
+/// refusal. What they agreed on is returned, so a caller can hold them to a
+/// refusal or an answer of its own.
+fn sameBoolWeight(gpa: Allocator, slab: *const slabmod.Slab) !WalkOutcome {
+    const runs = BoolPrefixCodec.weightOf(gpa, slab);
+    const rows = boolWeightOfRows(slab);
+    const a: WalkOutcome = if (runs) |w| .{ .weight = w, .refused = null } else |e| .{ .weight = .{}, .refused = e };
+    const b: WalkOutcome = if (rows) |w| .{ .weight = w, .refused = null } else |e| .{ .weight = .{}, .refused = e };
+    if (!sameRefusal(a.refused, b.refused) or a.weight.len != b.weight.len or a.weight.prefix != b.weight.prefix) {
+        std.debug.print("over runs {any} | over rows {any}\n", .{ a, b });
+        return error.TestUnexpectedResult;
+    }
+    return a;
+}
+
+/// One case's bytes as a slab owned by `gpa`.
+///
+/// `segments` and `tail` are left empty on purpose: a case is here to drive
+/// the two folds, and measuring the bytes first would refuse a malformed
+/// case before either fold ever saw it. The weight walk reads `data` and
+/// `len` and nothing else (`columns.zig:269-285`).
+fn boolCaseSlab(gpa: Allocator, bytes: []const u8, len: usize) !slabmod.Slab {
+    return .{ .data = try gpa.dupe(u8, bytes), .len = len, .segments = 0, .tail = .zero };
+}
+
+/// What one case owes, checked as well as agreed on, so a pair of walks that
+/// agree on a wrong answer cannot pass for a pair that agrees. A case that
+/// owes a refusal owes nothing else, and a case that owes an answer owes
+/// both halves of it.
+fn boolCaseOwed(outcome: WalkOutcome, want: ?ParseError, len: usize, prefix: i64) bool {
+    if (!sameRefusal(outcome.refused, want)) return false;
+    if (want != null) return true;
+    return outcome.weight.len == len and outcome.weight.prefix == prefix;
+}
+
+test "the run-level weight of a boolean slab is the row-level weight, over runs of one, two and three hundred" {
+    // **The claim is a substitution.** `weightOf` folds runs; it folded rows.
+    // Runs of one, two and three hundred are the three shapes that separate
+    // the two walks: a run no wider than the row walk's step, a run twice it,
+    // and a run that makes the row walk three hundred times longer than the
+    // run walk. Every slab is held to the row walk and to a count of the
+    // `true`s the test drew.
+    const gpa = testing.allocator;
+    var rng: u64 = 0x243f6a8885a308d3;
+    const run_lengths = [_]usize{ 1, 2, 300 };
+
+    for (0..32) |trial| {
+        var values: std.ArrayList(bool) = .empty;
+        defer values.deinit(gpa);
+        var trues: i64 = 0;
+        var v = (xorshift(&rng) & 1) == 0;
+        while (values.items.len < 900) {
+            const n = run_lengths[@as(usize, @intCast(xorshift(&rng) % run_lengths.len))];
+            for (0..n) |_| try values.append(gpa, v);
+            if (v) trues += @as(i64, @intCast(n));
+            v = !v;
+        }
+        const bytes = try BoolPrefixCodec.wireEncode(gpa, values.items, false);
+        defer gpa.free(bytes);
+        var slab = try slabmod.init(gpa, BoolPrefixCodec, bytes);
+        defer slab.deinit(gpa);
+
+        const w = (try sameBoolWeight(gpa, &slab)).weight;
+        if (w.len != values.items.len or w.prefix != trues) {
+            std.debug.print("trial {d}: {any} over {d} rows of which {d} are true\n", .{ trial, w, values.items.len, trues });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // **The two slabs the drawn runs cannot be relied on to produce**: one
+    // run of `true` and one run of `false`, each long enough that the row walk
+    // is the slow one by three orders of magnitude. The `true` slab is the one
+    // carrying the opening pad, and it is the shape the op set's `insert`
+    // column is at its widest (`bool.zig:14-15`).
+    for ([_]usize{ 900, 4096 }) |n| {
+        for ([_]bool{ true, false }) |v| {
+            const bytes = try BoolPrefixCodec.wireFill(gpa, n, v, false);
+            defer gpa.free(bytes);
+            var slab = try slabmod.init(gpa, BoolPrefixCodec, bytes);
+            defer slab.deinit(gpa);
+            const w = (try sameBoolWeight(gpa, &slab)).weight;
+            try testing.expectEqual(@as(usize, n), w.len);
+            try testing.expectEqual(if (v) @as(i64, @intCast(n)) else 0, w.prefix);
+        }
+    }
+}
+
+test "a slab that opens on a pad, and one with zero counts inside it, weight the same either way" {
+    // **The opening pad is a run of no rows, and it is never served.** A
+    // slab's own run sequence opens on a `false` run, so a slab whose values
+    // open on `true` carries a count of zero in front of them
+    // (`bool.zig:17-25`, `bool.rs:988-1002`). `nextRunMax` steps over that
+    // header and returns the run behind it, which is what `next` does too, so
+    // the fold must neither serve the pad as a run of no rows nor spend a row
+    // on it: a loop that spun on a zero count would hang on every all-`true`
+    // slab the port writes, and the second case below is here to catch that.
+    //
+    // **Zero counts inside the sequence are not canonical** — the writer
+    // merges two neighbours that carry the same value, so an empty run in the
+    // middle means the bytes should have been merged (`bool.zig:17-25`) — but
+    // the decoder accepts them and steps over each, so a fold that read one
+    // as a run of no rows and kept its budget would walk a different row
+    // count from the row walk. They are written in pairs, which leaves the
+    // parity the value is stored in the one the bytes mean: two zero counts
+    // flip it twice, so the second slab holds exactly the rows the first
+    // holds.
+    const gpa = testing.allocator;
+    const cases = [_][]const usize{
+        &.{ 300, 300 },
+        &.{ 300, 0, 0, 300 },
+        &.{ 0, 300 },
+        &.{ 1, 1, 1, 1, 0, 0, 0, 0, 1, 1 },
+        &.{ 0, 0, 0, 1 },
+    };
+
+    for (cases, 0..) |counts, i| {
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(gpa);
+        for (counts) |c| try leb128.appendUnsigned(&bytes, gpa, c);
+
+        var slab = try slabmod.init(gpa, BoolPrefixCodec, bytes.items);
+        defer slab.deinit(gpa);
+
+        // The model, walked the way `advanceRun` walks: the decoder opens on
+        // `true` and flips before each count, so the first count is a `false`
+        // count and a count of zero still occupies a run position.
+        var want_len: usize = 0;
+        var want_true: i64 = 0;
+        var value = true;
+        for (counts) |c| {
+            value = !value;
+            want_len += c;
+            if (value and c != 0) want_true += @as(i64, @intCast(c));
+        }
+        // The measure agrees: an empty run is a run position and no rows.
+        if (slab.len != want_len) {
+            std.debug.print("case {d} {any}: measured {d} rows, counts say {d}\n", .{ i, counts, slab.len, want_len });
+            return error.TestUnexpectedResult;
+        }
+
+        const w = (try sameBoolWeight(gpa, &slab)).weight;
+        if (w.len != want_len or w.prefix != want_true) {
+            std.debug.print("case {d} {any}: {any}, model {d} rows of which {d} are true\n", .{ i, counts, w, want_len, want_true });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "the run-level weight refuses what the row-level weight refuses, and neither of them allocates" {
+    // **Every refusal a boolean slab carries, at the same point.** The
+    // exhaustion is `error.InvalidValue`; the rest are the three raises of
+    // `advanceRun` — a truncated varint, an overlong one, and a count too wide
+    // for the packing (`bool.zig:325-335`, `leb128.zig:146-177`). Each case
+    // states which one it is, so the two folds agreeing on `error.InvalidValue`
+    // for a case that owed `error.UnexpectedEnd` cannot pass.
+    const gpa = testing.allocator;
+    // **A well-formed case is its own counts**: a count of one or two is one
+    // byte, and `300` is two (`0xac 0x02`). A slab's first count is a `false`
+    // count, so the all-`true` slab is the one with a zero in front of it.
+    const cases = [_]struct {
+        bytes: []const u8,
+        len: usize,
+        prefix: i64,
+        want: ?ParseError,
+        why: []const u8,
+    }{
+        .{ .bytes = &.{2}, .len = 5, .prefix = 0, .want = error.InvalidValue, .why = "two rows for five owed" },
+        .{ .bytes = &.{ 2, 2 }, .len = 4, .prefix = 2, .want = null, .why = "two falses then two trues" },
+        .{ .bytes = &.{ 2, 2 }, .len = 2, .prefix = 0, .want = null, .why = "two rows of a four-row slab" },
+        .{ .bytes = &.{3}, .len = 0, .prefix = 0, .want = null, .why = "no rows owed of a three-row slab" },
+        .{ .bytes = &.{}, .len = 3, .prefix = 0, .want = error.InvalidValue, .why = "no bytes at all" },
+        .{ .bytes = &.{ 0xac, 0x02 }, .len = 300, .prefix = 0, .want = null, .why = "three hundred falses" },
+        .{ .bytes = &.{ 0x00, 0xac, 0x02 }, .len = 300, .prefix = 300, .want = null, .why = "the pad then three hundred trues" },
+        .{ .bytes = &.{ 2, 0xac, 0x02 }, .len = 302, .prefix = 300, .want = null, .why = "two falses then three hundred trues" },
+        .{ .bytes = &.{0x80}, .len = 1, .prefix = 0, .want = error.UnexpectedEnd, .why = "a count cut short" },
+        .{ .bytes = &.{ 2, 0x80 }, .len = 3, .prefix = 0, .want = error.UnexpectedEnd, .why = "a count cut short after a run" },
+        .{ .bytes = &.{ 0x80, 0x00 }, .len = 1, .prefix = 0, .want = error.InvalidLeb128, .why = "an overlong count" },
+        .{ .bytes = &.{ 2, 0x80, 0x00 }, .len = 3, .prefix = 0, .want = error.InvalidLeb128, .why = "an overlong count after a run" },
+        .{ .bytes = &.{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02 }, .len = 1, .prefix = 0, .want = error.Overflow, .why = "a count too wide for the packing" },
+    };
+
+    for (cases) |c| {
+        var slab = try boolCaseSlab(gpa, c.bytes, c.len);
+        defer slab.deinit(gpa);
+        const outcome = try sameBoolWeight(gpa, &slab);
+        if (!boolCaseOwed(outcome, c.want, c.len, c.prefix)) {
+            std.debug.print("{s}: {any}, and the case says {any} at {d}\n", .{ c.why, outcome, c.want, c.prefix });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // **The sum's own refusal, at a boundary no slab can reach.** A count is
+    // at most `slab.len`, and a slab of `maxInt(i64) + 1` true rows is not a
+    // slab, so `weightOf` cannot leave `i64` and its `error.Overflow` is
+    // unreachable from bytes. `accumulateRun` is the same addition at a sum
+    // a caller can reach, and the row walk it replaces is `accumulate` over
+    // rows — so the pair below is where the two folds' overflow refusals are
+    // shown to land on the same sum: one `true` adds one, a run of them adds
+    // its count, and a `false` adds nothing however long it is.
+    var running: i64 = std.math.maxInt(i64) - 1;
+    try BoolPrefixCodec.accumulateRun(true, 1, &running);
+    try testing.expectEqual(std.math.maxInt(i64), running);
+    try testing.expectError(error.Overflow, BoolPrefixCodec.accumulateRun(true, 1, &running));
+    // **A refusal leaves the sum where it was**, which is what makes the
+    // refusal usable: `accumulateWire` propagates it with `try`
+    // (`column.zig:298`), so nothing downstream of it is half folded.
+    try testing.expectEqual(std.math.maxInt(i64), running);
+    running = std.math.maxInt(i64);
+    try BoolPrefixCodec.accumulateRun(false, 4096, &running);
+    try testing.expectEqual(std.math.maxInt(i64), running);
+    running = 0;
+    try BoolPrefixCodec.accumulateRun(false, std.math.maxInt(usize), &running);
+    try testing.expectEqual(@as(i64, 0), running);
+    if (comptime @bitSizeOf(usize) > @bitSizeOf(i64)) {
+        // **A run too wide for `i64` refuses rather than truncating**, at the
+        // sum the row walk would have refused after `maxInt(i64)` of its own
+        // additions.
+        try testing.expectError(error.Overflow, BoolPrefixCodec.accumulateRun(true, @as(usize, std.math.maxInt(i64)) + 1, &running));
+    }
+
+    // **And neither fold allocates, so there is no allocation point in one
+    // to move.** `weightOf` ignores its allocator — `reindexFrom` calls it
+    // once per slab and keeps the weight (`hexane/column.zig:6687-6693`) —
+    // so the fold that was replaced allocated nothing and the fold that
+    // replaced it allocates nothing. The sweep holds both to that: for every
+    // allocation index the run can be armed at, the two walks are answered
+    // and the allocator is left on the index it entered them on.
+    for (cases) |c| {
+        const needed = blk: {
+            var failing: testing.FailingAllocator = .init(gpa, .{});
+            var probe = try boolCaseSlab(failing.allocator(), c.bytes, c.len);
+            defer probe.deinit(failing.allocator());
+            _ = try sameBoolWeight(failing.allocator(), &probe);
+            break :blk failing.alloc_index;
+        };
+        // How many allocations the clean run makes, which is the number of
+        // arms worth visiting (`mark_index.zig:2907-2930`,
+        // `column.zig:9075-9101`).
+        for (0..needed + 1) |fail_index| {
+            var failing: testing.FailingAllocator = .init(gpa, .{ .fail_index = fail_index });
+            const arm = failing.allocator();
+            // A refusal in the setup says nothing about a fold, so it is
+            // skipped rather than counted as a pass: `fail_index` counts from
+            // the first allocation of the run, and this run's first
+            // allocation is the duplication.
+            var slab = boolCaseSlab(arm, c.bytes, c.len) catch continue;
+            defer slab.deinit(arm);
+            const before = failing.alloc_index;
+            const outcome = try sameBoolWeight(arm, &slab);
+            if (failing.alloc_index != before) {
+                std.debug.print("{s}: a fold allocated, and the allocator is on {d} not {d}\n", .{ c.why, failing.alloc_index, before });
+                return error.TestUnexpectedResult;
+            }
+            if (!boolCaseOwed(outcome, c.want, c.len, c.prefix)) {
+                std.debug.print("{s}: {any} under a refusal, and the case says {any} at {d}\n", .{ c.why, outcome, c.want, c.prefix });
+                return error.TestUnexpectedResult;
+            }
+        }
+        // **Armed where the walks left the allocator, they still answer.**
+        // `fail_index` counts successful allocations and latches once it is
+        // reached (`std/testing/FailingAllocator.zig:65-79`, the note at
+        // `mark_index.zig:3543-3547`), so arming it at `needed` refuses the
+        // very next allocation — and a walk that allocated would have been the
+        // one refused instead. The walks are answered and the refusal lands
+        // after them, which is the same point for the fold that was replaced
+        // and for the fold that replaced it.
+        var armed: testing.FailingAllocator = .init(gpa, .{ .fail_index = needed });
+        const arm = armed.allocator();
+        var slab = try boolCaseSlab(arm, c.bytes, c.len);
+        defer slab.deinit(arm);
+        const outcome = try sameBoolWeight(arm, &slab);
+        if (!boolCaseOwed(outcome, c.want, c.len, c.prefix)) {
+            std.debug.print("{s}: {any} armed at {d}, and the case says {any} at {d}\n", .{ c.why, outcome, needed, c.want, c.prefix });
+            return error.TestUnexpectedResult;
+        }
+        try testing.expectError(error.OutOfMemory, arm.alloc(u8, c.bytes.len + 1));
+    }
+}
+
+/// One refused splice on a boolean prefix column cut into several slabs, with
+/// the rows and the prefix sums read back as the model has them.
+fn boolSpliceRefusalAt(gpa: Allocator, budget: usize, model: []const bool, ins: []const bool, index: usize, del: usize) !void {
+    var col = try BoolPrefixColumn.initWithBudget(gpa, budget);
+    defer col.deinit();
+    try col.extend(gpa, model);
+
+    var want: std.ArrayList(bool) = .empty;
+    defer want.deinit(testing.allocator);
+    try want.appendSlice(testing.allocator, model[0..index]);
+    try want.appendSlice(testing.allocator, ins);
+    try want.appendSlice(testing.allocator, model[index + del ..]);
+
+    var committed = true;
+    if (col.splice(gpa, index, del, ins)) |_| {} else |e| {
+        // The bounds are checked before anything moves, so the only refusal a
+        // valid request can come back with is the allocator's.
+        if (e != error.OutOfMemory) return e;
+        committed = false;
+    }
+
+    // **The invariants are checked on a clean run and not here**: they read
+    // the column's own allocator (`column.zig:6863`, `:6879`), so an armed
+    // one refuses them and the refusal says nothing about the edit.
+    const got = try col.toSlice(testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(got.len, col.len());
+    if (!committed) {
+        // **A refusal leaves the column exactly as it was**: rows written but
+        // not counted, a range dropped but not rebuilt, or an index describing
+        // the layout before the cut would each show here as a value sequence
+        // that is neither list.
+        try testing.expectEqualSlices(bool, model, got);
+        return;
+    }
+    try testing.expectEqualSlices(bool, want.items, got);
+    // **And the prefix sums, which is the question `weightOf` answers.** Every
+    // one of them goes through `accumulateWire`, so a fold that lost or
+    // invented a row — or that refused where the row walk answered — shows
+    // here as a prefix that is not the count of the `true`s in front of it.
+    var trues: i64 = 0;
+    for (got, 0..) |_, i| {
+        if (i != 0) trues += @intFromBool(got[i - 1]);
+        const at = try col.getPrefix(i);
+        if (at != trues) {
+            std.debug.print("prefix at {d} is {d}, model {d}\n", .{ i, at, trues });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // The loop leaves the count of every row but the last, so the last row
+    // joins it here: the total is the count of every `true` in `got`.
+    if (got.len != 0) trues += @intFromBool(got[got.len - 1]);
+    if (trues != try col.getPrefix(got.len)) {
+        std.debug.print("the column's own total is not the model's {d}\n", .{trues});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "a refused allocation leaves a boolean prefix column's rows and prefix sums where they were" {
+    // **The path the fold is on.** `reindexFrom` asks this codec for the
+    // weight of every slab from the first one a splice touched
+    // (`hexane/column.zig:6687-6693`), and `settle` reaches it on every
+    // splice (`column.zig:6553`), so a weight that refused where the old one
+    // answered would show here as a refused splice on a column nothing was
+    // wrong with, and a weight that answered differently as a prefix sum that
+    // is not the model's.
+    const model = [_]bool{ true, false, true, true, false, true, false, true, true, true, false, false, true, false, true, true };
+    const ins = [_]bool{ true, true, false, true, false, false };
+    // Three and four runs to a slab, so sixteen alternating values are still
+    // several slabs: `reindexFrom` weighs more than one on every arm, which
+    // is the shape the measured profile was in.
+    const cuts = [_]struct { budget: usize, index: usize, del: usize }{
+        .{ .budget = 3, .index = 7, .del = 3 },
+        .{ .budget = 3, .index = 0, .del = 1 },
+        .{ .budget = 4, .index = 1, .del = 1 },
+        .{ .budget = 4, .index = 15, .del = 0 },
+    };
+    for (cuts) |c| {
+        const needed = blk: {
+            var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+            try boolSpliceRefusalAt(failing.allocator(), c.budget, &model, &ins, c.index, c.del);
+            // **The invariants, on a column no allocator refused.** They
+            // reweigh every slab against the index (`column.zig:6908`), which
+            // is the same fold this file changed, so they are read once here
+            // where every allocation they make succeeds.
+            var col = try BoolPrefixColumn.initWithBudget(testing.allocator, c.budget);
+            defer col.deinit();
+            try col.extend(testing.allocator, &model);
+            _ = try col.splice(testing.allocator, c.index, c.del, &ins);
+            if (try col.checkInvariants()) |v| {
+                std.debug.print("{s} (at {d})\n", .{ v.what, v.at });
+                return error.TestUnexpectedResult;
+            }
+            break :blk failing.alloc_index;
+        };
+        for (0..needed + 1) |fail_index| {
+            var failing: testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = fail_index });
+            // A refusal in the setup says nothing about the splice, so it is
+            // skipped rather than counted as a pass: `fail_index` counts from
+            // the first allocation of the run, and this run's first
+            // allocations are the column's own.
+            boolSpliceRefusalAt(failing.allocator(), c.budget, &model, &ins, c.index, c.del) catch |e| switch (e) {
+                error.OutOfMemory => continue,
+                else => return e,
+            };
+        }
     }
 }

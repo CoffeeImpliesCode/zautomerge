@@ -59,6 +59,15 @@
 //! It carries no payload. A value costs no bytes of its own, so a boolean slab
 //! is a bare sequence of run counts and the codec has nothing to copy out of
 //! it — [`Bool.Decoder`] hands back `bool` values, never windows.
+//!
+//! # What it hands back whole
+//!
+//! [`Bool.Decoder.nth`] reaches a row without reading the ones in front of
+//! it, and [`Bool.Decoder.nextRunMax`] goes one step further and hands back
+//! the *runs* — the shape upstream's `RunDecoder` gives a boolean column
+//! (`bool.rs:598-617`). A boolean run stores a count and nothing else, so a
+//! run is O(1) whatever its count is: there is no payload for a skip to walk
+//! and no payload for it to stop validating.
 
 const std = @import("std");
 const rle = @import("rle.zig");
@@ -168,7 +177,10 @@ pub fn BoolWith(comptime P: type) type {
         /// reads one LEB128 count. The document walk pulls booleans one at a
         /// time, so this never materialises the whole slab. A walk that has
         /// to *reach* a row without reading the ones before it uses
-        /// [`nth`](Decoder.nth), which steps over whole runs instead.
+        /// [`nth`](Decoder.nth), which steps over whole runs instead, and a
+        /// walk that wants the runs themselves — a weight to sum, a slab to
+        /// reindex — uses [`nextRunMax`](Decoder.nextRunMax), which is O(1)
+        /// per run whatever the run's count is.
         pub const Decoder = struct {
             /// The slab being walked, borrowed: it must stay alive and unmodified
             /// for as long as this decoder is used, and its owner must outlive the
@@ -235,10 +247,86 @@ pub fn BoolWith(comptime P: type) type {
                 }
             }
 
+            /// One run of a slab taken whole: `count` copies of `value`
+            /// (`Run<bool>`, `lib.rs:195-198`).
+            pub const RunValue = struct {
+                /// How many values the run holds, never more than the budget
+                /// the caller handed in.
+                count: usize,
+                /// The value every one of them carries.
+                value: bool,
+            };
+
+            /// The next run of values, at most `max` of them, or null once the
+            /// slab is exhausted (`RunDecoder::next_run_max`,
+            /// `bool.rs:598-617`).
+            ///
+            /// **O(1) per run, whatever the run is.** A boolean run stores a
+            /// count and nothing else — there is no run header and no payload
+            /// behind one — so a run of one and a run of a million cost the
+            /// same single varint read. That is what the same walk is only
+            /// *partly* worth in `rle.zig:575-584`, where a literal run's
+            /// values sit packed behind its header and have to come back one
+            /// at a time. Here there is no third kind of run to worry about.
+            ///
+            /// **The value is a parity, not a read.** `self.value` already
+            /// carries the current run's value because
+            /// [`advanceRun`](Decoder.advanceRun) flips it once per count, so
+            /// answering for it costs nothing — the field is the decoder's
+            /// own state, initialised to `true` so the first flip yields the
+            /// `false` the wire opens with (`bool.rs:457-460`,
+            /// `bool.zig:195-198`).
+            ///
+            /// **The opening zero-count pad is stepped over, never served.**
+            /// A count of zero leaves `remaining` at zero, so the loop takes
+            /// another header — which is what [`next`](Decoder.next) and
+            /// [`nth`](Decoder.nth) do, and what upstream does
+            /// (`bool.rs:604-615`). An interior zero count is dropped and
+            /// flips the parity the same way here as there, so the runs this
+            /// hands back are the runs [`decodeAll`](BoolWith.decodeAll)
+            /// writes and [`segmentsOf`](column.zig:2557) counts.
+            ///
+            /// **Past the end is null, with the slab spent**: `remaining` at
+            /// zero and `pos` at `bytes.len`, byte for byte the state
+            /// `next` leaves and where a further `nextRunMax` answers null
+            /// again. A budget of zero answers null where upstream's
+            /// `remaining.min(0)` hands back a zero-count run
+            /// (`bool.rs:606`), and that is the one difference: a run that
+            /// spends nothing is a run a caller looping on the count would
+            /// never leave, so this takes the same guard `rle.zig:589-590`
+            /// takes. Nothing is consumed by it, so the call after reads the
+            /// run the first one would have.
+            ///
+            /// **No refusal is lost.** The only refusals a boolean run can
+            /// carry are the three [`advanceRun`](Decoder.advanceRun) raises
+            /// — a truncated varint, an overlong one, and a count too wide
+            /// for a `usize` — and every one of them is a property of the
+            /// run's own count varint, which this walk **has** to read to
+            /// learn how long the run is. There is no payload behind a
+            /// boolean run for a skip to step over unchecked, which is
+            /// exactly what blocks the same walk in `rle.zig` (`rle.zig:
+            /// 518-531`): a literal run's declared length and its UTF-8 live
+            /// in its payload, so a count-only skip there would step over a
+            /// refusal. Here every refusal is raised at the run that carries
+            /// it, where the same number of `next` calls raises it.
+            pub fn nextRunMax(self: *Decoder, max: usize) ParseError!?RunValue {
+                if (max == 0) return null;
+                while (true) {
+                    if (self.remaining > 0) {
+                        const count = @min(self.remaining, max);
+                        self.remaining -= count;
+                        return .{ .count = count, .value = self.value };
+                    }
+                    if (self.pos >= self.bytes.len) return null;
+                    try self.advanceRun();
+                }
+            }
+
             /// Reads the run count at `pos`, flips the value it stands for
             /// and loads how many items the run owes — the run step
-            /// [`next`](Decoder.next) and [`nth`](Decoder.nth) both take
-            /// (`advance_run`, `bool.rs:547-559`).
+            /// [`next`](Decoder.next), [`nth`](Decoder.nth) and
+            /// [`nextRunMax`](Decoder.nextRunMax) all take (`advance_run`,
+            /// `bool.rs:547-559`).
             fn advanceRun(self: *Decoder) ParseError!void {
                 const run = try P.readUnsigned(self.bytes[self.pos..]);
                 self.pos += run.len;
@@ -633,6 +721,276 @@ test "run counts that overflow the total are rejected" {
     try std.testing.expectError(error.Overflow, countValues(rle.Leb128, &slab));
 }
 
+/// Holds [`Bool.Decoder.nextRunMax`] against `next` and `nth` over `values`,
+/// which is what `bytes` encodes: every value a run carries is the one
+/// `next` reads at the same offset, and every offset is also the one `nth`
+/// lands on.
+///
+/// **Every value, not a sample.** A run-level walk that mis-lands inside a
+/// run still agrees at some offsets and fails at others, so a spot check
+/// cannot stand in for the sweep.
+///
+/// The budget handed in is `values.len`, which is past the end of every slab
+/// this is called with: no run is ever cut short, so what it compares are
+/// the runs the format declares. A budget short enough to cut one is
+/// `nextRunMax past the end, on a budget, and spent`'s question.
+fn checkNextRunMaxParity(values: []const bool, bytes: []const u8) !void {
+    var runs = try Bool.Decoder.init(bytes);
+    var items = try Bool.Decoder.init(bytes);
+    var seen: usize = 0;
+    while (try runs.nextRunMax(values.len)) |run| {
+        // A count of zero would spend nothing and the walk would never end.
+        // The format has the one, and it is stepped over rather than served.
+        try std.testing.expect(run.count > 0);
+        for (0..run.count) |_| {
+            try std.testing.expect(seen < values.len);
+            try std.testing.expectEqual(@as(?bool, values[seen]), try items.next());
+            // **A fresh cursor per offset.** `nth(n)` consumes the `n` in
+            // front of the target, so a cursor carried round the loop would
+            // land on row `2n` rather than row `n` — the reason
+            // `nth raises the refusals next does` asks each offset of its own
+            // cursor too.
+            var jumped = try Bool.Decoder.init(bytes);
+            try std.testing.expectEqual(@as(?bool, values[seen]), try jumped.nth(seen));
+            seen += 1;
+        }
+    }
+    try std.testing.expectEqual(values.len, seen);
+    // Both walks are spent, and the run walk says so where `next` does.
+    try std.testing.expectEqual(@as(?bool, null), try items.next());
+    try std.testing.expectEqual(@as(?Bool.Decoder.RunValue, null), try runs.nextRunMax(1));
+}
+
+test "nextRunMax hands back every run of a slab whole" {
+    const gpa = std.testing.allocator;
+    const cases = [_][]const bool{
+        // The empty slab: no runs at all, so the walk answers null at once.
+        &.{},
+        // **Runs of 0.** Only the very first count may be zero — the pad that
+        // lets a slab open on `true` — and it is stepped over rather than
+        // served, so a slab that opens on `true` starts with a *real* run.
+        &.{true},
+        &.{ true, true },
+        // **Runs of 1 and of 2**, where a run-level walk and a value-level
+        // walk differ by the least there is to tell.
+        &.{false},
+        &.{ false, false },
+        &.{ false, true },
+        &.{ true, false },
+        &.{ true, false, true, false, true, false },
+        &.{ false, false, true, true },
+        // **Runs of 300.** A count whose LEB128 takes two bytes, so the run's
+        // length is not the length of the run's own header, on its own and
+        // behind another run.
+        &([_]bool{false} ** 300),
+        &([_]bool{true} ** 300),
+        &([_]bool{false} ** 300 ++ [_]bool{true} ** 300),
+        &([_]bool{true} ** 300 ++ [_]bool{false} ** 300),
+        // A slab that opens on `true` and then alternates: the pad, a wide
+        // run and a count of 1 all in one slab, which is the shape where a
+        // skip that treats the pad as a run or forgets to flip its parity
+        // shows.
+        &([_]bool{true} ** 2 ++ [_]bool{false} ++ [_]bool{true} ++ [_]bool{false} ** 300),
+        &([_]bool{true} ++ [_]bool{false} ** 3 ++ [_]bool{true}),
+    };
+    for (cases) |slice| {
+        const bytes = try encode(gpa, slice);
+        defer gpa.free(bytes);
+        try checkNextRunMaxParity(slice, bytes);
+    }
+    // A slab of many runs, at every run boundary.
+    {
+        var wide: [400]bool = undefined;
+        pseudoRandom(&wide, 2024);
+        const bytes = try encode(gpa, &wide);
+        defer gpa.free(bytes);
+        try checkNextRunMaxParity(&wide, bytes);
+    }
+    // **The opening pad is not a run.** `[true, true]` is two counts and one
+    // run, and the walk says so before it says anything about the values.
+    {
+        const bytes = try encode(gpa, &.{ true, true });
+        defer gpa.free(bytes);
+        try std.testing.expectEqualSlices(u8, &.{ 0, 2 }, bytes);
+        var dec = try Bool.Decoder.init(bytes);
+        const run = (try dec.nextRunMax(16)).?;
+        try std.testing.expectEqual(@as(usize, 2), run.count);
+        try std.testing.expectEqual(true, run.value);
+        try std.testing.expectEqual(@as(?Bool.Decoder.RunValue, null), try dec.nextRunMax(16));
+    }
+    // The empty slab answers a run the way it answers a value.
+    {
+        var dec = try Bool.Decoder.init(&[_]u8{});
+        try std.testing.expectEqual(@as(?Bool.Decoder.RunValue, null), try dec.nextRunMax(1));
+        try std.testing.expectEqual(@as(?bool, null), try dec.next());
+    }
+}
+
+test "nextRunMax past the end, on a budget, and spent" {
+    const gpa = std.testing.allocator;
+    // A budget cuts a run short and the rest of it comes back on the next
+    // call under the same value, so 300 values are served by three reads of
+    // one two-byte varint rather than 300 reads of one value.
+    {
+        const bytes = try encode(gpa, &([_]bool{false} ** 300));
+        defer gpa.free(bytes);
+        var dec = try Bool.Decoder.init(bytes);
+        for ([_]usize{ 100, 100, 100 }) |want| {
+            const run = (try dec.nextRunMax(want)).?;
+            try std.testing.expectEqual(want, run.count);
+            try std.testing.expectEqual(false, run.value);
+        }
+        // Past the end, with a budget that would have fitted.
+        try std.testing.expectEqual(@as(?Bool.Decoder.RunValue, null), try dec.nextRunMax(300));
+        try std.testing.expectEqual(@as(?bool, null), try dec.next());
+    }
+    // A budget that crosses a run boundary hands back one run at a time, and
+    // a budget of one is one value: the same five answers `next` gives.
+    {
+        const bytes = try encode(gpa, &.{ false, false, true, true, true });
+        defer gpa.free(bytes);
+        try std.testing.expectEqualSlices(u8, &.{ 2, 3 }, bytes);
+        var wide = try Bool.Decoder.init(bytes);
+        const first = (try wide.nextRunMax(3)).?;
+        try std.testing.expectEqual(@as(usize, 2), first.count);
+        try std.testing.expectEqual(false, first.value);
+        const second = (try wide.nextRunMax(3)).?;
+        try std.testing.expectEqual(@as(usize, 3), second.count);
+        try std.testing.expectEqual(true, second.value);
+        try std.testing.expectEqual(@as(?Bool.Decoder.RunValue, null), try wide.nextRunMax(3));
+
+        var ones = try Bool.Decoder.init(bytes);
+        var items = try Bool.Decoder.init(bytes);
+        while (try ones.nextRunMax(1)) |run| {
+            try std.testing.expectEqual(@as(usize, 1), run.count);
+            try std.testing.expectEqual(@as(?bool, run.value), try items.next());
+        }
+        try std.testing.expectEqual(@as(?bool, null), try items.next());
+    }
+    // Past the end by a wide margin, and spent either way: byte for byte the
+    // state `next` leaves behind.
+    {
+        const bytes = try encode(gpa, &.{ false, false, true });
+        defer gpa.free(bytes);
+        const whole = std.math.maxInt(usize);
+        // Past the end by a wide margin, and spent either way: byte for byte
+        // the state `next` leaves behind. **The decoder is walked out first** —
+        // a fresh one answers its first run, which is the point of the next
+        // block.
+        var past = try Bool.Decoder.init(bytes);
+        _ = (try past.nextRunMax(whole)).?;
+        _ = (try past.nextRunMax(whole)).?;
+        try std.testing.expectEqual(@as(?Bool.Decoder.RunValue, null), try past.nextRunMax(whole));
+        try std.testing.expectEqual(@as(?bool, null), try past.next());
+        // Part way in, a run comes back whole and the next call reads the
+        // run behind it rather than the rest of the one in hand.
+        var mid = try Bool.Decoder.init(bytes);
+        const head = (try mid.nextRunMax(whole)).?;
+        try std.testing.expectEqual(@as(usize, 2), head.count);
+        try std.testing.expectEqual(false, head.value);
+        const tail = (try mid.nextRunMax(whole)).?;
+        try std.testing.expectEqual(@as(usize, 1), tail.count);
+        try std.testing.expectEqual(true, tail.value);
+        try std.testing.expectEqual(@as(?Bool.Decoder.RunValue, null), try mid.nextRunMax(whole));
+        try std.testing.expectEqual(@as(?bool, null), try mid.next());
+    }
+    // **A budget of zero answers null**, where upstream's `remaining.min(0)`
+    // hands back a zero-count run (`bool.rs:606`). The difference is the
+    // guard `rle.zig:589-590` takes: a run that spends nothing is a run a
+    // caller looping on the count would never leave. Nothing is consumed, so
+    // the very next call reads the run the first one would have.
+    {
+        const bytes = try encode(gpa, &.{ false, false, true });
+        defer gpa.free(bytes);
+        var dec = try Bool.Decoder.init(bytes);
+        try std.testing.expectEqual(@as(?Bool.Decoder.RunValue, null), try dec.nextRunMax(0));
+        // The zero budget consumed nothing, so the run behind it is still
+        // whole — but the budget of one cuts that run to one row, and the
+        // row left in hand is the `false` the next call answers.
+        try std.testing.expectEqual(@as(usize, 1), (try dec.nextRunMax(1)).?.count);
+        try std.testing.expectEqual(@as(?bool, false), try dec.next());
+        try std.testing.expectEqual(@as(?bool, true), try dec.next());
+    }
+}
+
+test "nextRunMax raises the refusals next does" {
+    const whole = std.math.maxInt(usize);
+    // A truncated varint behind a run the walk steps over: the same
+    // `error.UnexpectedEnd` the `next` past that run's last value raises.
+    // Upstream's `advance_run` sets `remaining = 0` and ends the iteration
+    // instead (`bool.rs:552-558`), so this is the refusal a run-level walk
+    // would swallow if it did not have to read the count to know how long
+    // the run is.
+    {
+        var dec = try Bool.Decoder.init(&.{ 0x02, 0x80 });
+        const run = (try dec.nextRunMax(whole)).?;
+        try std.testing.expectEqual(@as(usize, 2), run.count);
+        try std.testing.expectEqual(false, run.value);
+        try std.testing.expectError(error.UnexpectedEnd, dec.nextRunMax(whole));
+        // And the walk is not spent by the refusal: the cursor is where the
+        // error left it, exactly as `next` leaves it.
+        try std.testing.expectError(error.UnexpectedEnd, dec.next());
+    }
+    // An overlong LEB128, refused as a malformed encoding rather than read
+    // as a count.
+    {
+        var dec = try Bool.Decoder.init(&([_]u8{0x80} ** 11));
+        try std.testing.expectError(error.InvalidLeb128, dec.nextRunMax(whole));
+    }
+    // A count the tenth byte cannot hold: refused as an overflow, which is
+    // what `decodeAll` and `countValues` raise for the same bytes.
+    {
+        var dec = try Bool.Decoder.init(
+            &.{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02 },
+        );
+        try std.testing.expectError(error.Overflow, dec.nextRunMax(whole));
+    }
+    // **A refusal behind a wide budget, not just behind a count of one.** A
+    // slab's weight is summed under a budget of the whole slab, so the
+    // refusal has to survive it: it is the walk that must read every count,
+    // not the budget that has to be small.
+    {
+        var dec = try Bool.Decoder.init(&.{ 0x05, 0x05, 0x80 });
+        try std.testing.expectEqual(@as(usize, 5), (try dec.nextRunMax(whole)).?.count);
+        try std.testing.expectEqual(@as(usize, 5), (try dec.nextRunMax(whole)).?.count);
+        try std.testing.expectError(error.UnexpectedEnd, dec.nextRunMax(whole));
+    }
+    // A slab that decodes cleanly decodes the same walked run by run, with
+    // every value landing where `next` puts it.
+    {
+        const gpa = std.testing.allocator;
+        var values: [300]bool = undefined;
+        pseudoRandom(&values, 11);
+        const bytes = try encode(gpa, values[0..]);
+        defer gpa.free(bytes);
+        var runs = try Bool.Decoder.init(bytes);
+        var items = try Bool.Decoder.init(bytes);
+        while (try runs.nextRunMax(values.len)) |run| {
+            for (0..run.count) |_| {
+                try std.testing.expectEqual(@as(?bool, run.value), try items.next());
+            }
+        }
+        try std.testing.expectEqual(@as(?bool, null), try items.next());
+        try std.testing.expectEqual(@as(?Bool.Decoder.RunValue, null), try runs.nextRunMax(values.len));
+    }
+    // The runs the walk hands back add up to the values `decodeAll` writes,
+    // which is the invariant every consumer of a weight rests on.
+    {
+        const gpa = std.testing.allocator;
+        var values: [301]bool = undefined;
+        pseudoRandom(&values, 4321);
+        const bytes = try encode(gpa, values[0..]);
+        defer gpa.free(bytes);
+        const decoded = try Bool.decodeAll(bytes, gpa);
+        defer gpa.free(decoded);
+        var total: usize = 0;
+        var dec = try Bool.Decoder.init(bytes);
+        while (try dec.nextRunMax(whole)) |run| total += run.count;
+        try std.testing.expectEqual(decoded.len, total);
+        try std.testing.expectEqual(values[0..].len, total);
+    }
+}
+
 // ── Upstream `hexane/src/tests.rs`, the frozen byte fixtures ──────────────────
 
 test "golden_format_bool" {
@@ -760,3 +1118,29 @@ test "the boolean codec encodes the reference's bytes for every golden case" {
 //   both have to agree that it costs a byte, and the bytes are obtained
 //   through `encodedSize`, so a disagreement between them would fail the byte
 //   compare rather than hide inside it.
+//
+// * **`nextRunMax` is upstream's `RunDecoder::next_run_max`
+//   (`bool.rs:598-617`) and it is here whole, not partially.** `rle.zig`'s
+//   `nextRunMax` can only take a *repeat* or a *null* run whole
+//   (`rle.zig:589-619`): a literal run's values sit packed behind its header,
+//   so it comes back one value at a time and the walk costs O(values) for it.
+//   A boolean run has no payload at all — its value is its position in the run
+//   sequence (`bool.rs:13-25`) — so every run is O(1) and the walk is
+//   O(runs) for the whole slab.
+//
+// * **The "no refusal is lost" contract transfers to `bool`, and the reason
+//   is the same fact.** For `rle` it holds only because `nth` re-reads a
+//   literal run's payloads (`skipLiterals`, `rle.zig:621-635`) — that is what
+//   keeps `error.LengthExceedsInput` and `error.InvalidUtf8` alive under a
+//   count-only skip (`rle.zig:518-531`). `bool` has neither refusal anywhere
+//   in its decoder: its run header *is* its whole body, and the only three
+//   refusals `advanceRun` can raise — `error.UnexpectedEnd`,
+//   `error.InvalidLeb128` and `error.Overflow` — are all properties of that
+//   one count varint (`advanceRun`, below `nextRunMax`), which a run-level
+//   walk must read to learn the run's length. So there is nothing behind a
+//   boolean run for a skip to step over unchecked, and the contract is
+//   satisfied by construction rather than by a workaround.
+//
+// * **The one deviation from upstream is a budget of zero**, which answers
+//   null here and a zero-count run there (`bool.rs:606`). It is the guard
+//   `rle.zig:589-590` already takes, and it consumes nothing either way.

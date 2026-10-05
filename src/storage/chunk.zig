@@ -21,6 +21,15 @@
 //! Because the hash covers the body, a chunk that hashes to its recorded
 //! checksum cannot have been altered anywhere inside it.
 //!
+//! **One hash, kept whole.** `readChunk` takes that SHA-256 once and publishes
+//! all thirty-two bytes of it: [`Chunk.checksum`] is the first four and
+//! [`Chunk.hash`] is all of it, so the change hash a body parser needs is
+//! already in hand instead of a second pass over the same bytes. Upstream
+//! keeps the same pair side by side in `Header` (`chunk.rs:187-194`), fills
+//! both from one `hash()` call (`chunk.rs:198-201`, `:271`, `:279`), and
+//! `Change::hash` reads the header back rather than recomputing
+//! (`change.rs:268-270`).
+//!
 //! The one exception is `ChunkType.compressed`, whose stored checksum is the
 //! checksum of the **inflated** body hashed as a `ChunkType.change`, not of
 //! the DEFLATE stream on the wire. Upstream writes the change's own checksum
@@ -71,6 +80,12 @@ pub const ChunkType = enum(u8) {
 /// equals `checksumOf(typ, data)` for every type except `compressed`, whose
 /// checksum covers the inflated body.
 ///
+/// **`hash` is the whole of what `checksum` is a prefix of.** The one SHA-256
+/// taken to compare those four bytes against the header is kept, not
+/// truncated, so the change hash a body parser downstream needs travels with
+/// the chunk instead of being taken again over the same body. It is null
+/// exactly when `typ == .compressed`, whose body was not hashed here at all.
+///
 /// **`frame` is the chunk and `data` is its tail.** The header cannot be
 /// derived from `data`, because the LEB128 carrying the length is exactly as
 /// wide as the length needs, so a reader that needs the whole chunk — the one
@@ -89,6 +104,19 @@ pub const Chunk = struct {
     /// `compressed` it covers the *inflated* body and is checked by
     /// [`decompressChunk`] instead.
     checksum: [checksum_size]u8,
+    /// The hash `checksum` is the first four bytes of, whole:
+    /// `SHA-256(typ || uleb128(data.len) || data)`, the thirty-two bytes
+    /// [`changeHashOf`] returns for those arguments — a change's identity when
+    /// `typ` is `change`, and that chunk type's own hash otherwise.
+    ///
+    /// This is the hash, not a checksum widened to fill it: the bytes past the
+    /// fourth are hash output here and zeros in `ChangeHash.fromChecksum`.
+    ///
+    /// **Null means the body was never hashed, and only ever that.** A
+    /// `compressed` chunk's stored checksum covers the inflated body rather
+    /// than the deflated bytes in `data` (`chunk.rs:118-122`), so there is no
+    /// body hash to publish and [`decompressChunk`] is what verifies it.
+    hash: ?ChangeHash,
     /// The body as stored, borrowed from the buffer the chunk was parsed
     /// from — still deflated for `ChunkType.compressed`.
     data: []const u8,
@@ -226,14 +254,73 @@ pub fn compressChunk(
 /// `parseChunk` cannot check the checksum without inflating. The expansion is
 /// unbounded — see [`decompressRaw`] — so this is where a caller with a
 /// resource ceiling imposes one.
+///
+/// **This is a spelling of [`decompressChunkWithHash`]**, which is where a
+/// compressed chunk's change hash comes from. A caller that has nothing to do
+/// with that hash — one that parses the inflated body by a route that hashes
+/// it again — is served by this one and pays nothing extra for it.
 pub fn decompressChunk(gpa: std.mem.Allocator, chunk: Chunk) ParseError![]u8 {
+    return (try decompressChunkWithHash(gpa, chunk)).body;
+}
+
+/// What [`decompressChunkWithHash`] hands back: the inflated body, which the
+/// caller owns, and the change hash the chunk's own header was checked
+/// against.
+///
+/// **The two are one value because they are one computation.** Upstream keeps
+/// the same pair side by side — `Header` carries the whole hash and the chunk's
+/// `checksum_valid` compares its first four bytes out of that one `hash()`
+/// call (`chunk.rs:187-201`, `:271`, `:279`) — and [`Chunk`] now carries it
+/// too for a body that never had to be inflated. This is what puts the pair on
+/// the compressed case, which is the one that had no place to keep it.
+pub const Inflated = struct {
+    /// The inflated body, owned by the caller and freed with `gpa`. Every
+    /// slice a body parser derives from it points into this buffer, so it must
+    /// outlive the parse and nothing may outlive it.
+    body: []u8,
+    /// `SHA-256(0x01 || uleb128(body.len) || body)` — the whole thirty-two
+    /// bytes, of which this chunk's header records the first four. It is
+    /// exactly what `changeHashOf` returns for those arguments, and exactly
+    /// what `change.zig`'s `parseChange` would compute for itself over the
+    /// same bytes: handing it to a body parser in place of letting that parser
+    /// hash saves the second SHA-256 over the body and changes nothing else.
+    hash: ChangeHash,
+};
+
+/// [`decompressChunk`], handing back the change hash this call had to compute
+/// anyway to do its job.
+///
+/// **This is where a compressed chunk's change hash exists at all.** The stored
+/// checksum of a `compressed` chunk is the checksum of the *inflated* body
+/// hashed as a `change` chunk (`chunk.rs:118-122`), so this is the first and
+/// only place those bytes are ever hashed: [`readChunk`] cannot produce a hash
+/// for this type because it never inflates, and a body parser downstream would
+/// otherwise take the same SHA-256 over the same bytes a second time. Upstream
+/// reads the hash back out of the header it inflated and verified
+/// (`change.rs:268-270`), which is what this hands over instead.
+///
+/// **The refusals are [`decompressChunk`]'s, tag for tag and at the same
+/// points**: `error.InvalidChunkType` before a byte is read, `error.InvalidDeflate`
+/// from the inflation, `error.OutOfMemory` from the growth, and
+/// `error.InvalidChecksum` from the comparison — last, and before any caller
+/// sees the inflated bytes. On any of them nothing is returned, the inflated
+/// buffer is freed on the way out by the same `errdefer`, and no column has
+/// been read, so a malformed compressed body reaches exactly as far as it
+/// always did and no further.
+pub fn decompressChunkWithHash(gpa: std.mem.Allocator, chunk: Chunk) ParseError!Inflated {
     if (chunk.typ != .compressed) return error.InvalidChunkType;
     const body = try decompressRaw(gpa, chunk.data);
     errdefer gpa.free(body);
-    if (!std.mem.eql(u8, &chunk.checksum, &checksumOf(.change, body))) {
+    // **One SHA-256 over the inflated bytes, kept whole.** The comparison needs
+    // the first four bytes of it; the change header a body parser builds needs
+    // all thirty-two. Truncating here and hashing again there is the second
+    // pass this exists to remove, so the hash is the one `checksumOf` was
+    // folding the same way.
+    const hash = changeHashOf(.change, body);
+    if (!std.mem.eql(u8, &chunk.checksum, &hash.checksum())) {
         return error.InvalidChecksum;
     }
-    return body;
+    return .{ .body = body, .hash = hash };
 }
 
 /// The room `compressRaw` leaves in its output buffer for everything the input
@@ -506,6 +593,11 @@ pub fn parseChunksPartial(
 /// `error.TooLarge` and `error.LengthExceedsInput`; and the checksum gives
 /// `error.InvalidChecksum` for every type but `compressed`. On any of them the
 /// cursor stands where the refusal found it, and nothing is returned.
+///
+/// On success the hash the body was checked against is published on the
+/// returned chunk as [`Chunk.hash`], all thirty-two bytes of it and not only
+/// the four that were compared. There is no second hash here to save: this is
+/// the one.
 fn readChunk(in: *Input) ParseError!Chunk {
     const start = in.pos;
     if (!std.mem.eql(u8, &try in.takeArray(u32), &magic)) return error.InvalidMagic;
@@ -528,12 +620,28 @@ fn readChunk(in: *Input) ParseError!Chunk {
     // The compressed case is deferred: its checksum is over the inflated body
     // (`chunk.rs:118-122`), and inflating here would make a framing parse
     // allocate. `decompressChunk` checks it before the body is used.
-    if (typ != .compressed and !std.mem.eql(u8, &checksum, &checksumOf(typ, data))) {
-        return error.InvalidChecksum;
-    }
+    //
+    // **This is the one SHA-256 this layer takes, and every byte of it is
+    // kept.** The four compared here are the four the header records, and the
+    // other twenty-eight are the hash a change's identity is made of, so a
+    // body parser downstream is handed it instead of hashing the same body
+    // again. The comparison sits where it always did, so a body that does not
+    // hash to what the header records is `error.InvalidChecksum` before
+    // anything is returned; and the compressed case publishes nothing, because
+    // its body was never hashed here.
+    const hash: ?ChangeHash = switch (typ) {
+        .compressed => null,
+        else => blk: {
+            const h = changeHashOf(typ, data);
+            const sum = h.checksum();
+            if (!std.mem.eql(u8, &checksum, &sum)) return error.InvalidChecksum;
+            break :blk h;
+        },
+    };
     return .{
         .typ = typ,
         .checksum = checksum,
+        .hash = hash,
         .data = data,
         .frame = in.bytes[start..in.pos],
     };
@@ -640,6 +748,112 @@ test "checksum and change hash are SHA-256 over type, length, and data" {
     // The checksum is not simply the first bytes of some other hashing: the
     // type byte is part of the input, so two types over the same body differ.
     try testing.expect(!std.mem.eql(u8, &checksumOf(.document, "abc"), &checksumOf(.change, "abc")));
+}
+
+test "a parsed chunk publishes the whole hash its checksum is a prefix of" {
+    const gpa = testing.allocator;
+    // Every type but `compressed`. The published hash is that type's own chunk
+    // hash, so the type byte is part of it and one body framed three ways
+    // publishes three hashes.
+    const bodies = [_][]const u8{ "", "one", "the quick brown fox" };
+    const kinds = [_]ChunkType{ .document, .change, .bundle };
+    for (bodies, kinds) |body, typ| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        try writeChunk(&out, gpa, typ, body);
+
+        const chunk = try parseChunk(out.items);
+        const hash = chunk.hash orelse return error.TestUnexpectedResult;
+        // The four header bytes are the first four of the thirty-two: one
+        // value at two widths, which is the whole point of keeping it.
+        try testing.expectEqualSlices(u8, &chunk.checksum, &hash.checksum());
+        try testing.expectEqual(changeHashOf(typ, body), hash);
+        // And the tail is hash output, not filler. A checksum zero-extended to
+        // thirty-two bytes agrees on four and differs on the rest.
+        const widened = ChangeHash.fromChecksum(chunk.checksum);
+        try testing.expect(!std.mem.eql(u8, &widened.bytes, &hash.bytes));
+    }
+
+    // On the bytes automerge itself wrote, the published hash is the change
+    // hash the sync protocol compares, all thirty-two of it. Ten header bytes
+    // and the 57-byte body is the whole of that chunk.
+    const first: []const u8 = two_change_chunks[0 .. 10 + change_body.len];
+    const written = try parseChunk(first);
+    try testing.expectEqualSlices(u8, &change_body, written.data);
+    const written_hash = written.hash orelse return error.TestUnexpectedResult;
+    var text: [64]u8 = undefined;
+    err.hexInto(&written_hash.bytes, &text);
+    try testing.expectEqualStrings(
+        "9ac3d730f262da35e71db591b9e8150de9b02826daf75006f2298916adec6e0b",
+        &text,
+    );
+    // ... and its first four are the four in that chunk's own header, read off
+    // the frame rather than recomputed.
+    try testing.expectEqualSlices(u8, written.frame[4..8], &written_hash.checksum());
+}
+
+test "a compressed chunk publishes no hash, because its body was never hashed" {
+    const gpa = testing.allocator;
+    const body = "a body that compresses well " ** 8;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try compressChunk(&out, gpa, body);
+
+    const chunk = try parseChunk(out.items);
+    // Its checksum covers the inflated body, which is not in `data`, so there
+    // is nothing here a hash could have been taken over. Null says exactly
+    // that, and nothing is claimed that was not checked.
+    try testing.expectEqual(@as(?ChangeHash, null), chunk.hash);
+
+    // The checksum is still exactly the change's own, checked where the body
+    // can be seen whole.
+    const inflated = try decompressChunk(gpa, chunk);
+    defer gpa.free(inflated);
+    try testing.expectEqualSlices(u8, &checksumOf(.change, inflated), &chunk.checksum);
+}
+
+test "a refused chunk publishes nothing" {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try writeChunk(&out, gpa, .change, "body");
+
+    // A body that no longer hashes to what the header records, both ways
+    // round: the edit is in the body, and the edit is in the checksum field.
+    var tampered = try gpa.dupe(u8, out.items);
+    defer gpa.free(tampered);
+    tampered[tampered.len - 1] ^= 0x01;
+    try testing.expectError(error.InvalidChecksum, parseChunk(tampered));
+
+    var wrong_sum = try gpa.dupe(u8, out.items);
+    defer gpa.free(wrong_sum);
+    wrong_sum[4] ^= 0x01;
+    try testing.expectError(error.InvalidChecksum, parseChunk(wrong_sum));
+
+    // The refusals that come before the body is reached are unchanged, and
+    // none of them can publish a hash: there was no body to have hashed.
+    try testing.expectError(error.UnexpectedEnd, parseChunk(out.items[0..6]));
+    try testing.expectError(error.InvalidMagic, parseChunk("not a chunk at all"));
+
+    var bad_type = try gpa.dupe(u8, out.items);
+    defer gpa.free(bad_type);
+    bad_type[8] = 0x09;
+    try testing.expectError(error.InvalidChunkType, parseChunk(bad_type));
+
+    var bad_len = try gpa.dupe(u8, out.items);
+    defer gpa.free(bad_len);
+    bad_len[9] = 0x7f; // 127 bytes claimed, 4 behind them
+    try testing.expectError(error.LengthExceedsInput, parseChunk(bad_len));
+
+    var bad_magic = try gpa.dupe(u8, out.items);
+    defer gpa.free(bad_magic);
+    bad_magic[2] ^= 0xff;
+    try testing.expectError(error.InvalidMagic, parseChunk(bad_magic));
+
+    var overlong = try gpa.dupe(u8, out.items);
+    defer gpa.free(overlong);
+    overlong[9] = 0x80; // a length prefix whose continuation byte is not there
+    try testing.expectError(error.UnexpectedEnd, parseChunk(overlong[0..10]));
 }
 
 test "a chunk written is a chunk parsed, byte for byte" {
@@ -1083,7 +1297,7 @@ test "compressChunk writes what decompressChunk reads back" {
     try testing.expectError(error.InvalidChecksum, decompressChunk(gpa, tampered));
     try testing.expectError(
         error.InvalidChunkType,
-        decompressChunk(gpa, .{ .typ = .change, .checksum = chunk.checksum, .data = chunk.data, .frame = chunk.frame }),
+        decompressChunk(gpa, .{ .typ = .change, .checksum = chunk.checksum, .hash = chunk.hash, .data = chunk.data, .frame = chunk.frame }),
     );
 
     // `writeChunk` cannot produce a compressed chunk: it hashes the deflated
@@ -1095,6 +1309,87 @@ test "compressChunk writes what decompressChunk reads back" {
     const misframed = try parseChunk(wrong.items);
     try testing.expectEqual(ChunkType.compressed, misframed.typ);
     try testing.expectError(error.InvalidChecksum, decompressChunk(gpa, misframed));
+}
+
+test "decompressChunkWithHash is decompressChunk with the change hash it already had" {
+    const gpa = testing.allocator;
+    const body = "a change body that compresses well " ** 20;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try compressChunk(&out, gpa, body);
+    const c = try parseChunk(out.items);
+
+    // The body is the one the plain spelling returns, byte for byte.
+    const plain = try decompressChunk(gpa, c);
+    defer gpa.free(plain);
+    const both = try decompressChunkWithHash(gpa, c);
+    defer gpa.free(both.body);
+    try testing.expectEqualStrings(plain, both.body);
+
+    // **The hash is over the inflated bytes, framed as a `change`** — not over
+    // the deflated ones still in `c.data`, and not over the header. Its first
+    // four bytes are the checksum this chunk's header records, which is what
+    // ties the two together: the comparison `decompressChunk` made is the same
+    // four bytes this hash begins with.
+    try testing.expect(both.hash.eql(changeHashOf(.change, plain)));
+    try testing.expectEqualSlices(u8, &c.checksum, &both.hash.checksum());
+    try testing.expect(!std.mem.eql(
+        u8,
+        &changeHashOf(.compressed, c.data).checksum(),
+        &both.hash.checksum(),
+    ));
+
+    // The same rule over the compressed fixture automerge wrote, where the
+    // recorded checksums were carried over from the uncompressed file.
+    const chunks = try parseChunks(&two_change_chunks_compressed, gpa);
+    defer gpa.free(chunks);
+    for (chunks) |compressed| {
+        try testing.expectEqual(ChunkType.compressed, compressed.typ);
+        const one = try decompressChunkWithHash(gpa, compressed);
+        defer gpa.free(one.body);
+        try testing.expect(one.hash.eql(changeHashOf(.change, one.body)));
+        try testing.expectEqualSlices(u8, &compressed.checksum, &one.hash.checksum());
+    }
+}
+
+test "both decompression spellings refuse the same bytes with the same tag" {
+    const gpa = testing.allocator;
+    const body = "a change body that compresses well " ** 20;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try compressChunk(&out, gpa, body);
+    const c = try parseChunk(out.items);
+
+    // A checksum that does not describe the inflated body, and a chunk that is
+    // not compressed at all: one refusal after the inflation, one before it.
+    var bad_checksum = c;
+    bad_checksum.checksum[0] ^= 0x01;
+    var wrong_type = c;
+    wrong_type.typ = .change;
+    // `writeChunk` hashes the bytes it is handed, so a `.compressed` chunk
+    // written over deflated bytes carries a checksum no inflation can match.
+    var wrong: std.ArrayList(u8) = .empty;
+    defer wrong.deinit(gpa);
+    try writeChunk(&wrong, gpa, .compressed, c.data);
+    const misframed = try parseChunk(wrong.items);
+
+    // **The sibling is a superset, not a variant.** Same input, same refusal,
+    // and nothing returned either way — which is what keeps a malformed
+    // compressed body from reaching a body parser through the new spelling
+    // when it did not through the old one.
+    for ([_]Chunk{ bad_checksum, wrong_type, misframed }) |input| {
+        if (decompressChunk(gpa, input)) |leaked| {
+            gpa.free(leaked);
+            return error.TestUnexpectedResult;
+        } else |plain_err| {
+            if (decompressChunkWithHash(gpa, input)) |leaked| {
+                gpa.free(leaked.body);
+                return error.TestUnexpectedResult;
+            } else |with_err| {
+                try testing.expectEqual(plain_err, with_err);
+            }
+        }
+    }
 }
 
 test "two change chunks written by automerge parse and re-serialise exactly" {

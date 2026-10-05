@@ -824,6 +824,11 @@ pub fn OpSet(comptime O: type) type {
         /// The action and value of each register's winner
         /// (`action_value_top_iter`, `op_set.rs:949-959`).
         pub const TopActionValues = tools.SkipIter(opiter.ActionValue, opiter.ActionValueIter, Top);
+        /// The five cursors behind [`Self.elemidAt`], kept by the caller so a
+        /// loop over one object's elements moves them rather than rebuilding
+        /// them — [`Self.elemCursor`] hands one over and [`ElemWalk.at`]
+        /// answers off it.
+        pub const ElemCursor = ElemWalk(O);
 
         /// The allocator every entry point here is given and every owned
         /// buffer belongs to.
@@ -862,7 +867,7 @@ pub fn OpSet(comptime O: type) type {
         /// doc's third and fourth sections are the rule.
         succ_scratch: std.ArrayList(SuccEntry) = .empty,
         /// The widest row the successor buffer has ever been sized for
-        /// ([`OpSet.reserveScratchFor`]).
+        /// ([`OpSet.reserveScratchTo`], [`OpSet.reserveScratchFor`]).
         ///
         /// **Two facts about it, and between them they are the whole of why
         /// the buffer's width is safe.** It is at least
@@ -2433,6 +2438,10 @@ pub fn OpSet(comptime O: type) type {
             var last_pos: ?usize = null;
             var delete = false;
             var did_expose = false;
+            // **The widest count this pass publishes**, kept here so the
+            // buffer's high-water mark can be raised without walking
+            // `succ_count` again ([`OpSet.reserveScratchTo`]).
+            var want: usize = 0;
             var i = inserts.len;
             while (i > 0) {
                 i -= 1;
@@ -2465,7 +2474,11 @@ pub fn OpSet(comptime O: type) type {
                     did_expose = true;
                     entry.top = try self.cols.index.top.get(item.pos);
                 }
-                try self.writeSuccColumns(item, succ_inc);
+                // The count this edge publishes is the row's width after the
+                // pass, so it is also the only width this pass can add to the
+                // document's maximum. `writeSuccColumns` has already proved it
+                // fits in a `u32`, which is what makes the widening safe.
+                want = @max(want, @as(usize, try self.writeSuccColumns(item, succ_inc)));
                 undo.appendAssumeCapacity(entry);
                 if (item.inc == null) {
                     var s_vis = try self.cols.index.visible.stageSplice(item.pos, 1, &.{false});
@@ -2483,7 +2496,25 @@ pub fn OpSet(comptime O: type) type {
                     s_top.publish(&self.cols.index.top);
                 }
             }
-            try self.refitScratch();
+            // **The width is taken from this pass, not from the columns.**
+            // Every row that could be wider than it already is was written
+            // above, and each one holds the `count` `writeSuccColumns`
+            // returned, so `want` is this pass's whole contribution to
+            // [`opiter.maxSuccCount`]. The rows that were already there were
+            // counted by whichever step last read the width, and
+            // [`OpSet.succ_scratch_width`] is at least that. So the maximum
+            // after this pass is `max(succ_scratch_width, want)` — the same
+            // mark and the same buffer length [`OpSet.refitScratch`] would have
+            // left, for the length of the list instead of the length of the
+            // document.
+            //
+            // **An empty `inserts` is the case this exists for.** The pass runs
+            // once per written op, and a row with no predecessor has no edges
+            // (`insertLocalOp` in `src/transact.zig`), so most of those passes
+            // publish nothing: `want` stays zero, the call below returns on
+            // the comparison, and the document-sized walk over `succ_count`
+            // never happens.
+            try self.reserveScratchTo(want);
         }
 
         /// Removes the successor edges `undos` names, restoring what they
@@ -2606,7 +2637,12 @@ pub fn OpSet(comptime O: type) type {
         /// this pass, counted from the end because the pass runs backwards; the
         /// new count is the row's old count plus that, which is what keeps
         /// `succ_count` and the flattened pair the same length.
-        fn writeSuccColumns(self: *Self, item: SuccInsert, succ_inc: usize) ParseError!void {
+        ///
+        /// **Returns the count it wrote**, which is the row's width after the
+        /// edge and so the whole of what [`OpSet.addSuccWithUndo`] needs to
+        /// keep the successor buffer wide without a pass over the column set
+        /// ([`OpSet.reserveScratchTo`]).
+        fn writeSuccColumns(self: *Self, item: SuccInsert, succ_inc: usize) ParseError!u32 {
             const new_count = std.math.add(u64, item.len, succ_inc) catch return error.Overflow;
             const count = std.math.cast(u32, new_count) orelse return error.Overflow;
             // **Staged, then published together.** These four columns have to
@@ -2626,6 +2662,7 @@ pub fn OpSet(comptime O: type) type {
             s_actor.publish(&self.cols.succ_actor);
             s_ctr.publish(&self.cols.succ_ctr);
             s_inc.publish(&self.cols.index.inc);
+            return count;
         }
 
         /// The same edge, *including* the index: what [`OpSet.addSucc`]
@@ -2635,7 +2672,9 @@ pub fn OpSet(comptime O: type) type {
         /// the text index and out of `top` — the same three columns
         /// `add_succ_with_undo` records and then writes, in the other order.
         fn writeSuccEdge(self: *Self, item: SuccInsert, succ_inc: usize) ParseError!void {
-            try self.writeSuccColumns(item, succ_inc);
+            // The count is [`OpSet.addSucc`]'s business only through
+            // [`OpSet.refitScratch`], which reads the width out of the columns.
+            _ = try self.writeSuccColumns(item, succ_inc);
             if (item.inc == null) {
                 var s_vis = try self.cols.index.visible.stageSplice(item.pos, 1, &.{false});
                 defer s_vis.deinit();
@@ -2653,16 +2692,22 @@ pub fn OpSet(comptime O: type) type {
         /// records that width in [`OpSet.succ_scratch_width`].
         ///
         /// **This is the only step that reads the width out of the columns**,
-        /// so every path that can make a row wider runs it: the two that add
-        /// successor edges ([`OpSet.addSucc`], [`OpSet.addSuccWithUndo`]), the
-        /// two that take edges and rows back out ([`OpSet.undoSucc`],
-        /// [`OpSet.undoOp`]), and the load ([`OpSet.fromParts`]). A buffer that
-        /// is already wide enough is left alone, so the common case costs one
-        /// pass over `succ_count` and no allocation.
+        /// so every path that can make a row wider either runs it or can name
+        /// the width without it: the load ([`OpSet.fromParts`]) and the three
+        /// that leave the columns to speak for themselves
+        /// ([`OpSet.addSucc`], [`OpSet.undoSucc`], [`OpSet.undoOp`]); the row
+        /// splice ([`OpSet.splice`], against [`OpSet.reserveScratchFor`]); and
+        /// the edge pass ([`OpSet.addSuccWithUndo`], against
+        /// [`OpSet.reserveScratchTo`]). A buffer that is already wide enough is
+        /// left alone, so the common case costs one pass over `succ_count` and
+        /// no allocation.
         ///
         /// **It reads the width out of the columns, so it can only run after
-        /// they are written** — which is why [`OpSet.splice`] does not call it
-        /// and reserves against [`OpSet.reserveScratchFor`] instead.
+        /// they are written** — which is why [`OpSet.splice`] does not call it,
+        /// and why [`OpSet.addSuccWithUndo`] does not either: both take the
+        /// width from the rows they are about to write or have just written,
+        /// which is the same number this walk arrives at, for the length of
+        /// the change instead of the length of the document.
         fn refitScratch(self: *Self) ParseError!void {
             const want = try opiter.maxSuccCount(O, &self.cols, .{
                 .start = 0,
@@ -2676,6 +2721,39 @@ pub fn OpSet(comptime O: type) type {
             // buffer does not back would tell the next splice it was already
             // wide enough when it is not.
             if (want > self.succ_scratch_width) self.succ_scratch_width = want;
+        }
+
+        /// Widens the successor buffer to `want` and records that width in
+        /// [`OpSet.succ_scratch_width`], **without walking the column set.**
+        ///
+        /// This is [`OpSet.refitScratch`] with the width handed to it instead
+        /// of read out of `succ_count`, and the two are the same call wherever
+        /// the caller can name the width. Two facts make that so:
+        ///
+        /// * `succ_scratch_width` is at least [`opiter.maxSuccCount`] over the
+        ///   whole column set ([`OpSet.succ_scratch_width`]), so the widest row
+        ///   that was already there needs no reservation.
+        /// * the rows the caller has just written are the only ones that can
+        ///   have got wider, so their new counts are the whole of what the walk
+        ///   would have added to the answer.
+        ///
+        /// Together they make the maximum after the write
+        /// `max(succ_scratch_width, want)`: the mark the resize below records,
+        /// and — only when it is the larger — the length it resizes to. Those
+        /// are the two numbers [`OpSet.refitScratch`] would have left.
+        ///
+        /// **A caller that cannot name the width must call
+        /// [`OpSet.refitScratch`].** That one re-establishes a mark which has
+        /// fallen behind the columns; this one can only raise a mark that is
+        /// already right.
+        fn reserveScratchTo(self: *Self, want: usize) ParseError!void {
+            if (want <= self.succ_scratch_width) return;
+            // **The mark is written after the resize, never before.** A refusal
+            // in the line below leaves the buffer as it was, and a mark the
+            // buffer does not back would tell the next walk it was already wide
+            // enough when it is not.
+            if (self.succ_scratch.items.len < want) try self.succ_scratch.resize(self.gpa, want);
+            self.succ_scratch_width = want;
         }
 
         /// The same bound as [`OpSet.refitScratch`], taken from `ops` and
@@ -2705,10 +2783,7 @@ pub fn OpSet(comptime O: type) type {
         fn reserveScratchFor(self: *Self, ops: []const O) ParseError!void {
             var want = self.succ_scratch_width;
             for (ops) |op| want = @max(want, op.succCount());
-            if (self.succ_scratch.items.len < want) {
-                try self.succ_scratch.resize(self.gpa, want);
-            }
-            self.succ_scratch_width = want;
+            try self.reserveScratchTo(want);
         }
 
         // ── Queries ─────────────────────────────────────────────────────
@@ -3394,29 +3469,68 @@ pub fn OpSet(comptime O: type) type {
         ///
         /// A row whose key is neither a map key nor a sequence anchor is
         /// `error.MissingKey` from the walk, and a row past `end` is null.
-        pub fn elemidAt(self: *Self, pos: usize, end: usize) ReadOpError!?ElemPos {
-            const rows: RowRange = .{ .start = pos, .end = end };
-            var insert = try self.cols.insert.iterRange(rows);
-            var id_ctr = try self.cols.id_ctr.iterRange(rows);
-            var id_actor = try self.cols.id_actor.iterRange(rows);
-            var key_ctr = try self.cols.key_ctr.iterRange(rows);
-            var key_actor = try self.cols.key_actor.iterRange(rows);
-            const elemid = try nextElemid(
-                &insert,
-                &id_ctr,
-                &id_actor,
-                &key_ctr,
-                &key_actor,
-            ) orelse return null;
-            var last_pos = pos;
-            var at = pos + 1;
-            while (at < end) : (at += 1) {
-                const next = try nextElemid(&insert, &id_ctr, &id_actor, &key_ctr, &key_actor) orelse
-                    break;
-                if (!next.eql(elemid)) break;
-                last_pos = at;
-            }
-            return .{ .elemid = elemid, .last_pos = last_pos };
+        ///
+        /// **Five columns, and none of the five is droppable.** Upstream reads
+        /// them the way this does (`op_set.rs:795-799`): one row each, in
+        /// lockstep, with `insert` choosing the arm.
+        ///
+        /// * `insert` chooses the arm, and it is the cheapest of the five — a
+        ///   boolean run-length wire, so reaching a row is a run walk
+        ///   ([`Bool.Decoder.nth`](../hexane/bool.zig)) and not a row walk.
+        /// * `id_ctr` and `id_actor` are the answer on an **insert** row.
+        /// * `key_ctr` and `key_actor` are the answer on anything else, and a
+        ///   row with neither is a **map key**: `null`, and the walk stops.
+        ///
+        /// The two on the other arm are read and thrown away, and that is not
+        /// waste this can cut. They are what keeps the rest in step with the
+        /// window, and each is a column whose own decoder can refuse on bytes
+        /// the other arm alone would not touch — a column not read is a
+        /// refusal not raised. **And two of the five cost to place**:
+        /// `id_ctr` and `key_ctr` are both delta columns, so `iterRange`
+        /// folds their wire from the slab start (`column.zig:257-279`), once
+        /// per call, and a caller asking about every element of an object
+        /// pays that fold twice per element.
+        ///
+        /// **So the saving is not fewer columns; it is one set of five, moved.**
+        /// [`Self.elemCursor`] hands the caller those five and
+        /// [`ElemWalk.at`] answers off them, so a reader that walks an object
+        /// in ascending row order pays the positioning once for the whole walk.
+        /// This method is that question with the five built, used and dropped
+        /// around it, which is what it stays for: the callers with no loop.
+        pub fn elemidAt(self: *const Self, pos: usize, end: usize) ReadOpError!?ElemPos {
+            var cursor = try self.elemCursor();
+            return cursor.at(pos, end);
+        }
+
+        /// The five cursors [`Self.elemidAt`] builds, for a caller to hold.
+        ///
+        /// **It owns nothing and has no `deinit`.** It borrows the op set, and
+        /// the five cursors borrow the columns' slab bytes, so the op set has
+        /// to outlive it and must not be written while it is live — the same
+        /// rule every walk this op set hands out is under (this module's
+        /// fourth section, and `rle.zig`'s own note that a decoder borrows
+        /// the slab it was given). A
+        /// `stageSplice` published into any of the five columns frees the slab
+        /// a cursor is standing on, and this has no way to notice.
+        ///
+        /// The cursors open over the whole op set and are **not** positioned
+        /// until the first [`ElemWalk.at`]; that call positions them the way
+        /// `elemidAt` did, so an answer from a fresh cursor is the answer the
+        /// per-call walk gives. A later call **moves** them when the row it
+        /// names is at or ahead of where they stand, and rebuilds them when it
+        /// is behind, so an answer never depends on the order the caller asked
+        /// in — see `ElemWalk.seek` for the two arms and why the second one
+        /// is not a slower fast path.
+        pub fn elemCursor(self: *const Self) ParseError!Self.ElemCursor {
+            const rows: RowRange = .{ .start = 0, .end = self.len() };
+            return .{
+                .set = self,
+                .insert = try self.cols.insert.iterRange(rows),
+                .id_ctr = try self.cols.id_ctr.iterRange(rows),
+                .id_actor = try self.cols.id_actor.iterRange(rows),
+                .key_ctr = try self.cols.key_ctr.iterRange(rows),
+                .key_actor = try self.cols.key_actor.iterRange(rows),
+            };
         }
 
         /// The rows of the register a row at `pos` belongs to
@@ -5458,6 +5572,193 @@ pub const ElemPos = struct {
     /// The last row that belongs to it.
     last_pos: usize,
 };
+
+/// The five cursors [`OpSet.elemidAt`](op_set.zig) builds, kept by the caller
+/// so a loop over one object's elements **moves** them instead of rebuilding
+/// them.
+///
+/// **This is upstream's `elemid_at` with the five `iter_range` calls hoisted
+/// out of the loop, and nothing else.** [`ElemWalk.at`] reads the same rows in
+/// the same order and answers the same [`ElemPos`], and every refusal a
+/// column's decoder raises is raised on the same rows. What changes is how
+/// often a row's bytes are read — once for a whole ascending walk rather than
+/// once per call.
+///
+/// # Why five, and why five and not three
+///
+/// **The arm is chosen per row by `insert`, and both arms are read on every
+/// row.** An insert's element is its own id and a put's is its key's, so
+/// [`nextElemid`] reads `id_ctr` and `id_actor` on the first and `key_ctr` and
+/// `key_actor` on the other, and then uses one pair or the other. It reads **all
+/// five** for two reasons, and the second is the one that binds:
+///
+/// * the five are read **in lockstep** — one row each per `nextElemid` call —
+///   so a row that skipped one would leave the rest of the window reading the
+///   wrong rows;
+/// * **a column not read is a refusal not raised.** `iterRange` and `next`
+///   walk the same bytes through the same readers, so a column this type
+///   skipped could carry a malformed run header that a read of it would have
+///   reported. Cutting a column is a behaviour change and not an
+///   optimisation.
+///
+/// Upstream reads five for the same two reasons (`op_set.rs:795-799`) and
+/// drops none of them, so there is no three-cursor formulation to take.
+///
+/// **The saving is in the moving, and `key_ctr` is what makes it worth taking.**
+/// It is a `DeltaOption`, and a delta column's `iterRange` folds its wire from
+/// the slab start to reach the row asked for (`skipWire`, `column.zig:257-279`),
+/// so a per-element caller pays that fold once per element over an object of
+/// *n* rows. `id_ctr` is a delta column too; `insert`, `id_actor` and
+/// `key_actor` reach a row in whole runs and are cheap either way.
+///
+/// # The two arms of `seek`
+///
+/// **Moving only goes forwards.** A column iterator's `shift` is `setMax` and
+/// then `advanceTo`, and `advanceTo` never rewinds (`column.zig:7272-7296`), so
+/// a `pos` at or ahead of where the five stand is served by moving them and a
+/// `pos` behind is served by rebuilding. **An answer therefore never depends
+/// on the order the caller asked in**, which is what lets this be a drop-in
+/// for [`OpSet.elemidAt`] rather than a second contract.
+///
+/// **The rebuild is `iterRange` and not a rewind from row zero**, and that is
+/// what keeps it cheap rather than merely correct: `iterRange` finds the slab
+/// by prefix and folds that slab's wire once (`locate`,
+/// `column.zig:6048-6058`), where walking up from the start of the column
+/// would be a pass over the whole prefix.
+pub fn ElemWalk(comptime O: type) type {
+    return struct {
+        const Self = @This();
+
+        /// The op set the five walk, borrowed for this cursor's life.
+        ///
+        /// **It has to outlive the cursor, and it must not be written while
+        /// the cursor is live.** A `stageSplice` published into any of the
+        /// five columns frees the slab a decoder is standing on — a wire
+        /// decoder borrows the bytes it was given (`rle.zig:426-437`) — and
+        /// this has no way to notice. **That is the rule every other walk this
+        /// op set hands out is already under**, and the one its module doc
+        /// states; nothing here weakens it and nothing here checks it.
+        set: *const OpSet(O),
+        /// `insert`, the arm of [`nextElemid`] (`columns.rs:28`).
+        insert: opcols.BoolPrefixColumn.Iterator,
+        /// `id_ctr`, the counter half of an insert's own id (`columns.rs:19`).
+        /// A delta column, so reaching a row folds deltas from the slab start.
+        id_ctr: opcols.CounterColumn.Iterator,
+        /// `id_actor`, the actor half of an insert's own id (`columns.rs:18`).
+        id_actor: opcols.ActorColumn.Iterator,
+        /// `key_ctr`, a sequence anchor's counter and null for a map key
+        /// (`columns.rs:23`). **A delta column**, like `id_ctr` above and
+        /// unlike the three around it: reaching a row here folds deltas from
+        /// the slab start, and reaching it in a whole run is the other four's
+        /// shape.
+        key_ctr: opcols.OptCounterColumn.Iterator,
+        /// `key_actor`, a sequence anchor's actor and null for a map key
+        /// (`columns.rs:22`).
+        key_actor: opcols.ActorOptColumn.Iterator,
+
+        /// Whether the five stand together and may be moved rather than
+        /// rebuilt.
+        ///
+        /// **False until the first `at` succeeds, and false again after every
+        /// refusal.** A refusal can land *between* two of the five `next`
+        /// calls in [`nextElemid`] — they are one after another — which leaves
+        /// the ones already read a row ahead of the ones after them. `seek`
+        /// only ever moves forwards, so such a cursor would be brought into
+        /// agreement by luck rather than by construction. This flag makes that
+        /// impossible: a cursor that has refused is rebuilt whole, which is
+        /// what a fresh [`OpSet.elemidAt`](op_set.zig) would have been.
+        placed: bool = false,
+
+        /// The row the next read lands on, which is where all five stand.
+        pub fn pos(self: *const Self) usize {
+            return self.insert.pos();
+        }
+
+        /// Whether the five stand together and may be moved rather than
+        /// rebuilt — `placed`, stated for a caller that wants to know which
+        /// arm its next read will take.
+        ///
+        /// **A caller has no reason to ask, and the answer is the same either
+        /// way.** It is here so a test can say that an ascending walk *moved*
+        /// rather than rebuilding, which is the whole of what the hoist is for
+        /// and is not otherwise observable from outside.
+        pub fn isPlaced(self: *const Self) bool {
+            return self.placed;
+        }
+
+        /// The element the row at `pos` belongs to and the last row of it:
+        /// [`OpSet.elemidAt`](op_set.zig), answered off cursors this cursor
+        /// already holds.
+        ///
+        /// **The answer is the answer `elemidAt` gives, in any order.** A
+        /// first call, a call behind the cursor, and a call that arrives after
+        /// a refusal each rebuild the five; a call at or ahead of them moves
+        /// them. The three paths differ in what they read on the way to the
+        /// row, not in what they answer.
+        ///
+        /// **A move can refuse where a rebuild would not, and only that
+        /// way.** `advanceTo` walks the rest of the slab the cursor stands in
+        /// before it jumps (`column.zig:7254-7260`), so a document malformed
+        /// in the rows behind the cursor is reported by a moved read and is
+        /// stepped over by a rebuilt one. **It can only add a refusal**, and
+        /// it is what every reader in this crate already does when it is
+        /// repositioned: `ListIter` and `ValueIter` shift the very same
+        /// columns the very same way.
+        pub fn at(self: *Self, at_pos: usize, end: usize) ReadOpError!?ElemPos {
+            // The one place that can say "these five are out of step". Every
+            // refusal below — in `seek` and in the walk alike — lands here.
+            errdefer self.placed = false;
+            try self.seek(at_pos, end);
+            const elemid = try nextElemid(
+                &self.insert,
+                &self.id_ctr,
+                &self.id_actor,
+                &self.key_ctr,
+                &self.key_actor,
+            ) orelse return null;
+            var last_pos = at_pos;
+            var at_row = at_pos + 1;
+            while (at_row < end) : (at_row += 1) {
+                const next = try nextElemid(
+                    &self.insert,
+                    &self.id_ctr,
+                    &self.id_actor,
+                    &self.key_ctr,
+                    &self.key_actor,
+                ) orelse break;
+                if (!next.eql(elemid)) break;
+                last_pos = at_row;
+            }
+            return .{ .elemid = elemid, .last_pos = last_pos };
+        }
+
+        /// Puts the five on `pos`, with the window ending at `end`. Move when
+        /// the row is ahead, rebuild when it is behind; see the type's second
+        /// section.
+        fn seek(self: *Self, at_pos: usize, end: usize) ParseError!void {
+            const rows: RowRange = .{ .start = at_pos, .end = end };
+            if (self.placed and at_pos >= self.insert.pos()) {
+                try self.insert.shift(rows);
+                try self.id_ctr.shift(rows);
+                try self.id_actor.shift(rows);
+                try self.key_ctr.shift(rows);
+                try self.key_actor.shift(rows);
+                return;
+            }
+            // **Cleared before the first one is built, not after the last.**
+            // A refusal between the five would otherwise leave a cursor
+            // holding four fresh cursors and one stale one, and `placed` is
+            // what says not to move a cursor in that state.
+            self.placed = false;
+            self.insert = try self.set.cols.insert.iterRange(rows);
+            self.id_ctr = try self.set.cols.id_ctr.iterRange(rows);
+            self.id_actor = try self.set.cols.id_actor.iterRange(rows);
+            self.key_ctr = try self.set.cols.key_ctr.iterRange(rows);
+            self.key_actor = try self.set.cols.key_actor.iterRange(rows);
+            self.placed = true;
+        }
+    };
+}
 
 /// The `MarkIdx` that names the begin at `id`, for the truncate upstream
 /// performs at `op_set.rs:523`.
@@ -7846,6 +8147,92 @@ test "iterObjIds yields one boundary per object, and a long object is still one 
     }
 }
 
+// ── One set of five, moved ─────────────────────────────────────────────────
+
+test "a held element cursor answers what a fresh one answers, at every row and in any order" {
+    const gpa = testing.allocator;
+    const doc = try Document(gpa);
+    defer doc.destroy();
+    const set = &doc.set;
+    const list = try set.scopeToObj(list_obj);
+    const n = set.len();
+
+    // **Four anchors, read off [`documentRows`] rather than asserted blind.**
+    // They are the shapes the walk has to get right: the list's **two-row**
+    // register is the one case where the forward walk runs at all, a
+    // single-row register is what every per-element reader is made of, and a
+    // root row is the case where the key names a map and the answer is
+    // nothing at all.
+    try testing.expectEqual(
+        @as(?ElemPos, .{ .elemid = anchor(opId(7, 0)), .last_pos = 5 }),
+        try set.elemidAt(5, list.end),
+    );
+    try testing.expectEqual(
+        @as(?ElemPos, .{ .elemid = anchor(opId(6, 0)), .last_pos = 7 }),
+        try set.elemidAt(6, list.end),
+    );
+    try testing.expectEqual(
+        @as(?ElemPos, .{ .elemid = anchor(opId(6, 0)), .last_pos = 7 }),
+        try set.elemidAt(7, list.end),
+    );
+    try testing.expectEqual(@as(?ElemPos, null), try set.elemidAt(4, list.end));
+
+    // **Ascending, on one cursor, against a fresh cursor at every row.** This
+    // is the arm the hoist exists for: every call after the first moves the
+    // five instead of rebuilding them, and none of them may notice.
+    var cursor = try set.elemCursor();
+    try testing.expect(!cursor.isPlaced());
+    var pos: usize = 0;
+    while (pos <= n) : (pos += 1) {
+        try testing.expectEqual(try set.elemidAt(pos, n), try cursor.at(pos, n));
+        try testing.expect(cursor.isPlaced());
+    }
+
+    // **The same row twice in a row**, which is the case where `seek` has to
+    // decide between moving and rebuilding from one number. The comparison is
+    // the one that holds whichever it picks.
+    _ = try cursor.at(n, n);
+    try testing.expectEqual(try set.elemidAt(n, n), try cursor.at(n, n));
+
+    // **And every row again, backwards**, so the rebuild arm is exercised by
+    // the same comparisons rather than assumed. The cursor is past the end by
+    // now, so each of these is behind it.
+    pos = n;
+    while (true) {
+        try testing.expectEqual(try set.elemidAt(pos, n), try cursor.at(pos, n));
+        if (pos == 0) break;
+        pos -= 1;
+    }
+
+    // **The move is a move.** A rebuild lands the cursor on the row it was
+    // asked for; a move leaves it where the walk stopped, which is past that
+    // row. The two-row register above is what puts it three rows on.
+    var walked = try set.elemCursor();
+    _ = try walked.at(6, n);
+    try testing.expect(walked.pos() > 6);
+}
+
+test "the element cursor answers an empty window, a window behind itself and a row past the end" {
+    const gpa = testing.allocator;
+    const doc = try Empty(gpa);
+    defer doc.destroy();
+    const set = &doc.set;
+
+    var cursor = try set.elemCursor();
+    try testing.expectEqual(@as(?ElemPos, null), try cursor.at(0, 0));
+    // **Past the end, and a window that ends behind its own start.** Both are
+    // `null` from a fresh `elemidAt` and both have to stay `null` here. The
+    // first call rebuilds, because that is every fresh cursor's first arm; the
+    // three after it move, and on an op set with no rows there is nowhere for
+    // the five to move to.
+    try testing.expectEqual(@as(?ElemPos, null), try set.elemidAt(3, 9));
+    try testing.expectEqual(@as(?ElemPos, null), try cursor.at(3, 9));
+    try testing.expectEqual(@as(?ElemPos, null), try set.elemidAt(2, 1));
+    try testing.expectEqual(@as(?ElemPos, null), try cursor.at(2, 1));
+    try testing.expectEqual(@as(?ElemPos, null), try set.elemidAt(0, 0));
+    try testing.expectEqual(@as(?ElemPos, null), try cursor.at(0, 0));
+}
+
 // ── The empty op set ───────────────────────────────────────────────────────
 
 test "every entry point answers on an op set with no rows" {
@@ -9169,6 +9556,231 @@ test "the mark is a high-water mark: a row taken back does not narrow the buffer
         rows += 1;
     }
     try testing.expectEqual(@as(usize, 1), rows);
+}
+
+test "addSuccWithUndo takes its buffer width from the edges it published, not from a walk" {
+    const gpa = testing.allocator;
+    var table = Table.init(gpa);
+    defer table.deinit();
+    var built = try counterSet(gpa, &table);
+    defer built.set.deinit();
+    defer built.before.deinit(gpa);
+    var journal: std.ArrayList(SuccUndo) = .empty;
+    defer journal.deinit(gpa);
+
+    // **Both rows arrive with no successors**, so [`OpSet.splice`] reserved
+    // against a zero width and the buffer is empty. Nothing has widened it
+    // and nothing can.
+    try testing.expectEqual(@as(usize, 0), built.set.succ_scratch.items.len);
+    try testing.expectEqual(@as(usize, 0), built.set.succ_scratch_width);
+
+    // **An empty edge list publishes nothing and reserves nothing.** This is
+    // the pass `insertLocalOp` runs for a row with no predecessor, and it is
+    // the one that used to walk every row of the document to learn a maximum
+    // it already had. Nothing about the set may move.
+    try built.set.addSuccWithUndo(&.{}, &journal);
+    try testing.expectEqual(@as(usize, 0), journal.items.len);
+    try testing.expectEqual(@as(usize, 0), built.set.succ_scratch_width);
+    try testing.expectEqual(@as(usize, 0), built.set.succ_scratch.items.len);
+    try expectScratchCoversRows(&built.set);
+
+    // **Two edges onto one row make the widest row two wide**, and the mark
+    // and the buffer land on exactly what a walk over `succ_count` reads
+    // back — so the width taken off the edges is the width out of the
+    // columns.
+    const two = [_]opmod.SuccInsert{
+        .{ .id = opId(4, 0), .pos = 0, .inc = 7, .len = 0, .sub_pos = 0 },
+        .{ .id = opId(3, 0), .pos = 0, .inc = 7, .len = 0, .sub_pos = 0 },
+    };
+    try built.set.addSuccWithUndo(&two, &journal);
+    try testing.expectEqual(@as(usize, 2), journal.items.len);
+    try testing.expectEqual(@as(u32, 2), (try built.set.cols.succ_count.get(0)).?);
+    try testing.expectEqual(
+        @as(usize, 2),
+        try opiter.maxSuccCount(TestRow, &built.set.cols, .{ .start = 0, .end = built.set.len() }),
+    );
+    try testing.expectEqual(@as(usize, 2), built.set.succ_scratch_width);
+    try testing.expectEqual(@as(usize, 2), built.set.succ_scratch.items.len);
+    try expectScratchCoversRows(&built.set);
+
+    // **An empty list after a widening leaves the mark where it is.** The mark
+    // is a high-water mark, so this is not a claim that it comes down — it is
+    // a claim that a pass which publishes nothing neither walks nor resizes.
+    try built.set.addSuccWithUndo(&.{}, &journal);
+    try testing.expectEqual(@as(usize, 2), journal.items.len);
+    try testing.expectEqual(@as(usize, 2), built.set.succ_scratch_width);
+    try testing.expectEqual(@as(usize, 2), built.set.succ_scratch.items.len);
+
+    // **A pass that publishes an edge narrower than the mark changes
+    // neither.** Row 1 is empty and one edge makes it one wide, which the
+    // buffer already holds, so the widest row is still two and the mark must
+    // stay where it is.
+    const one = [_]opmod.SuccInsert{try edgeOnto(&built.set, 1, opId(5, 0))};
+    try built.set.addSuccWithUndo(&one, &journal);
+    try testing.expectEqual(@as(usize, 3), journal.items.len);
+    try testing.expectEqual(@as(u32, 1), (try built.set.cols.succ_count.get(1)).?);
+    try testing.expectEqual(
+        @as(usize, 2),
+        try opiter.maxSuccCount(TestRow, &built.set.cols, .{ .start = 0, .end = built.set.len() }),
+    );
+    try testing.expectEqual(@as(usize, 2), built.set.succ_scratch_width);
+    try testing.expectEqual(@as(usize, 2), built.set.succ_scratch.items.len);
+    try expectScratchCoversRows(&built.set);
+
+    // **And a pass that does widen still widens.** Three more edges onto row 1,
+    // which is already one wide, take it to four — past the mark — and the
+    // buffer follows. All three edges were planned while the row stood at one,
+    // so each carries that same `len` and the pass's running `succ_inc` is what
+    // carries the row the rest of the way; the last edge it publishes is the
+    // widest count the pass wrote, and that is the width the mark takes.
+    const three = [_]opmod.SuccInsert{
+        try edgeOnto(&built.set, 1, opId(7, 0)),
+        try edgeOnto(&built.set, 1, opId(6, 0)),
+        try edgeOnto(&built.set, 1, opId(8, 0)),
+    };
+    try built.set.addSuccWithUndo(&three, &journal);
+    try testing.expectEqual(@as(usize, 6), journal.items.len);
+    try testing.expectEqual(@as(u32, 4), (try built.set.cols.succ_count.get(1)).?);
+    try testing.expectEqual(
+        @as(usize, 4),
+        try opiter.maxSuccCount(TestRow, &built.set.cols, .{ .start = 0, .end = built.set.len() }),
+    );
+    try testing.expectEqual(@as(usize, 4), built.set.succ_scratch_width);
+    try testing.expectEqual(@as(usize, 4), built.set.succ_scratch.items.len);
+    try expectScratchCoversRows(&built.set);
+}
+
+test "an empty edge list reserves nothing, so there is no allocation for the allocator to refuse" {
+    const gpa = testing.allocator;
+    var failing: testing.FailingAllocator = .init(gpa, .{ .resize_fail_index = 0 });
+    const agpa = failing.allocator();
+    var table = Table.init(agpa);
+    defer table.deinit();
+    var built = try counterSet(agpa, &table);
+    defer built.set.deinit();
+    defer built.before.deinit(agpa);
+    var journal: std.ArrayList(SuccUndo) = .empty;
+    defer journal.deinit(agpa);
+
+    // **A first widening, so neither the buffer nor the mark is at zero** and
+    // the empty pass below has a width it could wrongly be charged for.
+    const two = [_]opmod.SuccInsert{
+        .{ .id = opId(3, 0), .pos = 0, .inc = null, .len = 0, .sub_pos = 0 },
+        .{ .id = opId(4, 0), .pos = 0, .inc = null, .len = 0, .sub_pos = 0 },
+    };
+    try built.set.addSuccWithUndo(&two, &journal);
+    try testing.expectEqual(@as(usize, 2), built.set.succ_scratch_width);
+    // The checkpoint is taken **after** the widening, so what the empty pass is
+    // compared against is the document it must leave exactly as it found it.
+    var settled = try built.set.saveCheckpoint(agpa);
+    defer settled.deinit(agpa);
+
+    // **And now the allocator refuses its very next allocation.** Every
+    // allocation index from here on is past the end of what an empty pass can
+    // want: no widening to reserve, no column to splice, no journal to grow,
+    // since `ensureUnusedCapacity` has nothing to ask for either. A pass that
+    // allocated would come back `error.OutOfMemory` here and `try` would end
+    // the test.
+    //
+    // **What this does not prove, stated plainly:** the walk it replaces is
+    // column reads, and a column read allocates nothing, so no allocator can
+    // see it. This test pins the allocation half of the gate and the state it
+    // leaves; the walk half is only visible to a counter.
+    failing.fail_index = failing.alloc_index;
+    const before = failing.alloc_index;
+    try built.set.addSuccWithUndo(&.{}, &journal);
+    try testing.expectEqual(before, failing.alloc_index);
+    failing.fail_index = std.math.maxInt(usize);
+
+    try testing.expectEqual(@as(usize, 2), journal.items.len);
+    try testing.expectEqual(@as(usize, 2), built.set.succ_scratch_width);
+    try testing.expectEqual(@as(usize, 2), built.set.succ_scratch.items.len);
+    try expectScratchCoversRows(&built.set);
+    var after = try built.set.saveCheckpoint(agpa);
+    defer after.deinit(agpa);
+    try sameCheckpoint(settled, after);
+}
+
+test "addSuccWithUndo still refuses a widening it cannot pay for, and never marks ahead of its buffer" {
+    const gpa = testing.allocator;
+    const edges = [_]opmod.SuccInsert{
+        .{ .id = opId(3, 0), .pos = 0, .inc = 7, .len = 0, .sub_pos = 0 },
+        .{ .id = opId(4, 0), .pos = 0, .inc = null, .len = 0, .sub_pos = 0 },
+    };
+    // Measure the successful path instead of guessing how many allocations it
+    // makes, exactly as the journal-refusal test above does.
+    const allocation_count = blk: {
+        var failing: testing.FailingAllocator = .init(gpa, .{ .resize_fail_index = 0 });
+        const agpa = failing.allocator();
+        var table = Table.init(agpa);
+        defer table.deinit();
+        var built = try counterSet(agpa, &table);
+        defer built.set.deinit();
+        // **This pass owns the checkpoint like every other one.**
+        // `counterSet` hands one back whether or not this block reads it, and
+        // it is twenty separately allocated column encodings plus the table
+        // naming them ([`Checkpoint.deinit`]). Nothing below frees them, so a
+        // pass that only wants an allocation count is where it goes missing.
+        defer built.before.deinit(agpa);
+        var journal: std.ArrayList(SuccUndo) = .empty;
+        defer journal.deinit(agpa);
+        const before = failing.alloc_index;
+        try built.set.addSuccWithUndo(&edges, &journal);
+        break :blk failing.alloc_index - before;
+    };
+
+    var refused_after_publication = false;
+    var refused_at_widening = false;
+    var reached_success = false;
+    var skip: usize = 0;
+    while (skip <= allocation_count) : (skip += 1) {
+        // Rebuilt each time so every attempt starts from the same set and the
+        // same allocation sequence.
+        var failing: testing.FailingAllocator = .init(gpa, .{ .resize_fail_index = 0 });
+        const agpa = failing.allocator();
+        var table = Table.init(agpa);
+        defer table.deinit();
+        var built = try counterSet(agpa, &table);
+        defer built.set.deinit();
+        defer built.before.deinit(agpa);
+        var journal: std.ArrayList(SuccUndo) = .empty;
+        defer journal.deinit(agpa);
+
+        failing.fail_index = failing.alloc_index + skip;
+        const result = built.set.addSuccWithUndo(&edges, &journal);
+        failing.fail_index = std.math.maxInt(usize);
+        if (result) |_| {
+            // **The widening happened and the mark backs it.**
+            try testing.expectEqual(@as(usize, 2), built.set.succ_scratch_width);
+            try testing.expectEqual(@as(usize, 2), built.set.succ_scratch.items.len);
+            try expectScratchCoversRows(&built.set);
+            reached_success = true;
+            break;
+        } else |failure| {
+            try testing.expectEqual(error.OutOfMemory, failure);
+            // **The mark is never ahead of the buffer it describes**, which is
+            // what stops the next walk believing a width that was never
+            // allocated.
+            try testing.expect(built.set.succ_scratch_width <= built.set.succ_scratch.items.len);
+            // **A refusal with a whole journal came out of the widening.** The
+            // buffer reservation is the only fallible step left after the loop,
+            // so this arm is the widening's own refusal and it is not vacuous.
+            if (journal.items.len == edges.len) {
+                refused_after_publication = true;
+                if (built.set.succ_scratch.items.len == 0) refused_at_widening = true;
+            }
+            try built.set.undoSucc(journal.items);
+            var after = try built.set.saveCheckpoint(agpa);
+            defer after.deinit(agpa);
+            try sameCheckpoint(built.before, after);
+        }
+    }
+    try testing.expect(refused_after_publication);
+    // **And the refusal landed on the resize itself**, which is the one
+    // allocation the gate does not remove: this pass widens the buffer, so it
+    // still has to ask for it and still has to be able to say no.
+    try testing.expect(refused_at_widening);
+    try testing.expect(reached_success);
 }
 
 test "a checkpoint owns every column's bytes, and one deinit frees them" {

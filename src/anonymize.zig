@@ -116,8 +116,14 @@
 //!
 //! * These values have one owner. Do not shallow-copy them.
 //!   Move them only when no caller retains their address.
-//! * Every [`Anonymize`]'s arena and permutation tables are released by
+//! * Every [`Anonymize`]'s arenas and permutation tables are released by
 //!   `Anonymize.deinit`; every [`Shape`]'s by `Shape.deinit`.
+//! * **`Anonymize` owns two arenas because it has two lifetimes.** One change's
+//!   rewritten bytes die at the end of that change and go back to the allocator;
+//!   the actor map outlives every change in the document and does not. A
+//!   borrow from the first is good until the next change; a borrow from the
+//!   second is good until `deinit`. Which is which is stated on each field and
+//!   is not to be guessed at a call site.
 
 const std = @import("std");
 const err = @import("error.zig");
@@ -214,11 +220,49 @@ pub fn anonymize(
     return try anon.run(document);
 }
 
+/// The two arenas an [`Anonymize`] owns, created together or not at all.
+///
+/// **This exists so that exactly one owner is armed at a time.** `init` can
+/// fail twice over — once while creating the arenas, once at
+/// `ensureTotalCapacity` — and each failure has to release the arenas. If the
+/// per-`create` `errdefer`s were still armed when `Anonymize.deinit` took over,
+/// the arena *structs* would be destroyed twice on that second path, which is
+/// the double free this file's own [`ActorMap.deinit`] note warns about. Here
+/// the two cleanups are on disjoint paths: before `Arenas.create` returns,
+/// `Arenas.deinit` owns them; after, `Anonymize.deinit` does.
+const Arenas = struct {
+    /// One change's rewritten strings, byte runs and scalar rows. Reset at the
+    /// end of every change by [`Anonymize.run`].
+    scratch: *std.heap.ArenaAllocator,
+    /// The [`ActorMap`], and nothing else. Never reset.
+    actors: *std.heap.ArenaAllocator,
+
+    /// Both arenas, or neither. The first `create` failing has nothing else to
+    /// release; the second failing releases the first and itself.
+    fn create(gpa: Allocator) Allocator.Error!Arenas {
+        const scratch = try gpa.create(std.heap.ArenaAllocator);
+        errdefer gpa.destroy(scratch);
+        scratch.* = .init(gpa);
+        const actors = try gpa.create(std.heap.ArenaAllocator);
+        errdefer gpa.destroy(actors);
+        actors.* = .init(gpa);
+        return .{ .scratch = scratch, .actors = actors };
+    }
+
+    /// Releases both arenas' contents and the two structs themselves.
+    fn deinit(self: Arenas, gpa: Allocator) void {
+        self.scratch.deinit();
+        self.actors.deinit();
+        gpa.destroy(self.scratch);
+        gpa.destroy(self.actors);
+    }
+};
+
 /// One seeded anonymization: the permutations, the synthetic alphabet, the
-/// actor map, the hash map, and the arena every rewritten byte belongs to.
+/// actor map, the hash map, and the two arenas the rewritten bytes belong to.
 ///
 /// Upstream's `Anonymization` ([`anonymize.rs:31-51`](../../github-automerge-automerge/rust/automerge/src/anonymize.rs)).
-/// Owns the arena and tables. A shallow copy is not a second owner.
+/// Owns the arenas and tables. A shallow copy is not a second owner.
 /// The allocator must remain live through `deinit`.
 pub const Anonymize = struct {
     /// The allocator every buffer in this struct belongs to, except the arena's
@@ -243,8 +287,27 @@ pub const Anonymize = struct {
     /// different replacements, and a run of letters does not collapse onto one
     /// letter.
     synthetic_position: usize = 0,
-    /// Owned, heap-allocated arena for rewritten strings, byte runs, and actor ids.
+    /// Owned, heap-allocated arena for the rewritten strings, byte runs and
+    /// scalar rows of **one change**. [`run`](run) resets it at the end of
+    /// every change, so its high-water mark is one change and not every change
+    /// the document has.
+    ///
+    /// **A borrow from here is good until the end of the change that made it,
+    /// and not one moment longer.** [`mapActor`] is the exception and it is
+    /// not in here: it answers out of `actor_arena`, which no reset touches.
     arena: *std.heap.ArenaAllocator,
+    /// Owned, heap-allocated arena for the [`ActorMap`] and nothing else.
+    ///
+    /// **This one is never reset, and being a second arena is the whole reason
+    /// the reset above is sound.** The map is built once, before the first
+    /// change ([`buildActorMap`](buildActorMap)), and `mapActor` reads it on
+    /// every change and on every actor of it — so a map that lived in `arena`
+    /// would be freed by the first reset, and every actor after it would be
+    /// answered out of memory the next column had already reused. It is
+    /// `O(distinct actors)`, which is tens of sixteen-byte entries, so keeping
+    /// it for the whole run costs nothing beside the per-change bytes the
+    /// reset gives back.
+    actor_arena: *std.heap.ArenaAllocator,
     /// The source actor set, sorted, mapped to fresh ids. An empty map is a
     /// document with no changes.
     actors: ActorMap = .{ .entries = &.{} },
@@ -255,21 +318,31 @@ pub const Anonymize = struct {
     /// ([`anonymize.rs:70-81`](../../github-automerge-automerge/rust/automerge/src/anonymize.rs)).
     hashes: std.AutoHashMapUnmanaged(ChangeHash, ChangeHash) = .empty,
 
-    /// A fresh anonymization from a 32-byte seed. Allocates the arena and the
+    /// A fresh anonymization from a 32-byte seed. Allocates the arenas and the
     /// hash map, so it can fail; free the result with `deinit`.
+    ///
+    /// **The two failure paths release the arenas from two different places
+    /// and neither runs twice.** `Arenas.create` failing leaves `self` unbuilt
+    /// and disposes of whatever it had made; `ensureTotalCapacity` failing
+    /// leaves `self` built, and disposes through `Arenas.deinit` rather than
+    /// `Anonymize.deinit`, because the caller has not received `self` and so
+    /// will never call the latter.
     pub fn init(gpa: Allocator, seed: [seed_length]u8) Allocator.Error!Anonymize {
-        const arena = try gpa.create(std.heap.ArenaAllocator);
-        errdefer gpa.destroy(arena);
-        arena.* = .init(gpa);
-        var self: Anonymize = .{ .gpa = gpa, .prng = std.Random.ChaCha.init(seed), .arena = arena };
-        errdefer self.deinit();
+        const arenas = try Arenas.create(gpa);
+        var self: Anonymize = .{
+            .gpa = gpa,
+            .prng = std.Random.ChaCha.init(seed),
+            .arena = arenas.scratch,
+            .actor_arena = arenas.actors,
+        };
+        errdefer arenas.deinit(gpa);
         try self.hashes.ensureTotalCapacity(gpa, 16);
         self.shuffleSyntheticText();
         return self;
     }
 
-    /// Releases the arena, the permutation tables, the actor map and the hash
-    /// map. Everything a run allocated goes with the arena.
+    /// Releases both arenas, the permutation tables, the actor map and the
+    /// hash map. Everything a run allocated goes with one of the two arenas.
     /// The value is `undefined` afterward. Dispose exactly once.
     pub fn deinit(self: *Anonymize) void {
         self.structural.deinit(self.gpa);
@@ -277,7 +350,9 @@ pub const Anonymize = struct {
         self.actors.deinit();
         self.hashes.deinit(self.gpa);
         self.arena.deinit();
+        self.actor_arena.deinit();
         self.gpa.destroy(self.arena);
+        self.gpa.destroy(self.actor_arena);
         self.* = undefined;
     }
 
@@ -309,11 +384,60 @@ pub const Anonymize = struct {
         for (changes.slice()) |built| {
             var next = try self.rewriteChange(built.change);
             // `applyChanges` **copies** the change into the document's arena
-            // before screening it ([`doc.zig:3065-3069`](doc.zig)), so the body
-            // and the actor list this owns are dead the moment it returns.
+            // before screening it — `adoptChange` dupes `change.bytes` and
+            // re-parses from the copy ([`doc.zig:4882-4884`](doc.zig)) — so the
+            // body and the actor list this owns are dead the moment it
+            // returns, and it is the copy the document keeps.
             defer next.deinit(self.gpa);
             _ = try out.applyChanges(self.gpa, &.{next.change});
             try self.hashes.put(self.gpa, built.change.hash, next.change.hash);
+
+            // ── The reset boundary ──────────────────────────────────────────
+            //
+            // Everything this change put in `self.arena` is dead here, and
+            // this is where that is said instead of being left to `deinit`.
+            // `rewriteChange` builds its result in the arena — the commit
+            // message, the column payloads, the footer — and **every one of
+            // those is copied out of the arena before this line**, which is the
+            // property the reset depends on:
+            //
+            // * `encodeHeader` copies the message into the body
+            //   ([`change.zig:218`](change.zig)), and `parseChange` reads it
+            //   back out of *that* body, so the returned `Built` borrows
+            //   `gpa` memory and not the arena
+            //   ([`change.zig:396-398`](change.zig));
+            // * `writeOpsBlock` copies the footer
+            //   ([`change_chunk.zig:712`](storage/change_chunk.zig));
+            // * `encodeColumn` and `encodeValuePair` serialize string and
+            //   scalar payloads into their own `gpa` buffers, and say so —
+            //   "`values` is borrowed and the result is not"
+            //   ([`encoding.zig:1275-1282`](columnar/encoding.zig)).
+            //
+            // So the peak is **one change** rather than every change the
+            // document has, and on a long history that is the difference
+            // between a bounded arena and one that grows with the document.
+            //
+            // **`.retain_capacity` and not `.free_all`, because the next change
+            // wants an arena too**: handing the memory back and asking for it
+            // again once per change is an allocation per change to no end.
+            // What is retained is the high-water of the change just finished,
+            // so the peak is still one change.
+            //
+            // **The `false` is discarded, and that is not a suppressed
+            // failure.** `reset` answers `false` when a child reallocation did
+            // not fit, and the arena is fully usable afterwards either way: it
+            // has released everything, and the next allocation grows a buffer.
+            // Nothing that runs after this line reads the arena, so there is no
+            // correctness question for the answer to decide, and turning it
+            // into an error would refuse a rewrite that is already correct.
+            //
+            // **`error.OutOfMemory` never reaches here and needs no path.** The
+            // three statements above it return through `errdefer out.deinit()`
+            // and the caller's `Anonymize.deinit`, and `rewriteChange`'s own
+            // `errdefer`s return the partial body to `gpa`; nothing survives
+            // into a later change, and nothing is owed to this line. A retry
+            // from the caller therefore starts from a whole `Anonymize`.
+            _ = self.arena.reset(.retain_capacity);
         }
         return out;
     }
@@ -368,7 +492,10 @@ pub const Anonymize = struct {
             }
             if (collides) continue;
 
-            const arena = self.arena.allocator();
+            // **The actor arena, never the reset one.** This is the value that
+            // outlives every change, so it is the value a per-change reset
+            // would take away from `mapActor` mid-run.
+            const arena = self.actor_arena.allocator();
             const entries = try arena.alloc(ActorMap.Entry, trial.items.len);
             for (trial.items, 0..) |id, rank| {
                 entries[rank] = .{
@@ -572,8 +699,10 @@ pub const Anonymize = struct {
     /// upstream says so ([`shape.rs:428-430`](../../github-automerge-automerge/rust/automerge/src/anonymize/shape.rs)):
     /// half the draws are the same bit.
     ///
-    /// The result borrows the [`Anonymize`]'s arena, so it is valid until
-    /// `Anonymize.deinit`.
+    /// The result borrows the [`Anonymize`]'s per-change arena, so it is valid
+    /// until the end of the change being rewritten — which is where [`run`]
+    /// resets that arena — and not merely until `Anonymize.deinit`. A caller
+    /// that needs it longer has to copy it out.
     pub fn anonymizeScalar(self: *Anonymize, v: ScalarValue) AnonymizeError!ScalarValue {
         return switch (v) {
             .null_value => .null_value,
@@ -657,7 +786,8 @@ pub const Anonymize = struct {
     /// replacement because the table is one table for the whole run, so the
     /// same key is the same replacement in every object it appears in.
     ///
-    /// The result borrows the [`Anonymize`]'s arena.
+    /// The result borrows the [`Anonymize`]'s per-change arena, so it is valid
+    /// until the end of the change being rewritten and not longer.
     pub fn anonymizeStructuralString(self: *Anonymize, value: []const u8) (ParseError || InternalError)![]const u8 {
         return self.mapCodepoints(value, &self.structural);
     }
@@ -674,7 +804,10 @@ pub const Anonymize = struct {
     /// has to know about, because it means a one-character value of a space
     /// comes back unchanged by design.
     ///
-    /// The result borrows the [`Anonymize`]'s arena.
+    /// The result borrows the [`Anonymize`]'s per-change arena, so it is valid
+    /// until the end of the change being rewritten and not longer. The commit
+    /// message this makes for a change is copied into the body before the
+    /// change is returned, so the caller does not have to.
     pub fn anonymizeContentString(self: *Anonymize, value: []const u8) (ParseError || InternalError)![]const u8 {
         if (value.len == 0) return &.{};
         var out: std.ArrayList(u8) = .empty;
@@ -701,6 +834,9 @@ pub const Anonymize = struct {
     /// Every byte replaced from the shuffled synthetic alphabet
     /// ([`anonymize.rs:240-245`](../../github-automerge-automerge/rust/automerge/src/anonymize.rs)).
     /// The length never changes, which is what keeps a `Bytes` value's shape.
+    ///
+    /// The result borrows the [`Anonymize`]'s per-change arena, so it is valid
+    /// until the end of the change being rewritten and not longer.
     pub fn anonymizeBytes(self: *Anonymize, value: []const u8) ParseError![]const u8 {
         if (value.len == 0) return &.{};
         const arena = self.arena.allocator();
@@ -758,6 +894,32 @@ pub const Anonymize = struct {
         }
         self.synthetic_position = rng.uintLessThan(usize, self.synthetic_text.len);
     }
+    /// [`Anonymize.run`] with the reset line deleted and nothing else changed.
+    ///
+    /// **It is here to be the other side of a differential, and its value is that
+    /// it is a copy.** The arena consumes no randomness — every draw comes from
+    /// the generator, and an allocation draws nothing — so two runs over the same
+    /// document from the same seed take the same numbers however the arena is
+    /// managed, and their outputs can differ only if a reset handed back memory
+    /// that a later change was still reading. Comparing this against `run` is
+    /// therefore a test of the escape analysis the reset rests on, rather than
+    /// another statement of it.
+    fn runWithoutReset(self: *Anonymize, document: *Document) AnonymizeError!Document {
+        var changes = try document.getChanges(self.gpa, &.{});
+        defer changes.deinit(self.gpa);
+        try self.buildActorMap(changes.slice());
+
+        var out = try Document.initWithEncoding(self.gpa, document.io, document.textEncoding(), document.documentMode());
+        errdefer out.deinit();
+
+        for (changes.slice()) |built| {
+            var next = try self.rewriteChange(built.change);
+            defer next.deinit(self.gpa);
+            _ = try out.applyChanges(self.gpa, &.{next.change});
+            try self.hashes.put(self.gpa, built.change.hash, next.change.hash);
+        }
+        return out;
+    }
 };
 
 /// Which of the two string columns a rewrite is for. The value is not read —
@@ -786,10 +948,11 @@ const ActorMap = struct {
     entries: []Entry,
 
     const Entry = struct {
-        /// The source actor's bytes, copied into the arena so the map outlives
-        /// the changes it was built from.
+        /// The source actor's bytes, copied into the **actor arena** so the map
+        /// outlives every change that reads it. `arena` would be reset out from
+        /// under it.
         from: []const u8,
-        /// The replacement's bytes, also in the arena.
+        /// The replacement's bytes, in the actor arena for the same reason.
         to: ActorId,
     };
 
@@ -811,11 +974,11 @@ const ActorMap = struct {
         return null;
     }
 
-    /// The entries belong to the [`Anonymize`]'s arena, so this **clears the
-    /// reference and frees nothing**. An earlier version freed them with `gpa`
-    /// and that is a double free: the arena frees them too, and freeing arena
-    /// memory with the allocator that owns the arena is an invalid free even
-    /// when it happens only once.
+    /// The entries belong to the [`Anonymize`]'s **actor arena**, which no reset
+    /// touches, so this **clears the reference and frees nothing**. An earlier
+    /// version freed them with `gpa` and that is a double free: the arena frees
+    /// them too, and freeing arena memory with the allocator that owns the arena
+    /// is an invalid free even when it happens only once.
     fn deinit(self: *ActorMap) void {
         self.entries = &.{};
     }
@@ -5261,6 +5424,276 @@ test "a document a program built with every opcode keeps its shape and loses its
     defer result_shape.deinit();
     try testing.expect(source_shape.eql(result_shape));
     try checkPrivateDataChanged(gpa, &source, &rewritten);
+}
+
+// ── The per-change arena reset ──────────────────────────────────────────────
+
+/// The longest payload [`buildManyChanges`] will build a change around.
+const many_payload_max = 4096;
+
+/// The author names [`buildManyChanges`] gives its two actors, **one each** —
+/// the same two names [`buildRich`] uses, so a footer in this fixture is the
+/// same shape as a footer anywhere else in this file.
+const many_author_a = "private author name";
+const many_author_b = "private author two";
+
+/// A document of `count` changes, each carrying one string value of
+/// `payload_len` bytes, alternating between two actors and each depending on
+/// the one before it.
+///
+/// **Every change is the same width as every other, and that is the fixture's
+/// whole purpose.** The measurement below compares the arena bytes one change
+/// costs against the arena bytes `count` changes cost, and that comparison only
+/// means something if a change is the same size wherever it sits. So the keys
+/// and the messages are zero-padded to a fixed width, and the payload is
+/// filled with one repeated character that changes with the index: same
+/// length, different content. **The two changes carrying an author footer are
+/// the widest**, and the yardstick the measurement builds with
+/// `buildManyChanges(gpa, 1, payload_len)` is change zero, footer and all, so
+/// the widest change in the document and the yardstick are the same width.
+///
+/// **Two actors and a dependency chain, not one of each**, so the run exercises
+/// both `mapActor` calls — the header's own actor and each named
+/// `other_actor` — and the `hashes` map, which are the three things in the
+/// loop that are not per-change arena work and so must survive the reset.
+///
+/// **One author per actor, and each rides only that actor's first change.**
+/// An actor has one author, and the format says which change carries it:
+/// upstream stamps the author at `seq == 1`
+/// ([`automerge.rs:568`](../../github-automerge-automerge/rust/automerge/src/automerge.rs))
+/// and asserts that no other change carries one
+/// ([`change_graph.rs:563-566`](../../github-automerge-automerge/rust/automerge/src/change_graph.rs)),
+/// which is the rule this port's own writer follows
+/// ([`authorFooter`](transaction.zig)). A second footer for an actor is
+/// refused by the screen in front of a merge as `error.DuplicateAuthor`
+/// ([`batch.rs:1084-1090`](../../github-automerge-automerge/rust/automerge/src/op_set2/change/batch.rs)).
+///
+/// **That refusal is the author table answering and not the actor table.** The
+/// hypothesis it invites — that an actor id repeated across the fixture needs
+/// a per-change index out of [`applySpec`], or that the actors have to be
+/// interleaved differently — is wrong on this file's own evidence:
+/// [`Document.putActorRef`](doc.zig) interns an actor once and is a lookup on
+/// every change after that, so the same actor across `count` changes is what
+/// the fixture wants and never what is refused. What the screen reads is
+/// [`Document.getAuthorForActor`](doc.zig), which holds one name per actor, and
+/// an actor that has one already is a duplicate the moment a second footer
+/// arrives.
+fn buildManyChanges(gpa: Allocator, count: usize, payload_len: usize) !Document {
+    std.debug.assert(payload_len <= many_payload_max);
+    var doc = try Document.init(gpa, std.testing.io, .auto);
+    errdefer doc.deinit();
+
+    var key_buf: [12]u8 = @splat(0);
+    var message_buf: [24]u8 = @splat(0);
+    var payload: [many_payload_max]u8 = undefined;
+
+    var previous: ChangeHash = ChangeHash.zero;
+    // **The type is spelled out, not inferred.** `= ExId.root` alone infers
+    // the union's enum tag type, because `.root` is a void field, and the
+    // first assignment into it would not coerce.
+    var previous_map: ExId = .root;
+    var have_previous = false;
+    for (0..count) |i| {
+        const second = i % 2 == 1;
+        const actor = if (second) actor_b else actor_a;
+        const seq: u64 = @intCast(i / 2 + 1);
+        const actor_index = try doc.putActorRef(gpa, .{ .bytes = actor });
+        const ctr = 2 * i + 1;
+        const name: []const u8 = if (second) many_author_b else many_author_a;
+
+        const key = try std.fmt.bufPrint(&key_buf, "private-{d:0>4}", .{i});
+        const message = try std.fmt.bufPrint(&message_buf, "private message {d:0>4}", .{i});
+        @memset(payload[0..payload_len], @truncate('a' + @as(u8, @intCast(i % 26))));
+
+        // The map this change makes on the root...
+        const made = ExId{ .id = OpId.init(@intCast(ctr), actor_index) };
+        // **...and the map this change writes into, which from the second
+        // change on is the previous change's.** That is the point of the
+        // fixture's two actors: the object belongs to the *other* actor, so
+        // the change's header carries a real `other_actors` entry and the run
+        // has to map it as well as its own author. A fixture where every
+        // change only ever touches its own objects would leave that whole
+        // `mapActor` call untested, and it is one of the two the actor arena
+        // exists for.
+        const target = if (have_previous) previous_map else made;
+        const deps: []const ChangeHash = if (have_previous) &.{previous} else &.{};
+        const this_change = try applySpec(gpa, &doc, .{
+            .actor = actor,
+            .seq = seq,
+            .start_op = @intCast(ctr),
+            .deps = deps,
+            // **Only the actor's first change carries the footer**; every change
+            // after it would be a second author for an actor that has one.
+            .author = if (seq == 1) name else null,
+            .message = message,
+            .ops = &.{
+                .{ .ctr = @intCast(ctr), .action = .make_map, .key = KeyRef.fromStr(key) },
+                .{
+                    .ctr = @intCast(ctr + 1),
+                    .obj = target,
+                    .key = KeyRef.fromStr("private-payload"),
+                    .value = .{ .str = payload[0..payload_len] },
+                },
+            },
+        });
+        previous = this_change;
+        previous_map = made;
+        have_previous = true;
+    }
+    return doc;
+}
+
+test "a run that resets the arena between changes writes the same bytes as a run that does not" {
+    const gpa = testing.allocator;
+    var source = try buildManyChanges(gpa, 8, 512);
+    defer source.deinit();
+
+    var reset_anon = try Anonymize.init(gpa, @splat(41));
+    defer reset_anon.deinit();
+    var reset_doc = try reset_anon.run(&source);
+    defer reset_doc.deinit();
+    const reset_bytes = try reset_doc.save(gpa);
+    defer gpa.free(reset_bytes);
+
+    var flat_anon = try Anonymize.init(gpa, @splat(41));
+    defer flat_anon.deinit();
+    var flat_doc = try flat_anon.runWithoutReset(&source);
+    defer flat_doc.deinit();
+    const flat_bytes = try flat_doc.save(gpa);
+    // **The escape test.** A run that resets the arena between changes writes
+    // byte-for-byte what a run that does not writes.
+    //
+    // The reset is only sound because nothing derived from the per-change arena
+    // outlives the change that made it, and that is not a thing a reading of this
+    // file can settle — it took reading three callees' ownership contracts
+    // ([`change.zig:396-398`](change.zig), [`encoding.zig:1275-1282`](columnar/encoding.zig),
+    // [`doc.zig:4882-4884`](doc.zig)) to be sure of. This is the assertion that
+    // would stop being true the moment one of them changed: an escaped slice
+    // would be read back out of a buffer the next change has already been handed,
+    // and the change hashes would stop matching.
+    //
+    // **Both sides are compared twice, and the second comparison is the one that
+    // localizes a failure.** A difference in `save` bytes says the documents
+    // differ somewhere; a difference in one change's `body` says which change,
+    // and a change's hash is taken over exactly those bytes.
+
+    defer gpa.free(flat_bytes);
+
+    try testing.expect(flat_bytes.len > 0);
+    try testing.expectEqualSlices(u8, flat_bytes, reset_bytes);
+
+    var reset_changes = try reset_doc.getChanges(gpa, &.{});
+    defer reset_changes.deinit(gpa);
+    var flat_changes = try flat_doc.getChanges(gpa, &.{});
+    defer flat_changes.deinit(gpa);
+    try testing.expectEqual(flat_changes.slice().len, reset_changes.slice().len);
+    for (flat_changes.slice(), reset_changes.slice()) |flat, reset| {
+        try testing.expectEqual(flat.change.hash, reset.change.hash);
+        try testing.expectEqualSlices(u8, flat.body, reset.body);
+    }
+
+    // **And it is a real anonymization**, so the comparison above is not two
+    // runs agreeing on a rewrite that copied the private data through.
+    try checkPrivateDataChanged(gpa, &source, &reset_doc);
+}
+
+test "the per-change arena is bounded by one change, and without the reset it would not be" {
+    // **The retained-bytes claim.** The per-change arena's high-water is one
+    // change, not the whole document.
+    //
+    // This is the assertion the peak-RSS gate measures, stated about the thing
+    // that causes it. Before the reset the arena's capacity was the sum of every
+    // change's rewritten bytes; after, it is the largest single change's, which
+    // is what `bounded` is compared against.
+    //
+    // **The second half of the test is what keeps the first half honest.** An
+    // upper bound on its own is satisfied by an arena that allocates nothing, so
+    // the test also measures the same document the same way *without* the reset
+    // and requires that figure to be genuinely larger — both a multiple of the
+    // one-change yardstick and a multiple of the bounded one. If a future change
+    // made the per-change cost so small that the two figures converged, this
+    // would fail rather than pass quietly on a workload that no longer has
+    // anything to bound.
+
+    const gpa = testing.allocator;
+    const count = 24;
+    const payload_len = 1024;
+
+    // The yardstick: what one change costs, measured with the same code.
+    var one_doc = try buildManyChanges(gpa, 1, payload_len);
+    defer one_doc.deinit();
+    var one = try Anonymize.init(gpa, @splat(43));
+    defer one.deinit();
+    var one_out = try one.run(&one_doc);
+    defer one_out.deinit();
+    const per_change = one.arena.*.queryCapacity();
+    try testing.expect(per_change > 0);
+
+    var many_doc = try buildManyChanges(gpa, count, payload_len);
+    defer many_doc.deinit();
+
+    var bounded = try Anonymize.init(gpa, @splat(43));
+    defer bounded.deinit();
+    var bounded_out = try bounded.run(&many_doc);
+    defer bounded_out.deinit();
+    const bounded_bytes = bounded.arena.*.queryCapacity();
+
+    var flat = try Anonymize.init(gpa, @splat(43));
+    defer flat.deinit();
+    var flat_out = try flat.runWithoutReset(&many_doc);
+    defer flat_out.deinit();
+    const flat_bytes = flat.arena.*.queryCapacity();
+
+    // **The peak is one change.** Two changes' worth is the slack: the last
+    // change is not the first, and the arena's own growth is not its
+    // high-water exactly.
+    try testing.expect(bounded_bytes <= per_change * 2);
+    // **And that is a real bound, not a small workload.** Without the reset the
+    // same twenty-four changes cost an arena each.
+    try testing.expect(flat_bytes > per_change * (count / 2));
+    try testing.expect(flat_bytes > bounded_bytes * 4);
+}
+
+test "the actor map still answers for every actor after every change's reset" {
+    // **The countercondition, pinned.** The actor map still answers for every
+    // actor after a run has reset the arena once per change.
+    //
+    // This is the one escape the audit turned up: the map is built once, before
+    // the first change, and `mapActor` reads it for every change's author and for
+    // every `other_actor` a change names. In the reset arena it would be handed
+    // back after the first change and every lookup afterwards would be a binary
+    // search over memory the next column had already been given, which is why it
+    // lives in `actor_arena` instead.
+    //
+    // **The assertions are about the shape of the answer rather than its exact
+    // bytes, because the prefix is drawn from the seed and pinning it would only
+    // pin the generator.** What must hold is that every actor still maps, that the
+    // two are still two, and that each id still carries its own rank in the low
+    // eight bytes — the invariant `buildActorMap` states and the one reused bytes
+    // would not reproduce.
+
+    const gpa = testing.allocator;
+    var source = try buildManyChanges(gpa, 6, 128);
+    defer source.deinit();
+
+    var anon = try Anonymize.init(gpa, @splat(47));
+    defer anon.deinit();
+    var out = try anon.run(&source);
+    defer out.deinit();
+
+    // Six resets have happened by now.
+    const map_a = try anon.mapActor(.{ .bytes = actor_a });
+    const map_b = try anon.mapActor(.{ .bytes = actor_b });
+
+    try testing.expectEqual(@as(usize, 16), map_a.bytes.len);
+    try testing.expectEqual(@as(usize, 16), map_b.bytes.len);
+    try testing.expect(!std.mem.eql(u8, map_a.bytes, map_b.bytes));
+    // `actor_a` sorts before `actor_b`, so the ranks are zero and one.
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 8), map_a.bytes[8..16]);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 7 ++ [_]u8{1}), map_b.bytes[8..16]);
+    // **And an actor the document never had is still refused**, which is the
+    // other half: a map that had been overwritten would answer for anything.
+    try testing.expectError(error.MissingActor, anon.mapActor(.{ .bytes = actor_c }));
 }
 
 // ── Differences from upstream, in one place ─────────────────────────────────

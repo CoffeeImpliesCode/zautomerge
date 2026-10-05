@@ -4478,6 +4478,150 @@ test "initRootFromHydrate fills the root, and updateObject brings a map in line"
     try testing.expectEqual(@as(usize, 0), b2.ops.items.len);
 }
 
+test "updateMapValue numbers its operations depth first, and the row order is not that order" {
+    const gpa = testing.allocator;
+    var doc = try freshDocIn(gpa, .manual);
+    defer doc.deinit();
+
+    // **A value shaped to separate the two orders.** `a` is a map, `b` a list
+    // and `z` a scalar, so the root's sorted keys are `a`, `b`, `z` and a
+    // breadth-first walk would take the three root rows first and only then
+    // descend. The nested map has `x` and `y` and the list two scalars, so
+    // every descent is a real one and no key is a leaf before its siblings.
+    var inner = hydmod.Map.init(gpa, .root);
+    errdefer inner.deinit();
+    try inner.putOwned("y", hydmod.MapValue.init(hydmod.Value.scalar(.{ .int = 2 }), false));
+    try inner.putOwned("x", hydmod.MapValue.init(hydmod.Value.scalar(.{ .int = 1 }), false));
+
+    var list = hydmod.List.init(gpa, .root);
+    errdefer list.deinit();
+    try list.push(hydmod.Value.scalar(.{ .int = 20 }), false);
+    try list.push(hydmod.Value.scalar(.{ .int = 10 }), false);
+
+    var root = hydmod.Map.init(gpa, .root);
+    defer root.deinit();
+    try root.putOwned("z", hydmod.MapValue.init(hydmod.Value.scalar(.{ .int = 30 }), false));
+    try root.putOwned("b", hydmod.MapValue.init(.{ .object = .{ .list = list } }, false));
+    try root.putOwned("a", hydmod.MapValue.init(.{ .object = .{ .map = inner } }, false));
+    // **The move, made explicit**, as the test above spells it: `root` holds
+    // both tables now, so the local names must not free them a second time.
+    list = hydmod.List.init(gpa, .root);
+    inner = hydmod.Map.init(gpa, .root);
+
+    var tx = try Transaction.open(gpa, &doc);
+    defer tx.deinit();
+    const start_op = tx.start_op;
+    try tx.updateMapValue(.root, &root);
+
+    // **Seven operations, in the order `updateValue` writes them.**
+    // [`updateValue`](inner.rs:1203-1256) makes the child and then recurses
+    // into it before the next key, so the counters run
+    // `a, x, y, b, [0], [1], z`. A queue would have given
+    // `a, b, z, x, y, [0], [1]` — and with it every change hash, because
+    // [`nextId`] is `start_op + pending.len` (`:515-518`) and [`Batch.append`]
+    // reads that same length (`:2518`) *after* the caller has taken the id.
+    // **Append order into `pending` is id order**, which is why a batch is
+    // free to be one splice and is not free to be a queue.
+    try testing.expectEqual(@as(usize, 7), tx.pending.items.len);
+    const want = [_]struct { key: []const u8, action: Action, insert: bool }{
+        .{ .key = "a", .action = .make_map, .insert = false },
+        .{ .key = "x", .action = .set, .insert = false },
+        .{ .key = "y", .action = .set, .insert = false },
+        .{ .key = "b", .action = .make_list, .insert = false },
+        .{ .key = "", .action = .set, .insert = true },
+        .{ .key = "", .action = .set, .insert = true },
+        .{ .key = "z", .action = .set, .insert = false },
+    };
+    for (tx.pending.items, want, 0..) |item, w, i| {
+        try testing.expectEqual(start_op + @as(u64, @intCast(i)), @as(u64, item.tx.id().counter));
+        try testing.expectEqual(w.action, item.tx.action());
+        try testing.expectEqual(w.insert, item.tx.insert());
+        if (w.insert) {
+            // A sequence row is anchored to an element and not to a property
+            // name, and the key column is the one that says so.
+            try testing.expect(item.tx.keyStr() == null);
+        } else {
+            try testing.expectEqualStrings(w.key, item.tx.keyStr().?);
+        }
+    }
+
+    _ = try tx.commit(null, null);
+
+    // **And the rows are not in the order the operations were written in.**
+    // On an empty document the root's three rows were spliced at 0, then 1 and
+    // 2 were taken by the nested map's block, and the root's second and third
+    // rows were then spliced *back into* 1 and 2. **So consecutive writes do
+    // not share an insertion point**, and each position is read off the live
+    // op set by the write that follows it — [`seekOpsByMapKey`](opset/op_set.zig)
+    // at `:677` and [`mapKeyRow`] at `:696`. That is the whole of why the
+    // `update_*` family cannot be written the way [`Batch`] writes a BFS walk,
+    // and the row order below is what pins it.
+    try testing.expectEqual(@as(usize, 7), doc.ops.len());
+    const root_rows = try doc.ops.scopeToObj(.root);
+    try testing.expectEqual(@as(usize, 0), root_rows.start);
+    try testing.expectEqual(@as(usize, 3), root_rows.end);
+}
+
+test "a made object resolves the same on every write, and a spent transaction refuses anyway" {
+    const gpa = testing.allocator;
+    var doc = try freshDocIn(gpa, .manual);
+    defer doc.deinit();
+
+    var tx = try Transaction.open(gpa, &doc);
+    defer tx.deinit();
+    const child = try tx.putObject(.root, .{ .key = "c" }, .map);
+    // **The escape hatch, three times.** An object this transaction made is
+    // in no clock, so [`exidToObj`] answers it from `made_here` alone
+    // (`:586-589`) — and each of these has to resolve `child` to the same
+    // object, or the three registers land in three different places. This is
+    // the property a memo of `exidToObj` would rest on, so it is worth
+    // pinning as a fact about the transaction and not about a cache.
+    _ = try tx.put(child, .{ .key = "one" }, .{ .int = 1 });
+    _ = try tx.put(child, .{ .key = "two" }, .{ .int = 2 });
+    _ = try tx.put(child, .{ .key = "three" }, .{ .int = 3 });
+    _ = try tx.commit(null, null);
+
+    var one = try registerIn(gpa, &doc, child, "one");
+    defer one.deinit(gpa);
+    var two = try registerIn(gpa, &doc, child, "two");
+    defer two.deinit(gpa);
+    var three = try registerIn(gpa, &doc, child, "three");
+    defer three.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), one.ops.items.len);
+    try testing.expectEqual(@as(usize, 1), two.ops.items.len);
+    try testing.expectEqual(@as(usize, 1), three.ops.items.len);
+    // All three wrote the same parent object, so all three rows name it.
+    // **The column is the parent and not the row's own id**: `Op.id` is
+    // `OpLike::id` (`op.zig:2056-2059`), the operation's own identity, and
+    // each of these three rows is a *different* operation — `nextId` minted
+    // one per write — so comparing it against `child` compares two
+    // operations that are never the same one. `Op.obj` is the parent the
+    // object columns hold (`op.zig:2063-2066`), and *that* is what
+    // `exidToObj` resolved: the same value three times is the property, and
+    // one row's own id landing on another's counter is not.
+    const parent = child.opId().?;
+    try testing.expect(parent.eql(one.ops.items[0].obj().?));
+    try testing.expect(parent.eql(two.ops.items[0].obj().?));
+    try testing.expect(parent.eql(three.ops.items[0].obj().?));
+
+    // **And the refusal still fires, on an id this transaction has already
+    // resolved.** `requireOpen` runs ahead of the lookup on every call
+    // (`:581`), and that is the one thing a memo must not skip: a spent
+    // transaction answers `start_op` from `nextId` (`:515-518`), so a write
+    // that got past it would land on an op id the document already holds.
+    try testing.expectError(error.InvalidOp, tx.put(child, .{ .key = "four" }, .{ .int = 4 }));
+    try testing.expectError(error.InvalidOp, tx.putObject(child, .{ .key = "d" }, .map));
+
+    // The same through the other door onto `requireOpen`, which is a
+    // rollback rather than a commit.
+    var tx2 = try Transaction.open(gpa, &doc);
+    defer tx2.deinit();
+    const again = try tx2.putObject(.root, .{ .key = "c2" }, .map);
+    _ = try tx2.put(again, .{ .key = "x" }, .{ .int = 1 });
+    _ = try tx2.rollback();
+    try testing.expectError(error.InvalidOp, tx2.put(again, .{ .key = "y" }, .{ .int = 2 }));
+}
+
 test "updateText is a diff: an unchanged text writes no operation" {
     const gpa = testing.allocator;
     var doc = try freshDoc(gpa);

@@ -65,10 +65,15 @@
 //! raw DEFLATE stream over a change chunk body. Its stored checksum is the
 //! checksum of the **inflated** body hashed as a `change` chunk
 //! (`change/compressed.rs:18-34`), so `chunk.parseChunk` cannot check it — it
-//! defers exactly that case. `parseFramedChunk` is the only way in from a
-//! framed chunk, and it routes every compressed body through
-//! `chunk.decompressChunk`, which inflates it and verifies it against the
-//! header before a single column is read.
+//! defers exactly that case.
+//! `parseFramedChunk` is the only way in from a framed chunk, and it routes
+//! every compressed body through `chunk.decompressChunkWithHash`, which
+//! inflates it, verifies it against the header, and hands back the change hash
+//! it had to compute for that comparison — so the change built from it records
+//! that hash instead of hashing the same inflated bytes again. A body read from
+//! a `change` chunk gets the same treatment from the other end:
+//! `chunk.readChunk` already hashed it to check its checksum, and that hash
+//! travels on [`Chunk`](chunk.zig)'s `hash` field.
 
 const std = @import("std");
 const err = @import("../error.zig");
@@ -516,10 +521,39 @@ const min_desc_size: usize = 2;
 ///   construction, so a block that repeats an *empty* specification is not a
 ///   duplicate and is accepted, as upstream accepts it.
 pub fn parseChangeChunk(body: []const u8, gpa: Allocator) ParseError!ChangeChunk {
+    return parseChangeChunkWithHash(body, gpa, null);
+}
+
+/// [`parseChangeChunk`] with the change hash the caller already holds, which is
+/// the seam between the chunk layer's one SHA-256 and the header reader below.
+///
+/// `hash` must be `chunk.changeHashOf(.change, body)` — the whole thirty-two
+/// bytes over `body` framed as a `change` chunk. That is what
+/// [`Chunk`](chunk.zig)'s `hash` field carries for a chunk of that type, and
+/// what [`decompressChunkWithHash`](chunk.zig) hands back for a compressed
+/// one, which is how a caller reading a framed chunk gets it without hashing
+/// the body a second time.
+///
+/// **A null `hash` is not a different answer, it is no answer**: the hash is
+/// taken where [`parseChange`] has always taken it, after the header has
+/// parsed, so a refused body costs no SHA-256 under either spelling.
+///
+/// **Nothing here compares `hash` against `body`,** and that is the same
+/// bargain [`change.parseChangeWithHash`] documents: the checksum comparison in
+/// `chunk.readChunk` — or, for a compressed chunk, in
+/// [`decompressChunkWithHash`](chunk.zig) — has already been made over these
+/// very bytes, so a hash supplied here can only be the right one or a caller
+/// error. This function is unchanged in every other respect: the same header
+/// read, the same column metadata block, the same refusals in the same order.
+pub fn parseChangeChunkWithHash(
+    body: []const u8,
+    gpa: Allocator,
+    hash: ?ChangeHash,
+) ParseError!ChangeChunk {
     // The header reader owns the fields; this module needs only where it
     // ended. `header_len` is where the op metadata block starts, and the whole
     // body is what the change hash was taken over.
-    var change = try change_mod.parseChange(body, gpa);
+    var change = try change_mod.parseChangeWithHash(body, gpa, hash);
     errdefer change.deinit(gpa);
 
     var in: Input = .init(body);
@@ -593,29 +627,49 @@ fn descsInNormalOrder(descs: []const ColumnDesc) ParseError!void {
 /// a `ChunkType.compressed` one.
 ///
 /// A `change` chunk is read in place, from the caller's bytes. A `compressed`
-/// chunk is inflated through `chunk.decompressChunk`, which is the only place
-/// a compressed chunk's checksum can be checked: the stored checksum is the
-/// checksum of the inflated body hashed as a change chunk
+/// chunk is inflated through `chunk.decompressChunkWithHash`, which is the only
+/// place a compressed chunk's checksum can be checked: the stored checksum is
+/// the checksum of the inflated body hashed as a change chunk
 /// (`chunk.rs:118-122`), and `chunk.parseChunk` deliberately does not verify
 /// that case. So a body read this way has been verified, and a body read from
 /// a `change` chunk was verified when the chunk was parsed.
+///
+/// **Either way the change is handed the hash of the body it was read from,
+/// and neither body is hashed twice.** For a `change` chunk that hash is
+/// `Chunk.hash`, taken by `chunk.readChunk` for the comparison it had to make;
+/// for a compressed one it is the hash `decompressChunkWithHash` took over the
+/// inflated bytes for the comparison it had to make. Both are handed to
+/// [`parseChangeChunkWithHash`], which records them verbatim, so the change this
+/// returns carries the same identity as the one the old spelling reached by
+/// hashing for itself — and the difference between the two is one SHA-256 pass
+/// over the body rather than two.
 ///
 /// A `document` or `bundle` chunk is `error.InvalidChunkType`: those hold no
 /// single change.
 pub fn parseFramedChunk(c: chunk.Chunk, gpa: Allocator) ParseError!OwnedChangeChunk {
     switch (c.typ) {
         .change => {
-            const parsed = try parseChangeChunk(c.data, gpa);
+            // **`c.hash` is the hash `readChunk` already took over `c.data`.**
+            // It is passed through rather than unwrapped with `.?`: null here
+            // means a caller handed over a hand-built chunk, and null is what
+            // `parseChangeChunk` has always passed, so that caller gets the
+            // answer it got before rather than a trap.
+            const parsed = try parseChangeChunkWithHash(c.data, gpa, c.hash);
             return .{ .inflated = null, .parsed = parsed };
         },
         .compressed => {
             // The checksum is verified here, before the inflated bytes are
             // handed to a body parser, which is the whole reason this path
-            // goes through `decompressChunk` and not `decompressRaw`.
-            const body = try chunk.decompressChunk(gpa, c);
-            errdefer gpa.free(body);
-            const parsed = try parseChangeChunk(body, gpa);
-            return .{ .inflated = body, .parsed = parsed };
+            // goes through `decompressChunkWithHash` and not `decompressRaw`.
+            //
+            // **The hash rides out with the body.** This is the only place the
+            // inflated bytes are ever hashed — the stored checksum covers
+            // exactly them — so handing that hash to the body parser is what
+            // keeps a compressed change from hashing itself twice.
+            const inflated = try chunk.decompressChunkWithHash(gpa, c);
+            errdefer gpa.free(inflated.body);
+            const parsed = try parseChangeChunkWithHash(inflated.body, gpa, inflated.hash);
+            return .{ .inflated = inflated.body, .parsed = parsed };
         },
         .document, .bundle => return error.InvalidChunkType,
     }
@@ -1464,6 +1518,87 @@ test "a compressed change chunk is inflated and checked before it is read" {
     defer borrowed.deinit(gpa);
     try testing.expect(borrowed.inflated == null);
     try testing.expect(borrowed.parsed.change.bytes.ptr == plain.items.ptr + 10);
+}
+
+test "a framed chunk's hash reaches the change instead of being taken again" {
+    const gpa = testing.allocator;
+
+    // **The uncompressed path.** `readChunk` hashed the body to check it
+    // against the header and kept all thirty-two bytes, so the change this
+    // walk builds records that hash rather than a second one over the same
+    // bytes — and it is the hash over the body's own bytes.
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(gpa);
+    try chunk.writeChunk(&plain, gpa, .change, &fixture_first_body);
+    const c = try chunk.parseChunk(plain.items);
+    try testing.expect(c.hash != null);
+    var borrowed = try parseFramedChunk(c, gpa);
+    defer borrowed.deinit(gpa);
+    try testing.expect(borrowed.parsed.change.hash.eql(chunk.changeHashOf(.change, c.data)));
+    try testing.expect(borrowed.parsed.change.hash.eql(c.hash.?));
+
+    // **The compressed path.** `readChunk` publishes no hash here — it never
+    // inflates, which is why `c.hash` is null for this type — so the hash
+    // comes out of the decompression instead, and the change records it.
+    var framed: std.ArrayList(u8) = .empty;
+    defer framed.deinit(gpa);
+    try chunk.compressChunk(&framed, gpa, &fixture_first_body);
+    const cc = try chunk.parseChunk(framed.items);
+    try testing.expect(cc.hash == null);
+    var owned = try parseFramedChunk(cc, gpa);
+    defer owned.deinit(gpa);
+    const inflated = owned.inflated.?;
+    try testing.expect(owned.parsed.change.hash.eql(chunk.changeHashOf(.change, inflated)));
+    // The inflated bytes are the fixture's own, so the two agree.
+    try testing.expect(owned.parsed.change.hash.eql(chunk.changeHashOf(.change, &fixture_first_body)));
+
+    // **Handing the hash over and letting it be taken are the same answer.**
+    // That is the whole of what this seam changes: the parse, the columns and
+    // the change are identical, and only the number of SHA-256 passes over the
+    // body differs.
+    var taken = try parseChangeChunkWithHash(inflated, gpa, null);
+    defer taken.deinit(gpa);
+    try testing.expect(taken.change.hash.eql(owned.parsed.change.hash));
+    try testing.expectEqual(taken.change.seq, owned.parsed.change.seq);
+    try testing.expectEqual(taken.change.start_op, owned.parsed.change.start_op);
+    try testing.expectEqual(taken.change.time, owned.parsed.change.time);
+    try testing.expectEqualStrings(taken.change.message, owned.parsed.change.message);
+    try testing.expectEqual(try taken.opCount(), try owned.parsed.opCount());
+    try testing.expectEqualSlices(u8, taken.opData(), owned.parsed.opData());
+    try testing.expectEqualSlices(u8, taken.footer, owned.parsed.footer);
+    try testing.expectEqual(taken.change.header_len, owned.parsed.change.header_len);
+
+    // **A chunk handed over with no hash still reads.** `parseFramedChunk`
+    // passes `c.hash` through instead of unwrapping it, so a caller with a
+    // hand-built chunk gets the hash taken here — which is the answer it got
+    // before the seam existed — rather than a trap on a null.
+    const hand_built: chunk.Chunk = .{
+        .typ = .change,
+        .checksum = c.checksum,
+        .hash = null,
+        .data = c.data,
+        .frame = c.frame,
+    };
+    var from_hand = try parseFramedChunk(hand_built, gpa);
+    defer from_hand.deinit(gpa);
+    try testing.expect(from_hand.parsed.change.hash.eql(chunk.changeHashOf(.change, c.data)));
+    try testing.expect(from_hand.parsed.change.hash.eql(borrowed.parsed.change.hash));
+
+    // **A refused body is refused the same way with and without a hash.** The
+    // hash is taken after the header parses, so a body that never gets that
+    // far must not reach one on either spelling.
+    try testing.expectError(
+        error.LengthExceedsInput,
+        parseChangeChunkWithHash(fixture_first_body[0..41], gpa, null),
+    );
+    try testing.expectError(
+        error.LengthExceedsInput,
+        parseChangeChunkWithHash(
+            fixture_first_body[0..41],
+            gpa,
+            chunk.changeHashOf(.change, &fixture_first_body),
+        ),
+    );
 }
 
 test "a chunk that is not a change is refused" {

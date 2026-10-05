@@ -1004,6 +1004,69 @@ pub fn merge(
     a.tail = tail;
 }
 
+/// Whether a piece cut out of a slab can pick up a run the slab itself did
+/// not hold.
+///
+/// **The boolean wire, and only it.** A boolean run carries its value by its
+/// position in the run sequence (`bool.rs:13-25`), so a piece that has to
+/// open on a `true` run writes the zero-count `false` run in front of it
+/// (`bool.rs:988-1002`, `column.zig:2691-2707`) — and `measure` counts that
+/// pad as a run (`column.zig:2584`), so the pad spends budget the cut has
+/// to leave for it. Upstream spends it the same way and says so: the pad it
+/// writes behind a cut "counts as a segment" (`bool.rs:312-317`), the suffix
+/// it would put behind the cut is measured with `suffix.padding`
+/// (`bool.rs:322-326`), and the loader rounds its cut target down to even
+/// precisely to leave room for one (`bool.rs:970`). Every other codec's
+/// `wireSlice` copies the bytes it is handed (`column.zig:1090-1101`) and its
+/// run table publishes `opens_with_true = false` for every run
+/// (`column.zig:793`, `:975`), so its pieces hold exactly the runs they were
+/// cut at.
+fn piecePadsRuns(comptime E: type) bool {
+    return E.Wire == bool;
+}
+
+/// The runs a piece cut at `from` out of `segs` may hold and still fit the
+/// budget: the budget less the pad the piece has to write in front of it.
+///
+/// **`from == 0` pays nothing.** The first piece carries the slab's own pad
+/// inside `[0, to)` when the slab had one (`splitToBudget` below), so there
+/// is nothing to add; every piece behind it is a standalone slab and needs
+/// the pad the parity asks for.
+///
+/// `from` is a `from < segs.len` loop cursor, so `segs[from]` is a run. The
+/// budget is at least two — `Column.initWithBudget` and `Column.loadIter`
+/// both refuse one below it (`column.zig:3151`, `:5274`) — so the pad can
+/// never spend the whole cut and the cursor always advances.
+pub fn pieceRuns(
+    comptime E: type,
+    segs: []const Segment(E.Wire),
+    from: usize,
+    max_segments: usize,
+) usize {
+    const pad: usize = if (piecePadsRuns(E) and from != 0 and segs[from].opens_with_true) 1 else 0;
+    return max_segments - pad;
+}
+
+/// How many slabs a slab of `segments` runs leaves behind when it is cut at
+/// the budget: the room a caller has to have in its list before the cut puts
+/// them there (`Column.settle`, `Column.spliceOneSlab`,
+/// `Column.spliceAcrossSlabs`, `Column.tryMerge`).
+///
+/// The first piece keeps the slab's own identity (`splitToBudget` below), so
+/// this counts the pieces that spill and not the pieces the cut makes.
+///
+/// **A codec whose pieces cannot gain a pad is bound by the budget alone**,
+/// and `segments / max_segments` is the bound this file already reserved
+/// with — a conservative one, since the cut makes `ceil` pieces. One whose
+/// pieces can has every piece behind the first hold `max_segments - 1`
+/// runs, which is the bound here and the whole difference between the two.
+pub fn splitSpillCount(comptime E: type, segments: usize, max_segments: usize) usize {
+    if (!piecePadsRuns(E)) return segments / max_segments;
+    if (segments <= max_segments) return 0;
+    const behind: usize = max_segments - 1;
+    return (segments - max_segments + behind - 1) / behind;
+}
+
 /// Cuts `slab` down to the run budget, returning the pieces that spilled
 /// out. Cuts land on run boundaries, so every piece is itself a canonical
 /// slab and the byte stream they concatenate to is the one `slab` held.
@@ -1011,6 +1074,17 @@ pub fn merge(
 /// A run is never split, so a slab that is one very long run keeps one
 /// segment however long it is — the same exemption the column's invariant
 /// checker makes for a single oversize value (`column.rs:1311-1318`).
+///
+/// **A piece is cut one run short when it has to open on a `true` run**, and
+/// that is the whole difference between a boolean column and the rest
+/// ([`pieceRuns`](pieceRuns) above). The pad the piece writes is a run the
+/// wire spends and `measure` counts, so a piece cut at the full budget behind
+/// a `true` run lands one run over it — which is the arm the column's
+/// invariant checker refuses (`column.zig:6881-6882`), stated upstream at the
+/// same bound (`column.rs:1310-1315`). Upstream never has to make the
+/// correction because it cuts the run out of the rebuild rather than out of
+/// a finished slab, and the cut it makes is already against the pad
+/// (`bool.rs:312-317`, `:322-326`).
 pub fn splitToBudget(
     gpa: std.mem.Allocator,
     comptime E: type,
@@ -1028,7 +1102,7 @@ pub fn splitToBudget(
     defer gpa.free(segs);
     var from: usize = 0;
     while (from < segs.len) {
-        const to = @min(from + max_segments, segs.len);
+        const to = @min(from + pieceRuns(E, segs, from, max_segments), segs.len);
         // Reserve before the new piece owns bytes. A refused append must not
         // abandon a finished slab outside `out`'s cleanup guard.
         try out.ensureUnusedCapacity(gpa, 1);
@@ -1564,6 +1638,71 @@ test "splitToBudget cuts on run boundaries and every piece is a slab" {
         try E.appendRange(gpa, &all, p, 0, p.len);
     }
     try testing.expectEqualSlices(i64, values_in.items, all.items);
+}
+
+test "a boolean piece cut behind a true run is cut one run short, so every piece is inside the budget" {
+    const colmod = @import("column.zig");
+    const E = colmod.Bool;
+    const gpa = testing.allocator;
+
+    // **The shape the column's invariant checker refused**: a boolean prefix
+    // column built from sixteen alternating values and a budget of three or
+    // four. Eleven runs carry the values and the pad a slab opening on `true`
+    // writes in front of them (`bool.rs:988-1002`) is a twelfth, so every
+    // other piece of a cut has to open on a `true` run.
+    const opens_true = [_]bool{ true, false, true, true, false, true, false, true, true, true, false, false, true, false, true, true };
+    // **And the same values opening on `false`** (`bool.rs:988-1002`: a slab
+    // opens on a `false` run, so a leading `false` needs no pad), where no
+    // piece pays one and the cut is the budget itself.
+    const opens_false = [_]bool{ false, true, false, false, true, false, true, false, false, false, true, true, false, true, false, false };
+
+    for ([_]struct { budget: usize, values: []const bool, segments: usize }{
+        .{ .budget = 3, .values = &opens_true, .segments = 12 },
+        .{ .budget = 4, .values = &opens_true, .segments = 12 },
+        .{ .budget = 3, .values = &opens_false, .segments = 11 },
+        .{ .budget = 4, .values = &opens_false, .segments = 11 },
+    }) |c| {
+        const bytes = try E.wireEncode(gpa, c.values, false);
+        defer gpa.free(bytes);
+        var s = try init(gpa, E, bytes);
+        defer s.deinit(gpa);
+        try testing.expectEqual(c.segments, s.segments);
+        // The budget is crossed, which is the whole reason the cut runs.
+        try testing.expect(s.segments > c.budget);
+
+        var spilled = try splitToBudget(gpa, E, &s, c.budget);
+        defer {
+            for (spilled.items) |*p| p.deinit(gpa);
+            spilled.deinit(gpa);
+        }
+
+        // **Every piece is inside the budget, and the first one kept the
+        // slab's own identity** — so what spilled is what `splitSpillCount`
+        // bounds, which is the room a column reserves before it cuts
+        // (`column.zig:6291`, `:6387`, `:6541`, `:6608`). The arm that used to
+        // stand one run over is `column.zig:6881-6882`, upstream's is
+        // `column.rs:1310-1315`.
+        try testing.expect(spilled.items.len <= splitSpillCount(E, c.segments, c.budget));
+        try expectSlabSound(E, &s);
+        try testing.expect(s.segments <= c.budget);
+
+        // **The pieces hold the same values in the same order**, which is what
+        // says the shorter cut lost nothing: every piece is the run range it
+        // was cut at, and those ranges still tile the slab.
+        var all: std.ArrayList(bool) = .empty;
+        defer all.deinit(gpa);
+        const head = try E.wireRange(gpa, s.data, 0, s.len);
+        defer gpa.free(head);
+        try all.appendSlice(gpa, head);
+        for (spilled.items) |*p| {
+            try expectSlabSound(E, p);
+            try testing.expect(p.segments <= c.budget);
+            const piece = try E.wireRange(gpa, p.data, 0, p.len);
+            defer gpa.free(piece);
+            try all.appendSlice(gpa, piece);
+        }
+        try testing.expectEqualSlices(bool, c.values, all.items);
+    }
 }
 
 test "the tail is copied when the suffix came through and measured when it did not" {

@@ -1511,12 +1511,12 @@ pub const Text = struct {
     /// The allocator the text buffer, the mark set and every byte in
     /// `owned` are taken with.
     ///
-    /// **This is the allocator `init` was handed, and it must not be replaced
-    /// once the text has allocated** — see [`Map.gpa`], which states the rule
-    /// and why nothing catches a breach of it.
+    /// **This is the allocator `init` or [`take`] was handed, and it must not
+    /// be replaced once the text has allocated** — see [`Map.gpa`], which
+    /// states the rule and why nothing catches a breach of it.
     ///
     /// **This field and `value.gpa` are two records of one allocator, and both
-    /// must stay the one `init` was given.** [`Text.splice`] and
+    /// must stay the one the constructor was given.** [`Text.splice`] and
     /// [`Text.removeAt`] free the buffer they replace through *this* field
     /// while [`ConcreteTextValue.splice`] takes the next one from *its* own, so
     /// a pair that disagreed would free a block with an allocator that never
@@ -1545,16 +1545,41 @@ pub const Text = struct {
 
     /// A text object holding `s` ([`Text::new`](hydrate/text.rs):64-69`).
     ///
-    /// **This is the one constructor that allocates**, one buffer for `s`; a
-    /// failure leaves nothing to release. `gpa` is recorded on the text, on
-    /// its [`patches.ConcreteTextValue`] and on its mark set, and the caller
-    /// keeps it — [`Text.deinit`] frees the three with it and never with
-    /// anything else.
+    /// **This is the constructor that copies**, one buffer for `s`; a failure
+    /// leaves nothing to release. [`take`] is the other one and copies nothing.
+    /// `gpa` is recorded on the text, on its [`patches.ConcreteTextValue`] and
+    /// on its mark set, and the caller keeps it — [`Text.deinit`] frees the
+    /// three with it and never with anything else.
     pub fn init(gpa: Allocator, id: ExId, enc: TextEncoding, s: []const u8) Error!Text {
         return .{
             .gpa = gpa,
             .id = id,
             .value = try patches.ConcreteTextValue.init(gpa, s, enc),
+            .marks = .init(gpa),
+        };
+    }
+
+    /// A text object holding `bytes`, **which this takes over**
+    /// ([`OpSet::hydrate_text`](hydrate.rs):278-286`).
+    ///
+    /// **This constructor allocates nothing**, and that is the whole of why it
+    /// exists. [`OpSet.text`](opset/op_set.zig) has already built the object's
+    /// characters into a buffer the caller owns, so [`Text.init`] copied it
+    /// only for [`hydrateText`] to free the first — an allocation and a memcpy
+    /// of the entire text, per text object, spent before the walk looked at it
+    /// again. Here the buffer moves instead, and this text is its only owner
+    /// from this line on.
+    ///
+    /// **The bytes must have come from `gpa`, and they are freed exactly as
+    /// `init`'s are**: [`Text.deinit`] frees them through the value's own
+    /// `gpa`, and [`Text.splice`] and [`Text.removeAt`] free the buffer each
+    /// replaces. A caller holding bytes it does not own must use
+    /// [`Text.init`], which is the copy.
+    pub fn take(gpa: Allocator, id: ExId, enc: TextEncoding, bytes: []u8) Text {
+        return .{
+            .gpa = gpa,
+            .id = id,
+            .value = .{ .gpa = gpa, .enc = enc, .bytes = bytes },
             .marks = .init(gpa),
         };
     }
@@ -1859,11 +1884,42 @@ pub fn assertSet(comptime Set: type) void {
 /// ([`OpSet::to_string(top.elemid_or_key())`](hydrate.rs):252`,
 /// `op_set2/op_set.rs`:1093-1098`).
 ///
-/// A map key is the key; a sequence element is `"<counter>@<actor>"`. The
-/// caller owns the result.
-fn winnerKey(comptime Set: type, set: *const Set, gpa: Allocator, key: KeyRef) Error![]u8 {
-    if (key.keyStr()) |s| return gpa.dupe(u8, s);
-    return set.opIdText(gpa, key.seq.id);
+/// A map key is the key; a sequence element is `"<counter>@<actor>"`.
+///
+/// **The two arms own their bytes differently, and that is the whole of what
+/// this returns.** A sequence anchor has no interned bytes to name it, so
+/// [`OpSet.opIdText`](opset/op_set.zig) formats one here and this owns that
+/// buffer. A map key is **borrowed**: [`KeyRef.keyStr`](opset/types.zig):233
+/// hands back the op set's own string table
+/// ([`StringTable.resolve`](opset/columns.zig):485`), and [`Map.putOwned`]
+/// copies the key on the way into the map — so a copy made here was spent only
+/// to be freed a line later, and the walk was paying an allocation and a
+/// memcpy per map key for a buffer nobody ever read.
+///
+/// **The borrow is spent inside one step of the walk**, which is what makes it
+/// sound and not merely short-lived: [`hydrateMap`] puts the key before the
+/// loop advances, and the only thing between [`winnerKey`] and that
+/// [`Map.putOwned`] is [`hydrateOp`], which reads. So the bytes are copied out
+/// before any call that could grow or renumber the table.
+const WinnerKey = struct {
+    /// The key, either borrowed from the op set or owned here.
+    bytes: []const u8,
+    /// The buffer to give back, or null when `bytes` is the op set's.
+    owned: ?[]u8 = null,
+
+    /// Frees the buffer this owns and nothing else. **A null `owned` is the
+    /// ordinary case**, so the walk never has to ask which arm produced a key:
+    /// this is a no-op on the map path and the one free on the sequence path.
+    fn deinit(self: *WinnerKey, gpa: Allocator) void {
+        if (self.owned) |buf| gpa.free(buf);
+        self.* = undefined;
+    }
+};
+
+fn winnerKey(comptime Set: type, set: *const Set, gpa: Allocator, key: KeyRef) Error!WinnerKey {
+    if (key.keyStr()) |s| return .{ .bytes = s };
+    const text = try set.opIdText(gpa, key.seq.id);
+    return .{ .bytes = text, .owned = text };
 }
 
 /// The mirror of `obj` as a map ([`OpSet::hydrate_map`](hydrate.rs):244-259`).
@@ -1873,7 +1929,7 @@ fn winnerKey(comptime Set: type, set: *const Set, gpa: Allocator, key: KeyRef) E
 /// the value is [`hydrateOp`].
 ///
 /// **The caller owns the result, and `set` is borrowed for the call only.**
-/// Every byte the mirror holds — each key [`winnerKey`] produced and each
+/// Every byte the mirror holds — every key [`winnerKey`] names and each
 /// value's payload — is copied on the way in ([`Map.putOwned`]), so the mirror
 /// outlives the next mutation of `set` and nothing in it points into the op
 /// set. Release it with **one** [`Value.deinit`], which frees the whole tree;
@@ -1902,11 +1958,11 @@ pub fn hydrateMap(
     var tops = try set.topOps(obj, clock);
     defer tops.deinit(gpa);
     while (try tops.next()) |top| {
-        const key = try winnerKey(Set, set, gpa, top.elemidOrKey());
-        defer gpa.free(key);
+        var key = try winnerKey(Set, set, gpa, top.elemidOrKey());
+        defer key.deinit(gpa);
         var value = try hydrateOp(Set, set, gpa, top, clock);
         errdefer value.deinit();
-        try map.putOwned(key, MapValue.init(value, top.conflict));
+        try map.putOwned(key.bytes, MapValue.init(value, top.conflict));
     }
     return .{ .object = .{ .map = map } };
 }
@@ -1986,20 +2042,21 @@ pub fn hydrateList(
 /// upstream's rule applied to a fold the port added, not a second fold.
 ///
 /// **The caller owns the result, and `set` is borrowed for the call only.**
-/// The text itself is a copy ([`Text.init`] dupes it) and every mark's name and
-/// payload is a copy too, both through [`Text.putMark`], so the mirror outlives
-/// the next mutation of `set` and nothing in it points into the op set. Release
+/// The text itself is **one** copy — [`Text.take`] takes over the buffer
+/// [`set.text`] built instead of duping it — and every mark's name and payload
+/// is a copy too, through [`Text.putMark`], so the mirror outlives the next
+/// mutation of `set` and nothing in it points into the op set. Release
 /// it with **one** [`Value.deinit`], which frees the text buffer, the mark set
 /// and the mark bytes; [`Value`] says why a copy of the result is a move and
 /// not a second owner. `gpa` is recorded on the text and is never released
 /// here — the caller keeps it — and `clock` is borrowed for the call.
 ///
-/// **On an error the caller owns nothing.** The text built so far and its
-/// marks are released by the `errdefer` and the two buffers this function
-/// allocated for itself are freed by their `defer`s, so a failure after three
-/// marks and a failure after none are the same thing to the caller: no value.
-/// [`Text.init`] registers nothing itself, and its own failure to duplicate
-/// `text` leaves nothing to release either.
+/// **On an error the caller owns nothing.** The text and the marks built so far
+/// are released by the one `errdefer`, and the buffer [`set.text`] built is
+/// taken by [`Text.take`] before anything after it can fail, so a failure after
+/// three marks and a failure after none are the same thing to the caller: no
+/// value. [`Text.take`] allocates nothing and registers nothing, so it has no
+/// failure of its own that could leave a residue.
 ///
 /// `Set` must carry [`set_decls`]; [`assertSet`] says what that means and
 /// fails the build naming what is missing.
@@ -2012,8 +2069,7 @@ pub fn hydrateText(
 ) OpHydrateError!Value {
     assertSet(Set);
     const text = try set.text(gpa, obj, clock);
-    defer gpa.free(text);
-    var out = try Text.init(gpa, obj, set.textEncoding(), text);
+    var out = Text.take(gpa, obj, set.textEncoding(), text);
     errdefer out.deinit();
     // **`:1585` — the clock picks the arm**, the two indexes for the present
     // and the walk of the rows it sees for anything else. Unscoped, this is
@@ -4618,6 +4674,129 @@ test "hydrate: two reads of one op set give two mirrors different bytes" {
     defer three.deinit();
     try testing.expectEqualStrings("changed", firstElemId(&three).?);
     try testing.expectEqualStrings("hello!", rootText(&three).?.asStr());
+}
+
+/// The bytes the mirror's own hash table holds under `want`, or null. The key
+/// is what the map copied on the way in, so this is the only way to read what
+/// it stored as a property name rather than as a lookup argument.
+fn mirrorKey(m: *const Map, want: []const u8) ?[]const u8 {
+    var keys = m.entries.keyIterator();
+    while (keys.next()) |k| {
+        if (std.mem.eql(u8, k.*, want)) return k.*;
+    }
+    return null;
+}
+
+/// The document's string table's own copy of `want`, or null — the bytes a
+/// borrowing key would be reading.
+fn internedStr(doc: *const rtdoc.Document, want: []const u8) ?[]const u8 {
+    for (doc.strings.items.items) |item| {
+        if (std.mem.eql(u8, item, want)) return item;
+    }
+    return null;
+}
+
+test "hydrate: a mirror key is the map's own bytes, and outlives the op set's copy" {
+    const gpa = testing.allocator;
+    var doc = try rtdoc.Document.init(gpa, std.testing.io, .auto);
+    defer doc.deinit();
+    doc.setActorId(.{ .bytes = "7f" });
+    _ = try rttrans.put(&doc, .root, .{ .key = "id" }, .{ .str = "a" });
+
+    var one = try hydrateMap(RtSet, &doc.ops, gpa, .root, null);
+    defer one.deinit();
+
+    // **The key bytes, and not the value found under them.** The test above
+    // reaches every value through a literal key, so nothing in it ever reads
+    // what the map stored as a property name — which is where a key borrowed
+    // out of the op set's string table would be visible.
+    const key = mirrorKey(&one.object.map, "id").?;
+    try testing.expectEqualStrings("id", key);
+    // **The premise is asserted, not assumed**: the key column holds an id into
+    // the document's string table ([`Columns.splice`](opset/columns.zig):1182),
+    // and there is no interned copy to compare against if it ever stops.
+    const interned = internedStr(&doc, "id") orelse return error.TestUnexpectedResult;
+    try testing.expect(key.ptr != interned.ptr);
+
+    // **And the op set really does take on new strings while `one` is held**,
+    // so the read afterwards is about a mirror that was in the way of the
+    // document rather than about one nothing ever happened to.
+    const before = doc.strings.count();
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        var name: [24]u8 = undefined;
+        const fresh = try std.fmt.bufPrint(&name, "fresh-{d}-padding", .{i});
+        _ = try rttrans.put(&doc, .root, .{ .key = fresh }, ival(@intCast(i)));
+    }
+    try testing.expect(doc.strings.count() > before);
+
+    try testing.expectEqualStrings("id", key);
+    try testing.expectEqualStrings("a", one.object.map.get("id").?.asStr());
+}
+
+test "hydrate: winnerKey borrows a map key and formats a sequence anchor" {
+    const gpa = testing.allocator;
+    const f = try Fixture.init(gpa, &.{rt_actor});
+    defer f.destroy();
+
+    // **Zero allocations is the whole claim of the map arm**, and it is
+    // measured rather than read off the source: the `dupe` this arm used to
+    // make would move the counter by one, and the mirror it fed copied the key
+    // again a line later and freed this one.
+    var failing: testing.FailingAllocator = .init(gpa, .{});
+    const counted = failing.allocator();
+    var key = try winnerKey(Fixture.Set, &f.set, counted, .fromStr("id"));
+    defer key.deinit(counted);
+    try testing.expect(key.owned == null);
+    try testing.expectEqualStrings("id", key.bytes);
+    try testing.expectEqual(@as(usize, 0), failing.alloc_index);
+
+    // **The sequence arm owns what it formats, and the testing allocator's
+    // leak check is what proves the free happened** — `deinit` is the only
+    // owner, and the bytes it holds are the ones it was handed.
+    var anchor = try winnerKey(Fixture.Set, &f.set, gpa, .fromElemId(elem(3, 0)));
+    defer anchor.deinit(gpa);
+    try testing.expect(anchor.owned != null);
+    try testing.expectEqualStrings("3@" ++ rt_actor.bytes, anchor.bytes);
+    try testing.expectEqual(anchor.owned.?.ptr, anchor.bytes.ptr);
+}
+
+test "hydrate: Text.take adopts the caller's buffer, init copies it, and both free once" {
+    const gpa = testing.allocator;
+
+    // **The address is the assertion.** Two buffers holding equal bytes is
+    // what a copying text produces too, so the only way to say which
+    // constructor ran is to ask whether the mirror is holding the very buffer
+    // it was handed.
+    const mine = try gpa.dupe(u8, "abc");
+    var taken = Text.take(gpa, .root, doc_enc, mine);
+    defer taken.deinit();
+    try testing.expectEqualStrings("abc", taken.asStr());
+    try testing.expectEqual(@intFromPtr(mine.ptr), @intFromPtr(taken.value.bytes.ptr));
+
+    var copied = try Text.init(gpa, .root, doc_enc, mine);
+    defer copied.deinit();
+    try testing.expectEqualStrings("abc", copied.asStr());
+    try testing.expect(copied.value.bytes.ptr != mine.ptr);
+
+    // **And the adopted buffer is released exactly once.** `splice` frees the
+    // one it replaced and `deinit` frees the one it installed, so the
+    // testing allocator reports a leak if either free did not happen.
+    try taken.splice(0, "ab");
+    try testing.expectEqualStrings("ababc", taken.asStr());
+
+    // **The op-set path still reads the same.** `hydrateText` adopts its
+    // buffer rather than copying it, so the content is compared against what
+    // the copying constructor would have made of the same bytes.
+    var rt = try roundTripDoc(gpa);
+    defer rt.deinit();
+    var from_set = try hydrateText(RtSet, &rt.doc.ops, gpa, rt.text, null);
+    defer from_set.deinit();
+    const want = try rt.doc.ops.text(gpa, rt.text, null);
+    defer gpa.free(want);
+    var wanted = try Text.init(gpa, rt.text, doc_enc, want);
+    defer wanted.deinit();
+    try testing.expect(from_set.object.text.eql(&wanted));
 }
 
 test "hydrate: two applications of one stream give two mirrors different bytes" {
