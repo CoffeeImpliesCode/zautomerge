@@ -34,8 +34,10 @@
 //! carry the flattened position itself (`op_iter.zig:895-910`). Upstream's
 //! `OpIter` allocates nothing because its `SuccCursors` is lazy over the
 //! columns. The buffer therefore has to live somewhere, and this is the only
-//! layer that hands out walks. It is sized to [`op_iter.maxSuccCount`] and
-//! refitted on every mutation.
+//! layer that hands out walks. It is sized to [`op_iter.maxSuccCount`] and only
+//! ever widened: `OpSet.succ_scratch_width` is the widest row the buffer has
+//! been asked to hold, so a mutation that brings nothing wider costs neither an
+//! allocation nor a pass over the column.
 //!
 //! **The rule that follows, and it is load-bearing:** a walk borrows the op
 //! set's buffer, and the [`Op`](op.zig) a walk hands back points its successors
@@ -859,6 +861,27 @@ pub fn OpSet(comptime O: type) type {
         /// The successor buffer every walk this hands out borrows. The module
         /// doc's third and fourth sections are the rule.
         succ_scratch: std.ArrayList(SuccEntry) = .empty,
+        /// The widest row the successor buffer has ever been sized for
+        /// ([`OpSet.reserveScratchFor`]).
+        ///
+        /// **Two facts about it, and between them they are the whole of why
+        /// the buffer's width is safe.** It is at least
+        /// [`opiter.maxSuccCount`] over the whole column set, so the buffer is
+        /// never narrower than the widest row that exists; and
+        /// `succ_scratch.items.len` is at least this, because a mark is only
+        /// recorded once the resize that backs it has returned. A row wider
+        /// than the buffer is the one thing that can make a later walk answer
+        /// `error.TooLarge` (`op_iter.zig:1377`).
+        ///
+        /// **It only ever goes up, and a mark above the truth is not a wrong
+        /// one.** Taking rows away drops the column's real maximum and leaves
+        /// this where it was, and nothing reads the width for its value — it
+        /// is compared against a row's successor count and never handed out. A
+        /// walk writes `succ_count` entries into the buffer and stops there,
+        /// and both guards are one-sided (`op_iter.zig:1377`, `op.zig:499`), so
+        /// a buffer wider than the widest row reads identically and the only
+        /// cost is the memory.
+        succ_scratch_width: usize = 0,
 
         // ── Structure and lifecycle ─────────────────────────────────────
 
@@ -2014,10 +2037,22 @@ pub fn OpSet(comptime O: type) type {
         /// **The successor buffer is reserved before anything is written**,
         /// because a row that arrives with more successors than the buffer holds
         /// would make every later walk over this op set answer `error.TooLarge`
-        /// (`op_iter.zig:908-910`). The buffer that is already wide enough is
-        /// left alone, so a splice in a document with a wide register costs one
-        /// pass over `succ_count` and no allocation — and that pass is the one
-        /// [`OpSet.refitScratch`] would have made afterwards anyway.
+        /// (`op_iter.zig:908-910`). **The width it is reserved against is the
+        /// high-water mark [`OpSet.succ_scratch_width`], not a fresh pass over
+        /// `succ_count`**, so a splice that brings nothing wider than the buffer
+        /// already holds costs no allocation and no pass over the column.
+        ///
+        /// **There is no refit after the write, and the columns' own arithmetic
+        /// is why.** [`columns.Columns.splice`] filters the deletes out
+        /// (`columns.zig:1193`) and writes `succ_count` for the rows that are
+        /// left straight from each op's own `succCount()` (`columns.zig:1296`),
+        /// so the widest row this call can produce is the widest op in `ops` —
+        /// which is the half [`OpSet.reserveScratchFor`] has already taken. The
+        /// rows it does not write are the rows that were already there and were
+        /// already counted. The widest row in the column set after the write is
+        /// therefore no wider than the buffer the line below widened it to, and
+        /// the refit that used to run here could only compute a number no
+        /// larger and resize nothing.
         ///
         /// **Every step that can fail is a step that changes nothing.** The
         /// successor buffer and the object table's capacity are reserved before
@@ -2044,7 +2079,6 @@ pub fn OpSet(comptime O: type) type {
             try self.obj_info.reserve(self.gpa, objectMakingCount(O, ops));
             const added = try self.cols.splice(self.gpa, pos, ops, self.text_encoding, self.strings);
             try self.spliceObjects(ops);
-            try self.refitScratch();
             return added;
         }
 
@@ -2615,18 +2649,20 @@ pub fn OpSet(comptime O: type) type {
             }
         }
 
-        /// Widens the successor buffer to the widest row in the op set.
+        /// Widens the successor buffer to the widest row in the op set, and
+        /// records that width in [`OpSet.succ_scratch_width`].
         ///
-        /// Called after every mutation, because a row can arrive with more
-        /// successors than the buffer holds and every later walk would then
-        /// answer `error.TooLarge` ([`op_iter.SuccIterIter`]). A buffer that is
-        /// already wide enough is left alone, so the common case costs one pass
-        /// over `succ_count` and no allocation.
+        /// **This is the only step that reads the width out of the columns**,
+        /// so every path that can make a row wider runs it: the two that add
+        /// successor edges ([`OpSet.addSucc`], [`OpSet.addSuccWithUndo`]), the
+        /// two that take edges and rows back out ([`OpSet.undoSucc`],
+        /// [`OpSet.undoOp`]), and the load ([`OpSet.fromParts`]). A buffer that
+        /// is already wide enough is left alone, so the common case costs one
+        /// pass over `succ_count` and no allocation.
         ///
         /// **It reads the width out of the columns, so it can only run after
-        /// they are written** — which is why [`OpSet.splice`] calls
-        /// [`OpSet.reserveScratchFor`] first. After that call this cannot
-        /// allocate, so the failure it would otherwise introduce cannot happen.
+        /// they are written** — which is why [`OpSet.splice`] does not call it
+        /// and reserves against [`OpSet.reserveScratchFor`] instead.
         fn refitScratch(self: *Self) ParseError!void {
             const want = try opiter.maxSuccCount(O, &self.cols, .{
                 .start = 0,
@@ -2635,26 +2671,44 @@ pub fn OpSet(comptime O: type) type {
             if (self.succ_scratch.items.len < want) {
                 try self.succ_scratch.resize(self.gpa, want);
             }
+            // **The mark is written after the resize, never before.** A refusal
+            // in the line above leaves the buffer as it was, and a mark the
+            // buffer does not back would tell the next splice it was already
+            // wide enough when it is not.
+            if (want > self.succ_scratch_width) self.succ_scratch_width = want;
         }
 
         /// The same bound as [`OpSet.refitScratch`], taken from `ops` and
-        /// reserved before their rows are written.
+        /// reserved before their rows are written, **and without walking the
+        /// column set at all.**
         ///
         /// Every value a row arrives with is in `ops` before the columns are
         /// touched, so the widest incoming row can be found now — it is the
-        /// largest `succCount()` in `ops` — and combined with the widest row
-        /// already there. That is the whole of the buffer's width, so the refit
-        /// that runs after the write finds the buffer wide enough already and
-        /// changes nothing.
+        /// largest `succCount()` in `ops`. The widest row already there is not
+        /// read: [`OpSet.succ_scratch_width`] is at least it, because the
+        /// buffer is never narrower than the widest row that exists and the
+        /// mark is raised by every path that can make one wider. So `want` is
+        /// still the width of the widest row the column set will hold after the
+        /// write, reached from the ops and one `usize`.
+        ///
+        /// **What that buys.** A transaction writes its rows one
+        /// [`OpSet.splice`] at a time, and the pass this replaces grew with
+        /// the column set: `R` splices into a set that ends up `R` rows wide
+        /// walked `succ_count` twice per splice. The mark makes each of them
+        /// one comparison per op, plus the resize the first time the document
+        /// meets a row wider than any it has held.
+        ///
+        /// **A refusal changes nothing.** The mark is written after the resize
+        /// and after nothing else, so an `error.OutOfMemory` out of the
+        /// widening leaves the buffer, the mark and the columns exactly as they
+        /// were, and a retry starts from the width it started from.
         fn reserveScratchFor(self: *Self, ops: []const O) ParseError!void {
-            var want = try opiter.maxSuccCount(O, &self.cols, .{
-                .start = 0,
-                .end = self.cols.len(),
-            });
+            var want = self.succ_scratch_width;
             for (ops) |op| want = @max(want, op.succCount());
             if (self.succ_scratch.items.len < want) {
                 try self.succ_scratch.resize(self.gpa, want);
             }
+            self.succ_scratch_width = want;
         }
 
         // ── Queries ─────────────────────────────────────────────────────
@@ -8993,6 +9047,128 @@ fn expectScratchCoversRows(set: *const Set) !void {
         .end = set.cols.len(),
     });
     try testing.expect(set.succ_scratch.items.len >= want);
+}
+
+test "a refused widening leaves the mark behind the buffer and never ahead of it" {
+    const gpa = testing.allocator;
+    // **The one row that arrives with successors, and the reason this sweep can
+    // refuse a widening at all.** Every row in the refused-splice test above
+    // arrives with none, so the buffer there is never resized and
+    // [`OpSet.reserveScratchFor`] never has an allocation to refuse; this row
+    // arrives two wide, so it does.
+    const succs = [_]SuccEntry{
+        .{ .id = opId(90, 0), .inc = null },
+        .{ .id = opId(91, 0), .inc = null },
+    };
+    const rows = [_]TestRow{
+        rowAt(opId(1, 0), .root, .{ .map = "list" }, false, .make_list, .null_value, null, &.{}, true, true),
+        rowAt(opId(2, 0), made(1, 0), .{ .seq = head }, true, .set, .{ .str = "a" }, null, &succs, true, true),
+    };
+    var failing: testing.FailingAllocator = .init(gpa, .{});
+    const agpa = failing.allocator();
+    var skip: usize = 0;
+    var refused_at_widening = false;
+    var landed = false;
+    while (skip <= 512) {
+        // Rebuilt each time so every attempt starts from the same empty set and
+        // the same allocation sequence, exactly as the test above does.
+        failing.fail_index = std.math.maxInt(usize);
+        var table = Table.init(agpa);
+        defer table.deinit();
+        var set = try Set.fromActors(agpa, &fixture_actors, encoding, table.asTable());
+        defer set.deinit();
+        var before = try set.saveCheckpoint(agpa);
+        defer before.deinit(agpa);
+
+        failing.fail_index = failing.alloc_index + skip;
+        const outcome = set.splice(0, &rows);
+        failing.fail_index = std.math.maxInt(usize);
+        if (outcome) |added| {
+            try testing.expectEqual(@as(usize, 2), added);
+            // **The mark is the width the buffer was widened to**, and it came
+            // from the ops rather than from a walk over the column set. The two
+            // are the same number here; the mark is the one that stays.
+            try testing.expectEqual(@as(usize, 2), set.succ_scratch_width);
+            try testing.expectEqual(@as(usize, 2), set.succ_scratch.items.len);
+            try expectScratchCoversRows(&set);
+            landed = true;
+            break;
+        } else |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            // **The mark is never ahead of the buffer it describes.** It is
+            // written after the resize and not before, so a refusal out of the
+            // widening leaves it where it was rather than promising a width
+            // that was never allocated — which would let the next splice
+            // believe the buffer already holds it.
+            try testing.expect(set.succ_scratch_width <= set.succ_scratch.items.len);
+            if (set.succ_scratch.items.len == 0) {
+                refused_at_widening = true;
+                try testing.expectEqual(@as(usize, 0), set.succ_scratch_width);
+            }
+            try expectScratchCoversRows(&set);
+            // A refused staged splice writes no row, so the set is the empty
+            // one the checkpoint above recorded.
+            try testing.expectEqual(@as(usize, 0), set.len());
+            var after = try set.saveCheckpoint(agpa);
+            defer after.deinit(agpa);
+            try sameCheckpoint(before, after);
+            skip += 1;
+        }
+    }
+    try testing.expect(landed);
+    // A splice that allocated nothing could not have been refused, so the
+    // sweep would have proved nothing.
+    try testing.expect(skip > 0);
+    // **And the arm that refused the widening itself is in the sweep** — it is
+    // the first allocation the splice makes — so the branch above is not
+    // vacuous.
+    try testing.expect(refused_at_widening);
+}
+
+test "the mark is a high-water mark: a row taken back does not narrow the buffer, and a walk still reads" {
+    const gpa = testing.allocator;
+    var table = Table.init(gpa);
+    defer table.deinit();
+    var fx = try undoFixture(gpa, &table);
+    defer fx.tx.deinit(gpa);
+    defer fx.set.deinit();
+
+    // **The edge is the widest row the fixture holds**, and the buffer is
+    // exactly as wide as it: nothing here is over-wide yet, so these two are
+    // the same statement about the same number.
+    try testing.expectEqual(@as(usize, 1), fx.set.succ_scratch_width);
+    try testing.expectEqual(@as(usize, 1), fx.set.succ_scratch.items.len);
+    try testing.expectEqual(
+        try opiter.maxSuccCount(opmod.ChangeOp, &fx.set.cols, .{ .start = 0, .end = fx.set.len() }),
+        fx.set.succ_scratch.items.len,
+    );
+
+    try fx.set.undoOp(&fx.tx);
+
+    // **The true maximum is zero and the buffer is still one wide.** The undo
+    // takes the edge back and takes the row out with it, and
+    // [`OpSet.succ_scratch_width`] does not come down with either — that is
+    // what makes it a high-water mark rather than the current maximum, and
+    // nothing needs it to be the current maximum: the guard a walk puts on the
+    // buffer is one-sided (`op_iter.zig:1377`), so a buffer with room left in
+    // it reads exactly what a buffer sized to the current maximum would.
+    try testing.expectEqual(
+        @as(usize, 0),
+        try opiter.maxSuccCount(opmod.ChangeOp, &fx.set.cols, .{ .start = 0, .end = fx.set.len() }),
+    );
+    try testing.expectEqual(@as(usize, 1), fx.set.succ_scratch_width);
+    try testing.expectEqual(@as(usize, 1), fx.set.succ_scratch.items.len);
+
+    // **And the set is still a document**: a walk over what is left borrows
+    // that buffer and answers the row that is still there.
+    var walk = try fx.set.iter();
+    var rows: usize = 0;
+    while (try walk.next()) |row| {
+        var edges = row.succ();
+        while (edges.next()) |_| {}
+        rows += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), rows);
 }
 
 test "a checkpoint owns every column's bytes, and one deinit frees them" {

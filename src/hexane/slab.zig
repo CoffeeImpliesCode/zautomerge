@@ -113,6 +113,36 @@ fn packOf(comptime E: type) type {
     return if (@hasDecl(E, "Pack")) E.Pack else rle.Leb128;
 }
 
+/// [`E.wireRange`](column.zig) over a run table the caller already holds,
+/// for a codec that publishes [`wireRangeFromSegs`](column.zig); and
+/// `E.wireRange` itself for one that does not.
+///
+/// `opset/columns.zig`'s two codecs alias one of the column layer's field
+/// for field rather than wrapping it, so they publish no such seam — and
+/// `splice` is written over them.
+///
+/// **The seam the splice machinery is written against.**
+/// [`Partition.rebuild`](Partition) stands on a run table it built once for
+/// the whole slab and asks for the items of two of its runs; `wireRange`
+/// would hand each question a fresh table of the same bytes, which is one
+/// allocation and one walk of every run in front of the row for nothing.
+///
+/// The fallback is the same question asked the same way, so the values and
+/// the refusals — and the order they come back in — are `wireRange`'s own.
+fn wireRangeWithSegs(
+    comptime E: type,
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    segs: []const Segment(E.Wire),
+    from: usize,
+    to: usize,
+) ParseError![]E.Wire {
+    if (comptime @hasDecl(E, "wireRangeFromSegs")) {
+        return E.wireRangeFromSegs(gpa, bytes, segs, from, to);
+    }
+    return E.wireRange(gpa, bytes, from, to);
+}
+
 /// The default number of runs one slab may hold (`column.rs:21`).
 ///
 /// A load cuts at half this, to leave room for inserts without an overflow
@@ -505,11 +535,18 @@ fn Partition(comptime E: type) type {
 
         /// Rebuilds `mid` as the cut's prefix runs, then the inserted
         /// values, then the cut's postfix runs.
+        ///
+        /// **Out of `self.segs`, which the partition is already standing
+        /// in.** Both ranges here are inside one run each — the tail of run
+        /// `L` and the head of run `R` — and `E.wireRange` reaches them by
+        /// building a fresh run table of the whole slab first, once per
+        /// range per round. The seam asks the same question over the table
+        /// the partition was started with.
         fn rebuild(self: *Self) ParseError!void {
             self.mid.clearRetainingCapacity();
             const pre = self.preItems();
             if (pre.to > pre.from) {
-                const vals = try E.wireRange(self.gpa, self.data, pre.from, pre.to);
+                const vals = try wireRangeWithSegs(E, self.gpa, self.data, self.segs, pre.from, pre.to);
                 defer self.gpa.free(vals);
                 try self.mid.appendSlice(self.gpa, vals);
             }
@@ -520,7 +557,7 @@ fn Partition(comptime E: type) type {
                 const replaced = if (self.postfix) |p| @min(p.len, post_len) else 0;
                 if (replaced != 0) try self.mid.appendSlice(self.gpa, self.postfix.?[0..replaced]);
                 if (post_len > replaced) {
-                    const vals = try E.wireRange(self.gpa, self.data, post.from + replaced, post.to);
+                    const vals = try wireRangeWithSegs(E, self.gpa, self.data, self.segs, post.from + replaced, post.to);
                     defer self.gpa.free(vals);
                     try self.mid.appendSlice(self.gpa, vals);
                 }
@@ -845,16 +882,22 @@ fn itemSeam(
     out: *std.ArrayList(u8),
     a: *const Slab,
     a_last: Segment(E.Wire),
+    a_segs: []const Segment(E.Wire),
     b: *const Slab,
     b_first: Segment(E.Wire),
+    b_segs: []const Segment(E.Wire),
     opens_with_true: bool,
 ) ParseError!void {
     var items: std.ArrayList(E.Wire) = .empty;
     defer items.deinit(gpa);
-    const head = try E.wireRange(gpa, a.data, a_last.item_start, a_last.item_end);
+    // **Out of the run tables the caller built for this merge**
+    // (`merge`'s `a_segs` and `b_segs`), which is what the two ranges are
+    // read from; `E.wireRange` would rebuild each slab's whole table to
+    // answer a range that lies inside one run of it.
+    const head = try wireRangeWithSegs(E, gpa, a.data, a_segs, a_last.item_start, a_last.item_end);
     defer gpa.free(head);
     try items.appendSlice(gpa, head);
-    const tail = try E.wireRange(gpa, b.data, b_first.item_start, b_first.item_end);
+    const tail = try wireRangeWithSegs(E, gpa, b.data, b_segs, b_first.item_start, b_first.item_end);
     defer gpa.free(tail);
     try items.appendSlice(gpa, tail);
     const bytes = try E.wireEncode(gpa, items.items, opens_with_true);
@@ -924,7 +967,7 @@ pub fn merge(
     if (litRunHeaders(E) and a_last.kind == .literal and b_first.kind == .literal) {
         try litSeam(gpa, E, &seam, a, a_last, b, b_first);
     } else {
-        try itemSeam(gpa, E, &seam, a, a_last, b, b_first, (a.segments - 1) % 2 == 1);
+        try itemSeam(gpa, E, &seam, a, a_last, a_segs, b, b_first, b_segs, (a.segments - 1) % 2 == 1);
     }
     const mid_bytes = try seam.toOwnedSlice(gpa);
     defer gpa.free(mid_bytes);
@@ -983,7 +1026,6 @@ pub fn splitToBudget(
 
     const segs = try E.segmentsOf(gpa, slab.data);
     defer gpa.free(segs);
-
     var from: usize = 0;
     while (from < segs.len) {
         const to = @min(from + max_segments, segs.len);

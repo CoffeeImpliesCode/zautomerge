@@ -34,31 +34,45 @@
 //! # The column, and the aggregate that is not its weight
 //!
 //! Upstream's column is a `PrefixColumn<Option<MarkIdx>>`
-//! (`mark_index.rs:213-217`): a prefix column whose prefix is a *set*, and the
-//! aggregate the index stores per slab is that same set. `marks_at` reads it
-//! in one descent (`hexane/src/prefix.rs:550-555`, which is
-//! `get_prefix(index + 1)` at `:543-548` — a fold over the rows `0..=index`).
+//! (`mark_index.rs:213-217`) over a `MarkIdx` whose prefix value *is* the
+//! aggregate (`mark_index.rs:193-194`, `impl PrefixValue for MarkIdx { type
+//! Prefix = MarkAcc; }`), so the aggregate the index stores per slab is that
+//! same set, and the b-tree's own weight carries it.
+//!
+//! `marks_at` is one line: `let acc = self.data.get_total(target);`
+//! (`mark_index.rs:323`, over the method at `:315-331`). That is
+//! `get_prefix(index + 1)` (`hexane/src/prefix.rs:554-556`), which is
+//! `iter_range(index..len()).total` (`:547-549`), and `iter_range` seeks with
+//! `advance_by` (`:903`) — ONE `find_slab_at_item` descent (`:825`) that hands
+//! back the aggregate standing at that slab's first row, which seeds the
+//! running prefix. So upstream folds the runs of the **landing slab only**,
+//! bounded by a slab's run budget, and the answer costs `O(log S)` plus one
+//! slab.
 //!
 //! The port's column engine instantiates `btree.Tree(A)` over a weight that
 //! declares `Aggregate.{identity, merge, itemCount, eql}` and never looks
-//! inside one (`hexane/btree.zig:156-168`; those four aliases are the whole of
+//! inside one (`hexane/btree.zig:163-168`; those four aliases are the whole of
 //! the generic core's use of `A`) — which is why a set-valued aggregate *fits*
 //! the tree. It cannot hold one as written, because the tree copies weights
-//! byte for byte (`copyOf` is `gpa.dupe`, `btree.zig:140-147`, called from
-//! `:277` and `:480`) and `Tree.deinit` (`:232-243`) frees none of what a
-//! weight owns: a weight carrying sets would alias the staging buffer the
-//! column frees immediately after building the index
-//! (`hexane/column.zig:3227-3237`) and leak the rest of itself.
+//! byte for byte (`copyOf` is `gpa.dupe`, `btree.zig:150-157`, called from the
+//! clone at `:272-273` and from every node build after it) and `Tree.deinit`
+//! (`:284-295`) frees none of what a weight owns: a weight carrying sets would
+//! alias the staging buffer the column frees immediately after building the
+//! index (`hexane/column.zig:3227-3237`) and leak the rest of itself. Giving
+//! the weight ownership is a change to `btree.zig` — an `Aggregate` that
+//! declares `deinit` and `clone` for its weight — and it is not this file's
+//! to make.
 //!
-//! So `MarkAcc` is the prefix aggregate of the column's *values*, and
-//! `MarkIndexColumn.total` folds it from the first row to `target`: the same
-//! value `get_total` returns, reached by walking the other way. The difference
-//! is cost, not answer — a fold is O(runs before `target`) where a descent is
-//! O(log S) set merges — and `marks_at`'s only production caller is
-//! `rich_text_at` (`op_set2/op_set.rs:484`, `:557`, `:1035`), which asks once
-//! per query rather than once per row. Giving the weight ownership is a change
-//! to `btree.zig` — an `Aggregate` that declares `deinit` and `clone` for its
-//! weight — and it is not this file's to make.
+//! So the aggregate is kept the way a `Column` keeps its own `agg_before`
+//! (`hexane/column.zig:2795`, filled by `rebuildAggs` at `:6428-6447`): a flat
+//! per-slab prefix array **the column owns** ([`AggPrefix`]), one entry per
+//! slab, holding the aggregate over the rows *before* that slab.
+//! [`MarkIndexColumn.total`] descends to the slab holding `target`
+//! ([`Column.locate`](../../src/hexane/column.zig), `:5732-5742`), copies that
+//! entry, and folds the runs of the landing slab alone: the same answer
+//! upstream reaches, by the same two steps, at the same cost. The array is not
+//! the tree's weight — it is beside it, and `btree.zig` is not asked for
+//! anything.
 //!
 //! # Why the aggregate is a set and not a count
 //!
@@ -476,6 +490,22 @@ pub const MarkAcc = struct {
     }
 };
 
+/// A fresh aggregate holding `src`'s two sets, in `gpa`.
+///
+/// **The room is taken before the merge, not during it.** `addAssignRef`
+/// inserts one id at a time, and an `ArrayList` that has to grow on the way
+/// allocates and copies on the way; reserved up front the same merge is two
+/// allocations and one pass whichever of the two sets is bigger. A prefix
+/// read is nothing but this merge, so it is where the count is worth taking.
+fn copyAcc(gpa: Allocator, src: *const MarkAcc) Allocator.Error!MarkAcc {
+    var out = MarkAcc.init(gpa);
+    errdefer out.deinit();
+    try out.opens.ensureTotalCapacity(gpa, src.opens.items.len);
+    try out.closes.ensureTotalCapacity(gpa, src.closes.items.len);
+    try out.addAssignRef(src);
+    return out;
+}
+
 /// The first index of `items` whose id does not sort before `begin`. The sets are
 /// sorted by `OpId.order` (`types.zig:163`), so this is a binary search, and it
 /// is the routine `marks.zig:426-438` uses for mark names.
@@ -612,11 +642,76 @@ pub const MarkIter = struct {
 /// is the right shape for the one caller that has nothing else to keep whole;
 /// a caller writing a whole set of columns wants the stage itself.
 ///
+/// # A third store, and it is derived
+///
+/// The two above are the only stores that have to be kept whole together. The
+/// third — the per-slab prefix array [`AggPrefix`] that [`total`] reads — is
+/// derived state in the sense the whole mark index already is: every entry is
+/// a function of the rows, so a publish has only to record which of them
+/// stopped being true and the next reader rebuilds the rest. That is why it is
+/// not part of the all-or-nothing bargain, and why no write in this file can
+/// fail over it.
+///
 /// [`stageRemap`](MarkIndexColumn.stageRemap) is the same bargain on the other
 /// write path — an actor renumbering, which moves the rows and the cache
 /// together and must be all-or-nothing **across an op set**, not merely within
 /// one column — so it returns a [`StagedRemap`] and takes its publish the same
 /// way.
+///
+/// The per-slab prefix aggregates [`MarkIndexColumn`] keeps beside its rows,
+/// and how far into them is known to be current.
+///
+/// This is upstream's aggregate with the tree taken off it. Upstream's
+/// `MarkIdx` carries a `MarkAcc` as the b-tree's own weight
+/// (`mark_index.rs:193-194`, `:213-217`); here the column holds the aggregate
+/// standing before each slab in a flat array it owns, which is the same value
+/// the weight holds and the same one a descent reads
+/// (`hexane/src/prefix.rs:825`).
+///
+/// **`valid` is the whole of the maintenance argument, and it is a frontier,
+/// not a flag.** `entries[0..valid]` still line up with the column's slabs,
+/// and every entry at or past it either names a slab the column no longer
+/// cuts there or covers rows a write has moved, and is rebuilt before it is
+/// read again. An entry survives a write exactly when the row its
+/// `start_row` names is still the row its slab starts at **and** that row is
+/// at or before the write's own row — the first because the entry's
+/// aggregate is over the rows before exactly that row, and the second because
+/// a splice rewrites the rows from its own row on and nothing before it
+/// (`hexane/column.zig:5962-6099`). Both are checked against the published
+/// layout by [`StagedMarkIndex.publish`](MarkIndexColumn.StagedMarkIndex.publish),
+/// which is why the array cannot be a flag: the column is free to re-cut and
+/// coalesce slabs around the cut (`tryMergeRange` merges outwards from it,
+/// `hexane/column.zig:6352-6356`), so the frontier is measured rather than
+/// assumed.
+///
+/// A remap renumbers every row, so nothing survives one and the frontier goes
+/// to zero (`StagedRemap.publish`). Everything past it is rebuilt by the next
+/// query that reaches it, which is what stops a write that no query follows
+/// from paying for a prefix nobody reads.
+const AggPrefix = struct {
+    /// The entries, one per slab, in slab order. There is no entry for the
+    /// aggregate over the *whole* column: a query never needs one, because a
+    /// target past the end lands on the last row and that row's slab has a
+    /// base.
+    entries: std.ArrayList(AggEntry),
+    /// How many leading entries line up with the column as it stands. Never
+    /// more than `entries.items.len`, and never more than the slab count.
+    valid: usize,
+};
+
+/// One slab's base: the aggregate over the rows before it, and the row it
+/// starts at.
+const AggEntry = struct {
+    /// The row this slab's first row is at, as it was when the aggregate
+    /// below was folded. This is what a write checks to decide whether the
+    /// aggregate still answers for the slab that now sits at this index.
+    start_row: usize,
+    /// The aggregate over the rows `0..start_row` — upstream's tree weight
+    /// for the slab, held here rather than in the tree because the tree
+    /// cannot own it (the module comment).
+    acc: MarkAcc,
+};
+
 pub const MarkIndexColumn = struct {
     /// The allocator `init` was given and `deinit` frees with. It is a field
     /// and not a parameter on the mutators because the column already owns
@@ -629,6 +724,20 @@ pub const MarkIndexColumn = struct {
     /// `:277-286`). This is what `hasAnyMarks` and `markData` read
     /// (`:261-269`).
     cache: std.AutoHashMapUnmanaged(OpId, MarkData),
+    /// The per-slab prefix aggregates [`total`] reads, and the frontier that
+    /// says how far into them is current ([`AggPrefix`]).
+    ///
+    /// **A pointer, and that is load-bearing.** [`total`], [`marksAt`] and
+    /// [`richTextAt`] take a `*const MarkIndexColumn` — `OpSet.markSetAt`
+    /// (`op_set.zig:4310-4316`) reaches the mark index through a `*const
+    /// OpSet` — and the prefix has to be brought up to date by whichever of
+    /// them asks first, because the write that invalidated it is a publish,
+    /// which cannot fail and so cannot be where an allocating fold is paid
+    /// for. A pointer to the state is the only shape a `*const` receiver can
+    /// write through. What that buys is stated on [`total`]; what it costs is
+    /// that this type is no longer free of a reader mutating it, so two
+    /// threads sharing one index would race here.
+    agg: *AggPrefix,
 
     /// A cursor over the rows, decoded (`mark_index.rs:252-254`, `:256-260`).
     ///
@@ -734,22 +843,44 @@ pub const MarkIndexColumn = struct {
     /// [`deinit`] frees with — which it is, because `deinit` reads the field
     /// rather than taking one. Nothing else in the type takes an allocator
     /// for the column's own storage.
+    ///
+    /// **The prefix state is allocated here, so it is the third thing
+    /// [`deinit`] gives back** (see `agg`). A refusal from
+    /// `DataColumn.init` takes it with it, so `init` cannot leave a cell
+    /// behind on an index it never returned.
     pub fn init(gpa: Allocator) ParseError!MarkIndexColumn {
-        return .{ .gpa = gpa, .data = try DataColumn.init(gpa), .cache = .empty };
+        // The prefix state is a heap cell so the readers can refresh it
+        // through a `*const` index (see `agg`): one allocation, for an index
+        // that may never be asked a question.
+        const agg = try gpa.create(AggPrefix);
+        errdefer gpa.destroy(agg);
+        agg.* = .{ .entries = .empty, .valid = 0 };
+        return .{
+            .gpa = gpa,
+            .data = try DataColumn.init(gpa),
+            .cache = .empty,
+            .agg = agg,
+        };
     }
 
-    /// Frees the column's slabs and the cache's map, both with `self.gpa`.
-    /// Upstream frees both by dropping them (`:213-217`); the port keeps the
-    /// allocator in a field rather than taking one, so a caller cannot free
-    /// with an allocator other than the one it built with.
+    /// Frees the column's slabs, the cache's map and the prefix array, all
+    /// with `self.gpa`. Upstream frees its two by dropping them
+    /// (`:213-217`); the port keeps the allocator in a field rather than
+    /// taking one, so a caller cannot free with an allocator other than the
+    /// one it built with, and the prefix cell goes with them. Each entry in
+    /// the array is an owned aggregate and is given back through its own
+    /// `deinit` before the array naming them does.
     ///
     /// Afterwards the value is `undefined`: no method may be called on it, and
     /// a second call frees `undefined`, which no optimize mode diagnoses, so
-    /// call it exactly once per index. A copy taken beforehand shares both
-    /// allocations and is not a second owner.
+    /// call it exactly once per index. A copy taken beforehand shares every
+    /// allocation and is not a second owner.
     pub fn deinit(self: *MarkIndexColumn) void {
         self.data.deinit();
         self.cache.deinit(self.gpa);
+        for (self.agg.entries.items) |*entry| entry.acc.deinit();
+        self.agg.entries.deinit(self.gpa);
+        self.gpa.destroy(self.agg);
         self.* = undefined;
     }
 
@@ -1048,6 +1179,10 @@ pub const MarkIndexColumn = struct {
         /// `publish` checks. `del` and the inserted `values` are the ones
         /// [`stage`](MarkIndexColumn.stage) was given.
         rows: DataColumn.StagedSplice,
+        /// The row this splice was staged at. `publish` uses it to say which
+        /// of the index's prefix entries a reader can still trust: the rows
+        /// before this one are the rows the splice did not move.
+        at: usize,
         /// What the publish has to do to the cache, in order. Empty — and
         /// then not one allocation — for a splice that changes no mark.
         pending: []Pending,
@@ -1111,6 +1246,23 @@ pub const MarkIndexColumn = struct {
                 }
             }
             self.rows.publish(&col.data);
+            // The prefix frontier, and the whole of what a publish owes the
+            // prefix array. An entry survives exactly when the slab at its
+            // index still starts at the row the entry folded over, and that
+            // row is at or before this splice's own row — so the walk below
+            // measures both and stops at the first entry that fails either.
+            // Nothing here allocates, which is what keeps the publish
+            // infallible; everything at or past the frontier is the next
+            // reader's to rebuild.
+            const reached = @min(col.agg.entries.items.len, col.data.slabCount());
+            var row: usize = 0;
+            var f: usize = 0;
+            while (f < reached and row <= self.at and
+                col.agg.entries.items[f].start_row == row) : (f += 1)
+            {
+                row += col.data.slabAt(f).?.len;
+            }
+            col.agg.valid = f;
             if (self.pending.len != 0) self.gpa.free(self.pending);
             self.spent = true;
         }
@@ -1196,6 +1348,10 @@ pub const MarkIndexColumn = struct {
             self.rows.deinit();
             col.cache.deinit(col.gpa);
             col.cache = self.cache;
+            // Every row moved onto a new actor table, so no prefix entry
+            // describes these rows any more: the whole frontier goes, and the
+            // next reader rebuilds all of it.
+            col.agg.valid = 0;
             self.spent = true;
         }
     };
@@ -1324,7 +1480,13 @@ pub const MarkIndexColumn = struct {
             }
             break :words_blk try self.data.stageSplice(index, 0, words);
         } else try self.data.stageSplice(index, del, &.{});
-        return .{ .rows = rows, .pending = pending, .gpa = self.gpa, .spent = false };
+        return .{
+            .rows = rows,
+            .at = index,
+            .pending = pending,
+            .gpa = self.gpa,
+            .spent = false,
+        };
     }
 
     /// [`stage`] for the write path: inserts `values` before row `index`
@@ -1414,38 +1576,199 @@ pub const MarkIndexColumn = struct {
     }
 
     /// The prefix aggregate over the rows `0..=target` (`mark_index.rs:315-318`,
-    /// upstream's `PrefixColumn::get_total` at `hexane/src/prefix.rs:550-555`).
+    /// upstream's `PrefixColumn::get_total` at `hexane/src/prefix.rs:554-556`).
+    ///
+    /// **This is upstream's two steps and not a fold from the first row.** The
+    /// column descends to the slab holding `target` (`Column.locate`,
+    /// `hexane/column.zig:5732-5742`), which is the port's `find_slab_at_item`,
+    /// copies that slab's [`AggPrefix`] entry — the aggregate over every row
+    /// before it — and folds the runs of the landing slab alone. Upstream
+    /// reaches the same entry the same way, out of the tree's own weight
+    /// (`hexane/src/prefix.rs:825`), and folds that same slab (`:810-836`).
     ///
     /// `target` at or past the end folds every row, which is what upstream's
-    /// `get_prefix` does through `iter_range`'s clamp (`prefix.rs:543-548`,
-    /// `:670-671`). A run folds as one delta; the module comment says why that
-    /// is the whole rule.
+    /// `get_prefix` does through `iter_range`'s clamp (`prefix.rs:670-671`).
+    /// A run folds as one delta; the module comment says why that is the whole
+    /// rule.
+    ///
+    /// **What it costs, and what it may have to pay first.** A read is
+    /// `O(log S)` to descend, one owned copy of the landing slab's entry —
+    /// `O(k)` set operations for the `k` marks open behind that row, with the
+    /// room reserved up front so that is two allocations rather than one per
+    /// id — and at most one slab's worth of runs folded. What it replaces was
+    /// `O(runs before target)`.
+    ///
+    /// A read that reaches past the frontier first rebuilds the entries
+    /// between it and the slab it wants, which is `O(rows from the frontier
+    /// on)`. The frontier moves when a write invalidates entries and at no
+    /// other time, so a run of writes followed by a run of reads pays that
+    /// fold once for the second, and a run of reads on its own pays nothing.
+    /// The worst case is one write and one read alternating, which is what
+    /// this was before, and never worse than it.
     ///
     /// `gpa` allocates **the returned `MarkAcc` only** — its two sets, which
     /// the caller frees with [`MarkAcc.deinit`]. It says nothing about this
-    /// column's own storage, which was allocated with `self.gpa` at
-    /// [`init`]; passing a different allocator here is correct and is what
-    /// lets a reader fold into an arena. The aggregate is fresh either way:
-    /// nothing is shared with this index, which is why it is a value and not a
-    /// view.
+    /// column's own storage, which was allocated with `self.gpa` at [`init`],
+    /// and nothing about the [`AggPrefix`] this may have had to extend;
+    /// passing a different allocator here is correct and is what lets a reader
+    /// fold into an arena. The aggregate is fresh either way: nothing is
+    /// shared with this index, which is why it is a value and not a view.
     pub fn total(self: *const MarkIndexColumn, gpa: Allocator, target: usize) ParseError!MarkAcc {
-        var acc = MarkAcc.init(gpa);
+        const landing = self.landingOf(target) orelse return MarkAcc.init(gpa);
+        const width = self.data.len();
+        const end = if (target >= width) width else target + 1;
+        var acc = try self.accBefore(landing, gpa);
         errdefer acc.deinit();
-        if (self.data.len() == 0) return acc;
-        const end = if (target >= self.data.len()) self.data.len() else target + 1;
-        var it = try self.head(end);
-        while (try it.nextRun()) |run| {
-            if (run.value) |mark| try acc.applyOne(mark);
-        }
+        try self.foldRows(&acc, landing.row, end);
         return acc;
     }
 
-    /// A cursor over the rows `[0, end)`, which is what a prefix fold over
-    /// this column is: the head of the column with its window closed at `end`.
-    fn head(self: *const MarkIndexColumn, end: usize) ParseError!ValueIter {
-        var inner = try self.data.iterator();
-        inner.setMax(end);
-        return .{ .inner = inner };
+    /// Where a positional question about `target` lands: the slab holding it,
+    /// and the row that slab starts at.
+    ///
+    /// `target` at or past the end lands on the last row, because the prefix
+    /// is inclusive and every row folded is what the last row's prefix is.
+    /// Null for an empty column, which has no row to land on and no slab to
+    /// fold.
+    const Landing = struct {
+        /// The slab holding the row.
+        slab: usize,
+        /// The row that slab starts at, and so where the fold begins.
+        row: usize,
+    };
+
+    fn landingOf(self: *const MarkIndexColumn, target: usize) ?Landing {
+        const width = self.data.len();
+        if (width == 0) return null;
+        const row = if (target >= width) width - 1 else target;
+        const at = self.data.locate(row);
+        return .{ .slab = at.slab, .row = row - at.in_slab };
+    }
+
+    /// Folds the rows `[from, to)` in, run at a time. This is the whole of
+    /// what a prefix over this column is, once the rows before `from` are
+    /// known — and `total` calls it with `from` at a slab's first row, so the
+    /// window never crosses one.
+    fn foldRows(
+        self: *const MarkIndexColumn,
+        acc: *MarkAcc,
+        from: usize,
+        to: usize,
+    ) ParseError!void {
+        if (from >= to) return;
+        var rows = try self.iterRange(.{ .start = from, .end = to });
+        while (try rows.nextRun()) |run| {
+            if (run.value) |mark| try acc.applyOne(mark);
+        }
+    }
+
+    /// The aggregate over the rows before `landing`'s slab, brought up to
+    /// date first if the frontier says it is not.
+    fn accBefore(
+        self: *const MarkIndexColumn,
+        landing: Landing,
+        gpa: Allocator,
+    ) ParseError!MarkAcc {
+        if (landing.slab >= self.agg.valid) try self.repairAggs(landing.slab);
+        return copyAcc(gpa, &self.agg.entries.items[landing.slab].acc);
+    }
+
+    /// Rebuilds the entries from the frontier up to and including `upto`, so
+    /// that `entries[upto]` is the aggregate over the rows before slab `upto`.
+    ///
+    /// **It walks the rows from the frontier on, not the whole column.**
+    /// `entries[valid - 1]` already holds the aggregate over the rows before
+    /// slab `valid - 1`, so entry `valid` is that plus slab `valid - 1`'s own
+    /// runs, and so on; the entries below the frontier are never looked at.
+    /// That is what makes the cost proportional to how much of the column
+    /// moved rather than to how much of it there is.
+    ///
+    /// **A refusal leaves the frontier where it was.** The running aggregate
+    /// is given back by the `errdefer`, the entry a failed copy would have
+    /// written is left as the empty aggregate the loop appended it as, and
+    /// nothing below the frontier is touched — so the next call starts from
+    /// the same place and does the same work, and a refusal is never a
+    /// half-built prefix.
+    fn repairAggs(self: *const MarkIndexColumn, upto: usize) ParseError!void {
+        const state = self.agg;
+        // Everything at or past the frontier describes rows, or a slab layout,
+        // that this column no longer has. It is given back here rather than at
+        // the write that invalidated it, because a publish cannot fail and
+        // this can; and it is given back rather than overwritten in place so
+        // that the entries the loop below appends are the only ones it has to
+        // build. `valid` is clamped to what is actually there, because a
+        // frontier set by a splice in a column the array had not reached that
+        // far names entries that do not exist yet.
+        const valid: usize = @min(state.valid, state.entries.items.len);
+        while (state.entries.items.len > valid) {
+            state.entries.items[state.entries.items.len - 1].acc.deinit();
+            state.entries.items.len -= 1;
+        }
+        try state.entries.ensureTotalCapacity(self.gpa, upto + 1);
+
+        // The running aggregate and the row it covers up to. On entry to the
+        // loop below, `next` names the first entry still to be written and
+        // (`acc`, `row`) is the aggregate over the rows before slab `next`'s
+        // own runs — that is, over the rows before slab `next - 1`'s first
+        // row, which is what `row` is. Entry `next` is that plus slab
+        // `next - 1`, so the loop needs exactly one fold per entry.
+        var acc: MarkAcc = undefined;
+        var row: usize = 0;
+        var next: usize = valid;
+        if (next > 0) {
+            var behind: usize = 0;
+            while (behind + 1 < next) : (behind += 1) row += self.data.slabAt(behind).?.len;
+            acc = try copyAcc(self.gpa, &state.entries.items[next - 1].acc);
+        } else {
+            // Entry zero aggregates no rows at all, and there is no slab in
+            // front of the first one for a fold to cover, so it is written
+            // from the identity. This is the branch every column nothing has
+            // queried yet takes, and it is why the loop starts at one: at
+            // zero its first `slabAt(next - 1)` would name slab minus one.
+            acc = MarkAcc.init(self.gpa);
+            try self.storeAgg(0, 0, &acc);
+            next = 1;
+        }
+        // `defer`, not `errdefer`: `storeAgg` **copies** the aggregate into
+        // the entry, so this one keeps owning its own two sets on the way
+        // through the loop and has to give them back on the way out whether
+        // the loop finished or was refused. An `errdefer` here freed it only
+        // on the failure path and leaked the whole array on every call.
+        defer acc.deinit();
+
+        while (next <= upto) : (next += 1) {
+            // Slab `next - 1` is the one slab between the aggregate in hand
+            // and the entry being written, so the fold covers exactly its
+            // rows, and `row` leaves the iteration standing on the first row
+            // of slab `next` — which is the row the entry records.
+            const slab_len = self.data.slabAt(next - 1).?.len;
+            try self.foldRows(&acc, row, row + slab_len);
+            row += slab_len;
+            try self.storeAgg(next, row, &acc);
+        }
+        state.valid = upto + 1;
+    }
+
+    /// Writes entry `at`: `acc` is the aggregate over the rows before the slab
+    /// whose first row is `row`, and `row` is that first row.
+    ///
+    /// **The copy is built before the array is touched**, so a refusal leaves
+    /// the empty aggregate the growth loop appended standing where the array
+    /// is counting it, rather than a half-written entry a later read could
+    /// mistake for a built one.
+    fn storeAgg(
+        self: *const MarkIndexColumn,
+        at: usize,
+        row: usize,
+        acc: *const MarkAcc,
+    ) ParseError!void {
+        const state = self.agg;
+        while (state.entries.items.len <= at) {
+            try state.entries.append(self.gpa, .{ .start_row = row, .acc = MarkAcc.init(self.gpa) });
+        }
+        const built = try copyAcc(self.gpa, acc);
+        state.entries.items[at].acc.deinit();
+        state.entries.items[at] = .{ .start_row = row, .acc = built };
     }
 
     /// The mark ids open at `target` (`mark_index.rs:315-331`).
@@ -2921,3 +3244,391 @@ test "padding a mark index preserves marks and appends absent rows" {
         try testing.expectEqual(@as(?i64, null), try col.get(at));
     }
 }
+
+/// The rows one mark occupies, taken out of a model in place: what an undone
+/// mark leaves behind is the same rows with its own two gone.
+fn removeMarkRows(live: []?MarkIdx, live_len: *usize, target: OpId) void {
+    var kept: usize = 0;
+    var at: usize = 0;
+    while (at < live_len.*) : (at += 1) {
+        const v = live[at];
+        const gone = if (v) |m| switch (m) {
+            .start => |begin| begin.eql(target),
+            .end => |begin| begin.eql(target),
+        } else false;
+        if (gone) continue;
+        live[kept] = v;
+        kept += 1;
+    }
+    live_len.* = kept;
+}
+
+test "the prefix answers every position, before and after every write" {
+    // The case the per-slab prefix exists for, and the one the case above it
+    // cannot make. That one answers every position either side of ONE undo,
+    // so a prefix a single write failed to invalidate would still agree with
+    // the model at every position it asked about. Here a write is interleaved
+    // with the reads, so a frontier that did not move — or a reader that took
+    // an entry above it — is answered wrong at the *next* position asked for
+    // rather than the next hundred.
+    //
+    // The rounds step through the placed marks by a stride that does not
+    // divide their count, so the splice points walk across the whole column
+    // rather than marching through it: the frontier is asked to hold at a low
+    // slab and at a high one, at both ends, and with the array grown to only
+    // part of the way.
+    const gpa = testing.allocator;
+    const n = 20_000;
+    const num_marks = 600;
+
+    const model = try gpa.alloc(?MarkIdx, n);
+    defer gpa.free(model);
+    var placed: std.ArrayList(Placed) = .empty;
+    defer placed.deinit(gpa);
+    try placeMarks(gpa, n, num_marks, 5, model, &placed);
+    try testing.expect(placed.items.len > 100);
+
+    var col = try columnFor(gpa, model);
+    defer col.deinit();
+    try testing.expectEqual(n, col.len());
+    try testing.expect(col.data.slabCount() > 1);
+
+    // The live model: what the column should hold after each removal, and what
+    // every position is checked against.
+    var live = try gpa.alloc(?MarkIdx, n);
+    defer gpa.free(live);
+    @memcpy(live[0..n], model);
+    var live_len: usize = n;
+
+    var rng = Rng{ .state = 23 };
+    for (0..40) |round| {
+        const mark = placed.items[(round * 37) % placed.items.len];
+        if (col.markData(mark.id) != null) {
+            const rows = try findMarkPositions(gpa, &col, mark.id);
+            defer gpa.free(rows);
+            try testing.expectEqual(@as(usize, 2), rows.len);
+            try col.undo(rows[1], &[_]?MarkIndexBuilder{.{ .end = mark.id }});
+            try col.undo(rows[0], &[_]?MarkIndexBuilder{.{
+                .start = .{ .id = mark.id, .data = mkMark("m") },
+            }});
+            try testing.expect(col.markData(mark.id) == null);
+            removeMarkRows(live, &live_len, mark.id);
+        }
+        try testing.expectEqual(live_len, col.len());
+
+        // Sampled positions, and the two ends — the ends are what an
+        // off-by-one in the frontier or in the landing slab shows up on first.
+        for (0..6) |_| {
+            try expectActive(gpa, &col, live[0..live_len], rng.between(0, live_len));
+        }
+        for ([_]usize{ 0, live_len - 1, live_len / 2 }) |p| {
+            try expectActive(gpa, &col, live[0..live_len], p);
+        }
+    }
+}
+
+/// What [`MarkIndexColumn.marksAt`] answers at `pos`, against the brute-force
+/// oracle over `model`, in exact op-id order.
+fn expectActive(
+    gpa: Allocator,
+    col: *const MarkIndexColumn,
+    model: []const ?MarkIdx,
+    pos: usize,
+) !void {
+    const want = try oracleMarksAt(gpa, model, pos);
+    defer gpa.free(want);
+    const got = try activeMarkIds(gpa, col, pos);
+    defer gpa.free(got);
+    try expectIds(want, got);
+}
+
+test "a position is answered before any other, on a column nothing has queried yet" {
+    // The first ask on a fresh index is the path with no entry in front of it
+    // to fold from: the frontier is zero and the walk that rebuilds from it
+    // has no slab behind entry zero. Every position here is asked with the
+    // frontier still at zero, which is the case that has to work.
+    const gpa = testing.allocator;
+    const bold = id(0, 1);
+    const model = [_]?MarkIdx{
+        null,
+        .{ .start = bold },
+        null,
+        .{ .end = bold },
+    };
+
+    // One slab, so every position lands on slab zero: the first ask is the
+    // `upto == 0` path with `valid == 0`, and the second reads the same entry
+    // back out of the array rather than rebuilding it.
+    {
+        var col = try buildColumn(gpa, model.len, &.{
+            .{ .start = 1, .end = 3, .id = bold, .name = "bold" },
+        });
+        defer col.deinit();
+        try testing.expectEqual(@as(usize, 0), col.agg.valid);
+        try expectActive(gpa, &col, &model, 0);
+        try expectActive(gpa, &col, &model, 1);
+        try expectActive(gpa, &col, &model, 2);
+        // Past the end, which lands on the last row of the last slab.
+        try expectActive(gpa, &col, &model, 99);
+        // The first ask wrote exactly one entry, and it is slab zero's base.
+        try testing.expectEqual(@as(usize, 1), col.agg.valid);
+        try testing.expectEqual(@as(usize, 0), col.agg.entries.items[0].start_row);
+        try testing.expect(col.agg.entries.items[0].acc.opens.items.len == 0);
+    }
+
+    // Many slabs, asked deepest first: the frontier is zero and the entry
+    // wanted is the last one, so the whole walk from entry zero runs.
+    const n = 8_000;
+    {
+        const wide = try gpa.alloc(?MarkIdx, n);
+        defer gpa.free(wide);
+        var placed: std.ArrayList(Placed) = .empty;
+        defer placed.deinit(gpa);
+        try placeMarks(gpa, n, 600, 9, wide, &placed);
+        var wide_len: usize = n;
+        var col = try columnFor(gpa, wide);
+        defer col.deinit();
+        try testing.expectEqual(@as(usize, 0), col.agg.valid);
+        try testing.expect(col.data.slabCount() > 1);
+
+        try expectActive(gpa, &col, wide, n - 1);
+        try expectActive(gpa, &col, wide, 0);
+        try expectActive(gpa, &col, wide, 2);
+        // Every entry now names the row its slab starts at, which is what a
+        // write measures the frontier against.
+        try testing.expectEqual(col.data.slabCount(), col.agg.valid);
+        try testing.expectEqual(col.data.slabCount(), col.agg.entries.items.len);
+        var at: usize = 0;
+        for (col.agg.entries.items, 0..) |entry, i| {
+            try testing.expectEqual(at, entry.start_row);
+            at += col.data.slabAt(i).?.len;
+        }
+
+        // And a write on top of a fully built array still answers: the
+        // frontier has to survive a splice in the middle of the column, and
+        // the entries below it have to keep naming the rows they folded.
+        const mark = placed.items[placed.items.len / 2];
+        const rows = try findMarkPositions(gpa, &col, mark.id);
+        defer gpa.free(rows);
+        try testing.expectEqual(@as(usize, 2), rows.len);
+        try col.undo(rows[1], &[_]?MarkIndexBuilder{.{ .end = mark.id }});
+        try col.undo(rows[0], &[_]?MarkIndexBuilder{.{
+            .start = .{ .id = mark.id, .data = mkMark("m") },
+        }});
+        removeMarkRows(wide, &wide_len, mark.id);
+        try testing.expectEqual(wide_len, col.len());
+
+        try expectActive(gpa, &col, wide[0..wide_len], 0);
+        try expectActive(gpa, &col, wide[0..wide_len], wide_len - 1);
+        try expectActive(gpa, &col, wide[0..wide_len], wide_len / 2);
+    }
+}
+
+test "a refusal part way through building the prefix leaves it answering" {
+    // The prefix is built by allocating, so a refusal can land between the
+    // entry being appended and the copy being put into it. Two things have to
+    // survive that, and they are separate claims:
+    //
+    //   * the frontier never names an entry that is not there, so no reader
+    //     can take a half-built one, and `deinit` has what is left to
+    //     release; and
+    //   * **the same column answers the same positions afterwards**, which is
+    //     what `storeAgg`'s copy-before-touch ordering and `repairAggs`'s
+    //     `defer acc.deinit()` are for.
+    //
+    // The second claim needs an allocator that can recover, and
+    // `std.testing.FailingAllocator` cannot supply one — see [`RefuseOnce`]
+    // for what it does instead and why that matters here.
+    const gpa = testing.allocator;
+    const n = 800;
+    const model = try gpa.alloc(?MarkIdx, n);
+    defer gpa.free(model);
+    var placed: std.ArrayList(Placed) = .empty;
+    defer placed.deinit(gpa);
+    try placeMarks(gpa, n, 100, 3, model, &placed);
+    try testing.expect(placed.items.len > 10);
+
+    const asked = [_]usize{ n - 1, n / 2, 0 };
+
+    // What a clean build plus those three reads has to answer, measured by a
+    // probe that checks the outcome and not just the allocation count: an arm
+    // that reaches the reads at all has to have produced these.
+    const wanted = blk: {
+        const out = try gpa.alloc([]OpId, asked.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |w| gpa.free(w);
+            gpa.free(out);
+        }
+        while (filled < asked.len) : (filled += 1) {
+            out[filled] = try oracleMarksAt(gpa, model, asked[filled]);
+        }
+        break :blk out;
+    };
+    defer {
+        for (wanted) |w| gpa.free(w);
+        gpa.free(wanted);
+    }
+
+    // How many allocations the clean run takes, so the sweep visits each one.
+    // `FailingAllocator` with no `fail_index` never refuses and does count,
+    // which is the only thing it is used for here.
+    const needed = blk: {
+        var failing: testing.FailingAllocator = .init(gpa, .{});
+        var probe = try columnFor(failing.allocator(), model);
+        defer probe.deinit();
+        try testing.expect(probe.data.slabCount() > 1);
+        for (asked, wanted) |p, want| {
+            var ids = try probe.marksAt(failing.allocator(), p, null);
+            defer ids.deinit();
+            try idsMatch(&ids, want);
+        }
+        break :blk failing.alloc_index;
+    };
+
+    for (0..needed) |at| {
+        var once: RefuseOnce = .{ .inner = gpa, .at = at };
+        const arm = once.allocator();
+
+        // A refusal in the build says nothing about the reads, so it is
+        // skipped rather than turned into a pass.
+        var col = columnFor(arm, model) catch |e| switch (e) {
+            error.OutOfMemory => continue,
+            else => return error.TestUnexpectedResult,
+        };
+        defer col.deinit();
+
+        // The reads, which is where the prefix is built. An arm whose refusal
+        // landed here either answers or reports `OutOfMemory`, and nothing
+        // else is a pass.
+        for (asked) |p| {
+            var ids = col.marksAt(arm, p, null) catch |e| switch (e) {
+                error.OutOfMemory => continue,
+                else => return error.TestUnexpectedResult,
+            };
+            ids.deinit();
+        }
+
+        // The frontier never names an entry that is not there, whatever the
+        // refusal did — and `deinit` on the way out has to give back what is
+        // left of the array, which the testing allocator checks.
+        try testing.expect(col.agg.valid <= col.agg.entries.items.len);
+
+        // And the column answers every position again, with no further
+        // refusal: the aggregate that was half-copied is gone, not merely
+        // unreached.
+        for (asked, wanted) |p, want| {
+            var ids = try col.marksAt(arm, p, null);
+            defer ids.deinit();
+            try idsMatch(&ids, want);
+        }
+    }
+}
+
+/// Whether the marks still in `ids` are exactly `want`, in order. Allocates
+/// nothing, so a refusal sweep can run it on an arm that is holding a
+/// refusing allocator.
+fn idsMatch(ids: *MarkIter, want: []const OpId) !void {
+    var at: usize = 0;
+    while (ids.next()) |begin| {
+        if (at >= want.len or !begin.eql(want[at])) return error.TestUnexpectedResult;
+        at += 1;
+    }
+    if (at != want.len) return error.TestUnexpectedResult;
+}
+
+/// An allocator that refuses **exactly one** allocation — the one at index
+/// `at` — and behaves normally either side of it.
+///
+/// **`std.testing.FailingAllocator` cannot do this.** Its `alloc` returns
+/// *before* `alloc_index` advances (`std/testing/FailingAllocator.zig:65-79`
+/// on this Zig), so `fail_index = k` refuses every allocation that reaches
+/// index `k`, for the rest of that allocator's life: it latches. There is no
+/// "after" to observe, so a sweep built on it can assert that a refusal leaves
+/// nothing corrupt but can never assert that the object it refused recovers.
+/// That is the half of this file's refusal contract that `storeAgg`'s
+/// copy-before-touch ordering and `repairAggs`'s `defer acc.deinit()` exist to
+/// provide, and it is worth a test.
+///
+/// The index counts `resize` as well as `alloc`, because a managed
+/// `std.ArrayList` may grow in place and a sweep counting only `alloc` would
+/// step over allocations that matter. A refused `resize` is not terminal — the
+/// caller falls back to `alloc`, which is the next index along.
+const RefuseOnce = struct {
+    /// The allocator every real request goes to.
+    inner: Allocator,
+    /// The allocation index this one refuses.
+    at: usize,
+    /// How many requests have been made, `alloc` and `resize` together.
+    seen: usize = 0,
+    /// Whether it already has. This is what makes it *once*: the counter is
+    /// deliberately left where it was on the refusal, so the next request is
+    /// the same index and would be refused again without this flag.
+    refused: bool = false,
+
+    fn allocator(self: *RefuseOnce) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *RefuseOnce = @ptrCast(@alignCast(ctx));
+        if (self.seen == self.at and !self.refused) {
+            self.refused = true;
+            return null;
+        }
+        self.seen += 1;
+        return self.inner.rawAlloc(len, alignment, ra);
+    }
+
+    fn resize(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ra: usize,
+    ) bool {
+        const self: *RefuseOnce = @ptrCast(@alignCast(ctx));
+        if (self.seen == self.at and !self.refused) {
+            self.refused = true;
+            return false;
+        }
+        self.seen += 1;
+        return self.inner.rawResize(memory, alignment, new_len, ra);
+    }
+
+    /// `remap` is the third growth path an allocator can be asked for, and this
+    /// toolchain's `Allocator.VTable` carries it
+    /// (`std/mem/Allocator.zig:69`), so a vtable without one does not
+    /// compile. It refuses on the same condition as `alloc` and `resize`, and
+    /// otherwise defers to the inner allocator: a caller that gets `null` from
+    /// `remap` falls back to `alloc` plus `copy` at the next index along, which
+    /// is the path the sweep is meant to exercise.
+    fn remap(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ra: usize,
+    ) ?[*]u8 {
+        const self: *RefuseOnce = @ptrCast(@alignCast(ctx));
+        if (self.seen == self.at and !self.refused) {
+            self.refused = true;
+            return null;
+        }
+        self.seen += 1;
+        return self.inner.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *RefuseOnce = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ra);
+    }
+};

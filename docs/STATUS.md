@@ -11,6 +11,8 @@ source path and execution.
 | Check | Observed result |
 | --- | --- |
 | Final integrated Debug command | 69/69 steps succeeded; 3722/3723 Zig tests passed, one default-run skip, no failures. Includes `test slow-path ctest conformance save-interop`. |
+| Optimized-tree integrated Debug command | `zig build test`: 2006/2007 Zig tests passed with one default-run skip (62/62 steps). `zig build slow-path ctest conformance save-interop`: 1744/1744 passed (40/40 steps). Includes the ~14 new optimization tests. All ten golden vectors matched the reference; live save interop 6/6; the C ABI suite ran. |
+| Native benchmark, ReleaseSafe, `perf stat -e instructions` | Seven workloads in `bench/zautomerge_bench.zig`, each reproducing a suite-dominating case. Instructions retired, optimized tree: segmentation 0.89 B (was 10.57 B, **11.85x**); indexed-delta 1.61 B (was 2.54 B, **1.57x**); slab-merge 0.46 B (was 0.58 B, **1.26x**); prefix-bool 0.65 B (was 0.87 B, **1.33x**); update-object 12.47 B (was 18.76 B, **1.50x**). Checksums byte-identical across the pair wherever both were measured. |
 | Default native test roots, Debug | 1992 passed, one skipped. The library root passed 1729 with one skip; all 118 upstream document cases passed. |
 | Forced slow-path library root, Debug | 1730/1730 passed, including the case skipped in the default run. |
 | Ten golden vectors and live save interop | Every golden file matched the reference; the live verifier reported 6/6 cases verified. |
@@ -44,7 +46,7 @@ are still open.
 | --- | --- |
 | Cancelled `zig-gate` cross section | `x86_64-linux` finished at 1992 tests passed; `aarch64-linux` hit `per_build_timeout` (3600 s); `powerpc64-linux` was cancelled in flight. Cancelled work is not a pass. |
 | The aarch64 timeout, named | `upstream_doc_test.test.rollback after a save and load of a deep hydrated root map` — 117 of 118 passed, that case alone timed out after 15m 0.82 s against `--test-timeout 900s`. |
-| The same case natively, Debug | 52.96 s of that root's 100.3 s total. Per-step, `updateObject` over the 2,712-node hydrated root is 47.0 s; `hydrate` twice is 2.4 s each; save, load and rollback together are under 0.3 s. |
+| The same case natively, Debug | 52.96 s of that root's 100.3 s total. Per-step, `updateObject` over the hydrated root is 47.0 s; `hydrate` twice is 2.4 s each; save, load and rollback together are under 0.3 s. |
 | Why that is not a slow path but a slow host | 47.0 s of Debug at one core is roughly 850 s under `qemu-aarch64` user-mode emulation, which is what the 900 s per-case budget measures. The budget is not raised to fit it and the case is not cut down. |
 | Custom test runner, `zig build c-abi-test` | 6/6 steps, 21/21 cases, and the printed record footer and slowest-case table match the run. |
 | Custom test runner, upstream document root | 118/118 cases; the three cases over the 10 s stderr threshold were named with their durations, and the footer ranked all ten slowest. |

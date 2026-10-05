@@ -9,6 +9,14 @@
 //! The implementation is a left-to-right state machine over the class of each
 //! code point; the rules carry the numbers used in the UAX #29 annex, and the
 //! property tables below hold the class data.
+//!
+//! **Classifying a code point costs a fixed number of comparisons.** The
+//! inline tests are a fixed list of range checks, and the four property
+//! tables are searched and not walked: seven comparisons for `ext_pict`,
+//! eight for `combining`, seven for `spacing`, four for `format_controls`,
+//! and none at all for a code point below U+00A9, which is in none of them.
+//! A segmentation is therefore a bounded number of comparisons per code
+//! point rather than one per range per table.
 
 const std = @import("std");
 /// The errors the text helpers return. Zig's UTF-8 decoder does not publish
@@ -306,6 +314,14 @@ fn hangulJoins(prev: Class, cur: Class) bool {
     };
 }
 
+/// The UAX #29 grapheme class of `cp`.
+///
+/// **Every code point is classified by a bounded number of comparisons**, and
+/// the four property tables are the reason it used not to be: they were
+/// walked one range at a time, so a code point that reached them paid 348
+/// comparisons to be told it was in none of them. They are searched now — see
+/// [`inRanges`] — and a code point below [`first_property_cp`] skips them
+/// altogether, which is the whole cost of classifying ASCII.
 fn classOf(cp: u21) Class {
     switch (cp) {
         '\r' => return .cr,
@@ -334,6 +350,11 @@ fn classOf(cp: u21) Class {
         0x0600...0x0605, 0x06dd, 0x070f, 0x0890, 0x0891, 0x08e2, 0x0d4e, 0x110bd, 0x110cd, 0x111c2, 0x111c3, 0x1193f, 0x11941, 0x11a3a, 0x11a84...0x11a89, 0x11d46, 0x11f02 => return .prepend,
         else => {},
     }
+    // Nothing below the first code point any of the four tables names is in
+    // one of them, so such a code point is `.other` and none of the four is
+    // searched. That is 348 comparisons dropped for every ASCII code point,
+    // which on most text is most of them.
+    if (cp < first_property_cp) return .other;
     if (inRanges(cp, &ext_pict)) return .ext_pict;
     if (inRanges(cp, &combining)) return .extend;
     if (inRanges(cp, &spacing)) return .spacing_mark;
@@ -341,7 +362,85 @@ fn classOf(cp: u21) Class {
     return .other;
 }
 
+/// Whether `cp` falls inside one of `ranges`.
+///
+/// **A binary search, and only a correct one because `ranges` is sorted by
+/// start and holds no two overlapping ranges** — both checked at compile time
+/// by the block below the tables. The search ends on the last range that
+/// starts at or below `cp`, and that is the only range that can hold `cp`:
+/// every range sorted after it starts later, and because the two do not
+/// overlap it has to start above `cp`, which the search has already ruled
+/// out. A one-code-point range `[x, x]` is the same case with the two ends
+/// equal, and the largest code point any table names fits a `u21` with three
+/// bits to spare, so the comparisons are plain integer ones.
+///
+/// Seven comparisons for [`ext_pict`], eight for [`combining`], seven for
+/// [`spacing`] and four for [`format_controls`], where the walk this replaced
+/// cost one per range: 78, 172, 87 and 11, and 348 for a code point in none of
+/// them.
+///
+/// **The four tables are deliberately not merged into one.** A merged table
+/// would answer all four questions in 9 comparisons, against the 26 these
+/// four cost for a code point that is in none of them. But a code point that
+/// *is* in `ext_pict`, which is what an emoji is, would pay 9 where it pays 7
+/// to reach its own class, and ASCII and emoji are the two classes the
+/// segmentation oracle in `textdiff.zig` walks. Merging would also move the
+/// order of the four calls out of the code and into the data: `combining` and
+/// `spacing` both hold U+1A19 and U+1A1A, `combining` and `format_controls`
+/// both hold U+200C, and all three are `.extend` today, because `combining`
+/// is asked first.
 fn inRanges(cp: u21, ranges: []const [2]u21) bool {
+    var lo: usize = 0;
+    var hi: usize = ranges.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (ranges[mid][0] <= cp) lo = mid + 1 else hi = mid;
+    }
+    return lo != 0 and cp <= ranges[lo - 1][1];
+}
+
+/// [`classOf`] as it was before the tables were searched and the code points
+/// below [`first_property_cp`] short-circuited: the same four tables, walked
+/// in the same order, all four of them. **Kept as the oracle for the test at
+/// the foot of this file**, the way `textdiff.byPerPrefixCount` keeps the
+/// segmentation it replaced, so that a code point the two answer differently
+/// is a failing test rather than a segmentation nobody notices is wrong.
+fn classOfLinear(cp: u21) Class {
+    switch (cp) {
+        '\r' => return .cr,
+        '\n' => return .lf,
+        0x200d => return .zwj,
+        else => {},
+    }
+    if (cp >= 0x1f1e6 and cp <= 0x1f1ff) return .regional_indicator;
+    if (cp < 0x20 or (cp >= 0x7f and cp <= 0x9f)) return .control;
+    // Hangul.
+    if (cp >= 0x1100 and cp <= 0x115f) return .hangul_l;
+    if (cp >= 0x1160 and cp <= 0x11a7) return .hangul_v;
+    if (cp >= 0x11a8 and cp <= 0x11ff) return .hangul_t;
+    if (cp >= 0xa960 and cp <= 0xa97c) return .hangul_l;
+    if (cp >= 0xd7b0 and cp <= 0xd7c6) return .hangul_v;
+    if (cp >= 0xd7cb and cp <= 0xd7fb) return .hangul_t;
+    if (cp >= 0xac00 and cp <= 0xd7a3) {
+        return if ((cp - 0xac00) % 28 == 0) .hangul_lv else .hangul_lvt;
+    }
+    // Variation selectors and emoji modifiers extend.
+    if (cp >= 0xfe00 and cp <= 0xfe0f) return .extend;
+    if (cp >= 0xe0100 and cp <= 0xe01ef) return .extend;
+    if (cp >= 0x1f3fb and cp <= 0x1f3ff) return .extend;
+    // Prepended concatenation marks.
+    switch (cp) {
+        0x0600...0x0605, 0x06dd, 0x070f, 0x0890, 0x0891, 0x08e2, 0x0d4e, 0x110bd, 0x110cd, 0x111c2, 0x111c3, 0x1193f, 0x11941, 0x11a3a, 0x11a84...0x11a89, 0x11d46, 0x11f02 => return .prepend,
+        else => {},
+    }
+    if (inRangesLinear(cp, &ext_pict)) return .ext_pict;
+    if (inRangesLinear(cp, &combining)) return .extend;
+    if (inRangesLinear(cp, &spacing)) return .spacing_mark;
+    if (inRangesLinear(cp, &format_controls)) return .control;
+    return .other;
+}
+
+fn inRangesLinear(cp: u21, ranges: []const [2]u21) bool {
     for (ranges) |r| {
         if (cp >= r[0] and cp <= r[1]) return true;
     }
@@ -480,6 +579,54 @@ const ext_pict = [_][2]u21{
     .{ 0x1f888, 0x1f88f }, .{ 0x1f8ae, 0x1f8ff }, .{ 0x1f90c, 0x1f93a },
     .{ 0x1f93c, 0x1f945 }, .{ 0x1f947, 0x1faff }, .{ 0x1fc00, 0x1fffd },
 };
+
+/// The lowest code point any of the four tables above names: U+00A9, out of
+/// [`ext_pict`]. Every code point below it is in none of the four, so
+/// [`classOf`] answers `.other` for it without searching any of them, and that
+/// is where the 348 comparisons an ASCII code point used to cost went.
+///
+/// It is checked against the tables at compile time, because a table that
+/// grew an entry below it would make that answer wrong, and wrong silently —
+/// in a way no test over a corpus would notice.
+const first_property_cp: u21 = 0xa9;
+
+const PropertyTable = struct {
+    name: []const u8,
+    ranges: []const [2]u21,
+};
+
+/// Every property table, named, so the check below reaches all four through
+/// one type and can name the one that failed.
+const property_tables = [_]PropertyTable{
+    .{ .name = "ext_pict", .ranges = &ext_pict },
+    .{ .name = "combining", .ranges = &combining },
+    .{ .name = "spacing", .ranges = &spacing },
+    .{ .name = "format_controls", .ranges = &format_controls },
+};
+
+comptime {
+    // **A searched table has to be sorted and has to hold no overlap, and
+    // neither is visible at the call site.** [`inRanges`] reads its answer
+    // off the range the search lands on, so a table that grew an entry out of
+    // order, or two ranges that came to overlap, would be searched into a
+    // wrong answer rather than refused. Checking here makes that a build
+    // failure naming the table, instead of a misclassified code point found
+    // much later; a walk would have needed neither property, which is why
+    // nothing checked them until the search did.
+    for (property_tables) |t| {
+        for (t.ranges, 0..) |r, i| {
+            if (r[0] > r[1]) @compileError(t.name ++ " has a range that ends before it starts");
+            if (r[0] < first_property_cp) {
+                @compileError(t.name ++ " has a range below first_property_cp, which" ++
+                    " classOf answers .other without searching");
+            }
+            if (i == 0) continue;
+            const prev = t.ranges[i - 1];
+            if (r[0] <= prev[0]) @compileError(t.name ++ " has ranges that are not sorted by start");
+            if (r[0] <= prev[1]) @compileError(t.name ++ " has two ranges that overlap");
+        }
+    }
+}
 
 test "codepoint and utf16 counting" {
     try std.testing.expectEqual(@as(usize, 2), try countCodepoints("aé"));
@@ -671,4 +818,43 @@ test "a code point cut off by the end of the string is refused" {
     // "a€b" is three clusters, so its boundaries are 0, 1 and 4.
     try std.testing.expectEqual(@as(usize, 1), try prevGraphemeBoundary("a€b", 2));
     try std.testing.expectEqual(@as(usize, 4), try prevGraphemeBoundary("a€b", 5));
+}
+
+test "the searched tables classify exactly what the walked ones did" {
+    // **`classOfLinear` is the implementation this one replaced**, kept whole:
+    // the same inline tests, then the same four tables walked in the same
+    // order. Every code point the two answer differently is a segmentation
+    // that changed, so the sweep below is what makes "same answer, fewer
+    // comparisons" a checked claim rather than an argued one.
+    //
+    // It covers **every code point of the Basic Multilingual Plane** — which
+    // is every code point below `first_property_cp`, every one the inline
+    // tests decide, and every BMP entry of all four tables — and then, above
+    // the BMP, **every range of all four tables from one code point below its
+    // start to one above its end**. That last part is every code point a table
+    // holds above the BMP and both ends of every such range, which is where a
+    // search that landed one range too low would show.
+    for (0..0x10000) |raw| {
+        const cp: u21 = @intCast(raw);
+        try std.testing.expectEqual(classOfLinear(cp), classOf(cp));
+    }
+    for (property_tables) |t| {
+        for (t.ranges) |r| {
+            const lo: u21 = r[0];
+            const hi: u21 = r[1];
+            if (hi < 0x10000) continue;
+            var cp: u21 = lo - 1;
+            while (cp <= hi + 1) : (cp += 1) {
+                try std.testing.expectEqual(classOfLinear(cp), classOf(cp));
+            }
+        }
+    }
+    // **A stride over what the two sweeps leave**, so a range that had moved
+    // out of their reach would still be caught. It re-decides nothing: a code
+    // point that is in no table and stands beside none is `.other` by both
+    // versions, for the same reason.
+    var probe: u21 = 0x10000;
+    while (probe <= 0x10ffff) : (probe += 64) {
+        try std.testing.expectEqual(classOfLinear(probe), classOf(probe));
+    }
 }

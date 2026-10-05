@@ -845,6 +845,44 @@ pub fn build(b: *std.Build) void {
         "Check the port's saves against the automerge reference, in both directions",
     );
     save_interop_step.dependOn(&verify_reference_saves.step);
+
+    // `zig build bench` is the performance gate, and it is a separate step
+    // rather than another test because it asserts nothing about behaviour: it
+    // measures the seven workloads that dominate the suite's wall clock and
+    // prints `BENCH <name> <iters> <total_ns> <ns_per_iter>` per workload so
+    // two builds can be diffed by machine rather than by eye. Nothing here is
+    // filtered, skipped or weakened to make a number look better — the step
+    // runs every workload it declares, and the numbers it prints are the only
+    // thing it produces.
+    //
+    // **`-Doptimize` decides what is being measured.** Debug is what the test
+    // gate runs and what the per-case cost record in `zig build test` reports;
+    // `ReleaseSafe` is what a consumer runs, and it is the mode in which an
+    // algorithmic change shows up as a real speedup rather than as a change
+    // in how many bounds checks fire. Both are legitimate subjects and they do
+    // not give the same answer, so the mode is the caller's choice and is not
+    // pinned here.
+    //
+    // The benchmark is built against the published `zautomerge` module by the
+    // name a consumer imports it by, so it cannot reach a private and cannot
+    // drift from the public surface without failing to build.
+    const bench_bin = b.addExecutable(.{
+        .name = "zautomerge-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/zautomerge_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zautomerge", .module = mod }},
+        }),
+    });
+    const run_bench = b.addRunArtifact(bench_bin);
+    run_bench.has_side_effects = true;
+    run_bench.step.dependOn(b.getInstallStep());
+    const bench_step = b.step(
+        "bench",
+        "Measure the seven dominant workloads and print a machine-readable line each",
+    );
+    bench_step.dependOn(&run_bench.step);
 }
 
 /// Run one test root under `test/verification_runner.zig` and put that root's

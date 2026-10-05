@@ -142,6 +142,23 @@ fn addI64(a: i64, b: i64) ParseError!i64 {
     return r[0];
 }
 
+/// `running` plus `d` added `count` times, or `error.Overflow` when the sum
+/// leaves the `i64` the deltas accumulate in.
+///
+/// **`count` additions in one step, refusing exactly what `count` of them
+/// would.** The fold is taken at `i128` width rather than in the `i64` the
+/// product does not fit: a repeat run of two deltas of `2^62` carries a
+/// running sum from `-2^62` to `2^62`, which is in range, while the product
+/// `2^63` is not — so refusing on the product would turn a slab `addI64`
+/// accepts row by row into one it rejects. The partial sums of a run of one
+/// delta move monotonically, so the total is in range exactly when every
+/// intermediate is, which makes this one check the same check.
+fn addRunOf(running: i64, d: i64, count: usize) ParseError!i64 {
+    const wide: i128 = @as(i128, running) + @as(i128, d) * @as(i128, @intCast(count));
+    if (wide < std.math.minInt(i64) or wide > std.math.maxInt(i64)) return error.Overflow;
+    return @intCast(wide);
+}
+
 /// Where a slab is written. `out` is null while the slab is only being
 /// measured, which is how `encodedSize` and `write` share one code path
 /// and can never disagree about how many bytes a slab takes.
@@ -206,6 +223,16 @@ pub fn DeltaWith(comptime P: type, comptime T: type) type {
         /// codec either way and a null run in a non-nullable column is
         /// `realize`'s to refuse.
         const WireDecoder = rle.RleWith(P, i64, true, false).Decoder;
+
+        /// One run of stored deltas taken whole: `count` rows carrying the
+        /// same delta (`Run<Option<i64>>`, `delta/decoder.rs:43-55`).
+        pub const WireRun = struct {
+            /// How many rows the run holds.
+            count: usize,
+            /// The delta every one of them stands for, or null for a null run
+            /// — which holds no delta and leaves the running value alone.
+            value: Stored,
+        };
 
         /// A column value as a realized `i64`, or null for a null row.
         /// A value outside the domain is `error.Overflow`.
@@ -340,7 +367,8 @@ pub fn DeltaWith(comptime P: type, comptime T: type) type {
             return out;
         }
 
-        /// A cursor over a slab that yields values one at a time.
+        /// A cursor over a slab that yields values one at a time, or that
+        /// steps over whole runs to reach one (`nth`, `delta/decoder.rs:81-86`).
         pub const Decoder = struct {
             /// The value cursor underneath, over the same borrowed slab. It
             /// carries this decoder's borrow: the `bytes` given to [`init`]
@@ -363,6 +391,64 @@ pub fn DeltaWith(comptime P: type, comptime T: type) type {
                 const d = (try self.inner.next()) orelse return null;
                 if (d) |dv| self.running = try addI64(self.running, dv);
                 return try realize(self.running, d);
+            }
+
+            /// The value `n` rows ahead, consuming the `n` in front of it, or
+            /// null at the end of the slab (`Iterator::nth`,
+            /// `delta/decoder.rs:81-86`).
+            ///
+            /// **O(runs skipped)**: the underlying RLE cursor hands back a
+            /// repeat or a null run whole, so a slab of a few long runs of
+            /// equal deltas is crossed by reading a few run headers instead of
+            /// decoding every row in front of the target. A literal run of
+            /// varying deltas still costs one read per delta, because its
+            /// values are packed back to back — the same limit upstream's
+            /// `nth` has, since it walks `next_delta_run_max` too
+            /// (`delta/decoder.rs:81-86`).
+            ///
+            /// A `n` past the end answers null with the running sum left
+            /// where the slab ran out, and a `n` of zero answers exactly what
+            /// [`next`](Decoder.next) does.
+            ///
+            /// **No refusal is lost.** Every delta the skip folds in goes
+            /// through [`addRunOf`] and every landed-on row through
+            /// [`realize`], so a running sum that leaves the `i64` the deltas
+            /// accumulate in, or the column's own window, is still
+            /// `error.Overflow` (`delta/indexed.rs:65-89`) — reported at the
+            /// run that carries it, which is the run `n` calls to `next`
+            /// report it at. Every malformed slab the RLE cursor refuses — a
+            /// truncated or overlong varint, a count past `maxSlabLen`, a run
+            /// claiming more values than the bytes hold — is raised the same
+            /// way.
+            pub fn nth(self: *Decoder, n: usize) ParseError!?T {
+                var left = n;
+                while (left > 0) {
+                    const run = (try self.nextDeltaRunMax(left)) orelse return null;
+                    left -= run.count;
+                }
+                return self.next();
+            }
+
+            /// The next run of stored deltas, at most `max` rows of it, folded
+            /// into the running sum (`next_delta_run_max`,
+            /// `delta/decoder.rs:43-55`).
+            ///
+            /// `Some(0)` means the realized value repeats for the whole run,
+            /// null is a null run, and a varying run of deltas comes back one
+            /// row at a time. This is the primitive `nth` is built on: a
+            /// repeat run's `d * count` is added in one step rather than
+            /// `count` times.
+            pub fn nextDeltaRunMax(self: *Decoder, max: usize) ParseError!?WireRun {
+                const run = (try self.inner.nextRunMax(max)) orelse return null;
+                if (run.value) |dv| self.running = try addRunOf(self.running, dv, run.count);
+                // The column's own window, checked exactly where `realize`
+                // checks it. A skip that folded a run whole and stopped there
+                // would step over a running sum `next` refuses — and, on a
+                // column whose window is narrower than `i64`, a sum that
+                // leaves the window and comes back would be answered instead
+                // of refused.
+                _ = try realize(self.running, run.value);
+                return .{ .count = run.count, .value = run.value };
             }
         };
 
@@ -838,13 +924,26 @@ pub const DeltaOption = Delta(?u32);
 
 /// The number of rows in `bytes`, walked with the RLE cursor so a decode
 /// makes its allocation exactly once.
+///
+/// **Run at a time, not row at a time.** The row count is a sum of run
+/// counts, so the walk asks the cursor for whole runs through
+/// [`nextRunMax`] rather than decoding every row to add one to a counter. A
+/// slab of a few long runs of equal deltas costs one read per run instead of
+/// one per row, which is the whole of the win, and it is the same walk
+/// [`Decoder.nth`] takes to reach a row.
+///
+/// Every refusal the row-at-a-time walk raised is still raised: the run
+/// header is read by the same `readRunHeader` and a literal run's payloads by
+/// the same `readValue`, so a truncated or overlong varint, a count past
+/// `maxSlabLen`, a run claiming more values than the bytes hold and an
+/// overflowing count all surface at the run that carries them.
 fn countRows(comptime P: type, bytes: []const u8) ParseError!usize {
     var dec = try rle.RleWith(P, i64, true, false).Decoder.init(bytes);
     var total: usize = 0;
-    while (true) {
-        _ = (try dec.next()) orelse return total;
-        total = std.math.add(usize, total, 1) catch return error.Overflow;
+    while (try dec.nextRunMax(std.math.maxInt(usize))) |run| {
+        total = std.math.add(usize, total, run.count) catch return error.Overflow;
     }
+    return total;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -874,6 +973,173 @@ fn expectColumn(comptime D: type, values: []const D.Value, bytes: []const u8) !v
     var dec = try D.Decoder.init(bytes);
     for (values) |v| try testing.expectEqual(v, (try dec.next()).?);
     try testing.expectEqual(@as(?D.Value, null), try dec.next());
+
+    try checkNthParity(D, values, bytes);
+}
+
+/// Holds [`Decoder.nth`] against `next` over `values`, which is what `bytes`
+/// encodes: for every `i`, `nth(i)` is `values[i]`, the cursor is left
+/// standing on that row, and the walk from there is unchanged.
+///
+/// **Every `i`, not a sample.** The running sum is what a skip has to get
+/// right — it advances a whole run at a time, so a fold that is off by one
+/// row, or that forgets a null run contributes nothing, still agrees on the
+/// rows a single jump does not cross and disagrees on the ones it does.
+fn checkNthParity(comptime D: type, values: []const D.Value, bytes: []const u8) !void {
+    for (values, 0..) |want, i| {
+        var jumped = try D.Decoder.init(bytes);
+        try testing.expectEqual(want, (try jumped.nth(i)).?);
+        // The cursor stands on `i`, so `next` answers `i + 1`.
+        for (values[i + 1 ..]) |rest| {
+            try testing.expectEqual(rest, (try jumped.next()).?);
+        }
+        try testing.expectEqual(@as(?D.Value, null), try jumped.next());
+    }
+    // Past the end, by one and by a wide margin, and spent either way.
+    var past = try D.Decoder.init(bytes);
+    try testing.expectEqual(@as(?D.Value, null), try past.nth(values.len));
+    try testing.expectEqual(@as(?D.Value, null), try past.next());
+    var far = try D.Decoder.init(bytes);
+    try testing.expectEqual(@as(?D.Value, null), try far.nth(values.len + 1000));
+    try testing.expectEqual(@as(?D.Value, null), try far.next());
+}
+
+test "nth reaches every row of a slab with mixed runs" {
+    const gpa = testing.allocator;
+    // The three run kinds a delta slab can hold, in one slab each. `expectColumn`
+    // holds `nth` against `next` at every offset of every case it is given;
+    // these pin the shapes themselves so a failure names the run layout that
+    // broke rather than just "some slab".
+    {
+        // One repeat run of equal deltas: the shape `nth` is O(1) over, since
+        // the whole run folds into the running sum in one step.
+        const D = Delta(u32);
+        try expectColumn(D, &.{ 1, 4, 7, 10, 13, 16, 19, 22, 25, 28 }, &.{ 0x7f, 0x01, 0x09, 0x03 });
+    }
+    {
+        // A null run between repeat runs, on the nullable column: a null row
+        // holds no delta, so it leaves the running sum alone. A skip that
+        // charged a null run a step would land on the wrong row here, and one
+        // that charged it nothing lands on the right one — so both the null
+        // run and the repeat runs it separates are in the same case.
+        const D = DeltaOption;
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(gpa);
+        const values = [_]D.Value{ 5, 10, 15, null, null, 25, 30, null, 40, 45, 50 };
+        try D.append(&list, gpa, &values);
+        try checkNthParity(D, &values, list.items);
+        // And the run-level read agrees with the row-at-a-time decode.
+        const back = try D.decodeAll(list.items, gpa);
+        defer gpa.free(back);
+        try testing.expectEqualSlices(D.Value, &values, back);
+    }
+    {
+        // A literal run of varying deltas — the shape that stays O(rows),
+        // because the deltas are packed back to back and only the ones in
+        // front say where the next one starts.
+        const D = Delta(i64);
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(gpa);
+        const values = [_]D.Value{ 10, 25, 30, 44, 51, 70, 88, 95 };
+        try D.append(&list, gpa, &values);
+        try checkNthParity(D, &values, list.items);
+    }
+    // The empty slab: no runs at all, so `nth(0)` is already past the end.
+    {
+        var dec = try DeltaOption.Decoder.init(&[_]u8{});
+        try testing.expect((try dec.nth(0)) == null);
+        try testing.expect((try dec.next()) == null);
+    }
+}
+
+test "nth folds a repeat run in one step, refusing only what the sum refuses" {
+    const D = Delta(i64);
+    const gpa = testing.allocator;
+
+    // **`half * 2` is not an `i64`.** The two rows behind the last are one
+    // repeat run of `half`, and folding it needs the sum of two of them, which
+    // is in range — so a skip that multiplied delta by count in `i64` would
+    // refuse a slab `next` walks to the end of. This is the case that makes
+    // the fold `i128` (`addRunOf`, `delta.zig:145-159`).
+    {
+        const half = @as(i64, 1) << 62;
+        const values = [_]i64{ -half, 0, half };
+        var buf: [64]u8 = undefined;
+        const n = D.encodedSize(&values);
+        try testing.expect(n <= buf.len);
+        D.write(buf[0..n], &values);
+
+        // `nth(2)` crosses the repeat run whole and lands on the last row.
+        var last = try D.Decoder.init(buf[0..n]);
+        try testing.expectEqual(@as(?i64, half), try last.nth(2));
+        // `nth(1)` crosses the one-element literal run and lands on the
+        // middle row, with the running sum carried one delta behind.
+        var mid = try D.Decoder.init(buf[0..n]);
+        try testing.expectEqual(@as(?i64, 0), try mid.nth(1));
+        // And `nth(0)` is the first row.
+        var first = try D.Decoder.init(buf[0..n]);
+        try testing.expectEqual(@as(?i64, -half), try first.nth(0));
+
+        // The row-at-a-time decode accepts the same slab.
+        const back = try D.decodeAll(buf[0..n], gpa);
+        defer gpa.free(back);
+        try testing.expectEqualSlices(i64, &values, back);
+    }
+
+    // **And the refusal is still there where it belongs.** A repeat run of
+    // count 3 over the delta `4_000_000_000_000_000_001` realizes
+    // `half`, `2·half`, `3·half`, and `3·half` leaves `i64`. Folded whole,
+    // the partial sums move monotonically, so the total being out of range is
+    // the same fact as an intermediate being out of range.
+    //
+    // **The payload is written out as bytes, not produced by `D.write`.** A
+    // delta column's realized value *is* the running sum, so a sum that leaves
+    // `i64` needs a value outside `i64`, which `D.write` cannot produce — a
+    // fixture generated by the code under test cannot catch that code. The
+    // bytes are the canonical signed LEB128 for `half`
+    // (`0x3782DACE9D900001`), the same value the column-level case at
+    // `column.zig:15914` hand-writes for the same boundary.
+    {
+        const half = 4_000_000_000_000_000_001;
+        const three = [_]u8{ 3, 0x81, 0x80, 0xc0, 0xec, 0xe9, 0xd9, 0xb6, 0xc1, 0x37 };
+        // Canonical first: the refusal below is about the sum, so the run has
+        // to be one the canonicality check accepts.
+        try rle.RleOption(i64).canonical(&three);
+
+        try testing.expectError(error.Overflow, D.decodeAll(&three, gpa));
+        var dec = try D.Decoder.init(&three);
+        // The rows that are still in range are answered; the one behind them
+        // is not, and neither is a full decode.
+        try testing.expectEqual(@as(?i64, 2 * half), try dec.nth(1));
+        try testing.expectError(error.Overflow, dec.nth(0));
+    }
+}
+
+test "nth raises the refusals next does" {
+    // A truncated run header behind a well-formed repeat run: the skip walks
+    // into it and reports it, exactly where `next` would after serving the
+    // run in front of it.
+    {
+        // The slab is a repeat run of two deltas of 1, so the rows are 1 and
+        // 2: `nth(1)` crosses the whole run in one step and lands on the
+        // second row, and the skip behind it hits the truncated header.
+        var dec = try DeltaOption.Decoder.init(&.{ 0x02, 0x01, 0x80 });
+        try testing.expectEqual(@as(?u32, 2), try dec.nth(1));
+        try testing.expectError(error.UnexpectedEnd, dec.nth(0));
+    }
+    // A null run in a non-nullable column, behind a literal run. The refusal
+    // belongs to `realize`, so a skip that stops short of that row does not
+    // reach it — which is what `next` does too.
+    {
+        var dec = try Delta(u32).Decoder.init(&.{ 0x7f, 0x01, 0x00, 0x01 });
+        try testing.expectEqual(@as(?u32, 1), try dec.nth(0));
+        try testing.expectError(error.UnexpectedNull, dec.nth(0));
+    }
+    // A run that claims more values than the bytes hold.
+    {
+        var dec = try DeltaOption.Decoder.init(&.{ 0x02, 0x01, 0x7d, 0x01 });
+        try testing.expectError(error.LengthExceedsInput, dec.nth(2));
+    }
 }
 
 test "strictly increasing column" {

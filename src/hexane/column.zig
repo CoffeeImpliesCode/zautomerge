@@ -200,6 +200,113 @@ fn addChecked(a: i64, b: i64) ParseError!i64 {
     return std.math.add(i64, a, b) catch error.Overflow;
 }
 
+/// `running + each * count`, reported rather than wrapped — the fold a whole
+/// run of equal entries stands for, and the shape upstream's delta cursor
+/// folds a run with (`d * run.count`, `delta/decoder.rs:48-50`).
+///
+/// **It refuses exactly what `count` checked additions refuse.** The
+/// intermediate sums of a constant `each` run monotonically from `running` to
+/// `running + each * count`, so if both ends are inside `i64` every sum
+/// between them is too, and if the end is outside it then the addition that
+/// produced it was the one `count` checked additions would have refused. The
+/// `i128` is what lets one refusal stand in for `count` of them without any
+/// intermediate wrap.
+fn addRunOf(running: i64, each: i64, count: usize) ParseError!i64 {
+    const wide: i128 = @as(i128, running) + @as(i128, each) * @as(i128, count);
+    if (wide < std.math.minInt(i64) or wide > std.math.maxInt(i64)) return error.Overflow;
+    return @intCast(wide);
+}
+
+/// Advances `dec` past `n` rows of its own slab, leaving it standing on row
+/// `n`, and keeps `running` — the column's realized value in front of the
+/// decoder — in step. `false` when the slab ran out before `n` rows, which is
+/// the refusal `n` calls to `WireDecoder.next` turn into `error.InvalidValue`.
+///
+/// This is upstream's `advance_by` (`delta/decoder.rs:57-63`) brought down to
+/// the wire cursor every codec shares: *"Advance past `n` items in O(runs),
+/// leaving the running sum where item `n` starts"*. Upstream spells it as
+/// `nth(n - 1)` and discards what comes back, and so does the fast arm below,
+/// because a decoder's `nth` consumes its target.
+///
+/// **Three arms, chosen at comptime, and which one a codec takes is a fact
+/// about its decoder rather than about this function:**
+///
+/// * a **delta** codec stores differences, so a run of equal differences is a
+///   run of `count` identical folds and the walk is
+///   `WireDecoder.nextRunMax` plus one fold per run — the shape of upstream's
+///   `next_delta_run_max` (`delta/decoder.rs:43-55`), reached through the
+///   column's own running value because the column's `WireDecoder` is the
+///   run-length cursor underneath and not `delta.zig`'s `Decoder`. The fold is
+///   the codec's `skipRun`, so the domain check and the absent-row refusal
+///   happen where the codec puts them;
+/// * any other codec whose decoder has an `nth` answers with it —
+///   `bool.rs:579-595`, `rle/decoder.rs:318-401` — **O(runs skipped)**;
+/// * a decoder with neither keeps the item-at-a-time walk, which is what this
+///   function was before. Every codec in the crate names a decoder that has
+///   both, so no instantiation takes this arm today; it is here so that a
+///   codec added later compiles rather than becoming a wall of errors.
+///
+/// **No refusal is lost.** A skipped run is read through the same header
+/// reader `next` uses, and a literal run's payloads through the same value
+/// reader, so a truncated or overlong varint, a count that is not
+/// representable, a run claiming more values than the bytes hold and an
+/// invalid UTF-8 payload all surface at the run that carries them — which is
+/// where `n` calls to `next` surface them. A delta column's absent row and
+/// out-of-domain realized value are refused by the codec fold, as they are by
+/// `valueOfWire` on every row it would otherwise have read.
+fn skipWire(comptime E: type, dec: *E.WireDecoder, n: usize, running: *i64) ParseError!bool {
+    if (n == 0) return true;
+    if (comptime E.is_delta and @hasDecl(E, "skipRun") and @hasDecl(E.WireDecoder, "nextRunMax")) {
+        var left = n;
+        while (left != 0) {
+            const run = (try dec.nextRunMax(left)) orelse return false;
+            left -= run.count;
+            try E.skipRun(run.value, run.count, running);
+        }
+        return true;
+    }
+    if (comptime @hasDecl(E.WireDecoder, "nth")) {
+        // `nth(n - 1)` consumes the row in front of the target and leaves the
+        // decoder on the target, which is the row `skipRows` stands on.
+        return (try dec.nth(n - 1)) != null;
+    }
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const w = (try dec.next()) orelse return false;
+        _ = try E.valueOfWire(w, running);
+    }
+    return true;
+}
+
+/// Advances `dec` past `n` rows of its own slab the way `runningAt` walks
+/// them: no realized values, only the codec's `accumulate` fold over the
+/// entries it steps over. `false` when the slab ran out before `n` rows.
+///
+/// The fast arm needs a fold that takes a whole run at once, because a
+/// prefix sum over a run of `count` equal lengths is `length * count` — the
+/// one multiplication every codec's accumulator already implies
+/// (`accumulateRun` on `PrefixBase`, `DeltaBase`). A codec that does not
+/// publish one keeps the row-at-a-time walk; that is the case for the op set's
+/// two hand-written prefix codecs, whose declarations live outside this file.
+fn accumulateWire(comptime E: type, dec: *E.WireDecoder, n: usize, running: *i64) ParseError!bool {
+    if (comptime @hasDecl(E, "accumulateRun") and @hasDecl(E.WireDecoder, "nextRunMax")) {
+        if (n == 0) return true;
+        var left = n;
+        while (left != 0) {
+            const run = (try dec.nextRunMax(left)) orelse return false;
+            left -= run.count;
+            try E.accumulateRun(run.value, run.count, running);
+        }
+        return true;
+    }
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const w = (try dec.next()) orelse return false;
+        try E.accumulate(w, running);
+    }
+    return true;
+}
+
 /// One run of a column: `count` copies of `value` (`Run`, `lib.rs:196-201`).
 ///
 /// A repeat, absent or boolean run yields its whole count. A *literal*
@@ -327,6 +434,65 @@ fn packOf(comptime E: type) type {
     return if (@hasDecl(E, "Pack")) E.Pack else rle.Leb128;
 }
 
+/// How many runs a segment walk holds before it has to touch the heap at
+/// all, which is the run budget (`slab.zig:125`) — the most a slab this
+/// port stores holds.
+///
+/// **A size for the frame, not a limit on the answer.** `bytes` handed to
+/// `segmentsOf` is not always a slab a column cut: a middle being
+/// re-encoded, a whole wire form being loaded and a seam being measured
+/// all hold more, and a walk that outruns this spills into the heap rather
+/// than refusing. The segments, their order and the refusals are the same
+/// either way.
+const seg_walk_default: usize = slabmod.default_max_segments;
+
+/// [`E.wireRange`] over a run table the caller already holds, for a codec
+/// that publishes `wireRangeFromSegs`; and `E.wireRange` itself for one that
+/// does not.
+///
+/// The values and the refusals, and the order they come back in, are
+/// `wireRange`'s own either way; what the fallback costs is the table the
+/// seam would have reused.
+fn wireRangeWithSegs(
+    comptime E: type,
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    segs: []const slabmod.Segment(E.Wire),
+    from: usize,
+    to: usize,
+) ParseError![]E.Wire {
+    if (comptime @hasDecl(E, "wireRangeFromSegs")) {
+        return E.wireRangeFromSegs(gpa, bytes, segs, from, to);
+    }
+    return E.wireRange(gpa, bytes, from, to);
+}
+
+/// Where a walk over one slab's run sequence stands: the byte and the item
+/// of the run it would read **next**, which is the run one past the one it
+/// last read. Handing this back is what turns a walk that crosses runs from
+/// a rescan of the slab into a walk that advances (`runAtOrAfter`).
+///
+/// The walk answers a row by reading runs until one of them ends past it, so
+/// every run in front of the resume point has been read already and every
+/// run behind it has not. `pos` and `item` are the two halves of "where the
+/// reading stopped" — the byte is a position in the slab and the item is a
+/// row — and the run sequence keeps no other state: a repeat run's value is
+/// in its own header, a literal run's items follow it, and a run's item
+/// bounds are its own two numbers.
+pub const RunCursor = struct {
+    /// The byte the next run's header starts at.
+    pos: usize,
+    /// The item the next run's first item is.
+    item: usize,
+    /// Which value the next run carries, for the one codec whose runs do
+    /// not say: a boolean run's value **is** its position in the run
+    /// sequence (`bool.zig:13-25`), so a walk that resumes inside a slab
+    /// cannot recover it from the bytes and carries it here instead. Every
+    /// other codec reads the value out of the run's own header and leaves
+    /// this alone.
+    parity: bool,
+};
+
 /// The first row in `slab` at which the running sum reaches `target`,
 /// counted from the slab's own start — `find_prefix_in_slab`
 /// (`prefix.rs:111-150`).
@@ -347,10 +513,18 @@ fn packOf(comptime E: type) type {
 /// value adds up a sum the column does not have, and the descent then
 /// answers a row past the one holding `target` — which is how a two-unit text
 /// element came back as the element behind it.
+/// **The walk advances.** Every turn asks for the run holding `items`, and
+/// `items` is the end of the run the last turn read, so the asks move
+/// forward one run at a time while the walk is handed the point the last one
+/// stopped reading at. The runs it skips that way are exactly the ones a
+/// walk from byte 0 would have skipped (`runAtOrAfter`'s own rule), so a
+/// slab of `K` runs costs `K` header parses where a fresh scan per run costs
+/// `1 + 2 + ... + K` — and this loop is inside every prefix search.
 fn findPrefixInSlab(comptime E: type, slab: *const Slab, target: i64) ParseError!usize {
     var items: usize = 0;
     var acc: i64 = 0;
-    while (try E.runAtOrAfter(slab.data, items)) |ra| {
+    var cursor: ?RunCursor = null;
+    while (try E.runAtOrAfter(slab.data, items, cursor)) |ra| {
         const n = ra.seg.itemCount();
         if (ra.seg.kind == .literal) {
             // One item is one run upstream, so one item is one division: the
@@ -365,11 +539,13 @@ fn findPrefixInSlab(comptime E: type, slab: *const Slab, target: i64) ParseError
                 acc = peek;
             }
             items = ra.seg.item_end;
+            cursor = ra.cursor;
             continue;
         }
         const p = if (ra.seg.first_value) |v| prefixUnit(E.Wire, v) else 0;
         if (p == 0) {
             items = ra.seg.item_end;
+            cursor = ra.cursor;
             continue;
         }
         const span = std.math.mul(i64, p, @as(i64, @intCast(n))) catch return error.Overflow;
@@ -384,6 +560,7 @@ fn findPrefixInSlab(comptime E: type, slab: *const Slab, target: i64) ParseError
         }
         acc = peek;
         items = ra.seg.item_end;
+        cursor = ra.cursor;
     }
     return items;
 }
@@ -412,12 +589,14 @@ fn slabOf(gpa: std.mem.Allocator, comptime E: type, wires: []const E.Wire) Parse
     return .{ .data = bytes, .len = wires.len, .segments = m.segments, .tail = m.tail };
 }
 
-/// Every value of a slab, in wire form, through the run walk. Only a run
-/// with a value has items, so the value-less run — the boolean pad —
-/// contributes nothing.
-fn wireAll(gpa: std.mem.Allocator, comptime E: type, bytes: []const u8) ParseError![]E.Wire {
-    const segs = try E.segmentsOf(gpa, bytes);
-    defer gpa.free(segs);
+/// Every value of a slab, in wire form, through a run table the caller
+/// already holds. Only a run with a value has items, so the value-less run
+/// — the boolean pad — contributes nothing.
+fn wireAllFromSegs(
+    gpa: std.mem.Allocator,
+    comptime E: type,
+    segs: []const slabmod.Segment(E.Wire),
+) ParseError![]E.Wire {
     var total: usize = 0;
     for (segs) |s| total = std.math.add(usize, total, s.itemCount()) catch return error.Overflow;
     const out = try gpa.alloc(E.Wire, total);
@@ -545,10 +724,31 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
             return .{ .value = v.value, .len = v.len };
         }
 
-        /// Every run of a slab, in wire order.
+        /// Every run of a slab, in wire order. The caller owns the slice.
+        ///
+        /// **One allocation, and it is the right size.** Built by `append`
+        /// the table grows from nothing — `n + n/2 + init` every time it has
+        /// to — and `toOwnedSlice` shrinks it again, so a budgeted slab
+        /// costs seven allocate/copy/free rounds and an eighth shrink, and
+        /// every one of those is a `memcpy` of what has been read so far plus
+        /// a `memset` inside the allocator over the slack the growth left.
+        /// The runs of a slab this port stored fit in the run budget
+        /// (`slab.zig:125`), so they are written into a stack buffer and
+        /// copied once into an allocation of exactly that many runs, and a
+        /// run sequence longer than the budget — a whole wire form being
+        /// loaded, a middle being re-encoded — spills into the heap for the
+        /// whole walk and costs the one allocation all the same.
+        ///
+        /// The walk is the one it was, run for run, so the segments, their
+        /// order, and the refusals and the points they come back at are the
+        /// same an `append` per run gave.
         pub fn segmentsOf(gpa: std.mem.Allocator, bytes: []const u8) ParseError![]slabmod.Segment(Wire) {
-            var out: std.ArrayList(slabmod.Segment(Wire)) = .empty;
-            errdefer out.deinit(gpa);
+            var held: [seg_walk_default]slabmod.Segment(Wire) = undefined;
+            // Empty for every slab a column stored, and the only heap the
+            // walk touches before the one allocation below.
+            var spill: std.ArrayList(slabmod.Segment(Wire)) = .empty;
+            defer spill.deinit(gpa);
+            var n: usize = 0;
             var pos: usize = 0;
             var item: usize = 0;
             while (pos < bytes.len) {
@@ -564,10 +764,10 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
                     end = payload + v.len;
                 } else if (hdr.value == 0) {
                     if (comptime !Nullable) return error.UnexpectedNull;
-                    const n = try P.readUnsigned(bytes[payload..]);
-                    count = std.math.cast(usize, n.value) orelse return error.Overflow;
+                    const n_hdr = try P.readUnsigned(bytes[payload..]);
+                    count = std.math.cast(usize, n_hdr.value) orelse return error.Overflow;
                     value = try nullWire();
-                    end = payload + n.len;
+                    end = payload + n_hdr.len;
                 } else {
                     count = std.math.cast(usize, -hdr.value) orelse return error.Overflow;
                     var p = payload;
@@ -578,7 +778,7 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
                     while (k < count) : (k += 1) p += (try payloadRead(P, Payload, bytes, p)).len;
                     end = p;
                 }
-                try out.append(gpa, .{
+                const seg: slabmod.Segment(Wire) = .{
                     .byte_start = pos,
                     .byte_end = end,
                     .item_start = item,
@@ -586,11 +786,21 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
                     .first_value = value,
                     .opens_with_true = false,
                     .kind = if (hdr.value == 0) .absent else if (hdr.value > 0) .repeat else .literal,
-                });
+                };
+                if (n < held.len) {
+                    held[n] = seg;
+                    n += 1;
+                } else {
+                    try spill.append(gpa, seg);
+                }
                 item = std.math.add(usize, item, count) catch return error.Overflow;
                 pos = end;
             }
-            return out.toOwnedSlice(gpa);
+            const out = try gpa.alloc(slabmod.Segment(Wire), n + spill.items.len);
+            errdefer gpa.free(out);
+            @memcpy(out[0..n], held[0..n]);
+            @memcpy(out[n..], spill.items);
+            return out;
         }
 
         /// The values of items `[from, to)` of a slab, in wire form. The
@@ -607,6 +817,31 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
         ) ParseError![]Wire {
             const segs = try segmentsOf(gpa, bytes);
             defer gpa.free(segs);
+            return wireRangeFromSegs(gpa, bytes, segs, from, to);
+        }
+
+        /// [`wireRange`](WireRle.wireRange) over a run table the caller
+        /// already holds, which answers the same values and refuses at the
+        /// same points without rebuilding the table.
+        ///
+        /// The seam the splice partition is written against: it walks
+        /// `self.segs` to find the cut's runs and then asks this function
+        /// for the items of two of them, and `wireRange` would hand each
+        /// question a table of the whole slab it is already standing in
+        /// (`slab.zig`'s `Partition.rebuild`).
+        ///
+        /// `segs` must be the runs of `bytes`. Nothing here re-reads the
+        /// bytes a run's header already answered, so a table that does not
+        /// describe `bytes` is a caller that broke its own contract — the
+        /// one check `wireRange` makes and this does not is that the runs
+        /// came from these bytes at all.
+        pub fn wireRangeFromSegs(
+            gpa: std.mem.Allocator,
+            bytes: []const u8,
+            segs: []const slabmod.Segment(Wire),
+            from: usize,
+            to: usize,
+        ) ParseError![]Wire {
             var len: usize = 0;
             for (segs) |s| len = std.math.add(usize, len, s.itemCount()) catch return error.Overflow;
             if (to > len or from > to) return error.InvalidValue;
@@ -655,6 +890,8 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
             seg: slabmod.Segment(Wire),
             /// The item the cursor stands on, inside `seg`.
             at: usize,
+            /// Where a walk that has read up to `seg` stands now, one run on.
+            cursor: RunCursor,
         };
 
         /// The run holding item `at`, or the first one behind it, or null
@@ -665,9 +902,30 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
         ///
         /// A run with no items never holds anything, so a zero-count run
         /// is stepped over rather than answered.
-        pub fn runAtOrAfter(bytes: []const u8, at: usize) ParseError!?RunAt {
+        ///
+        /// **A [`RunCursor`](RunCursor) makes the walk advance.** `from` is
+        /// null for a walk that starts at the slab's first run, and the
+        /// cursor of an earlier answer on these same bytes for one that does
+        /// not. It is honoured only when the row asked for is at or behind
+        /// `from.item`, and that is what keeps the answer the one a walk from
+        /// byte 0 would have given: the walk steps over a run only when that
+        /// run does **not** end past `at`, and every run in front of
+        /// `from.pos` ends at or before `from.item <= at`, so a walk from
+        /// byte 0 steps over exactly those and then carries exactly `from`
+        /// into the rest of the walk. The same runs are therefore read from
+        /// the same bytes with the same reads: the same run answered and the
+        /// same refusal raised. A row in front of the cursor is answered
+        /// from byte 0 instead, so nothing here depends on the rows being
+        /// asked for in order.
+        pub fn runAtOrAfter(bytes: []const u8, at: usize, from: ?RunCursor) ParseError!?RunAt {
             var pos: usize = 0;
             var item: usize = 0;
+            if (from) |f| {
+                if (at >= f.item) {
+                    pos = f.pos;
+                    item = f.item;
+                }
+            }
             while (pos < bytes.len) {
                 const hdr = try P.readSigned(bytes[pos..]);
                 const payload = pos + hdr.len;
@@ -712,6 +970,14 @@ fn WireRle(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
                             .kind = kind,
                         },
                         .at = at,
+                        // `parity` is the one field of `RunCursor` a codec
+                        // without header-carried values never reads, and it is
+                        // dead on the resume path here for the same reason:
+                        // this walk answers every run's value from its own
+                        // header, so nothing consults the position parity.
+                        // The boolean codec's own `runAtOrAfter` sets it to
+                        // the run index's parity, which is the only reader.
+                        .cursor = .{ .pos = end, .item = stop, .parity = false },
                     };
                 }
                 item = stop;
@@ -1651,6 +1917,7 @@ fn RleBase(comptime Payload: type, comptime Nullable: bool, comptime Utf8: bool,
 
         pub const segmentsOf = Base.segmentsOf;
         pub const wireRange = Base.wireRange;
+        pub const wireRangeFromSegs = Base.wireRangeFromSegs;
         pub const wireRunItems = Base.wireRunItems;
         pub const wireEncode = Base.wireEncode;
         pub const wireFill = Base.wireFill;
@@ -1832,6 +2099,7 @@ fn PrefixBase(comptime P: type, comptime T: type) type {
 
         pub const segmentsOf = Base.segmentsOf;
         pub const wireRange = Base.wireRange;
+        pub const wireRangeFromSegs = Base.wireRangeFromSegs;
         pub const wireRunItems = Base.wireRunItems;
         pub const wireEncode = Base.wireEncode;
         pub const wireFill = Base.wireFill;
@@ -1890,6 +2158,26 @@ fn PrefixBase(comptime P: type, comptime T: type) type {
             } else {
                 running.* = try addChecked(running.*, @as(i64, @intCast(w)));
             }
+        }
+
+        /// `accumulate` over `count` rows of one length: a prefix sum
+        /// spends `count` copies of a length in one multiplication, which is
+        /// what makes a run-level walk of a prefix column O(runs) rather than
+        /// O(rows). An absent row has no length, so a run of them adds
+        /// nothing, as `accumulate` says of one.
+        pub fn accumulateRun(w: Wire, count: usize, running: *i64) ParseError!void {
+            // `addRunOf(running, each, count)`, **not** `addChecked(running,
+            // each * count)`: the run's span is only meaningful once it is
+            // added to the sum in front of it, and a sum that stays in `i64`
+            // can span more than `i64` on its own — a prefix sum folded from a
+            // large negative running value must refuse exactly what `count`
+            // checked additions refuse, and no more.
+            if (comptime isNullable(T)) {
+                const v = w orelse return;
+                running.* = try addRunOf(running.*, @as(i64, @intCast(v)), count);
+                return;
+            }
+            running.* = try addRunOf(running.*, @as(i64, @intCast(w)), count);
         }
 
         /// The wire entry one value takes on a column whose running value
@@ -1995,6 +2283,7 @@ fn DeltaBase(comptime P: type, comptime T: type) type {
 
         pub const segmentsOf = Base.segmentsOf;
         pub const wireRange = Base.wireRange;
+        pub const wireRangeFromSegs = Base.wireRangeFromSegs;
         pub const wireRunItems = Base.wireRunItems;
         pub const wireEncode = Base.wireEncode;
         pub const wireFill = Base.wireFill;
@@ -2085,6 +2374,44 @@ fn DeltaBase(comptime P: type, comptime T: type) type {
         /// slab's base, and a running *sum* needs this.
         pub fn accumulate(w: Wire, running: *i64) ParseError!void {
             if (w) |d| running.* = try addChecked(running.*, d);
+        }
+
+        /// Folds `count` rows of one stored difference into `running`, the
+        /// way `count` calls to `valueOfWire` would and in two steps
+        /// (`next_delta_run_max`, `delta/decoder.rs:43-55`).
+        ///
+        /// This is the fold a run-level skip of a delta column runs on, and it
+        /// carries the two refusals that fold has to carry: a realized value
+        /// outside the column's domain, and an absent row on a column that has
+        /// none — `error.UnexpectedNull`, exactly as `valueOfWire` refuses it
+        /// row by row.
+        ///
+        /// **Both ends of the run are realized, and both are needed.** The
+        /// values `count` rows of difference `d` realize are `running + d`,
+        /// `running + 2d`, …, `running + count·d`; `valueOfWire` refuses each
+        /// of them in turn, and the sequence is monotone, so its first and
+        /// last elements bracket the rest and **realizing those two refuses
+        /// exactly what realizing every one refuses**. Realizing only the last
+        /// is *not* the same refusal: with `count >= 2` the run can open below
+        /// the domain and climb back into it, which the row-at-a-time walk
+        /// refuses on its first row and a last-only check answers.
+        pub fn skipRun(w: Wire, count: usize, running: *i64) ParseError!void {
+            const d = w orelse {
+                if (comptime !Nullable) return error.UnexpectedNull;
+                return;
+            };
+            // The run's first row: `count >= 1` on every run a decoder hands
+            // back, so this is one checked addition and one domain check.
+            _ = try realize(try addRunOf(running.*, d, 1));
+            running.* = try addRunOf(running.*, d, count);
+            _ = try realize(running.*);
+        }
+
+        /// `accumulate` over `count` rows of one difference: a sum, so
+        /// nothing is realized and nothing is refused for a domain the sum
+        /// only has to leave at the end.
+        pub fn accumulateRun(w: Wire, count: usize, running: *i64) ParseError!void {
+            if (w) |d| running.* = try addRunOf(running.*, d, count);
         }
 
         /// The wire entry one value takes, measured from the running value
@@ -2221,9 +2548,19 @@ fn BoolCodec(comptime P: type) type {
         /// `false`s, so a slab that starts on `true` opens with a count of zero
         /// — a run with no items, and the only such run the format has
         /// (`bool.rs:988-1002`).
+        ///
+        /// **One allocation, and it is the right size**, for the reason
+        /// [`WireRle.segmentsOf`](WireRle.segmentsOf) gives: the runs are
+        /// written into a stack buffer and copied once into an allocation of
+        /// exactly that many runs, and a run sequence longer than the run
+        /// budget spills into the heap for the whole of the walk.
         pub fn segmentsOf(gpa: std.mem.Allocator, bytes: []const u8) ParseError![]slabmod.Segment(Wire) {
-            var out: std.ArrayList(slabmod.Segment(Wire)) = .empty;
-            errdefer out.deinit(gpa);
+            var held: [seg_walk_default]slabmod.Segment(Wire) = undefined;
+            // Empty for every slab a column stored, and the only heap the
+            // walk touches before the one allocation below.
+            var spill: std.ArrayList(slabmod.Segment(Wire)) = .empty;
+            defer spill.deinit(gpa);
+            var n: usize = 0;
             var pos: usize = 0;
             var item: usize = 0;
             var value: bool = false;
@@ -2231,7 +2568,7 @@ fn BoolCodec(comptime P: type) type {
             while (pos < bytes.len) {
                 const c = try P.readUnsigned(bytes[pos..]);
                 const count = std.math.cast(usize, c.value) orelse return error.Overflow;
-                try out.append(gpa, .{
+                const seg: slabmod.Segment(Wire) = .{
                     .byte_start = pos,
                     .byte_end = pos + c.len,
                     .item_start = item,
@@ -2239,7 +2576,13 @@ fn BoolCodec(comptime P: type) type {
                     .first_value = if (count == 0) null else value,
                     .opens_with_true = value,
                     .kind = if (count == 0) .pad else if (count == 1) .literal else .repeat,
-                });
+                };
+                if (n < held.len) {
+                    held[n] = seg;
+                    n += 1;
+                } else {
+                    try spill.append(gpa, seg);
+                }
                 item = std.math.add(usize, item, count) catch return error.Overflow;
                 pos += c.len;
                 // Only the very first run may hold no items, and it does not
@@ -2249,14 +2592,45 @@ fn BoolCodec(comptime P: type) type {
                 if (!first or !value) value = !value;
                 first = false;
             }
-            return out.toOwnedSlice(gpa);
+            const out = try gpa.alloc(slabmod.Segment(Wire), n + spill.items.len);
+            errdefer gpa.free(out);
+            @memcpy(out[0..n], held[0..n]);
+            @memcpy(out[n..], spill.items);
+            return out;
         }
 
         /// The wire values for rows `from..to` of `bytes`, as a fresh
         /// caller-owned slice. Decodes the whole slab and copies the window out
         /// of it, so `from > to` or `to` past the end is `error.InvalidValue`.
         pub fn wireRange(gpa: std.mem.Allocator, bytes: []const u8, from: usize, to: usize) ParseError![]Wire {
-            const all = try wireAll(gpa, Self, bytes);
+            const segs = try segmentsOf(gpa, bytes);
+            defer gpa.free(segs);
+            return wireRangeFromSegs(gpa, bytes, segs, from, to);
+        }
+
+        /// [`wireRange`](BoolCodec.wireRange) over a run table the caller
+        /// already holds, answering the same values and refusing at the same
+        /// points without rebuilding the table.
+        ///
+        /// `segs` must be the runs of `bytes`; see
+        /// `WireRle.wireRangeFromSegs` for why nothing here re-reads what a
+        /// run's header already answered.
+        ///
+        /// **`bytes` goes unread**, where the RLE codecs' seam reads it for
+        /// a literal run's values: a boolean run stores no value at all —
+        /// its value is its position in the run sequence, which `segs`
+        /// already carries (`bool.rs:13-25`). The parameter is kept so that
+        /// the two codecs take the same question the same way, and the
+        /// dispatcher in `slab.zig` and this file can be one call.
+        pub fn wireRangeFromSegs(
+            gpa: std.mem.Allocator,
+            bytes: []const u8,
+            segs: []const slabmod.Segment(Wire),
+            from: usize,
+            to: usize,
+        ) ParseError![]Wire {
+            _ = bytes;
+            const all = try wireAllFromSegs(gpa, Self, segs);
             defer gpa.free(all);
             if (to > all.len or from > to) return error.InvalidValue;
             return gpa.dupe(Wire, all[from..to]);
@@ -2396,6 +2770,8 @@ fn BoolCodec(comptime P: type) type {
             seg: slabmod.Segment(Wire),
             /// The item the cursor stands on, inside `seg`.
             at: usize,
+            /// Where a walk that has read up to `seg` stands now, one run on.
+            cursor: RunCursor,
         };
 
         /// The run holding item `at`, or the first one behind it, or null
@@ -2405,11 +2781,28 @@ fn BoolCodec(comptime P: type) type {
         ///
         /// The leading pad holds no items and so is stepped over rather than
         /// answered (`bool.rs:988-1002`).
-        pub fn runAtOrAfter(bytes: []const u8, at: usize) ParseError!?RunAt {
+        ///
+        /// `from` is the [`RunCursor`](RunCursor) of an earlier answer on
+        /// these same bytes and makes the walk advance from there; the rule
+        /// that keeps the answer the one a walk from byte 0 would give is
+        /// `WireRle`'s own, and only the value of the run it lands on is
+        /// extra here, because a boolean run's value is its position in the
+        /// sequence rather than anything the bytes at `pos` say.
+        pub fn runAtOrAfter(bytes: []const u8, at: usize, from: ?RunCursor) ParseError!?RunAt {
             var pos: usize = 0;
             var item: usize = 0;
             var value: bool = false;
             var first = true;
+            if (from) |f| {
+                if (at >= f.item) {
+                    pos = f.pos;
+                    item = f.item;
+                    value = f.parity;
+                    // A cursor always stands past the slab's own first run,
+                    // which is the only one `first` speaks for.
+                    first = pos == 0;
+                }
+            }
             while (pos < bytes.len) {
                 const c = try P.readUnsigned(bytes[pos..]);
                 const count = std.math.cast(usize, c.value) orelse return error.Overflow;
@@ -2426,6 +2819,7 @@ fn BoolCodec(comptime P: type) type {
                             .kind = if (count == 1) .literal else .repeat,
                         },
                         .at = at,
+                        .cursor = .{ .pos = pos + c.len, .item = stop, .parity = !value },
                     };
                 }
                 item = stop;
@@ -2828,7 +3222,10 @@ pub fn Column(comptime T: type, comptime E: type) type {
         // ── Reading ─────────────────────────────────────────────────────
 
         /// The value at `index`, or null past the end. O(log S) to find the
-        /// slab, then a walk of the runs before the row inside it.
+        /// slab, then **O(runs skipped)** to reach the row inside it — the
+        /// shape upstream's `get` has, where the decoder is asked for the row
+        /// rather than the rows in front of it being read one at a time
+        /// (`column.rs:1500-1516`, and the `decoder.nth` at `column.rs:424`).
         pub fn get(self: *const Self, index: usize) ParseError!?T {
             if (index >= self.total_len) return null;
             const hit = self.tree.findByPrefix(index) orelse return null;
@@ -2838,11 +3235,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
             // A delta column's values are measured from its slab's base; the
             // other codecs do not read `running` at all.
             var running = self.baseOf(hit.slab);
-            var i: usize = 0;
-            while (i < offset) : (i += 1) {
-                const w = (try dec.next()) orelse return error.InvalidValue;
-                _ = try E.valueOfWire(w, &running);
-            }
+            if (!try skipWire(E, &dec, offset, &running)) return error.InvalidValue;
             const w = (try dec.next()) orelse return error.InvalidValue;
             return try E.valueOfWire(w, &running);
         }
@@ -2875,7 +3268,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
 
         /// A cursor over the rows in `range`, clamped to the column
         /// (`Column::iter_range`, `column.rs:1384-1421`). O(log S) to
-        /// position, then the rows before the start inside its own slab,
+        /// position, then O(runs skipped) over the slab the start lands in,
         /// then O(1) per row. Allocates nothing.
         ///
         /// An empty range is still *positioned* at its start, decoder and
@@ -2969,6 +3362,11 @@ pub fn Column(comptime T: type, comptime E: type) type {
         ///
         /// Only a codec whose weight carries a prefix has one;
         /// `error.Unsupported` for the rest.
+        ///
+        /// O(log S) to find the slab, then **O(runs skipped)** over the rows
+        /// in front of `index` inside it — a prefix sum takes a whole run of
+        /// equal lengths in one multiplication, and a delta sum a whole run
+        /// of equal differences in one fold (`accumulateWire`).
         pub fn runningAt(self: *const Self, index: usize) ParseError!i64 {
             if (!comptime E.tracks_prefix) return error.Unsupported;
             if (self.slabs.items.len == 0) return 0;
@@ -2986,11 +3384,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
             const s = &self.slabs.items[si];
             var running: i64 = 0;
             var dec = try E.WireDecoder.init(s.data);
-            var i: usize = 0;
-            while (i < offset) : (i += 1) {
-                const w = (try dec.next()) orelse return error.InvalidValue;
-                try E.accumulate(w, &running);
-            }
+            if (!try accumulateWire(E, &dec, offset, &running)) return error.InvalidValue;
             return try addChecked(self.baseOf(si), running);
         }
 
@@ -3084,7 +3478,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
         pub fn isOnly(self: *const Self, value: T) ParseError!bool {
             for (self.slabs.items, 0..) |s, si| {
                 if (s.len == 0) continue;
-                const ra = (try E.runAtOrAfter(s.data, 0)) orelse continue;
+                const ra = (try E.runAtOrAfter(s.data, 0, null)) orelse continue;
                 const n = if (ra.seg.kind == .literal) 1 else ra.seg.itemCount();
                 if (n != s.len) return false;
                 // The run carries a *wire* entry, and a delta column's is a
@@ -4388,7 +4782,11 @@ pub fn Column(comptime T: type, comptime E: type) type {
                             try mid.appendSlice(gpa, head_items);
                         }
                         {
-                            const tail_items = try E.wireRange(gpa, s.data, b_first.item_start, b_first.item_end);
+                            // **Out of the run table this loop already
+                            // holds** (`segs`, built from `s.data` above):
+                            // `E.wireRange` answers the same items by
+                            // rebuilding that table first.
+                            const tail_items = try wireRangeWithSegs(E, gpa, s.data, segs, b_first.item_start, b_first.item_end);
                             defer gpa.free(tail_items);
                             try mid.appendSlice(gpa, tail_items);
                         }
@@ -6652,14 +7050,47 @@ pub fn Column(comptime T: type, comptime E: type) type {
             /// the same about its own), so this is a shape a real column
             /// has and not an artefact of a fixture.
             ///
+            /// A walk that *crosses* runs misses the cache every run, and
+            /// what it used to pay for each miss was `runAtOrAfter` reading
+            /// the slab's run sequence from byte 0 again: one walk over a
+            /// slab of `K` runs cost `1 + 2 + ... + K` header parses where
+            /// `K` would do. `run_seek` is what stops that.
+            ///
             /// It can only answer while the cursor is in the run it was
             /// taken from, and the slab is part of it because a run's item
             /// bounds are relative to its own slab.
             run_cache: ?RunCache = null,
+
+            /// Where the last run lookup stopped reading, so a walk that
+            /// steps forward resumes there instead of at byte 0 — the
+            /// half of the same problem `run_cache` does not cover.
+            ///
+            /// It is a [`RunCursor`](RunCursor) and the bytes it was taken
+            /// from, because a resume point means nothing without them and a
+            /// slab index alone would be a claim about the column rather
+            /// than about the run sequence. Both are checked on every use,
+            /// so a cursor that was left on another slab, or a walk that
+            /// went back behind it, reads the slab from byte 0 and gets the
+            /// answer it always got.
+            ///
+            /// A cursor left behind by a walk that has since moved is still
+            /// right, just no longer useful: the column a cursor walks is
+            /// not written while it is open (the note on `col` above), so
+            /// the bytes a cursor names are the bytes it was read from, and
+            /// `runAtOrAfter`'s own rule says a walk from it answers the same
+            /// run a walk from byte 0 would.
+            run_seek: ?RunSeekCache = null,
+
             /// The run the last lookup found, and the slab it belongs to.
             const RunCache = struct {
                 slab: usize,
                 seg: slabmod.Segment(E.Wire),
+            };
+            /// A resume point, and the slab and bytes it belongs to.
+            const RunSeekCache = struct {
+                slab: usize,
+                data: []const u8,
+                cursor: RunCursor,
             };
 
             /// The next value, or null at the end of the window.
@@ -6711,10 +7142,8 @@ pub fn Column(comptime T: type, comptime E: type) type {
 
             /// Consumes `n` rows off the current slab's decoder and moves
             /// the cursor with them, keeping the running value in step.
-            /// This is the walk inside a slab that the port cannot skip:
-            /// the decoders here have no `nth`, so a seek pays for the
-            /// rows before its target inside its own slab, exactly as
-            /// `get` does (`column.rs:1500-1516`).
+            /// **O(runs skipped)** inside the slab, the walk `get` makes and
+            /// the shape upstream's `Iter::nth` has (`column.rs:410-424`).
             fn skip(self: *Iterator, n: usize) ParseError!void {
                 try self.skipRows(n);
                 self.at += n;
@@ -6738,12 +7167,23 @@ pub fn Column(comptime T: type, comptime E: type) type {
             /// `skip`, a run walk, a rewind — keeps the two together, and
             /// a caller that wants to position the cursor walks the
             /// decoder alone and leaves the position where it wants it.
+            ///
+            /// The rows are walked **a run at a time**, not one at a time:
+            /// `skipWire` is upstream's `advance_by` (`delta/decoder.rs:
+            /// 57-63`) — *"Advance past `n` items in O(runs), leaving the
+            /// running sum where item `n` starts"* — and a repeat, null or
+            /// boolean run is charged its whole declared count in O(1). A
+            /// literal run still costs one read per row in front of the
+            /// target, because its values are packed back to back and nothing
+            /// says where any one of them starts (`rle/decoder.rs:318-319`),
+            /// which is upstream's limit too.
+            ///
+            /// Every refusal is where it was: a skipped run is read by the
+            /// same header and value readers `next` uses, and a delta column's
+            /// fold refuses an absent row on a column that has none and a
+            /// realized value outside the column's domain.
             fn skipRows(self: *Iterator, n: usize) ParseError!void {
-                var i: usize = 0;
-                while (i < n) : (i += 1) {
-                    const w = (try self.dec.next()) orelse return error.InvalidValue;
-                    _ = try E.valueOfWire(w, &self.running);
-                }
+                if (!try skipWire(E, &self.dec, n, &self.running)) return error.InvalidValue;
             }
 
             /// Moves the cursor onto slab `si` and onto the row `row` —
@@ -6761,9 +7201,10 @@ pub fn Column(comptime T: type, comptime E: type) type {
             /// The invariant this establishes, and the reason the
             /// argument is not the offset: after this, `at == row` and
             /// the decoder stands on `row`. Upstream gets the decoder
-            /// there with one `decoder.nth` (`column.rs:438`); these
-            /// decoders have no `nth`, so the rows in front of the target
-            /// inside the slab are read, the walk `skip` already pays.
+            /// there with one `decoder.nth` (`column.rs:438`), and so does
+            /// this: the walk is `skipRows`, which is that skip over whole
+            /// runs, so a target deep inside a slab's long run costs O(runs)
+            /// and not O(rows).
             fn advanceToSlab(self: *Iterator, si: usize, row: usize) ParseError!bool {
                 if (si >= self.col.slabs.items.len) {
                     self.slab_idx = si;
@@ -6799,10 +7240,12 @@ pub fn Column(comptime T: type, comptime E: type) type {
             /// The value `n` rows ahead, or null past the end of the
             /// window (`Iter::nth`, `column.rs:411-439`).
             ///
-            /// A `n` that stays inside the current slab walks; one that
-            /// leaves it asks the index, which is O(log S). Either way the
-            /// rows between here and there are read, because the decoders
-            /// have no `nth` of their own.
+            /// **O(log S + runs skipped)**, which is the complexity upstream
+            /// states for this method (`column.rs:410-411`, and the two
+            /// `decoder.nth` calls at `column.rs:424` and `column.rs:438`).
+            /// A `n` that stays inside the current slab skips whole runs;
+            /// one that leaves it asks the index, which is O(log S), and
+            /// then skips whole runs in the slab it lands in.
             pub fn nth(self: *Iterator, n: usize) ParseError!?T {
                 if (n >= self.items_left) {
                     if (self.items_left > 0) _ = try self.nth(self.items_left - 1);
@@ -6906,7 +7349,7 @@ pub fn Column(comptime T: type, comptime E: type) type {
                     const ni = self.slab_idx + 1;
                     if (ni >= self.col.slabs.items.len) break;
                     const nslab = &self.col.slabs.items[ni];
-                    const head_run = (try E.runAtOrAfter(nslab.data, 0)) orelse break;
+                    const head_run = (try E.runAtOrAfter(nslab.data, 0, null)) orelse break;
                     if (compareValue(T, head_run.seg.first_value.?, value) != .eq) break;
                     _ = try self.stepToNextSlab();
                     const taken = (try self.takeRunInSlab(budget)) orelse break;
@@ -6952,18 +7395,43 @@ pub fn Column(comptime T: type, comptime E: type) type {
             /// from the codec otherwise. The two answers are the same one:
             /// `runAtOrAfter` returns the run holding `at`, which is one run
             /// for every `at` inside it (`slab.zig`'s `RunAt`).
+            ///
+            /// **The codec walk resumes where the last one stopped.** A miss
+            /// hands the walk the [`RunCursor`](RunCursor) of the last answer
+            /// on this very slab when the row asked for is at or behind it,
+            /// which is the condition under which `runAtOrAfter` answers the
+            /// same run either way — every run in front of the cursor ends
+            /// at or before `at`, so a walk from byte 0 steps over exactly
+            /// those and arrives with exactly that cursor. Anything else —
+            /// another slab, other bytes, a row behind the cursor — is
+            /// walked from byte 0, so a seek that goes backwards and one that
+            /// jumps to a distant slab answer as they always did.
             fn runSegAt(self: *Iterator, data: []const u8, at: usize) ParseError!?slabmod.Segment(E.Wire) {
                 if (self.run_cache) |c| {
                     if (c.slab == self.slab_idx and at >= c.seg.item_start and at < c.seg.item_end) {
                         return c.seg;
                     }
                 }
-                const ra = (try E.runAtOrAfter(data, at)) orelse {
+                const ra = (try E.runAtOrAfter(data, at, self.resumeAt(data, at))) orelse {
                     self.run_cache = null;
+                    self.run_seek = null;
                     return null;
                 };
                 self.run_cache = .{ .slab = self.slab_idx, .seg = ra.seg };
+                self.run_seek = .{ .slab = self.slab_idx, .data = data, .cursor = ra.cursor };
                 return ra.seg;
+            }
+
+            /// The resume point for a walk about `at` on `data`, or null for
+            /// a walk from byte 0. Null unless all three hold: the cursor is
+            /// on this slab, it was taken from these bytes, and `at` is at
+            /// or behind the row it stopped at.
+            fn resumeAt(self: *const Iterator, data: []const u8, at: usize) ?RunCursor {
+                const s = self.run_seek orelse return null;
+                if (s.slab != self.slab_idx) return null;
+                if (s.data.ptr != data.ptr or s.data.len != data.len) return null;
+                if (at < s.cursor.item) return null;
+                return s.cursor;
             }
 
             /// Steps onto the next slab, re-reading its decoder and
@@ -13320,17 +13788,46 @@ test "try_merge_range_replace_across_slabs" {
 // (it is the number of runs the column holds), so `seek_to_value_basic` picks
 // a wide one to reach the slab search and the rest keep upstream's handful.
 
-/// The rows `target` occupies in a **sorted** model, by linear scan. The
-/// answer for a value the column does not hold is the empty range at the row
-/// it would have been inserted at — the rule `column.rs:913-934` implements,
-/// and the one `partition_point` gives upstream.
+/// The rows `target` occupies in a **sorted** model: the model's own
+/// `partition_point` twice over. The answer for a value the column does not
+/// hold is the empty range at the row it would have been inserted at — the
+/// rule `column.rs:913-934` implements, and the one `partition_point` gives
+/// upstream.
+///
+/// Both answers are searched for rather than scanned to, and both were
+/// scans: a model of `n` rows cost `2n` steps where two searches cost
+/// `2 * log2(n)` of them, and the fuzzes around here ask the same question
+/// of a sorted model once per target and once per route.
 fn scopeInModel(model: []const u64, target: u64, range: RowRange) RowRange {
     const window = clampRange(range, model.len);
-    var start = window.start;
-    var end = window.start;
-    while (start < window.end and model[start] < target) : (start += 1) {}
-    while (end < window.end and model[end] <= target) : (end += 1) {}
-    return .{ .start = start, .end = end };
+    const rows = model[window.start..window.end];
+    return .{
+        .start = window.start + lowerBoundU64(rows, target),
+        .end = window.start + upperBoundU64(rows, target),
+    };
+}
+
+/// The first row of the **sorted** `rows` at or past `target` — where a row
+/// `target` would be inserted, `partition_point(|x| x < target)`.
+fn lowerBoundU64(rows: []const u64, target: u64) usize {
+    var lo: usize = 0;
+    var hi: usize = rows.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (rows[mid] < target) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+/// The first row of the **sorted** `rows` past `target`.
+fn upperBoundU64(rows: []const u64, target: u64) usize {
+    var lo: usize = 0;
+    var hi: usize = rows.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (rows[mid] <= target) lo = mid + 1 else hi = mid;
+    }
+    return lo;
 }
 
 /// The answer `Iterator::seek_to_value` gives for `target` when the cursor
@@ -13588,16 +14085,40 @@ fn lessNullable(_: void, a: ?u64, b: ?u64) bool {
     return nullableLess(u64, a, b);
 }
 
-/// The rows `target` occupies in a **sorted** nullable model, by linear
-/// scan: the same rule and the same insertion-point answer as
-/// [`scopeInModel`](scopeInModel), over `?U`.
+/// The rows `target` occupies in a **sorted** nullable model: the same rule
+/// and the same insertion-point answer as [`scopeInModel`](scopeInModel),
+/// over `?U` and reached by the same two searches.
 fn scopeInNullableModelOf(comptime U: type, model: []const ?U, target: ?U, range: RowRange) RowRange {
     const window = clampRange(range, model.len);
-    var start = window.start;
-    var end = window.start;
-    while (start < window.end and nullableLess(U, model[start], target)) : (start += 1) {}
-    while (end < window.end and !nullableLess(U, target, model[end])) : (end += 1) {}
-    return .{ .start = start, .end = end };
+    const rows = model[window.start..window.end];
+    return .{
+        .start = window.start + lowerBoundNullable(U, rows, target),
+        .end = window.start + upperBoundNullable(U, rows, target),
+    };
+}
+
+/// The first row of the **sorted** `rows` at or past `target`, in
+/// [`nullableLess`](nullableLess)'s order.
+fn lowerBoundNullable(comptime U: type, rows: []const ?U, target: ?U) usize {
+    var lo: usize = 0;
+    var hi: usize = rows.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (nullableLess(U, rows[mid], target)) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+/// The first row of the **sorted** `rows` past `target`, in
+/// [`nullableLess`](nullableLess)'s order.
+fn upperBoundNullable(comptime U: type, rows: []const ?U, target: ?U) usize {
+    var lo: usize = 0;
+    var hi: usize = rows.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (!nullableLess(U, target, rows[mid])) lo = mid + 1 else hi = mid;
+    }
+    return lo;
 }
 
 fn scopeInNullableModel(model: []const ?u64, target: ?u64, range: RowRange) RowRange {
@@ -13636,10 +14157,35 @@ fn lessByColumn(comptime T: type) fn (context: void, a: T, b: T) bool {
 /// The first row of `items` that is **past** `v`: `partition_point(|x| x <= v)`,
 /// the insertion point upstream's two fuzzes take for a value being inserted
 /// into a sorted column (`tests.rs:3854`, `:3983`).
+///
+/// **`items` is sorted, so this is a search and not a scan.** It is the same
+/// call upstream makes — `current.partition_point(|&v| v <= val)`
+/// (`tests.rs:3854`) — where it is a binary search over the rows already
+/// inserted; here it walked them. The walk was the same answer for the
+/// length of the list and cost was not: one insert per row into a growing
+/// list is `n(n+1)/2` comparisons a trial, and `fuzz_scope_and_seek_to_value`
+/// draws up to 250 rows over 500 trials.
+///
+/// The loop is the file's own spelling of the same thing —
+/// `slabOfRow` is `partition_point(|&p| p <= row)` over the slab-start
+/// prefixes — with `compareValue` in the comparison.
+///
+/// Sortedness is what makes the search the same answer as the scan and not
+/// merely a plausible one. `compareValue(T, items[i], v) != .gt` says
+/// `items[i] <= v`, and over a sorted list that holds for a prefix of the
+/// rows and fails for every row behind the first failure — so the row it
+/// first fails at is the row the scan stopped on, and neither returns
+/// anything else. The invariant that holds it there is the insert's own:
+/// every row goes in at `upperBound` of the rows already there, so `items`
+/// is sorted because that is what the caller did with every answer.
 fn upperBound(comptime T: type, items: []const T, v: T) usize {
-    var i: usize = 0;
-    while (i < items.len and compareValue(T, items[i], v) != .gt) : (i += 1) {}
-    return i;
+    var lo: usize = 0;
+    var hi: usize = items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (compareValue(T, items[mid], v) == .gt) hi = mid else lo = mid + 1;
+    }
+    return lo;
 }
 
 /// A sorted column of `values` on the run budget `budget`, built the way
@@ -14286,15 +14832,15 @@ test "nth_across_slabs" {
 //  A target inside one long repeat run. Ten thousand copies of one value are
 //  **one run**, so a target in the middle of it cannot be found by an index
 //  descent at all: the column is a single slab holding a single wire header,
-//  and the answer is whatever the decoder's remaining count says
-//  (`tests.rs:2226-2235`).
+//  and the answer is whatever the decoder's remaining count says.
 //
-//  Upstream's comment on this case reads "nth should skip in O(1)". **That is
-//  a cost claim, and this port makes the opposite trade** — its decoders have
-//  no `nth`, so the rows in front of the target inside its own slab are read
-//  one at a time (`column.zig:3648-3650`, `skipRows`), which the code says in
-//  as many words. What is asserted here is the **answer**, not how long the
-//  walk took, and the offsets that matter are the ones deep inside the run.
+//  Upstream's comment on this case reads "nth should skip in O(1)"
+//  (`tests.rs:2226-2235`). **The answer is the part under test**, but the
+//  port meets the cost claim too: the rows in front of the target are skipped
+//  a whole run at a time (`skipWire`, upstream's `advance_by`,
+//  `delta/decoder.rs:57-63`), so one run header is read rather than the ten
+//  thousand rows behind it. The offsets that matter are the ones deep inside
+//  the run.
 test "nth_within_repeat_run" {
     const gpa = testing.allocator;
     const rows: usize = 10_000;
@@ -14308,6 +14854,109 @@ test "nth_within_repeat_run" {
     defer gpa.free(segs);
     try testing.expectEqual(@as(usize, 1), segs.len);
     try expectNth(u64, Rle(u64), &col, model, &.{ 0, 1, 5000, 9999, 10_000 });
+}
+
+/// Every offset of `col`: `nth` and `get` against the walk they replace,
+/// through the **column's** read path rather than the decoder's. A fresh
+/// cursor per offset, so no answer is inherited from the one before.
+///
+/// The comparison is against the row **`i` successive `next` calls leave the
+/// cursor on**, which is the row `nth(i)` returns: `nth` consumes the `i` rows
+/// in front of its target and the target itself, so `i` `next` calls and one
+/// `nth(i)` stand on the same row and report the same position.
+fn expectNthEqualsWalk(comptime T: type, comptime E: type, col: *const Column(T, E)) !void {
+    const rows = col.len();
+    for (0..rows + 1) |i| {
+        var walked = try col.iterator();
+        var k: usize = 0;
+        while (k < i) : (k += 1) _ = try walked.next();
+        try testing.expectEqual(@as(usize, i), walked.pos());
+
+        var seeked = try col.iterator();
+        const by_nth = try seeked.nth(i);
+        const by_get = try col.get(i);
+
+        // One past the last row: both are the end of the data, and `nth`
+        // leaves the cursor there rather than throwing — the arm
+        // `nth_across_slabs` pins on the offsets just short of it.
+        if (i == rows) {
+            try testing.expect(by_nth == null);
+            try testing.expect(by_get == null);
+            try testing.expectEqual(@as(usize, rows), seeked.pos());
+            continue;
+        }
+
+        const want = (try walked.next()) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(usize, i + 1), walked.pos());
+        try testing.expectEqual(want, by_nth orelse return error.TestUnexpectedResult);
+        try testing.expectEqual(want, by_get orelse return error.TestUnexpectedResult);
+        // `nth` consumes the row it lands on, so it leaves the cursor one
+        // past it — which is what makes the two arms composable.
+        try testing.expectEqual(@as(usize, i + 1), seeked.pos());
+    }
+}
+
+//  **A run-level skip has to answer exactly what a row-at-a-time walk
+//  answers, and it answers through a different decoder call.** `skipRows` no
+//  longer reads the rows in front of its target: it steps over whole runs —
+//  `WireDecoder.nth` for a codec that stores its values, a `nextRunMax` walk
+//  with a folded running sum for a delta column ([`skipWire`](column.zig)).
+//  Neither of those reads the values it steps over, so the only thing that
+//  can catch a fold that folds the wrong number of times, or a skip that
+//  lands one row short, is a comparison against the walk it replaced.
+//
+//  Three columns, because the three are three different skips:
+//
+//  * `RleOption(u64)` is the plain `WireDecoder.nth` arm over a slab holding
+//    **all three run kinds** — a repeat, a null run and a literal run — so
+//    every target lands in or behind a different kind of run;
+//  * `DeltaOption` is the fold arm, and its wire is a run of *differences*:
+//    the repeat run is a run of zero deltas and the literal run is a run of
+//    distinct ones, so a skip that folded `d` once per run instead of `d`
+//    once per row lands on the wrong value and says so here;
+//  * `Bool` is the other `WireDecoder.nth` arm — a different decoder type
+//    with its own run header and its own idea of what a run costs.
+//
+//  Each column is one slab, so every offset is a within-slab skip: the cross-
+//  slab arm is `nth_across_slabs`'s, and it runs the same `skipRows`.
+test "nth_answers_what_the_walk_answers_on_a_mixed_slab" {
+    const gpa = testing.allocator;
+    {
+        const Opt = Column(?u64, RleOption(u64));
+        // An absent row, a repeat of three, two more absent rows, a literal
+        // run of three, a repeat of two, an absent row and a literal run of
+        // two: every run kind a slab of this codec can hold, in that order.
+        const values = [_]?u64{ null, 7, 7, 7, null, null, 1, 2, 3, 9, 9, null, 4, 5 };
+        var col = try Opt.initWithBudget(gpa, 64);
+        defer col.deinit();
+        try col.extend(gpa, &values);
+        try testing.expectEqual(@as(usize, 1), col.slabCount());
+        try expectNthEqualsWalk(?u64, RleOption(u64), &col);
+    }
+    {
+        const D = Column(?u32, DeltaOption);
+        // The differences are `_, +3, +3, 0, 0, _, +4, -4, _, +1, +1, 0, _,
+        // _`: distinct deltas to step over one at a time, zero deltas to
+        // charge a whole run in one fold, and the absent rows between them.
+        const values = [_]?u32{ null, 3, 6, 6, 6, null, 10, 6, null, 7, 8, 8, null, null };
+        var col = try D.initWithBudget(gpa, 64);
+        defer col.deinit();
+        try col.extend(gpa, &values);
+        try testing.expectEqual(@as(usize, 1), col.slabCount());
+        try expectNthEqualsWalk(?u32, DeltaOption, &col);
+    }
+    {
+        const B = Column(bool, Bool);
+        // A boolean run is a length with no payload, and these values are
+        // `true×2, false×3, true×3, false×1` — so a skip here is a handful of
+        // run headers and no value reads at all.
+        const values = [_]bool{ true, true, false, false, false, true, true, true, false };
+        var col = try B.initWithBudget(gpa, 64);
+        defer col.deinit();
+        try col.extend(gpa, &values);
+        try testing.expectEqual(@as(usize, 1), col.slabCount());
+        try expectNthEqualsWalk(bool, Bool, &col);
+    }
 }
 
 test "nth_from_iter_range" {

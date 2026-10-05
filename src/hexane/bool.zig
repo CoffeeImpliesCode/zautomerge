@@ -166,7 +166,9 @@ pub fn BoolWith(comptime P: type) type {
         ///
         /// Each run yields its value repeatedly; crossing into the next run
         /// reads one LEB128 count. The document walk pulls booleans one at a
-        /// time, so this never materialises the whole slab.
+        /// time, so this never materialises the whole slab. A walk that has
+        /// to *reach* a row without reading the ones before it uses
+        /// [`nth`](Decoder.nth), which steps over whole runs instead.
         pub const Decoder = struct {
             /// The slab being walked, borrowed: it must stay alive and unmodified
             /// for as long as this decoder is used, and its owner must outlive the
@@ -192,17 +194,56 @@ pub fn BoolWith(comptime P: type) type {
             /// The next value, null at the end of the slab. A malformed run
             /// count part-way through the slab is reported here, not swallowed.
             pub fn next(self: *Decoder) ParseError!?bool {
+                while (self.remaining == 0) {
+                    if (self.pos >= self.bytes.len) return null;
+                    try self.advanceRun();
+                }
+                self.remaining -= 1;
+                return self.value;
+            }
+
+            /// The value `n` values ahead, consuming the `n` in front of it,
+            /// or null at the end of the slab (`Iterator::nth`,
+            /// `bool.rs:579-595`).
+            ///
+            /// **O(runs skipped)** — each run is skipped in O(1) by
+            /// decrementing the count, so reaching the last of a slab of a
+            /// few long runs reads a few LEB128 counts rather than every
+            /// value before it. A `n` past the end answers null and leaves
+            /// the cursor spent, exactly as `n` calls to
+            /// [`next`](Decoder.next) would (`self.remaining -= n; return
+            /// self.next()`).
+            ///
+            /// Every refusal `next` raises is raised here at the same run:
+            /// this module has no unchecked count reader, so a truncated or
+            /// overlong varint and a count too wide for a `usize` are all
+            /// reported rather than swallowed the way upstream's
+            /// `advance_run` drops them (`bool.rs:552-558`).
+            pub fn nth(self: *Decoder, n: usize) ParseError!?bool {
+                var left = n;
                 while (true) {
                     if (self.remaining > 0) {
-                        self.remaining -= 1;
-                        return self.value;
+                        if (left < self.remaining) {
+                            self.remaining -= left;
+                            return self.next();
+                        }
+                        left -= self.remaining;
+                        self.remaining = 0;
                     }
                     if (self.pos >= self.bytes.len) return null;
-                    const run = try P.readUnsigned(self.bytes[self.pos..]);
-                    self.pos += run.len;
-                    self.value = !self.value;
-                    self.remaining = std.math.cast(usize, run.value) orelse return error.Overflow;
+                    try self.advanceRun();
                 }
+            }
+
+            /// Reads the run count at `pos`, flips the value it stands for
+            /// and loads how many items the run owes — the run step
+            /// [`next`](Decoder.next) and [`nth`](Decoder.nth) both take
+            /// (`advance_run`, `bool.rs:547-559`).
+            fn advanceRun(self: *Decoder) ParseError!void {
+                const run = try P.readUnsigned(self.bytes[self.pos..]);
+                self.pos += run.len;
+                self.value = !self.value;
+                self.remaining = std.math.cast(usize, run.value) orelse return error.Overflow;
             }
         };
     };
@@ -423,6 +464,133 @@ test "the decoder holds a run's value until the run ends" {
     for (0..2) |_| try std.testing.expectEqual(@as(?bool, false), try dec.next());
     for (0..5) |_| try std.testing.expectEqual(@as(?bool, true), try dec.next());
     try std.testing.expectEqual(@as(?bool, null), try dec.next());
+}
+
+/// Holds [`Bool.Decoder.nth`] against `next` over `values`, which is what
+/// `bytes` encodes: for every `i`, `nth(i)` is `values[i]`, the cursor is
+/// left standing on that value, and the walk from there is unchanged.
+///
+/// **Every `i`, not a sample.** A run-level skip that mis-lands inside a run
+/// still agrees at some offsets and fails at others, so a spot check cannot
+/// stand in for the sweep.
+fn checkNthParity(values: []const bool, bytes: []const u8) !void {
+    for (values, 0..) |want, i| {
+        var jumped = try Bool.Decoder.init(bytes);
+        try std.testing.expectEqual(@as(?bool, want), try jumped.nth(i));
+        // The cursor stands on `i`, so `next` answers `i + 1`.
+        for (values[i + 1 ..]) |rest| {
+            try std.testing.expectEqual(@as(?bool, rest), try jumped.next());
+        }
+        try std.testing.expectEqual(@as(?bool, null), try jumped.next());
+    }
+}
+
+test "nth reaches every value of a slab, over a run or not" {
+    const gpa = std.testing.allocator;
+    const cases = [_][]const bool{
+        // The empty slab: no runs at all, so `nth(0)` is already past the end.
+        &.{},
+        // The single-run slabs, which are where a skip that walks runs
+        // instead of subtracting counts has nothing else to fall back on.
+        &.{false},
+        &.{true},
+        &([_]bool{false} ** 7),
+        &([_]bool{true} ** 300),
+        // Two runs, and the same slab opened on `true` — so the zero-count
+        // pad is a run of its own that a skip steps over rather than serves.
+        &.{ false, true },
+        &.{ true, false },
+        &.{ false, false, false, true, true },
+        &.{ true, true, true, false, false, false },
+        // Every value its own run: the skip pays one varint read per run, and
+        // a count of one is where an off-by-one lands on the next run.
+        &.{ true, false, true, false, true, false },
+        &.{ false, true, false, true },
+        // A count that crosses the LEB128 width boundary, so a run's count is
+        // read from two bytes rather than one. Kept short on purpose: the
+        // parity sweep is quadratic, and a two-byte count does not need a
+        // 16k-value slab to be exercised.
+        &([_]bool{true} ** 200),
+    };
+    for (cases) |slice| {
+        const bytes = try encode(gpa, slice);
+        defer gpa.free(bytes);
+        try checkNthParity(slice, bytes);
+    }
+    // The empty slab answers `nth` the way it answers `next`.
+    {
+        var dec = try Bool.Decoder.init(&[_]u8{});
+        try std.testing.expectEqual(@as(?bool, null), try dec.nth(0));
+        try std.testing.expectEqual(@as(?bool, null), try dec.next());
+    }
+    // A wide slab over many runs, at every offset.
+    {
+        var wide: [400]bool = undefined;
+        pseudoRandom(&wide, 4242);
+        const bytes = try encode(gpa, &wide);
+        defer gpa.free(bytes);
+        try checkNthParity(&wide, bytes);
+    }
+    // Past the end, by one and by a wide margin, and spent either way.
+    {
+        const bytes = try encode(gpa, &.{ false, false, true });
+        defer gpa.free(bytes);
+        var past = try Bool.Decoder.init(bytes);
+        try std.testing.expectEqual(@as(?bool, null), try past.nth(3));
+        try std.testing.expectEqual(@as(?bool, null), try past.next());
+        var far = try Bool.Decoder.init(bytes);
+        try std.testing.expectEqual(@as(?bool, null), try far.nth(3 + 1000));
+        try std.testing.expectEqual(@as(?bool, null), try far.next());
+    }
+}
+
+test "nth raises the refusals next does" {
+    // A truncated varint behind a run the skip walks over: the same
+    // `error.UnexpectedEnd` a `next` past the run's last value raises. This
+    // is the refusal a count-only skip would swallow — upstream's
+    // `advance_run` sets `remaining = 0` and ends the iteration instead
+    // (`bool.rs:552-558`), where this module's reader reports.
+    {
+        var dec = try Bool.Decoder.init(&.{ 0x02, 0x80 });
+        try std.testing.expectEqual(@as(?bool, false), try dec.nth(1));
+        try std.testing.expectError(error.UnexpectedEnd, dec.nth(0));
+    }
+    // An overlong LEB128, refused as a malformed encoding rather than read
+    // as a count.
+    {
+        var dec = try Bool.Decoder.init(&([_]u8{0x80} ** 11));
+        try std.testing.expectError(error.InvalidLeb128, dec.nth(0));
+    }
+    // A count the tenth byte cannot hold: refused as an overflow, which is
+    // what `decodeAll` and `countValues` raise for the same bytes.
+    {
+        var dec = try Bool.Decoder.init(
+            &.{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02 },
+        );
+        try std.testing.expectError(error.Overflow, dec.nth(0));
+    }
+    // A slab that decodes cleanly decodes the same walked by `nth` alone,
+    // with the cursor landing on each row in turn.
+    //
+    // **Each offset is asked of its OWN cursor.** A `nth(n)` consumes `n + 1`
+    // rows from wherever the cursor stands, so a cursor carried round the loop
+    // lands iteration `i` on row `2i - 1`, not row `i` — the two agree only
+    // for `i <= 1`. This is the shape `expectNth` in column.zig already uses,
+    // for the same reason.
+    {
+        const gpa = std.testing.allocator;
+        var values: [300]bool = undefined;
+        pseudoRandom(&values, 7);
+        const bytes = try encode(gpa, values[0..]);
+        defer gpa.free(bytes);
+        for (values, 0..) |want, i| {
+            var fresh = try Bool.Decoder.init(bytes);
+            try std.testing.expectEqual(@as(?bool, want), try fresh.nth(i));
+        }
+        // And past the end, from a cursor that has never been moved.
+        var past = try Bool.Decoder.init(bytes);
+        try std.testing.expectEqual(@as(?bool, null), try past.nth(values.len));
+    }
 }
 
 test "truncated input is rejected" {

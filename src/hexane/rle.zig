@@ -419,6 +419,10 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool, comptime Utf8: bool, co
         /// null run is read once and then served from memory; a literal run
         /// re-reads the wire for every value, which is what makes the format
         /// forward-decodable.
+        ///
+        /// A cursor that has to *reach* a row rather than read up to it uses
+        /// [`nth`](Decoder.nth), which steps over whole runs in O(1) each
+        /// (`rle/decoder.rs:318-401`).
         pub const Decoder = struct {
             /// The slab being walked.
             ///
@@ -496,6 +500,140 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool, comptime Utf8: bool, co
                 }
             }
 
+            /// The value `n` values ahead, consuming the `n` in front of it,
+            /// or null once the slab is exhausted (`Iterator::nth`,
+            /// `rle/decoder.rs:318-401`).
+            ///
+            /// **O(runs skipped)**: a repeat and a null run are skipped in
+            /// O(1) each, and a literal run advances `pos` through its
+            /// payloads without decoding the values it passes over — which
+            /// is all upstream can do too, since a literal run's later values
+            /// are only reachable by walking the ones in front of them
+            /// (`rle/decoder.rs:318-319`). So a `n` that lands inside a
+            /// literal run pays for that run's payloads and nothing else.
+            ///
+            /// A `n` past the end answers null with the slab spent, and a
+            /// `n` of zero answers exactly what [`next`](Decoder.next) does.
+            ///
+            /// **No refusal is lost.** This module has no unchecked reader:
+            /// the run header is read through [`readRunHeader`] and the
+            /// payload through [`readValue`], so a truncated or overlong
+            /// varint (`error.UnexpectedEnd`, `error.InvalidLeb128`), a count
+            /// that is not representable (`error.Overflow`), a run that
+            /// claims more values than the bytes hold
+            /// (`error.LengthExceedsInput`), a count past `maxSlabLen`
+            /// (`error.TooLarge`), a null run in a non-nullable column
+            /// (`error.UnexpectedNull`) and an invalid UTF-8 byte payload
+            /// (`error.InvalidUtf8`) are all raised, at the run that carries
+            /// them, exactly where `n` calls to `next` raise them. Upstream's
+            /// `nth` gets that for free from a column validated at load; this
+            /// codec validates on every read (`rle.zig:622-629`), so `nth`
+            /// does too.
+            pub fn nth(self: *Decoder, n: usize) ParseError!?Element {
+                var left: u64 = @intCast(n);
+                // The run in hand goes first, since a cursor handed over part
+                // way through one has to finish it off before the next
+                // header means anything.
+                if (self.remaining > 0) {
+                    if (left < self.remaining) {
+                        try self.skipLiterals(left);
+                        self.remaining -= left;
+                        return self.next();
+                    }
+                    try self.skipLiterals(self.remaining);
+                    left -= self.remaining;
+                    self.remaining = 0;
+                }
+                // Then run headers, one per turn, until the target is inside
+                // one of them or the slab runs out. `enterRun` is the same
+                // step `next` takes, so a skipped run is read under the same
+                // rules and raises the same refusals.
+                while (true) {
+                    if (!try self.enterRun()) return null;
+                    // A run that yields nothing is stepped over, as in `next`.
+                    if (self.remaining == 0) continue;
+                    if (left < self.remaining) {
+                        try self.skipLiterals(left);
+                        self.remaining -= left;
+                        return self.next();
+                    }
+                    try self.skipLiterals(self.remaining);
+                    left -= self.remaining;
+                    self.remaining = 0;
+                }
+            }
+
+            /// One run of values taken whole: `count` copies of `value`
+            /// (`Run`, `lib.rs:194-197`).
+            pub const RunValue = struct {
+                /// How many values the run holds.
+                count: usize,
+                /// The value every one of them is.
+                value: Element,
+            };
+
+            /// The next run of values, at most `max` of them, or null once
+            /// the slab is exhausted (`RunDecoder::next_run_max`,
+            /// `rle/decoder.rs:503-537`).
+            ///
+            /// A repeat or a null run is charged its whole declared count in
+            /// O(1); a literal run comes back one value at a time, because
+            /// its values are packed back to back and its count says nothing
+            /// about where any one of them starts. That is upstream's shape
+            /// and the reason a run-level skip is O(runs) for the first two
+            /// and O(values) for the third.
+            ///
+            /// This is the walk a delta column's `nth` is built on: a repeat
+            /// run of equal *deltas* is folded into the running sum in one
+            /// step (`delta/decoder.rs:43-55`).
+            pub fn nextRunMax(self: *Decoder, max: usize) ParseError!?RunValue {
+                if (max == 0) return null;
+                const budget: u64 = @intCast(max);
+                while (true) {
+                    if (self.remaining > 0) {
+                        switch (self.run) {
+                            .repeat => |v| {
+                                const count = @min(self.remaining, budget);
+                                self.remaining -= count;
+                                return .{ .count = @intCast(count), .value = v };
+                            },
+                            .literal => {
+                                self.remaining -= 1;
+                                const cv = try readValue(self.data, self.pos);
+                                self.pos += cv.len;
+                                return .{ .count = 1, .value = cv.value };
+                            },
+                            .null_run => {
+                                const count = @min(self.remaining, budget);
+                                self.remaining -= count;
+                                return .{ .count = @intCast(count), .value = try nullRunElement() };
+                            },
+                            // `remaining > 0` means `enterRun` set a run that
+                            // owes at least one value, so this is unreachable.
+                            .idle => return error.InvalidValue,
+                        }
+                    }
+                    // A run that yields nothing is stepped over, as in `next`.
+                    if (!try self.enterRun()) return null;
+                }
+            }
+
+            /// Moves `pos` past `n` values of the run being served without
+            /// decoding them into values, reading each payload's length on
+            /// the way (`skip_literals`, `rle/decoder.rs:284-290`).
+            ///
+            /// A repeat, null or idle run costs nothing, so the loop is only
+            /// entered for a literal one — the only run whose values are not
+            /// implied by its header.
+            fn skipLiterals(self: *Decoder, n: u64) ParseError!void {
+                if (std.meta.activeTag(self.run) != .literal) return;
+                var i: u64 = 0;
+                while (i < n) : (i += 1) {
+                    const cv = try readValue(self.data, self.pos);
+                    self.pos += cv.len;
+                }
+            }
+
             /// Reads the run header at `pos` and loads the run it describes.
             /// Returns false at the end of the slab. Every field is assigned
             /// together, so a rejected header leaves the decoder as it was.
@@ -534,16 +672,30 @@ fn RleGeneric(comptime T: type, comptime Nullable: bool, comptime Utf8: bool, co
 
         // ── Element helpers ────────────────────────────────────────────────
 
-        /// The element a null run yields. Unreachable for a non-nullable
-        /// column, where `enterRun` and `canonical` reject the run first.
-        fn nullElement() ParseError!?Element {
+        /// The element a null run yields, with nothing wrapped around it.
+        ///
+        /// **This is the absent column value, not the end of the slab.**
+        /// The two are separate answers and every caller wants exactly one
+        /// of them: [`Decoder.next`] wraps this in its own optional because
+        /// its end-of-slab answer needs one, while a run read whole
+        /// ([`Decoder.nextRunMax`]) carries the value bare, so a null run is a
+        /// run that exists and holds absent values rather than a run that ran
+        /// out. Unreachable for a non-nullable column, where `enterRun` and
+        /// `canonical` reject the run first.
+        fn nullRunElement() ParseError!Element {
             if (Nullable) {
                 // A typed binding, so the `null` lands on the column value and
-                // not on the end-of-slab optional wrapped around it.
+                // not on an end-of-slab optional wrapped around it.
                 const absent: Element = null;
                 return absent;
             }
             return error.UnexpectedNull;
+        }
+
+        /// [`nullRunElement`] as an end-of-slab-shaped answer: the absent
+        /// value for a null run, and null at the end of the slab.
+        fn nullElement() ParseError!?Element {
+            return try nullRunElement();
         }
 
         /// Whether an element is an absent value. Always false for a
@@ -1001,9 +1153,162 @@ fn checkRoundTrip(comptime Codec: type, comptime T: type, values: []const T) !vo
     }
     try testing.expect((try dec.next()) == null);
 
+    try checkNthParity(Codec, values, buf);
+
     const appended = try expectWritten(Codec, T, values);
     defer gpa.free(appended);
     try testing.expectEqualSlices(u8, buf, appended);
+}
+
+/// Holds [`Decoder.nth`] against `next`: for every `i`, a fresh cursor's
+/// `nth(i)` is the same value `i` successive `next` calls return, the
+/// cursor is left on that value rather than one before it, and the rest of
+/// the slab still comes back in order from there.
+///
+/// **Every `i`, not a sample.** A run-level skip that lands a value early,
+/// late, or on the wrong run still passes a spot check at one offset; it
+/// fails somewhere in the sweep. `nth(values.len)` and a `nth` well past the
+/// end answer null, and a cursor past the end stays spent — the two answers
+/// `n` calls to `next` give.
+fn checkNthParity(comptime Codec: type, values: []const Codec.Element, bytes: []const u8) !void {
+    for (values, 0..) |want, i| {
+        var jumped = try Codec.Decoder.init(bytes);
+        const got = (try jumped.nth(i)).?;
+        try testing.expect(Codec.elementEql(want, got));
+        // The cursor stands on `i`, so `next` answers `i + 1`.
+        for (values[i + 1 ..]) |rest| {
+            const r = (try jumped.next()).?;
+            try testing.expect(Codec.elementEql(rest, r));
+        }
+        try testing.expect((try jumped.next()) == null);
+    }
+    // Past the end, by one and by a wide margin, and spent either way.
+    var past = try Codec.Decoder.init(bytes);
+    try testing.expect((try past.nth(values.len)) == null);
+    try testing.expect((try past.next()) == null);
+    var far = try Codec.Decoder.init(bytes);
+    try testing.expect((try far.nth(values.len + 1000)) == null);
+    try testing.expect((try far.next()) == null);
+}
+
+test "nth reaches every value of a slab with mixed runs" {
+    const gpa = testing.allocator;
+    // The shapes a skip has to get right, in one slab each: a single repeat
+    // run, a single literal run, and a slab that alternates all three run
+    // kinds — where a skip that mishandles `remaining` between runs lands on
+    // the wrong one and a skip that mishandles `pos` inside a literal run
+    // reads a length off the wrong payload.
+    {
+        // One repeat run of six. `checkRoundTrip` holds `nth` against `next`
+        // at every offset; the slab is pinned here so the shape is named.
+        const Codec = Rle(u64);
+        const values = [_]u64{ 9, 9, 9, 9, 9, 9 };
+        const bytes = try expectWritten(Codec, u64, &values);
+        defer gpa.free(bytes);
+        try testing.expectEqualSlices(u8, &.{ 0x06, 0x09 }, bytes);
+        try checkNthParity(Codec, &values, bytes);
+    }
+    {
+        // One literal run of six distinct values: every value's byte offset
+        // is only reachable by walking the ones in front of it, which is the
+        // case upstream's `skip_literals` exists for
+        // (`rle/decoder.rs:284-290`).
+        const Codec = Rle(u64);
+        const values = [_]u64{ 1, 2, 3, 5, 8, 13 };
+        const bytes = try expectWritten(Codec, u64, &values);
+        defer gpa.free(bytes);
+        try checkNthParity(Codec, &values, bytes);
+    }
+    {
+        // Repeat, null, literal, null, repeat: the nullable codec, and the
+        // only shape in which a null run is charged a whole count in O(1)
+        // while its neighbours are not.
+        const Codec = RleOption(u64);
+        const values = [_]?u64{ 7, 7, null, null, 4, 9, null, 2, 2, 2 };
+        const bytes = try expectWritten(Codec, ?u64, &values);
+        defer gpa.free(bytes);
+        try Codec.canonical(bytes);
+        try checkNthParity(Codec, &values, bytes);
+
+        // The same walk through `decodeAll`, so the skip and the full decode
+        // cannot disagree about what the slab holds.
+        const back = try Codec.decodeAll(bytes, gpa);
+        defer gpa.free(back);
+        try expectEqualElements(Codec, &values, back);
+    }
+    {
+        // A byte payload in a literal run: its length prefix is what a skip
+        // has to read to find the value behind it, and the values differ in
+        // length so a skip that assumed one byte each walks off the run.
+        const Codec = Rle([]const u8);
+        const values = [_][]const u8{ "alpha", "be", "gamma", "d", "epsilon" };
+        const bytes = try expectWritten(Codec, []const u8, &values);
+        defer gpa.free(bytes);
+        try checkNthParity(Codec, &values, bytes);
+    }
+    // The empty slab: no runs at all, so `nth(0)` is already past the end.
+    {
+        const Codec = RleOption(u64);
+        var dec = try Codec.Decoder.init(&[_]u8{});
+        try testing.expect((try dec.nth(0)) == null);
+        try testing.expect((try dec.next()) == null);
+    }
+}
+
+test "nth raises the same refusals next does" {
+    const gpa = testing.allocator;
+    const U = Rle(u64);
+    const O = RleOption(u64);
+
+    // A truncated header behind a well-formed run. `nth(1)` answers the last
+    // value of the run in front of it, and the next skip walks into the
+    // truncated header and reports it — which is what `next` does there.
+    {
+        var dec = try U.Decoder.init(&[_]u8{ 0x02, 0x01, 0x80 });
+        try testing.expectEqual(@as(?u64, 1), try dec.nth(1));
+        try testing.expectError(error.UnexpectedEnd, dec.nth(0));
+    }
+    // A null run in a non-nullable column, behind a literal run: the refusal
+    // is the one `next` raises when it reaches that run.
+    {
+        var dec = try U.Decoder.init(&[_]u8{ 0x7f, 0x01, 0x00, 0x01 });
+        try testing.expectError(error.UnexpectedNull, dec.nth(1));
+    }
+    // An overlong varint in the header the skip lands on, behind a
+    // well-formed run so the opening read is not the one that refuses.
+    {
+        const overlong = [_]u8{ 0x02, 0x01 } ++ [_]u8{0x80} ** 11;
+        var dec = try O.Decoder.init(&overlong);
+        try testing.expectError(error.InvalidLeb128, dec.nth(2));
+    }
+    // A count the slab cannot back: `readRunHeader` refuses it before any
+    // value is read, so the skip refuses it where `next` would.
+    {
+        var dec = try U.Decoder.init(&[_]u8{ 0x02, 0x01, 0x7d, 0x01 });
+        try testing.expectError(error.LengthExceedsInput, dec.nth(2));
+    }
+    // An invalid UTF-8 byte payload **inside a literal run the skip walks
+    // over**. This is the refusal a length-only skip would lose: upstream can
+    // afford it because the column was validated at load, and this codec
+    // validates on every read (`rle.zig:622-629`), so `nth` validates too.
+    {
+        const bad = [_][]const u8{ "ok", &[_]u8{ 0xff, 0xfe } };
+        const bytes = try expectWritten(RleUtf8(false), []const u8, &bad);
+        defer gpa.free(bytes);
+        var dec = try RleUtf8(false).Decoder.init(bytes);
+        try testing.expectEqualStrings("ok", (try dec.nth(0)).?);
+        try testing.expectError(error.InvalidUtf8, dec.nth(0));
+        // And a slab cut short before the bad value is answered from what is
+        // there, since nothing past the target is read. The cut has to keep
+        // the *first* payload: `readRunHeader` refuses a literal run whose
+        // count the remaining bytes cannot back (`rle.zig:835`), and `init`
+        // is where it reads the opening header, so a slab of nothing but that
+        // header is `error.LengthExceedsInput` at the boundary rather than an
+        // answer. Upstream never meets this because its `nth` is written
+        // against a column validated at load (`rle/decoder.rs:347`).
+        var early = try RleUtf8(false).Decoder.init(bytes[0..4]);
+        try testing.expectEqualStrings("ok", (try early.nth(0)).?);
+    }
 }
 
 /// Two value sequences hold the same values.

@@ -121,17 +121,16 @@ CROSS_BUILD_TIMEOUT=3600
 # `zig build test` runs every root through `test/verification_runner.zig`,
 # which speaks the build runner's own protocol unchanged — the counts in
 # `Build Summary: N/M tests passed` are the same ones this matrix has always
-# read — and additionally appends one line per case to a record file under
-# **this target's own** cache directory: `n/total <ns> pass|skip|fail <name>`
-# when a case finishes, and `n/total begin - <name>` before it starts. Three
-# things follow for reading a row below.
+# read — and additionally appends one line per case to a record file under the
+# build's own cache directory: `n/total <ns> pass|skip|fail <name>` when a case
+# finishes, and `n/total begin - <name>` before it starts. Two things follow for
+# reading a row below.
 #
 #   * A root that finishes prints its own summary into the log: how many of
-#     its cases ran, the total seconds, the ten slowest cases by name, and
-#     the last five lines of the record. A forty-minute native root is
-#     therefore attributable from the run that already happened, instead of
-#     from a re-run with a filter — which is the narrowing this matrix does
-#     not do.
+#     its cases ran, the total seconds, the ten slowest cases by name, and the
+#     last five lines of the record. A forty-minute native root is therefore
+#     attributable from the run that already happened, instead of from a
+#     re-run with a filter — which is the narrowing this matrix does not do.
 #   * A root that is killed is still readable. `--test-timeout 900s` is a
 #     **per-case** budget, so a case that outruns it is named in the build
 #     runner's error together with how long it had been running, and the last
@@ -139,9 +138,22 @@ CROSS_BUILD_TIMEOUT=3600
 #     CROSS_BUILD_TIMEOUT is a whole-phase deadline and kills the build
 #     itself, so nothing is printed after it; the record file on disk is what
 #     is left, and its last line is the case in flight.
-#   * cross-test gives every target a fresh `--cache-dir`, so one target's
-#     records are never another target's, and `tail -f` on the record of a
-#     root that is still going is the live view of it.
+#
+# **The record is per RUN, not per target.** cross-test mints one fresh
+# `--cache-dir` for the whole run and passes that same directory to every
+# target's phase, so a record file is truncated by the next target that runs
+# the same root. Measured on this checkout: `build-x86_64-linux.log` and
+# `build-aarch64-linux.log` of one run carry the same `--cache-dir`, as did
+# all three logs of the run before it. Two consequences, both benign and both
+# worth knowing before reading the files:
+#
+#   * `tail -f` on a record is the live view of that root **for the target
+#     currently in flight**, and stops being that root's history the moment
+#     another target starts the same root.
+#   * The durable, non-overwriting evidence for a target is the footer its own
+#     `print <label> case timings` step printed into **its own build log**,
+#     which is written once and never rewritten. Read the logs, not the cache,
+#     when the question is what a finished target did.
 #
 # None of that makes a timeout a pass. It is still a budget finding to read
 # and not to reclassify: nothing here is raised to turn one green, and
