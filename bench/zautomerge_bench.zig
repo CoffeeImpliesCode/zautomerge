@@ -749,7 +749,7 @@ fn indexedDelta(ctx: Ctx) !Result {
         while (target < 500) : (target += 97) {
             var find = try col.findByValue(@intCast(target));
             defer find.deinit();
-            while (find.next()) |hit| {
+            while (try find.next()) |hit| {
                 const slab = col.slabAt(hit.slab) orelse return error.InvalidValue;
                 var it = try col.iterRange(.{
                     .start = hit.items_before,
