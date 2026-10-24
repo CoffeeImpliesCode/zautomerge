@@ -458,8 +458,8 @@ const Table = struct {
         return self.items.items[id];
     }
 
-    fn intern(ctx: *const anyopaque, text: []const u8, gpa: Allocator) ParseError!u32 {
-        const self: *Table = @ptrCast(@alignCast(@constCast(ctx)));
+    fn intern(ctx: *anyopaque, text: []const u8, gpa: Allocator) ParseError!u32 {
+        const self: *Table = @ptrCast(@alignCast(ctx));
         for (self.items.items, 0..) |item, i| {
             if (std.mem.eql(u8, item, text)) return std.math.cast(u32, i) orelse error.Overflow;
         }

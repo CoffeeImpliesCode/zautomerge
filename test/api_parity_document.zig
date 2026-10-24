@@ -469,7 +469,7 @@ fn loadFields(value: Value, names: []const []const u8) !void {
     for (names) |name| _ = try common.field(value, name);
 }
 
-fn loadTree(gpa: Allocator, expected: Value, doc: *const am.doc.Document) !void {
+fn loadTree(gpa: Allocator, expected: Value, doc: *am.doc.Document) !void {
     const json = try am.autoserde.AutoSerde(am.doc.Document).from(doc).toJson(gpa);
     defer gpa.free(json);
     try common.expectJsonText(gpa, expected, json);

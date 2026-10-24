@@ -137,16 +137,11 @@
 //! search (`:1476-1488`), and [`ChangeGraph.clockAt`](change_graph.zig) sizes
 //! a [`Clock`] from `numActors()` and reads the graph (`:464-474`).
 //!
-//! # `*const Document`, and the one place the const is dropped
+//! # Mutable reader borrows
 //!
-//! `API.md` §Read states the surface as `doc: *const Document` "so a read never
-//! needs a mutable borrow, which is what lets iterators be plain values". That
-//! holds here: nothing in this file writes to a document. But a walk over the
-//! op set moves that op set's **shared** successor buffer and top-walk scratch
-//! ([op_set.zig:638-640](../opset/op_set.zig)'s module doc, third and fourth
-//! sections), so `OpSet.topOps` and every `iterRange` take `*Set` rather than
-//! `*const Set`. [`mutableOps`] is where the const is dropped, and it says so;
-//! every use of it is one of those two.
+//! Historical reads retain clocks on the document. Iterator walks also update
+//! shared op-set scratch. These operations require a mutable document borrow;
+//! metadata-only queries keep their const receiver.
 
 const std = @import("std");
 const err = @import("error.zig");
@@ -477,20 +472,9 @@ pub const KeyRange = struct {
 
 /// The document's op set as a **mutable** pointer, for a walk that borrows it.
 ///
-/// **The `const` is dropped and nothing writes through it.** A walk over an op
-/// set moves that op set's shared successor buffer
-/// ([op_set.zig:40-49](../opset/op_set.zig)'s fourth section) and, for a
-/// winner walk, its top scratch as well, so `OpSet.topOps` and `OpSet.iterRange`
-/// take `*Set`. This is the only place in the crate that casts the const away
-/// for a read, and every caller of it is one of those two methods.
-///
-/// It is sound because **a read does not mutate a document** — every method
-/// below either reads the columns or hands back a walk — and because the
-/// walks that take this pointer borrow it rather than keep it. It is a
-/// `*const Document` in the signature because
-/// [API.md](../API.md) §Read says so, not because the op set is const-safe.
-fn mutableOps(doc: *const Document) *Set {
-    return @constCast(&doc.ops);
+/// Borrows the op set's mutable iterator scratch.
+fn mutableOps(doc: *Document) *Set {
+    return &doc.ops;
 }
 
 /// `obj` with its actor index resolved against the document's actor table, or
@@ -551,8 +535,8 @@ fn liveObjOrSelf(doc: *const Document, obj: ExId) ExId {
 ///
 /// Explicit historical clocks use a separate document-owned pool, so selecting
 /// another head set does not invalidate this isolation's clock.
-fn readScope(doc: *const Document) Error!?Clock {
-    const scope = try mutableDoc(doc).readScope(doc.gpa) orelse return null;
+fn readScope(doc: *Document) Error!?Clock {
+    const scope = try doc.readScope(doc.gpa) orelse return null;
     return scope.*;
 }
 
@@ -560,33 +544,15 @@ fn readScope(doc: *const Document) Error!?Clock {
 /// (`automerge.rs:1236-1247`); other heads borrow retained historical slots.
 /// Transaction wrappers instead call `historicalScope` for every explicit head
 /// set, excluding pending operations even when graph heads match.
-fn atScope(doc: *const Document, heads: []const ChangeHash) ReadError!?Clock {
+fn atScope(doc: *Document, heads: []const ChangeHash) ReadError!?Clock {
     if (doc.graph.headsAreCurrent(heads)) return null;
     return try historicalScope(doc, heads);
 }
 
 /// Retains a historical clock until document mutation or destruction.
 /// Returned copies borrow heap slots, so selecting other heads preserves walks.
-pub fn historicalScope(doc: *const Document, heads: []const ChangeHash) ReadError!Clock {
-    const owner = mutableDoc(doc);
-    return (try owner.clockAtScope(doc.gpa, heads)).*;
-}
-
-/// The document as a **mutable** pointer, for a [`Document`](doc.zig) method
-/// the port gives one.
-///
-/// **The `const` is dropped and nothing writes through it.** Three
-/// `Document` methods take `*Document` where upstream takes `&self`:
-/// [`getChangeByHash`](doc.zig), [`getChanges`](doc.zig) and the
-/// [`collectByHashes`](doc.zig) behind it. Upstream's reason is interior
-/// mutability. The Zig reader exposes its mutable cache explicitly.
-/// None of them writes a row,
-/// an object or a head — the collector re-encodes a change out of the op set
-/// and hands back owned bytes, which is why [`getChangeByHash`]'s contract is
-/// that the *caller* owns the result rather than that the caller freed
-/// something the document had been holding.
-fn mutableDoc(doc: *const Document) *Document {
-    return @constCast(doc);
+pub fn historicalScope(doc: *Document, heads: []const ChangeHash) ReadError!Clock {
+    return (try doc.clockAtScope(doc.gpa, heads)).*;
 }
 
 /// The value one operation carries, and the id of that operation
@@ -706,7 +672,7 @@ pub fn get(doc: anytype, obj: ExId, prop: Prop) ReadError!?DocItem {
 /// allocation, and `NotAnObject` / `InvalidOp` / `null` for the three cases its
 /// table names.
 pub fn getAtScope(
-    doc: *const Document,
+    doc: *Document,
     obj: ExId,
     prop: Prop,
     scope: ?Clock,
@@ -854,7 +820,7 @@ pub fn getAllAt(
 /// `Automerge::get_all_for(obj, prop, clock)`
 /// ([`automerge.rs`:1891-1927](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
 pub fn getAllAtScope(
-    doc: *const Document,
+    doc: *Document,
     obj: ExId,
     prop: Prop,
     scope: ?Clock,
@@ -1422,7 +1388,7 @@ pub fn getMarks(
 /// Returns caller-owned mark runs intersecting a half-open window.
 /// Mark payloads borrow the document; the supplied clock remains caller-owned.
 pub fn getMarksAtScope(
-    doc: *const Document,
+    doc: *Document,
     obj: ExId,
     from: usize,
     max: usize,
@@ -1515,7 +1481,7 @@ pub fn markSetAtIndex(
 /// An id that names no object is `error.NotAnObject`, from [`liveObj`], which
 /// is upstream's `exid_to_obj` (`:1935`).
 pub fn markSetAtScope(
-    doc: *const Document,
+    doc: *Document,
     obj: ExId,
     index: usize,
     scope: ?Clock,
@@ -1593,7 +1559,7 @@ pub fn parentsAt(doc: anytype, obj: ExId, heads: []const ChangeHash) ReadError!P
 /// [`parents`] and [`parentsAt`] under the clock the caller supplies —
 /// upstream's `Automerge::parents_for(obj, clock)`
 /// ([`automerge.rs`:1652-1660](../../github-automerge-automerge/rust/automerge/src/automerge.rs)).
-pub fn parentsAtScope(doc: *const Document, obj: ExId, scope: ?Clock) ReadError!Parents {
+pub fn parentsAtScope(doc: *Document, obj: ExId, scope: ?Clock) ReadError!Parents {
     // `get_obj_meta` (`automerge.rs:760-768`) is the check; upstream spells it
     // `self.exid_to_obj(obj)?` (`:1657`).
     // An id the actor table can no longer name is the same refusal as one that
@@ -1703,7 +1669,7 @@ pub fn iterAt(
 /// here outlives the call — which is the answer to "does this leave a pointer
 /// into a returned stack frame": it does not, and the same two lines
 /// [`PatchDoc.handle`](doc.zig) spells for the diff walk are the shape.
-fn handle(doc: *const Document) iterdoc.Doc(ChangeOp) {
+fn handle(doc: *Document) iterdoc.Doc(ChangeOp) {
     return .init(mutableOps(doc), doc.textEncoding());
 }
 
@@ -1883,7 +1849,7 @@ pub fn getCursorPosition(
 /// under the graph's heads". **Collapsing the two is what let a cursor resolve
 /// at the present when a C caller asked for the heads it was minted at.**
 pub fn getCursorPositionFor(
-    doc: *const Document,
+    doc: *Document,
     obj: ExId,
     cursor: Cursor,
     scope: ?Clock,
@@ -1989,7 +1955,7 @@ pub fn getMissingDeps(
 pub fn getChangeByHash(doc: anytype, hash: ChangeHash, gpa: Allocator) ChangeError!?docmod.Built {
     if (@typeInfo(@TypeOf(doc)).pointer.child != Document)
         return ReadDoc(@TypeOf(doc)).getChangeByHash(doc, hash, gpa);
-    return mutableDoc(doc).getChangeByHash(gpa, hash);
+    return doc.getChangeByHash(gpa, hash);
 }
 
 /// What the document holds
@@ -2162,44 +2128,44 @@ pub fn listRangeAt(
 }
 
 /// Length in the document's encoding under the supplied borrowed clock.
-pub fn lengthAtScope(doc: *const Document, obj: ExId, scope: ?Clock) ReadError!usize {
+pub fn lengthAtScope(doc: *Document, obj: ExId, scope: ?Clock) ReadError!usize {
     const live = liveObjOrSelf(doc, obj);
     if (doc.ops.objectType(live) == null) return 0;
     return mutableOps(doc).seqLength(live, doc.textEncoding(), scope);
 }
 
 /// Returns caller-owned UTF-8 under the supplied borrowed clock.
-pub fn textAtScope(doc: *const Document, obj: ExId, scope: ?Clock, gpa: Allocator) ReadError![]u8 {
+pub fn textAtScope(doc: *Document, obj: ExId, scope: ?Clock, gpa: Allocator) ReadError![]u8 {
     const live = try liveObj(doc, obj);
     _ = try doc.objectType(live);
     return mutableOps(doc).text(gpa, live, scope);
 }
 
 /// Keys borrowing the document and supplied clock until mutation.
-pub fn keysAtScope(doc: *const Document, obj: ExId, scope: ?Clock) ReadError!Keys {
+pub fn keysAtScope(doc: *Document, obj: ExId, scope: ?Clock) ReadError!Keys {
     return Keys.ofObj(mutableOps(doc), liveObjOrSelf(doc, obj), scope);
 }
 
 /// Fills the caller's term; both outputs borrow the document and clock.
-pub fn valuesAtScope(doc: *const Document, obj: ExId, term: *ValueTerm, scope: ?Clock) ReadError!Values {
+pub fn valuesAtScope(doc: *Document, obj: ExId, term: *ValueTerm, scope: ?Clock) ReadError!Values {
     term.* = try ValueTerm.ofObj(mutableOps(doc), liveObjOrSelf(doc, obj), scope);
     return Values.init(mutableOps(doc), term, scope);
 }
 
 /// Builds a span fold borrowing the document and clock; spans own their output.
-pub fn spansAtScope(doc: *const Document, obj: ExId, scope: ?Clock, gpa: Allocator) ReadError!Spans {
+pub fn spansAtScope(doc: *Document, obj: ExId, scope: ?Clock, gpa: Allocator) ReadError!Spans {
     const live = try liveObj(doc, obj);
     _ = try doc.objectType(live);
     return Spans.init(gpa, mutableOps(doc), try doc.ops.spans(live), scope, doc.textEncoding());
 }
 
 /// Returns a caller-owned run slice whose mark payloads borrow the document.
-pub fn marksAtScope(doc: *const Document, obj: ExId, scope: ?Clock, gpa: Allocator) ReadError![]Mark {
+pub fn marksAtScope(doc: *Document, obj: ExId, scope: ?Clock, gpa: Allocator) ReadError![]Mark {
     return mutableOps(doc).calculateMarksAt(gpa, try liveObj(doc, obj), scope);
 }
 
 /// Recursive walk borrowing the document and clock until mutation.
-pub fn iterAtScope(doc: *const Document, obj: ExId, scope: ?Clock, gpa: Allocator) DiffError!DocIter {
+pub fn iterAtScope(doc: *Document, obj: ExId, scope: ?Clock, gpa: Allocator) DiffError!DocIter {
     const live = if (obj.eql(.root)) obj else liveObjOrSelf(doc, obj);
     const typ = doc.ops.objectType(live) orelse .map;
     const view = handle(doc);
@@ -2208,7 +2174,7 @@ pub fn iterAtScope(doc: *const Document, obj: ExId, scope: ?Clock, gpa: Allocato
 
 /// Returns an owned stable cursor under the supplied borrowed clock.
 pub fn getCursorMovingAtScope(
-    doc: *const Document,
+    doc: *Document,
     obj: ExId,
     pos: CursorPosition,
     bias: Bias,
@@ -2219,7 +2185,7 @@ pub fn getCursorMovingAtScope(
 }
 
 /// Map walk borrowing the document and clock until mutation.
-pub fn mapRangeAtScope(doc: *const Document, obj: ExId, range: KeyRange, scope: ?Clock) ReadError!MapRange {
+pub fn mapRangeAtScope(doc: *Document, obj: ExId, range: KeyRange, scope: ?Clock) ReadError!MapRange {
     const live = liveObjOrSelf(doc, obj);
     return MapRange.init(
         mutableOps(doc),
@@ -2232,7 +2198,7 @@ pub fn mapRangeAtScope(doc: *const Document, obj: ExId, range: KeyRange, scope: 
 }
 
 /// Sequence walk borrowing the document and clock until mutation.
-pub fn listRangeAtScope(doc: *const Document, obj: ExId, range: IndexRange, scope: ?Clock) ReadError!ListRange {
+pub fn listRangeAtScope(doc: *Document, obj: ExId, range: IndexRange, scope: ?Clock) ReadError!ListRange {
     const live = liveObjOrSelf(doc, obj);
     return ListRange.init(
         mutableOps(doc),
@@ -2254,7 +2220,7 @@ pub fn ReadDoc(comptime R: type) type {
     };
     const Ptr = switch (@typeInfo(R)) {
         .pointer => R,
-        else => if (R == Document) *const R else *R,
+        else => *R,
     };
     return struct {
         pub const ReaderPtr = Ptr;
@@ -2265,22 +2231,22 @@ pub fn ReadDoc(comptime R: type) type {
 
         pub fn keys(reader: Ptr, obj: ExId) ReadError!Keys {
             if (Base == Document) return @import("read.zig").keys(reader, obj);
-            return owner(reader).keys(obj);
+            return reader.keys(obj);
         }
 
         pub fn get(reader: Ptr, obj: ExId, prop: Prop) ReadError!?DocItem {
             if (Base == Document) return @import("read.zig").get(reader, obj, prop);
-            return owner(reader).get(obj, prop);
+            return reader.get(obj, prop);
         }
 
         pub fn length(reader: Ptr, obj: ExId) ReadError!usize {
             if (Base == Document) return @import("read.zig").length(reader, obj);
-            return owner(reader).length(obj);
+            return reader.length(obj);
         }
 
         pub fn text(reader: Ptr, obj: ExId, gpa: Allocator) ReadError![]u8 {
             if (Base == Document) return @import("read.zig").text(reader, obj, gpa);
-            return owner(reader).text(obj, gpa);
+            return reader.text(obj, gpa);
         }
 
         fn raw(reader: Ptr) *const Document {
@@ -2289,137 +2255,139 @@ pub fn ReadDoc(comptime R: type) type {
             return &reader.doc;
         }
 
-        fn owner(reader: Ptr) *Base {
-            return @constCast(reader);
+        fn mutableRaw(reader: Ptr) *Document {
+            if (Base == Document) return reader;
+            if (@typeInfo(@TypeOf(reader.doc)) == .pointer) return reader.doc;
+            return &reader.doc;
         }
 
         pub fn getAt(reader: Ptr, obj: ExId, prop: Prop, heads: []const ChangeHash) ReadError!?DocItem {
             if (Base == Document) return @import("read.zig").getAt(reader, obj, prop, heads);
-            return owner(reader).getAt(obj, prop, heads);
+            return reader.getAt(obj, prop, heads);
         }
 
         pub fn getAll(reader: Ptr, obj: ExId, prop: Prop, gpa: Allocator) ReadError![]DocItem {
             if (Base == Document) return @import("read.zig").getAll(reader, obj, prop, gpa);
-            return owner(reader).getAll(obj, prop, gpa);
+            return reader.getAll(obj, prop, gpa);
         }
 
         pub fn getAllAt(reader: Ptr, obj: ExId, prop: Prop, heads: []const ChangeHash, gpa: Allocator) ReadError![]DocItem {
             if (Base == Document) return @import("read.zig").getAllAt(reader, obj, prop, heads, gpa);
-            return owner(reader).getAllAt(obj, prop, heads, gpa);
+            return reader.getAllAt(obj, prop, heads, gpa);
         }
 
         pub fn keysAt(reader: Ptr, obj: ExId, heads: []const ChangeHash) ReadError!Keys {
             if (Base == Document) return @import("read.zig").keysAt(reader, obj, heads);
-            return owner(reader).keysAt(obj, heads);
+            return reader.keysAt(obj, heads);
         }
 
         pub fn values(reader: Ptr, obj: ExId, term: *ValueTerm) ReadError!Values {
             if (Base == Document) return @import("read.zig").values(reader, obj, term);
-            return owner(reader).values(obj, term);
+            return reader.values(obj, term);
         }
 
         pub fn valuesAt(reader: Ptr, obj: ExId, heads: []const ChangeHash, term: *ValueTerm) ReadError!Values {
             if (Base == Document) return @import("read.zig").valuesAt(reader, obj, heads, term);
-            return owner(reader).valuesAt(obj, heads, term);
+            return reader.valuesAt(obj, heads, term);
         }
 
         pub fn lengthAt(reader: Ptr, obj: ExId, heads: []const ChangeHash) ReadError!usize {
             if (Base == Document) return @import("read.zig").lengthAt(reader, obj, heads);
-            return owner(reader).lengthAt(obj, heads);
+            return reader.lengthAt(obj, heads);
         }
 
         pub fn textAt(reader: Ptr, obj: ExId, heads: []const ChangeHash, gpa: Allocator) ReadError![]u8 {
             if (Base == Document) return @import("read.zig").textAt(reader, obj, heads, gpa);
-            return owner(reader).textAt(obj, heads, gpa);
+            return reader.textAt(obj, heads, gpa);
         }
 
         pub fn spans(reader: Ptr, obj: ExId, gpa: Allocator) ReadError!Spans {
             if (Base == Document) return @import("read.zig").spans(reader, obj, gpa);
-            return owner(reader).spans(obj, gpa);
+            return reader.spans(obj, gpa);
         }
 
         pub fn spansAt(reader: Ptr, obj: ExId, heads: []const ChangeHash, gpa: Allocator) ReadError!Spans {
             if (Base == Document) return @import("read.zig").spansAt(reader, obj, heads, gpa);
-            return owner(reader).spansAt(obj, heads, gpa);
+            return reader.spansAt(obj, heads, gpa);
         }
 
         pub fn marks(reader: Ptr, obj: ExId, gpa: Allocator) ReadError![]Mark {
             if (Base == Document) return @import("read.zig").marks(reader, obj, gpa);
-            return owner(reader).marks(obj, gpa);
+            return reader.marks(obj, gpa);
         }
 
         pub fn marksAt(reader: Ptr, obj: ExId, heads: []const ChangeHash, gpa: Allocator) ReadError![]Mark {
             if (Base == Document) return @import("read.zig").marksAt(reader, obj, heads, gpa);
-            return owner(reader).marksAt(obj, heads, gpa);
+            return reader.marksAt(obj, heads, gpa);
         }
 
         pub fn getMarks(reader: Ptr, obj: ExId, from: usize, max: usize, gpa: Allocator) ReadError![]Mark {
             if (Base == Document) return @import("read.zig").getMarks(reader, obj, from, max, gpa);
-            return owner(reader).getMarks(obj, from, max, gpa);
+            return reader.getMarks(obj, from, max, gpa);
         }
 
         pub fn markSetAtIndex(reader: Ptr, obj: ExId, index: usize, heads: ?[]const ChangeHash, gpa: Allocator) ReadError!MarkSet {
             if (Base == Document) return @import("read.zig").markSetAtIndex(reader, obj, index, heads, gpa);
-            return owner(reader).markSetAtIndex(obj, index, heads, gpa);
+            return reader.markSetAtIndex(obj, index, heads, gpa);
         }
 
         pub fn parents(reader: Ptr, obj: ExId) ReadError!Parents {
             if (Base == Document) return @import("read.zig").parents(reader, obj);
-            return owner(reader).parents(obj);
+            return reader.parents(obj);
         }
 
         pub fn parentsAt(reader: Ptr, obj: ExId, heads: []const ChangeHash) ReadError!Parents {
             if (Base == Document) return @import("read.zig").parentsAt(reader, obj, heads);
-            return owner(reader).parentsAt(obj, heads);
+            return reader.parentsAt(obj, heads);
         }
 
         pub fn iter(reader: Ptr, gpa: Allocator) DiffError!DocIter {
             if (Base == Document) return @import("read.zig").iter(reader, gpa);
-            return owner(reader).iter(gpa);
+            return reader.iter(gpa);
         }
 
         pub fn iterAt(reader: Ptr, obj: ExId, heads: ?[]const ChangeHash, gpa: Allocator) DiffError!DocIter {
             if (Base == Document) return @import("read.zig").iterAt(reader, obj, heads, gpa);
-            return owner(reader).iterAt(obj, heads, gpa);
+            return reader.iterAt(obj, heads, gpa);
         }
 
         pub fn getCursor(reader: Ptr, obj: ExId, pos: CursorPosition, heads: ?[]const ChangeHash, gpa: Allocator) ReadError!Cursor {
             if (Base == Document) return @import("read.zig").getCursor(reader, obj, pos, heads, gpa);
-            return owner(reader).getCursor(obj, pos, heads, gpa);
+            return reader.getCursor(obj, pos, heads, gpa);
         }
 
         pub fn getCursorMoving(reader: Ptr, obj: ExId, pos: CursorPosition, heads: ?[]const ChangeHash, bias: Bias, gpa: Allocator) ReadError!Cursor {
             if (Base == Document) return @import("read.zig").getCursorMoving(reader, obj, pos, heads, bias, gpa);
-            return owner(reader).getCursorMoving(obj, pos, heads, bias, gpa);
+            return reader.getCursorMoving(obj, pos, heads, bias, gpa);
         }
 
         pub fn getCursorPosition(reader: Ptr, obj: ExId, cursor: Cursor, heads: ?[]const ChangeHash) ReadError!usize {
             if (Base == Document) return @import("read.zig").getCursorPosition(reader, obj, cursor, heads);
-            return owner(reader).getCursorPosition(obj, cursor, heads);
+            return reader.getCursorPosition(obj, cursor, heads);
         }
 
         pub fn mapRange(reader: Ptr, obj: ExId, range: KeyRange) ReadError!MapRange {
             if (Base == Document) return @import("read.zig").mapRange(reader, obj, range);
-            return owner(reader).mapRange(obj, range);
+            return reader.mapRange(obj, range);
         }
 
         pub fn mapRangeAt(reader: Ptr, obj: ExId, range: KeyRange, heads: []const ChangeHash) ReadError!MapRange {
             if (Base == Document) return @import("read.zig").mapRangeAt(reader, obj, range, heads);
-            return owner(reader).mapRangeAt(obj, range, heads);
+            return reader.mapRangeAt(obj, range, heads);
         }
 
         pub fn listRange(reader: Ptr, obj: ExId, range: IndexRange) ReadError!ListRange {
             if (Base == Document) return @import("read.zig").listRange(reader, obj, range);
-            return owner(reader).listRange(obj, range);
+            return reader.listRange(obj, range);
         }
 
         pub fn listRangeAt(reader: Ptr, obj: ExId, range: IndexRange, heads: []const ChangeHash) ReadError!ListRange {
             if (Base == Document) return @import("read.zig").listRangeAt(reader, obj, range, heads);
-            return owner(reader).listRangeAt(obj, range, heads);
+            return reader.listRangeAt(obj, range, heads);
         }
 
         pub fn hydrate(reader: Ptr, obj: ExId, heads: ?[]const ChangeHash, gpa: Allocator) HydrateError!hydmod.Value {
-            return @import("read.zig").hydrate(raw(reader), obj, heads, gpa);
+            return @import("read.zig").hydrate(mutableRaw(reader), obj, heads, gpa);
         }
 
         pub fn objectType(reader: Ptr, obj: ExId) Error!ObjType {
@@ -2431,7 +2399,7 @@ pub fn ReadDoc(comptime R: type) type {
         }
 
         pub fn getChangeByHash(reader: Ptr, hash: ChangeHash, gpa: Allocator) ChangeError!?docmod.Built {
-            return @import("read.zig").getChangeByHash(raw(reader), hash, gpa);
+            return @import("read.zig").getChangeByHash(mutableRaw(reader), hash, gpa);
         }
 
         pub fn stats(reader: Ptr) Stats {
@@ -2807,7 +2775,7 @@ fn deleteElem(gpa: Allocator, doc: *Document, victim: OpId, delete_id: OpId) !vo
 }
 
 /// Reads every key of `obj` out of a [`Keys`] walk, in order, **copied**.
-fn keyList(gpa: Allocator, doc: *const Document, obj: ExId) ![][]const u8 {
+fn keyList(gpa: Allocator, doc: *Document, obj: ExId) ![][]const u8 {
     var walk = try keys(doc, obj);
     defer walk.deinit(doc.allocator());
     var out: std.ArrayList([]const u8) = .empty;
@@ -2830,7 +2798,7 @@ fn freeStrings(gpa: Allocator, list: []const []const u8) void {
 }
 
 /// The values of a [`Values`] walk over `obj`, in order, with their ids.
-fn valueList(gpa: Allocator, doc: *const Document, obj: ExId) ![]itervalues.ValuesItem {
+fn valueList(gpa: Allocator, doc: *Document, obj: ExId) ![]itervalues.ValuesItem {
     var term: ValueTerm = undefined;
     var walk = try values(doc, obj, &term);
     defer term.deinit(doc.allocator());
@@ -2841,7 +2809,7 @@ fn valueList(gpa: Allocator, doc: *const Document, obj: ExId) ![]itervalues.Valu
 }
 
 /// The keys and values of a [`MapRange`] walk, owned.
-fn mapItems(gpa: Allocator, doc: *const Document, obj: ExId, range: KeyRange) ![]itermap.OwnedMapRangeItem {
+fn mapItems(gpa: Allocator, doc: *Document, obj: ExId, range: KeyRange) ![]itermap.OwnedMapRangeItem {
     var walk = try mapRange(doc, obj, range);
     var out: std.ArrayList(itermap.OwnedMapRangeItem) = .empty;
     errdefer {
@@ -2878,7 +2846,7 @@ const ListItem = struct {
 /// The elements of a [`ListRange`] walk over `obj`, as owned strings.
 fn listItems(
     gpa: Allocator,
-    doc: *const Document,
+    doc: *Document,
     obj: ExId,
     range: IndexRange,
 ) ![]ListItem {
@@ -4433,7 +4401,7 @@ fn textFixture(gpa: Allocator, encoding: TextEncoding, body: []const u8) !TextDo
 /// fixture whose rows are out of order reads back plausibly wrong rather than
 /// wrongly, and `validateOpOrder` is the only thing that says so — a mark
 /// fixture that is one row out of order is green and meaningless.
-fn checkPremises(doc: *const Document, obj: ExId, encoding: TextEncoding) !void {
+fn checkPremises(doc: *Document, obj: ExId, encoding: TextEncoding) !void {
     if (!try mutableOps(doc).validateOpOrder()) {
         std.debug.print(
             "encoding {s}: the rows no longer follow the row-order invariant (op_set.rs:167-175)\n",
@@ -4491,7 +4459,7 @@ fn expectLen(got: usize, want: usize, enc: TextEncoding) !void {
 /// **not** turn a `'\n'` into one ([`inner.rs:1473-1512`](../../github-automerge-automerge/rust/automerge/src/transaction/inner.rs));
 /// only `split_block` makes a block, and the test above pins that.
 fn expectChars(
-    doc: *const Document,
+    doc: *Document,
     obj: ExId,
     want: []const []const u8,
     enc: TextEncoding,
@@ -4516,7 +4484,7 @@ fn expectChars(
 /// cases, the multi-byte case) does not call this, because the answer there is
 /// whatever the encoding's rounding rule says and not the character.
 fn expectCharAt(
-    doc: *const Document,
+    doc: *Document,
     obj: ExId,
     index: usize,
     want: []const u8,
@@ -4653,7 +4621,7 @@ const Shape = struct {
 
 /// Every span of `obj`, collected, with each span's own bytes copied out so the
 /// walk can be freed before the shapes are read.
-fn readShapes(gpa: Allocator, doc: *const Document, obj: ExId) ![]Shape {
+fn readShapes(gpa: Allocator, doc: *Document, obj: ExId) ![]Shape {
     var walk = try spans(doc, obj, gpa);
     defer walk.deinit();
     var out: std.ArrayList(Shape) = .empty;
@@ -4694,7 +4662,7 @@ test "owned span shape collection releases text marks and block maps on allocati
         defer committed.deinit(testing.allocator);
     }
     try testing.checkAllAllocationFailures(testing.allocator, struct {
-        fn exercise(gpa: Allocator, doc: *const Document, obj: ExId) !void {
+        fn exercise(gpa: Allocator, doc: *Document, obj: ExId) !void {
             const shapes = try readShapes(gpa, doc, obj);
             defer freeShapes(gpa, shapes);
             try testing.expectEqual(@as(usize, 3), shapes.len);
@@ -6760,7 +6728,7 @@ test "text: every index agrees with the marks the operations describe (text.rs:1
 /// exactly the names the model puts somewhere.
 fn checkAllIndices(
     gpa: Allocator,
-    doc: *const Document,
+    doc: *Document,
     obj: ExId,
     ops: []const MarkOp,
     enc: TextEncoding,
@@ -7998,7 +7966,7 @@ fn mirrorList(v: *const hydmod.Value) MirrorKindError!*const hydmod.List {
 /// answer — the readers below.
 fn expectMirroredMap(
     gpa: Allocator,
-    doc: *const Document,
+    doc: *Document,
     obj: ExId,
     m: *const hydmod.Map,
 ) MirrorError!void {
@@ -8046,7 +8014,7 @@ fn expectMirroredMap(
 /// **Every element of a list mirror, in order, against the reader.**
 fn expectMirroredList(
     gpa: Allocator,
-    doc: *const Document,
+    doc: *Document,
     obj: ExId,
     l: *const hydmod.List,
 ) MirrorError!void {
@@ -8079,7 +8047,7 @@ fn expectMirroredList(
 /// **A text mirror's characters and its marks, against the readers.**
 fn expectMirroredText(
     gpa: Allocator,
-    doc: *const Document,
+    doc: *Document,
     obj: ExId,
     t: *const hydmod.Text,
 ) MirrorError!void {
@@ -8131,7 +8099,7 @@ fn expectMirroredText(
 /// which is what makes the check recursive.
 fn expectMirroredValue(
     gpa: Allocator,
-    doc: *const Document,
+    doc: *Document,
     got: DocItem,
     want: *const hydmod.Value,
 ) MirrorError!void {
@@ -9467,7 +9435,7 @@ const WalkItem = struct {
 /// Walks `doc` and returns what it saw, in order, with everything copied.
 fn walkTo(
     gpa: Allocator,
-    doc: *const Document,
+    doc: *Document,
     obj: ExId,
     heads: ?[]const ChangeHash,
 ) ![]WalkItem {
@@ -9778,7 +9746,7 @@ test "iterAt at heads the present has moved past reports the state then" {
 //
 // | Zig 0.16.0 | upstream | Rust | port | does not / is / this |
 // | --- | --- | --- | --- | --- |
-// | `getAt(doc, obj, prop, heads)` | `ReadDoc::get_at` (`read.rs:266-271`) | `fn get_at<O: AsRef<ExId>, P: Into<Prop>>(&self, obj: O, prop: P, heads: &[ChangeHash]) -> Result<Option<(Value<'_>, ExId)>, AutomergeError>` | `pub fn getAt(doc: *const Document, obj: ExId, prop: Prop, heads: []const ChangeHash) ReadError!?DocItem` | **is** upstream's name and argument order; **does not** return `(Value<'_>, ExId)` — a `DocItem` whose `value` is the port's borrowed `ValueRef`; **is** a free function over `*const Document`, not a trait method |
+// | `getAt(doc, obj, prop, heads)` | `ReadDoc::get_at` (`read.rs:266-271`) | `fn get_at<O: AsRef<ExId>, P: Into<Prop>>(&self, obj: O, prop: P, heads: &[ChangeHash]) -> Result<Option<(Value<'_>, ExId)>, AutomergeError>` | `pub fn getAt(doc: anytype, obj: ExId, prop: Prop, heads: []const ChangeHash) ReadError!?DocItem` | Uses upstream's name and argument order, returning a borrowed `DocItem`. The generic owner must be mutable because historical clocks are retained on it. |
 // | `getAllAt(doc, obj, prop, heads, gpa)` | `ReadDoc::get_all_at` (`read.rs:293-298`) | `-> Result<Vec<(Value<'_>, ExId)>, AutomergeError>` | `-> ReadError![]DocItem` | **takes** an allocator upstream does not — upstream allocates the `Vec`; the twenty-line dispatch is shared with `getAll` through the private `getAllAtScope`, which is upstream's `get_all_for` (`automerge.rs:1891-1927`) |
 // | `lengthAt(doc, obj, heads)` | `ReadDoc::length_at` (`read.rs:149`) | `fn length_at<O: AsRef<ExId>>(&self, obj: O, heads: &[ChangeHash]) -> usize` | `-> ReadError!usize` | **is** upstream's answer; **does not** flatten the op set's column errors into `0` — that is `length`'s pre-existing deviation from upstream's `.unwrap_or(0)` (`automerge.rs:1711`) and this method keeps it |
 // | `keysAt(doc, obj, heads)` | `ReadDoc::keys_at` (`read.rs:55`) | `fn keys_at<O: AsRef<ExId>>(&self, obj: O, heads: &[ChangeHash]) -> Keys<'_>` | `-> ReadError!Keys` | **is** upstream's name and the same walk; **is** clock-scoped by a `Clock` the document owns, because a walk copies the `Clock` and borrows only its `slots` |
@@ -9789,10 +9757,10 @@ test "iterAt at heads the present has moved past reports the state then" {
 // | `mapRangeAt(doc, obj, range, heads)` | `ReadDoc::map_range_at` (`read.rs:99-104`) | `range: R` where `R: RangeBounds<String>` | `range: KeyRange` | **takes** the port's `KeyRange`, which `API.md` specifies and which can name an excluded end that `RangeBounds` cannot reach from a C caller |
 // | `listRangeAt(doc, obj, range, heads)` | `ReadDoc::list_range_at` (`read.rs:118-123`) | `range: R` where `R: RangeBounds<usize>` | `range: IndexRange` | **takes** the port's half-open `IndexRange` (`src/iter/list_range.zig:136`), because Zig has no range-bounds protocol |
 // | `parentsAt(doc, obj, heads)` | `ReadDoc::parents_at` (`read.rs:40-44`) | `fn parents_at<O: AsRef<ExId>>(&self, obj: O, heads: &[ChangeHash]) -> Result<Parents<'_>, AutomergeError>` | `-> ReadError!Parents` | **is** upstream's name; **does not** raise on an id that names nothing — the walk answers nothing, which is `parents`'s pre-existing reduction of upstream's `InvalidObjId` (`automerge.rs:1657`) |
-// | `getCursor(doc, obj, pos, heads, gpa)` | `ReadDoc::get_cursor` (`read.rs:199-204`) | `fn get_cursor<O, I: Into<CursorPosition>>(&self, obj: O, position: I, at: Option<&[ChangeHash]>) -> Result<Cursor, AutomergeError>` | `pub fn getCursor(doc: *const Document, obj: ExId, pos: CursorPosition, heads: ?[]const ChangeHash, gpa: Allocator) ReadError!Cursor` | **is** upstream's single signature with the heads in it, **is** its argument order, and **does not** have a second name for the heads: `getCursorAt` was a port-only split and is gone; **names** the parameter `heads`, which is upstream's own binding in the body (`automerge.rs:2175`) rather than a renaming, and **takes** an allocator upstream does not |
-// | `getCursorMoving(doc, obj, pos, heads, bias, gpa)` | `ReadDoc::get_cursor_moving` (`read.rs:224-230`) | the same `at: Option<&[ChangeHash]>`, with `move_cursor` after it (`automerge.rs:2179-2188`) | `pub fn getCursorMoving(doc: *const Document, obj: ExId, pos: CursorPosition, heads: ?[]const ChangeHash, bias: Bias, gpa: Allocator) ReadError!Cursor` | **ditto**, and `getCursorMovingAt` is gone |
-// | `getCursorPosition(doc, obj, cursor, heads)` | `ReadDoc::get_cursor_position` (`read.rs:237-242`) | the same `at: Option<&[ChangeHash]>` (`automerge.rs:2190-2198`) | `pub fn getCursorPosition(doc: *const Document, obj: ExId, cursor: Cursor, heads: ?[]const ChangeHash) ReadError!usize` | **ditto**, and `getCursorPositionAt` is gone; **is** upstream's two-line `Automerge` wrapper (`let clock = at.and_then(\|heads\| self.clock_at(heads)); self.get_cursor_position_for(obj, cursor, clock)`) and **is not** `AutoCommit`'s, which resolves the same `at` through `get_scope` (`autocommit.rs:794-805`) and takes a different arm while a transaction is in flight; **the relabel now lives one function down**, in `getCursorPositionFor` |
-// | `getCursorPositionFor(doc, obj, cursor, scope)` | `Automerge::get_cursor_position_for` (`automerge.rs:1760-1849`) | `pub(crate) fn get_cursor_position_for(&self, obj: &ExId, cursor: &Cursor, clock: Option<Clock>) -> Result<usize, AutomergeError>` | `pub fn getCursorPositionFor(doc: *const Document, obj: ExId, cursor: Cursor, scope: ?Clock) ReadError!usize` | **is** that helper, **and it is what both `ReadDoc` receivers reach underneath** (`automerge.rs:2197`, `autocommit.rs:1003`); **takes the clock rather than the heads** because the two receivers build it differently and the difference is load-bearing; **relabels** the op set's `error.InvalidIndex` for a cursor naming a row of another object as `error.InvalidCursor`, which is upstream's own `.ok_or_else(\|\| InvalidCursor(cursor.clone()))` on the seek's `None` (`automerge.rs:1778-1781`) — the seek cannot raise upstream, and the port's can (`op_set.zig:3145`) — **and that is the layer upstream puts it on** |
+// | `getCursor(doc, obj, pos, heads, gpa)` | `ReadDoc::get_cursor` (`read.rs:199-204`) | `fn get_cursor<O, I: Into<CursorPosition>>(&self, obj: O, position: I, at: Option<&[ChangeHash]>) -> Result<Cursor, AutomergeError>` | `pub fn getCursor(doc: anytype, obj: ExId, pos: CursorPosition, heads: ?[]const ChangeHash, gpa: Allocator) ReadError!Cursor` | Keeps upstream's heads argument and order, and takes an allocator for owned output. The owner is mutable for retained clocks and iterator scratch. |
+// | `getCursorMoving(doc, obj, pos, heads, bias, gpa)` | `ReadDoc::get_cursor_moving` (`read.rs:224-230`) | `at: Option<&[ChangeHash]>`, followed by `move_cursor` (`automerge.rs:2179-2188`) | `pub fn getCursorMoving(doc: anytype, obj: ExId, pos: CursorPosition, heads: ?[]const ChangeHash, bias: Bias, gpa: Allocator) ReadError!Cursor` | Uses the same mutable owner contract as `getCursor`. |
+// | `getCursorPosition(doc, obj, cursor, heads)` | `ReadDoc::get_cursor_position` (`read.rs:237-242`) | `at: Option<&[ChangeHash]>` (`automerge.rs:2190-2198`) | `pub fn getCursorPosition(doc: anytype, obj: ExId, cursor: Cursor, heads: ?[]const ChangeHash) ReadError!usize` | Raw reads and automatic reads select their respective scope before calling `getCursorPositionFor`. |
+// | `getCursorPositionFor(doc, obj, cursor, scope)` | `Automerge::get_cursor_position_for` (`automerge.rs:1760-1849`) | `pub(crate) fn get_cursor_position_for(&self, obj: &ExId, cursor: &Cursor, clock: Option<Clock>) -> Result<usize, AutomergeError>` | `pub fn getCursorPositionFor(doc: *Document, obj: ExId, cursor: Cursor, scope: ?Clock) ReadError!usize` | Takes the resolved borrowed clock and mutable iterator scratch. Relabels a seek's `InvalidIndex` as `InvalidCursor`, matching upstream's refusal at `automerge.rs:1778-1781`. |
 // | `hydrate(doc, obj, heads, gpa)` | `Automerge::hydrate_obj` (`automerge.rs:1638-1650`) | `let clock = heads.and_then(\|h\| self.clock_at(h));` (`:1644`, and `:2228` for `ReadDoc::hydrate`) | `heads: ?[]const ChangeHash` | **builds** the clock through `ChangeGraph.clockAt` where upstream **shortcuts** through `Automerge::clock_at`, which answers no clock for the present's own heads (`:1236-1247`); **the answers agree** — a full clock over the present is the present — **and the work does not** |
 // | `markSetAtIndex(doc, obj, index, heads, gpa)` | `Automerge::get_marks` / `AutoCommit::get_scope` (`automerge.rs:2236-2244`, `autocommit.rs:794-805`) | `heads.and_then(\|h\| self.clock_at(h))` (`:2242`), and `clock_at` from `get_scope`'s first arm when no transaction is in flight (`autocommit.rs:800-804`) | the same `heads: ?[]const ChangeHash` | **as** `hydrate`: the `Some` arm keeps a full clock upstream does not build, so it takes `markSetAtScope`'s walk where upstream takes `get_marks_fast` (`:1937-1938`); **the answer is the same** and the test `markSetAtIndex answers the set at one index, and the heads decide which path reads it` reads both arms |
 // | `Document.clockAtScope(gpa, heads)` | `Automerge::clock_at` (`automerge.rs:1236-1247`) | `pub(crate) fn clock_at(&self, heads: &[ChangeHash]) -> Option<Clock>` | `pub fn clockAtScope(self: *Document, gpa: Allocator, heads: []const ChangeHash) Error!?*const clockmod.Clock` | **is** upstream's resolution for every `*_at`, heads-are-current shortcut included; **borrows** where upstream moves, and the document caches the one clock and frees the previous pair |
@@ -9897,15 +9865,15 @@ fn generalizedReaderSmoke(
     try testing.expect(heads[0].eql(change.change.hash));
 }
 
-test "generalized free readers preserve raw held scoped and const receiver behavior" {
+test "generalized free readers preserve raw held scoped and borrowed receiver behavior" {
     // Real consumers instantiate every adapter reader against all three owners.
     // Scope and hydrate differ deliberately (transaction.rs:228; autocommit.rs:1011).
     const AutoCommit = @import("autocommit.zig").AutoCommit;
     const gpa = testing.allocator;
     var owner = try AutoCommit.initWithEncoding(gpa, testing.io, .unicode_code_point);
     defer owner.deinit();
-    const const_owner: *const AutoCommit = &owner;
-    try testing.expect((try get(const_owner, .root, .{ .key = "version" })) == null);
+    const borrowed_owner: *AutoCommit = &owner;
+    try testing.expect((try get(borrowed_owner, .root, .{ .key = "version" })) == null);
     try testing.expect(owner.transaction == null);
     _ = try owner.put(.root, .{ .key = "version" }, .{ .int = 1 });
     const text_obj = try owner.putObject(.root, .{ .key = "text" }, .text);
@@ -9920,25 +9888,31 @@ test "generalized free readers preserve raw held scoped and const receiver behav
     try testing.expect(owner.transaction == null);
 
     try generalizedReaderSmoke(&owner.doc, text_obj, list_obj, &heads, 2);
-    const const_doc: *const Document = &owner.doc;
-    try generalizedReaderSmoke(const_doc, text_obj, list_obj, &heads, 2);
+    const borrowed_doc: *Document = &owner.doc;
+    try generalizedReaderSmoke(borrowed_doc, text_obj, list_obj, &heads, 2);
+    const metadata_doc: *const Document = borrowed_doc;
+    const metadata_owner: *const AutoCommit = borrowed_owner;
+    try testing.expectEqual(ObjType.text, try objectType(metadata_doc, text_obj));
+    try testing.expectEqual(ObjType.list, try objectType(metadata_owner, list_obj));
+    try testing.expectEqual(@as(u64, 2), stats(metadata_doc).num_changes);
+    try testing.expectEqual(TextEncoding.unicode_code_point, textEncoding(metadata_owner));
     try generalizedReaderSmoke(&owner, text_obj, list_obj, &heads, 2);
-    try generalizedReaderSmoke(const_owner, text_obj, list_obj, &heads, 2);
+    try generalizedReaderSmoke(borrowed_owner, text_obj, list_obj, &heads, 2);
     try testing.expect(owner.transaction == null);
     {
         var tx = try trans.Transaction.openAt(gpa, &owner.doc, &heads);
         defer tx.deinit() catch @panic("transaction cleanup failed");
         try generalizedReaderSmoke(&tx, text_obj, list_obj, &heads, 1);
-        const const_tx: *const trans.Transaction = &tx;
-        try generalizedReaderSmoke(const_tx, text_obj, list_obj, &heads, 1);
+        const borrowed_tx: *trans.Transaction = &tx;
+        try generalizedReaderSmoke(borrowed_tx, text_obj, list_obj, &heads, 1);
         // Explicit newer heads override the transaction's historical scope.
-        try testing.expectEqual(@as(i64, 2), (try getAt(const_tx, .root, .{ .key = "version" }, &.{second})).?.value.scalar.int);
-        var raw_mirror = try hydrate(const_tx, .root, null, gpa);
+        try testing.expectEqual(@as(i64, 2), (try getAt(borrowed_tx, .root, .{ .key = "version" }, &.{second})).?.value.scalar.int);
+        var raw_mirror = try hydrate(borrowed_tx, .root, null, gpa);
         defer raw_mirror.deinit();
         try testing.expectEqual(@as(i64, 2), raw_mirror.object.map.get("version").?.int);
         _ = try tx.put(.root, .{ .key = "pending" }, .{ .int = 9 });
-        try testing.expectEqual(@as(i64, 9), (try get(const_tx, .root, .{ .key = "pending" })).?.value.scalar.int);
-        try testing.expect((try getAt(const_tx, .root, .{ .key = "pending" }, &heads)) == null);
+        try testing.expectEqual(@as(i64, 9), (try get(borrowed_tx, .root, .{ .key = "pending" })).?.value.scalar.int);
+        try testing.expect((try getAt(borrowed_tx, .root, .{ .key = "pending" }, &heads)) == null);
         try testing.expectEqual(@as(usize, 1), tx.count());
         try testing.expect(!tx.closed);
         _ = try tx.rollback();
@@ -9946,23 +9920,23 @@ test "generalized free readers preserve raw held scoped and const receiver behav
 
     _ = try owner.put(.root, .{ .key = "version" }, .{ .int = 3 });
     try generalizedReaderSmoke(&owner, text_obj, list_obj, &heads, 3);
-    try generalizedReaderSmoke(const_owner, text_obj, list_obj, &heads, 3);
+    try generalizedReaderSmoke(borrowed_owner, text_obj, list_obj, &heads, 3);
     try testing.expectEqual(@as(usize, 1), owner.pendingOps());
     try testing.expect(owner.transaction != null);
-    try testing.expectEqual(@as(u64, 2), stats(const_owner).num_changes);
+    try testing.expectEqual(@as(u64, 2), stats(borrowed_owner).num_changes);
     // Trait graph reads bypass the identically named AutoCommit closing barriers.
     const unknown: ChangeHash = .{ .bytes = @as([32]u8, @splat(0xab)) };
-    const missing_hashes = try getMissingDeps(const_owner, &.{unknown}, gpa);
+    const missing_hashes = try getMissingDeps(borrowed_owner, &.{unknown}, gpa);
     defer gpa.free(missing_hashes);
     try testing.expectEqual(@as(usize, 1), missing_hashes.len);
     try testing.expect(unknown.eql(missing_hashes[0]));
-    try testing.expect((try getChangeByHash(const_owner, unknown, gpa)) == null);
+    try testing.expect((try getChangeByHash(borrowed_owner, unknown, gpa)) == null);
     try testing.expectEqual(@as(usize, 1), owner.pendingOps());
-    try testing.expectEqual(@as(u64, 2), stats(const_owner).num_changes);
+    try testing.expectEqual(@as(u64, 2), stats(borrowed_owner).num_changes);
     try owner.isolate(gpa, &heads);
     // Isolation closes pending work; null hydrate still reads the full raw state.
-    try testing.expectEqual(@as(i64, 1), (try get(const_owner, .root, .{ .key = "version" })).?.value.scalar.int);
-    var raw_mirror = try hydrate(const_owner, .root, null, gpa);
+    try testing.expectEqual(@as(i64, 1), (try get(borrowed_owner, .root, .{ .key = "version" })).?.value.scalar.int);
+    var raw_mirror = try hydrate(borrowed_owner, .root, null, gpa);
     defer raw_mirror.deinit();
     try testing.expectEqual(@as(i64, 3), raw_mirror.object.map.get("version").?.int);
 }

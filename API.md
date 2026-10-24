@@ -63,6 +63,9 @@ Owned scalar conversions copy bytes. Release `OwnedScalarValue` and `value.Owned
 The `read` namespace supplies generic functions. Transactions and automatic documents also expose reader methods.
 Core readers include `get`, `getAll`, `keys`, `values`, `length`, `text`, `marks`, `spans`,
 `parents`, `mapRange`, `listRange`, `iter`, and cursor lookup.
+Content readers, historical scopes, serialization, and patch rendering require mutable
+owner pointers: they update retained clocks or iterator scratch. Metadata queries such
+as `objectType`, `stats`, and `textEncoding` still accept const pointers.
 
 Ordinary automatic reads see pending work without committing it.
 Explicit historical heads select committed rows and exclude pending operations, including at current graph heads.
@@ -302,6 +305,7 @@ The default build installs `libzautomerge.a` and `include/automerge.h`.
 The production root is `src/c/root.zig`. The variadic `AMresultFrom` implementation comes from `src/c/result_from.c`.
 `AMdoc` uses the native automatic lifecycle. Ordinary reads leave pending writes open.
 History, save, setters, and sync close pending work. `AMclone` preserves pending state independently.
+Content reads take `AMdoc *`, not `const AMdoc *`, because they update owner caches.
 `AMrollback` returns zero if rollback fails, retaining its journal for retry.
 The C bridge selects UTF-8 code-unit indexing.
 `AMresultFree` releases result-owned handles. Keep results live while using their borrowed items and bytes.

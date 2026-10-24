@@ -425,7 +425,7 @@ fn forked(gpa: Allocator, io: std.Io) !Pair {
 /// The object at `key` under the root, read through the document's own read
 /// surface. Its id is stable for the life of the object, which is why the
 /// reference reads it once between transactions and keeps it.
-fn childId(doc: *const Document, key: []const u8) !ExId {
+fn childId(doc: *Document, key: []const u8) !ExId {
     const item = (try am.read.get(doc, .root, .{ .key = key })) orelse
         return error.NoSuchKey;
     return switch (item.value) {
@@ -860,7 +860,7 @@ fn firstDifference(a: []const u8, b: []const u8) usize {
 /// hydration comparison reads the same state through a different surface, so a
 /// difference the column walk cannot see and a difference the materialization
 /// cannot see are both caught.
-fn compareDocuments(id: Id, mine: *const Document, theirs: *const Document) !void {
+fn compareDocuments(id: Id, mine: *Document, theirs: *Document) !void {
     const my_stats = mine.stats();
     const their_stats = theirs.stats();
     if (my_stats.num_changes != their_stats.num_changes or

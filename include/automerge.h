@@ -1061,10 +1061,10 @@ AMresult *AMgetChanges(AMdoc *doc, const AMitems *have_deps);
 AMresult *AMgetChangesAdded(AMdoc *doc1, AMdoc *doc2);
 
 /** \brief Creates a cursor at a position in a list or text object. Rust: `src/doc.rs:412`. */
-AMresult *AMgetCursor(const AMdoc *doc, const AMobjId *obj_id, size_t position, const AMitems *heads);
+AMresult *AMgetCursor(AMdoc *doc, const AMobjId *obj_id, size_t position, const AMitems *heads);
 
 /** \brief Gets the position of a cursor within an object. Rust: `src/doc.rs:455`. */
-AMresult *AMgetCursorPosition(const AMdoc *doc, const AMobjId *obj_id, const AMcursor *cursor, const AMitems *heads);
+AMresult *AMgetCursorPosition(AMdoc *doc, const AMobjId *obj_id, const AMcursor *cursor, const AMitems *heads);
 
 /** \brief Gets a document's current heads. Rust: `src/doc.rs:488`. */
 AMresult *AMgetHeads(AMdoc *doc);
@@ -1076,7 +1076,7 @@ AMresult *AMgetMissingDeps(AMdoc *doc, const AMitems *heads);
 AMresult *AMgetLastLocalChange(AMdoc *doc);
 
 /** \brief Gets the keys of a map object. Rust: `src/doc.rs:564`. */
-AMresult *AMkeys(const AMdoc *doc, const AMobjId *obj_id, const AMitems *heads);
+AMresult *AMkeys(AMdoc *doc, const AMobjId *obj_id, const AMitems *heads);
 
 /** \brief Loads a document from an array of bytes. Rust: `src/doc.rs:598`. */
 AMresult *AMload(const uint8_t *src, size_t count);
@@ -1088,13 +1088,13 @@ AMresult *AMloadIncremental(AMdoc *doc, const uint8_t *src, size_t count);
 AMresult *AMmerge(AMdoc *dest, AMdoc *src);
 
 /** \brief Gets an object's size. Rust: `src/doc.rs:674`. */
-size_t AMobjSize(const AMdoc *doc, const AMobjId *obj_id, const AMitems *heads);
+size_t AMobjSize(AMdoc *doc, const AMobjId *obj_id, const AMitems *heads);
 
 /** \brief Gets an object's type. Rust: `src/doc.rs:709`. */
 AMobjType AMobjObjType(const AMdoc *doc, const AMobjId *obj_id);
 
 /** \brief Gets an object's items. Rust: `src/doc.rs:738`. */
-AMresult *AMobjItems(const AMdoc *doc, const AMobjId *obj_id, const AMitems *heads);
+AMresult *AMobjItems(AMdoc *doc, const AMobjId *obj_id, const AMitems *heads);
 
 /** \brief Gets the count of operations pending in a document's transaction. Rust: `src/doc.rs:766`. */
 size_t AMpendingOps(const AMdoc *doc);
@@ -1130,7 +1130,7 @@ AMresult *AMsplice(AMdoc *doc, const AMobjId *obj_id, size_t pos, ptrdiff_t del,
 AMresult *AMspliceText(AMdoc *doc, const AMobjId *obj_id, size_t pos, ptrdiff_t del, AMbyteSpan text);
 
 /** \brief Gets a text object's contents. Rust: `src/doc.rs:995`. */
-AMresult *AMtext(const AMdoc *doc, const AMobjId *obj_id, const AMitems *heads);
+AMresult *AMtext(AMdoc *doc, const AMobjId *obj_id, const AMitems *heads);
 
 /* -------------------------------------------------------------------------
  * Lists. Rust: src/doc/list.rs.
@@ -1143,9 +1143,9 @@ AMresult *AMtext(const AMdoc *doc, const AMobjId *obj_id, const AMitems *heads);
 /** Rust: `src/doc/list.rs:50`. */
 AMresult *AMlistDelete(AMdoc *doc, const AMobjId *obj_id, size_t pos);
 /** Rust: `src/doc/list.rs:83`. */
-AMresult *AMlistGet(const AMdoc *doc, const AMobjId *obj_id, size_t pos, const AMitems *heads);
+AMresult *AMlistGet(AMdoc *doc, const AMobjId *obj_id, size_t pos, const AMitems *heads);
 /** Rust: `src/doc/list.rs:124`. */
-AMresult *AMlistGetAll(const AMdoc *doc, const AMobjId *obj_id, size_t pos, const AMitems *heads);
+AMresult *AMlistGetAll(AMdoc *doc, const AMobjId *obj_id, size_t pos, const AMitems *heads);
 /** Rust: `src/doc/list.rs:162`. */
 AMresult *AMlistIncrement(AMdoc *doc, const AMobjId *obj_id, size_t pos, int64_t value);
 /** Rust: `src/doc/list.rs:198`. */
@@ -1169,7 +1169,7 @@ AMresult *AMlistPutTimestamp(AMdoc *doc, const AMobjId *obj_id, size_t pos, bool
 /** Rust: `src/doc/list.rs:579`. */
 AMresult *AMlistPutUint(AMdoc *doc, const AMobjId *obj_id, size_t pos, bool insert, uint64_t value);
 /** Rust: `src/doc/list.rs:619`. */
-AMresult *AMlistRange(const AMdoc *doc, const AMobjId *obj_id, size_t begin, size_t end, const AMitems *heads);
+AMresult *AMlistRange(AMdoc *doc, const AMobjId *obj_id, size_t begin, size_t end, const AMitems *heads);
 
 /* -------------------------------------------------------------------------
  * Maps. Rust: src/doc/map.rs.
@@ -1182,9 +1182,9 @@ AMresult *AMlistRange(const AMdoc *doc, const AMobjId *obj_id, size_t begin, siz
 /** Rust: `src/doc/map.rs:30`. */
 AMresult *AMmapDelete(AMdoc *doc, const AMobjId *obj_id, AMbyteSpan key);
 /** Rust: `src/doc/map.rs:63`. */
-AMresult *AMmapGet(const AMdoc *doc, const AMobjId *obj_id, AMbyteSpan key, const AMitems *heads);
+AMresult *AMmapGet(AMdoc *doc, const AMobjId *obj_id, AMbyteSpan key, const AMitems *heads);
 /** Rust: `src/doc/map.rs:105`. */
-AMresult *AMmapGetAll(const AMdoc *doc, const AMobjId *obj_id, AMbyteSpan key, const AMitems *heads);
+AMresult *AMmapGetAll(AMdoc *doc, const AMobjId *obj_id, AMbyteSpan key, const AMitems *heads);
 /** Rust: `src/doc/map.rs:143`. */
 AMresult *AMmapIncrement(AMdoc *doc, const AMobjId *obj_id, AMbyteSpan key, int64_t value);
 /** Rust: `src/doc/map.rs:174`. */
@@ -1208,7 +1208,7 @@ AMresult *AMmapPutTimestamp(AMdoc *doc, const AMobjId *obj_id, AMbyteSpan key, i
 /** Rust: `src/doc/map.rs:463`. */
 AMresult *AMmapPutUint(AMdoc *doc, const AMobjId *obj_id, AMbyteSpan key, uint64_t value);
 /** Rust: `src/doc/map.rs:500`. */
-AMresult *AMmapRange(const AMdoc *doc, const AMobjId *obj_id, AMbyteSpan begin, AMbyteSpan end, const AMitems *heads);
+AMresult *AMmapRange(AMdoc *doc, const AMobjId *obj_id, AMbyteSpan begin, AMbyteSpan end, const AMitems *heads);
 
 /* -------------------------------------------------------------------------
  * Marks. Rust: src/doc/mark.rs.
@@ -1227,7 +1227,7 @@ size_t AMmarkStart(const AMmark *mark);
 size_t AMmarkEnd(const AMmark *mark);
 
 /** \brief Gets the marks over a range of a list or text object. Rust: `src/doc/mark.rs:193`. */
-AMresult *AMmarks(const AMdoc *doc, const AMobjId *obj_id, const AMitems *heads);
+AMresult *AMmarks(AMdoc *doc, const AMobjId *obj_id, const AMitems *heads);
 
 /**
  * \brief Creates a mark over a range of a list or text object.

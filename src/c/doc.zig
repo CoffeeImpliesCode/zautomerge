@@ -1379,16 +1379,9 @@ pub fn boxValues(alloc: Allocator, values: []const Value) !*AMresult {
 // Conversions between the C handles and the port's own types.
 // ---------------------------------------------------------------------------
 
-/// The document's op set as a **mutable** pointer, for a walk that borrows it.
-///
-/// [read.zig](../read.zig) performs exactly this cast, and says why: "The
-/// `const` is dropped and nothing writes through it. A walk over an op set
-/// moves that op set's shared successor buffer" (`read.zig:352-360`,
-/// `op_set.zig:40-49`), and so `topOps` and every `iter*` walk take `*Set`. It
-/// is the reason this file can answer a `heads` argument at all, since
-/// `read.zig` itself passes `null` for the clock it has no parameter for.
-fn mutableOps(d: *const AMdoc) *docmod.Set {
-    return @constCast(&d.owner.doc.ops);
+/// Borrows mutable op-set scratch for a read iterator.
+fn mutableOps(d: *AMdoc) *docmod.Set {
+    return &d.owner.doc.ops;
 }
 
 // ---------------------------------------------------------------------------
@@ -1659,9 +1652,9 @@ fn headsOf(alloc: Allocator, items: ?*const AMitems) ![]ChangeHash {
 /// (`src/doc.rs:466-470`) and `Clock::from_heads(&[])` is a clock that covers
 /// nothing, so `AMlistGet(doc, obj, pos, &empty)` answers nothing. Collapsing
 /// the two would make an empty `heads` mean "now", which is the opposite.
-fn clockFromItems(alloc: Allocator, doc: *const AMdoc, items: ?*const AMitems) !?Clock {
+fn clockFromItems(alloc: Allocator, doc: *AMdoc, items: ?*const AMitems) !?Clock {
     if (items == null) {
-        const owner = &@constCast(doc).owner;
+        const owner = &doc.owner;
         const scope = if (owner.transaction) |*tx|
             try tx.scopeClock()
         else if (try owner.doc.readScope(owner.allocator())) |clock|
@@ -1672,7 +1665,7 @@ fn clockFromItems(alloc: Allocator, doc: *const AMdoc, items: ?*const AMitems) !
     }
     const hashes = try headsOf(alloc, items);
     defer alloc.free(hashes);
-    return try @constCast(doc).owner.doc.graph.clockAt(alloc, hashes);
+    return try doc.owner.doc.graph.clockAt(alloc, hashes);
 }
 
 /// `clamp!` (Rust: `src/doc/utils.rs:1-9`): a position past the object's end
@@ -1926,7 +1919,7 @@ fn winningRow(found: *const opsetmod.OpsFound) ?opmod.Op {
 /// `read.get`'s dispatch table (`read.zig:452-496`) with a clock, over the
 /// same two `seekOps*` calls it makes.
 fn getAt(
-    doc: *const AMdoc,
+    doc: *AMdoc,
     obj: ExId,
     prop: Prop,
     clock: ?Clock,
@@ -1959,7 +1952,7 @@ fn getAt(
 /// (`automerge.rs:1921-1925`).
 fn getAllAt(
     alloc: Allocator,
-    doc: *const AMdoc,
+    doc: *AMdoc,
     obj: ExId,
     prop: Prop,
     clock: ?Clock,
@@ -3199,7 +3192,7 @@ pub export fn AMgetChangesAdded(doc1: ?*AMdoc, doc2: ?*AMdoc) ?*AMresult {
 /// either way, and the only thing the other route would change here is which
 /// clock a caller naming the document's own heads gets. See the diff block.
 pub export fn AMgetCursor(
-    doc: ?*const AMdoc,
+    doc: ?*AMdoc,
     obj_id: ?*const AMobjId,
     position: usize,
     heads: ?*const AMitems,
@@ -3312,7 +3305,7 @@ pub export fn AMgetCursor(
 /// in this file — so [`read.getCursorPosition`](../read.zig)'s own `readScope`
 /// already answers that arm.
 pub export fn AMgetCursorPosition(
-    doc: ?*const AMdoc,
+    doc: ?*AMdoc,
     obj_id: ?*const AMobjId,
     cursor: ?*const AMcursor,
     heads: ?*const AMitems,
@@ -3330,7 +3323,7 @@ pub export fn AMgetCursorPosition(
         at = headsOf(c_alloc, heads) catch |e| return failWith(c_alloc, e);
     }
     defer if (at) |hashes| c_alloc.free(hashes);
-    const pos = @constCast(d).owner.getCursorPosition(obj, cur.body, at) catch |e|
+    const pos = d.owner.getCursorPosition(obj, cur.body, at) catch |e|
         return failWith(c_alloc, e);
     return boxOne(c_alloc, valueUint(pos)) catch |e| failWith(c_alloc, e);
 }
@@ -3370,7 +3363,7 @@ pub export fn AMgetLastLocalChange(doc: ?*AMdoc) ?*AMresult {
 /// [`Keys`](../iter/keys.zig) walk is the same [`OpSet.topOps`](../opset/op_set.zig)
 /// `read.keys` uses (`read.zig:637`), with a clock when `heads` is not null.
 pub export fn AMkeys(
-    doc: ?*const AMdoc,
+    doc: ?*AMdoc,
     obj_id: ?*const AMobjId,
     heads: ?*const AMitems,
 ) ?*AMresult {
@@ -3450,7 +3443,7 @@ pub export fn AMmerge(dest: ?*AMdoc, src: ?*AMdoc) ?*AMresult {
 /// [`OpSet.seqLength`](../opset/op_set.zig) is the layer `read.length` calls
 /// (`read.zig:573`).
 pub export fn AMobjSize(
-    doc: ?*const AMdoc,
+    doc: ?*AMdoc,
     obj_id: ?*const AMobjId,
     heads: ?*const AMitems,
 ) usize {
@@ -3480,7 +3473,7 @@ pub export fn AMobjObjType(doc: ?*const AMdoc, obj_id: ?*const AMobjId) AMobjTyp
 /// and `AMitem::exact` is `Item { index: None, obj_id: Some(..), value: Some(..) }`
 /// (`src/item.rs:1027-1033`).
 pub export fn AMobjItems(
-    doc: ?*const AMdoc,
+    doc: ?*AMdoc,
     obj_id: ?*const AMobjId,
     heads: ?*const AMitems,
 ) ?*AMresult {
@@ -3743,7 +3736,7 @@ fn toHydrate(v: optypes.ValueRef) hydmod.Value {
 ///
 /// One `AM_VAL_TYPE_STR` item.
 pub export fn AMtext(
-    doc: ?*const AMdoc,
+    doc: ?*AMdoc,
     obj_id: ?*const AMobjId,
     heads: ?*const AMitems,
 ) ?*AMresult {
@@ -3798,14 +3791,14 @@ pub export fn AMlistDelete(doc: ?*AMdoc, obj_id: ?*const AMobjId, pos: usize) ?*
 
 /// `AMlistGet`. Rust: `src/doc/list.rs:83-99`.
 pub export fn AMlistGet(
-    doc: ?*const AMdoc,
+    doc: ?*AMdoc,
     obj_id: ?*const AMobjId,
     pos: usize,
     heads: ?*const AMitems,
 ) ?*AMresult {
     const d = doc orelse return invalidDoc(c_alloc);
     const obj = objIdOf(d, obj_id) catch |e| return failWith(c_alloc, e);
-    const len = @constCast(d).owner.length(obj) catch |e| return failWith(c_alloc, e);
+    const len = d.owner.length(obj) catch |e| return failWith(c_alloc, e);
     const at = adjustPos(pos, false, len) catch |e| return failWith(c_alloc, e);
     var clock = clockFromItems(c_alloc, d, heads) catch |e| return failWith(c_alloc, e);
     defer if (clock) |*c| c.deinit();
@@ -3815,14 +3808,14 @@ pub export fn AMlistGet(
 
 /// `AMlistGetAll`. Rust: `src/doc/list.rs:124-140`.
 pub export fn AMlistGetAll(
-    doc: ?*const AMdoc,
+    doc: ?*AMdoc,
     obj_id: ?*const AMobjId,
     pos: usize,
     heads: ?*const AMitems,
 ) ?*AMresult {
     const d = doc orelse return invalidDoc(c_alloc);
     const obj = objIdOf(d, obj_id) catch |e| return failWith(c_alloc, e);
-    const len = @constCast(d).owner.length(obj) catch |e| return failWith(c_alloc, e);
+    const len = d.owner.length(obj) catch |e| return failWith(c_alloc, e);
     const at = adjustPos(pos, false, len) catch |e| return failWith(c_alloc, e);
     var clock = clockFromItems(c_alloc, d, heads) catch |e| return failWith(c_alloc, e);
     defer if (clock) |*c| c.deinit();
@@ -4028,7 +4021,7 @@ pub export fn AMlistPutUint(
 
 /// `AMlistRange`. Rust: `src/doc/list.rs:619-636`.
 pub export fn AMlistRange(
-    doc: ?*const AMdoc,
+    doc: ?*AMdoc,
     obj_id: ?*const AMobjId,
     begin: usize,
     end: usize,
@@ -4124,7 +4117,7 @@ pub export fn AMmapDelete(
 
 /// `AMmapGet`. Rust: `src/doc/map.rs:63-79`.
 pub export fn AMmapGet(
-    doc: ?*const AMdoc,
+    doc: ?*AMdoc,
     obj_id: ?*const AMobjId,
     key: AMbyteSpan,
     heads: ?*const AMitems,
@@ -4140,7 +4133,7 @@ pub export fn AMmapGet(
 
 /// `AMmapGetAll`. Rust: `src/doc/map.rs:105-121`.
 pub export fn AMmapGetAll(
-    doc: ?*const AMdoc,
+    doc: ?*AMdoc,
     obj_id: ?*const AMobjId,
     key: AMbyteSpan,
     heads: ?*const AMitems,
@@ -4376,7 +4369,7 @@ pub export fn AMmapPutUint(
 /// A `begin` past its `end` is the reference's `Invalid range [begin-end)`.
 ///
 pub export fn AMmapRange(
-    doc: ?*const AMdoc,
+    doc: ?*AMdoc,
     obj_id: ?*const AMobjId,
     begin: AMbyteSpan,
     end: AMbyteSpan,
@@ -4516,7 +4509,7 @@ pub export fn AMmarkEnd(mark: ?*const AMmark) usize {
 /// `heads` only (`:45-46` and `:100-101`), as does
 /// [`test/c/suite/item_tests.c`](:210-211).
 pub export fn AMmarks(
-    doc: ?*const AMdoc,
+    doc: ?*AMdoc,
     obj_id: ?*const AMobjId,
     heads: ?*const AMitems,
 ) ?*AMresult {
@@ -5204,7 +5197,7 @@ test "a C text index names the character a default-configured reference build na
 /// the result is. A helper that returned `span.slice()` would hand back a
 /// pointer into freed memory, which is exactly what the first run of this
 /// test did: it read four bytes of `\x9a` and reported "found ����".
-fn textInto(doc: *const AMdoc, obj: *const AMobjId, out: []u8) ![]const u8 {
+fn textInto(doc: *AMdoc, obj: *const AMobjId, out: []u8) ![]const u8 {
     const read = AMtext(doc, obj, null) orelse return error.Unexpected;
     defer abi.AMresultFree(read);
     var span: AMbyteSpan = .empty;

@@ -1765,7 +1765,7 @@ const WantSpan = struct {
 };
 
 /// The spans of `obj` as a reader sees them, each one owned by `gpa`.
-fn readSpanList(gpa: Allocator, doc: *const AutoCommit, obj: ExId) ![]ReadSpan {
+fn readSpanList(gpa: Allocator, doc: *AutoCommit, obj: ExId) ![]ReadSpan {
     var out: std.ArrayList(ReadSpan) = .empty;
     errdefer {
         for (out.items) |*s| s.deinit(gpa);
@@ -1846,7 +1846,7 @@ fn marksEql(a: []const MarkSet.Entry, b: []const MarkSet.Entry) bool {
 /// wrong length with the wrong spans passes one.
 fn expectDocSpans(
     gpa: Allocator,
-    doc: *const AutoCommit,
+    doc: *AutoCommit,
     obj: ExId,
     want: []const WantSpan,
 ) !void {

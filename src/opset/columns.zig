@@ -757,8 +757,8 @@ pub const IndexLengths = struct {
 /// recording where they came from, which is also why an id is stable across a
 /// save and a load.
 pub const StringTable = struct {
-    /// The table's own state, passed to both functions unchanged.
-    ctx: *const anyopaque,
+    /// Mutable table state for interning; resolution only borrows it.
+    ctx: *anyopaque,
     /// The bytes of the string `id` names, owned by the table and valid for as
     /// long as the table is.
     resolve: *const fn (ctx: *const anyopaque, id: u32) []const u8,
@@ -766,7 +766,7 @@ pub const StringTable = struct {
     /// with more strings than an id can name answers `error.Overflow`; the
     /// error set is the parser's because that is where a save and a load
     /// already fail.
-    intern: *const fn (ctx: *const anyopaque, bytes: []const u8, gpa: Allocator) ParseError!u32,
+    intern: *const fn (ctx: *anyopaque, bytes: []const u8, gpa: Allocator) ParseError!u32,
 };
 
 /// What `export` produced: the column set and the data block its ranges index
@@ -2572,8 +2572,8 @@ const Table = struct {
     /// than 2^32 strings cannot name the last of them. The bound is checked
     /// rather than assumed: a `@intCast` of a collection length here would
     /// trap in a debug build and wrap in a release one.
-    fn intern(ctx: *const anyopaque, text: []const u8, gpa: Allocator) ParseError!u32 {
-        const self: *Table = @ptrCast(@alignCast(@constCast(ctx)));
+    fn intern(ctx: *anyopaque, text: []const u8, gpa: Allocator) ParseError!u32 {
+        const self: *Table = @ptrCast(@alignCast(ctx));
         for (self.items.items, 0..) |item, i| {
             if (std.mem.eql(u8, item, text)) return std.math.cast(u32, i) orelse error.Overflow;
         }

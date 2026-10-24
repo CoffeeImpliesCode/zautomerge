@@ -267,7 +267,7 @@ fn committedSplice(doc: *Document, obj: ExId, index: usize, del: isize, values: 
 
 /// `doc.text(&obj)` as a caller-owned string, which is what [`read.text`](../src/read.zig)
 /// hands back ([`read.rs`:181](../github-automerge-automerge/rust/automerge/src/read.rs)).
-fn readText(doc: *const Document, obj: ExId) ![]u8 {
+fn readText(doc: *Document, obj: ExId) ![]u8 {
     return am.read.text(doc, obj, gpa);
 }
 
@@ -279,7 +279,7 @@ fn readText(doc: *const Document, obj: ExId) ![]u8 {
 /// **One span's text is not a borrow**: `read.spans` hands each span over and
 /// each one owns its text and its mark set, so each span is released before the
 /// next `next` overwrites the walk's buffer.
-fn spanText(doc: *const Document, obj: ExId) ![]u8 {
+fn spanText(doc: *Document, obj: ExId) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     var walk = try am.read.spans(doc, obj, gpa);
@@ -293,12 +293,12 @@ fn spanText(doc: *const Document, obj: ExId) ![]u8 {
 }
 
 /// The marks over `obj`, as a caller-owned list.
-fn readMarks(doc: *const Document, obj: ExId) ![]Mark {
+fn readMarks(doc: *Document, obj: ExId) ![]Mark {
     return am.read.marks(doc, obj, gpa);
 }
 
 /// The object at `obj.prop`.
-fn objectAt(doc: *const Document, obj: ExId, prop: Prop) !ExId {
+fn objectAt(doc: *Document, obj: ExId, prop: Prop) !ExId {
     const item = (try am.read.get(doc, obj, prop)) orelse return error.NoSuchKey;
     return switch (item.value) {
         .object => item.id,
@@ -307,7 +307,7 @@ fn objectAt(doc: *const Document, obj: ExId, prop: Prop) !ExId {
 }
 
 /// The scalar at `obj.prop`.
-fn scalarAt(doc: *const Document, obj: ExId, prop: Prop) !ScalarValue {
+fn scalarAt(doc: *Document, obj: ExId, prop: Prop) !ScalarValue {
     const item = (try am.read.get(doc, obj, prop)) orelse return error.NoSuchKey;
     return switch (item.value) {
         .scalar => |s| s,

@@ -635,13 +635,13 @@ test "API parity serde allocation failures release both backend projections" {
     var doc = try Document.load(gpa, testing.io, &reference_bytes, .unicode_code_point);
     defer doc.deinit();
     const Probe = struct {
-        fn json(limited: Allocator, source: *const Document) !void {
+        fn json(limited: Allocator, source: *Document) !void {
             const bytes = try AutoSerde(Document).from(source).toJson(limited);
             defer limited.free(bytes);
             try testing.expectEqualStrings(golden, bytes);
         }
 
-        fn structured(limited: Allocator, source: *const Document) !void {
+        fn structured(limited: Allocator, source: *Document) !void {
             var tokens = @import("autoserde.zig").TokenStream.init(limited);
             defer tokens.deinit();
             try AutoSerde(Document).from(source).serialize(limited, &tokens);

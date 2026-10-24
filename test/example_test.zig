@@ -660,7 +660,7 @@ fn checkItem(
 /// and every row counter is compared, and each cursor is then required to be
 /// exhausted — neither may hold an item the other has not named.
 fn compareShape(
-    cdoc: *const cabi.AMdoc,
+    cdoc: *cabi.AMdoc,
     root: *const cabi.AMobjId,
     heads: ?*const cabi.AMitems,
     zig_doc: *Document,
@@ -835,7 +835,7 @@ test "the four bound shapes: one document through AMmapRange and through read.ma
 }
 
 /// The keys [`rangesFixture`] puts in the root map, as a walk sees them.
-fn keysOf(list: Allocator, doc: *const Document, range: am.read.KeyRange) ![]u8 {
+fn keysOf(list: Allocator, doc: *Document, range: am.read.KeyRange) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(list);
     var walk = try am.read.mapRange(doc, am.root, range);

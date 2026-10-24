@@ -1741,7 +1741,7 @@ pub fn PatchBuilder(comptime D: type) type {
         /// The document every path and value is read from. **Borrowed**: it
         /// must outlive the builder, and nothing is copied out of it except
         /// into the arena.
-        doc: *const D,
+        doc: *D,
         /// The patches built so far, in stream order. **This is the builder's
         /// output**: [`PatchLog.buildCurrent`] appends it to the batch in
         /// `out` once the walk is done. Its buffer is `gpa` memory, so it is
@@ -1812,7 +1812,7 @@ pub fn PatchBuilder(comptime D: type) type {
         /// they are read.
         pub fn init(
             out: *Patches,
-            doc: *const D,
+            doc: *D,
             owned_seed: PathMap,
             seed_gpa: Allocator,
             clock: ?Clock,
@@ -1854,7 +1854,7 @@ pub fn PatchBuilder(comptime D: type) type {
         }
 
         /// One event, one call ([`PatchBuilder::log_event`](patch_builder.rs):49-110`).
-        pub fn logEvent(self: *Self, doc: *const D, exid: ExId, ev: *const Event) MakeError!void {
+        pub fn logEvent(self: *Self, doc: *D, exid: ExId, ev: *const Event) MakeError!void {
             switch (ev.*) {
                 .put_map => |e| try self.put(
                     exid,
@@ -2431,7 +2431,7 @@ pub const ExposeQueue = struct {
         comptime D: type,
         obj: ExId,
         builder: *PatchBuilder(D),
-        doc: *const D,
+        doc: *D,
         clock: ?Clock,
     ) MakeError!void {
         while (self.first()) |exposed| {
@@ -2446,7 +2446,7 @@ pub const ExposeQueue = struct {
         self: *ExposeQueue,
         comptime D: type,
         builder: *PatchBuilder(D),
-        doc: *const D,
+        doc: *D,
         clock: ?Clock,
     ) MakeError!void {
         while (self.first()) |exposed| {
@@ -2465,7 +2465,7 @@ pub const ExposeQueue = struct {
         comptime D: type,
         exid: ExId,
         builder: *PatchBuilder(D),
-        doc: *const D,
+        doc: *D,
         clock: ?Clock,
     ) MakeError!void {
         const id = internalObjOf(exid);
@@ -3299,7 +3299,7 @@ pub const PatchLog = struct {
     pub fn finishCurrentView(
         self: *PatchLog,
         comptime D: type,
-        doc: *const D,
+        doc: *D,
         heads: []const ChangeHash,
     ) MakeError!void {
         if (D == @import("doc.zig").Document) return doc.finishCurrentPatchView(self, heads);
@@ -3332,7 +3332,7 @@ pub const PatchLog = struct {
     /// transactions and applied batches share this same event stream.
     /// The events are not consumed, but the one-use path hint is
     /// (patch_log.rs:513). Subsequent renders resolve paths from the document.
-    pub fn makePatches(self: *PatchLog, comptime D: type, doc: *const D) MakeError!Patches {
+    pub fn makePatches(self: *PatchLog, comptime D: type, doc: *D) MakeError!Patches {
         // Raw documents own the indexed reader adapter and its lifetime.
         if (D == @import("doc.zig").Document) return doc.makePatches(self);
         if (self.oom) return error.OutOfMemory;
@@ -3435,13 +3435,13 @@ pub const PatchLog = struct {
         self: *PatchLog,
         comptime D: type,
         out: *Patches,
-        doc: *const D,
+        doc: *D,
     ) MakeError!void {
         assertDoc(D);
         // Logical read-cache mutation follows Document's canonical scoped
         // readers. The borrowed clock header never owns its buffers here.
         const clock: ?Clock = if (self.heads) |h|
-            (try @constCast(doc).clockAtScope(self.gpa, h)).*
+            (try doc.clockAtScope(self.gpa, h)).*
         else
             null;
         // **The seed is released here, on every path out, until the builder
@@ -4133,8 +4133,8 @@ const Table = struct {
         return self.items.items[id];
     }
 
-    fn intern(ctx: *const anyopaque, text: []const u8, gpa: Allocator) ParseError!u32 {
-        const self: *Table = @ptrCast(@alignCast(@constCast(ctx)));
+    fn intern(ctx: *anyopaque, text: []const u8, gpa: Allocator) ParseError!u32 {
+        const self: *Table = @ptrCast(@alignCast(ctx));
         for (self.items.items, 0..) |item, i| {
             if (std.mem.eql(u8, item, text)) return std.math.cast(u32, i) orelse error.Overflow;
         }
@@ -4411,7 +4411,7 @@ test "a scripted merge produces the hand-derived patch stream" {
         .id = opId(1, 0),
         .conflict = false,
     }};
-    const doc: TestDoc = .{ .objs = &.{
+    var doc: TestDoc = .{ .objs = &.{
         .{ .id = .root, .typ = .map, .map_items = &root_map_item },
         .{
             .id = list_obj,
@@ -4444,7 +4444,7 @@ test "every PatchAction variant is produced by the event that names it" {
     // document these patches are read against is empty. That is deliberate: it
     // isolates the event-to-action mapping from path resolution, which the
     // scripted-merge and expose tests cover.
-    const doc: TestDoc = .{ .objs = &.{} };
+    var doc: TestDoc = .{ .objs = &.{} };
 
     var bold: MarkSet = MarkSet.fromPairs(gpa, &.{.{ .name = "bold", .value = ival(1) }}) catch unreachable;
     defer bold.deinit();
@@ -4554,7 +4554,7 @@ test "the expose queue supplies an object's content before the patch that names 
     const child_items = [_]ListItem{
         .{ .index = 0, .value = .{ .scalar = sval("p") }, .id = opId(4, 0), .conflict = false },
     };
-    const doc: TestDoc = .{ .objs = &.{
+    var doc: TestDoc = .{ .objs = &.{
         .{ .id = .root, .typ = .map, .map_items = &root_items },
         .{ .id = .{ .id = opId(1, 0) }, .typ = .map, .parent = .root, .map_items = &inner_items },
         .{ .id = .{ .id = opId(3, 0) }, .typ = .list, .parent = .{ .id = opId(1, 0) }, .list_items = &child_items },
@@ -4668,7 +4668,7 @@ test "migrateActors runs before any op is logged and the logged ids follow it" {
     try testing.expectEqualStrings("migrateActors", probe.order.items[0]);
     try testing.expectEqualStrings("putMap", probe.order.items[1]);
 
-    const doc: TestDoc = .{ .objs = &.{
+    var doc: TestDoc = .{ .objs = &.{
         .{ .id = .root, .typ = .map },
     } };
     var patches = try probe.log.makePatches(TestDoc, &doc);
@@ -4703,7 +4703,7 @@ test "a rolled-back transaction leaves no patch behind" {
         .id = opId(1, 0),
         .conflict = false,
     }};
-    const doc: TestDoc = .{ .objs = &.{
+    var doc: TestDoc = .{ .objs = &.{
         .{ .id = .root, .typ = .map, .map_items = &root_items },
         .{ .id = list_obj, .typ = .list, .parent = .root },
     } };
@@ -4745,7 +4745,7 @@ test "two adjacent events on one object are one patch, and two objects are two" 
         .id = opId(1, 0),
         .conflict = false,
     }};
-    const doc: TestDoc = .{ .objs = &.{
+    var doc: TestDoc = .{ .objs = &.{
         .{ .id = .root, .typ = .map, .map_items = &root_items },
         .{ .id = list_obj, .typ = .list, .parent = .root },
     } };
@@ -4774,7 +4774,7 @@ test "n mark events on one object coalesce into one patch holding every run, in 
         .id = opId(1, 0),
         .conflict = false,
     }};
-    const doc: TestDoc = .{ .objs = &.{
+    var doc: TestDoc = .{ .objs = &.{
         .{ .id = .root, .typ = .map, .map_items = &root_items },
         .{ .id = list_obj, .typ = .list, .parent = .root },
     } };
@@ -4876,7 +4876,7 @@ test "a delete that lands inside the insert before it takes the elements back ou
     const gpa = testing.allocator;
     var log: PatchLog = .active(gpa);
     defer log.deinit();
-    const doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
+    var doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
 
     // An insert of three, then a delete of two inside it: the values come out
     // of the tail insert and only the third is left, so there is **one** patch
@@ -4906,7 +4906,7 @@ test "a delete that lands inside the insert before it takes the elements back ou
 test "PatchBuilder coalesced text deletion preserves supplementary scalar suffix in every encoding" {
     // Delete the complete scalar span, not its individual encoded units.
     // Upstream removes those units from its native-unit tree (`patch_builder.rs`:242-247).
-    const doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
+    var doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
     for ([_]TextEncoding{
         .utf8_code_unit, .utf16_code_unit, .unicode_code_point, .grapheme_cluster,
     }) |enc| {
@@ -5059,7 +5059,7 @@ fn logEveryVariant(gpa: Allocator, log: *PatchLog) !void {
 
 test "the same log replayed twice yields the same patches" {
     const gpa = testing.allocator;
-    const doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
+    var doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
 
     // Twice, over two logs built by the same calls.
     var one: PatchLog = .active(gpa);
@@ -5098,7 +5098,7 @@ test "the same log replayed twice yields the same patches" {
 
 test "an empty log and an unchanged document produce no patches" {
     const gpa = testing.allocator;
-    const doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
+    var doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
 
     // Nothing logged.
     var empty: PatchLog = .active(gpa);
@@ -5125,7 +5125,7 @@ test "an empty log and an unchanged document produce no patches" {
 
 test "a borrowed mark set is copied, not retained" {
     const gpa = testing.allocator;
-    const doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
+    var doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
 
     var log: PatchLog = .active(gpa);
     defer log.deinit();
@@ -5176,7 +5176,7 @@ test "a borrowed mark set is copied, not retained" {
 ///
 /// **No `defer log.deinit()` in here, on purpose.** Dropping the log before
 /// the read is the whole test; a `defer` would free it after.
-fn patchesAfterLogInsert(gpa: Allocator, doc: *const TestDoc, value: ScalarValue) !Patches {
+fn patchesAfterLogInsert(gpa: Allocator, doc: *TestDoc, value: ScalarValue) !Patches {
     var log: PatchLog = .active(gpa);
     log.insert(.root, 0, .{ .scalar = value }, opId(1, 0), false);
     const patches = try log.makePatches(TestDoc, doc);
@@ -5211,7 +5211,7 @@ fn oneInsertValue(p: *const Patches) !InsertValue {
 
 test "an insert's string payload belongs to the batch, not to the log" {
     const gpa = testing.allocator;
-    const doc: TestDoc = .{ .objs = &.{} };
+    var doc: TestDoc = .{ .objs = &.{} };
     const payload = "a string that has to outlive the log that carried it";
 
     var patches = try patchesAfterLogInsert(gpa, &doc, .{ .str = payload });
@@ -5224,7 +5224,7 @@ test "an insert's string payload belongs to the batch, not to the log" {
 
 test "an insert's byte payload belongs to the batch, not to the log" {
     const gpa = testing.allocator;
-    const doc: TestDoc = .{ .objs = &.{} };
+    var doc: TestDoc = .{ .objs = &.{} };
     const payload = "bytes that have to outlive the log that carried them";
 
     var patches = try patchesAfterLogInsert(gpa, &doc, .{ .bytes = payload });
@@ -5237,7 +5237,7 @@ test "an insert's byte payload belongs to the batch, not to the log" {
 
 test "an insert's actor-id payload belongs to the batch, not to the log" {
     const gpa = testing.allocator;
-    const doc: TestDoc = .{ .objs = &.{} };
+    var doc: TestDoc = .{ .objs = &.{} };
     const payload = "0123456789abcdef";
 
     var patches = try patchesAfterLogInsert(gpa, &doc, .{ .actor_id = ActorId.init(payload) });
@@ -5250,7 +5250,7 @@ test "an insert's actor-id payload belongs to the batch, not to the log" {
 
 test "an insert's unknown-type payload belongs to the batch, not to the log" {
     const gpa = testing.allocator;
-    const doc: TestDoc = .{ .objs = &.{} };
+    var doc: TestDoc = .{ .objs = &.{} };
     const payload = "a value from a version of automerge this port does not know";
 
     var patches = try patchesAfterLogInsert(gpa, &doc, .{
@@ -5266,7 +5266,7 @@ test "an insert's unknown-type payload belongs to the batch, not to the log" {
 
 test "an insert that merges into the tail patch copies its payload too" {
     const gpa = testing.allocator;
-    const doc: TestDoc = .{ .objs = &.{} };
+    var doc: TestDoc = .{ .objs = &.{} };
     const first = "the payload the tail patch was opened with";
     const second = "the payload that merged into it";
 
@@ -5292,7 +5292,7 @@ test "an insert that merges into the tail patch copies its payload too" {
 
 test "a batch of insert, put and mark patches outlives the log that built it" {
     const gpa = testing.allocator;
-    const doc: TestDoc = .{ .objs = &.{} };
+    var doc: TestDoc = .{ .objs = &.{} };
 
     // **The mark's value is a `str` on purpose.** An `Int` value carries no
     // bytes, so a mark with one could not tell a copied value payload from a
@@ -5352,7 +5352,7 @@ test "a path's map key belongs to the batch, not to the document" {
         .id = opId(1, 0),
         .conflict = false,
     }};
-    const doc: TestDoc = .{ .objs = &.{
+    var doc: TestDoc = .{ .objs = &.{
         .{ .id = .root, .typ = .map, .map_items = &root_items },
         .{ .id = .{ .id = opId(1, 0) }, .typ = .map, .parent = .root },
     } };
@@ -5412,7 +5412,7 @@ test "a delete in a change is a DeleteMap and a DeleteSeq" {
         .id = opId(2, 0),
         .conflict = false,
     }};
-    const doc: TestDoc = .{ .objs = &.{
+    var doc: TestDoc = .{ .objs = &.{
         .{ .id = .root, .typ = .map, .map_items = &root_items },
         .{ .id = text_obj, .typ = .text, .parent = .root },
     } };
@@ -5460,7 +5460,7 @@ test "a text insert is a splice and a mark-only change is a Mark" {
         .id = opId(2, 0),
         .conflict = false,
     }};
-    const doc: TestDoc = .{ .objs = &.{
+    var doc: TestDoc = .{ .objs = &.{
         .{ .id = .root, .typ = .map, .map_items = &root_items },
         .{ .id = text_obj, .typ = .text, .parent = .root },
     } };
@@ -5522,7 +5522,7 @@ test "a merge's own two rules are a Conflict and an Increment" {
 
 test "a transaction that made no ops takes its speculative actor back out" {
     const gpa = testing.allocator;
-    const doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
+    var doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
     const two_actors = [_]ActorId{ fixture_actors[0], fixture_actors[1] };
 
     var log: PatchLog = .active(gpa);
@@ -5563,7 +5563,7 @@ test "a transaction that made no ops takes its speculative actor back out" {
 
 test "the patches of a view already left behind come first, in the order they were built" {
     const gpa = testing.allocator;
-    const doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
+    var doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
     const heads = [_]ChangeHash{.{ .bytes = @as([32]u8, @splat(0x11)) }};
 
     var log: PatchLog = .active(gpa);
@@ -5587,7 +5587,7 @@ test "the patches of a view already left behind come first, in the order they we
 
 test "a delete of no elements changes nothing and traps on nothing" {
     const gpa = testing.allocator;
-    const doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
+    var doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
 
     var log: PatchLog = .active(gpa);
     defer log.deinit();
@@ -5635,7 +5635,7 @@ test "a refused mark run frees the half it had already copied" {
 /// A document whose root holds nothing, so the only way a nested object's
 /// path can be resolved is through the cache the caller seeded. The key is a
 /// literal, which is what [`PathMap`]'s borrow contract asks of a test.
-const unbacked_doc: TestDoc = .{
+var unbacked_doc: TestDoc = .{
     .objs = &.{
         .{ .id = .root, .typ = .map },
         .{ .id = .{ .id = OpId.init(2, 0) }, .typ = .map, .parent = .root },
@@ -5788,7 +5788,7 @@ test "snapshot hints render first against an old owner through a cloned borrowed
     try testing.expect(owner.idToExid(OpId.init(3, 0)).eql(first_insert.obj));
 }
 
-fn clonedIndexedSeedThenFree(gpa: Allocator, owner: *const @import("doc.zig").Document) !void {
+fn clonedIndexedSeedThenFree(gpa: Allocator, owner: *@import("doc.zig").Document) !void {
     var log = PatchLog.active(gpa);
     defer log.deinit();
     log.putMap(
@@ -6125,7 +6125,7 @@ test "actor migration retains trailing actors and replays both root producers" {
     try testing.expectEqual(@as(usize, 2), log.actors.items.len);
     try testing.expectEqualStrings("a", log.actors.items[0].bytes);
     try testing.expectEqualStrings("b", log.actors.items[1].bytes);
-    const doc = TestDoc{};
+    var doc = TestDoc{};
     var patches = try log.makePatches(TestDoc, &doc);
     defer patches.deinit();
     try expectPatches(testing.allocator, &patches, &.{
@@ -6211,7 +6211,7 @@ test "PatchLog merge accepts foreign metadata and retains the compatible actor t
     try testing.expectEqualStrings("c", target.actors.items[1].bytes);
     try testing.expectEqual(@as(?u64, 2), other.identity);
     try testing.expectEqual(@as(usize, 1), other.events.items.len);
-    const doc = TestDoc{};
+    var doc = TestDoc{};
     var patches = try target.makePatches(TestDoc, &doc);
     defer patches.deinit();
     try expectPatches(testing.allocator, &patches, &.{
@@ -6229,7 +6229,7 @@ test "PatchLog merge accepts foreign metadata and retains the compatible actor t
 
 test "native text units patch coalescing retains incomplete encoded units" {
     // A consumer's patch must preserve a one-unit deletion inside a scalar.
-    const doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
+    var doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
     for ([_]TextEncoding{ .utf8_code_unit, .utf16_code_unit }) |enc| {
         var out = Patches.init(testing.allocator);
         defer out.deinit();
@@ -6396,7 +6396,7 @@ fn publishHandshakeDoc(comptime actor: ActorIdx) TestDoc {
 }
 
 fn publishHandshakeCompleted(log: *PatchLog, text: []const u8) !void {
-    const doc = TestDoc{};
+    var doc = TestDoc{};
     var source = PatchLog.active(log.gpa);
     defer source.deinit();
     source.splice(.root, 0, text, null);
@@ -6474,7 +6474,7 @@ fn publishHandshakeOriginal(target: *PatchLog) !void {
     // a deep copy so repeated atomicity checks do not mutate either owner.
     var observed = try target.cloneAndRebind(target.gpa, target.identity.?);
     defer observed.deinit();
-    const doc = publishHandshakeDoc(1);
+    var doc = publishHandshakeDoc(1);
     var patches = try observed.makePatches(TestDoc, &doc);
     defer patches.deinit();
     try expectPatches(testing.allocator, &patches, &.{
@@ -6494,7 +6494,7 @@ fn publishHandshakeOriginal(target: *PatchLog) !void {
 fn publishHandshakeStageOwned(stage: *PatchLog) !void {
     try testing.expect(stage.isActive());
     try publishHandshakeOwner(stage, &publish_handshake_new_actors);
-    const doc = publishHandshakeDoc(2);
+    var doc = publishHandshakeDoc(2);
     var patches = try stage.makePatches(TestDoc, &doc);
     defer patches.deinit();
     try testing.expectEqual(@as(usize, 18), patches.len());
@@ -6570,7 +6570,7 @@ test "canonical PatchLog handshake publication allocates nothing and preserves m
     failing.resize_fail_index = std.math.maxInt(usize);
     try testing.expect(!stage.isActive());
     try publishHandshakeOwner(&target, &publish_handshake_new_actors);
-    const doc = publishHandshakeDoc(2);
+    var doc = publishHandshakeDoc(2);
     var patches = try target.makePatches(TestDoc, &doc);
     defer patches.deinit();
     try testing.expectEqual(@as(usize, 23), patches.len());
@@ -6614,7 +6614,7 @@ fn publishHandshakeCloneCheckpoint(gpa: Allocator) !void {
     original = PatchLog.inactive(gpa);
     try cloned.validateActors(&publish_handshake_old_actors);
     try testing.expectEqual(@as(?u64, 74), cloned.identity);
-    const doc = publishHandshakeDoc(1);
+    var doc = publishHandshakeDoc(1);
     var patches = try cloned.makePatches(TestDoc, &doc);
     defer patches.deinit();
     cloned.deinit();
@@ -6663,7 +6663,7 @@ test "patch values read high unsigned scalars with wrapping integer semantics" {
 
 fn publishOriginPublished(target: *PatchLog) !void {
     try publishHandshakeOwner(target, &publish_handshake_new_actors);
-    const doc = publishHandshakeDoc(2);
+    var doc = publishHandshakeDoc(2);
     var patches = try target.makePatches(TestDoc, &doc);
     defer patches.deinit();
     try testing.expectEqual(@as(usize, 23), patches.len());

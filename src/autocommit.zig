@@ -241,7 +241,7 @@ pub const AutoCommit = struct {
     }
 
     /// Returns a raw borrowed document only after the pending transaction closes.
-    pub fn document(self: *AutoCommit) !*const docmod.Document {
+    pub fn document(self: *AutoCommit) !*docmod.Document {
         try self.ensureTransactionClosed();
         return &self.doc;
     }
@@ -317,7 +317,7 @@ pub const AutoCommit = struct {
     }
 
     /// Materializes caller-owned patches from a borrowed external log without closing.
-    pub fn makePatches(self: *const AutoCommit, log: *patchesmod.PatchLog) !patchesmod.Patches {
+    pub fn makePatches(self: *AutoCommit, log: *patchesmod.PatchLog) !patchesmod.Patches {
         return self.doc.makePatches(log);
     }
 

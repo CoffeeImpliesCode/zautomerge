@@ -165,7 +165,7 @@ pub fn expectHeads(gpa: Allocator, expected: Json, actual: []const am.types.Chan
     }
 }
 
-pub fn expectTree(gpa: Allocator, expected: Json, actual: *const am.doc.Document) !void {
+pub fn expectTree(gpa: Allocator, expected: Json, actual: *am.doc.Document) !void {
     const json = try am.autoserde.AutoSerde(am.doc.Document).from(actual).toJson(gpa);
     defer gpa.free(json);
     try expectJsonText(gpa, expected, json);

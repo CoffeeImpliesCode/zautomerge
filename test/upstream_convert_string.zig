@@ -91,7 +91,7 @@ fn newDoc(encoding: TextEncoding) !Document {
 
 /// The scalar at `obj.prop`, or `error.NoSuchKey` when nothing is there and
 /// `error.NotAnObject` when an object is.
-fn scalarAt(doc: *const Document, obj: ExId, prop: Prop) !ScalarValue {
+fn scalarAt(doc: *Document, obj: ExId, prop: Prop) !ScalarValue {
     const item = (try am.read.get(doc, obj, prop)) orelse return error.NoSuchKey;
     return switch (item.value) {
         .scalar => |s| s,
@@ -109,7 +109,7 @@ fn scalarAt(doc: *const Document, obj: ExId, prop: Prop) !ScalarValue {
 ///
 /// Both upstream and the public reader carry the object's type in the value;
 /// `item.id` separately identifies the object.
-fn expectTextObject(doc: *const Document, obj: ExId, prop: Prop) !ExId {
+fn expectTextObject(doc: *Document, obj: ExId, prop: Prop) !ExId {
     const item = (try am.read.get(doc, obj, prop)) orelse {
         std.debug.print("no value found at {s}\n", .{@tagName(prop)});
         return error.NoSuchKey;
@@ -139,7 +139,7 @@ fn expectTextObject(doc: *const Document, obj: ExId, prop: Prop) !ExId {
 /// UTF-8 and UTF-16 operations contain code points but may span multiple units;
 /// grapheme indexing stores a whole cluster per element.
 fn expectTextObjectContents(
-    doc: *const Document,
+    doc: *Document,
     text_id: ExId,
     want: []const u8,
     enc: TextEncoding,

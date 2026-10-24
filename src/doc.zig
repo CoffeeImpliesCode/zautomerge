@@ -285,8 +285,8 @@ pub const Strings = struct {
     /// which is `ParseError` because that is where a save fails too.
     /// Duplicates allocate nothing. A refusal publishes no key and consumes no
     /// ID; earlier resolved byte borrows remain valid until `deinit`.
-    fn intern(ctx: *const anyopaque, bytes: []const u8, gpa: Allocator) ParseError!u32 {
-        const self: *Strings = @ptrCast(@alignCast(@constCast(ctx)));
+    fn intern(ctx: *anyopaque, bytes: []const u8, gpa: Allocator) ParseError!u32 {
+        const self: *Strings = @ptrCast(@alignCast(ctx));
         if (self.map.getIndex(bytes)) |i| {
             return std.math.cast(u32, i) orelse error.Overflow;
         }
@@ -6558,7 +6558,7 @@ pub const Document = struct {
     /// [`batchmod.applyChangesBatchToSink`] directly. The caller owns the
     /// result. Rendering does not migrate or reject the actor table, matching
     /// Rust `patch_log.rs:505-529`; indexed IDs are exported through this document.
-    pub fn makePatches(self: *const Document, log: *patchesmod.PatchLog) patchesmod.MakeError!patchesmod.Patches {
+    pub fn makePatches(self: *Document, log: *patchesmod.PatchLog) patchesmod.MakeError!patchesmod.Patches {
         var view = PatchDoc.init(log.gpa, self, null);
         defer view.deinit();
         return log.makePatches(PatchDoc, &view);
@@ -6567,7 +6567,7 @@ pub const Document = struct {
     /// Materializes the borrowed log's current view through the private patch
     /// reader before the log begins recording at another head set.
     pub fn finishCurrentPatchView(
-        self: *const Document,
+        self: *Document,
         log: *patchesmod.PatchLog,
         heads: []const ChangeHash,
     ) patchesmod.MakeError!void {
@@ -6579,11 +6579,9 @@ pub const Document = struct {
     /// The clock a set of heads names ([`Automerge::clock_range`](../../github-automerge-automerge/rust/automerge/src/automerge.rs),
     /// `automerge.rs:1230-1234`, one half of it).
     ///
-    /// **Not `@constCast` for its own sake**: [`ChangeGraph.clockAt`] is
-    /// `&mut self` upstream and here because it grows a clock as it walks, and
-    /// a diff reads the graph without changing the document.
-    fn clockAtHeads(self: *const Document, gpa: Allocator, heads: []const ChangeHash) Error!clockmod.Clock {
-        return @constCast(&self.graph).clockAt(gpa, heads);
+    /// Computing the clock updates the graph's traversal cache.
+    fn clockAtHeads(self: *Document, gpa: Allocator, heads: []const ChangeHash) Error!clockmod.Clock {
+        return self.graph.clockAt(gpa, heads);
     }
 
     /// The facade's isolated read cone, or null for the unscoped present
@@ -6736,7 +6734,7 @@ const PatchDoc = struct {
     /// The allocator the arena is taken with.
     gpa: Allocator,
     /// The document these nine names read.
-    doc: *const Document,
+    doc: *Document,
     /// Every borrowed payload the patch layer reads lives here, and dies in
     /// [`deinit`](PatchDoc.deinit).
     arena: std.heap.ArenaAllocator,
@@ -6745,7 +6743,7 @@ const PatchDoc = struct {
     /// stable historical pool; the adapter never invents an empty clock.
     clock: ?clockmod.Clock,
 
-    fn init(gpa: Allocator, doc: *const Document, clock: ?clockmod.Clock) PatchDoc {
+    fn init(gpa: Allocator, doc: *Document, clock: ?clockmod.Clock) PatchDoc {
         return .{ .gpa = gpa, .doc = doc, .arena = .init(gpa), .clock = clock };
     }
 
@@ -6756,7 +6754,7 @@ const PatchDoc = struct {
 
     /// The handle the walks are built over ([`Doc.iter/doc.rs`:44`).
     fn handle(self: *const PatchDoc) iterdoc.Doc(ChangeOp) {
-        return .init(@constCast(&self.doc.ops), self.doc.textEncoding());
+        return .init(&self.doc.ops, self.doc.textEncoding());
     }
 
     pub fn textEncoding(self: *const PatchDoc) TextEncoding {
@@ -6788,7 +6786,7 @@ const PatchDoc = struct {
         heads: []const ChangeHash,
     ) Error!*const clockmod.Clock {
         if (self.clock) |*clock| return clock;
-        return @constCast(self.doc).clockAtScope(gpa, heads);
+        return self.doc.clockAtScope(gpa, heads);
     }
 
     pub fn actorList(self: *const PatchDoc) []const ActorId {
@@ -6796,7 +6794,7 @@ const PatchDoc = struct {
     }
 
     pub fn mapRangeFor(self: *const PatchDoc, id: ExId, clock: ?clockmod.Clock) MapSlice {
-        const set = @constCast(&self.doc.ops);
+        const set = &self.doc.ops;
         const rows = set.mapRange(id, null, null) catch |e| {
             return .{ .iter = undefined, .failure = patchReadError(e) };
         };
@@ -6807,7 +6805,7 @@ const PatchDoc = struct {
     }
 
     pub fn listRangeFor(self: *const PatchDoc, id: ExId, clock: ?clockmod.Clock) ListSlice {
-        const set = @constCast(&self.doc.ops);
+        const set = &self.doc.ops;
         const rows = set.listRange(id) catch |e| {
             return .{ .iter = undefined, .failure = patchReadError(e) };
         };
@@ -6828,9 +6826,9 @@ const PatchDoc = struct {
     /// ([`patchesmod.Span`](patches.zig), `patches.zig`:179-183`), and
     /// upstream's `flush_obj` reads the index off `SpanInternal` too
     /// (`patch_log.rs`:736-740`).
-    pub fn spans(self: *const PatchDoc, id: ExId, clock: ?clockmod.Clock) SpanSlice {
-        const set = @constCast(&self.doc.ops);
-        const arena = @constCast(&self.arena).allocator();
+    pub fn spans(self: *PatchDoc, id: ExId, clock: ?clockmod.Clock) SpanSlice {
+        const set = &self.doc.ops;
+        const arena = self.arena.allocator();
         const rows = set.spans(id) catch |e| {
             return .{ .iter = undefined, .failure = patchReadError(e) };
         };
@@ -8584,10 +8582,10 @@ test "the index a document is built with is the index its bytes rebuild" {
     // this too, but a test that says "these two documents are equal" and a test
     // that says "each of them is internally consistent" are different claims,
     // and two equally broken documents satisfy the first.
-    for ([_]*const Document{ &built, &reloaded }) |doc| {
+    for ([_]*Document{ &built, &reloaded }) |doc| {
         try testing.expectEqual(@as(usize, 14), doc.ops.len());
-        try testing.expect(try @constCast(&doc.ops).validateOpOrder());
-        try testing.expectEqual(@as(?opsetmod.TopIndexFault, null), try @constCast(&doc.ops).validateTopIndex());
+        try testing.expect(try doc.ops.validateOpOrder());
+        try testing.expectEqual(@as(?opsetmod.TopIndexFault, null), try doc.ops.validateTopIndex());
         try testing.expectEqual(doc.ops.cols.index.top.len(), doc.ops.cols.index.visible.len());
     }
     // And the two indexes are the *same* index, cell for cell. A checker that
@@ -8604,7 +8602,7 @@ test "the index a document is built with is the index its bytes rebuild" {
     // document answers every one of them the same way. The mark is the one
     // that matters: a wrong `top` in the text object's registers is exactly
     // what a text read walks.
-    for ([_]*const Document{ &built, &reloaded }) |doc| {
+    for ([_]*Document{ &built, &reloaded }) |doc| {
         const text = try readonly.text(doc, text_id, gpa);
         defer gpa.free(text);
         try testing.expectEqualStrings("hi!", text);
@@ -8641,21 +8639,21 @@ test "the index a document is built with is the index its bytes rebuild" {
 /// A root map key's value as the string the document holds.
 ///
 /// **Borrowed, not copied** ([`read.zig` §The ownership rule](../read.zig)):
-/// the bytes are the op set's interned value, so the slice dies with the next
-/// mutation. Nothing here mutates.
-fn scalarOf(doc: *const Document, key: []const u8) ![]const u8 {
+/// the bytes are the op set's interned value, valid until mutation. The read
+/// leaves content unchanged but can update iterator scratch.
+fn scalarOf(doc: *Document, key: []const u8) ![]const u8 {
     return scalarOfKey(doc, ExId.root, key);
 }
 
 /// `key`'s value in the map at `obj`, as a string.
-fn scalarOfKey(doc: *const Document, obj: ExId, key: []const u8) ![]const u8 {
+fn scalarOfKey(doc: *Document, obj: ExId, key: []const u8) ![]const u8 {
     const item = (try @import("read.zig").get(doc, obj, .{ .key = key })) orelse
         return error.TestUnexpectedResult;
     return item.value.scalar.str;
 }
 
 /// The value at `index` in the list at `obj`, as a string.
-fn scalarAt(doc: *const Document, obj: ExId, index: usize) ![]const u8 {
+fn scalarAt(doc: *Document, obj: ExId, index: usize) ![]const u8 {
     const item = (try @import("read.zig").get(doc, obj, .{ .index = index })) orelse
         return error.TestUnexpectedResult;
     return item.value.scalar.str;
@@ -11138,7 +11136,7 @@ fn concatChunks(gpa: Allocator, parts: []const []const u8) ![]u8 {
 /// ([`DocObjItem`](iter/doc.zig)) — a list of them would be a list of slices
 /// neither the walk nor this function owns.
 fn walkReaching(
-    doc: *const Document,
+    doc: *Document,
     gpa: Allocator,
     key: []const u8,
 ) !struct { count: usize, reached: bool } {
