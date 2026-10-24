@@ -3,12 +3,8 @@
 //!
 //! ## What this file is, and why it is the other half of the totality gate
 //!
-//! [`AGENTS.md`](../AGENTS.md) states the rule absolutely: *"Every parser is
-//! total over untrusted input: a `ParseError`, never a panic, never an unbounded
-//! loop, never an unchecked allocation size. The 8 fixtures in the upstream
-//! `tests/fuzz-crashers/` are the regression suite for this."* That suite is
-//! built and green ([`src/storage/totality_test.zig`](../src/storage/totality_test.zig),
-//! 885 truncations, 7,144 bit flips, 1,413 hostile DEFLATE streams).
+//! Parsers must reject untrusted input without panic, unbounded loops, or unchecked allocation sizes.
+//! The separate [`storage totality suite`](../src/storage/totality_test.zig) embeds upstream fuzz-crasher fixtures.
 //!
 //! **This file is the other half, and it is not a second copy of the first.**
 //! `totality_test.zig` is a *mutation* suite: it takes well-formed documents and
@@ -66,19 +62,15 @@
 //! the bytes are a **fresh `Vec` on the heap**, owned by the `ActorId`, and the
 //! `Vec`'s allocation outlives the call.
 //!
-//! **A string literal can never die, so a test that only ever uses literals
-//! never reaches the path a real caller does.** A sibling agent found the C
-//! ABI's actor was freed memory today, and it surfaced only through the C gate
-//! because every actor in the Zig tests was a literal. [`Actors`] therefore
-//! hands out **arena-allocated copies** of every actor byte, including the two
+//! String-literal actors cannot expose use-after-free defects in actor storage.
+//! [`Actors`] hands out arena-allocated copies of every actor byte, including the two
 //! upstream one-byte actors `[0]` and `[1]`, and the arena is freed only when
 //! the document is. That is upstream's lifetime, and it is the shape a consumer's
 //! bytes have.
 //!
 //! ## Boundedness: the argument, because no green run proves it
 //!
-//! [`AGENTS.md`](../AGENTS.md) names *"never an unbounded loop"* as a clause of
-//! its own, and a passing test says nothing about it. The argument for this file:
+//! Boundedness requires more than a successful test run. The argument for this file:
 //!
 //! * **The only untrusted bytes in this file are 207.** [`broken_mark_bytes`]
 //!   embeds `test/fixtures/broken_zero_width_mark.automerge`, byte-compared
@@ -159,11 +151,8 @@ const Span = am.iter.spans.Span;
 const root: ExId = am.root;
 
 /// [`rust/automerge/tests/fixtures/broken_zero_width_mark.automerge`](../github-automerge-automerge/rust/automerge/tests/fixtures),
-/// embedded. **`@embedFile` rather than a runtime path**, which is the mapping
-/// `docs/survey/08-conformance-history.md:530` records for upstream's
-/// `include_bytes!` and why: `zig test` does not guarantee the process working
-/// directory is the package root, so a runtime read is fragile in a way an
-/// embed is not. It also means this file's build step needs **no `setCwd`**.
+/// embedded with `@embedFile`, matching upstream's `include_bytes!`.
+/// Embedding avoids dependence on the test process's working directory.
 ///
 /// **The bytes were checked before they were used.** `cmp` against the reference
 /// checkout: identical, 207 bytes on both sides.
@@ -442,7 +431,8 @@ test "splice a string into a marked text object rewrites the text" {
     var doc = try newDoc(&actors);
     defer doc.deinit();
 
-    const text = try committedWrite(&doc, "putObject", .{ root, Prop{ .key = "text" }, ObjType.text });
+    var text = try (try committedWrite(&doc, "putObject", .{ root, Prop{ .key = "text" }, ObjType.text })).dup(gpa);
+    defer text.deinitOwned(gpa);
     try committedWrite(&doc, "updateText", .{ text, "abcd" });
     try committedWrite(&doc, "mark", .{ text, 0, 4, "m", ExpandMark.none, ScalarValue{ .bool_value = true } });
 
@@ -561,7 +551,8 @@ test "a zero width mark on an empty text object round trips through save and loa
     var doc = try newDoc(&actors);
     defer doc.deinit();
 
-    const text = try committedWrite(&doc, "putObject", .{ root, Prop{ .key = "text" }, ObjType.text });
+    var text = try (try committedWrite(&doc, "putObject", .{ root, Prop{ .key = "text" }, ObjType.text })).dup(gpa);
+    defer text.deinitOwned(gpa);
     try committedWrite(&doc, "unmark", .{ text, 0, 0, ExpandMark.after, "italic", null });
     try commitAs(&doc, &actors, &.{1});
     try committedWrite(&doc, "mark", .{ text, 0, 0, "link", ExpandMark.before, ScalarValue{ .bool_value = true } });
@@ -661,7 +652,8 @@ test "splice text at the object's own length over a conflicted element" {
     var doc = try newDoc(&actors);
     defer doc.deinit();
 
-    const text = try committedWrite(&doc, "putObject", .{ root, Prop{ .key = "text" }, ObjType.text });
+    var text = try (try committedWrite(&doc, "putObject", .{ root, Prop{ .key = "text" }, ObjType.text })).dup(gpa);
+    defer text.deinitOwned(gpa);
     try committedWrite(&doc, "spliceText", .{ text, 0, 0, "a" });
     try commitAs(&doc, &actors, &.{0});
 
@@ -727,7 +719,8 @@ test "a mark inside one multi width element round trips through save and load" {
     var doc = try newDoc(&actors);
     defer doc.deinit();
 
-    const text = try committedWrite(&doc, "putObject", .{ root, Prop{ .key = "text" }, ObjType.text });
+    var text = try (try committedWrite(&doc, "putObject", .{ root, Prop{ .key = "text" }, ObjType.text })).dup(gpa);
+    defer text.deinitOwned(gpa);
     _ = try committedWrite(&doc, "insert", .{ text, 0, ScalarValue{ .str = "hello world" } });
     try commitAs(&doc, &actors, &.{0});
     try committedWrite(&doc, "mark", .{ text, 3, 8, "bold", ExpandMark.none, ScalarValue{ .bool_value = true } });
