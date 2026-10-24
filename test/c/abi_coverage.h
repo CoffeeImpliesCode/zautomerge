@@ -15,9 +15,7 @@
  * case here, written against the reference's documented behaviour rather
  * than against this port's, and cited to the `path:line` that states it.
  *
- * These are not ports of upstream cases. Upstream has no case for any of
- * them; `AGENTS.md`'s "Port upstream tests case-for-case" does not apply,
- * and the gap these close is one the reference itself leaves.
+ * These cases supplement the upstream suite.
  */
 int run_abi_coverage_tests(void);
 

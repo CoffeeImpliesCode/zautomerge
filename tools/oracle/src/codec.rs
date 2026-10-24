@@ -6,15 +6,8 @@
 //! load-time slab cutter — and prints, for a corpus of values, the bytes
 //! the reference itself produced.
 //!
-//! **The claim this file exists to support.** `docs/plan.md` §P2 asks for
-//! "every codec round-trips bytes for random inputs against the Rust", and
-//! the interesting half of that is not the round trip. An encoder and a
-//! decoder agreeing with each other is a statement about *this*
-//! implementation alone; what a document written by the port needs is that
-//! the reference reads the same bytes. So every record here carries the
-//! reference's bytes for a named input, and the Zig side compares its own
-//! bytes to them. A difference is a compatibility break, not a test
-//! failure.
+//! Each record carries the reference's bytes for a named input.
+//! The Zig tests compare their encoded bytes with this corpus.
 //!
 //! # The corpus
 //!

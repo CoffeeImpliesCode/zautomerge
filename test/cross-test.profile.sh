@@ -59,7 +59,7 @@ CROSS_BUILD_STEP=test
 #   powerpc64-linux  BIG-ENDIAN (`/bin/qemu-ppc64`), and the only byte-order
 #                    evidence this project has: the host, aarch64-linux and
 #                    x86_64-windows are all little-endian. The compatibility
-#                    contract in AGENTS.md is encoded bytes — LEB128, the
+#                    contract is encoded bytes — LEB128, the
 #                    column order, the change hashes — and a value that reaches
 #                    the wire through the host's own byte order is invisible on
 #                    every little-endian row. It hid exactly once, and **the

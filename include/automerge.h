@@ -360,8 +360,7 @@ typedef struct AMunknownValue {
  * This port replaces the reference's opaque `uint8_t detail[24]` blob with the
  * plain struct `Detail` it has always wrapped: `{len: usize, offset: isize,
  * ptr: *const c_void}` at `src/items.rs:10-15`. The layout, and therefore the
- * 24-byte size, is identical; only the transparency differs. See
- * `docs/plan.md` §10.
+ * 24-byte size, is identical; only the transparency differs.
  */
 typedef struct AMitems {
   size_t len;      /**< The count of items in the sequence. */
@@ -1410,9 +1409,8 @@ AMresult *AMsyncStateTheirNeeds(const AMsyncState *sync_state, bool *has_value);
  *
  * Upstream keeps these in four separate headers under
  * `include/automerge-c/utils/` and never regenerates them. They are folded
- * into this one header here because a consumer of this port has a single
- * header to install, and because `docs/STATUS.md` gives this slice exactly
- * two files. Every declaration below is a transcription of
+ * into this header so consumers install one header. Every declaration below
+ * is a transcription of
  * `include/automerge-c/utils/{result,string,stack,stack_callback_data}.h`
  * plus `src/utils/{result,string,stack,stack_callback_data}.c`.
  *
