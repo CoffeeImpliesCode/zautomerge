@@ -648,8 +648,10 @@ test "API parity serde allocation failures release both backend projections" {
             try testing.expect(tokens.items.items.len > 0);
         }
     };
-    try testing.checkAllAllocationFailures(gpa, Probe.json, .{&doc});
-    try testing.checkAllAllocationFailures(gpa, Probe.structured, .{&doc});
+    // Keep failure indices independent of SafeAllocator's in-place growth.
+    var backing: testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
+    try testing.checkAllAllocationFailures(backing.allocator(), Probe.json, .{&doc});
+    try testing.checkAllAllocationFailures(backing.allocator(), Probe.structured, .{&doc});
     const json = try AutoSerde(Document).from(&doc).toJson(gpa);
     defer gpa.free(json);
     try testing.expectEqualStrings(golden, json);

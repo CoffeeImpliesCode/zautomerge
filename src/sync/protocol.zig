@@ -4844,10 +4844,12 @@ test "sync change batches retain requested wire order in V1 and threshold-equal 
     for (0..4) |i| {
         try putAndCommit(gpa, &sender, "more", .{ .int = @intCast(i) }, @intCast(i));
     }
+    // Keep failure indices independent of SafeAllocator's in-place growth.
+    var backing: testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
     for ([_]bool{ false, true }) |v2| {
         try generateOrderedBatchAndFree(gpa, &sender, &requested, framed, v2);
         try testing.checkAllAllocationFailures(
-            gpa,
+            backing.allocator(),
             generateOrderedBatchAndFree,
             .{ &sender, &requested, framed, v2 },
         );

@@ -11396,8 +11396,10 @@ test "a bundle and its fragment encodings survive every allocation failure" {
         original[0..],
         repeated[0..],
     };
+    // Keep failure indices independent of SafeAllocator's in-place growth.
+    var backing: testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
     for (lists) |hashes| {
-        try testing.checkAllAllocationFailures(gpa, bundleThenDeinit, .{ &source, hashes });
+        try testing.checkAllAllocationFailures(backing.allocator(), bundleThenDeinit, .{ &source, hashes });
     }
 
     // **Both arms of `bundleFragments`, on real fragments.** The first two are
@@ -11432,7 +11434,7 @@ test "a bundle and its fragment encodings survive every allocation failure" {
     // the arguments to `@call` as they are, so what goes in the tuple has to
     // be the parameter's type and not something it coerces to.
     try testing.checkAllAllocationFailures(
-        gpa,
+        backing.allocator(),
         fragmentsThenDeinit,
         .{ &source, wanted[0..], want_types[0..] },
     );
@@ -11606,7 +11608,9 @@ test "a bundle chunk survives every allocation failure on the way back in" {
     // named one would queue instead of apply and the walk would stop early.
     const both = firstTwoChanges(&source);
     const list: []const ChangeHash = &both;
-    try testing.checkAllAllocationFailures(gpa, loadBundleChunkThenDeinit, .{ &source, list });
+    // Keep failure indices independent of SafeAllocator's in-place growth.
+    var backing: testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
+    try testing.checkAllAllocationFailures(backing.allocator(), loadBundleChunkThenDeinit, .{ &source, list });
 }
 
 /// Writes two bundles and loads both into one peer, for the sweep below.
@@ -11640,8 +11644,10 @@ test "a bundle behind another bundle survives every allocation failure" {
     var source = try buildSample(gpa);
     defer source.deinit();
     const both = firstTwoChanges(&source);
+    // Keep failure indices independent of SafeAllocator's in-place growth.
+    var backing: testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
     try testing.checkAllAllocationFailures(
-        gpa,
+        backing.allocator(),
         loadTwoBundleChunksThenDeinit,
         .{ &source, both[0], both[1] },
     );
@@ -15395,8 +15401,10 @@ test "duplicate selected history frees partial clones and preserves readable his
     var requested: [8]ChangeHash = undefined;
     const order = [_]usize{ 2, 3, 1, 2, 0, 3, 2, 1 };
     for (order, &requested) |index, *hash| hash.* = expected.at(index).hash;
+    // Keep failure indices independent of SafeAllocator's in-place growth.
+    var backing: testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
     try testing.checkAllAllocationFailures(
-        gpa,
+        backing.allocator(),
         selectedHistoryBatchAndFree,
         .{ &source, requested[0..] },
     );
