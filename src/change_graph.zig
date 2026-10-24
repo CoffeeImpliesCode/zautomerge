@@ -2036,8 +2036,7 @@ pub const ChangeGraph = struct {
     /// so the nodes, the three clocks, `seq_index` and the op counters all
     /// move together or none of them does. A clock left naming the old slot
     /// is not a smaller wrong answer: it is a clock that reads as covering a
-    /// different actor, which is the whole of what `AGENTS.md`'s actor-mirror
-    /// rule is about.
+    /// different actor.
     pub fn insertActor(self: *ChangeGraph, gpa: Allocator, idx: ActorIdx) Error!void {
         const at: usize = idx;
         if (at > self.seq_index.items.len) return error.InvalidIndex;

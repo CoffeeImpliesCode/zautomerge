@@ -62,7 +62,7 @@
 //! adjacent runs carrying the same value must be one run
 //! (`rle/decoder.rs:438-497`); the boolean codec is the standing example of
 //! what happens when that rule is carried over to an encoding whose runs
-//! carry no value (`docs/STATUS.md` defect 3). An arena's canonical form is a
+//! carry no value. An arena's canonical form is a
 //! *layout* rule, not an equality rule: adjacent slabs may hold identical
 //! bytes and stay split, and what has to hold is
 //!
@@ -1635,7 +1635,7 @@ test "copyRanges carries the source's slab boundaries across whole" {
     var src = try RawColumn.withMaxSegments(gpa, 4);
     defer src.deinit();
     for (0..12) |i| {
-        const v = [_]u8{@as(u8, 'a') + @as(u8, @intCast(i))} ** 4;
+        const v = @as([4]u8, @splat(@as(u8, 'a') + @as(u8, @intCast(i))));
         try src.spliceSlice(src.len(), 0, &v);
     }
     try testing.expectEqual(@as(usize, 12), src.slabCount());
@@ -2871,8 +2871,7 @@ test "max_segments_two_full_cycle" {
 // ported cases into English, so it under-counts what is actually asserted.
 // Per-case status, module-qualified ids, exclusion kinds, and the mapping from
 // an upstream case to a Zig declaration are owned by
-// `docs/hexane-cases.json`, pinned to the reference commit; the denominator is
-// published once, in `docs/STATUS.md`.
+// `docs/hexane-cases.json`, pinned to the reference commit.
 //
 // What stays here is the half a tally cannot carry: **where a blocked case
 // would be unblocked**, and why this file is the wrong home for it. Three

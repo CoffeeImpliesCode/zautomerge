@@ -128,9 +128,8 @@
 //! exports on that line.
 //!
 //! `KeyOpIter` (`iter.rs:25`) is the fourth and is **not a gap**: it is
-//! `#[cfg(test)]` upstream (`keys.rs:53-90`) and
-//! [`docs/plan.md`](../../docs/plan.md) §2 lists it among the items the port
-//! does not carry; [`keys.zig`](keys.zig) records the same decision.
+//! `#[cfg(test)]` upstream (`keys.rs:53-90`) and is not ported.
+//! [`keys.zig`](keys.zig) records the same decision.
 
 const std = @import("std");
 const types = @import("../types.zig");
@@ -708,9 +707,9 @@ test "the handle is a borrowed op set and an encoding, and it holds no document"
     // from wherever the document last was. There is no such field, and these
     // three assertions fail the moment one is added.
     const info = @typeInfo(Doc(opmod.Op)).@"struct";
-    try testing.expectEqual(@as(usize, 2), info.fields.len);
-    try testing.expect(info.fields[0].type == *Set);
-    try testing.expect(info.fields[1].type == types.TextEncoding);
+    try testing.expectEqual(@as(usize, 2), info.field_types.len);
+    try testing.expect(info.field_types[0] == *Set);
+    try testing.expect(info.field_types[1] == types.TextEncoding);
 
     // **Which is also the answer to "what does a handle allocate".** Two
     // fields, one a pointer and one a one-byte enum: a handle is a value, it

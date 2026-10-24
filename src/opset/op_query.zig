@@ -14,10 +14,7 @@
 //! constructors that are generic over the walk they wrap.** Three reasons, all
 //! of which are the port's own and none of which is a preference.
 //!
-//! * `docs/plan.md` §3 reserves a vtable for exactly one dispatch, `ReadDoc`
-//!   against `Transactable`, and the file that owns the rule says why: a
-//!   caller there really does hold either document flavour *at runtime*
-//!   ([`op.zig:46-49`](op.zig)). No op-set query site does. Every consumer
+//! * No op-set query site needs runtime dispatch. Every consumer
 //!   writes one generic walk and instantiates it: `TopOps::new(op_set, clock,
 //!   range)` is generic over its inner (`op_set2/op_set/top_op.rs:26`),
 //!   `VisibleOpIter::new` is generic (`op_set2/op_set/visible.rs:174-177`),
@@ -57,7 +54,7 @@
 //! |---|---|---|
 //! | `marks`, `no_marks` | [`marks.zig`](marks.zig) | upstream `op_set2/op_set/marks.rs:3` imports `OpQueryTerm` *from this file*, so the dependency runs that way there too |
 //! | `visible`, `visible_slow` | `visible.zig` | upstream `visible.rs:267-275` implements `OpQueryTerm` for `VisibleOpIter`, same direction, and `VisIter` does not exist yet |
-//! | `key_ops` | — | `#[cfg(test)]` upstream (`op_query.rs:29-32`) and its `KeyOpIter` is not ported (`docs/plan.md` §2) |
+//! | `key_ops` | — | `#[cfg(test)]` upstream (`op_query.rs:29-32`) and its `KeyOpIter` is not ported |
 //!
 //! In Rust a trait's default body can name any type in the crate, so one
 //! `impl OpQuery for I {}` (`op_query.rs:72`) hands all four to every query.

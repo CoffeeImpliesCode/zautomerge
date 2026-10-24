@@ -161,7 +161,7 @@ fn copyOf(
     items: []const T,
 ) std.mem.Allocator.Error!std.ArrayList(T) {
     const buf = try gpa.dupe(T, items);
-    return .{ .items = buf, .capacity = buf.len };
+    return .{ .items = buf, .capacity = buf.len, .pointer_stability = .{} };
 }
 
 /// `a / b` rounded up. `b` is never zero.
@@ -1180,7 +1180,7 @@ pub fn Tree(comptime A: type) type {
                 const siblings = &self.nodeMut(node_id).internal;
                 const buf = try self.gpa.dupe(ChildSlot, siblings.items[first_size..]);
                 siblings.shrinkAndFree(self.gpa, first_size);
-                tail = .{ .items = buf, .capacity = buf.len };
+                tail = .{ .items = buf, .capacity = buf.len, .pointer_stability = .{} };
             }
             defer tail.deinit(self.gpa);
 
@@ -2135,7 +2135,7 @@ test "range comparisons do not overflow translated endpoints" {
 
 test "a structural split refuses relative overflow without changing source slabs" {
     const hi = std.math.maxInt(i64);
-    var aggs = [_]SlabAgg{simple(1, 0)} ** branch_factor;
+    var aggs = @as([branch_factor]SlabAgg, @splat(simple(1, 0)));
     aggs[0] = simple(1, -hi);
     aggs[40] = simple(1, hi);
     aggs[41] = simple(1, 1);
@@ -2156,7 +2156,7 @@ test "a structural split refuses relative overflow without changing source slabs
 
 test "a multi-leaf rewrite checks its final summaries instead of partial publication" {
     const hi = std.math.maxInt(i64);
-    var aggs = [_]SlabAgg{simple(1, 0)} ** (branch_factor * 2);
+    var aggs = @as([(branch_factor * 2)]SlabAgg, @splat(simple(1, 0)));
     aggs[0] = simple(1, hi);
     aggs[branch_factor] = simple(1, -hi);
     var tree = try SlabBTree.fromSlice(testing.allocator, &aggs);
@@ -2399,7 +2399,7 @@ test "subtree height counts internal levels, and an empty internal node has none
 
 test "findByPrefix answers every item boundary" {
     const gpa = testing.allocator;
-    const aggs = [_]SlabAgg{simple(5, 10)} ** 10;
+    const aggs = @as([10]SlabAgg, @splat(simple(5, 10)));
     var tree = try SlabBTree.fromSlice(gpa, &aggs);
     defer tree.deinit();
 
@@ -2957,7 +2957,7 @@ test "the invariant checker rejects a corrupted tree" {
         const mid = tree.node(tree.root).internal.items[0].id;
         const leaf_id = tree.node(mid).internal.items[0].id;
         switch (tree.nodeMut(leaf_id).*) {
-            .leaf => |*l| try l.appendSlice(gpa, &([_]SlabAgg{simple(1, 1)} ** 8)),
+            .leaf => |*l| try l.appendSlice(gpa, &(@as([8]SlabAgg, @splat(simple(1, 1))))),
             .internal => return error.InvalidIndex,
         }
         const v = (try tree.checkInvariants()).?;
@@ -3290,7 +3290,7 @@ test "the deep structural sweep holds the tree sound at every mutation" {
 
 test "Splice is rejected for an out-of-range position" {
     const gpa = testing.allocator;
-    var tree = try SlabBTree.fromSlice(gpa, &[_]SlabAgg{simple(1, 1)} ** 3);
+    var tree = try SlabBTree.fromSlice(gpa, &@as([3]SlabAgg, @splat(simple(1, 1))));
     defer tree.deinit();
 
     try testing.expectError(error.InvalidIndex, tree.splice(0, 4, &.{}));

@@ -37,16 +37,12 @@
 //! (`op_set2/op.rs:1324-1361`), and implements it four times. The trait's
 //! successor half is a generic associated type
 //! (`type SuccIter<'b>: ExactSizeIterator<Item = OpId> + 'b`, `:1325-1327`),
-//! which Zig cannot spell — it is the one blocker
-//! [survey §Zig mapping notes](../../docs/survey/02-transaction-opset.md)
-//! calls out. The port splits it into static-arity functions: every op type
+//! which the port splits into static-arity functions: every op type
 //! carries `succCount`, `succAt`, `succIncCount` and `succIncAt`, and a
 //! caller that needs them for several op types is generic over
 //! `comptime O: type` — which is what [`columns.zig`](columns.zig) is
 //! (`:503`) — so the choice is resolved at comptime and inlined, with no
-//! vtable and no allocation. The vtable of `docs/plan.md` §3.2 is reserved
-//! for `ReadDoc`/`Transactable`, where a caller really does hold either
-//! document flavour at runtime.
+//! vtable and no allocation.
 //!
 //! [`assertOpLike`] checks at compile time that a type carries the whole
 //! set.
@@ -731,9 +727,7 @@ pub const OpBuilder = struct {
         };
     }
 
-    /// Frees the predecessor list and nothing else: every borrowed payload
-    /// belongs to the caller (`AGENTS.md` §Invariants, "slices returned into
-    /// a document's own storage").
+    /// Frees the predecessor list. Every borrowed payload remains the caller's.
     ///
     /// `gpa` must be the allocator [`init`] built the list with, for the
     /// reason every resetting teardown in this file gives.

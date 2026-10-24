@@ -31,7 +31,7 @@ pub const Counter = struct {
             const linux = std.os.linux;
             var attr: linux.perf_event_attr = .{
                 .type = .HARDWARE,
-                .config = @intFromEnum(linux.PERF.COUNT.HW.INSTRUCTIONS),
+                .config = @backingInt(linux.PERF.COUNT.HW.INSTRUCTIONS),
                 // PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING.
                 .read_format = (1 << 0) | (1 << 1),
                 .flags = .{

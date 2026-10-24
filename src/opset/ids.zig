@@ -5,9 +5,8 @@
 //! written by `automerge` 0.12.0 and one written here have to carry the same
 //! columns under the same tags, or they are different documents. The
 //! operation rows themselves are written in ascending normalized specification
-//! order, which is the order `RawColumns::parse` requires
-//! ([survey 03](../docs/survey/03-storage-columnar.md) §Column layout), so
-//! the order of `all_column_specs` below is load-bearing as well.
+//! order, which is the order `RawColumns::parse` requires.
+//! The order of `all_column_specs` below must remain unchanged.
 //!
 //! Nine ids carry sixteen specifications, because a logical column can be more
 //! than one physical column: the object is an actor and a counter, the key is
@@ -191,7 +190,7 @@ test "the op set column words are the format's" {
     for (expected) |e| {
         try std.testing.expectEqual(e.word, e.spec.raw);
         try std.testing.expectEqual(e.word >> 4, e.spec.id());
-        try std.testing.expectEqual(e.tag, @intFromEnum(e.spec.encoding()));
+        try std.testing.expectEqual(e.tag, @backingInt(e.spec.encoding()));
         // A column in a document is not itself deflated.
         try std.testing.expect(!e.spec.isCompressed());
     }

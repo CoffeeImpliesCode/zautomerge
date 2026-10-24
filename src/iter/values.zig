@@ -57,9 +57,8 @@
 //! # `getMarks` forwards, and that is the whole point
 //!
 //! A query term whose `getMarks` answers null always is a *different* thing from
-//! one that answers the mark set for the register it stands on, and
-//! `docs/STATUS.md` keeps that distinction open for `MarkIndexColumn`'s own
-//! cursor. So [`Values.getMarks`] forwards rather than deciding, and the test
+//! one that answers the mark set for the register it stands on.
+//! [`Values.getMarks`] forwards rather than deciding, and the test
 //! "a term that answers null always is not a term that answers correctly" walks
 //! the same rows through both an inner that can only answer null and one that
 //! cannot, and reads the mark out of the second.
@@ -153,8 +152,8 @@ pub const ValuesError = opquery.QueryError || InternalError;
 /// ([`op_set.zig:258-270`](../opset/op_set.zig)).
 ///
 /// The value is **borrowed**: its payload is read out of the op set's value
-/// column, which a splice rewrites, so it is valid **until the next mutation**
-/// ([`AGENTS.md`](../../AGENTS.md) *Invariants*). Upstream's `types::Value<'a>`
+/// column, which a splice rewrites, so it is valid until the next mutation.
+/// Upstream's `types::Value<'a>`
 /// is a `Cow`, so an owned copy is [`ValueRef.intoOwned`](../opset/types.zig).
 ///
 /// **The id is a second borrow, and it is the one a caller forgets.** It is
@@ -1244,9 +1243,8 @@ test "constructing a value walk allocates nothing, and neither does reading one"
     // **The term is built first, outside the measured span**, because
     // `TopQuery` does allocate — the three successor buffers
     // ([`top_op.zig:687-701`](../opset/top_op.zig)) — and it allocates them
-    // because a winner walk is three walks alive at once. `docs/plan.md` §3 says
-    // *constructing an iterator* allocates nothing, and the wrapper is what that
-    // is about; the term is the walk it reads through and the caller owns it.
+    // because a winner walk is three walks alive at once.
+    // Constructing the iterator wrapper allocates nothing; the caller owns its term.
     var warm_inner = try TopQuery(opmod.Op).ofObj(&doc.set, .root, null);
     defer warm_inner.deinit(gpa);
     {

@@ -53,9 +53,7 @@
 //! # The allocator, and where the C ABI gets one
 //!
 //! Upstream takes the allocator from Rust's global `Box` allocator; nothing in
-//! the C ABI carries one. Porting the ABI verbatim would mean smuggling an
-//! allocator in a global, which this project forbids (`AGENTS.md` "Invariants";
-//! `docs/plan.md` §8, "a library that hides its allocator cannot be embedded").
+//! the C ABI carries one. The Zig implementation passes allocators explicitly.
 //!
 //! So the port splits at one seam:
 //!
@@ -617,9 +615,8 @@ fn boxResult(comptime RT: type, gpa: Allocator, r: Allocator.Error!RT) Allocator
 // item layer because `AMresultItems`, which is `result.rs:597`, returns one,
 // and because the whole type is the `{len, offset, ptr}` triple the reference
 // hides inside an opaque `uint8_t detail[24]`
-// (`src/items.rs:10-15`, `src/items.rs:123-132`). `docs/plan.md` §10 records
-// the decision to make those three fields visible instead; the layout and
-// therefore the size are unchanged.
+// (`src/items.rs:10-15`, `src/items.rs:123-132`). The port exposes those three
+// fields without changing the layout or size.
 // ---------------------------------------------------------------------------
 
 /// Compares two items. Zig spells `PartialEq` as an `eql` method, so an item
@@ -1042,7 +1039,7 @@ const status_tags = [_]AMstatusTag{
 /// asserts (`test/enum_string_tests.c:30, :52, :72, :109`).
 fn tagToString(tags: anytype, raw: u32) [*:0]const u8 {
     for (tags) |tag| {
-        if (@as(u32, @intCast(@intFromEnum(tag.v))) == raw) return tag.n;
+        if (@as(u32, @intCast(@backingInt(tag.v))) == raw) return tag.n;
     }
     return "???";
 }
@@ -1557,60 +1554,59 @@ pub fn CAbi(comptime Item: type) type {
 
 const t = std.testing;
 
-// The gate `docs/STATUS.md:230` names: "enum discriminants pinned to the exact
-// integers the upstream header uses". Every literal below is the value the
-// reference's Rust source produces, at the line named beside it.
+// Enum discriminants match the integers produced by the reference Rust source.
+// Each literal cites its source declaration.
 test "enum discriminants match the Rust" {
     // src/obj.rs:170-179
-    try t.expectEqual(@as(c_int, 0), @intFromEnum(AMobjType.AM_OBJ_TYPE_DEFAULT));
-    try t.expectEqual(@as(c_int, 1), @intFromEnum(AMobjType.AM_OBJ_TYPE_LIST));
-    try t.expectEqual(@as(c_int, 2), @intFromEnum(AMobjType.AM_OBJ_TYPE_MAP));
-    try t.expectEqual(@as(c_int, 3), @intFromEnum(AMobjType.AM_OBJ_TYPE_TEXT));
+    try t.expectEqual(@as(c_int, 0), @backingInt(AMobjType.AM_OBJ_TYPE_DEFAULT));
+    try t.expectEqual(@as(c_int, 1), @backingInt(AMobjType.AM_OBJ_TYPE_LIST));
+    try t.expectEqual(@as(c_int, 2), @backingInt(AMobjType.AM_OBJ_TYPE_MAP));
+    try t.expectEqual(@as(c_int, 3), @backingInt(AMobjType.AM_OBJ_TYPE_TEXT));
 
     // src/doc/mark.rs:40-51. Non-sequential and alphabetical; do not renumber.
-    try t.expectEqual(@as(c_int, 3), @intFromEnum(AMmarkExpand.AM_MARK_EXPAND_AFTER));
-    try t.expectEqual(@as(c_int, 2), @intFromEnum(AMmarkExpand.AM_MARK_EXPAND_BEFORE));
-    try t.expectEqual(@as(c_int, 4), @intFromEnum(AMmarkExpand.AM_MARK_EXPAND_BOTH));
-    try t.expectEqual(@as(c_int, 0), @intFromEnum(AMmarkExpand.AM_MARK_EXPAND_DEFAULT));
-    try t.expectEqual(@as(c_int, 1), @intFromEnum(AMmarkExpand.AM_MARK_EXPAND_NONE));
+    try t.expectEqual(@as(c_int, 3), @backingInt(AMmarkExpand.AM_MARK_EXPAND_AFTER));
+    try t.expectEqual(@as(c_int, 2), @backingInt(AMmarkExpand.AM_MARK_EXPAND_BEFORE));
+    try t.expectEqual(@as(c_int, 4), @backingInt(AMmarkExpand.AM_MARK_EXPAND_BOTH));
+    try t.expectEqual(@as(c_int, 0), @backingInt(AMmarkExpand.AM_MARK_EXPAND_DEFAULT));
+    try t.expectEqual(@as(c_int, 1), @backingInt(AMmarkExpand.AM_MARK_EXPAND_NONE));
 
     // src/index.rs:60-67
-    try t.expectEqual(@as(c_int, 0), @intFromEnum(AMidxType.AM_IDX_TYPE_DEFAULT));
-    try t.expectEqual(@as(c_int, 1), @intFromEnum(AMidxType.AM_IDX_TYPE_KEY));
-    try t.expectEqual(@as(c_int, 2), @intFromEnum(AMidxType.AM_IDX_TYPE_POS));
+    try t.expectEqual(@as(c_int, 0), @backingInt(AMidxType.AM_IDX_TYPE_DEFAULT));
+    try t.expectEqual(@as(c_int, 1), @backingInt(AMidxType.AM_IDX_TYPE_KEY));
+    try t.expectEqual(@as(c_int, 2), @backingInt(AMidxType.AM_IDX_TYPE_POS));
 
     // src/result.rs:476-484. Unalphabetized so that 0 is success.
-    try t.expectEqual(@as(c_int, 0), @intFromEnum(AMstatus.ok));
-    try t.expectEqual(@as(c_int, 1), @intFromEnum(AMstatus.error_));
-    try t.expectEqual(@as(c_int, 2), @intFromEnum(AMstatus.invalid_result));
+    try t.expectEqual(@as(c_int, 0), @backingInt(AMstatus.ok));
+    try t.expectEqual(@as(c_int, 1), @backingInt(AMstatus.error_));
+    try t.expectEqual(@as(c_int, 2), @backingInt(AMstatus.invalid_result));
 
     // src/item.rs:1296-1341. One bit per tag; 0 is reserved for DEFAULT.
-    try t.expectEqual(@as(c_uint, 0), @intFromEnum(AMvalType.AM_VAL_TYPE_DEFAULT));
-    try t.expectEqual(@as(c_uint, 1), @intFromEnum(AMvalType.AM_VAL_TYPE_VOID));
-    try t.expectEqual(@as(c_uint, 2), @intFromEnum(AMvalType.AM_VAL_TYPE_ACTOR_ID));
-    try t.expectEqual(@as(c_uint, 4), @intFromEnum(AMvalType.AM_VAL_TYPE_BOOL));
-    try t.expectEqual(@as(c_uint, 8), @intFromEnum(AMvalType.AM_VAL_TYPE_BYTES));
-    try t.expectEqual(@as(c_uint, 16), @intFromEnum(AMvalType.AM_VAL_TYPE_CHANGE));
-    try t.expectEqual(@as(c_uint, 32), @intFromEnum(AMvalType.AM_VAL_TYPE_CHANGE_HASH));
-    try t.expectEqual(@as(c_uint, 64), @intFromEnum(AMvalType.AM_VAL_TYPE_COUNTER));
-    try t.expectEqual(@as(c_uint, 128), @intFromEnum(AMvalType.AM_VAL_TYPE_CURSOR));
-    try t.expectEqual(@as(c_uint, 256), @intFromEnum(AMvalType.AM_VAL_TYPE_DOC));
-    try t.expectEqual(@as(c_uint, 512), @intFromEnum(AMvalType.AM_VAL_TYPE_F64));
-    try t.expectEqual(@as(c_uint, 1024), @intFromEnum(AMvalType.AM_VAL_TYPE_INT));
-    try t.expectEqual(@as(c_uint, 2048), @intFromEnum(AMvalType.AM_VAL_TYPE_MARK));
-    try t.expectEqual(@as(c_uint, 4096), @intFromEnum(AMvalType.AM_VAL_TYPE_NULL));
-    try t.expectEqual(@as(c_uint, 8192), @intFromEnum(AMvalType.AM_VAL_TYPE_OBJ_TYPE));
-    try t.expectEqual(@as(c_uint, 16384), @intFromEnum(AMvalType.AM_VAL_TYPE_STR));
-    try t.expectEqual(@as(c_uint, 32768), @intFromEnum(AMvalType.AM_VAL_TYPE_SYNC_HAVE));
-    try t.expectEqual(@as(c_uint, 65536), @intFromEnum(AMvalType.AM_VAL_TYPE_SYNC_MESSAGE));
-    try t.expectEqual(@as(c_uint, 131072), @intFromEnum(AMvalType.AM_VAL_TYPE_SYNC_STATE));
-    try t.expectEqual(@as(c_uint, 262144), @intFromEnum(AMvalType.AM_VAL_TYPE_TIMESTAMP));
-    try t.expectEqual(@as(c_uint, 524288), @intFromEnum(AMvalType.AM_VAL_TYPE_UINT));
-    try t.expectEqual(@as(c_uint, 1048576), @intFromEnum(AMvalType.AM_VAL_TYPE_UNKNOWN));
+    try t.expectEqual(@as(c_uint, 0), @backingInt(AMvalType.AM_VAL_TYPE_DEFAULT));
+    try t.expectEqual(@as(c_uint, 1), @backingInt(AMvalType.AM_VAL_TYPE_VOID));
+    try t.expectEqual(@as(c_uint, 2), @backingInt(AMvalType.AM_VAL_TYPE_ACTOR_ID));
+    try t.expectEqual(@as(c_uint, 4), @backingInt(AMvalType.AM_VAL_TYPE_BOOL));
+    try t.expectEqual(@as(c_uint, 8), @backingInt(AMvalType.AM_VAL_TYPE_BYTES));
+    try t.expectEqual(@as(c_uint, 16), @backingInt(AMvalType.AM_VAL_TYPE_CHANGE));
+    try t.expectEqual(@as(c_uint, 32), @backingInt(AMvalType.AM_VAL_TYPE_CHANGE_HASH));
+    try t.expectEqual(@as(c_uint, 64), @backingInt(AMvalType.AM_VAL_TYPE_COUNTER));
+    try t.expectEqual(@as(c_uint, 128), @backingInt(AMvalType.AM_VAL_TYPE_CURSOR));
+    try t.expectEqual(@as(c_uint, 256), @backingInt(AMvalType.AM_VAL_TYPE_DOC));
+    try t.expectEqual(@as(c_uint, 512), @backingInt(AMvalType.AM_VAL_TYPE_F64));
+    try t.expectEqual(@as(c_uint, 1024), @backingInt(AMvalType.AM_VAL_TYPE_INT));
+    try t.expectEqual(@as(c_uint, 2048), @backingInt(AMvalType.AM_VAL_TYPE_MARK));
+    try t.expectEqual(@as(c_uint, 4096), @backingInt(AMvalType.AM_VAL_TYPE_NULL));
+    try t.expectEqual(@as(c_uint, 8192), @backingInt(AMvalType.AM_VAL_TYPE_OBJ_TYPE));
+    try t.expectEqual(@as(c_uint, 16384), @backingInt(AMvalType.AM_VAL_TYPE_STR));
+    try t.expectEqual(@as(c_uint, 32768), @backingInt(AMvalType.AM_VAL_TYPE_SYNC_HAVE));
+    try t.expectEqual(@as(c_uint, 65536), @backingInt(AMvalType.AM_VAL_TYPE_SYNC_MESSAGE));
+    try t.expectEqual(@as(c_uint, 131072), @backingInt(AMvalType.AM_VAL_TYPE_SYNC_STATE));
+    try t.expectEqual(@as(c_uint, 262144), @backingInt(AMvalType.AM_VAL_TYPE_TIMESTAMP));
+    try t.expectEqual(@as(c_uint, 524288), @backingInt(AMvalType.AM_VAL_TYPE_UINT));
+    try t.expectEqual(@as(c_uint, 1048576), @backingInt(AMvalType.AM_VAL_TYPE_UNKNOWN));
 
     // Every tag is distinct, which is what makes the bitmask in
     // `AMstackCallbackData` a bitmask rather than a comparison.
-    var seen: std.EnumSet(AMvalType) = .initEmpty();
+    var seen: std.EnumSet(AMvalType) = .empty;
     for (val_type_tags) |tag| {
         try t.expect(!seen.contains(tag.v));
         seen.insert(tag.v);
@@ -1635,7 +1631,7 @@ const Counted = struct {
         return self;
     }
 
-    fn deinit(self: Counted, gpa: Allocator) void {
+    pub fn deinit(self: Counted, gpa: Allocator) void {
         _ = gpa;
         self.drops.* += 1;
     }
@@ -2107,27 +2103,27 @@ test "pushing a null result with no callback is refused, not crashed on" {
 test "enum to string round-trips for every tag" {
     for (val_type_tags) |tag| {
         var back: AMvalType = AMvalType.AM_VAL_TYPE_UNKNOWN;
-        try t.expect(AMvalTypeFromString(&back, AMvalTypeToString(@intCast(@intFromEnum(tag.v)))));
+        try t.expect(AMvalTypeFromString(&back, AMvalTypeToString(@intCast(@backingInt(tag.v)))));
         try t.expectEqual(tag.v, back);
     }
     for (status_tags) |tag| {
         var back: AMstatus = .invalid_result;
-        try t.expect(AMstatusFromString(&back, AMstatusToString(@intCast(@intFromEnum(tag.v)))));
+        try t.expect(AMstatusFromString(&back, AMstatusToString(@intCast(@backingInt(tag.v)))));
         try t.expectEqual(tag.v, back);
     }
     for (obj_type_tags) |tag| {
         var back: AMobjType = .AM_OBJ_TYPE_TEXT;
-        try t.expect(AMobjTypeFromString(&back, AMobjTypeToString(@intCast(@intFromEnum(tag.v)))));
+        try t.expect(AMobjTypeFromString(&back, AMobjTypeToString(@intCast(@backingInt(tag.v)))));
         try t.expectEqual(tag.v, back);
     }
     for (idx_type_tags) |tag| {
         var back: AMidxType = .AM_IDX_TYPE_POS;
-        try t.expect(AMidxTypeFromString(&back, AMidxTypeToString(@intCast(@intFromEnum(tag.v)))));
+        try t.expect(AMidxTypeFromString(&back, AMidxTypeToString(@intCast(@backingInt(tag.v)))));
         try t.expectEqual(tag.v, back);
     }
     for (mark_expand_tags) |tag| {
         var back: AMmarkExpand = .AM_MARK_EXPAND_DEFAULT;
-        try t.expect(AMmarkExpandFromString(&back, AMmarkExpandToString(@intCast(@intFromEnum(tag.v)))));
+        try t.expect(AMmarkExpandFromString(&back, AMmarkExpandToString(@intCast(@backingInt(tag.v)))));
         try t.expectEqual(tag.v, back);
     }
 }
@@ -2172,7 +2168,7 @@ test "a null destination is refused, not dereferenced" {
 
     // A successful parse still writes, and the success arm is reached only
     // through a real destination.
-    try t.expectEqualStrings("AM_OBJ_TYPE_MAP", std.mem.span(AMobjTypeToString(@intCast(@intFromEnum(dest)))));
+    try t.expectEqualStrings("AM_OBJ_TYPE_MAP", std.mem.span(AMobjTypeToString(@intCast(@backingInt(dest)))));
 }
 
 // Zig 0.16.0 / upstream / Rust / port

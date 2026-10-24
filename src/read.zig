@@ -21,20 +21,15 @@
 //! [`docmod.Document`](doc.zig) method, an [`opsetmod.OpSet`](opset/op_set.zig)
 //! entry point, an [`iter/`](iter/) walk, a [`cursormod`](cursor.zig) function,
 //! or a [`parentsmod.Parents`](opset/parents.zig) walk — and each one says
-//! which, with a `path:line`. **A reader that recomputed one of those would be
-//! a second source of truth for it**, which is the defect
-//! [docs/STATUS.md](docs/STATUS.md) records as the port's most transferable
-//! lesson, and the reason [`parents`] does not walk the object columns itself
+//! which, with a `path:line`. A reader that recomputed one of those would be
+//! a second source of truth for it. [`parents`] does not walk the object columns itself
 //! when [`OpSet.parentObject`](opset/op_set.zig) already answers it.
 //!
 //! # The ownership rule, and why it is written on every method
 //!
-//! [plan §5.4](../../docs/plan.md) requires that "every public type that can
-//! return borrowed data states its owner in the signature", and
-//! [AGENTS.md](AGENTS.md) that a slice into a document's storage "is valid
-//! until the next mutation". **Neither is inferable from a Zig signature** — a
-//! `[]const u8` and a `[]u8` look alike — so every method below says which it
-//! is. The three shapes that occur here, and what each costs the caller:
+//! Slices into document storage remain valid until the next mutation.
+//! Each method documents its borrowed and owned output.
+//! The three shapes and their caller obligations are:
 //!
 //! | shape | methods | the caller's obligation |
 //! |---|---|---|
@@ -212,9 +207,7 @@ const testing = std.testing;
 /// ([op_iter.zig:149-160](../opset/op_iter.zig)) — which is neither a subset
 /// of `Error` nor of `ParseError`. A reader that turned one of those into
 /// `null` or into `0` would answer "no such object" for a document that has
-/// one, which is the defect [docs/STATUS.md](docs/STATUS.md) names as "a
-/// reader that is more permissive than its writer hides the writer's bug". So
-/// this set is the union, and it is the same union under four names in the
+/// one. This set is the union, and it is the same union under four names in the
 /// crate: [`docmod.OpError`](doc.zig), [`iterkeys.KeysError`](iter/keys.zig),
 /// [`itermap.ReadError`](iter/map_range.zig) and
 /// [`docmod.MarkError`](doc.zig).
@@ -361,17 +354,14 @@ pub const Bias = cursormod.MoveCursor;
 
 /// One value and the operation that put it there
 /// ([`ReadDoc::get`](../../github-automerge-automerge/rust/automerge/src/read.rs):259-263
-/// returns the tuple `(Value, ExId)`;
-/// [docs/plan.md §5.4](../../docs/plan.md) names the pair `DocItem`).
+/// returns the tuple `(Value, ExId)`).
 ///
 /// **The pair is a copy; the bytes inside it are the document's.** A
 /// [`ValueRef`]'s `str`, `bytes`, `actor_id` or `unknown` payload, and a
 /// [`Prop.key`](types.zig) slice, all point into the op set's value column or
 /// string table, so a `DocItem` is valid until the next mutation of the
 /// document — which is upstream's `Value<'a>` borrow
-/// ([read.rs:263](../../github-automerge-automerge/rust/automerge/src/read.rs))
-/// and [AGENTS.md](AGENTS.md)'s rule, and is why the type is a struct and not
-/// an `Owned` one.
+/// ([read.rs:263](../../github-automerge-automerge/rust/automerge/src/read.rs)).
 ///
 /// **`value` is [`ValueRef`], which is upstream's `types::Value`**
 /// ([op_set2/types.rs:667-675](../opset/types.zig)): `object` carries the
@@ -589,11 +579,9 @@ pub fn historicalScope(doc: *const Document, heads: []const ChangeHash) ReadErro
 /// `Document` methods take `*Document` where upstream takes `&self`:
 /// [`getChangeByHash`](doc.zig), [`getChanges`](doc.zig) and the
 /// [`collectByHashes`](doc.zig) behind it. Upstream's reason is interior
-/// mutability, and [plan §3.2](../../docs/plan.md) says so in as many words:
-/// "A method that would need `&mut self` on a read (`getHeads`, `getChanges`
-/// take `&mut self` upstream purely for interior-mutability caching) takes
-/// `*Document` in Zig and the cache is explicit." **None of them writes a row,
-/// an object or a head** — the collector re-encodes a change out of the op set
+/// mutability. The Zig reader exposes its mutable cache explicitly.
+/// None of them writes a row,
+/// an object or a head — the collector re-encodes a change out of the op set
 /// and hands back owned bytes, which is why [`getChangeByHash`]'s contract is
 /// that the *caller* owns the result rather than that the caller freed
 /// something the document had been holding.
@@ -1961,8 +1949,7 @@ pub fn getCursorPositionFor(
 /// ([`ChangeGraph.missingDepsFrom`](change_graph.zig), `:759-778`) and cannot
 /// answer without one, so both were added. The report names them as
 /// deviations. **A borrowed slice is not an option**: a document has nowhere
-/// to keep the answer, and a global would be
-/// [AGENTS.md](AGENTS.md)'s forbidden hidden allocator.
+/// to keep the answer without hidden global allocation.
 ///
 /// **The change queue is chained in front of `heads`**, which is upstream's
 /// whole line (`:2290-2291`): a change that arrived early is not missing, it is
@@ -3497,9 +3484,7 @@ test "a map key is the document's own bytes, and a mutation does not move them" 
 
     // The held slice is still the document's own bytes and still says what it
     // said. **Asserting this is the point**: the alternative — re-reading and
-    // asserting the *new* value — would pass whether or not the rule held,
-    // which is [docs/STATUS.md](docs/STATUS.md)'s "a test that cannot fail is
-    // not a test".
+    // asserting the new value — would pass whether or not the rule held.
     try testing.expectEqualStrings("hello", held);
 
     // And the reader is right after the mutation, which is the other half.
@@ -4201,8 +4186,7 @@ test "constructing a walk allocates nothing, and the walks that allocate are fre
     // holds ([iter/map_range.zig:835-836](../iter/map_range.zig),
     // [iter/list_range.zig:714-715](../iter/list_range.zig),
     // [opset/parents.zig:295-302](../opset/parents.zig)), and a reader that
-    // allocated would be a reader whose iterator is a heap object — which
-    // [plan §3](../../docs/plan.md) says is not one.
+    // allocated would make iterator construction allocate.
     counting.allocs = 0;
     var mr = try mapRange(&doc, .root, .all());
     try testing.expectEqual(@as(usize, 0), counting.allocs);
@@ -5318,8 +5302,7 @@ const Pair = struct {
 /// the mark state at one index (`read.rs`:168-173), and `marks` is the
 /// whole-object fold (`read.rs`:155). This port has one reader and a filter —
 /// [`getMarks`] is literally [`marks`] restricted to a window
-/// (read.zig:759-779) — so comparing the two proves nothing and is the kind
-/// of test [AGENTS.md](AGENTS.md) says to delete rather than fix.
+/// (read.zig:759-779) — so comparing the two provides no independent check.
 ///
 /// The model is the operations the test applied, read by their own rules:
 ///
@@ -7894,8 +7877,7 @@ test "text: three marks over one sentence come back as five splices with their m
         // `bold`, `comment:`, `italic` in that order
         // ([`text.rs`:243-258](../../../github-automerge-automerge/rust/automerge/tests/text.rs)),
         // which is upstream's `HashSet` order and happens to be the name
-        // order too. **Listing the three the other way round was the whole
-        // of [docs/STATUS.md](docs/STATUS.md)'s one failing text case.**
+        // order too.
         const bold = MarkName{ .name = "bold", .value = .{ .bool_value = true } };
         const italic = MarkName{ .name = "italic", .value = .{ .bool_value = true } };
         const cmt = MarkName{ .name = comment, .value = .{ .str = "foxes are my favorite animal!" } };
@@ -8729,9 +8711,7 @@ test "hydrate at null heads bypasses the document's isolation" {
 //
 // * **`mark_created_after_insertion` (`text.rs`:143-161) asserts the runs the
 //   two marks produce, not that they do not fail.** Upstream's whole
-//   assertion is two `unwrap()`s, and [AGENTS.md](AGENTS.md) says a test that
-//   only shows a call did not throw is a test that proves nothing. The runs are
-//   a strict superset of the assertion, so nothing upstream checks is lost.
+//   assertion is two `unwrap()`s. Checking the resulting runs also checks their values.
 //
 // * **`deleting_in_middle_of_multibyte_char_moves_the_cursor_to_after_the_character`
 //   (`text.rs`:923-941) is stated as upstream's algorithm, not as a table.**
@@ -9971,7 +9951,7 @@ test "generalized free readers preserve raw held scoped and const receiver behav
     try testing.expect(owner.transaction != null);
     try testing.expectEqual(@as(u64, 2), stats(const_owner).num_changes);
     // Trait graph reads bypass the identically named AutoCommit closing barriers.
-    const unknown: ChangeHash = .{ .bytes = [_]u8{0xab} ** 32 };
+    const unknown: ChangeHash = .{ .bytes = @as([32]u8, @splat(0xab)) };
     const missing_hashes = try getMissingDeps(const_owner, &.{unknown}, gpa);
     defer gpa.free(missing_hashes);
     try testing.expectEqual(@as(usize, 1), missing_hashes.len);

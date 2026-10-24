@@ -1185,7 +1185,7 @@ test "malformed messages are refused, each with the class upstream reports" {
     var too_many_heads: std.ArrayList(u8) = .empty;
     defer too_many_heads.deinit(gpa);
     try too_many_heads.appendSlice(gpa, &[_]u8{ message_type_sync, 0x05 });
-    try too_many_heads.appendSlice(gpa, &([_]u8{0x11} ** 64));
+    try too_many_heads.appendSlice(gpa, &(@as([64]u8, @splat(0x11))));
     try testing.expectError(error.LengthExceedsInput, Message.decode(gpa, too_many_heads.items));
 
     // A `have` whose bloom field claims ten bytes and has three: the
@@ -1260,10 +1260,10 @@ test "a chunk list joins into one stream" {
 
 test "advance heads keeps what we gained and what we still share" {
     const gpa = testing.allocator;
-    const a = try ChangeHash.parse(gpa, "0a" ** 32);
-    const b = try ChangeHash.parse(gpa, "0b" ** 32);
-    const c = try ChangeHash.parse(gpa, "0c" ** 32);
-    const d = try ChangeHash.parse(gpa, "0d" ** 32);
+    const a = try ChangeHash.parse(gpa, &@as([32 * "0a".len]u8, @bitCast(@as([32]["0a".len]u8, @splat("0a".*)))));
+    const b = try ChangeHash.parse(gpa, &@as([32 * "0b".len]u8, @bitCast(@as([32]["0b".len]u8, @splat("0b".*)))));
+    const c = try ChangeHash.parse(gpa, &@as([32 * "0c".len]u8, @bitCast(@as([32]["0c".len]u8, @splat("0c".*)))));
+    const d = try ChangeHash.parse(gpa, &@as([32 * "0d".len]u8, @bitCast(@as([32]["0d".len]u8, @splat("0d".*)))));
 
     // We were at `a`; we are now at `a`, `b` and `c`; the last shared heads
     // were `a` and `c`. `b` is new, and `a` and `c` come back through the
@@ -1332,7 +1332,9 @@ test "a message survives every allocation failure" {
     }
     const bytes = try err.hexFrom(gpa, hex orelse return error.GoldenVectorMissing);
     defer gpa.free(bytes);
-    try testing.checkAllAllocationFailures(gpa, decodeThenEncode, .{bytes});
+    // Keep failure indices independent of SafeAllocator's in-place growth.
+    var backing: testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
+    try testing.checkAllAllocationFailures(backing.allocator(), decodeThenEncode, .{bytes});
 }
 
 // Every reader a network message reaches is either a value or a

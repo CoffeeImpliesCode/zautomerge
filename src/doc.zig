@@ -1058,7 +1058,7 @@ fn encodeAction(
     ops: []const O,
 ) ParseError!columnarenc.Encoded {
     scratch.clearRetainingCapacity();
-    for (ops) |op| try scratch.append(gpa, .{ .uint = @intFromEnum(op.action()) });
+    for (ops) |op| try scratch.append(gpa, .{ .uint = @backingInt(op.action()) });
     return columnarenc.encodeColumn(gpa, OpColumn.action.id(), .rle_uint, scratch.items);
 }
 
@@ -3690,8 +3690,7 @@ pub const Document = struct {
     /// runs **last**, after both fallible steps have succeeded. The order this
     /// replaces rewrote the cache *first*, so a refusal out of either of them
     /// returned a document whose current actor had been renumbered while the
-    /// other three tables stood still: mirrors disagreeing with each other,
-    /// which is the failure `AGENTS.md` describes. Leaving the rewrite out
+    /// other three tables stood still. Leaving the rewrite out
     /// altogether is not the fix either — a cached index nobody rewrites is
     /// the silent rename this method's own [`Actor.removeActor`] exists to
     /// prevent.
@@ -4443,8 +4442,7 @@ pub const Document = struct {
     /// **The bytes are not byte-identical to the reference's**, and must not
     /// be: DEFLATE is not reproducible across implementations. Everything
     /// except the DEFLATE stream is byte-exact, and equivalence is checked by
-    /// loading the output and comparing the materialized document
-    /// ([plan §1](../../docs/plan.md)).
+    /// loading the output and comparing the materialized document.
     ///
     /// Changes the document holds but cannot apply — the ones still waiting for
     /// a dependency — are **appended verbatim** when `retain_orphans` is set
@@ -9651,8 +9649,8 @@ test "a load sizes every actor index from the actor table, not from the changes"
 
     // **The second index is the one that moves.** "a" sorts before both, so
     // every index at or above zero is renumbered and `m` — the actor the graph
-    // already holds a change for — goes from slot 1 to slot 2. This is the
-    // insertion `AGENTS.md` names: the renumbered index is not the one that
+    // already holds a change for — goes from slot 1 to slot 2. The
+    // renumbered index is not the one that
     // was inserted, so reading only the new actor back proves nothing.
     _ = try loaded.putActorRef(gpa, .{ .bytes = "a" });
     try testing.expectEqual(@as(usize, 3), loaded.numActors());
@@ -9776,8 +9774,7 @@ test "a refused removeActor leaves every actor table as it found it" {
     // **last**, after the two steps that can fail. Rewritten first — as it was
     // — the cached index moves down by one and *then* the call returns an
     // error, so the document's current actor is whichever actor moved into the
-    // freed slot while the other tables stand still: mirrors disagreeing with
-    // each other, which is the failure `AGENTS.md` names.
+    // freed slot while the other tables stand still.
     //
     // **The refusal is reachable through this entry point**, which is what
     // makes the assertions below a test of the fan rather than of the happy
@@ -12220,9 +12217,8 @@ test "recording a commit does not change the change it made" {
 
 // ── The change-hash round trip ──────────────────────────────────────────────
 //
-// **A change hash is SHA-256 over that change's own encoded bytes**
-// ([`AGENTS.md`](../../AGENTS.md)). Everything below is that one sentence
-// checked from each of the three directions it can break in: the document
+// A change hash is SHA-256 over that change's own encoded bytes.
+// The tests check each of the three directions it can break in: the document
 // must hash what it wrote, the graph must record what it hashed, and the
 // collector must rebuild the bytes the hash was taken over. The three tests
 // are deliberately in that order — each one fails in a different place, and a
@@ -12238,7 +12234,7 @@ test "recording a commit does not change the change it made" {
 /// different change with a different hash. `ACTOR_B` on `:45` *is* thirty-two
 /// characters and sixteen bytes; the asymmetry is in the reference's own
 /// constants, and the golden chunks are what it produced from them.
-const oracle_actor = [_]u8{0xa1} ** 15;
+const oracle_actor = @as([15]u8, @splat(0xa1));
 
 /// The timestamp [`tools/oracle/src/main.rs:157-159`](../../tools/oracle/src/main.rs)
 /// (`commit_options`) stamps on every commit of the scripted document. It is a
@@ -12522,7 +12518,7 @@ test "a change chunk the document hands out names the op its last operation has"
     // starts at 1 and its ops sit on the *same* counters as the ones above,
     // on a different actor — which is what makes the two concurrent rather
     // than sequential.
-    const fork_actor = [_]u8{0x5c} ** 15;
+    const fork_actor = @as([15]u8, @splat(0x5c));
     var fork = try Document.init(gpa, std.testing.io);
     defer fork.deinit();
     fork.setActorId(.{ .bytes = &fork_actor });
@@ -12748,10 +12744,7 @@ test "this port's write path produces the reference's own change chunks, byte fo
 /// Every string the walk finds in the register `key` of `obj`, appended to
 /// `out`.
 ///
-/// **The strings borrow the document's own storage** — the rule in
-/// [AGENTS.md](../AGENTS.md) — so the assertion that reads them has to come
-/// before the next write to that document. That is why this collects rather
-/// than copies: the caller reads them on the next line.
+/// The strings borrow document storage. Read them before the next document mutation.
 fn collectRegister(
     gpa: Allocator,
     out: *std.ArrayList([]const u8),
@@ -13670,7 +13663,7 @@ test "an incremental load into an empty document re-establishes that document's 
 // | `Actor.removeActor(slot, dropped)` | `Actor::remove_actor`, `automerge.rs:53-61` | `fn remove_actor(&mut self, index: usize, actors: &[ActorId])` — reads `actors[index]` itself, which upstream can do because its caller's four lines cannot fail | `pub fn removeActor(self: *Actor, slot: ActorIdx, dropped: ActorId) void` | **takes the bytes rather than the table**, because the port's caller rewrites the union **after** the fan has dropped the slot they came from. The out-of-range fallback the old signature needed (`ActorId.init(&.{})`) **is gone** with it: the slot is bounds-checked by the only caller |
 // | the `at >= self.ops.actors.items.len` refusal at the top of `Document.removeActor` | `Vec::remove`, `op_set.rs:1420` | panics on an index past the end | `return error.InvalidActorIndex` | **is** this file's own check, and it is what makes reading `dropped` safe. It turns a process-wide trap — which stops a test binary and hides every test after it, the shape recorded above at `transact.zig` — into an error a caller can read. `error.InvalidActorIndex` is the document's word for it (`error.zig:32-33`) |
 // | the `seqForActor(idx) != 0` refusal in `Document.removeActor` | `ChangeGraph::remove_actor`'s `assert!`, `change_graph.rs:176` | **traps** — a process-wide abort, not a returned error — when a slot still holds a change | `if (at >= self.graph.numActors() or self.graph.seqForActor(idx) != 0) return error.InvalidActorIndex;`, checked with the other guards before any table moves | **is** the same condition read one step earlier and through the document's vocabulary, which is what lets the fan below be all-infallible (`self.graph.removeActor(…) catch unreachable`). It costs the port the graph's own `error.InvalidIndex` as an answer, and that is the right trade: **no caller of this entry point can observe it**, because the check fires first, so a test naming it would pin a tag the public method never returns |
-// | the route table on `adoptActorMirrors` | `load::load_changes`, `storage/load.rs:113-120`; `load_incremental`, `automerge.rs:1027-1069` | `Chunk::Document` hands `reconstruct_changes`' output to `apply_changes`, so on the incremental route an actor nothing names never reaches the live table either | five routes, named and checked: a document chunk adopted whole (`load`, `loadInto`, `clone`, `fork`, `forkAt`, `loadIncremental` on an empty document), a document chunk read for its changes and **released** (`loadIncremental` on a non-empty one), a change-chunk stream, `merge` and `applyChanges`, and a removal | **is** the check that a fix on one route is not a fix on the others — the defect class `AGENTS.md` names. The second route adopts no table at all, and the third interns through `putActorRef` **before** the screen runs, which is what keeps `BatchApply.insertNewActors` from growing `ops.actors` alone |
+// | the route table on `adoptActorMirrors` | `load::load_changes`, `storage/load.rs:113-120`; `load_incremental`, `automerge.rs:1027-1069` | `Chunk::Document` hands `reconstruct_changes`' output to `apply_changes`, so on the incremental route an actor nothing names never reaches the live table either | five routes, named and checked: a document chunk adopted whole (`load`, `loadInto`, `clone`, `fork`, `forkAt`, `loadIncremental` on an empty document), a document chunk read for its changes and **released** (`loadIncremental` on a non-empty one), a change-chunk stream, `merge` and `applyChanges`, and a removal | checks actor-table consistency across loading routes. The second route adopts no table at all, and the third interns through `putActorRef` before the screen runs, which keeps `BatchApply.insertNewActors` from growing `ops.actors` alone |
 
 test "independent default documents merge both histories" {
     const gpa = testing.allocator;
@@ -15126,8 +15119,8 @@ test "caller-owned loader logs retain their own allocator for nested path hints"
     defer source.deinit();
     const bytes = try source.save(log_gpa);
     defer log_gpa.free(bytes);
-    var owner_allocator: std.heap.DebugAllocator(.{}) = .init;
-    defer testing.expect(owner_allocator.deinit() == .ok) catch
+    var owner_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    defer testing.expect(owner_allocator.deinit() == 0) catch
         @panic("loader document allocator leaked");
     const owner_gpa = owner_allocator.allocator();
     var log = patchesmod.PatchLog.inactive(log_gpa);

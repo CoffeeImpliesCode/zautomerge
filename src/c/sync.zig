@@ -24,8 +24,7 @@
 //! ([doc.zig](doc.zig), `Value.sync_message` / `Value.sync_state` /
 //! `Value.change`). `AMitemToSyncMessage` and friends therefore hand out a
 //! pointer into the item's own heap allocation, which outlives every call the
-//! C side can make. Porting a map that nothing reads would be
-//! [AGENTS.md](../AGENTS.md)'s forbidden dead code.
+//! C side can make.
 //!
 //! ## `AMreceiveSyncMessage` receives a **copy**, so a handle is reusable
 //!
@@ -817,8 +816,7 @@ test "a null out-parameter is an error result, and a null handle writes false" {
 //   is reached through an `AMitem`**, and the item stores the handle inline in
 //   its own heap cell ([doc.zig](doc.zig), `Value.sync_message` /
 //   `Value.sync_state` / `Value.change`) — which is upstream's layout too
-//   (`src/item.rs:40-42`). Porting a map nothing reads is
-//   [AGENTS.md](../AGENTS.md)'s forbidden dead code.
+//   (`src/item.rs:40-42`).
 //
 // * **`owns_payload` is the one field here that is not in the reference, and it
 //   exists because the reference gets a `clone` for free.** Upstream's

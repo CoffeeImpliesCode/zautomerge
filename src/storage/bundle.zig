@@ -1113,7 +1113,7 @@ const OpWriter = struct {
         else
             Cell.null_value);
         try self.insert.append(self.gpa, .{ .boolean = op.insert });
-        try self.action.append(self.gpa, .{ .uint = @intFromEnum(op.action) });
+        try self.action.append(self.gpa, .{ .uint = @backingInt(op.action) });
         try self.values.append(self.gpa, op.value);
         try self.pred_count.append(self.gpa, .{ .uint = op.pred.len });
         for (op.pred) |p| {
@@ -3385,20 +3385,20 @@ test "malformed bundles are rejected, one class at a time" {
             // Upstream's `InvalidChangeColumn` and `NotInNormalOrder` are both
             // `error.InvalidColumnSpec` here, because the error set carries no
             // payload and one variant covers both.
-            .body = &[_]u8{ 0x00, 0x01, 0x10 } ++ &[_]u8{0xaa} ** 16 ++
+            .body = &[_]u8{ 0x00, 0x01, 0x10 } ++ &@as([16]u8, @splat(0xaa)) ++
                 &[_]u8{ 0x09, 0x3c, 0x02, 0x03, 0x02, 0x13, 0x02, 0x23, 0x02, 0x33, 0x02, 0x45, 0x02, 0x50, 0x03, 0x53, 0x02, 0x60, 0x02 } ++
-                &[_]u8{0x00} ** 19,
+                &@as([19]u8, @splat(0x00)),
             .want = error.InvalidColumnSpec,
         },
         .{
             .name = "a column count the body could not hold",
-            .body = &[_]u8{ 0x00, 0x01, 0x10 } ++ &[_]u8{0xaa} ** 16 ++
+            .body = &[_]u8{ 0x00, 0x01, 0x10 } ++ &@as([16]u8, @splat(0xaa)) ++
                 &[_]u8{ 0x7f, 0x01, 0x02 },
             .want = error.LengthExceedsInput,
         },
         .{
             .name = "a column length that runs past its data block",
-            .body = &[_]u8{ 0x00, 0x01, 0x10 } ++ &[_]u8{0xaa} ** 16 ++
+            .body = &[_]u8{ 0x00, 0x01, 0x10 } ++ &@as([16]u8, @splat(0xaa)) ++
                 &[_]u8{ 0x09, 0x01, 0x40 },
             .want = error.LengthExceedsInput,
         },

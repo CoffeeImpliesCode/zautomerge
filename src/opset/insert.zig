@@ -96,9 +96,8 @@
 //! (`insert.rs:92`) and every call site constructs a query and calls it once
 //! (`op_set.rs:558-567`, `:584-608`). So **one `InsertQuery` answers one
 //! target**, and a caller that wants a second target constructs a second one.
-//! The `Shiftable` forwards below exist for repositioning the *walk* — the next
-//! agent that slices a resolver is expected to reset the rest — and the note on
-//! [`InsertQuery.advanceTo`] says what a caller must not do with them.
+//! The `Shiftable` forwards reposition the walk. Callers must reset the remaining resolver state.
+//! [`InsertQuery.advanceTo`] states the repositioning restrictions.
 //!
 //! The general form and the fast paths are two calls with different `index`
 //! arguments into the *same* query type, and a `debug_assert_eq!` between them

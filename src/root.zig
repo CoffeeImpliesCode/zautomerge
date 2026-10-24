@@ -8,11 +8,9 @@
 //! here and one written here loads there; sync states interoperate in both
 //! directions; change hashes match byte for byte. `save()` output is not
 //! byte-identical, because DEFLATE is not reproducible across implementations.
-//! See `docs/plan.md` §1.
 //!
 //! Published as dependency module `zautomerge` and static artifact
-//! `zautomerge` with `automerge.h`. Requires Zig 0.16.0; the manifest floor is
-//! not a claim about later compiler releases. Native document constructors
+//! `zautomerge` with `automerge.h`. Requires Zig 0.17.0. Native document constructors
 //! borrow a live `std.Io` capability for secure actor generation.
 
 const std = @import("std");

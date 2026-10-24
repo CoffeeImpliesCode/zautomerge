@@ -121,26 +121,16 @@ const usage =
 ;
 
 pub fn main(init: std.process.Init) !u8 {
-    // ── The leak arbiter ──────────────────────────────────────────────────
-    //
-    // **`std.process.Init.gpa` is not a leak arbiter in ReleaseFast.** `std.start`
-    // only installs its own `DebugAllocator` when `use_debug_allocator` holds,
-    // and that needs either a non-ReleaseFast mode or `link_libc` plus
-    // `single_threaded` (`std/start.zig:689-713`). A plain ReleaseFast native
-    // build lands on `smp_allocator`, which detects nothing.
-    //
-    // So the benchmark builds its own arbiter over `init.gpa` and asks it
-    // directly. `safety` mirrors what `std.start` would have chosen: the
-    // per-allocation checks are the point in Debug and ReleaseSafe, and a
-    // benchmark that performs tens of thousands of allocations per iteration
-    // should not pay for them while it is being timed. `detectLeaks` is called
-    // unconditionally at the end, so the *count* is on the record in every mode
-    // even where the individual reports are less informative.
-    var arbiter: std.heap.DebugAllocator(.{ .safety = builtin.mode != .ReleaseFast and builtin.mode != .ReleaseSmall }) = .{
-        .backing_allocator = init.gpa,
-    };
+    // Retain a checking allocator in every mode. Its final deinit returns the leak
+    // count; write-after-free checks are disabled for fast and small builds.
+    var arbiter: std.heap.SafeAllocator = .init(init.gpa, .{
+        .check_write_after_free = builtin.mode != .fast and builtin.mode != .small,
+    });
     const gpa = arbiter.allocator();
-    defer arbiter.deinitWithoutLeakChecks();
+    var allocator_live = true;
+    defer {
+        if (allocator_live) _ = arbiter.deinit();
+    }
 
     // ── The output stream ─────────────────────────────────────────────────
     //
@@ -348,9 +338,8 @@ pub fn main(init: std.process.Init) !u8 {
 
     std.debug.print("\n# checksum sink {x}\n", .{sink});
 
-    // Ask the arbiter directly, because `deinit` only checks when `safety` is
-    // on and the number must be on the record either way.
-    const leaked = arbiter.detectLeaks();
+    const leaked = arbiter.deinit();
+    allocator_live = false;
     std.debug.print("# LEAKS {d}\n", .{leaked});
     if (leaked != 0) {
         std.debug.print(

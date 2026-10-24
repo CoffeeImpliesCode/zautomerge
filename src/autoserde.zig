@@ -34,8 +34,8 @@ pub fn BackendError(comptime Backend: type) type {
         else => Backend,
     };
     inline for (.{
-        "Error", "beginMap", "endMap", "mapKey", "beginSeq",
-        "endSeq", "element", "string", "scalar",
+        "Error",  "beginMap", "endMap", "mapKey", "beginSeq",
+        "endSeq", "element",  "string", "scalar",
     }) |name| {
         if (!@hasDecl(B, name)) {
             @compileError("Serialization backend requires " ++ name ++
@@ -212,10 +212,7 @@ pub fn AutoSerde(comptime R: type) type {
             try self.serialize(gpa, &backend);
         }
 
-
-        fn writeMap(self: Self, obj: ExId, gpa: Allocator, backend: anytype)
-            (read.ReadError || BackendError(@TypeOf(backend)))!void
-        {
+        fn writeMap(self: Self, obj: ExId, gpa: Allocator, backend: anytype) (read.ReadError || BackendError(@TypeOf(backend)))!void {
             var keys: std.ArrayList([]const u8) = .empty;
             defer {
                 for (keys.items) |key| gpa.free(key);
@@ -241,9 +238,7 @@ pub fn AutoSerde(comptime R: type) type {
             try backend.endMap();
         }
 
-        fn writeSeq(self: Self, obj: ExId, gpa: Allocator, backend: anytype)
-            (read.ReadError || BackendError(@TypeOf(backend)))!void
-        {
+        fn writeSeq(self: Self, obj: ExId, gpa: Allocator, backend: anytype) (read.ReadError || BackendError(@TypeOf(backend)))!void {
             const length = try Reader.length(self.doc, obj);
             try backend.beginSeq();
             for (0..length) |index| {
@@ -255,9 +250,7 @@ pub fn AutoSerde(comptime R: type) type {
             try backend.endSeq();
         }
 
-        fn writeVal(self: Self, item: read.DocItem, gpa: Allocator, backend: anytype)
-            (read.ReadError || BackendError(@TypeOf(backend)))!void
-        {
+        fn writeVal(self: Self, item: read.DocItem, gpa: Allocator, backend: anytype) (read.ReadError || BackendError(@TypeOf(backend)))!void {
             switch (item.value) {
                 .object => |kind| switch (kind) {
                     .map, .table => try self.writeMap(item.id, gpa, backend),
@@ -554,7 +547,6 @@ test "an unknown scalar is a map with its two fields, in order" {
     try testing.expectEqualStrings("{\"type_code\":42,\"bytes\":[7]}", aw.written());
 }
 
-
 test "API parity serde preserves scoped transaction pending view" {
     // A historical transaction must not serialize the document's later current view.
     const gpa = testing.allocator;
@@ -693,7 +685,8 @@ test "API parity serde scoped nested objects use historical and pending text" {
     const json = try AutoSerde(trans.Transaction).from(&scoped).toJson(gpa);
     defer gpa.free(json);
     try testing.expectEqualStrings(
-        "{\"nested\":{\"value\":1},\"sequence\":[2],\"text\":\"old!\"}", json,
+        "{\"nested\":{\"value\":1},\"sequence\":[2],\"text\":\"old!\"}",
+        json,
     );
     var tokens = TokenStream.init(gpa);
     defer tokens.deinit();

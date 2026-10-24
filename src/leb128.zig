@@ -307,7 +307,7 @@ test "malformed input is rejected, never trapped" {
     // Truncated: every byte has the continuation bit.
     try std.testing.expectError(error.UnexpectedEnd, readUnsigned(&[_]u8{ 0x80, 0x80 }));
     // Overlong: eleven bytes.
-    try std.testing.expectError(error.InvalidLeb128, readUnsigned(&[_]u8{0x80} ** 11));
+    try std.testing.expectError(error.InvalidLeb128, readUnsigned(&@as([11]u8, @splat(0x80))));
     // Tenth byte carries more than the one bit left.
     try std.testing.expectError(
         error.Overflow,
@@ -373,7 +373,7 @@ test "an overlong encoding is refused, signed and unsigned alike" {
     try std.testing.expectError(error.InvalidLeb128, readUnsigned(&[_]u8{ 0xff, 0x80, 0x00 }));
     // `0` in ten bytes: the same rule at the tenth byte, where the tenth
     // byte's own bounds check would otherwise let a zero payload through.
-    try std.testing.expectError(error.InvalidLeb128, readUnsigned(&[_]u8{0x80} ** 9 ++ [_]u8{0x00}));
+    try std.testing.expectError(error.InvalidLeb128, readUnsigned(&@as([9]u8, @splat(0x80)) ++ [_]u8{0x00}));
 
     // Signed, positive: a `0x00` terminator after a penultimate byte whose
     // sign bit is clear (`storage/parse/leb128.rs:63-65`). Upstream's vector is
@@ -495,9 +495,9 @@ test "every unsigned width round trips at its own boundary, with the bytes" {
         // the type boundary, and it is where an implementation that packs the
         // ninth byte loses the sign.
         .{ .value = 9223372036854775807, .want = &[_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f } },
-        .{ .value = 9223372036854775808, .want = &[_]u8{0x80} ** 9 ++ [_]u8{0x01} },
+        .{ .value = 9223372036854775808, .want = &@as([9]u8, @splat(0x80)) ++ [_]u8{0x01} },
         // `:166-169` — `u64::MAX`, ten bytes, of which the tenth carries one bit.
-        .{ .value = std.math.maxInt(u64), .want = &[_]u8{0xff} ** 9 ++ [_]u8{0x01} },
+        .{ .value = std.math.maxInt(u64), .want = &@as([9]u8, @splat(0xff)) ++ [_]u8{0x01} },
     };
     for (cases) |c| {
         var buf: [max_unsigned_size]u8 = undefined;
@@ -575,8 +575,8 @@ test "every signed width round trips at its own boundary, with the bytes" {
         .{ .value = -1048576, .want = &[_]u8{ 0x80, 0x80, 0x40 } },
         .{ .value = 134217727, .want = &[_]u8{ 0xff, 0xff, 0xff, 0x3f } },
         .{ .value = -134217728, .want = &[_]u8{ 0x80, 0x80, 0x80, 0x40 } },
-        .{ .value = std.math.maxInt(i64), .want = &[_]u8{0xff} ** 9 ++ [_]u8{0x00} },
-        .{ .value = std.math.minInt(i64), .want = &[_]u8{0x80} ** 9 ++ [_]u8{0x7f} },
+        .{ .value = std.math.maxInt(i64), .want = &@as([9]u8, @splat(0xff)) ++ [_]u8{0x00} },
+        .{ .value = std.math.minInt(i64), .want = &@as([9]u8, @splat(0x80)) ++ [_]u8{0x7f} },
     };
     for (cases) |c| {
         var buf: [max_signed_size]u8 = undefined;
@@ -790,7 +790,7 @@ test "every strict prefix of a canonical encoding is an error, never a short rea
         &[_]u8{ 0xff, 0x7f },
         &[_]u8{ 0x80, 0x80, 0x01 },
         &[_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f },
-        &([_]u8{0xff} ** 9 ++ [_]u8{0x01}),
+        &(@as([9]u8, @splat(0xff)) ++ [_]u8{0x01}),
     };
     for (unsigned) |full| {
         var buf: [2 * max_unsigned_size]u8 = undefined;
@@ -822,8 +822,8 @@ test "every strict prefix of a canonical encoding is an error, never a short rea
         &[_]u8{ 0x98, 0x78 },
         &[_]u8{ 0xd0, 0x0f },
         &[_]u8{ 0x80, 0x80, 0x40 },
-        &([_]u8{0xff} ** 9 ++ [_]u8{0x00}),
-        &([_]u8{0x80} ** 9 ++ [_]u8{0x7f}),
+        &(@as([9]u8, @splat(0xff)) ++ [_]u8{0x00}),
+        &(@as([9]u8, @splat(0x80)) ++ [_]u8{0x7f}),
     };
     for (signed) |full| {
         var buf: [2 * max_signed_size]u8 = undefined;

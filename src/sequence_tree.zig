@@ -982,8 +982,7 @@ const Rng = struct {
 };
 
 /// The base seed of the property tests. Upstream lets proptest pick a fresh
-/// random seed per run; the port fixes it so a failure is reproducible, which
-/// is what `docs/plan.md` §3 asks for.
+/// random seed per run; the port fixes it so a failure is reproducible.
 const base_seed: u64 = 0x5EED_5EED_0BAD_C0DE;
 /// The number of generated cases per property test.
 const cases: usize = 5;

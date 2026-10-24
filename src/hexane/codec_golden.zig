@@ -1,13 +1,8 @@
 //! The codec differential corpus: what the Rust reference encoded, and the
 //! machinery to hold this port to it.
 //!
-//! `docs/plan.md` §P2 asks for "every codec round-trips bytes for random
-//! inputs against the Rust". Half of that is a round trip and half of a round
-//! trip is a tautology: an encoder and a decoder that agree with each other
-//! say nothing about whether the reference reads the same bytes, and the
-//! reference is what the compatibility contract is written against. So this
-//! module carries the reference's own bytes, and the tests beside it compare
-//! the port's bytes to those.
+//! Round trips alone cannot establish compatibility with the reference codec.
+//! This module carries reference bytes for comparison with the port's output.
 //!
 //! # The corpus
 //!

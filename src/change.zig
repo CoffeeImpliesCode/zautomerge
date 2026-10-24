@@ -1817,7 +1817,7 @@ test "every change a document hands out names the counter its own last op row ca
     const gpa = testing.allocator;
     var doc = try docmod.Document.init(gpa, std.testing.io);
     defer doc.deinit();
-    doc.setActorId(.{ .bytes = &([_]u8{0xa1} ** 16) });
+    doc.setActorId(.{ .bytes = &(@as([16]u8, @splat(0xa1))) });
 
     // The rows the test writes: three operations in one change, then a merge
     // commit with none, then one more. **The empty change is the interesting
@@ -1931,7 +1931,7 @@ test "every change a document hands out names the counter its own last op row ca
     // `getChangeByHash` carrying the same one.
     var other = try docmod.Document.init(gpa, std.testing.io);
     defer other.deinit();
-    other.setActorId(.{ .bytes = &([_]u8{0xb2} ** 16) });
+    other.setActorId(.{ .bytes = &(@as([16]u8, @splat(0xb2))) });
     {
         var t3 = try transact.Transaction.open(gpa, &other);
         defer t3.deinitClosed();
@@ -2359,7 +2359,7 @@ test "expanded informational author and hash never replace authoritative extra b
 test "change compression helper uses framed cutoff and preserves decompressed identity" {
     const gpa = testing.allocator;
     const ops = [_]ExpandedOp{.{
-        .action = .{ .put = .{ .str = "repeated payload " ** 40 } },
+        .action = .{ .put = .{ .str = &@as([40 * "repeated payload ".len]u8, @bitCast(@as([40]["repeated payload ".len]u8, @splat("repeated payload ".*)))) } },
         .obj = .root,
         .key = .{ .map = "payload" },
         .pred = &.{},

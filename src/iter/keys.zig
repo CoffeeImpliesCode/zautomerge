@@ -43,8 +43,7 @@
 //!
 //! Upstream's item is an owned `String` because `OpSet::to_string` is
 //! `format!` ([`op_set.rs:1093-1098`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs)).
-//! The port's is a borrowed slice, which is the house rule for a slice out of a
-//! document's own storage ([`AGENTS.md`](../../AGENTS.md) *Invariants*). **One
+//! The port returns a borrowed slice into document storage. One
 //! return type carries both windows, so which one a key is under is decided by
 //! what kind of key it is, and that is stated here because nothing else on the
 //! surface says it:**
@@ -78,8 +77,7 @@
 //! `KeyIter` and `KeyOpIter` ([`keys.rs:30-90`](../../github-automerge-automerge/rust/automerge/src/iter/keys.rs))
 //! are `#[cfg(test)]` upstream and are **not ported**, for the reason
 //! [op_query.zig's module table](../opset/op_query.zig) already recorded:
-//! `key_ops` is a test-only combinator and its `KeyOpIter` is named in
-//! `docs/plan.md` §2. They are also not needed: they group a *raw* op stream by
+//! `key_ops` is a test-only combinator. These helpers group a raw op stream by
 //! key, and the walk this file holds has already done that — a register is one
 //! row out of it.
 //!

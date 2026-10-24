@@ -43,10 +43,8 @@ const ObjType = am.ObjType;
 /// A list of strings the test owns.
 ///
 /// **The copy is the point.** A [`read.ListRange`] and every item it hands out
-/// borrow the document's own storage, which the next mutation may move
-/// ([AGENTS.md](../AGENTS.md), "Slices returned into a document's own storage
-/// are valid until the next mutation"), so a session that reads a list and
-/// then writes to the document takes its own copy of what it wants to keep.
+/// borrow document storage until mutation. A test that reads a list and then
+/// writes to the document copies the strings it needs to retain.
 /// Reading a stale reader instead would be reading bytes the document may
 /// have moved, so this test reads a **fresh** reader after every write and
 /// asserts the copies taken before it afterwards.

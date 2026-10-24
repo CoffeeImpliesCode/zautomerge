@@ -1,11 +1,8 @@
 //! The totality regression suite for the storage read path.
 //!
-//! `AGENTS.md` names the gate this file exists to run: *"Every parser is
-//! total over untrusted input: a `ParseError`, never a panic, never an
-//! unbounded loop, never an unchecked allocation size. The 8 fixtures in the
-//! upstream `tests/fuzz-crashers/` are the regression suite for this."* The
-//! eight fixtures are embedded below byte for byte, so the suite needs no
-//! file system and is the same bytes whoever runs it.
+//! Parsers must reject untrusted input without panic, unbounded loops, or unchecked allocation sizes.
+//! The eight upstream `tests/fuzz-crashers/` fixtures are embedded below.
+//! The suite needs no filesystem access for these inputs.
 //!
 //! Total does not mean "does not crash". Every input here has to answer with
 //! **a named `ParseError` variant** and not merely with "an error", because a
@@ -815,7 +812,7 @@ const tallied_refusals = [_]ParseError{
 };
 
 const RefusalTally = struct {
-    counts: [tallied_refusals.len]usize = [_]usize{0} ** tallied_refusals.len,
+    counts: [tallied_refusals.len]usize = @as([tallied_refusals.len]usize, @splat(0)),
     other: usize = 0,
 
     /// Prints the non-zero entries, so the run says which variant each

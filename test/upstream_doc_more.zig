@@ -50,7 +50,7 @@
 //! * **The leak arbiter is [`gpa`]**, and every owned value comes out of it:
 //!  every document, every change list, every chunk buffer, every footer dup, and
 //!  every hydrated mirror. Slices borrowed out of a document are asserted
-//!  before the next write ([AGENTS.md](../AGENTS.md)).
+//!  before the next write.
 //! * **Prose about a test goes inside the braces** as `//`, never above the
 //!  declaration as `///` — Zig 0.16 analyses test declarations in a non-test
 //!  build, so a `///` on a `test` takes the whole module down.
@@ -267,9 +267,7 @@ fn extraBytes(built: *const am.doc.Built) ![]u8 {
     return try gpa.dupe(u8, try built.change.extraBytes(gpa));
 }
 
-/// Two change-hash lists with the same members. **Elementwise, because
-/// [`ChangeHash`] is a struct and Zig 0.16 refuses `==` on one**
-/// ([AGENTS.md](../AGENTS.md): a 32-byte array has no operator to borrow).
+/// Compares change hashes elementwise.
 fn sameHashes(a: []const ChangeHash, b: []const ChangeHash) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| {
@@ -847,8 +845,7 @@ test "an opId of 2^42 never truncates to the document root" {
 // **Not ported, and the reason is upstream's own file: the whole case is inside
 // a `/* … */` block.** `test.rs`:2715 opens `/*`, `#[test]` is at `:2716` and
 // `fn conflicting_unicode_text_with_different_widths` at `:2717`, and `:2744`
-// closes it. **`cargo test` does not run it**, and [AGENTS.md](../AGENTS.md)
-// says "do not port upstream dead code".
+// closes it. `cargo test` does not run it.
 //
 // It is worth recording *why* it is worth nothing, because a name-only diff
 // against `#[test]` lines counts it as a live case and then reports a phantom

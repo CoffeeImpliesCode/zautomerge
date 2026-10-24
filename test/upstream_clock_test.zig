@@ -7,8 +7,8 @@ const Tx = am.Transaction;
 const ChangeHash = am.ChangeHash;
 const Change = am.change_record.Change;
 const root = am.root;
-const actor_a = am.ActorId{ .bytes = &([_]u8{0xa1} ** 15) };
-const actor_b = am.ActorId{ .bytes = &([_]u8{0xb2} ** 16) };
+const actor_a = am.ActorId{ .bytes = &(@as([15]u8, @splat(0xa1))) };
+const actor_b = am.ActorId{ .bytes = &(@as([16]u8, @splat(0xb2))) };
 
 fn commit(tx: *Tx, message: []const u8) !ChangeHash {
     var result = try tx.commitWith(.{ .message = message, .time = 1_700_000_000 });
@@ -132,13 +132,13 @@ test "clock corpus gates all dependency-closed subsets and every covers and merg
         }
         try testing.expectEqual(@as(usize, 1), found);
     }
-    var reference = [_]ChangeHash{.{ .bytes = [_]u8{0} ** 32 }} ** 4;
+    var reference: [4]ChangeHash = @splat(.{ .bytes = @splat(0) });
     var docs: [7]Document = undefined;
     var doc_count: usize = 0;
     defer for (docs[0..doc_count]) |*doc| doc.deinit();
     var change_count: usize = 0;
-    var covers_seen = [_][7]bool{[_]bool{false} ** 7} ** 7;
-    var merges_seen = [_][7]bool{[_]bool{false} ** 7} ** 7;
+    var covers_seen = @as([7][7]bool, @splat(@as([7]bool, @splat(false))));
+    var merges_seen = @as([7][7]bool, @splat(@as([7]bool, @splat(false))));
     var lines = std.mem.splitScalar(u8, @embedFile("golden/clock.jsonl"), '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;

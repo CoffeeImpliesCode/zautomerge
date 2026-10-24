@@ -902,7 +902,7 @@ fn stepName(s: Step) []const u8 {
 /// and a re-put of the *same* register, and a test that pinned only the count
 /// would be blind to the two having swapped.
 fn expectIsolateStream(enc: TextEncoding, got: []const Patch) !void {
-    const hundreds = "a" ** 100;
+    const hundreds = &@as([100 * "a".len]u8, @bitCast(@as([100]["a".len]u8, @splat("a".*))));
     var want: [7]Step = undefined;
     want[0] = .{ .delete = "color" };
     want[1] = .{ .delete = "name" };
@@ -1267,7 +1267,7 @@ fn parseHex(hex: []const u8) !ParsedChange {
     if (!std.mem.eql(u8, bytes.items[0..4], &am.storage.chunk.magic)) {
         return error.NotAChangeChunk;
     }
-    if (bytes.items[8] != @intFromEnum(am.storage.chunk.ChunkType.change)) {
+    if (bytes.items[8] != @backingInt(am.storage.chunk.ChunkType.change)) {
         return error.NotAChangeChunk;
     }
     const body = bytes.items[header_len..];

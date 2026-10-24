@@ -2356,7 +2356,7 @@ fn ival(v: i64) ScalarValue {
 // ── 1. The round trip ───────────────────────────────────────────────────────
 
 /// The one actor the round-trip document is built by.
-const rt_actor: ActorId = ActorId.init("\xaa" ** 8);
+const rt_actor: ActorId = ActorId.init(&@as([8 * "\xaa".len]u8, @bitCast(@as([8]["\xaa".len]u8, @splat("\xaa".*)))));
 
 /// The three objects the round-trip change makes, which are the ids of the ops
 /// that make them.
@@ -2510,7 +2510,7 @@ fn bareChange(actor: ActorId, seq: u64, start: u64, max_op: u64, tag: u8) Change
         .header_len = 0,
         .actor = actor,
         .deps = &.{},
-        .hash = .{ .bytes = [_]u8{tag} ** 32 },
+        .hash = .{ .bytes = @as([32]u8, @splat(tag)) },
         .time = 0,
         .message = &.{},
         .seq = seq,
@@ -3118,7 +3118,7 @@ const actions = [_]struct {
 test "every patch action applies, and each one changes the mirror" {
     const gpa = testing.allocator;
     comptime {
-        if (@typeInfo(PatchAction).@"union".fields.len != 9) {
+        if (@typeInfo(PatchAction).@"union".field_names.len != 9) {
             @compileError("patches.PatchAction is not the nine variants of patch.rs:33-89");
         }
         if (actions.len != 9) @compileError("one action is missing from the table");
@@ -3170,11 +3170,11 @@ test "every patch action applies, and each one changes the mirror" {
 
     // And every variant was in fact exercised: a tag the table does not name
     // would otherwise be a silently untested arm.
-    var covered = [_]bool{false} ** 9;
-    for (actions) |a| covered[@intFromEnum(a.tag)] = true;
+    var covered = @as([9]bool, @splat(false));
+    for (actions) |a| covered[@backingInt(a.tag)] = true;
     for (covered, 0..) |was, i| {
         if (!was) {
-            std.debug.print("no action exercises the {s} variant\n", .{@tagName(@as(std.meta.Tag(PatchAction), @enumFromInt(i)))});
+            std.debug.print("no action exercises the {s} variant\n", .{@tagName(@as(std.meta.Tag(PatchAction), @fromBackingInt(@intCast(i))))});
             return error.TestUnexpectedResult;
         }
     }
@@ -3905,7 +3905,7 @@ test "every value variant round-trips through the mirror" {
     };
     // **One case per [`ScalarValue`] variant, so a new one fails the build.**
     comptime {
-        if (@typeInfo(ScalarValue).@"union".fields.len != cases.len) {
+        if (@typeInfo(ScalarValue).@"union".field_names.len != cases.len) {
             @compileError("ScalarValue is not the eleven variants of src/value.zig:88-101");
         }
     }
@@ -4260,7 +4260,7 @@ test "a register with two live rows is hydrated with its conflict flag" {
     const gpa = testing.allocator;
     const f = try Fixture.init(gpa, &.{
         rt_actor,
-        ActorId.init("\xbb" ** 8),
+        ActorId.init(&@as([8 * "\xbb".len]u8, @bitCast(@as([8]["\xbb".len]u8, @splat("\xbb".*))))),
     });
     defer f.destroy();
 
@@ -5114,8 +5114,7 @@ fn expectTextMarks(
 // Every case below is here for one reason, and the reason is measured rather
 // than assumed: **the arm it names was reached by no test in the tree**, which
 // was established by breaking that arm and watching the whole suite stay
-// green — 1250 tests, no compile error, `FAIL=0`. That is `docs/plan.md` §1.1a
-// pointed at this file, and it is the same instrument twice: the arm is broken
+// green — 1250 tests, no compile error, `FAIL=0`. The arm is broken
 // once more after the test is written, and the run names the test that goes
 // red.
 //
@@ -6025,9 +6024,8 @@ test "two marks on one element, and the second one does not lose the first" {
 //   three fail there on the ownership assertion itself.
 //
 // * **Nine of the arms of this file's own dispatches were reached by no test in
-//   the tree, and that was measured rather than assumed.** §12 says which. The
-//   instrument is `docs/plan.md` §1.1a's: each arm was broken on its own, the
-//   whole suite run, and the arm counted as *unverified* when the suite stayed
+//   the tree, and that was measured rather than assumed.** §12 says which.
+//   Each arm was broken on its own, the whole suite run, and the arm counted as unverified when the suite stayed
 //   green. **Twenty-six such mutations were run against the tree as it stood,
 //   in one batch, and only two of them were detected** — [`Text.putMarks`],
 //   which the round trip reaches through a splice that carries marks, and

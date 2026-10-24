@@ -101,10 +101,10 @@ pub const request_kind = "port-save";
 // ── The fixed history ────────────────────────────────────────────────────────
 
 /// Actor A: fifteen bytes of `0xa1`.
-pub const actor_a = [_]u8{0xa1} ** 15;
+pub const actor_a = @as([15]u8, @splat(0xa1));
 
 /// Actor B: sixteen bytes of `0xb2`.
-pub const actor_b = [_]u8{0xb2} ** 16;
+pub const actor_b = @as([16]u8, @splat(0xb2));
 
 /// The timestamp every commit in every scenario carries.
 pub const commit_time: i64 = 1_700_000_000;

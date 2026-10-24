@@ -6,8 +6,8 @@ const Value = std.json.Value;
 const expect = std.testing.expect;
 const equal = std.testing.expectEqual;
 const strings = std.testing.expectEqualStrings;
-const actor_a = am.ActorId.init(&([_]u8{0xa1} ** 15));
-const actor_b = am.ActorId.init(&([_]u8{0xb2} ** 16));
+const actor_a = am.ActorId.init(&(@as([15]u8, @splat(0xa1))));
+const actor_b = am.ActorId.init(&(@as([16]u8, @splat(0xb2))));
 
 // Every assertion is against a reference observation, not a native self-roundtrip.
 // The scripts are tools/oracle/src/api_parity.rs:546-674. Rust Debug and the
@@ -27,16 +27,16 @@ pub fn verify(gpa: Allocator, io: std.Io, records: []const common.Record, seen: 
     empty.author = null;
     empty.hash = null;
 
-    var variants = [_]bool{false} ** 22;
-    var scalars = [_]bool{false} ** 12;
-    var exids = [_]bool{false} ** 4;
-    var invalid_exids = [_]bool{false} ** 7;
-    var footers = [_]bool{false} ** 5;
-    var authors = [_]bool{false} ** 2;
-    var hex_inputs = [_]bool{false} ** 4;
-    var object_types = [_]bool{false} ** 4;
-    var imports = [_]bool{false} ** 5;
-    var singletons = [_]bool{false} ** 6;
+    var variants = @as([22]bool, @splat(false));
+    var scalars = @as([12]bool, @splat(false));
+    var exids = @as([4]bool, @splat(false));
+    var invalid_exids = @as([7]bool, @splat(false));
+    var footers = @as([5]bool, @splat(false));
+    var authors = @as([2]bool, @splat(false));
+    var hex_inputs = @as([4]bool, @splat(false));
+    var object_types = @as([4]bool, @splat(false));
+    var imports = @as([5]bool, @splat(false));
+    var singletons = @as([6]bool, @splat(false));
     for (records, 0..) |record, index| {
         const name = record.scenario;
         errdefer std.debug.print("API parity values scenario: {s}\n", .{name});

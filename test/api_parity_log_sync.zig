@@ -9,8 +9,8 @@ const Message = am.sync.message.Message;
 const State = am.sync.state.State;
 const protocol = am.sync.protocol;
 const testing = std.testing;
-const actor_a = [_]u8{0xa1} ** 15;
-const actor_b = [_]u8{0xb2} ** 16;
+const actor_a = @as([15]u8, @splat(0xa1));
+const actor_b = @as([16]u8, @splat(0xb2));
 const success_names = [_][]const u8{
     "external-log-apply",
     "external-log-incremental",

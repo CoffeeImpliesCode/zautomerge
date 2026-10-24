@@ -24,9 +24,7 @@
 //! Upstream gets "every data column is the same length" from Rust's type
 //! system: `OpIter` cannot exist unless [`columns.Columns`] was built whole.
 //! Zig has no such guarantee, and upstream checks the property in exactly
-//! one place — `validate_top_index` (`op_set2/op_set.rs:177-186`), a debug
-//! assertion the survey names as the one spot a port would need `unsafe`
-//! for ([survey §Zig mapping notes](../../docs/survey/02-transaction-opset.md)).
+//! one place — `validate_top_index` (`op_set2/op_set.rs:177-186`), a debug assertion.
 //!
 //! **The port establishes it instead of asserting it.** [`checkRowLengths`]
 //! is O(1) — thirteen `len()` calls, no walk, no allocation — and
@@ -72,7 +70,7 @@
 //!   `:273-291`, `:414-425`, …). Upstream marks both ends
 //!   `#[allow(unused)]` and the port's `Column.Iterator` has no
 //!   `suspend`/`IterState` to suspend into, so there is nothing to build
-//!   on. `docs/plan.md` §2 drops upstream dead code.
+//!   on.
 //! * `OpIter`'s `Shiftable` impl. Upstream has none: `Shiftable` is
 //!   implemented for the eight sub-iterators, and the op set composes it.
 //!   All eight carry the full kernel here ([`assertShiftable`] proves it at
@@ -2194,8 +2192,7 @@ pub fn OpIter(comptime O: type) type {
         /// call site of `OpIter::nth` in the op set (`op_set.rs:690` is
         /// the one `nth` in that file, and it is on the `insert` column's
         /// own cursor), so nothing depends on the panicking half; the
-        /// error a genuine read failure raises is returned rather than
-        /// unwrapped, per `AGENTS.md`.
+        /// error a genuine read failure raises is returned rather than unwrapped.
         pub fn tryNth(self: *Self, n: usize) ReadOpError!?Op {
             if (n >= self.len()) return null;
             const id = (try self.id.maybeTryNth(n)) orelse return null;

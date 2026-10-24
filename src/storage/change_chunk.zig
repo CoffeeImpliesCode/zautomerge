@@ -33,9 +33,7 @@
 //! from `ChangeOpsColumns::raw_columns`
 //! (`storage/change/change_op_columns.rs:291-367`), which is also the order the
 //! writer emits them, and that order is ascending by normalized specification
-//! — the order `RawColumns::parse` requires
-//! ([survey 03](../docs/survey/03-storage-columnar.md) §Change op column
-//! layout).
+//! — the order `RawColumns::parse` requires.
 //!
 //! Which of the fourteen a change actually carries depends on its ops: the
 //! object columns are an empty range, and so absent, for an all-root change
@@ -195,9 +193,7 @@ pub const OpColumn = enum(u8) {
 
     /// The operation column with this specification, or null when the block
     /// holds a column that is not one of the fourteen: a successor column of
-    /// id 8, an id 2 or 6 that a change chunk never uses
-    /// ([survey 03](../docs/survey/03-storage-columnar.md) §Change op column
-    /// layout), or an id past the fourteen.
+    /// id 8, an id 2 or 6 that a change chunk never uses, or an id past the fourteen.
     ///
     /// The DEFLATE bit is ignored, as it is in every other comparison of two
     /// specifications (`column_specification.rs:14-17`), so this identifies a
@@ -215,7 +211,7 @@ pub const OpColumn = enum(u8) {
     /// The table row for this column. The table is in tag order and the
     /// comptime block below checks it, so this is an index, not a scan.
     fn row(self: OpColumn) TableRow {
-        return op_column_table[@intFromEnum(self)];
+        return op_column_table[@backingInt(self)];
     }
 };
 
@@ -256,11 +252,11 @@ comptime {
     // `OpColumn.row` indexes this table by tag, so the table must be in tag
     // order and must cover every tag. Both are checked here rather than
     // discovered by a lookup that returns the wrong column.
-    if (op_column_table.len != @typeInfo(OpColumn).@"enum".fields.len) {
+    if (op_column_table.len != @typeInfo(OpColumn).@"enum".field_names.len) {
         @compileError("every OpColumn needs a row in op_column_table");
     }
     for (op_column_table, 0..) |row, i| {
-        if (@intFromEnum(row.tag) != i) {
+        if (@backingInt(row.tag) != i) {
             @compileError("op_column_table must be in OpColumn tag order");
         }
     }
@@ -1687,7 +1683,7 @@ test "opCount is the row count of the action column and not the column count" {
     // as well.
     body.clearRetainingCapacity();
     try body.appendSlice(gpa, &header);
-    const many = [_]?u64{7} ** 1000;
+    const many = @as([1000]?u64, @splat(7));
     var wide: [32]u8 = undefined;
     rle.RleOption(u64).write(&wide, &many);
     const len_many = rle.RleOption(u64).encodedSize(&many);

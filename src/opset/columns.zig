@@ -38,9 +38,8 @@
 //! **The two string columns hold interned ids.** The wire carries the string
 //! itself, length-prefixed under `ColumnType::String`; this port's column
 //! layer is integer-only, so those two columns hold a counter into the
-//! document's string table, which is what the port plan chose
-//! ([plan §5.3](../../docs/plan.md), and the same decision for a change's key
-//! column at [columnar/columns.zig:46-49](../columnar/columns.zig)). The
+//! document's string table, as does the change key column
+//! ([columnar/columns.zig:46-49](../columnar/columns.zig)). The
 //! translation happens at the three points where ids become bytes and back:
 //! `splice` interns what the ops carry, `export` resolves, `load` interns.
 //! Nothing else may write those two columns.
@@ -98,10 +97,8 @@
 //!
 //! Upstream writes the row accessors once, as the `OpLike` trait
 //! (`op_set2/op.rs:1327-1372`). Its successor iterator is a generic
-//! associated type, which Zig has no spelling for
-//! ([survey §Zig mapping notes](../../docs/survey/02-transaction-opset.md)),
-//! so this file is generic over the op type `O` and calls a fixed set of
-//! accessors on it — the split the survey settles on. `op.zig` owns `Op`;
+//! associated type. This file is generic over the op type `O` and calls a fixed
+//! set of accessors on it. `op.zig` owns `Op`;
 //! nothing here reaches into its fields.
 
 const std = @import("std");
@@ -529,8 +526,7 @@ pub const OptCounterColumn = hexane.Column(?u32, hexane.DeltaOption);
 /// A nullable unsigned integer on a run-length column: `obj_ctr`, `key_str`
 /// and `mark_name` (`columns.rs:21`, `:22`, `:32`).
 ///
-/// The two string columns hold an interned string id rather than a counter,
-/// which is the port's storage model ([plan §5.3](../../docs/plan.md)). The
+/// The two string columns hold interned string ids. The
 /// *specification* they are saved under is `.string`, so only `export` and
 /// `load` may write or read them; a caller that dumps this column's bytes
 /// under its own specification writes the wrong format.
@@ -622,29 +618,29 @@ pub const Indexes = struct {
 
         /// Binds every prepared column into the provisional index set.
         pub fn bind(self: *Overlay, view: *Indexes) void {
-            inline for (@typeInfo(Overlay).@"struct".fields) |field| {
-                if (@field(self, field.name)) |*stage| stage.bind(&@field(view, field.name));
+            inline for (@typeInfo(Overlay).@"struct".field_names) |name| {
+                if (@field(self, name)) |*stage| stage.bind(&@field(view, name));
             }
         }
 
         /// Captures all bound provisional columns before publication/disposal.
         pub fn capture(self: *Overlay, view: *Indexes) void {
-            inline for (@typeInfo(Overlay).@"struct".fields) |field| {
-                if (@field(self, field.name)) |*stage| stage.capture(&@field(view, field.name));
+            inline for (@typeInfo(Overlay).@"struct".field_names) |name| {
+                if (@field(self, name)) |*stage| stage.capture(&@field(view, name));
             }
         }
 
         /// Publishes every prepared derived column without allocating.
         pub fn publish(self: *Overlay, source: *Indexes) void {
-            inline for (@typeInfo(Overlay).@"struct".fields) |field| {
-                if (@field(self, field.name)) |*stage| stage.publish(&@field(source, field.name));
+            inline for (@typeInfo(Overlay).@"struct".field_names) |name| {
+                if (@field(self, name)) |*stage| stage.publish(&@field(source, name));
             }
         }
 
         /// Disposes prepared derived columns; source values remain unchanged.
         pub fn deinit(self: *Overlay) void {
-            inline for (@typeInfo(Overlay).@"struct".fields) |field| {
-                if (@field(self, field.name)) |*stage| stage.deinit();
+            inline for (@typeInfo(Overlay).@"struct".field_names) |name| {
+                if (@field(self, name)) |*stage| stage.deinit();
             }
         }
     };
@@ -653,17 +649,18 @@ pub const Indexes = struct {
     pub fn beginOverlay(self: *Indexes, out: *Overlay, options: OverlayOptions) ParseError!void {
         out.* = .{};
         errdefer out.deinit();
-        inline for (@typeInfo(Overlay).@"struct".fields) |field| {
-            const needed = if (comptime std.mem.eql(u8, field.name, "mark"))
+        const info = @typeInfo(Overlay).@"struct";
+        inline for (info.field_names, info.field_types) |name, T| {
+            const needed = if (comptime std.mem.eql(u8, name, "mark"))
                 options.rows
-            else if (comptime std.mem.eql(u8, field.name, "inc"))
+            else if (comptime std.mem.eql(u8, name, "inc"))
                 options.successors
             else
                 options.rows or options.visibility;
             if (needed) {
-                @field(out, field.name) = @as(@typeInfo(field.type).optional.child, undefined);
-                @field(self, field.name).beginOverlay(&@field(out, field.name).?) catch |e| {
-                    @field(out, field.name) = null;
+                @field(out, name) = @as(@typeInfo(T).optional.child, undefined);
+                @field(self, name).beginOverlay(&@field(out, name).?) catch |e| {
+                    @field(out, name) = null;
                     return e;
                 };
             }
@@ -746,7 +743,7 @@ pub const IndexLengths = struct {
 // ── Strings across the storage boundary ────────────────────────────────────
 
 /// The document's string table, which is what the two string columns are
-/// counters into ([plan §5.3](../../docs/plan.md)).
+/// counters into.
 ///
 /// `resolve` turns an id into the bytes the wire carries and `intern` turns
 /// bytes back into an id. Both are the caller's own table; nothing here stores
@@ -935,43 +932,43 @@ pub fn Columns(comptime O: type) type {
 
             /// Binds prepared columns into an otherwise borrowed column view.
             pub fn bind(self: *Overlay, view: *Self) void {
-                inline for (@typeInfo(Overlay).@"struct".fields) |field| {
-                    if (comptime std.mem.eql(u8, field.name, "index")) {
+                inline for (@typeInfo(Overlay).@"struct".field_names) |name| {
+                    if (comptime std.mem.eql(u8, name, "index")) {
                         self.index.bind(&view.index);
-                    } else if (@field(self, field.name)) |*stage| {
-                        stage.bind(&@field(view, field.name));
+                    } else if (@field(self, name)) |*stage| {
+                        stage.bind(&@field(view, name));
                     }
                 }
             }
 
             /// Captures every bound column before publication or disposal.
             pub fn capture(self: *Overlay, view: *Self) void {
-                inline for (@typeInfo(Overlay).@"struct".fields) |field| {
-                    if (comptime std.mem.eql(u8, field.name, "index")) {
+                inline for (@typeInfo(Overlay).@"struct".field_names) |name| {
+                    if (comptime std.mem.eql(u8, name, "index")) {
                         self.index.capture(&view.index);
-                    } else if (@field(self, field.name)) |*stage| {
-                        stage.capture(&@field(view, field.name));
+                    } else if (@field(self, name)) |*stage| {
+                        stage.capture(&@field(view, name));
                     }
                 }
             }
 
             /// Publishes prepared columns without allocation or decoding.
             pub fn publish(self: *Overlay, source: *Self) void {
-                inline for (@typeInfo(Overlay).@"struct".fields) |field| {
-                    if (comptime std.mem.eql(u8, field.name, "index")) {
+                inline for (@typeInfo(Overlay).@"struct".field_names) |name| {
+                    if (comptime std.mem.eql(u8, name, "index")) {
                         self.index.publish(&source.index);
-                    } else if (@field(self, field.name)) |*stage| {
-                        stage.publish(&@field(source, field.name));
+                    } else if (@field(self, name)) |*stage| {
+                        stage.publish(&@field(source, name));
                     }
                 }
             }
 
             /// Releases only provisional storage, not borrowed source slabs.
             pub fn deinit(self: *Overlay) void {
-                inline for (@typeInfo(Overlay).@"struct".fields) |field| {
-                    if (comptime std.mem.eql(u8, field.name, "index")) {
+                inline for (@typeInfo(Overlay).@"struct".field_names) |name| {
+                    if (comptime std.mem.eql(u8, name, "index")) {
                         self.index.deinit();
-                    } else if (@field(self, field.name)) |*stage| {
+                    } else if (@field(self, name)) |*stage| {
                         stage.deinit();
                     }
                 }
@@ -986,20 +983,21 @@ pub fn Columns(comptime O: type) type {
         ) ParseError!void {
             out.* = .{};
             errdefer out.deinit();
-            inline for (@typeInfo(Overlay).@"struct".fields) |field| {
-                if (comptime !std.mem.eql(u8, field.name, "index")) {
-                    const needed = if (comptime std.mem.eql(u8, field.name, "value"))
+            const info = @typeInfo(Overlay).@"struct";
+            inline for (info.field_names, info.field_types) |name, T| {
+                if (comptime !std.mem.eql(u8, name, "index")) {
+                    const needed = if (comptime std.mem.eql(u8, name, "value"))
                         options.payloads
-                    else if (comptime std.mem.eql(u8, field.name, "succ_count"))
+                    else if (comptime std.mem.eql(u8, name, "succ_count"))
                         options.rows or options.successors
-                    else if (comptime std.mem.startsWith(u8, field.name, "succ_"))
+                    else if (comptime std.mem.startsWith(u8, name, "succ_"))
                         options.successors
                     else
                         options.rows;
                     if (needed) {
-                        @field(out, field.name) = @as(@typeInfo(field.type).optional.child, undefined);
-                        @field(self, field.name).beginOverlay(&@field(out, field.name).?) catch |e| {
-                            @field(out, field.name) = null;
+                        @field(out, name) = @as(@typeInfo(T).optional.child, undefined);
+                        @field(self, name).beginOverlay(&@field(out, name).?) catch |e| {
+                            @field(out, name) = null;
                             return e;
                         };
                     }
@@ -1598,8 +1596,7 @@ pub fn Columns(comptime O: type) type {
         /// A delete is not a row: it is filtered out here (`:423`) and does
         /// not appear in the return value, in any of the sixteen columns, or
         /// in the count. It reaches the op set as a successor id on the op it
-        /// deletes, which `add_succ` writes after this returns
-        /// ([survey §4](../../docs/survey/02-transmission-opset.md)).
+        /// deletes, which `add_succ` writes after this returns.
         ///
         /// The two prefix positions are read first, before any column moves
         /// (`:425-426`), because both are sums over columns this function is

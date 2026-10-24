@@ -132,7 +132,7 @@ test "Rust metadata fields and frontier query sets agree" {
     try testing.expectEqual(@as(usize, 6), change_count);
     try testing.expectEqual(@as(usize, 7), query_count);
     try testing.expectEqual(@as(usize, 1), empty_count);
-    try testing.expect(try doc.getChangeMetaByHash(gpa, .{ .bytes = [_]u8{0xff} ** 32 }) == null);
+    try testing.expect(try doc.getChangeMetaByHash(gpa, .{ .bytes = @as([32]u8, @splat(0xff)) }) == null);
 }
 test "metadata results are independent owners across mutation and document teardown" {
     const gpa = testing.allocator;

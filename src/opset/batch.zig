@@ -6,7 +6,7 @@
 //!
 //! # Why this file is the one that has to be right
 //!
-//! Row order is a **strict order, not a total one** ([survey §4](../../docs/survey/02-transaction-opset.md)):
+//! Row order is a strict order, not a total one:
 //! objects ascend, registers group, ids ascend within a register, and an
 //! insert that starts a register is legal only if it is anchored to the
 //! previous element *or* its own id sorts before that element's
@@ -27,8 +27,7 @@
 //! 3. `import_ops` (`:857-862`) — decode each change into [`ChangeOp`]s and
 //!    update the history. **Not here**: the decode is `op_set2/change.rs`'s
 //!    `ChangeOpsColumns` and the history update is the change graph's, both
-//!    modules this file does not own ([plan §4](../../docs/plan.md) gives the
-//!    decode to `zautomerge.change`). The decoded ops arrive as the `ops`
+//!    modules this file does not own. The decoded ops arrive as the `ops`
 //!    argument, which is why `apply` takes them and not only `changes`. Every
 //!    other step is unchanged.
 //! 4. `order_ops_for_doc` (`:979-1015`) — **the sort**.
@@ -60,9 +59,8 @@
 //!
 //! # What the patch log is here
 //!
-//! Upstream's `PatchLog` lives in `patches/patch_log.rs` and the port has not
-//! written it ([plan §4](../../docs/plan.md) gives it to `zautomerge.patches`).
-//! This file therefore declares the **sink it calls** as a comptime contract —
+//! Upstream's `PatchLog` lives in `patches/patch_log.rs`; the port's implementation
+//! lives in `zautomerge.patches`. This file declares the sink as a comptime contract —
 //! [`log_decls`], checked by [`assertLog`] — and hands out [`NullLog`] for a
 //! merge nobody is watching. That is the one shape that is not a straight
 //! transcription, and it is why [`ValueState`] and the two walkers are generic
@@ -340,11 +338,11 @@ fn sameParams(comptime L: type, comptime name: []const u8) bool {
         else => return false,
     };
     const want = @field(log_sig_params, name);
-    if (have.is_generic or have.is_var_args or have.params.len != want.len + 1) return false;
-    const receiver = have.params[0].type orelse return false;
+    if (have.is_generic or have.attrs.varargs or have.param_types.len != want.len + 1) return false;
+    const receiver = have.param_types[0] orelse return false;
     if (receiver != *L and receiver != *const L) return false;
     inline for (want, 0..) |w, i| {
-        const t = have.params[i + 1].type orelse return false;
+        const t = have.param_types[i + 1] orelse return false;
         if (t != w) return false;
     }
     const result = have.return_type orelse return false;
@@ -3125,7 +3123,7 @@ fn bareChange(actor: ActorId, seq: u64, start: u64, tag: u8) Change {
         .header_len = 0,
         .actor = actor,
         .deps = &.{},
-        .hash = .{ .bytes = [_]u8{tag} ** 32 },
+        .hash = .{ .bytes = @as([32]u8, @splat(tag)) },
         .time = 0,
         .message = &.{},
         .seq = seq,
@@ -3464,7 +3462,7 @@ const Recorder = struct {
     }
 
     /// Frees the copied payloads and the events. Once only.
-    fn deinit(self: *Recorder) void {
+    pub fn deinit(self: *Recorder) void {
         for (self.owned.items) |bytes| self.gpa.free(bytes);
         self.owned.deinit(self.gpa);
         self.items.deinit(self.gpa);
@@ -5335,7 +5333,7 @@ test "and one by the lesser actor lands before it too" {
 
 /// A hash absent from the fixture's real encoded change history.
 fn hashOf(tag: u8) ChangeHash {
-    return .{ .bytes = [_]u8{tag} ** 32 };
+    return .{ .bytes = @as([32]u8, @splat(tag)) };
 }
 
 /// Frees the `other_actors` of a change the screen did **not** take. The array

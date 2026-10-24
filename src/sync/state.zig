@@ -503,7 +503,7 @@ pub const State = struct {
 
         // Installed whole, so nothing holding the state can see it half merged.
         gpa.free(old_allocated);
-        self.sent_hashes = .{ .items = out[0..at], .capacity = out.len };
+        self.sent_hashes = .{ .items = out[0..at], .capacity = out.len, .pointer_stability = .{} };
     }
 
     /// Records `hash` in `sent_hashes`, keeping the set ascending and
@@ -605,8 +605,8 @@ test "an empty state is two bytes" {
 
 test "a state round trips its shared heads and nothing else" {
     const gpa = testing.allocator;
-    const a = try ChangeHash.parse(gpa, "0a" ** 32);
-    const b = try ChangeHash.parse(gpa, "0b" ** 32);
+    const a = try ChangeHash.parse(gpa, &@as([32 * "0a".len]u8, @bitCast(@as([32]["0a".len]u8, @splat("0a".*)))));
+    const b = try ChangeHash.parse(gpa, &@as([32 * "0b".len]u8, @bitCast(@as([32]["0b".len]u8, @splat("0b".*)))));
 
     var state = State.new(gpa);
     defer state.deinit();
@@ -649,7 +649,7 @@ test "a state round trips its shared heads and nothing else" {
 
 test "the state type byte is the only one a state accepts" {
     const gpa = testing.allocator;
-    const a = try ChangeHash.parse(gpa, "0a" ** 32);
+    const a = try ChangeHash.parse(gpa, &@as([32 * "0a".len]u8, @bitCast(@as([32]["0a".len]u8, @splat("0a".*)))));
 
     var state = State.new(gpa);
     defer state.deinit();
@@ -769,7 +769,7 @@ test "their needs both halves of what the peer said" {
 
 test "leaving read-only resets the exchange and keeps the capabilities" {
     const gpa = testing.allocator;
-    const a = try ChangeHash.parse(gpa, "0a" ** 32);
+    const a = try ChangeHash.parse(gpa, &@as([32 * "0a".len]u8, @bitCast(@as([32]["0a".len]u8, @splat("0a".*)))));
 
     // A fresh read-only state, which is a default state with one flag set.
     var fresh = State.newReadOnly(gpa);
@@ -822,9 +822,9 @@ test "leaving read-only resets the exchange and keeps the capabilities" {
 
 test "sent hashes are a set" {
     const gpa = testing.allocator;
-    const a = try ChangeHash.parse(gpa, "0a" ** 32);
-    const b = try ChangeHash.parse(gpa, "0b" ** 32);
-    const c = try ChangeHash.parse(gpa, "0c" ** 32);
+    const a = try ChangeHash.parse(gpa, &@as([32 * "0a".len]u8, @bitCast(@as([32]["0a".len]u8, @splat("0a".*)))));
+    const b = try ChangeHash.parse(gpa, &@as([32 * "0b".len]u8, @bitCast(@as([32]["0b".len]u8, @splat("0b".*)))));
+    const c = try ChangeHash.parse(gpa, &@as([32 * "0c".len]u8, @bitCast(@as([32]["0c".len]u8, @splat("0c".*)))));
 
     var state = State.new(gpa);
     defer state.deinit();
@@ -1031,8 +1031,8 @@ test "a state survives every allocation failure" {
     var state = State.new(gpa);
     defer state.deinit();
     state.shared_heads = try gpa.dupe(ChangeHash, &.{
-        try ChangeHash.parse(gpa, "0a" ** 32),
-        try ChangeHash.parse(gpa, "0b" ** 32),
+        try ChangeHash.parse(gpa, &@as([32 * "0a".len]u8, @bitCast(@as([32]["0a".len]u8, @splat("0a".*))))),
+        try ChangeHash.parse(gpa, &@as([32 * "0b".len]u8, @bitCast(@as([32]["0b".len]u8, @splat("0b".*))))),
     });
     const bytes = try state.encode(gpa);
     defer gpa.free(bytes);

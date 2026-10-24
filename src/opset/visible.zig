@@ -39,8 +39,7 @@
 //!
 //! # Constructing one of these allocates nothing
 //!
-//! A visibility walk is paid for on every walk of every object, so
-//! [`plan.md` §3](../../docs/plan.md) makes an iterator a value. Every type
+//! A visibility walk runs for every walk of every object. Every iterator type
 //! here is a few column cursors and some numbers
 //! ([`column.Column.Iterator`](../../src/hexane/column.zig)), a `Clock` the
 //! caller owns, and — for the scan flavour — the caller's successor buffer,

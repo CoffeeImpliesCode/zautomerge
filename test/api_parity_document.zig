@@ -23,8 +23,14 @@ pub fn verify(gpa: Allocator, io: std.Io, records: []const common.Record, seen: 
 }
 
 fn documentFailure(scenario: []const u8, failure: anyerror) void {
-    std.debug.print("api-parity kind=api-parity scenario={s} error={s}\n",
-        .{ scenario, @errorName(failure) });
+    std.debug.print("api-parity kind=api-parity scenario={s} error={s}\n", .{ scenario, @errorName(failure) });
+}
+
+fn documentResult(scenario: []const u8, result: anytype) @TypeOf(result) {
+    return result catch |failure| {
+        documentFailure(scenario, failure);
+        return failure;
+    };
 }
 
 fn txRecord(records: []const common.Record, name: []const u8) !usize {
@@ -60,7 +66,7 @@ fn txExpectHash(gpa: Allocator, expected: Value, actual: ?am.types.ChangeHash) !
 fn txNewDocument(gpa: Allocator, io: std.Io) !am.doc.Document {
     var doc = try am.doc.Document.init(gpa, io);
     errdefer doc.deinit();
-    doc.setActorId(am.types.ActorId.init(&([_]u8{0xa1} ** 15)));
+    doc.setActorId(am.types.ActorId.init(&@as([15]u8, @splat(0xa1))));
     return doc;
 }
 
@@ -70,74 +76,29 @@ fn txCommit(tx: *am.Transaction, gpa: Allocator) !am.types.ChangeHash {
     return result.hash orelse error.ExpectedChange;
 }
 
-fn txExpectPatches(gpa: Allocator, expected: Value, doc: *am.doc.Document,
-    log: *am.patches.PatchLog) !void
-{
+fn txExpectPatches(gpa: Allocator, expected: Value, doc: *am.doc.Document, log: *am.patches.PatchLog) !void {
     errdefer std.debug.print("api-parity document field=patches\n", .{});
     var patches = try doc.makePatches(log);
     defer patches.deinit();
     try common.expectCanonicalPatches(gpa, expected, patches.slice());
 }
 
-fn verifyTransactions(gpa: Allocator, io: std.Io, records: []const common.Record,
-    seen: []bool) !void
-{
+fn verifyTransactions(gpa: Allocator, io: std.Io, records: []const common.Record, seen: []bool) !void {
     var indexes: [tx_scenarios.len]usize = undefined;
     const field_counts = [_]usize{ 7, 6, 7, 3, 5, 8, 5 };
     for (tx_scenarios, field_counts, 0..) |name, count, index| {
-        errdefer |failure| documentFailure(name, failure);
-        indexes[index] = try txRecord(records, name);
-        const data = records[indexes[index]].data;
-        try std.testing.expect(data == .object);
-        try std.testing.expectEqual(count, data.object.count());
+        indexes[index] = try documentResult(name, txCheckRecord(records, name, count));
     }
     var doc = try txNewDocument(gpa, io);
     defer doc.deinit();
     // api_parity.rs:transactions; transaction.rs:impl_read_doc_for_tx.
     var list: am.types.ExId = undefined;
     var text: am.types.ExId = undefined;
-    const base = blk: {
-        errdefer |failure| documentFailure(tx_scenarios[0], failure);
-        var tx = try am.Transaction.open(gpa, &doc);
-        defer tx.deinitClosed();
-        _ = try tx.put(ROOT, .{ .key = "k" }, .{ .int = 1 });
-        list = try tx.putObject(ROOT, .{ .key = "list" }, .list);
-        _ = try tx.insert(list, 0, .{ .int = 1 });
-        text = try tx.putObject(ROOT, .{ .key = "text" }, .text);
-        try tx.spliceText(text, 0, 0, "old");
-        break :blk try txCommit(&tx, gpa);
-    };
-    {
-        errdefer |failure| documentFailure(tx_scenarios[0], failure);
-        var tx = try am.Transaction.open(gpa, &doc);
-        defer tx.deinitClosed();
-        _ = try tx.put(ROOT, .{ .key = "k" }, .{ .int = 2 });
-        try tx.spliceText(text, 0, 3, "new");
-        _ = try txCommit(&tx, gpa);
-    }
+    const base = try documentResult(tx_scenarios[0], txScopedBase(gpa, &doc, &list, &text));
+    try documentResult(tx_scenarios[0], txScopedUpdate(gpa, &doc, text));
     const full_heads = try doc.getHeads(gpa);
     defer gpa.free(full_heads);
-    {
-        errdefer |failure| documentFailure(tx_scenarios[0], failure);
-        const data = records[indexes[0]].data;
-        var log = am.patches.PatchLog.active(gpa);
-        defer log.deinit();
-        var tx = try am.Transaction.openWithPatchLog(gpa, &doc, &log, &.{base});
-        defer tx.deinitClosed();
-        _ = try tx.put(ROOT, .{ .key = "p" }, .{ .int = 3 });
-        _ = try tx.insert(list, 1, .{ .int = 4 });
-        try txExpectHash(gpa, try common.field(data, "base"), base);
-        try common.expectHeads(gpa, try common.field(data, "full_heads"), full_heads);
-        try txExpectField(gpa, data, "pending", tx.count());
-        try txExpectScopedReaders(gpa, try common.field(data, "reads"), &tx,
-            list, text, base, full_heads);
-        var result = try tx.commitWith(.{ .time = 0 });
-        defer result.deinit(gpa);
-        try txExpectHash(gpa, try common.field(data, "hash"), result.hash);
-        try common.expectSnapshot(gpa, io, try common.field(data, "committed"), &doc);
-        try txExpectPatches(gpa, try common.field(data, "patches"), &doc, &result.patch_log);
-        try common.mark(seen, indexes[0]);
-    }
+    try documentResult(tx_scenarios[0], txScopedCheck(gpa, io, records[indexes[0]].data, &doc, list, text, base, full_heads, seen, indexes[0]));
     try txOwnedStory(gpa, io, records[indexes[1]].data, &doc);
     try common.mark(seen, indexes[1]);
     try txClosureStories(gpa, io, records[indexes[2]].data, records[indexes[3]].data, &doc);
@@ -150,8 +111,60 @@ fn verifyTransactions(gpa: Allocator, io: std.Io, records: []const common.Record
     try common.mark(seen, indexes[6]);
 }
 
+fn txCheckRecord(records: []const common.Record, name: []const u8, count: usize) !usize {
+    const index = try txRecord(records, name);
+    const data = records[index].data;
+    try std.testing.expect(data == .object);
+    try std.testing.expectEqual(count, data.object.count());
+    return index;
+}
+
+fn txScopedBase(gpa: Allocator, doc: *am.doc.Document, list: *am.types.ExId, text: *am.types.ExId) !am.types.ChangeHash {
+    var tx = try am.Transaction.open(gpa, doc);
+    defer tx.deinitClosed();
+    _ = try tx.put(ROOT, .{ .key = "k" }, .{ .int = 1 });
+    list.* = try tx.putObject(ROOT, .{ .key = "list" }, .list);
+    _ = try tx.insert(list.*, 0, .{ .int = 1 });
+    text.* = try tx.putObject(ROOT, .{ .key = "text" }, .text);
+    try tx.spliceText(text.*, 0, 0, "old");
+    return try txCommit(&tx, gpa);
+}
+
+fn txScopedUpdate(gpa: Allocator, doc: *am.doc.Document, text: am.types.ExId) !void {
+    var tx = try am.Transaction.open(gpa, doc);
+    defer tx.deinitClosed();
+    _ = try tx.put(ROOT, .{ .key = "k" }, .{ .int = 2 });
+    try tx.spliceText(text, 0, 3, "new");
+    _ = try txCommit(&tx, gpa);
+}
+
+fn txScopedCheck(gpa: Allocator, io: std.Io, data: Value, doc: *am.doc.Document, list: am.types.ExId, text: am.types.ExId, base: am.types.ChangeHash, full_heads: []const am.types.ChangeHash, seen: []bool, index: usize) !void {
+    var log = am.patches.PatchLog.active(gpa);
+    defer log.deinit();
+    var tx = try am.Transaction.openWithPatchLog(gpa, doc, &log, &.{base});
+    defer tx.deinitClosed();
+    _ = try tx.put(ROOT, .{ .key = "p" }, .{ .int = 3 });
+    _ = try tx.insert(list, 1, .{ .int = 4 });
+    try txExpectHash(gpa, try common.field(data, "base"), base);
+    try common.expectHeads(gpa, try common.field(data, "full_heads"), full_heads);
+    try txExpectField(gpa, data, "pending", tx.count());
+    try txExpectScopedReaders(gpa, try common.field(data, "reads"), &tx, list, text, base, full_heads);
+    var result = try tx.commitWith(.{ .time = 0 });
+    defer result.deinit(gpa);
+    try txExpectHash(gpa, try common.field(data, "hash"), result.hash);
+    try common.expectSnapshot(gpa, io, try common.field(data, "committed"), doc);
+    try txExpectPatches(gpa, try common.field(data, "patches"), doc, &result.patch_log);
+    try common.mark(seen, index);
+}
+
 fn txOwnedStory(gpa: Allocator, io: std.Io, data: Value, doc: *am.doc.Document) !void {
-    errdefer |failure| documentFailure(tx_scenarios[1], failure);
+    txOwnedStoryInner(gpa, io, data, doc) catch |failure| {
+        documentFailure(tx_scenarios[1], failure);
+        return failure;
+    };
+}
+
+fn txOwnedStoryInner(gpa: Allocator, io: std.Io, data: Value, doc: *am.doc.Document) !void {
     // owned_transaction.rs:70-95; the open journal requires a stable final address.
     var copied = try doc.clone(gpa);
     var copied_live = true;
@@ -169,8 +182,7 @@ fn txOwnedStory(gpa: Allocator, io: std.Io, data: Value, doc: *am.doc.Document) 
     defer committed.result.deinit(gpa);
     try txExpectHash(gpa, try common.field(data, "hash"), committed.result.hash);
     try common.expectSnapshot(gpa, io, try common.field(data, "state"), &committed.document);
-    try txExpectPatches(gpa, try common.field(data, "patches"), &committed.document,
-        &committed.result.patch_log);
+    try txExpectPatches(gpa, try common.field(data, "patches"), &committed.document, &committed.result.patch_log);
     var rollback_doc = try committed.document.clone(gpa);
     var rollback_doc_live = true;
     defer if (rollback_doc_live) rollback_doc.deinit();
@@ -190,9 +202,7 @@ const TxClosure = struct {
     message: [64]u8 = undefined,
     observed_result: ?usize = null,
 
-    fn rejected(_: void, tx: *am.Transaction)
-        (am.transaction.TransactionError || error{ConsumerError})!void
-    {
+    fn rejected(_: void, tx: *am.Transaction) (am.transaction.TransactionError || error{ConsumerError})!void {
         _ = try tx.put(ROOT, .{ .key = "reject" }, .{ .bool_value = true });
         return error.ConsumerError;
     }
@@ -227,11 +237,15 @@ fn txDisposeOutcome(outcome: anytype) void {
     }
 }
 
-fn txClosureStories(gpa: Allocator, io: std.Io, failed: Value, logged: Value,
-    doc: *am.doc.Document) !void
-{
+fn txClosureStories(gpa: Allocator, io: std.Io, failed: Value, logged: Value, doc: *am.doc.Document) !void {
     var scenario = tx_scenarios[2];
-    errdefer |failure| documentFailure(scenario, failure);
+    txClosureStoriesInner(gpa, io, failed, logged, doc, &scenario) catch |failure| {
+        documentFailure(scenario, failure);
+        return failure;
+    };
+}
+
+fn txClosureStoriesInner(gpa: Allocator, io: std.Io, failed: Value, logged: Value, doc: *am.doc.Document, scenario: *[]const u8) !void {
     // automerge.rs:586-666; typed application errors retain their primary identity.
     try common.expectSnapshot(gpa, io, try common.field(failed, "before"), doc);
     var failure = try am.transaction.enclose(void, gpa, doc, {}, TxClosure.rejected);
@@ -244,14 +258,12 @@ fn txClosureStories(gpa: Allocator, io: std.Io, failed: Value, logged: Value,
             try std.testing.expect(f.transaction == null);
             try std.testing.expect(f.result == null);
             try txExpectField(gpa, failed, "cancelled", f.cancelled);
-            try std.testing.expectEqualStrings("consumer-error",
-                try common.string(try common.field(failed, "error")));
+            try std.testing.expectEqualStrings("consumer-error", try common.string(try common.field(failed, "error")));
         },
     }
     try common.expectSnapshot(gpa, io, try common.field(failed, "after_failure"), doc);
     var ctx: TxClosure = .{};
-    var outcome = try am.transaction.encloseWith(usize, gpa, doc, &ctx,
-        TxClosure.accepted, TxClosure.options);
+    var outcome = try am.transaction.encloseWith(usize, gpa, doc, &ctx, TxClosure.accepted, TxClosure.options);
     defer txDisposeOutcome(&outcome);
     switch (outcome) {
         .failure => return error.ExpectedClosureSuccess,
@@ -262,11 +274,10 @@ fn txClosureStories(gpa: Allocator, io: std.Io, failed: Value, logged: Value,
         },
     }
     try common.expectSnapshot(gpa, io, try common.field(failed, "state"), doc);
-    scenario = tx_scenarios[3];
+    scenario.* = tx_scenarios[3];
     var sink = am.patches.PatchLog.active(gpa);
     defer sink.deinit();
-    var published = try am.transaction.encloseWithPatchLog(void, gpa, doc, &sink, {},
-        TxClosure.logged, TxClosure.loggedOptions);
+    var published = try am.transaction.encloseWithPatchLog(void, gpa, doc, &sink, {}, TxClosure.logged, TxClosure.loggedOptions);
     defer txDisposeOutcome(&published);
     switch (published) {
         .failure => return error.ExpectedLoggedSuccess,
@@ -274,15 +285,20 @@ fn txClosureStories(gpa: Allocator, io: std.Io, failed: Value, logged: Value,
             try std.testing.expect(!sink.recording);
             try std.testing.expect(success.patch_log.recording);
             try txExpectHash(gpa, try common.field(logged, "hash"), success.hash);
-            try txExpectPatches(gpa, try common.field(logged, "patches"), doc,
-                &success.patch_log);
+            try txExpectPatches(gpa, try common.field(logged, "patches"), doc, &success.patch_log);
         },
     }
     try common.expectSnapshot(gpa, io, try common.field(logged, "state"), doc);
 }
 
 fn txNestedStory(gpa: Allocator, io: std.Io, data: Value) !void {
-    errdefer |failure| documentFailure(tx_scenarios[4], failure);
+    txNestedStoryInner(gpa, io, data) catch |failure| {
+        documentFailure(tx_scenarios[4], failure);
+        return failure;
+    };
+}
+
+fn txNestedStoryInner(gpa: Allocator, io: std.Io, data: Value) !void {
     var doc = try txNewDocument(gpa, io);
     defer doc.deinit();
     var map: am.types.ExId = undefined;
@@ -322,7 +338,13 @@ fn txNestedStory(gpa: Allocator, io: std.Io, data: Value) !void {
 
 fn txEqualHeadsStories(gpa: Allocator, io: std.Io, scoped: Value, unscoped: Value) !void {
     var scenario = tx_scenarios[5];
-    errdefer |failure| documentFailure(scenario, failure);
+    txEqualHeadsStoriesInner(gpa, io, scoped, unscoped, &scenario) catch |failure| {
+        documentFailure(scenario, failure);
+        return failure;
+    };
+}
+
+fn txEqualHeadsStoriesInner(gpa: Allocator, io: std.Io, scoped: Value, unscoped: Value, scenario: *[]const u8) !void {
     // Ordinary historical reads exclude pending rows, including at current heads.
     // Hydrate's matching-current-head optimization is a distinct upstream contract.
     var doc = try txNewDocument(gpa, io);
@@ -358,32 +380,29 @@ fn txEqualHeadsStories(gpa: Allocator, io: std.Io, scoped: Value, unscoped: Valu
         _ = try tx.rollback();
     }
     {
-        scenario = tx_scenarios[6];
+        scenario.* = tx_scenarios[6];
         var tx = try am.Transaction.open(gpa, &doc);
         defer tx.deinitClosed();
         _ = try tx.put(ROOT, .{ .key = "pending" }, .{ .int = 2 });
         try common.expectHeads(gpa, try common.field(unscoped, "heads"), heads);
         try txExpectTree(gpa, try common.field(unscoped, "current"), &tx);
-        try txReadExpectOptional(gpa, try common.field(unscoped, "get_at_pending"),
-            try tx.getAt(ROOT, .{ .key = "pending" }, heads));
+        try txReadExpectOptional(gpa, try common.field(unscoped, "get_at_pending"), try tx.getAt(ROOT, .{ .key = "pending" }, heads));
         var hydrated = try tx.hydrate(ROOT, null, gpa);
         defer hydrated.deinit();
         var at = try tx.hydrate(ROOT, heads, gpa);
         defer at.deinit();
         try common.expectHydrated(gpa, try common.field(unscoped, "hydrate_null"), &hydrated);
-        try common.expectHydrated(gpa,
-            try common.field(unscoped, "pending_hydrate_same_heads"), &at);
+        try common.expectHydrated(gpa, try common.field(unscoped, "pending_hydrate_same_heads"), &at);
         _ = try tx.rollback();
     }
 }
 
 // tools/oracle/src/api_parity.rs:378 (loads); upstream automerge.rs:855-1030,
 // 1973-2020. All input bytes below are loaded by the native public surface.
-const loadCanonicalActorBytes = [_]u8{0xb2} ** 16;
+const loadCanonicalActorBytes: [16]u8 = @splat(0xb2);
 
 fn loadRefusal(expected: Value, result: am.doc.LoadError!am.doc.Document, expected_native: am.doc.LoadError) !void {
-    errdefer std.debug.print("api-parity load refusal expected-native={s}\n",
-        .{@errorName(expected_native)});
+    errdefer std.debug.print("api-parity load refusal expected-native={s}\n", .{@errorName(expected_native)});
     if (result) |loaded| {
         var unexpected = loaded;
         defer unexpected.deinit();
@@ -406,35 +425,37 @@ fn loadRefusal(expected: Value, result: am.doc.LoadError!am.doc.Document, expect
 pub fn verifyLoads(gpa: Allocator, io: std.Io, records: []const common.Record, seen: []bool) !void {
     const scenarios = [_][]const u8{
         "load-unverified-mismatching-heads", "load-partial-checksum",
-        "load-string-migration-author", "load-rescue-broken-mark",
+        "load-string-migration-author",      "load-rescue-broken-mark",
     };
-    var found = [_]bool{false} ** scenarios.len;
+    var found: [scenarios.len]bool = @splat(false);
     for (records, 0..) |record, record_index| {
-        errdefer |failure| documentFailure(record.scenario, failure);
         if (!std.mem.startsWith(u8, record.scenario, "load-")) continue;
-        try std.testing.expectEqualStrings("api-parity", record.kind);
-        const scenario_index = for (scenarios, 0..) |scenario, index| {
-            if (std.mem.eql(u8, scenario, record.scenario)) break index;
-        } else return error.UnknownLoadScenario;
-        try std.testing.expect(!found[scenario_index]);
-        switch (scenario_index) {
-            0 => try loadUnverified(gpa, io, record.data),
-            1 => try loadPartial(gpa, io, record.data),
-            2 => try loadMigration(gpa, io, record.data),
-            3 => try loadRescue(gpa, io, record.data),
-            else => unreachable,
-        }
-        found[scenario_index] = true;
-        try common.mark(seen, record_index);
+        try documentResult(record.scenario, verifyLoadRecord(gpa, io, record, record_index, &scenarios, &found, seen));
     }
     for (found) |present| try std.testing.expect(present);
+}
+
+fn verifyLoadRecord(gpa: Allocator, io: std.Io, record: common.Record, record_index: usize, scenarios: []const []const u8, found: []bool, seen: []bool) !void {
+    try std.testing.expectEqualStrings("api-parity", record.kind);
+    const scenario_index = for (scenarios, 0..) |scenario, index| {
+        if (std.mem.eql(u8, scenario, record.scenario)) break index;
+    } else return error.UnknownLoadScenario;
+    try std.testing.expect(!found[scenario_index]);
+    switch (scenario_index) {
+        0 => try loadUnverified(gpa, io, record.data),
+        1 => try loadPartial(gpa, io, record.data),
+        2 => try loadMigration(gpa, io, record.data),
+        3 => try loadRescue(gpa, io, record.data),
+        else => unreachable,
+    }
+    found[scenario_index] = true;
+    try common.mark(seen, record_index);
 }
 
 fn loadFields(value: Value, names: []const []const u8) !void {
     if (value != .object) return error.ExpectedObject;
     errdefer {
-        std.debug.print("api-parity load fields expected={d} actual={d}\n",
-            .{ names.len, value.object.count() });
+        std.debug.print("api-parity load fields expected={d} actual={d}\n", .{ names.len, value.object.count() });
         var entries = value.object.iterator();
         while (entries.next()) |entry| {
             std.debug.print("api-parity load field present={s}\n", .{entry.key_ptr.*});
@@ -487,8 +508,7 @@ fn loadUnverified(gpa: Allocator, io: std.Io, data: Value) !void {
     try loadFields(data, &.{ "input_hex", "check", "unverified", "dont_check" });
     const bytes = try common.unhex(gpa, try common.string(try common.field(data, "input_hex")));
     defer gpa.free(bytes);
-    try loadRefusal(try common.field(data, "check"),
-        am.doc.Document.load(gpa, io, bytes, .unicode_code_point), error.MissingHash);
+    try loadRefusal(try common.field(data, "check"), am.doc.Document.load(gpa, io, bytes, .unicode_code_point), error.MissingHash);
     var unverified = try am.doc.Document.loadUnverifiedHeads(gpa, io, bytes, .{});
     defer unverified.deinit();
     try loadUncheckedState(gpa, try common.field(data, "unverified"), &unverified);
@@ -500,15 +520,12 @@ fn loadUnverified(gpa: Allocator, io: std.Io, data: Value) !void {
 }
 
 fn loadPartial(gpa: Allocator, io: std.Io, data: Value) !void {
-    try loadFields(data, &.{ "input_hex", "change_first_hex", "refuse", "ignore",
-        "change_first_ignore", "unverified_valid", "checksum_hex", "checksum_unverified",
-        "active_load_patches", "incremental_count", "incremental" });
+    try loadFields(data, &.{ "input_hex", "change_first_hex", "refuse", "ignore", "change_first_ignore", "unverified_valid", "checksum_hex", "checksum_unverified", "active_load_patches", "incremental_count", "incremental" });
     const stream = try common.unhex(gpa, try common.string(try common.field(data, "input_hex")));
     defer gpa.free(stream);
     const change_first = try common.unhex(gpa, try common.string(try common.field(data, "change_first_hex")));
     defer gpa.free(change_first);
-    try loadRefusal(try common.field(data, "refuse"),
-        am.doc.Document.load(gpa, io, stream, .unicode_code_point), error.LengthExceedsInput);
+    try loadRefusal(try common.field(data, "refuse"), am.doc.Document.load(gpa, io, stream, .unicode_code_point), error.LengthExceedsInput);
     var ignored = try am.doc.Document.loadWithOptions(gpa, io, stream, .{ .on_partial_load = .ignore });
     defer ignored.deinit();
     try loadOk(gpa, io, try common.field(data, "ignore"), &ignored);
@@ -533,8 +550,7 @@ fn loadPartial(gpa: Allocator, io: std.Io, data: Value) !void {
     try common.expectSnapshot(gpa, io, valid, &ignored);
     const checksum = try common.unhex(gpa, try common.string(try common.field(data, "checksum_hex")));
     defer gpa.free(checksum);
-    try loadRefusal(try common.field(data, "checksum_unverified"),
-        am.doc.Document.loadUnverifiedHeads(gpa, io, checksum, .{}), error.InvalidChecksum);
+    try loadRefusal(try common.field(data, "checksum_unverified"), am.doc.Document.loadUnverifiedHeads(gpa, io, checksum, .{}), error.InvalidChecksum);
     var log = am.patches.PatchLog.active(gpa);
     defer log.deinit();
     var logged = try am.doc.Document.loadWithOptions(gpa, io, base, .{ .patch_log = &log });
@@ -545,8 +561,7 @@ fn loadPartial(gpa: Allocator, io: std.Io, data: Value) !void {
     try common.expectCanonicalPatches(gpa, try common.field(data, "active_load_patches"), patches.slice());
     var incremental = try am.doc.Document.load(gpa, io, base, .unicode_code_point);
     defer incremental.deinit();
-    try std.testing.expectEqual(try common.integer(usize, try common.field(data, "incremental_count")),
-        try incremental.loadIncremental(gpa, stream));
+    try std.testing.expectEqual(try common.integer(usize, try common.field(data, "incremental_count")), try incremental.loadIncremental(gpa, stream));
     try common.expectSnapshot(gpa, io, try common.field(data, "incremental"), &incremental);
 }
 
@@ -566,11 +581,15 @@ fn loadReplaceActor(change: *am.change_record.ExpandedChange) void {
     const old = change.actor;
     change.actor = replacement;
     for (@constCast(change.ops)) |*op| {
-        switch (op.obj) { .root => {}, .id => |*id| loadReplaceId(id, old, replacement) }
+        switch (op.obj) {
+            .root => {},
+            .id => |*id| loadReplaceId(id, old, replacement),
+        }
         switch (op.key) {
             .map => {},
             .seq => |*element| switch (element.*) {
-                .head => {}, .id => |*id| loadReplaceId(id, old, replacement),
+                .head => {},
+                .id => |*id| loadReplaceId(id, old, replacement),
             },
         }
         const predecessors = @constCast(op.pred);
@@ -581,9 +600,7 @@ fn loadReplaceActor(change: *am.change_record.ExpandedChange) void {
 }
 
 fn loadMigration(gpa: Allocator, io: std.Io, data: Value) !void {
-    try loadFields(data, &.{ "input_hex", "value", "author", "base_change_count",
-        "migration_author", "migration_op_count", "normalized_equal", "canonical_migration",
-        "canonical_hex", "canonical_hash", "next", "next_author", "object_type" });
+    try loadFields(data, &.{ "input_hex", "value", "author", "base_change_count", "migration_author", "migration_op_count", "normalized_equal", "canonical_migration", "canonical_hex", "canonical_hash", "next", "next_author", "object_type" });
     const input = try common.unhex(gpa, try common.string(try common.field(data, "input_hex")));
     defer gpa.free(input);
     var source = try am.doc.Document.load(gpa, io, input, .unicode_code_point);
@@ -593,7 +610,8 @@ fn loadMigration(gpa: Allocator, io: std.Io, data: Value) !void {
     try std.testing.expectEqual(try common.integer(usize, try common.field(data, "base_change_count")), base_changes.len());
     const author = [_]u8{ 0xff, 0x00, 0x80 };
     var migrated = try am.doc.Document.loadWithOptions(gpa, io, input, .{
-        .string_migration = .convert_to_text, .author = &author,
+        .string_migration = .convert_to_text,
+        .author = &author,
     });
     defer migrated.deinit();
     try loadTree(gpa, try common.field(data, "value"), &migrated);
@@ -662,8 +680,7 @@ fn loadRescue(gpa: Allocator, io: std.Io, data: Value) !void {
     try std.testing.expectEqualStrings("broken_zero_width_mark.automerge", try common.string(try common.field(data, "fixture")));
     const bytes = try common.unhex(gpa, try common.string(try common.field(data, "input_hex")));
     defer gpa.free(bytes);
-    try loadRefusal(try common.field(data, "strict"),
-        am.doc.Document.load(gpa, io, bytes, .unicode_code_point), error.InvalidMarkOrder);
+    try loadRefusal(try common.field(data, "strict"), am.doc.Document.load(gpa, io, bytes, .unicode_code_point), error.InvalidMarkOrder);
     var rescued = try am.doc.Document.rescue(gpa, io, bytes);
     defer rescued.deinit();
     const expected = try common.field(data, "rescue");
@@ -673,24 +690,23 @@ fn loadRescue(gpa: Allocator, io: std.Io, data: Value) !void {
 
 // Lifecycle scripts mirror tools/oracle/src/api_parity.rs::lifecycle (Rust 0.12.0).
 // Source strings are provenance, not native behavior assertions.
-const life_actor_a = [_]u8{0xa1} ** 15;
-const life_actor_b = [_]u8{0xb2} ** 16;
+const life_actor_a: [15]u8 = @splat(0xa1);
+const life_actor_b: [16]u8 = @splat(0xb2);
 const life_scenarios = [_][]const u8{
-    "held-clone-rollback", "empty-change-closes-pending", "isolation-hydrate-null",
-    "barrier-map", "diff-owned-repeat", "isolated-ordered-patches",
+    "held-clone-rollback",     "empty-change-closes-pending", "isolation-hydrate-null",
+    "barrier-map",             "diff-owned-repeat",           "isolated-ordered-patches",
     "has-our-changes-ordered", "isolated-list-boundary",
 };
 const life_routes = [_][]const u8{
-    "read", "hydrate", "trait-missing", "inherent-missing", "trait-change",
-    "inherent-change", "heads", "history", "save", "save-incremental", "save-after",
-    "save-verify", "fork", "actor", "author", "diff", "diff-incremental", "reset-diff",
-    "update-diff", "apply", "merge", "load-incremental", "isolate", "integrate", "sync",
+    "read",            "hydrate",          "trait-missing", "inherent-missing", "trait-change",
+    "inherent-change", "heads",            "history",       "save",             "save-incremental",
+    "save-after",      "save-verify",      "fork",          "actor",            "author",
+    "diff",            "diff-incremental", "reset-diff",    "update-diff",      "apply",
+    "merge",           "load-incremental", "isolate",       "integrate",        "sync",
     "has-our-changes",
 };
 
-pub fn verifyLifecycle(gpa: Allocator, io: std.Io, records: []const common.Record,
-    seen: []bool) !void
-{
+pub fn verifyLifecycle(gpa: Allocator, io: std.Io, records: []const common.Record, seen: []bool) !void {
     var indices: [life_scenarios.len]usize = undefined;
     for (life_scenarios, 0..) |scenario, slot| {
         var found: ?usize = null;
@@ -768,9 +784,7 @@ fn lifeHeads(gpa: Allocator, expected: Value, doc: *am.AutoCommit) !void {
     try lifeOrderedHeads(gpa, expected, heads);
 }
 
-fn lifeOrderedHeads(gpa: Allocator, expected: Value,
-    actual: []const am.types.ChangeHash) !void
-{
+fn lifeOrderedHeads(gpa: Allocator, expected: Value, actual: []const am.types.ChangeHash) !void {
     try common.expectHeads(gpa, expected, actual);
     const ordered = try common.array(expected);
     try std.testing.expectEqual(ordered.len, actual.len);
@@ -783,11 +797,15 @@ fn lifeItem(gpa: Allocator, expected: Value, actual: ?am.read.DocItem) !void {
 
 fn lifeHeld(gpa: Allocator, io: std.Io, held: Value, empty: Value) !void {
     var scenario = life_scenarios[0];
-    errdefer |failure| documentFailure(scenario, failure);
+    lifeHeldInner(gpa, io, held, empty, &scenario) catch |failure| {
+        documentFailure(scenario, failure);
+        return failure;
+    };
+}
+
+fn lifeHeldInner(gpa: Allocator, io: std.Io, held: Value, empty: Value, scenario: *[]const u8) !void {
     // autocommit.rs:63-70,704-772: pending clones keep two independent journals.
-    try lifeFields(held, &.{ "pending", "read", "clone_pending",
-        "source_pending_after_clone", "clone_cancelled", "clone_value", "source_value",
-        "hash", "empty_commit", "history_len", "change_hex" });
+    try lifeFields(held, &.{ "pending", "read", "clone_pending", "source_pending_after_clone", "clone_cancelled", "clone_value", "source_value", "hash", "empty_commit", "history_len", "change_hex" });
     try lifeFields(empty, &.{ "hash", "history_len", "op_counts", "value" });
     var doc = try lifeAuto(gpa, io);
     defer doc.deinit();
@@ -803,8 +821,7 @@ fn lifeHeld(gpa: Allocator, io: std.Io, held: Value, empty: Value) !void {
     try lifeNumber(held, "source_pending_after_clone", doc.pendingOps());
     try lifeNumber(held, "clone_cancelled", try copy.rollback());
     try lifeOptionalHash(try common.field(held, "hash"), try doc.commitWith(.{ .time = 0 }));
-    try lifeOptionalHash(try common.field(held, "empty_commit"),
-        try doc.commitWith(.{ .time = 0 }));
+    try lifeOptionalHash(try common.field(held, "empty_commit"), try doc.commitWith(.{ .time = 0 }));
     var history = try doc.getChanges(gpa, &.{});
     defer history.deinit(gpa);
     try lifeNumber(held, "history_len", history.len());
@@ -821,7 +838,7 @@ fn lifeHeld(gpa: Allocator, io: std.Io, held: Value, empty: Value) !void {
     }
     try lifeTree(gpa, try common.field(held, "clone_value"), &copy);
     try lifeTree(gpa, try common.field(held, "source_value"), &doc);
-    scenario = life_scenarios[1];
+    scenario.* = life_scenarios[1];
     _ = try doc.put(ROOT, .{ .key = "c" }, .{ .int = 3 });
     try lifeHash(try common.field(empty, "hash"), try doc.emptyChange(.{ .time = 0 }));
     var all = try doc.getChangesMeta(gpa, &.{});
@@ -831,18 +848,21 @@ fn lifeHeld(gpa: Allocator, io: std.Io, held: Value, empty: Value) !void {
     try std.testing.expectEqual(counts.len, all.items.items.len);
     for (counts, all.items.items) |count, meta| {
         errdefer std.debug.print("api-parity lifecycle field=op_counts\n", .{});
-        try std.testing.expectEqual(try common.integer(u64, count),
-            meta.max_op + 1 - meta.start_op);
+        try std.testing.expectEqual(try common.integer(u64, count), meta.max_op + 1 - meta.start_op);
     }
     try lifeTree(gpa, try common.field(empty, "value"), &doc);
 }
 
 fn lifeIsolation(gpa: Allocator, io: std.Io, data: Value) !void {
-    errdefer |failure| documentFailure(life_scenarios[2], failure);
+    lifeIsolationInner(gpa, io, data) catch |failure| {
+        documentFailure(life_scenarios[2], failure);
+        return failure;
+    };
+}
+
+fn lifeIsolationInner(gpa: Allocator, io: std.Io, data: Value) !void {
     // autocommit.rs:433-443,827-829: hydrate(None) bypasses isolation without closing.
-    try lifeFields(data, &.{ "h1", "h2", "isolated_heads", "has_full_changes",
-        "scoped_serde", "explicit_pending", "hydrate_null", "hydrate_historical",
-        "pending_before_integrate", "pending_after_integrate", "value", "heads" });
+    try lifeFields(data, &.{ "h1", "h2", "isolated_heads", "has_full_changes", "scoped_serde", "explicit_pending", "hydrate_null", "hydrate_historical", "pending_before_integrate", "pending_after_integrate", "value", "heads" });
     var doc = try lifeAuto(gpa, io);
     defer doc.deinit();
     _ = try doc.put(ROOT, .{ .key = "k" }, .{ .int = 1 });
@@ -859,8 +879,7 @@ fn lifeIsolation(gpa: Allocator, io: std.Io, data: Value) !void {
     try lifeBool(data, "has_full_changes", try doc.hasOurChanges(&state));
     _ = try doc.put(ROOT, .{ .key = "p" }, .{ .int = 3 });
     try lifeTree(gpa, try common.field(data, "scoped_serde"), &doc);
-    try lifeItem(gpa, try common.field(data, "explicit_pending"),
-        try doc.getAt(ROOT, .{ .key = "p" }, &.{h1}));
+    try lifeItem(gpa, try common.field(data, "explicit_pending"), try doc.getAt(ROOT, .{ .key = "p" }, &.{h1}));
     var current = try doc.hydrate(ROOT, null, gpa);
     defer current.deinit();
     var historical = try doc.hydrate(ROOT, &.{h1}, gpa);
@@ -877,7 +896,9 @@ fn lifeIsolation(gpa: Allocator, io: std.Io, data: Value) !void {
 fn lifeBarrier(gpa: Allocator, io: std.Io, route: usize, doc: *am.AutoCommit) !void {
     const Reader = am.read.ReadDoc(am.AutoCommit);
     switch (route) {
-        0 => { _ = try doc.get(ROOT, .{ .key = "pending" }); },
+        0 => {
+            _ = try doc.get(ROOT, .{ .key = "pending" });
+        },
         1 => {
             var value = try doc.hydrate(ROOT, null, gpa);
             defer value.deinit();
@@ -936,14 +957,18 @@ fn lifeBarrier(gpa: Allocator, io: std.Io, route: usize, doc: *am.AutoCommit) !v
         },
         17 => try doc.resetDiffCursor(),
         18 => try doc.updateDiffCursor(),
-        19 => { _ = try doc.applyChanges(gpa, &.{}); },
+        19 => {
+            _ = try doc.applyChanges(gpa, &.{});
+        },
         20 => {
             var other = try lifeAuto(gpa, io);
             defer other.deinit();
             const heads = try doc.merge(gpa, &other);
             defer gpa.free(heads);
         },
-        21 => { _ = try doc.loadIncremental(gpa, &.{}); },
+        21 => {
+            _ = try doc.loadIncremental(gpa, &.{});
+        },
         22 => try doc.isolate(gpa, &.{}),
         23 => try doc.integrate(),
         24 => {
@@ -966,7 +991,13 @@ fn lifeBarrier(gpa: Allocator, io: std.Io, route: usize, doc: *am.AutoCommit) !v
 
 fn lifeBarriersAndDiff(gpa: Allocator, io: std.Io, barriers: Value, repeated: Value) !void {
     var scenario = life_scenarios[3];
-    errdefer |failure| documentFailure(scenario, failure);
+    lifeBarriersAndDiffInner(gpa, io, barriers, repeated, &scenario) catch |failure| {
+        documentFailure(scenario, failure);
+        return failure;
+    };
+}
+
+fn lifeBarriersAndDiffInner(gpa: Allocator, io: std.Io, barriers: Value, repeated: Value, scenario: *[]const u8) !void {
     // autocommit.rs:184-215,254,356-411,609-632,827-829: trait reads are nonclosing.
     const cases = try common.array(barriers);
     try std.testing.expectEqual(life_routes.len, cases.len);
@@ -977,8 +1008,7 @@ fn lifeBarriersAndDiff(gpa: Allocator, io: std.Io, barriers: Value, repeated: Va
     for (cases, life_routes, 0..) |data, name, route| {
         errdefer std.debug.print("api-parity barrier route={s}\n", .{name});
         try lifeFields(data, &.{ "route", "pending", "value", "changes" });
-        try std.testing.expectEqualStrings(name,
-            try common.string(try common.field(data, "route")));
+        try std.testing.expectEqualStrings(name, try common.string(try common.field(data, "route")));
         var doc: am.AutoCommit = undefined;
         try source.cloneInto(gpa, &doc);
         defer doc.deinit();
@@ -996,15 +1026,13 @@ fn lifeBarriersAndDiff(gpa: Allocator, io: std.Io, barriers: Value, repeated: Va
         for (changes, history.items.items) |expected, meta| {
             try lifeFields(expected, &.{ "hash", "actor", "time" });
             try lifeHash(try common.field(expected, "hash"), meta.hash);
-            const actor = try common.unhex(gpa,
-                try common.string(try common.field(expected, "actor")));
+            const actor = try common.unhex(gpa, try common.string(try common.field(expected, "actor")));
             defer gpa.free(actor);
             try std.testing.expectEqualSlices(u8, actor, meta.actor.bytes);
-            try std.testing.expectEqual(try common.integer(i64,
-                try common.field(expected, "time")), meta.timestamp);
+            try std.testing.expectEqual(try common.integer(i64, try common.field(expected, "time")), meta.timestamp);
         }
     }
-    scenario = life_scenarios[4];
+    scenario.* = life_scenarios[4];
     const hash = (try source.commitWith(.{ .time = 0 })) orelse
         return error.MissingLifecycleHash;
     try lifeHash(try common.field(repeated, "hash"), hash);
@@ -1041,7 +1069,13 @@ fn lifePatchesEqual(left: []const am.patches.Patch, right: []const am.patches.Pa
 }
 
 fn lifeOrderedPatches(gpa: Allocator, io: std.Io, data: Value) !void {
-    errdefer |failure| documentFailure(life_scenarios[5], failure);
+    lifeOrderedPatchesInner(gpa, io, data) catch |failure| {
+        documentFailure(life_scenarios[5], failure);
+        return failure;
+    };
+}
+
+fn lifeOrderedPatchesInner(gpa: Allocator, io: std.Io, data: Value) !void {
     // autocommit.rs:433-443; patch_log.rs:276-301: ordered rollback/isolate/integrate batches.
     try lifeFields(data, &.{ "forward", "backward", "isolated", "integrated", "state", "heads" });
     var doc = try lifeAuto(gpa, io);
@@ -1103,7 +1137,13 @@ fn lifeRawWrite(gpa: Allocator, doc: *am.doc.Document, key: []const u8) !void {
 }
 
 fn lifeHasOurChanges(gpa: Allocator, io: std.Io, data: Value) !void {
-    errdefer |failure| documentFailure(life_scenarios[6], failure);
+    lifeHasOurChangesInner(gpa, io, data) catch |failure| {
+        documentFailure(life_scenarios[6], failure);
+        return failure;
+    };
+}
+
+fn lifeHasOurChangesInner(gpa: Allocator, io: std.Io, data: Value) !void {
     // automerge.rs:2027-2029 compares ordered full heads, not set containment.
     try lifeFields(data, &.{ "heads", "exact", "reversed", "subset", "state" });
     var left = try lifeFixture(gpa, io);
@@ -1124,8 +1164,7 @@ fn lifeHasOurChanges(gpa: Allocator, io: std.Io, data: Value) !void {
     try lifeBool(data, "exact", left.hasOurChanges(&state));
     std.mem.reverse(am.types.ChangeHash, state.shared_heads);
     try lifeBool(data, "reversed", left.hasOurChanges(&state));
-    const subset = try gpa.dupe(am.types.ChangeHash,
-        state.shared_heads[0 .. state.shared_heads.len - 1]);
+    const subset = try gpa.dupe(am.types.ChangeHash, state.shared_heads[0 .. state.shared_heads.len - 1]);
     gpa.free(state.shared_heads);
     state.shared_heads = subset;
     try lifeBool(data, "subset", left.hasOurChanges(&state));
@@ -1133,10 +1172,15 @@ fn lifeHasOurChanges(gpa: Allocator, io: std.Io, data: Value) !void {
 }
 
 fn lifeListBoundary(gpa: Allocator, io: std.Io, data: Value) !void {
-    errdefer |failure| documentFailure(life_scenarios[7], failure);
+    lifeListBoundaryInner(gpa, io, data) catch |failure| {
+        documentFailure(life_scenarios[7], failure);
+        return failure;
+    };
+}
+
+fn lifeListBoundaryInner(gpa: Allocator, io: std.Io, data: Value) !void {
     // ReadDoc scope; automerge-c/src/doc/list.rs:83-99,124-140 uses scoped append length.
-    try lifeFields(data, &.{ "old_heads", "full_heads", "scoped_length", "scoped_get",
-        "scoped_get_all", "explicit_new_get", "appended", "pending", "cancelled", "rolled_back" });
+    try lifeFields(data, &.{ "old_heads", "full_heads", "scoped_length", "scoped_get", "scoped_get_all", "explicit_new_get", "appended", "pending", "cancelled", "rolled_back" });
     var doc = try lifeAuto(gpa, io);
     defer doc.deinit();
     const list = try doc.putObject(ROOT, .{ .key = "list" }, .list);
@@ -1150,15 +1194,13 @@ fn lifeListBoundary(gpa: Allocator, io: std.Io, data: Value) !void {
     try doc.isolate(gpa, &.{old});
     const length = try doc.length(list);
     try lifeNumber(data, "scoped_length", length);
-    try lifeItem(gpa, try common.field(data, "scoped_get"),
-        try doc.get(list, .{ .index = 1 }));
+    try lifeItem(gpa, try common.field(data, "scoped_get"), try doc.get(list, .{ .index = 1 }));
     const all = try doc.getAll(list, .{ .index = 1 }, gpa);
     defer gpa.free(all);
     const expected = try common.array(try common.field(data, "scoped_get_all"));
     try std.testing.expectEqual(expected.len, all.len);
     for (expected, all) |item, actual| try lifeItem(gpa, item, actual);
-    try lifeItem(gpa, try common.field(data, "explicit_new_get"),
-        try doc.getAt(list, .{ .index = 1 }, &.{new}));
+    try lifeItem(gpa, try common.field(data, "explicit_new_get"), try doc.getAt(list, .{ .index = 1 }, &.{new}));
     _ = try doc.insert(list, length, .{ .int = 3 });
     try lifeTree(gpa, try common.field(data, "appended"), &doc);
     try lifeNumber(data, "pending", doc.pendingOps());
@@ -1181,13 +1223,12 @@ fn txExpectScopedReaders(
 ) !void {
     // Require the complete semantic projection plus its one excluded diagnostic.
     const fields = [_][]const u8{
-        "serde", "get", "get_at", "keys", "map_range", "list_range", "length",
-        "text", "text_at", "marks", "spans", "parents", "keys_at_held",
-        "empty_heads_read", "get_all", "get_all_at", "map_range_at", "list_range_at",
-        "values", "values_at", "length_at", "object_type", "marks_at", "spans_at",
-        "parents_at", "cursor", "cursor_position", "cursor_moving", "cursor_position_at",
-        "iter", "iter_at", "change_hash_lookup", "stats", "stats_debug", "missing_deps",
-        "text_encoding", "hydrate_null", "hydrate_at",
+        "serde",              "get",          "get_at",       "keys",               "map_range", "list_range",      "length",
+        "text",               "text_at",      "marks",        "spans",              "parents",   "keys_at_held",    "empty_heads_read",
+        "get_all",            "get_all_at",   "map_range_at", "list_range_at",      "values",    "values_at",       "length_at",
+        "object_type",        "marks_at",     "spans_at",     "parents_at",         "cursor",    "cursor_position", "cursor_moving",
+        "cursor_position_at", "iter",         "iter_at",      "change_hash_lookup", "stats",     "stats_debug",     "missing_deps",
+        "text_encoding",      "hydrate_null", "hydrate_at",
     };
     for (fields) |name| _ = try common.field(expected, name);
     try std.testing.expectEqual(fields.len, expected.object.count());
@@ -1205,10 +1246,8 @@ fn txExpectScopedReaders(
     const cursor = try R.getCursor(tx, text, .{ .index = 1 }, null, gpa);
 
     try txExpectTree(gpa, try common.field(expected, "serde"), tx);
-    try txReadExpectOptional(gpa, try common.field(expected, "get"),
-        try R.get(tx, ROOT, .{ .key = "k" }));
-    try txReadExpectOptional(gpa, try common.field(expected, "get_at"),
-        try R.getAt(tx, ROOT, .{ .key = "p" }, full_heads));
+    try txReadExpectOptional(gpa, try common.field(expected, "get"), try R.get(tx, ROOT, .{ .key = "k" }));
+    try txReadExpectOptional(gpa, try common.field(expected, "get_at"), try R.getAt(tx, ROOT, .{ .key = "p" }, full_heads));
     {
         var walk = try R.keys(tx, ROOT);
         defer walk.deinit(owner_gpa);
@@ -1301,17 +1340,14 @@ fn txExpectScopedReaders(
         defer gpa.free(token);
         try txExpectField(gpa, expected, "cursor", token);
     }
-    try txExpectField(gpa, expected, "cursor_position",
-        try R.getCursorPosition(tx, text, cursor, null));
+    try txExpectField(gpa, expected, "cursor_position", try R.getCursorPosition(tx, text, cursor, null));
     {
-        const moving = try R.getCursorMoving(tx, text, .{ .index = 1 }, historical,
-            .before, gpa);
+        const moving = try R.getCursorMoving(tx, text, .{ .index = 1 }, historical, .before, gpa);
         const token = try am.cursor.toStr(gpa, moving);
         defer gpa.free(token);
         try txExpectField(gpa, expected, "cursor_moving", token);
     }
-    try txExpectField(gpa, expected, "cursor_position_at",
-        try R.getCursorPosition(tx, text, cursor, historical));
+    try txExpectField(gpa, expected, "cursor_position_at", try R.getCursorPosition(tx, text, cursor, historical));
     {
         var walk = try R.iter(tx, gpa);
         defer walk.deinit();
@@ -1328,8 +1364,7 @@ fn txExpectScopedReaders(
             defer built.deinit(gpa);
             const wanted = try common.field(expected, "change_hash_lookup");
             try common.expectHash(try common.field(wanted, "hash"), built.hash());
-            const bytes = try common.unhex(gpa,
-                try common.string(try common.field(wanted, "hex")));
+            const bytes = try common.unhex(gpa, try common.string(try common.field(wanted, "hex")));
             defer gpa.free(bytes);
             const native_bytes = try built.change.rawBytes(gpa);
             defer gpa.free(native_bytes);

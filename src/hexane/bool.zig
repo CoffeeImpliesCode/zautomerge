@@ -432,37 +432,37 @@ test "counts crossing the LEB128 boundary take their continuation byte" {
     const gpa = std.testing.allocator;
     // 127 is the largest one-byte count.
     {
-        const bytes = try encode(gpa, &([_]bool{false} ** 127));
+        const bytes = try encode(gpa, &(@as([127]bool, @splat(false))));
         defer gpa.free(bytes);
         try std.testing.expectEqualSlices(u8, &.{0x7f}, bytes);
     }
     // 128 is the smallest two-byte count.
     {
-        const bytes = try encode(gpa, &([_]bool{false} ** 128));
+        const bytes = try encode(gpa, &(@as([128]bool, @splat(false))));
         defer gpa.free(bytes);
         try std.testing.expectEqualSlices(u8, &.{ 0x80, 0x01 }, bytes);
     }
     // 300 = 0b10_0101100: low 7 bits 0101100, then 0b10.
     {
-        const bytes = try encode(gpa, &([_]bool{false} ** 300));
+        const bytes = try encode(gpa, &(@as([300]bool, @splat(false))));
         defer gpa.free(bytes);
         try std.testing.expectEqualSlices(u8, &.{ 0xac, 0x02 }, bytes);
     }
     // 16383 is the largest two-byte count, 16384 the smallest three-byte one.
     {
-        const bytes = try encode(gpa, &([_]bool{false} ** 16383));
+        const bytes = try encode(gpa, &(@as([16383]bool, @splat(false))));
         defer gpa.free(bytes);
         try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x7f }, bytes);
     }
     {
-        const bytes = try encode(gpa, &([_]bool{false} ** 16384));
+        const bytes = try encode(gpa, &(@as([16384]bool, @splat(false))));
         defer gpa.free(bytes);
         try std.testing.expectEqualSlices(u8, &.{ 0x80, 0x80, 0x01 }, bytes);
     }
     // A run that follows another run keeps the same width rule, with the
     // padding run for the leading `true`.
     {
-        const values: []const bool = &([_]bool{true} ++ [_]bool{false} ** 128);
+        const values: []const bool = &([_]bool{true} ++ @as([128]bool, @splat(false)));
         const bytes = try encode(gpa, values);
         defer gpa.free(bytes);
         try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01, 0x80, 0x01 }, bytes);
@@ -510,7 +510,7 @@ test "append matches write and can be called repeatedly" {
     defer list.deinit(gpa);
 
     const first: []const bool = &.{ true, true, false, true };
-    const second: []const bool = &([_]bool{false} ** 300);
+    const second: []const bool = &(@as([300]bool, @splat(false)));
     try Bool.append(&list, gpa, first);
     try Bool.append(&list, gpa, second);
 
@@ -582,8 +582,8 @@ test "nth reaches every value of a slab, over a run or not" {
         // instead of subtracting counts has nothing else to fall back on.
         &.{false},
         &.{true},
-        &([_]bool{false} ** 7),
-        &([_]bool{true} ** 300),
+        &(@as([7]bool, @splat(false))),
+        &(@as([300]bool, @splat(true))),
         // Two runs, and the same slab opened on `true` — so the zero-count
         // pad is a run of its own that a skip steps over rather than serves.
         &.{ false, true },
@@ -598,7 +598,7 @@ test "nth reaches every value of a slab, over a run or not" {
         // read from two bytes rather than one. Kept short on purpose: the
         // parity sweep is quadratic, and a two-byte count does not need a
         // 16k-value slab to be exercised.
-        &([_]bool{true} ** 200),
+        &(@as([200]bool, @splat(true))),
     };
     for (cases) |slice| {
         const bytes = try encode(gpa, slice);
@@ -646,7 +646,7 @@ test "nth raises the refusals next does" {
     // An overlong LEB128, refused as a malformed encoding rather than read
     // as a count.
     {
-        var dec = try Bool.Decoder.init(&([_]u8{0x80} ** 11));
+        var dec = try Bool.Decoder.init(&(@as([11]u8, @splat(0x80))));
         try std.testing.expectError(error.InvalidLeb128, dec.nth(0));
     }
     // A count the tenth byte cannot hold: refused as an overflow, which is
@@ -702,7 +702,7 @@ test "truncated input is rejected" {
 test "an overlong LEB128 is rejected" {
     const gpa = std.testing.allocator;
     // Eleven continuation bytes: one more than a u64 can occupy.
-    try std.testing.expectError(error.InvalidLeb128, Bool.decodeAll(&([_]u8{0x80} ** 11), gpa));
+    try std.testing.expectError(error.InvalidLeb128, Bool.decodeAll(&(@as([11]u8, @splat(0x80))), gpa));
     // The tenth byte of a u64 carries one bit; two is an overflow.
     try std.testing.expectError(
         error.Overflow,
@@ -782,16 +782,16 @@ test "nextRunMax hands back every run of a slab whole" {
         // **Runs of 300.** A count whose LEB128 takes two bytes, so the run's
         // length is not the length of the run's own header, on its own and
         // behind another run.
-        &([_]bool{false} ** 300),
-        &([_]bool{true} ** 300),
-        &([_]bool{false} ** 300 ++ [_]bool{true} ** 300),
-        &([_]bool{true} ** 300 ++ [_]bool{false} ** 300),
+        &(@as([300]bool, @splat(false))),
+        &(@as([300]bool, @splat(true))),
+        &(@as([300]bool, @splat(false)) ++ @as([300]bool, @splat(true))),
+        &(@as([300]bool, @splat(true)) ++ @as([300]bool, @splat(false))),
         // A slab that opens on `true` and then alternates: the pad, a wide
         // run and a count of 1 all in one slab, which is the shape where a
         // skip that treats the pad as a run or forgets to flip its parity
         // shows.
-        &([_]bool{true} ** 2 ++ [_]bool{false} ++ [_]bool{true} ++ [_]bool{false} ** 300),
-        &([_]bool{true} ++ [_]bool{false} ** 3 ++ [_]bool{true}),
+        &(@as([2]bool, @splat(true)) ++ [_]bool{false} ++ [_]bool{true} ++ @as([300]bool, @splat(false))),
+        &([_]bool{true} ++ @as([3]bool, @splat(false)) ++ [_]bool{true}),
     };
     for (cases) |slice| {
         const bytes = try encode(gpa, slice);
@@ -832,7 +832,7 @@ test "nextRunMax past the end, on a budget, and spent" {
     // call under the same value, so 300 values are served by three reads of
     // one two-byte varint rather than 300 reads of one value.
     {
-        const bytes = try encode(gpa, &([_]bool{false} ** 300));
+        const bytes = try encode(gpa, &(@as([300]bool, @splat(false))));
         defer gpa.free(bytes);
         var dec = try Bool.Decoder.init(bytes);
         for ([_]usize{ 100, 100, 100 }) |want| {
@@ -934,7 +934,7 @@ test "nextRunMax raises the refusals next does" {
     // An overlong LEB128, refused as a malformed encoding rather than read
     // as a count.
     {
-        var dec = try Bool.Decoder.init(&([_]u8{0x80} ** 11));
+        var dec = try Bool.Decoder.init(&(@as([11]u8, @splat(0x80))));
         try std.testing.expectError(error.InvalidLeb128, dec.nextRunMax(whole));
     }
     // A count the tenth byte cannot hold: refused as an overflow, which is

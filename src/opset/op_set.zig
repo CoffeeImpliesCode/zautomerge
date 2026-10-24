@@ -16,13 +16,13 @@
 //!
 //! # Three additions to those four fields, and why each is forced
 //!
-//! **The allocator.** `AGENTS.md` says every entry point that allocates takes
-//! one and does not hide it in a global, and the columns, the object index and
+//! **The allocator.** Every allocating entry point takes one explicitly.
+//! The columns, the object index and
 //! the mark cache each own memory. A document is a value in this port, not a
 //! global.
 //!
-//! **The string table.** The two string columns hold *interned ids*, not bytes
-//! ([plan §5.3](../../docs/plan.md)); `columns.zig` reads and writes them
+//! **The string table.** The two string columns hold interned ids, not bytes;
+//! `columns.zig` reads and writes them
 //! through a [`StringTable`](columns.zig), and so does every walk
 //! ([`op_iter.OpIter.init`](op_iter.zig)). Upstream's `Columns` holds the bytes
 //! and needs no table. Holding it here rather than threading it through thirty
@@ -908,7 +908,7 @@ pub fn OpSet(comptime O: type) type {
         /// How every text width in the document is measured (`op_set.rs:64`).
         text_encoding: TextEncoding,
         /// The document's string table, which the two string columns and every
-        /// walk read through ([plan §5.3](../../docs/plan.md)). The module doc
+        /// walk read through. The module doc
         /// says why it lives here.
         strings: StringTable,
         /// The successor buffer every walk this hands out borrows. The module
@@ -1097,7 +1097,7 @@ pub fn OpSet(comptime O: type) type {
         ///
         /// **Two of these entries are comparable only within one op set.** The
         /// `key_str` and `mark_name` entries are the encoded **ids**
-        /// ([plan §5.3](../../docs/plan.md)), where upstream's are
+        /// where upstream's are
         /// `self.key_str.save()` and `self.mark_name.save()` over
         /// `Column<Option<String>>` (`columns.rs:196`, `:201`) and so hold the
         /// strings themselves. A checkpoint is an undo target here and is
@@ -1502,7 +1502,7 @@ pub fn OpSet(comptime O: type) type {
         /// (`columns.rs:111`) and the same for `mark_name` (`:117`).
         ///
         /// **This port's two string columns hold interned ids**
-        /// ([plan §5.3](../../docs/plan.md)) and two op sets have two string
+        /// and two op sets have two string
         /// tables, so both sides are resolved through their own
         /// [`OpSet.strings`] and the bytes are compared. Comparing the ids
         /// would answer a different question — *were these two documents built
@@ -3380,7 +3380,7 @@ pub fn OpSet(comptime O: type) type {
         /// `op_set.rs:927-932`).
         ///
         /// The values are interned **ids**, where upstream's are the strings
-        /// themselves ([plan §5.3](../../docs/plan.md)). Resolve each through
+        /// themselves. Resolve each through
         /// the op set's string table; [`OpSet.propRange`] is what does that
         /// when a caller wants a *range* rather than a walk.
         pub fn keyStrIterRange(self: *const Self, rows: RowRange) ParseError!opcols.UintOptColumn.Iterator {
@@ -4013,7 +4013,7 @@ pub fn OpSet(comptime O: type) type {
         /// The fast path for the present and the slow one for a clock, and
         /// **upstream's `slow_path_assertions` cross-check is ported behind
         /// [`check_slow_paths`]** (`:645-649`), which is the port's spelling of
-        /// upstream's feature gate ([plan §2](../../docs/plan.md)). A test
+        /// upstream's feature gate. A test
         /// compares the two answers directly, so the check is exercised whether
         /// or not the flag is set.
         pub fn seekOpsByIndex(
@@ -10582,10 +10582,8 @@ test "a mark over two graphemes is one run, at the object's own indices" {
     // **The other reader, asked the other question.** [`OpSet.getMarks`] is
     // `mark_index.richTextAt` reached through one prefix descent
     // (`op_set.rs:1031-1035`): it answers for a *position*, where
-    // `calculateMarks` answers for a *range walked*. Both answer here, and the
-    // standing distinction in `docs/STATUS.md` is that they are not
-    // interchangeable — so this asserts both rather than one standing in for
-    // the other.
+    // `calculateMarks` answers for a range walked. They are not interchangeable,
+    // so this asserts both.
     var open_at_one = try set.getMarks(gpa, made(2, 0), 1);
     defer open_at_one.deinit();
     try testing.expectEqual(@as(usize, 1), open_at_one.numMarks());
@@ -11888,7 +11886,7 @@ test "a register with two winners is a broken index, and the cross-check still s
 // | [`OpSet.debugDiff`] returns `?`[`DebugCmpFault`](DebugCmpFault) and names **which** op set is at fault and where | `OpSet::debug_cmp` is `#[cfg(test)]`, returns `()`, and panics through `assert_eq!` ([`op_set.rs:68-71`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs), [`columns.rs:99-130`](../../github-automerge-automerge/rust/automerge/src/op_set2/columns.rs)) | a one-bit answer leaves the reader of two documents that differ with no way to tell which is broken, and the two doors to one document — the local transaction path and the apply path — can disagree about where a row goes. Upstream's own `debug_assert!(doc.ops.validate_op_order())` ([`batch.rs:949`](../../github-automerge-automerge/rust/automerge/src/op_set2/change/batch.rs)) is what says which of the two is wrong, and a comparison that cannot compute it cannot route the reader |
 // | `debugCmp` runs both invariant checkers, on **both** sides, before it compares a column | `Columns::debug_cmp` compares fifteen columns and the value arena and nothing else ([`columns.rs:97-133`](../../github-automerge-automerge/rust/automerge/src/op_set2/columns.rs)) | "these two differ" and "this one is broken" are different facts. A broken op set can be **column for column identical** to a sound one — the rows are the same, only the order is wrong — so a comparison that answers the pair question first reports green on it |
 // | `debugCmp` compares the **actor table** and the **`obj_info` table** | neither ([`op_set.rs:69-71`](../../github-automerge-automerge/rust/automerge/src/op_set2/op_set.rs) reaches only `cols`) | upstream's answer does not say whether a reloaded document still knows what its objects are, which is what makes the comparison the instrument for "a save and a reload are the same document" rather than only "have the same rows" |
-// | the two **string** columns are compared as strings, through each side's own [`OpSet.strings`] | they are `hexane::Column<Option<String>>` and hold the strings ([`columns.rs:24`](../../github-automerge-automerge/rust/automerge/src/op_set2/columns.rs), [`columns.rs:111`](../../github-automerge-automerge/rust/automerge/src/op_set2/columns.rs), [`columns.rs:117`](../../github-automerge-automerge/rust/automerge/src/op_set2/columns.rs)) | this port's hold interned ids ([plan §5.3](../../docs/plan.md)) and two op sets have two string tables, so an id comparison would answer "were these built against the same table" |
+// | the two **string** columns are compared as strings, through each side's own [`OpSet.strings`] | they are `hexane::Column<Option<String>>` and hold the strings ([`columns.rs:24`](../../github-automerge-automerge/rust/automerge/src/op_set2/columns.rs), [`columns.rs:111`](../../github-automerge-automerge/rust/automerge/src/op_set2/columns.rs), [`columns.rs:117`](../../github-automerge-automerge/rust/automerge/src/op_set2/columns.rs)) | this port's hold interned ids and two op sets have two string tables, so an id comparison would answer "were these built against the same table" |
 // | the comparison stays **positional** | so does upstream's | the row order is required, not free: [`opmod.Op.step`](op.zig) is the invariant ([`op.rs:1048-1073`](../../github-automerge-automerge/rust/automerge/src/op_set2/op.rs)), upstream's one and only call site of `validate_op_order` is the `debug_assert!` at the end of every apply ([`batch.rs:949`](../../github-automerge-automerge/rust/automerge/src/op_set2/change/batch.rs)) — **the load path does not check the row order at all**, it asserts `validate_top_index` instead ([`storage/document.rs:351`](../../github-automerge-automerge/rust/automerge/src/storage/document.rs)) — and a map walk does not sort ([`map_range.rs:1486-1490`](../iter/map_range.zig)). Two op sets with the same rows in a different order **read** differently, so comparing them by value would report green on a broken document |
 // | the two checkers, twenty columns, the arena, the mark cache and the object table — **all twenty** of [`checkpoint_column_names`] | fifteen columns and the arena | the four index columns are derived state that a reloaded document rebuilds ([`OpSet.load`](op_set.zig)), and comparing them is what catches a rebuild that disagrees with the rows it was built from |
 // | [`OpSet.debugCmp`]'s error set is `ParseError \|\| InternalError` and the four of [`ReadOpError`]'s own members become `error.Invariant` | `debug_cmp` panics | the op set is not untrusted input — it is the document — so a walk that cannot read a row of one is an invariant failure. [`Document.debugCmp`](../doc.zig) declares that error set and is not this file's to widen |

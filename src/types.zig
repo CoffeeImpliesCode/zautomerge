@@ -897,7 +897,7 @@ pub const ObjType = enum {
     /// Orders the types by their numeric value, which is the order they are
     /// declared in. Nothing in the wire format depends on it.
     pub fn order(a: ObjType, b: ObjType) std.math.Order {
-        return std.math.order(@intFromEnum(a), @intFromEnum(b));
+        return std.math.order(@backingInt(a), @backingInt(b));
     }
 };
 
@@ -1114,23 +1114,23 @@ test "ExId from parts rejects half a pair" {
 test "ChangeHash ordering, checksum, and fragment level" {
     const gpa = std.testing.allocator;
     var a: ChangeHash = .zero;
-    a.bytes = [_]u8{0x01} ** 32;
+    a.bytes = @as([32]u8, @splat(0x01));
     var b: ChangeHash = .zero;
-    b.bytes = [_]u8{0x02} ** 32;
+    b.bytes = @as([32]u8, @splat(0x02));
     try std.testing.expect(a.order(b) == .lt);
     try std.testing.expectEqual([4]u8{ 1, 1, 1, 1 }, a.checksum());
     // Only the first four bytes survive a checksum round trip.
     const from_sum = ChangeHash.fromChecksum(a.checksum());
     try std.testing.expectEqualSlices(u8, a.bytes[0..4], from_sum.bytes[0..4]);
-    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 28, from_sum.bytes[4..]);
+    try std.testing.expectEqualSlices(u8, &@as([28]u8, @splat(0)), from_sum.bytes[4..]);
     try std.testing.expectEqual(@as(usize, 0), a.fragmentLevel());
 
     var c: ChangeHash = .zero;
-    c.bytes = [_]u8{0} ** 32;
+    c.bytes = @as([32]u8, @splat(0));
     c.bytes[31] = 1;
     try std.testing.expectEqual(@as(usize, 31), c.fragmentLevel());
 
-    const parsed = try ChangeHash.parse(gpa, "00" ** 32);
+    const parsed = try ChangeHash.parse(gpa, &@as([32 * "00".len]u8, @bitCast(@as([32]["00".len]u8, @splat("00".*)))));
     try std.testing.expect(parsed.eql(ChangeHash.zero));
 }
 
@@ -1184,7 +1184,7 @@ test "an actor id is any byte string, and only a non-hex string is refused" {
     defer gpa.free(upper.bytes);
     try std.testing.expect(upper.eql(short));
 
-    const long = try ActorId.fromHex(gpa, "ab" ** 32);
+    const long = try ActorId.fromHex(gpa, &@as([32 * "ab".len]u8, @bitCast(@as([32]["ab".len]u8, @splat("ab".*)))));
     defer gpa.free(long.bytes);
     try std.testing.expectEqual(@as(usize, 32), long.bytes.len);
 

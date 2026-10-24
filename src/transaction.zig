@@ -384,9 +384,7 @@ pub fn hashForOpid(tx: *const Transaction, id: ExId) ?ChangeHash {
 /// `deps.iter().filter_map(|hash| change_graph.hash_to_index(hash))`).
 ///
 /// **A dependency the graph does not hold is dropped, with no error.** That is
-/// upstream's `filter_map` and it is a real hazard rather than an oversight —
-/// [`docs/survey/02-transaction-opset.md`](../docs/survey/02-transaction-opset.md)
-/// §risks records it, and a dependency that disappears from a header is a
+/// upstream's `filter_map`. A dependency that disappears from a header is a
 /// change whose hash no longer matches what its producer computed. The port
 /// reproduces it because the header is a compatibility boundary and a change
 /// naming a dependency its reader does not have would be worse.

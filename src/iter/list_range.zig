@@ -68,11 +68,10 @@
 //! [`API.md`](../../API.md)'s**, `struct { start: usize, end: ?usize }` with a
 //! null `end` meaning "to the end of the object", and that removes both of
 //! upstream's arithmetic traps: `Excluded(0)` as a start bound underflows and
-//! `Included(usize::MAX)` as an end bound overflows there
-//! ([survey §`normalize_range`](../../docs/survey/05-iter-query-patch.md)).
+//! `Included(usize::MAX)` as an end bound overflows there.
 //!
 //! Upstream filters **after** diffing, so `list_range(obj, 900_000..)` still
-//! walks every row ([survey §`ListRange`](../../docs/survey/05-iter-query-patch.md)).
+//! walks every row.
 //! So does this, and the reason is the same: the index of an element is not
 //! known until the elements before it have been counted.
 //!
@@ -129,9 +128,8 @@ const predates = maprange.predates;
 ///
 /// **The port's shape is [`API.md`](../../API.md)'s and not upstream's
 /// `RangeBounds`**, and the difference is not only spelling: upstream's
-/// `Excluded(0)` start underflows and its `Included(usize::MAX)` end overflows
-/// ([survey §`normalize_range`](../../docs/survey/05-iter-query-patch.md)), and
-/// a half-open pair of bounds cannot. `start` is inclusive; a null `end` is
+/// `Excluded(0)` start underflows and its `Included(usize::MAX)` end overflows.
+/// A half-open pair of bounds cannot. `start` is inclusive; a null `end` is
 /// the end of the object.
 ///
 /// # An inverted range is empty, and that is deliberate
@@ -968,7 +966,7 @@ pub fn ListRange(comptime O: type) type {
         /// **The filter is after the diff**, as upstream's is: an element's
         /// index is only known once the elements before it have been counted,
         /// so a range that starts past the end of the object still walks every
-        /// row ([survey §`ListRange`](../../docs/survey/05-iter-query-patch.md)).
+        /// row.
         ///
         /// **Three things follow from that, and they are the ones a caller
         /// gets wrong.** An element outside `range` is *skipped*, not a reason to
@@ -1552,9 +1550,7 @@ test "a half-open index range is the shape the C binding builds, and `end - 1` i
     const cases = [_]Case{
         // **The whole list**, and the C case's `0..SIZE_MAX` beside it. **The
         // end is a `usize` and not a key**, so a `SIZE_MAX` end cannot
-        // overflow the way upstream's `Included(usize::MAX)` does in
-        // `normalize_range` ([survey §`normalize_range`](../../docs/survey/05-iter-query-patch.md)) —
-        // that is the reason [`IndexRange`] is half-open and not four arms.
+        // overflow the way upstream's `Included(usize::MAX)` does in `normalize_range`.
         .{ .range = .{ .start = 0, .end = 8 }, .want = &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, .what = "the whole list" },
         .{
             .range = .{ .start = 0, .end = std.math.maxInt(usize) },

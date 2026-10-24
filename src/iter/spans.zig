@@ -1278,8 +1278,7 @@ fn SpansActionValue(comptime O: type) type {
                 try set.valueIterRange(rows),
             );
             // `spans.rs:72`: `matches!(clock, ClockRange::Current(None))` is
-            // the "no clock to honour" case, and the survey names it as the
-            // fast path's first half (`docs/survey/05-iter-query-patch.md:581`).
+            // the "no clock to honour" case.
             const clockless = switch (over) {
                 .current => |maybe| maybe == null,
                 .diff => false,
@@ -1525,8 +1524,7 @@ pub fn SpansDiff(comptime O: type) type {
         /// `:405-430`, [`opset/types.zig:428`](../../opset/types.zig)): a mark
         /// end has no name, and an **unmark is a mark begin whose value is
         /// null**, so a null value never makes a row a mark end. Reading the
-        /// name as an optional rather than the value is the whole of that rule
-        /// and it is the trap `docs/STATUS.md` keeps open.
+        /// name as an optional rather than the value preserves that distinction.
         ///
         /// The port's [`opiter.MarkInfoIter.tryNth`] is **total** — it raises
         /// `error.MissingValue` at the end of the window where upstream's

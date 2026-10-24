@@ -1,9 +1,8 @@
 //! The document chunk: a whole document in the compact columnar form `save`
 //! writes and `load` reads.
 //!
-//! A document chunk body is four regions, in this order and no other
-//! ([survey 03](../docs/survey/03-storage-columnar.md) §Document chunk body,
-//! from the layout comment at `storage/document.rs:71-101`):
+//! A document chunk body is four regions in this order
+//! (`storage/document.rs:71-101`):
 //!
 //! ```text
 //! offset        size  field
@@ -1858,8 +1857,8 @@ test "a column of the deflate threshold is deflated and a shorter one is not" {
 
     // Two columns either side of the threshold, and two small ones to show
     // that a document with any data at all is not a special case.
-    const short = [_]u8{0x5a} ** 255;
-    const long = [_]u8{0x5a} ** 256;
+    const short = @as([255]u8, @splat(0x5a));
+    const long = @as([256]u8, @splat(0x5a));
     var data: std.ArrayList(u8) = .empty;
     defer data.deinit(gpa);
     try data.appendSlice(gpa, &[_]u8{ 0x7f, 0x00 }); // id actor: one row, actor 0

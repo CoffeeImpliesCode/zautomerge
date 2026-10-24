@@ -465,9 +465,8 @@ test "conversion adds no size when there is nothing to convert" {
         // (`convert_string_to_text.rs:71`). Upstream compares the two saved
         // documents' byte lengths, and so does this — **and the byte length is
         // the only place the two implementations may not agree**, because
-        // `save()` is not required to be byte-identical across implementations
-        // ([AGENTS.md](../AGENTS.md): *`save()` output is not required to be
-        // byte-identical to the reference*). Both lengths here come from the
+        // `save()` is not required to be byte-identical across implementations.
+        // Both lengths here come from the
         // **same** encoder over the **same** empty document, so the comparison
         // is exact rather than approximate.
         try testing.expectEqual(empty_document.len, saved_again.len);

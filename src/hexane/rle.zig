@@ -1277,7 +1277,7 @@ test "nth raises the same refusals next does" {
     // An overlong varint in the header the skip lands on, behind a
     // well-formed run so the opening read is not the one that refuses.
     {
-        const overlong = [_]u8{ 0x02, 0x01 } ++ [_]u8{0x80} ** 11;
+        const overlong = [_]u8{ 0x02, 0x01 } ++ @as([11]u8, @splat(0x80));
         var dec = try O.Decoder.init(&overlong);
         try testing.expectError(error.InvalidLeb128, dec.nth(2));
     }
@@ -1385,8 +1385,8 @@ test "encodedSize is exactly the bytes write produces" {
         &.{300},
         &.{std.math.maxInt(u64)},
         &.{ 1, 2, 3 },
-        &([_]u64{0} ** 5),
-        &([_]u64{0} ** 200),
+        &(@as([5]u64, @splat(0))),
+        &(@as([200]u64, @splat(0))),
         &.{ 1, 2, 3, 3, 3 },
         &.{ 1, 2, 3, 3, 3, 4, 5, 5, 6, 7, 7, 7, 7, 8 },
     };
@@ -1414,11 +1414,11 @@ test "encodedSize is exactly the bytes write produces" {
 test "identical values encode as one repeat run" {
     const Codec = Rle(u64);
     // signed(5) ++ unsigned(7): a header and a value, nothing else.
-    try expectBytes(Codec, u64, &([_]u64{7} ** 5), &.{ 0x05, 0x07 });
+    try expectBytes(Codec, u64, &(@as([5]u64, @splat(7))), &.{ 0x05, 0x07 });
     // Two equal values are the smallest run that may carry a repeat header.
     try expectBytes(Codec, u64, &.{ 9, 9 }, &.{ 0x02, 0x09 });
     // A long run: the count needs two header bytes, the value one.
-    try expectBytes(Codec, u64, &([_]u64{0} ** 200), &.{ 0xc8, 0x01, 0x00 });
+    try expectBytes(Codec, u64, &(@as([200]u64, @splat(0))), &.{ 0xc8, 0x01, 0x00 });
     // One value alone is a one-element literal, never `signed(1)`.
     try expectBytes(Codec, u64, &.{42}, &.{ 0x7f, 0x2a });
 
@@ -1426,7 +1426,7 @@ test "identical values encode as one repeat run" {
     try expectBytes(Codec, u64, &.{ 1, 1, 2, 2, 3 }, &.{ 0x02, 0x01, 0x02, 0x02, 0x7f, 0x03 });
 
     // The option codec is the same, and an absent value never becomes a run.
-    try expectBytes(RleOption(u64), ?u64, &([_]?u64{9} ** 5), &.{ 0x05, 0x09 });
+    try expectBytes(RleOption(u64), ?u64, &(@as([5]?u64, @splat(9))), &.{ 0x05, 0x09 });
 
     // A run far larger than the slab that carries it: two header bytes and one
     // value byte in, a thousand values out, in a single allocation. The
@@ -1462,7 +1462,7 @@ test "a null run round trips" {
 
     // Adjacent absent values merge into one null run; an absent value never
     // merges with a present one.
-    try expectBytes(Codec, ?u64, &([_]?u64{null} ** 5), &.{ 0x00, 0x05 });
+    try expectBytes(Codec, ?u64, &(@as([5]?u64, @splat(null))), &.{ 0x00, 0x05 });
     try expectBytes(Codec, ?u64, &.{ 5, null, null, 6 }, &.{ 0x7f, 0x05, 0x00, 0x02, 0x7f, 0x06 });
     // A present run, then a null run, then a present run.
     try expectBytes(
@@ -1490,7 +1490,7 @@ test "the wire format is what the upstream comment says" {
     // Literal run: signed_leb128( -n )  v0 v1 … v(n-1)
     try expectBytes(U, u64, &.{ 1, 2, 3, 4 }, &.{ 0x7c, 0x01, 0x02, 0x03, 0x04 });
     // Null run   : signed_leb128( 0 )  unsigned_leb128( count )
-    try expectBytes(O, ?u64, &([_]?u64{null} ** 3), &.{ 0x00, 0x03 });
+    try expectBytes(O, ?u64, &(@as([3]?u64, @splat(null))), &.{ 0x00, 0x03 });
     // An i64 payload is signed LEB128, so -1 is one byte and the most negative
     // value is ten.
     try expectBytes(I, i64, &.{ -1, 0 }, &.{ 0x7e, 0x7f, 0x00 });
@@ -1589,7 +1589,7 @@ test "an overlong LEB128 is rejected" {
     const O = RleOption(u64);
 
     // Eleven continuation bytes: longer than any LEB128.
-    const overlong = [_]u8{0x80} ** 11;
+    const overlong = @as([11]u8, @splat(0x80));
     try testing.expectError(error.InvalidLeb128, U.decodeAll(&overlong, gpa));
     try testing.expectError(error.InvalidLeb128, O.decodeAll(&overlong, gpa));
     try testing.expectError(error.InvalidLeb128, U.Decoder.init(&overlong));
@@ -1652,11 +1652,11 @@ test "canonical accepts what write produces" {
     };
     for (us) |c| try expectCanonical(Rle(u64), u64, c);
 
-    const is = [_][]const i64{ &.{ -1, -1, 5 }, &([_]i64{0} ** 3), &.{ std.math.minInt(i64), 0 } };
+    const is = [_][]const i64{ &.{ -1, -1, 5 }, &(@as([3]i64, @splat(0))), &.{ std.math.minInt(i64), 0 } };
     for (is) |c| try expectCanonical(Rle(i64), i64, c);
 
     const os = [_][]const ?u64{
-        &([_]?u64{null} ** 4),
+        &(@as([4]?u64, @splat(null))),
         &.{ 1, null, null, 2 },
         &.{ 5, 5, 5, null, null, 4, 5, 5 },
         &.{ null, 1, 2, 3, null },

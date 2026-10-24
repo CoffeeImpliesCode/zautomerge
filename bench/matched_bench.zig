@@ -22,12 +22,12 @@ const Workload = enum {
     @"diff-subtree",
 };
 const Result = struct {
-    phases: [std.meta.fields(Phase).len]?u64 = @splat(null),
+    phases: [@typeInfo(Phase).@"enum".field_names.len]?u64 = @splat(null),
     checksum: u64 = 0,
     heads: []Hash = &.{},
 
     fn add(self: *Result, phase: Phase, ns: u64) void {
-        const slot = &self.phases[@intFromEnum(phase)];
+        const slot = &self.phases[@backingInt(phase)];
         slot.* = (slot.* orelse 0) + ns;
     }
     fn mix(self: *Result, value: u64) void {
@@ -53,9 +53,11 @@ pub fn main(init: std.process.Init) !void {
     const gpa = std.heap.c_allocator;
     const args = try init.minimal.args.toSlice(gpa);
     defer gpa.free(args);
-    if (args.len != 3) return error.ExpectedWorkloadAndSize;
-    const workload = std.meta.stringToEnum(Workload, args[1]) orelse return error.UnknownWorkload;
-    const large = if (std.mem.eql(u8, args[2], "large")) true else if (std.mem.eql(u8, args[2], "small")) false else return error.UnknownSize;
+    if (args.len != 1 and args.len != 3) return error.ExpectedWorkloadAndSize;
+    const workload_name = if (args.len == 1) "insert-growth" else args[1];
+    const size = if (args.len == 1) "small" else args[2];
+    const workload = std.meta.stringToEnum(Workload, workload_name) orelse return error.UnknownWorkload;
+    const large = if (std.mem.eql(u8, size, "large")) true else if (std.mem.eql(u8, size, "small")) false else return error.UnknownSize;
     const n: usize = switch (workload) {
         .@"text-edits", .merge, .@"diff-first", .@"diff-repeat", .@"diff-rotate", .@"diff-subtree" => if (large) 4096 else 1024,
         .@"sync-roundtrip" => if (large) 400 else 200,
@@ -74,11 +76,12 @@ pub fn main(init: std.process.Init) !void {
     var buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &buffer);
     const writer = &output.interface;
-    try writer.print("{{\"implementation\":\"zig\",\"workload\":\"{s}\",\"size\":\"{s}\",\"n\":{d},\"phases_ns\":{{", .{ @tagName(workload), args[2], n });
+    try writer.print("{{\"implementation\":\"zig\",\"workload\":\"{s}\",\"size\":\"{s}\",\"n\":{d},\"phases_ns\":{{", .{ @tagName(workload), size, n });
     var separator: []const u8 = "";
-    inline for (std.meta.fields(Phase)) |field| {
-        if (result.phases[field.value]) |ns| {
-            try writer.print("{s}\"{s}\":{d}", .{ separator, field.name, ns });
+    const phases = @typeInfo(Phase).@"enum";
+    inline for (phases.field_names, phases.field_values) |name, value| {
+        if (result.phases[value]) |ns| {
+            try writer.print("{s}\"{s}\":{d}", .{ separator, name, ns });
             separator = ",";
         }
     }

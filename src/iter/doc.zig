@@ -126,7 +126,7 @@
 //!
 //! # Constructing a handle and an object walk allocates nothing
 //!
-//! [`docs/plan.md` §3](../../docs/plan.md) §3: an iterator is a value. A
+//! An iterator is a value. A
 //! [`Doc`] is a pointer and an enum, and an [`ObjIdIter`] is two column
 //! cursors and a borrowed clock — no allocator anywhere, and no state beyond
 //! the cursor, which is what the test "a handle and an object walk are
@@ -136,8 +136,7 @@
 //! what they hold: each one owns a [`SpansInternal`](spans.zig) fold and an
 //! [`ObjQueue`], so both take an allocator at
 //! [`DocIter.init`](DocIter)/[`DiffIter.init`](DiffIter) and give it back at
-//! `deinit`. That is the house rule ([AGENTS.md](../../AGENTS.md)
-//! *Invariants*) rather than a departure: the fold grows a run buffer and the
+//! `deinit`. The fold grows a run buffer and the
 //! queue grows per nested object, and a port that hid either behind a global
 //! would hand two documents' walks one allocator.
 //!
@@ -199,10 +198,8 @@
 //!
 //! **`DocObjItem.obj`'s `Arc<ExId>` (`iter/doc.rs:337-338`, refreshed by a
 //! comparison at `:294-298`).** The port's is a plain [`ObjId`]
-//! ([`types.ExId`](../types.zig)) — same type, no refcount: the survey
-//! records the refcount as an optimisation and not a semantic
-//! ([`docs/survey/05-iter-query-patch.md:713`](../../docs/survey/05-iter-query-patch.md)),
-//! and there is nothing to share — one walk hands each item to one caller. The
+//! ([`types.ExId`](../types.zig)) without a refcount.
+//! One walk hands each item to one caller. The
 //! *refresh* is kept, because it is what keeps the actor table read once per
 //! object rather than once per item (`iter/doc.rs:295-297`).
 
@@ -497,9 +494,8 @@ comptime {
     // check over the eight kernel names (`column.zig:4032-4044`) and *naming
     // the value instantiates it*, so a walk missing one of the eight would not
     // compile. The mark does not check that a **body** compiles, and an
-    // uninstantiated body is never analysed
-    // ([`docs/STATUS.md`](../../docs/STATUS.md) items 10 and 12), which is
-    // why the test "the walk's kernel moves it" calls all eight.
+    // uninstantiated body is never analysed. The test "the walk's kernel moves it"
+    // calls all eight.
     _ = ObjIdIter.shiftable;
 }
 
@@ -939,15 +935,15 @@ pub fn DiffIter(comptime O: type) type {
                     if (info != .@"fn") @compileError("DiffIter.log sink " ++ name ++ " must be a function");
                     const got = info.@"fn";
                     const want = @typeInfo(@TypeOf(@field(patches.PatchLog, name))).@"fn";
-                    if (got.is_generic or got.is_var_args or got.params.len != want.params.len or got.return_type != want.return_type) {
+                    if (got.is_generic or got.attrs.varargs or got.param_types.len != want.param_types.len or got.return_type != want.return_type) {
                         @compileError("DiffIter.log sink " ++ name ++ " has an incompatible signature");
                     }
-                    const receiver = got.params[0].type.?;
+                    const receiver = got.param_types[0].?;
                     if (receiver != Sink and receiver != *Sink and receiver != *const Sink) {
                         @compileError("DiffIter.log sink " ++ name ++ " has an incompatible receiver");
                     }
-                    for (got.params[1..], want.params[1..]) |actual, expected| {
-                        if (actual.type != expected.type) @compileError("DiffIter.log sink " ++ name ++ " has an incompatible parameter");
+                    for (got.param_types[1..], want.param_types[1..]) |actual, expected| {
+                        if (actual != expected) @compileError("DiffIter.log sink " ++ name ++ " has an incompatible parameter");
                     }
                 }
             }
@@ -1578,7 +1574,8 @@ pub fn DocIter(comptime O: type) type {
             const incoming = got.obj.opId();
             const same = if (current) |id|
                 if (incoming) |next_id| id.eql(next_id) else false
-            else incoming == null;
+            else
+                incoming == null;
             if (!same) self.obj_export = exidOf(O, self.op_set, got.obj);
             const clock: ?Clock = switch (self.inner.span_iter.iter.clock) {
                 .current => |value| value,
@@ -2008,8 +2005,7 @@ test "the walk's objects are the op set's own, and a long run is one boundary" {
 
     // The rows are built into one allocation, which the caller owns and frees
     // after the op set is destroyed: `Op` borrows its payloads, and an
-    // allocation per row is what keeps a fixture's rows off the stack
-    // ([`docs/STATUS.md`](../../docs/STATUS.md) item 11).
+    // allocation keeps the fixture's rows off the stack.
     const rows = try gpa.alloc(opmod.Op, total_rows);
     defer gpa.free(rows);
     // The root, one `make_*` per child, its keys ascending (rule **R2**,
@@ -2203,9 +2199,8 @@ test "the walk's kernel moves it" {
     const handle: Doc(opmod.Op) = .init(&doc.set, encoding);
 
     // Every one of the eight names, each with the answer it owes. **A kernel
-    // method that no test calls is a body no compiler has analysed**
-    // ([`docs/STATUS.md`](../../docs/STATUS.md) items 10 and 12), so this is
-    // where [`ObjIdIter.shiftable`] is checked rather than merely declared.
+    // method that no test calls can remain unanalyzed**, so this exercises
+    // [`ObjIdIter.shiftable`] rather than merely declaring it.
 
     // `setMax` truncates the window, and the walk stops at it. With two rows
     // the root's run is whole and the list's row is not in the window at all.
@@ -2879,9 +2874,8 @@ test "the recursive walk reads the root's rows, then every child, parents before
 //   "borrowed from this span"; here the span *is* the borrow, so the returned
 //   slice points into the item and every arm has a value — which is why
 //   upstream's `Option` is always `Some`. **`DocObjItem.obj` is an [`ExId`]
-//   and not an `Arc<ExId>`**, which the survey records as an optimisation and
-//   not a semantic (`docs/survey/05-iter-query-patch.md:713`); the *refresh*
-//   is kept, so the actor table is read once per object rather than once per
+//   and not an `Arc<ExId>`**. The refresh is kept,
+//   so the actor table is read once per object rather than once per
 //   item (`iter/doc.rs:294-298`).
 //
 // * **`DocItemInternal::export` is `DocItemInternal::exportItem` here**, and

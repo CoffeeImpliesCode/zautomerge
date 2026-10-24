@@ -54,7 +54,7 @@
 //!
 //! **The port's old rule was the opposite and was a port-only invention**: a
 //! mirror borrowed, and every caller had to finish with it before the next
-//! write ([AGENTS.md](../AGENTS.md)). So "a mirror outlives the document it was
+//! write. So "a mirror outlives the document it was
 //! read from" is a **property with a consumer-visible consequence**, and the
 //! second test states it rather than leaving it in a module doc: the mirror is
 //! read **after** the document has been mutated again, and must still say what
@@ -65,8 +65,7 @@
 //! ## What is **not** claimed here
 //!
 //! **No byte comparison.** `Document.save` output is not byte-identical to the
-//! reference — DEFLATE is not reproducible across implementations
-//! ([AGENTS.md](../AGENTS.md)) — and nothing in this file compares a save to
+//! reference — DEFLATE is not reproducible across implementations — and nothing in this file compares a save to
 //! anything. The round trip asserted here is the one the port promises: **the
 //! same document, materialised**.
 //!

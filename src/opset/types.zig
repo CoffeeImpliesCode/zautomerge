@@ -551,7 +551,7 @@ pub const ActionColumn = column.Column(u64, column.Rle(u64));
 /// is FORMAT: it is written into every document, and it is not the order the
 /// variants are declared in. Transcribed, not derived.
 pub fn actionCode(a: Action) u64 {
-    return @intFromEnum(a);
+    return @backingInt(a);
 }
 
 /// The action the code `code` stands for, or `error.InvalidAction` for
@@ -591,7 +591,7 @@ test "the action codes are the format table" {
         .{ Action.mark, 7 },
     };
     inline for (table) |pair| {
-        try testing.expectEqual(@as(u8, pair[1]), @intFromEnum(pair[0]));
+        try testing.expectEqual(@as(u8, pair[1]), @backingInt(pair[0]));
         try testing.expectEqual(@as(u64, pair[1]), actionCode(pair[0]));
         try testing.expectEqual(pair[0], try actionFromCode(pair[1]));
     }
@@ -609,8 +609,8 @@ test "an action's tag value is its wire code, not its declaration order" {
     // carries code 2, `set` is the fourth and carries code 1. The port has
     // one number per variant and it is the code, so the port's enum order is
     // the code order and *not* upstream's declaration order.
-    try testing.expectEqual(@as(u8, 2), @intFromEnum(Action.make_list));
-    try testing.expectEqual(@as(u8, 1), @intFromEnum(Action.set));
+    try testing.expectEqual(@as(u8, 2), @backingInt(Action.make_list));
+    try testing.expectEqual(@as(u8, 1), @backingInt(Action.set));
     try testing.expect(actionCode(Action.make_list) > actionCode(Action.set));
     try testing.expect(actionCode(Action.set) < actionCode(Action.make_text));
 
@@ -1119,23 +1119,23 @@ test "a run header is three bytes whatever the count says" {
     // A repeat run's count is a signed LEB128, and a three-byte header is the
     // most it ever costs, so a run can claim far more values than the slab
     // has bytes (rle.zig:59-68).
-    const n1 = [_]ActorIdx{7} ** 1;
-    const n2 = [_]ActorIdx{7} ** 2;
-    const n63 = [_]ActorIdx{7} ** 63;
-    const n64 = [_]ActorIdx{7} ** 64;
-    const n8191 = [_]ActorIdx{7} ** 8191;
-    const n8192 = [_]ActorIdx{7} ** 8192;
+    const n1 = @as([1]ActorIdx, @splat(7));
+    const n2 = @as([2]ActorIdx, @splat(7));
+    const n63 = @as([63]ActorIdx, @splat(7));
+    const n64 = @as([64]ActorIdx, @splat(7));
+    const n8191 = @as([8191]ActorIdx, @splat(7));
+    const n8192 = @as([8192]ActorIdx, @splat(7));
     try testing.expectEqual(@as(usize, 2), rle.Rle(ActorIdx).encodedSize(&n1));
     try testing.expectEqual(@as(usize, 2), rle.Rle(ActorIdx).encodedSize(&n2));
     try testing.expectEqual(@as(usize, 2), rle.Rle(ActorIdx).encodedSize(&n63));
     try testing.expectEqual(@as(usize, 3), rle.Rle(ActorIdx).encodedSize(&n64));
     try testing.expectEqual(@as(usize, 3), rle.Rle(ActorIdx).encodedSize(&n8191));
     try testing.expectEqual(@as(usize, 4), rle.Rle(ActorIdx).encodedSize(&n8192));
-    try testing.expectEqual(@as(usize, 4), rle.Rle(ActorIdx).encodedSize(&n1 ** 16384));
+    try testing.expectEqual(@as(usize, 4), rle.Rle(ActorIdx).encodedSize(&@as([16384]ActorIdx, @splat(n1[0]))));
 
     // 16384 copies of one action are four bytes: a three-byte header and a
     // one-byte payload, and the count is honoured.
-    const many = [_]u64{actionCode(.mark)} ** 16384;
+    const many = @as([16384]u64, @splat(actionCode(.mark)));
     try testing.expectEqual(@as(usize, 4), rle.Rle(u64).encodedSize(&many));
 
     var col = try ActionColumn.init(gpa);

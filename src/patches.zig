@@ -3821,12 +3821,12 @@ fn assertSame(comptime what: []const u8, comptime got: type, comptime want: type
         @compileError("patch sink method " ++ what ++ " returns the wrong type: " ++
             @typeName(got) ++ " is not " ++ @typeName(want));
     }
-    if (g.params.len != w.params.len) {
+    if (g.param_types.len != w.param_types.len) {
         @compileError("patch sink method " ++ what ++ " takes " ++
             @typeName(got) ++ " and not " ++ @typeName(want));
     }
-    for (g.params[1..], w.params[1..]) |a, b| {
-        if (a.type == null or b.type == null or a.type.? != b.type.?) {
+    for (g.param_types[1..], w.param_types[1..]) |a, b| {
+        if (a == null or b == null or a.? != b.?) {
             @compileError("patch sink method " ++ what ++ " has the wrong shape: " ++
                 @typeName(got) ++ " is not " ++ @typeName(want));
         }
@@ -4287,7 +4287,7 @@ fn bareChange(actor: ActorId, seq: u64, start: u64, tag: u8) Change {
         .header_len = 0,
         .actor = actor,
         .deps = &.{},
-        .hash = .{ .bytes = [_]u8{tag} ** 32 },
+        .hash = .{ .bytes = @as([32]u8, @splat(tag)) },
         .time = 0,
         .message = &.{},
         .seq = seq,
@@ -4498,7 +4498,7 @@ test "every PatchAction variant is produced by the event that names it" {
     // Every variant of the union is on that list. Counting the tags off the
     // patches is what makes this a checker rather than a hope: a tenth variant
     // would not appear, and the count below would not match.
-    var seen: [action_variants]bool = .{false} ** action_variants;
+    var seen: [action_variants]bool = @splat(false);
     var total: usize = 0;
     for (patches.slice()) |p| {
         seen[actionTag(p.action)] = true;
@@ -5564,7 +5564,7 @@ test "a transaction that made no ops takes its speculative actor back out" {
 test "the patches of a view already left behind come first, in the order they were built" {
     const gpa = testing.allocator;
     const doc: TestDoc = .{ .objs = &.{.{ .id = .root, .typ = .map }} };
-    const heads = [_]ChangeHash{.{ .bytes = [_]u8{0x11} ** 32 }};
+    const heads = [_]ChangeHash{.{ .bytes = @as([32]u8, @splat(0x11)) }};
 
     var log: PatchLog = .active(gpa);
     defer log.deinit();
@@ -6040,7 +6040,7 @@ test "native text units failed splice retains editable owned state" {
         var text = try ConcreteTextValue.init(gpa, "a", enc);
         defer text.deinit();
         failing.fail_index = failing.alloc_index;
-        try testing.expectError(error.OutOfMemory, text.splice(0, "😀" ** 64));
+        try testing.expectError(error.OutOfMemory, text.splice(0, &@as([64 * "😀".len]u8, @bitCast(@as([64]["😀".len]u8, @splat("😀".*))))));
         try testing.expectEqual(@as(usize, 1), text.len());
         const observed = try text.makeString(testing.allocator);
         defer testing.allocator.free(observed);
@@ -6259,7 +6259,7 @@ test "native text units every splice allocation failure preserves original text"
         fn run(gpa: Allocator, enc: TextEncoding) !void {
             var text = try ConcreteTextValue.init(gpa, "prefix😀suffix", enc);
             defer text.deinit();
-            text.splice(3, "😀x" ** 64) catch |failure| {
+            text.splice(3, &@as([64 * "😀x".len]u8, @bitCast(@as([64]["😀x".len]u8, @splat("😀x".*))))) catch |failure| {
                 const observed = try text.makeString(testing.allocator);
                 defer testing.allocator.free(observed);
                 try testing.expectEqualStrings("prefix😀suffix", observed);
@@ -6267,7 +6267,7 @@ test "native text units every splice allocation failure preserves original text"
                 return failure;
             };
             try testing.expectEqual(
-                enc.width("prefix😀suffix") + enc.width("😀x" ** 64),
+                enc.width("prefix😀suffix") + enc.width(&@as([64 * "😀x".len]u8, @bitCast(@as([64]["😀x".len]u8, @splat("😀x".*))))),
                 text.len(),
             );
         }
@@ -6348,7 +6348,7 @@ const publish_handshake_old_actors = [_]ActorId{ ActorId.init("a"), ActorId.init
 const publish_handshake_new_actors = [_]ActorId{
     ActorId.init("a"), ActorId.init("b"), ActorId.init("c"),
 };
-const publish_handshake_heads = [_]ChangeHash{.{ .bytes = [_]u8{0x63} ** 32 }};
+const publish_handshake_heads = [_]ChangeHash{.{ .bytes = @as([32]u8, @splat(0x63)) }};
 
 fn publishHandshakeDoc(comptime actor: ActorIdx) TestDoc {
     const empty_objects = comptime blk: {

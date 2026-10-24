@@ -1,4 +1,5 @@
 const std = @import("std");
+const Translator = @import("translate_c").Translator;
 const manifest = @import("build.zig.zon");
 
 const TextIndexing = enum {
@@ -226,9 +227,7 @@ pub fn build(b: *std.Build) void {
     // `rust/hexane/src/tests.rs`, ported case for case where the port's public
     // API reaches the case, into `src/hexane/hexane_test.zig`. **Its own step
     // and not one of the 198 in-file test blocks**, for the same reason
-    // `upstream_doc_more.zig` is its own file: upstream's `tests.rs` is 193 KB
-    // and one agent's worth of work, and it would otherwise be a continuation
-    // of a 6,000-line `column.zig` that two writers cannot share.
+    // `upstream_doc_more.zig` is its own file: the upstream test source is large.
     //
     // The root is `src/hexane/hexane_test.zig` rather than `src/root.zig`
     // because the file is **about** `src/hexane/`, and `mod` is imported by
@@ -472,10 +471,8 @@ pub fn build(b: *std.Build) void {
     // them, because the input is a **valid** document whose *operation order* is
     // what is under test.
     //
-    // **A non-zero exit here is a crash finding, not a bug report.** `AGENTS.md`
-    // states the rule absolutely — *"never a panic, never an unbounded loop,
-    // never an unchecked allocation size"* — and `Document.load` is a library
-    // entry point a caller hands bytes from somewhere else, so every case names
+    // `Document.load` must reject malformed input without panic, unbounded loops,
+    // or unchecked allocation sizes. Each case names
     // the refusal it expects (`error.InvalidMarkOrder`,
     // `error.InvalidValueType`) rather than merely observing that something
     // failed.
@@ -598,6 +595,17 @@ pub fn build(b: *std.Build) void {
 
     // Compile all signature/layout/discriminant checks against the shipped
     // header. The C suite links the production artifact, not this check root.
+    const c_header: Translator = .init(b.dependency("translate_c", .{}), .{
+        .name = "automerge-header",
+        .c_source_file = b.addWriteFiles().add("automerge-header.h",
+            \\#include "automerge.h"
+            \\#undef AMexpect
+            \\
+        ),
+        .target = target,
+        .optimize = optimize,
+    });
+    c_header.addIncludePath(b.path("include"));
     const abi_check = b.addLibrary(.{
         .name = "zautomerge-abi-check",
         .linkage = .static,
@@ -606,7 +614,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
-            .imports = &.{.{ .name = "zautomerge", .module = mod }},
+            .imports = &.{
+                .{ .name = "zautomerge", .module = mod },
+                .{ .name = "c_header", .module = c_header.mod },
+            },
         }),
     });
     abi_check.root_module.addIncludePath(b.path("include"));
@@ -699,13 +710,13 @@ pub fn build(b: *std.Build) void {
         // open shared object file`, exit 127 — a link that succeeded and a
         // process that never started.
         //
-        // `b.path` panics on an absolute sub_path (`Build.zig:1756-1759`) and
-        // `b.pathFromRoot` is the low-level spelling of the same join
-        // (`Build.zig:1767-1772`), so take the one that accepts either.
-        // `pathResolve` is lexical (`fs.path.resolvePosix`, `path.zig:1107`):
-        // it collapses `..` against the *build root*, never against the
-        // directory `zig build` was invoked from.
-        const abs_prefix = if (std.fs.path.isAbsolute(prefix)) prefix else b.pathFromRoot(prefix);
+        // Resolve absolute and relative prefixes against the build root so runtime
+        // search paths do not depend on the test process's working directory.
+        const abs_prefix = std.fs.path.resolve(b.allocator, &.{
+            b.root.toString(b.allocator) catch @panic("OOM"),
+            prefix,
+        }) catch @panic("OOM");
+        b.dependOnDirectoryContents(.{ .cwd_relative = abs_prefix });
         ctest_exe.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ abs_prefix, "include" }) });
         // Only add library directories that exist. Missing candidates are
         // normal across prefixes; other inspection errors stop configuration.
@@ -813,7 +824,7 @@ pub fn build(b: *std.Build) void {
     ctest_step.dependOn(&run_ctest.step);
     // `zig build conformance` drives the Rust oracle in `tools/oracle` against
     // the reference automerge implementation, once per golden vector, and
-    // `zig build conformance -- <name>` drives one subcommand. The oracle is a
+    // `zig build oracle -- <name>` runs a raw subcommand. The oracle is a
     // development tool: it is not reachable from the default step, so
     // `zig build` and `zig build test` need neither cargo nor the reference
     // checkout.
@@ -852,7 +863,7 @@ pub fn build(b: *std.Build) void {
     // be recorded into it. One step serves every vector, and in the steady
     // state, where nothing is recorded, there is no such step at all.
     var record_dir: ?*std.Build.Step.Run = null;
-    if (record and !existsInBuildRoot(b, golden_dir)) {
+    if (record) {
         const mkdir = b.addSystemCommand(&.{ "mkdir", "-p" });
         mkdir.addFileArg(b.path(golden_dir));
         mkdir.setCwd(b.path("."));
@@ -860,24 +871,18 @@ pub fn build(b: *std.Build) void {
         record_dir = mkdir;
     }
 
-    // No subcommand runs every vector, because that is the gate's own command
-    // and the one that has to work. One subcommand naming a vector runs that
-    // one. Anything else — a subcommand the step does not own (the rule and the
-    // list are both at `golden_vectors`), or a caller's own output file — goes
-    // to the oracle unchanged, which is the command line the oracle already
-    // implements.
-    const args = b.args orelse &.{};
-    const one_vector = args.len == 1 and isGoldenVector(args[0]);
+    const vector = b.option([]const u8, "conformance-vector", "Check or record one named golden vector");
     const conformance_step = b.step("conformance", "Check test/golden/ against the automerge reference oracle");
-    if (one_vector) {
-        conformance_step.dependOn(&addGoldenVector(b, link_oracle, args[0], record, record_dir).step);
-    } else if (args.len == 0) {
+    if (vector) |name| {
+        if (!isGoldenVector(name)) std.debug.panic("unknown golden vector: {s}", .{name});
+        conformance_step.dependOn(&addGoldenVector(b, link_oracle, name, record, record_dir).step);
+    } else {
         for (golden_vectors) |name| {
             conformance_step.dependOn(&addGoldenVector(b, link_oracle, name, record, record_dir).step);
         }
-    } else {
-        conformance_step.dependOn(&addPassthrough(b, link_oracle, args).step);
     }
+    const oracle_step = b.step("oracle", "Run an oracle subcommand with passthrough arguments");
+    oracle_step.dependOn(&addPassthrough(b, link_oracle).step);
 
     // `zig build save-interop` is the **live** half of the same gate, and it
     // is a step rather than a test because the reference has to answer
@@ -1041,11 +1046,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_matched = b.addRunArtifact(matched_bin);
     run_matched.has_side_effects = true;
-    if (b.args) |matched_args| {
-        run_matched.addArgs(matched_args);
-    } else {
-        run_matched.addArgs(&.{ "insert-growth", "small" });
-    }
+    run_matched.addPassthruArgs();
     const matched_step = b.step(
         "bench-matched",
         "Measure one deterministic workload matched to Rust Automerge",
@@ -1081,7 +1082,7 @@ pub fn build(b: *std.Build) void {
 /// Four decisions in here, three of them about not losing the evidence:
 ///
 /// - The runner is attached to the compile step here rather than passed to
-///   each of the sixteen `b.addTest` call sites, because
+///   each `b.addTest` call site, because
 ///   `std.Build.addRunArtifact` reads `test_runner` to choose between the
 ///   server protocol and an exit code (`Build.zig`:986-1000). A runner
 ///   attached after that call would leave a `Run` step waiting for a
@@ -1206,12 +1207,12 @@ fn addGoldenVector(
 /// checked: either the subcommand is one this step does not own, which prints
 /// its report to the terminal, or the caller named an output file, which is
 /// theirs to compare.
-fn addPassthrough(b: *std.Build, link: *std.Build.Step.Run, args: []const []const u8) *std.Build.Step.Run {
+fn addPassthrough(b: *std.Build, link: *std.Build.Step.Run) *std.Build.Step.Run {
     const run = b.addSystemCommand(&.{"cargo"});
     run.addArgs(&.{ "run", "--quiet", "--manifest-path" });
     run.addFileArg(b.path("tools/oracle/Cargo.toml"));
     run.addArg("--");
-    run.addArgs(args);
+    run.addPassthruArgs();
     run.setCwd(b.path("."));
     run.stdio = .inherit;
     run.setName("run automerge oracle");
@@ -1230,14 +1231,6 @@ fn isGoldenVector(name: []const u8) bool {
         if (std.mem.eql(u8, name, vector)) return true;
     }
     return false;
-}
-
-/// Whether `rel` is in the committed tree. Asked while the build script runs,
-/// which is on every `zig build`, so the answer cannot be stale inside one
-/// build.
-fn existsInBuildRoot(b: *std.Build, rel: []const u8) bool {
-    b.build_root.handle.access(b.graph.io, rel, .{}) catch return false;
-    return true;
 }
 
 /// Opens `path` to confirm it is a directory. Missing or non-directory

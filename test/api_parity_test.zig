@@ -54,11 +54,13 @@ test "API parity corpus rejects unknown envelopes and duplicate ownership" {
     try std.testing.expectError(error.DuplicateRecordOwnership, common.mark(&seen, 0));
     try std.testing.expectError(error.InvalidRecordIndex, common.mark(&seen, 1));
     const records = [_]common.Record{.{
-        .kind = "api-parity", .scenario = "not-owned", .source = "source:1", .data = .null,
+        .kind = "api-parity",
+        .scenario = "not-owned",
+        .source = "source:1",
+        .data = .null,
     }};
     seen[0] = false;
-    try std.testing.expectError(error.UnknownOrUnconsumedScenario,
-        common.requireAllSeen(&records, &seen));
+    try std.testing.expectError(error.UnknownOrUnconsumedScenario, common.requireAllSeen(&records, &seen));
 }
 
 test "API parity JSON compares complete trees and full width integers" {

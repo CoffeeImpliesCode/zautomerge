@@ -1127,7 +1127,7 @@ const Permutations = struct {
         cp: u21,
     ) (ParseError || InternalError)!u21 {
         const rank = characterRank(cp);
-        const slot = &self.tables[@intFromEnum(rank.alphabet)];
+        const slot = &self.tables[@backingInt(rank.alphabet)];
         if (slot.* == null) slot.* = try derangement(gpa, rng, rank.count);
         return characterFromRank(cp, slot.*.?[rank.index]) orelse error.Invariant;
     }
@@ -2349,10 +2349,7 @@ fn contentStringShape(a: Allocator, text: []const u8) ParseError!ContentStringSh
 /// upstream's [`assert_private_data_changed`](../../github-automerge-automerge/rust/automerge/src/anonymize/shape.rs)
 /// at [`shape.rs:326-386`](../../github-automerge-automerge/rust/automerge/src/anonymize/shape.rs).
 ///
-/// **Upstream panics and this returns**, which is the port's rule
-/// ([`AGENTS.md`](../../AGENTS.md)): a checker that cannot be run as a value is
-/// a checker that cannot be run in a test that continues. Each variant names
-/// the assertion it replaces so a failing test says which promise broke.
+/// Returns a named error for each upstream assertion.
 pub const CheckError = error{
     /// The two documents hold different numbers of changes.
     ChangeCount,
@@ -2790,7 +2787,7 @@ fn applySpec(gpa: Allocator, doc: *Document, spec: ChangeSpec) !ChangeHash {
         },
         .action => {
             scratch.clearRetainingCapacity();
-            for (ops) |op| try scratch.append(gpa, .{ .uint = @intFromEnum(op.action) });
+            for (ops) |op| try scratch.append(gpa, .{ .uint = @backingInt(op.action) });
             try set.push(gpa, col, scratch.items);
         },
         .value_metadata => {
@@ -3413,10 +3410,7 @@ fn appendLiveElements(
 
 /// The number of live elements of a sequence object.
 ///
-/// **Counted from the operations rather than from a reader**, because the
-/// document layer's list reader is not part of this port yet
-/// ([`docs/STATUS.md`](../../docs/STATUS.md) §"Where the document slice
-/// stands").
+/// Counts live elements directly from the operations.
 fn sequenceLength(doc: *Document, gpa: Allocator, obj: ExId) usize {
     var ops = opsOf(gpa, doc) catch return 0;
     defer ops.deinit(gpa);
@@ -5145,8 +5139,8 @@ fn indexOfHash(list: []const Built, hash: ChangeHash) ?usize {
 //
 //  **Compared on the change hashes, not on `save`.** The hash is SHA-256 over
 //  the change body, and the body is exactly what the seed decides; `save` wraps
-//  it in a DEFLATE stream whose framing is not something anonymization promises
-//  ([`AGENTS.md`](../../AGENTS.md) §"Invariants"). The saved bytes are asserted
+//  it in a DEFLATE stream whose framing anonymization does not promise.
+//  The saved bytes are asserted
 //  equal as well, because within one process they are, and a difference there
 //  would mean the rewrite was not reproducible at all.
 test "the same seed rewrites the same document the same way, and a different seed does not" {
@@ -5412,7 +5406,7 @@ test "a document a program built with every opcode keeps its shape and loses its
     defer rows.deinit(gpa);
     try testing.expect(rows.rows.len > 20);
     var actions: [8]bool = @splat(false);
-    for (rows.rows) |row| actions[@intFromEnum(row.action)] = true;
+    for (rows.rows) |row| actions[@backingInt(row.action)] = true;
     for (actions) |seen| try testing.expect(seen);
     const actors = try source.getActors(gpa);
     defer gpa.free(actors);
@@ -5689,8 +5683,8 @@ test "the actor map still answers for every actor after every change's reset" {
     try testing.expectEqual(@as(usize, 16), map_b.bytes.len);
     try testing.expect(!std.mem.eql(u8, map_a.bytes, map_b.bytes));
     // `actor_a` sorts before `actor_b`, so the ranks are zero and one.
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 8), map_a.bytes[8..16]);
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 7 ++ [_]u8{1}), map_b.bytes[8..16]);
+    try testing.expectEqualSlices(u8, &(@as([8]u8, @splat(0))), map_a.bytes[8..16]);
+    try testing.expectEqualSlices(u8, &(@as([7]u8, @splat(0)) ++ [_]u8{1}), map_b.bytes[8..16]);
     // **And an actor the document never had is still refused**, which is the
     // other half: a map that had been overwritten would answer for anything.
     try testing.expectError(error.MissingActor, anon.mapActor(.{ .bytes = actor_c }));
@@ -5700,7 +5694,7 @@ test "the actor map still answers for every actor after every change's reset" {
 
 // | here | upstream | why |
 // | --- | --- | --- |
-// | `checkPrivateDataChanged` returns one of fifteen [`CheckError`]s | `assert_private_data_changed` panics ([`shape.rs:326-386`](../../github-automerge-automerge/rust/automerge/src/anonymize/shape.rs)) | a checker that cannot be run as a value cannot be run in a test that continues; the port's rule ([`AGENTS.md`](../../AGENTS.md)) |
+// | `checkPrivateDataChanged` returns one of fifteen [`CheckError`]s | `assert_private_data_changed` panics ([`shape.rs:326-386`](../../github-automerge-automerge/rust/automerge/src/anonymize/shape.rs)) | named errors let callers continue after a failed check |
 // | one variant per `assert_`, plus [`error.ExtraBytes`] for `assert_bytes_changed` over a change's footer | the same assertions without names | a failing test has to say which promise broke |
 // | `anonymize` takes thirty-two seed bytes | `anonymize` draws its own ([`anonymize.rs:27-29`](../../github-automerge-automerge/rust/automerge/src/anonymize.rs)) | Zig 0.16 has no source of randomness in `std` ([`types.zig:99-112`](types.zig)) |
 // | [`Shape`] and [`Shape.eql`] are public | `ShapeSignature` is `pub(super)` ([`shape.rs:11`](../../github-automerge-automerge/rust/automerge/src/anonymize/shape.rs)) | the shape is half the contract this file exports, and a comparison nothing can call is a comparison nothing can test |

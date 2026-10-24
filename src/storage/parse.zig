@@ -3,12 +3,10 @@
 //!
 //! Upstream is a nom-style combinator library (`storage/parse.rs`, 619 lines)
 //! over a moving `Input` window. None of that machinery ports. This crate's
-//! parsers are hand-written rather than combinator-composed
-//! ([survey 03](../docs/survey/03-storage-columnar.md) §Simplifications 15), so
+//! parsers are hand-written rather than combinator-composed, so
 //! only the cursor and its readers are needed here. What survives the port is
 //! the property the whole upstream read path rests on: a stack of decoders
-//! that all borrow from one input buffer and allocate nothing
-//! ([survey 03](../docs/survey/03-storage-columnar.md) §Parse layer).
+//! that all borrow from one input buffer and allocate nothing.
 //!
 //! Four rules hold for every reader, and a caller may rely on all of them.
 //!
@@ -596,7 +594,7 @@ test "a hostile count is rejected before anything is allocated" {
     // 16-byte elements.
     var huge = std.ArrayList(u8).empty;
     defer huge.deinit(std.testing.allocator);
-    try huge.appendSlice(std.testing.allocator, &[_]u8{0x80} ** 5);
+    try huge.appendSlice(std.testing.allocator, &@as([5]u8, @splat(0x80)));
     try huge.append(std.testing.allocator, 0x40);
     try huge.appendNTimes(std.testing.allocator, 0x00, 64);
     var big: Input = .init(huge.items);
@@ -807,11 +805,11 @@ test "a length prefix is measured from after itself" {
 
     // A two-byte prefix is measured the same way: `0x80 0x02` is 256, and
     // 256 payload bytes is the least that can satisfy it.
-    var few: Input = .init(&[_]u8{ 0x80, 0x02 } ++ [_]u8{0x00} ** 255);
+    var few: Input = .init(&[_]u8{ 0x80, 0x02 } ++ @as([255]u8, @splat(0x00)));
     try std.testing.expectError(error.LengthExceedsInput, few.readStrBytes());
     try std.testing.expectEqual(@as(usize, 0), few.pos);
 
-    var many: Input = .init(&[_]u8{ 0x80, 0x02 } ++ [_]u8{0x00} ** 256);
+    var many: Input = .init(&[_]u8{ 0x80, 0x02 } ++ @as([256]u8, @splat(0x00)));
     try std.testing.expectEqual(@as(usize, 256), (try many.readStrBytes()).len);
     try std.testing.expect(many.isEmpty());
 
@@ -894,7 +892,7 @@ test "a LEB128 read consumes only its own bytes and keeps the strict rules" {
 
     // The strict reader's rejections reach the caller unchanged rather than
     // being smoothed into a value, and a rejected read consumes nothing.
-    var overlong: Input = .init(&[_]u8{0x80} ** 11);
+    var overlong: Input = .init(&@as([11]u8, @splat(0x80)));
     try std.testing.expectError(error.InvalidLeb128, overlong.takeUleb());
     try std.testing.expectEqual(@as(usize, 0), overlong.pos);
 
@@ -916,7 +914,7 @@ test "the cursor never leaves its buffer" {
         &.{},
         "a",
         "abcdef",
-        &[_]u8{0xff} ** 64,
+        &@as([64]u8, @splat(0xff)),
     };
     const jumps = [_]usize{ 0, 1, 2, 3, 7, 64, 65, 4096, std.math.maxInt(usize) };
 

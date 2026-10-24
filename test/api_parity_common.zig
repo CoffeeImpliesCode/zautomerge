@@ -1,6 +1,6 @@
 //! Typed comparisons for the public API replay. The oracle owns the corpus;
 //! these projections are built only from native public values and readers.
-//! Source: tools/oracle/src/api_parity.rs and docs/survey/05-iter-query-patch.md.
+//! Source: tools/oracle/src/api_parity.rs.
 const std = @import("std");
 const am = @import("zautomerge");
 const Allocator = std.mem.Allocator;
@@ -229,10 +229,13 @@ pub fn writeValueJson(value: anytype, writer: *std.Io.Writer) !void {
     }
     switch (value) {
         .object => |kind| try writeJson(.{
-            .type = "object", .object_type = @tagName(kind),
+            .type = "object",
+            .object_type = @tagName(kind),
         }, writer),
         .scalar => |scalar| try writeJson(.{
-            .type = "scalar", .datatype = scalarDatatype(scalar), .value = scalar,
+            .type = "scalar",
+            .datatype = scalarDatatype(scalar),
+            .value = scalar,
         }, writer),
     }
 }
@@ -290,7 +293,10 @@ pub fn writeMarks(marks: []const am.marks.Mark, writer: *std.Io.Writer) !void {
     for (marks, 0..) |item, index| {
         if (index != 0) try writer.writeByte(',');
         try writeJson(.{
-            .name = item.name, .value = item.value, .start = item.start, .end = item.end,
+            .name = item.name,
+            .value = item.value,
+            .start = item.start,
+            .end = item.end,
         }, writer);
     }
     try writer.writeByte(']');
@@ -312,7 +318,10 @@ pub fn writeHydrated(gpa: Allocator, actual: *const am.hydrate.Value, writer: *s
 const HydratedJsonError = am.Error || std.Io.Writer.Error || error{HydratedNestingTooDeep};
 
 fn writeHydratedDepth(
-    gpa: Allocator, actual: *const am.hydrate.Value, writer: *std.Io.Writer, depth: usize,
+    gpa: Allocator,
+    actual: *const am.hydrate.Value,
+    writer: *std.Io.Writer,
+    depth: usize,
 ) HydratedJsonError!void {
     if (depth > 128) return error.HydratedNestingTooDeep;
     if (actual.toScalar()) |scalar| {
@@ -339,7 +348,10 @@ fn writeHydratedDepth(
     }
 }
 fn writeHydratedMap(
-    gpa: Allocator, map: *const am.hydrate.Map, writer: *std.Io.Writer, depth: usize,
+    gpa: Allocator,
+    map: *const am.hydrate.Map,
+    writer: *std.Io.Writer,
+    depth: usize,
 ) HydratedJsonError!void {
     try writer.writeByte('{');
     var entries = map.entries.iterator();
@@ -434,7 +446,9 @@ fn writePatchValue(value: am.patches.Value, id: am.types.ExId, writer: *std.Io.W
     try writer.writeByte(']');
 }
 pub fn writeCanonicalPatches(
-    gpa: Allocator, actual: []const am.patches.Patch, writer: *std.Io.Writer,
+    gpa: Allocator,
+    actual: []const am.patches.Patch,
+    writer: *std.Io.Writer,
 ) !void {
     try writer.writeByte('[');
     for (actual, 0..) |patch, index| {
@@ -520,7 +534,9 @@ pub fn writeCanonicalPatches(
     try writer.writeByte(']');
 }
 pub fn expectCanonicalPatches(
-    gpa: Allocator, expected: Json, actual: []const am.patches.Patch,
+    gpa: Allocator,
+    expected: Json,
+    actual: []const am.patches.Patch,
 ) !void {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();

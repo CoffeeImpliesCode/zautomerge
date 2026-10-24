@@ -34,9 +34,7 @@
 //! ([`Document.getHeads`](../src/doc.zig) returns a copy the caller frees), every
 //! patch batch ([`Patches.deinit`](../src/patches.zig)), every hydrated mirror
 //! ([`hydrate.Value.deinit`](../src/hydrate.zig)) and every clock.
-//! [AGENTS.md](../AGENTS.md)'s rule about slices borrowed from a document's own
-//! storage is why [`realizeValues`] borrows and the assertions that use it come
-//! before the next write.
+//! [`realizeValues`] borrows document storage, so assertions use its output before the next write.
 
 const std = @import("std");
 const am = @import("zautomerge");
@@ -309,9 +307,8 @@ const Entry = struct { key: []const u8, values: []const Node };
 
 /// What a document actually holds. **The mirror image of [`Exp`]**, and the
 /// borrow rule is the port's: a `str`, a `bytes` or a map key points into the
-/// document's own storage and is valid until the next mutation
-/// ([AGENTS.md](../AGENTS.md)), which is why every assertion below that uses one
-/// runs before the next write.
+/// document's own storage and is valid until the next mutation.
+/// Assertions use these borrows before the next write.
 const Node = union(enum) {
     map: []Entry,
     list: []const []const Node,
@@ -2453,10 +2450,8 @@ test "save and restore a complex transactional document" {
 
 // ── The P5 save round trip: an addition, not an upstream case ────────────────
 //
-// **What this asserts, and what it deliberately does not.** [`AGENTS.md`](../AGENTS.md)
-// declares that `save()` output is **not** byte-identical to the reference,
-// because DEFLATE is not reproducible across implementations, and that
-// "equivalence is checked by loading and comparing the materialized document".
+// `save()` output need not be byte-identical to the reference because DEFLATE
+// can differ across implementations. Compare loaded materialized documents.
 // That exemption was previously only *stated*. **An exemption nobody checks is
 // an exemption that quietly widens**, and this port has already had a
 // save-byte comparison applied narrowly once with the decision recorded, so
@@ -2474,8 +2469,7 @@ test "save and restore a complex transactional document" {
 //   answers are [`Document.debugCmp`](../src/doc.zig), which compares the two
 //   **op sets** rather than the two byte strings, and this test is the one that
 //   compares the two **materialisations**. None of the three is a byte
-//   comparison and none may become one without changing
-//   [`AGENTS.md`](../AGENTS.md).
+//   comparison.
 // * **Why the comparison is element by element and not by length or by a
 //   shared head count.** A document can share every head and still read
 //   differently. **This port has had exactly that defect**: a wrong row order
@@ -2900,7 +2894,7 @@ test "a local increment in a map" {
     defer doc4.deinit();
     const again = try doc4.save(gpa);
     defer gpa.free(again);
-    // DEFLATE is not reproducible across implementations ([AGENTS.md](../AGENTS.md)),
+    // DEFLATE is not reproducible across implementations,
     // so upstream's `assert_eq!(doc4.save(), doc1.save())` is a comparison of
     // **materialized documents** here, which is the equivalence the port
     // promises.
@@ -3619,8 +3613,7 @@ test "inserting text near deleted marks" {
 
     // Upstream's test ends in `dbg!`, which asserts nothing. **The text is
     // asserted here instead**, because it is the observable the sequence was
-    // written to produce and a "does not panic" test proves nothing
-    // ([AGENTS.md](../AGENTS.md)). "hello world" is eleven characters; deleting
+    // written to produce. "hello world" is eleven characters; deleting
     // ten from index one leaves "h", and the two inserts make "ah" and then
     // "aha" — which is what upstream's three `//` comments say.
     try testing.expectEqualStrings("aha", try tx.textFor(text_id));
@@ -4146,8 +4139,7 @@ test "missing actors when documents are forked" {
 
     // **Upstream's `save_and_verify` is a save followed by a load and a
     // comparison, and that is what runs here**: [`Document.save`](../src/doc.zig)
-    // has no `verify` arm, and [AGENTS.md](../AGENTS.md) is explicit that
-    // `save()` bytes are not required to be identical across implementations.
+    // has no `verify` arm. Save bytes need not be identical across implementations.
     const s2 = try doc2.save(gpa);
     defer gpa.free(s2);
     var reloaded = try AutoCommit.load(gpa, io, s2, .unicode_code_point);
@@ -5113,7 +5105,7 @@ test "patches expose a surviving conflict after deleting the other branch" {
             var right = try forkDoc(&target);
             defer right.deinit();
             try right.setActorId(.{ .bytes = "fe004faf" });
-            _ = try right.put(object, .{ .index = 0 }, .{ .bytes = &[_]u8{0} ** 32 });
+            _ = try right.put(object, .{ .index = 0 }, .{ .bytes = &@as([32]u8, @splat(0)) });
             {
                 const heads = try target.merge(gpa, &left);
                 gpa.free(heads);
@@ -5497,7 +5489,7 @@ test "a queued orphan need does not block an unrelated sync response" {
 // ## `save()` bytes are compared as documents, not as bytes
 //
 // Upstream's `assert_eq!(doc1.save(), doc2.save())` appears three times here.
-// DEFLATE is not reproducible across implementations ([AGENTS.md](../AGENTS.md)),
+// DEFLATE is not reproducible across implementations,
 // so each is [`Document.debugCmp`](../src/doc.zig) — **the equivalence the port
 // promises**, materialized document rather than byte string.
 //
@@ -5509,7 +5501,7 @@ test "a queued orphan need does not block an unrelated sync response" {
 //   `{false, null}`: `third.delete` removes the winning `-88`, which leaves the
 //   two concurrent values that remain.
 // * `inserting_text_near_deleted_marks` ends in upstream's `dbg!`, which asserts
-//   nothing, and a bare "does not panic" proves nothing ([AGENTS.md](../AGENTS.md)).
+//   nothing. The test checks the resulting text.
 //   The text is asserted instead, and it is `"aha"`: `"hello world"` is eleven
 //   characters, deleting ten from index one leaves `"h"`, and the two inserts
 //   make `"ah"` and then `"aha"` — which is what upstream's three `//` comments

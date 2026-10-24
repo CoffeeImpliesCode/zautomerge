@@ -164,8 +164,7 @@ pub const MarkIdx = union(enum) {
     ///
     /// At and above actor index 2^31 the top bit is the sign bit and the
     /// row's polarity stops being recoverable, so the encoding is only
-    /// injective below 2^31 — upstream's property too, noted at
-    /// `docs/survey/02-transaction-opset.md:1155`.
+    /// injective below 2^31.
     pub fn asI64(self: MarkIdx) i64 {
         return switch (self) {
             .start => |begin| markIdxWord(begin),
@@ -2444,8 +2443,7 @@ test "the largest actor and counter the word holds, and the alias above it" {
 
     // One actor higher and the word is `minInt(i64)`, which decodes as an
     // `End`: the encoding is only injective below actor index 2^31, which is
-    // upstream's property too (`mark_index.rs:25-34`; noted at
-    // `docs/survey/02-transaction-opset.md:1155`). Pinned because the word is
+    // upstream's property too (`mark_index.rs:25-34`). Pinned because the word is
     // the column's value type, not because a document carries it.
     const alias = MarkIdx{ .start = id(0x80000000, 0) };
     try testing.expectEqual(std.math.minInt(i64), alias.asI64());

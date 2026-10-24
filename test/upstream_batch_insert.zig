@@ -2015,9 +2015,8 @@ fn spliceScalars(
 // file.** Giving the replayed document one operation the write path never made
 // produced **exit 1, 0 compile errors, and 43 `...FAIL (Invariant)`** —
 // `error.Invariant` being what [`Document.debugCmp`] raises, so the
-// **row-order** comparison fired first. The rule that makes such a run
-// trustworthy is in [`docs/plan.md` §1.1](../docs/plan.md): **an exit code says
-// something went wrong, it does not say what**, so a falsification counts only
+// row-order comparison fired first. An exit code alone does not identify the fault,
+// so a falsification counts only
 // when the exit code is non-zero **and** there are no compile errors **and** the
 // count of `...FAIL` is non-zero with a diagnostic naming the fault.
 //

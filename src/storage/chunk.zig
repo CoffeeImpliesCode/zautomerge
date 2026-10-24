@@ -2,8 +2,7 @@
 //!
 //! A document is a bare concatenation of self-delimiting chunks. There is no
 //! table, no index, no footer and no format-version field; compatibility rests
-//! entirely on the magic bytes and the chunk-type byte. See the "Chunk header"
-//! section of `docs/survey/03-storage-columnar.md`.
+//! entirely on the magic bytes and the chunk-type byte.
 //!
 //! ```text
 //! offset  size  field
@@ -144,7 +143,7 @@ pub fn changeHashOf(typ: ChunkType, data: []const u8) ChangeHash {
     // before the data; a fixed stack buffer is the same two updates without
     // the allocation.
     var prefix: [1 + leb128.max_unsigned_size]u8 = undefined;
-    prefix[0] = @intFromEnum(typ);
+    prefix[0] = @backingInt(typ);
     const n = leb128.writeUnsigned(prefix[1..], data.len);
 
     var hasher = Sha256.init(.{});
@@ -203,7 +202,7 @@ pub fn writeChunk(
     try out.appendSlice(gpa, &magic);
     const sum = checksumOf(typ, data);
     try out.appendSlice(gpa, &sum);
-    try out.append(gpa, @intFromEnum(typ));
+    try out.append(gpa, @backingInt(typ));
     try leb128.appendUnsigned(out, gpa, data.len);
     try out.appendSlice(gpa, data);
 }
@@ -238,7 +237,7 @@ pub fn compressChunk(
     try out.appendSlice(gpa, &magic);
     const sum = checksumOf(.change, body);
     try out.appendSlice(gpa, &sum);
-    try out.append(gpa, @intFromEnum(ChunkType.compressed));
+    try out.append(gpa, @backingInt(ChunkType.compressed));
     try leb128.appendUnsigned(out, gpa, deflated.len);
     try out.appendSlice(gpa, deflated);
 }
@@ -934,7 +933,7 @@ test "a parsed chunk publishes the whole hash its checksum is a prefix of" {
 
 test "a compressed chunk publishes no hash, because its body was never hashed" {
     const gpa = testing.allocator;
-    const body = "a body that compresses well " ** 8;
+    const body = &@as([8 * "a body that compresses well ".len]u8, @bitCast(@as([8]["a body that compresses well ".len]u8, @splat("a body that compresses well ".*))));
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     try compressChunk(&out, gpa, body);
@@ -1322,7 +1321,7 @@ test "malformed chunks are rejected" {
     defer bytes.deinit(gpa);
     try bytes.appendSlice(gpa, &magic);
     try bytes.appendSlice(gpa, &[_]u8{ 0, 0, 0, 0 }); // never verified
-    try bytes.append(gpa, @intFromEnum(ChunkType.change));
+    try bytes.append(gpa, @backingInt(ChunkType.change));
     try bytes.appendNTimes(gpa, 0x80, 11);
 
     try testing.expectError(error.InvalidLeb128, parseChunk(bytes.items));
@@ -1411,7 +1410,7 @@ test "a failed write leaves the bytes it had already appended" {
     try untouched.append(gpa, 0x77);
     try testing.expectError(
         error.OutOfMemory,
-        compressChunk(&untouched, deflate_fails.allocator(), "a body that compresses well " ** 8),
+        compressChunk(&untouched, deflate_fails.allocator(), &@as([8 * "a body that compresses well ".len]u8, @bitCast(@as([8]["a body that compresses well ".len]u8, @splat("a body that compresses well ".*))))),
     );
     try testing.expectEqualSlices(u8, &[_]u8{0x77}, untouched.items);
 }
@@ -1504,7 +1503,7 @@ test "a declared length that would wrap the deflate capacity hint is refused" {
         // The checksum is never reached: the length is bounded first, so four
         // zero bytes here are as good as the value the reference would write.
         try bytes.appendSlice(gpa, &[_]u8{ 0, 0, 0, 0 });
-        try bytes.append(gpa, @intFromEnum(ChunkType.change));
+        try bytes.append(gpa, @backingInt(ChunkType.change));
         try leb128.appendUnsigned(&bytes, gpa, len);
         try bytes.appendSlice(gpa, "body");
         try testing.expectError(error.LengthExceedsInput, parseChunk(bytes.items));
@@ -1522,7 +1521,7 @@ test "a declared length that would wrap the deflate capacity hint is refused" {
 
 test "a raw DEFLATE stream round trips, and a truncated one does not" {
     const gpa = testing.allocator;
-    const body = "abcabcabcabc" ** 64;
+    const body = &@as([64 * "abcabcabcabc".len]u8, @bitCast(@as([64]["abcabcabcabc".len]u8, @splat("abcabcabcabc".*))));
     const deflated = try compressRaw(gpa, body);
     defer gpa.free(deflated);
     try testing.expect(deflated.len < body.len);
@@ -1571,7 +1570,7 @@ test "the deflate capacity hint is the old sum where it fits, and never wraps" {
 
 test "compressChunk writes what decompressChunk reads back" {
     const gpa = testing.allocator;
-    const body = "a change body that compresses well " ** 20;
+    const body = &@as([20 * "a change body that compresses well ".len]u8, @bitCast(@as([20]["a change body that compresses well ".len]u8, @splat("a change body that compresses well ".*))));
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     try compressChunk(&out, gpa, body);
@@ -1616,7 +1615,7 @@ test "compressChunk writes what decompressChunk reads back" {
 
 test "decompressChunkWithHash is decompressChunk with the change hash it already had" {
     const gpa = testing.allocator;
-    const body = "a change body that compresses well " ** 20;
+    const body = &@as([20 * "a change body that compresses well ".len]u8, @bitCast(@as([20]["a change body that compresses well ".len]u8, @splat("a change body that compresses well ".*))));
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     try compressChunk(&out, gpa, body);
@@ -1657,7 +1656,7 @@ test "decompressChunkWithHash is decompressChunk with the change hash it already
 
 test "both decompression spellings refuse the same bytes with the same tag" {
     const gpa = testing.allocator;
-    const body = "a change body that compresses well " ** 20;
+    const body = &@as([20 * "a change body that compresses well ".len]u8, @bitCast(@as([20]["a change body that compresses well ".len]u8, @splat("a change body that compresses well ".*))));
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     try compressChunk(&out, gpa, body);

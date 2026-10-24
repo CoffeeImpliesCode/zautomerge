@@ -21,8 +21,6 @@
 //! significant three bits encode the column type. The 4th least significant
 //! bit is 1 if the column is DEFLATE compressed. The remaining bits are the
 //! column ID" (<https://automerge.org/automerge-binary-format-spec/#_column_specification>).
-//! ([survey 03](../docs/survey/03-storage-columnar.md)
-//! §Column specification and layout validation)
 //!
 //! Nothing here may be "tidied": the numbers are the format. Upstream's own
 //! test vectors (`column_specification.rs:227-268`), the specification's
@@ -206,7 +204,7 @@ pub const ColumnSpec = struct {
     /// unaffected.
     pub fn make(col_id: u32, enc: Encoding, compressed: bool) ColumnSpec {
         std.debug.assert(col_id <= max_id);
-        var raw: u32 = (col_id << 4) | @as(u32, @intFromEnum(enc));
+        var raw: u32 = (col_id << 4) | @as(u32, @backingInt(enc));
         // Upstream clears the bit explicitly rather than leaving it alone
         // (`:27-28`), so `make` is a function of its three arguments only.
         raw = if (compressed) raw | deflate_mask else raw & normalize_mask;
@@ -868,7 +866,7 @@ test "every encoding tag is one of eight and no two share a tag" {
     try testing.expectError(error.InvalidEncoding, Encoding.fromTag(8));
     try testing.expectError(error.InvalidEncoding, Encoding.fromTag(0x5e));
     try testing.expectError(error.InvalidEncoding, Encoding.fromTag(0xff));
-    try testing.expectEqual(@as(usize, 8), @typeInfo(Encoding).@"enum".fields.len);
+    try testing.expectEqual(@as(usize, 8), @typeInfo(Encoding).@"enum".field_names.len);
 }
 
 test "a deflated spec and its inflated twin are the same column" {

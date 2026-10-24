@@ -27,9 +27,9 @@
 //! longer agree — a silently wrong answer rather than a build failure.
 //!
 //! So this root does the part the link cannot: it **translates the header
-//! itself**, through the same `zig translate-c` every other C translation unit
-//! in this project goes through, and compares what the C side sees against
-//! what the library actually is. Five things are checked, all at comptime, all
+//! itself**, through the external `translate-c` package, and compares what
+//! the C side sees against what the library actually is. Five things are
+//! checked, all at comptime, all
 //! of them failing the build rather than a run:
 //!
 //! 1. **Every function the header declares exists on both sides, and the
@@ -65,7 +65,7 @@
 //!
 //! 4. **Every enum discriminant equals the header's, and neither side can hold
 //!    a tag the other cannot name.** All 37 tags across the five enums are
-//!    compared against the constants `zig translate-c` emitted, and both lists
+//!    compared against the constants `translate-c` emitted, and both lists
 //!    are reflected against the side they describe rather than trusted: every
 //!    `AM_OBJ_TYPE_`, `AM_MARK_EXPAND_`, `AM_IDX_TYPE_`, `AM_VAL_TYPE_` and
 //!    `AM_STATUS_` constant the header translates to must already be one of
@@ -93,20 +93,20 @@
 //! where the semantics matter, and they are the ones whose change would alter
 //! what a caller may pass.
 //!
-//! Nothing here needs libc at run time; `@cImport` is a compile-time
-//! translation. The module is still built with `link_libc`, because
+//! Nothing here needs libc at run time; header translation is a build step.
+//! The module is still built with `link_libc`, because
 //! `c/doc.zig`'s `c_allocator` is a `@compileError` without it.
 //!
 //! # Target
 //!
 //! Every check above is a *compile-time* assertion, so it holds for whatever
 //! target `abi_check` is built for and says nothing about any other, and for
-//! whatever enum lowering `zig translate-c` picks there. Two are genuinely
+//! whatever enum lowering `translate-c` picks there. Two are genuinely
 //! target-dependent and will say so by failing rather than by passing
 //! quietly.
 //!
 //! `AMitems.offset` is `isize` in the library and `ptrdiff_t` in the header.
-//! `ptrdiff_t` is not a fixed `c_long`: it reaches `@cImport` as whatever
+//! `ptrdiff_t` is not a fixed `c_long`: it reaches `translate-c` as whatever
 //! this toolchain's `<stddef.h>` expands the target builtin
 //! `__PTRDIFF_TYPE__` to, so naming an ABI's long width here would be a
 //! guess about a builtin rather than a check. The available check is the
@@ -126,33 +126,23 @@
 //! no cmocka result is being claimed here. The two artifacts answer
 //! different questions and a compiling guard says nothing about the second:
 //! this root proves the header and the library describe the same ABI, the
-//! suite proves the built library behaves. The measured record lives in
-//! `docs/STATUS.md` and `docs/plan.md`; this file states only what its own
-//! compilation shows, and any failure it raises names the symbol, the
-//! parameter and both shapes.
+//! suite checks the built library's behavior. ABI-check failures name the symbol,
+//! parameter, and both shapes.
 //!
 //! **Build wiring.** `abi_check` is declared in `build.zig` with this file as
-//! its `root_source_file`, `link_libc = true`, and `include` on its root
-//! module's include path — without that path `@cImport` fails with `unable to
-//! find 'automerge.h'`. `ctest_bin.step.dependOn(&abi_check.step)` is what
-//! makes `zig build ctest` depend on it, so the C gate fails if any check
-//! below does.
+//! its `root_source_file`, `link_libc = true`, and the translated header
+//! module imported as `c_header`. Translation includes `automerge.h`, then
+//! undefines its source-location macro `AMexpect`. The `ctest` build step
+//! depends on `abi_check`, so the C gate fails if any check below does.
 
 const std = @import("std");
 
-/// The header a C consumer compiles against, translated here by the same
-/// `zig translate-c` that produced `include/automerge.h`'s types in every
-/// other translation unit. Nothing below is transcribed: `c.AMitems`,
+/// The header a C consumer compiles against, translated by the external
+/// `translate-c` package. Nothing below is transcribed: `c.AMitems`,
 /// `c.AMstackCallbackData`, `c.AM_OBJ_TYPE_MAP` and the rest are whatever the
 /// C declarations actually are, so this file cannot drift from the header the
 /// way a hand-copied declaration list would.
-const c = @cImport({
-    @cInclude("automerge.h");
-    // AMexpect is a source-location macro, not an ABI entry point. Removing
-    // only the macro avoids translate-c's unevaluable __FILE__ expression;
-    // a real function declaration of that name would remain reflected.
-    @cUndef("AMexpect");
-});
+const c = @import("c_header");
 
 /// `src/c/result.zig`: the enums, the byte span, and the ten file-level entry
 /// points that need no allocator.
@@ -474,7 +464,7 @@ fn sameDiscriminants(
             @compileError("the header's " ++ label ++ " does not declare " ++ header_name);
         }
         const from_header: c_int = @field(c, header_name);
-        const from_library: c_int = @intCast(@intFromEnum(library_value));
+        const from_library: c_int = @intCast(@backingInt(library_value));
         if (from_header != from_library) {
             @compileError(std.fmt.comptimePrint(
                 "{s}.{s}: the header says {d} and the library says {d}",
@@ -492,7 +482,7 @@ fn sameDiscriminants(
         const from_header: c_int = @intCast(@field(c, header_name));
         var aliased = false;
         inline for (library_values) |library_value| {
-            const value: c_int = @intCast(@intFromEnum(library_value));
+            const value: c_int = @intCast(@backingInt(library_value));
             if (from_header == value) aliased = true;
         }
         if (!aliased) {
@@ -505,10 +495,10 @@ fn sameDiscriminants(
     // The translated header's own declaration list, reflected the way
     // `header_exports` is: a tag nobody wrote down is a compile error here
     // rather than a constant this file claims to cover and does not.
-    inline for (@typeInfo(c).@"struct".decls) |decl| {
-        if (!headerTag(prefix, decl.name)) continue;
-        if (!namesHave(header_names, decl.name)) {
-            @compileError("include/automerge.h declares " ++ decl.name ++
+    inline for (@typeInfo(c).@"struct".decl_names) |name| {
+        if (!headerTag(prefix, name)) continue;
+        if (!namesHave(header_names, name)) {
+            @compileError("include/automerge.h declares " ++ name ++
                 ", which this file does not check: add it to the " ++ label ++
                 " name list in the same edit and pair it with the tag it names, " ++
                 "or with the tag it aliases");
@@ -516,15 +506,16 @@ fn sameDiscriminants(
     }
     // …and the library's own fields, so neither side can end up holding a tag
     // the other has no name for.
-    inline for (@typeInfo(Zig).@"enum".fields) |field| {
+    const enum_info = @typeInfo(Zig).@"enum";
+    inline for (enum_info.field_names, enum_info.field_values) |field_name, field_value| {
         var paired = false;
         inline for (library_values) |library_value| {
-            if (@intFromEnum(library_value) == field.value) paired = true;
+            if (@backingInt(library_value) == field_value) paired = true;
         }
         if (!paired) {
             @compileError(std.fmt.comptimePrint(
                 "{s}.{s}: the library has the tag and no header constant is paired with it",
-                .{ label, field.name },
+                .{ label, field_name },
             ));
         }
     }
@@ -646,7 +637,9 @@ fn canon(comptime T: type) []const u8 {
         .float => |f| "f" ++ num(f.bits),
         .@"struct" => |st| blk: {
             var out: []const u8 = "struct(";
-            inline for (st.fields) |f| out = out ++ f.name ++ ":" ++ canon(f.type) ++ ",";
+            inline for (st.field_names, st.field_types) |field_name, field_type| {
+                out = out ++ field_name ++ ":" ++ canon(field_type) ++ ",";
+            }
             break :blk out ++ ")";
         },
         .@"fn" => "fnptr(" ++ fnShape(T) ++ ")",
@@ -658,22 +651,22 @@ fn canon(comptime T: type) []const u8 {
 fn fnShape(comptime T: type) []const u8 {
     const info = @typeInfo(T).@"fn";
     var out: []const u8 = "fn(";
-    inline for (info.params) |p| out = out ++ canon(p.type.?) ++ ",";
+    inline for (info.param_types) |param_type| out = out ++ canon(param_type.?) ++ ",";
     out = out ++ ")";
-    if (info.is_var_args) out = out ++ "...";
+    if (info.attrs.varargs) out = out ++ "...";
     out = out ++ "->";
     if (info.return_type) |r| {
         out = out ++ (if (r == void) "void" else canon(r));
     } else {
         out = out ++ "noreturn";
     }
-    return out ++ "+" ++ @tagName(info.calling_convention);
+    return out ++ "+" ++ @tagName(info.attrs.@"callconv");
 }
 
 /// Whether `name` is one of the header's **function** declarations, decided by
 /// the translation rather than by its spelling. Both filters are needed.
 ///
-/// `@cImport`ing `include/automerge.h` also brings in everything `<stddef.h>`
+/// Translating `include/automerge.h` also brings in everything `<stddef.h>`
 /// and the C library's own headers declare, so the `AM` prefix is what keeps
 /// the reflection to this ABI's entry points. Inside it, `AM_CHANGE_HASH_SIZE`
 /// and `AM_ROOT` are macros, the eleven handles and the by-value structs are
@@ -696,7 +689,7 @@ fn headerFunction(comptime name: []const u8) bool {
 /// the same struct. `@typeInfo` is what separates a tag from a typedef, a
 /// function or a callback typedef, and it accepts the one alias shape that is
 /// not an enumerator of its own: `#define AM_VAL_TYPE_X AM_VAL_TYPE_Y` reaches
-/// `@cImport` as a constant of the same integer type holding the same value,
+/// `translate-c` as a constant of the same integer type holding the same value,
 /// which is exactly the case `sameDiscriminants` allows to outnumber the
 /// library's fields.
 fn headerTag(comptime prefix: []const u8, comptime name: []const u8) bool {
@@ -735,20 +728,20 @@ fn zigExport(comptime name: []const u8) type {
 fn sameSignature(comptime label: []const u8, comptime C: type, comptime Zig: type) void {
     const ci = @typeInfo(C).@"fn";
     const zi = @typeInfo(Zig).@"fn";
-    if (ci.params.len != zi.params.len) {
-        @compileError(label ++ ": the header takes " ++ num(ci.params.len) ++
-            " parameters and the library takes " ++ num(zi.params.len));
+    if (ci.param_types.len != zi.param_types.len) {
+        @compileError(label ++ ": the header takes " ++ num(ci.param_types.len) ++
+            " parameters and the library takes " ++ num(zi.param_types.len));
     }
-    if (ci.is_var_args != zi.is_var_args) {
+    if (ci.attrs.varargs != zi.attrs.varargs) {
         @compileError(label ++ ": only one side is variadic");
     }
-    if (!std.meta.eql(ci.calling_convention, zi.calling_convention)) {
-        @compileError(label ++ ": the header calls it " ++ @tagName(ci.calling_convention) ++
-            " and the library calls it " ++ @tagName(zi.calling_convention));
+    if (!std.meta.eql(ci.attrs.@"callconv", zi.attrs.@"callconv")) {
+        @compileError(label ++ ": the header calls it " ++ @tagName(ci.attrs.@"callconv") ++
+            " and the library calls it " ++ @tagName(zi.attrs.@"callconv"));
     }
-    inline for (ci.params, zi.params, 0..) |cp, zp, i| {
-        const ct = cp.type.?;
-        const zt = zp.type.?;
+    inline for (ci.param_types, zi.param_types, 0..) |cp, zp, i| {
+        const ct = cp.?;
+        const zt = zp.?;
         if (!std.mem.eql(u8, canon(ct), canon(zt))) {
             @compileError(std.fmt.comptimePrint(
                 "{s}: parameter {d} is {s} in the header and {s} in the library",
@@ -781,7 +774,7 @@ comptime {
     for (header_exports) |name| {
         if (!@hasDecl(c, name)) {
             @compileError("include/automerge.h declares " ++ name ++
-                ", which @cImport did not translate: the header and this table have drifted");
+                ", which translate-c did not translate: the header and this table have drifted");
         }
         var exported = false;
         for (namespaces) |ns| {
@@ -817,26 +810,26 @@ comptime {
     // can actually express and against the Zig half it calls.
     {
         const ci = @typeInfo(@TypeOf(c.AMresultFrom)).@"fn";
-        if (ci.params.len != 1 or !ci.is_var_args) {
+        if (ci.param_types.len != 1 or !ci.attrs.varargs) {
             @compileError("AMresultFrom must stay `(int, ...)`");
         }
         const zi = @typeInfo(@TypeOf(abi.AMresultFromList)).@"fn";
-        if (zi.params.len != 2 or zi.is_var_args) {
+        if (zi.param_types.len != 2 or zi.attrs.varargs) {
             @compileError("AMresultFromList must stay `(int, AMresult *const *)`");
         }
         // The count crosses as a C `int` on one side and a `c_int` on the
         // other, and the answer as a nullable `AMresult *` on both.
-        if (!std.mem.eql(u8, canon(ci.params[0].type.?), canon(zi.params[0].type.?))) {
-            @compileError("AMresultFrom's count parameter is " ++ canon(ci.params[0].type.?) ++
-                " in the header and " ++ canon(zi.params[0].type.?) ++ " in the library");
+        if (!std.mem.eql(u8, canon(ci.param_types[0].?), canon(zi.param_types[0].?))) {
+            @compileError("AMresultFrom's count parameter is " ++ canon(ci.param_types[0].?) ++
+                " in the header and " ++ canon(zi.param_types[0].?) ++ " in the library");
         }
         // The C file collects the variadic arguments into `AMresult *[count]`
         // and hands that array over, so the Zig half's second parameter is a
         // pointer to an array of result pointers — two levels of pointer, one
         // of them to the opaque handle.
-        if (!std.mem.eql(u8, canon(zi.params[1].type.?), "ptr(ptr(handle:AMresult))")) {
+        if (!std.mem.eql(u8, canon(zi.param_types[1].?), "ptr(ptr(handle:AMresult))")) {
             @compileError("AMresultFromList's second parameter is " ++
-                canon(zi.params[1].type.?) ++ ", not an array of AMresult *");
+                canon(zi.param_types[1].?) ++ ", not an array of AMresult *");
         }
         if (!std.mem.eql(u8, canon(ci.return_type.?), canon(zi.return_type.?))) {
             @compileError("AMresultFrom returns " ++ canon(ci.return_type.?) ++
@@ -868,10 +861,10 @@ comptime {
     if (@typeInfo(c) != .@"struct") {
         @compileError("the translated header is not a struct, so its declarations cannot be reflected");
     }
-    for (@typeInfo(c).@"struct".decls) |decl| {
-        if (!headerFunction(decl.name)) continue;
-        if (!tableHas(decl.name)) {
-            @compileError("include/automerge.h declares AM function " ++ decl.name ++
+    for (@typeInfo(c).@"struct".decl_names) |name| {
+        if (!headerFunction(name)) continue;
+        if (!tableHas(name)) {
+            @compileError("include/automerge.h declares AM function " ++ name ++
                 ", which this file does not check: add it to header_exports in the same " ++
                 "edit, bump the pinned count below, and give it the signature check it " ++
                 "then needs");
@@ -1125,5 +1118,5 @@ comptime {
     // the nullable-result contract that canonicalisation deliberately omits.
     std.debug.assert(@typeInfo(@TypeOf(doc.AMcreate)).@"fn".return_type.? == ?*abi.AMresult);
     std.debug.assert(@typeInfo(@TypeOf(sync.AMsyncStateInit)).@"fn".return_type.? == ?*abi.AMresult);
-    std.debug.assert(std.meta.eql(@typeInfo(@TypeOf(sync.AMsyncStateInit)).@"fn".calling_convention, .c));
+    std.debug.assert(std.meta.eql(@typeInfo(@TypeOf(sync.AMsyncStateInit)).@"fn".attrs.@"callconv", .c));
 }

@@ -1537,7 +1537,7 @@ test "the eight tags are the format's, and a tag outside them is refused" {
         .boolean,       .string, .value_metadata, .value,
     }) |tag| {
         const enc: Encoding = tag;
-        try testing.expectEqual(enc, try encodingFromTag(@intFromEnum(enc)));
+        try testing.expectEqual(enc, try encodingFromTag(@backingInt(enc)));
     }
     // Three bits, so there is no ninth tag: the fourth low bit of a whole
     // specification is the DEFLATE flag (`column_specification.rs:21-29`).
@@ -2292,8 +2292,7 @@ test "an overlong LEB in a counter payload is refused, and the short form is not
 test "an overlong LEB is refused for every value type that carries one" {
     // The three *signed* types — 4, 8 and 9 — each under a word declaring two
     // payload bytes (`column_range/value.rs:226`, `:249` and `:252`; the code
-    // table is `meta.rs:23-43`, as recorded in
-    // docs/survey/02-transaction-opset.md:1151). The `0x7f` in front is one
+    // table is `meta.rs:23-43`). The `0x7f` in front is one
     // literal metadata row, as in the counter fixtures.
     const signed_words = [_]u8{ 0x24, 0x28, 0x29 };
 

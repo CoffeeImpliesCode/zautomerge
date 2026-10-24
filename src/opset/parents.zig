@@ -18,8 +18,7 @@
 //!
 //! **Do not "fix" this.** A port that makes `next` yield root-down silently
 //! reverses twice and returns the path upside down, which looks plausible
-//! until a path is applied to a document with more than one container
-//! ([survey §"Patches and parents" notes 61 and 5](../../docs/survey/01-core-api.md)).
+//! until a path is applied to a document with more than one container.
 //! The reverse order is stated on [`Parents.next`] and pinned by every test in
 //! this file.
 //!
@@ -180,9 +179,7 @@ pub const PathError = StepError || Allocator.Error;
 /// (`patch.rs:21`) — and this file declares it once. **It borrows its map key
 /// from the op set's key column** rather than copying it, which upstream's
 /// `Prop::Map(k.to_string())` does (`op_set.rs:358`): the walk already borrows
-/// the op set for as long as the path is readable, and
-/// [AGENTS.md](../../AGENTS.md) says a slice into a document's own storage is
-/// valid until the next mutation.
+/// the op set for as long as the path is readable. The key is valid until the next mutation.
 pub const PathElem = struct {
     /// The object this step leaves.
     obj: ExId,

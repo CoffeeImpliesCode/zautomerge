@@ -8,7 +8,7 @@
 //! detail, it is the format. The change encoder writes the actor list in table
 //! order and refers to later operations by index, so a table ordered by
 //! anything but byte-lexicographic order produces different change hashes and
-//! unreadable documents (`docs/survey/01-core-api.md:1637-1642`; upstream
+//! unreadable documents (upstream
 //! `types.rs:39-45` derives `Ord` over the bytes and warns about exactly this,
 //! upstream `automerge.rs:1309-1321` binary-searches the table).
 //!

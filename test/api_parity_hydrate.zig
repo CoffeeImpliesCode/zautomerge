@@ -102,7 +102,9 @@ fn nativeText(gpa: Allocator, data: Json, encoding: Encoding) !void {
     try expected.appendSlice(gpa, original_units);
     try expected.insert(gpa, 1, insert_unit);
     const splice: am.patches.PatchAction = .{ .splice_text = .{
-        .index = 1, .value = patch_text, .marks = null,
+        .index = 1,
+        .value = patch_text,
+        .marks = null,
     } };
     try apply(&value, encoding, splice);
     try apply(&second, encoding, splice);
@@ -117,7 +119,8 @@ fn nativeText(gpa: Allocator, data: Json, encoding: Encoding) !void {
     try expectText(gpa, data, "remove_inserted_unit", &second);
     try expectUnits(&second.object.text.value, original_units);
     try apply(&value, encoding, .{ .delete_seq = .{
-        .index = 0, .length = if (original_units.len == 2) 2 else 1,
+        .index = 0,
+        .length = if (original_units.len == 2) 2 else 1,
     } });
     try expectText(gpa, data, "remove_remaining", &value);
     try expectUnits(&value.object.text.value, &.{});
@@ -128,7 +131,7 @@ fn nativeText(gpa: Allocator, data: Json, encoding: Encoding) !void {
 }
 
 fn setActor(doc: *am.AutoCommit) !void {
-    const actor = [_]u8{0xa1} ** 15;
+    const actor = @as([15]u8, @splat(0xa1));
     try doc.setActorId(am.types.ActorId.init(&actor));
 }
 
@@ -293,8 +296,7 @@ fn rich(gpa: Allocator, io: std.Io, records: []const common.Record, seen: []bool
     var foreign = try am.types.ExId.parse(gpa, "999@b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2");
     defer foreign.deinitOwned(gpa);
     const portable = [_]am.patches.Patch{.{ .obj = foreign, .path = &.{}, .action = .{
-        .put_map = .{ .key = "portable", .value = .{ .scalar = .{ .bool_value = true } },
-            .obj = foreign, .conflict = false },
+        .put_map = .{ .key = "portable", .value = .{ .scalar = .{ .bool_value = true } }, .obj = foreign, .conflict = false },
     } }};
     try testing.expect((try hydrated.applyPatches(.unicode_code_point, &portable)) == .ok);
     try common.expectHydrated(gpa, try common.field(records[portable_index].data, "value"), &hydrated);
@@ -305,7 +307,9 @@ fn rich(gpa: Allocator, io: std.Io, records: []const common.Record, seen: []bool
         .{ .obj = foreign, .prop = .{ .key = "attrs" } },
     };
     const nested_patch = [_]am.patches.Patch{.{
-        .obj = foreign, .path = &path, .action = portable[0].action,
+        .obj = foreign,
+        .path = &path,
+        .action = portable[0].action,
     }};
     try testing.expect((try nested.value.applyPatches(.unicode_code_point, &nested_patch)) == .ok);
     const nested_attrs = &nested.value.object.map.get("attrs").?.object.map;

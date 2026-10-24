@@ -136,11 +136,11 @@ fn mainServer(init: std.process.Init.Minimal, progress_path: ?[]const u8, slow_m
     @disableInstrumentation();
     stdin_reader = .initStreaming(.stdin(), runner_threaded_io, &stdin_buffer);
     stdout_writer = .initStreaming(.stdout(), runner_threaded_io, &stdout_buffer);
-    var server = try std.zig.Server.init(.{
+    var server: std.zig.Server = .{
         .in = &stdin_reader.interface,
         .out = &stdout_writer.interface,
-        .zig_version = builtin.zig_version_string,
-    });
+    };
+    try server.serveStringMessage(.zig_version, builtin.zig_version_string);
 
     while (true) {
         const hdr = try server.receiveMessage();
@@ -150,24 +150,25 @@ fn mainServer(init: std.process.Init.Minimal, progress_path: ?[]const u8, slow_m
                 return std.process.exit(0);
             },
             .query_test_metadata => {
-                testing.allocator_instance = .{};
-                defer if (testing.allocator_instance.deinit() == .leak) {
+                var allocator_instance: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+                defer if (allocator_instance.deinit() != 0) {
                     @panic("internal test runner memory leak");
                 };
+                const gpa = allocator_instance.allocator();
 
                 var string_bytes: std.ArrayList(u8) = .empty;
-                defer string_bytes.deinit(testing.allocator);
-                try string_bytes.append(testing.allocator, 0); // Reserve 0 for null.
+                defer string_bytes.deinit(gpa);
+                try string_bytes.append(gpa, 0); // Reserve 0 for null.
 
                 const test_fns = builtin.test_functions;
-                const names = try testing.allocator.alloc(u32, test_fns.len);
-                defer testing.allocator.free(names);
-                const expected_panic_msgs = try testing.allocator.alloc(u32, test_fns.len);
-                defer testing.allocator.free(expected_panic_msgs);
+                const names = try gpa.alloc(u32, test_fns.len);
+                defer gpa.free(names);
+                const expected_panic_msgs = try gpa.alloc(u32, test_fns.len);
+                defer gpa.free(expected_panic_msgs);
 
                 for (test_fns, names, expected_panic_msgs) |test_fn, *name, *expected_panic_msg| {
                     name.* = @intCast(string_bytes.items.len);
-                    try string_bytes.ensureUnusedCapacity(testing.allocator, test_fn.name.len + 1);
+                    try string_bytes.ensureUnusedCapacity(gpa, test_fn.name.len + 1);
                     string_bytes.appendSliceAssumeCapacity(test_fn.name);
                     string_bytes.appendAssumeCapacity(0);
                     // The port has no `std.testing.expect_panic`, so no case
@@ -185,7 +186,10 @@ fn mainServer(init: std.process.Init.Minimal, progress_path: ?[]const u8, slow_m
             },
             .run_test => {
                 testing.environ = init.environ;
-                testing.allocator_instance = .{};
+                testing.allocator_instance = .init(std.heap.page_allocator, .{
+                    .canary = 0xc3a701ba,
+                    .check_write_after_free = true,
+                });
                 testing.io_instance = .init(testing.allocator, .{
                     .argv0 = .init(init.args),
                     .environ = init.environ,
@@ -221,8 +225,7 @@ fn mainServer(init: std.process.Init.Minimal, progress_path: ?[]const u8, slow_m
                 const elapsed_ns: u64 = @intCast(started.untilNow(runner_threaded_io).raw.nanoseconds);
 
                 testing.io_instance.deinit();
-                const leak_count = testing.allocator_instance.detectLeaks();
-                testing.allocator_instance.deinitWithoutLeakChecks();
+                const leak_count = testing.allocator_instance.deinit();
 
                 if (record) |*rec| rec.finishCase(index, test_fn.name, elapsed_ns, status, slow_ms);
 
@@ -243,7 +246,7 @@ fn mainServer(init: std.process.Init.Minimal, progress_path: ?[]const u8, slow_m
                 });
             },
             else => {
-                std.debug.print("unsupported message: {x}\n", .{@intFromEnum(hdr.tag)});
+                std.debug.print("unsupported message: {x}\n", .{@backingInt(hdr.tag)});
                 std.process.exit(1);
             },
         }
@@ -265,14 +268,17 @@ fn mainSimple(init: std.process.Init.Minimal, slow_ms: u64) void {
     var leaks: usize = 0;
 
     for (test_fn_list, 0..) |test_fn, i| {
-        testing.allocator_instance = .{};
+        testing.allocator_instance = .init(std.heap.page_allocator, .{
+            .canary = 0xc3a701ba,
+            .check_write_after_free = true,
+        });
         testing.io_instance = .init(testing.allocator, .{
             .argv0 = .init(init.args),
             .environ = init.environ,
         });
         defer {
             testing.io_instance.deinit();
-            if (testing.allocator_instance.deinit() == .leak) leaks += 1;
+            if (testing.allocator_instance.deinit() != 0) leaks += 1;
         }
         testing.log_level = .warn;
         testing.environ = init.environ;
@@ -328,10 +334,10 @@ pub fn log(
     args: anytype,
 ) void {
     @disableInstrumentation();
-    if (@intFromEnum(message_level) <= @intFromEnum(std.log.Level.err)) {
+    if (@backingInt(message_level) <= @backingInt(std.log.Level.err)) {
         log_err_count +|= 1;
     }
-    if (@intFromEnum(message_level) <= @intFromEnum(testing.log_level)) {
+    if (@backingInt(message_level) <= @backingInt(testing.log_level)) {
         std.debug.print(
             "[" ++ @tagName(scope) ++ "] (" ++ @tagName(message_level) ++ "): " ++ format ++ "\n",
             args,

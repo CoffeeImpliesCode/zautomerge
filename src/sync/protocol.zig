@@ -1437,7 +1437,7 @@ fn carriesDocument(m: *const Message) bool {
     for (m.changes.iter()) |chunk| {
         if (chunk.len <= chunk_type_offset) continue;
         if (!std.mem.eql(u8, chunk[0..chunk_magic.len], chunk_magic[0..])) continue;
-        if (chunk[chunk_type_offset] == @intFromEnum(chunkmod.ChunkType.document)) return true;
+        if (chunk[chunk_type_offset] == @backingInt(chunkmod.ChunkType.document)) return true;
     }
     return false;
 }
@@ -2412,14 +2412,15 @@ fn receiveTwiceWithFlags(gpa: Allocator) !void {
 }
 
 test "a replaced capability list survives every allocation failure" {
-    const gpa = testing.allocator;
+    // Keep failure indices independent of SafeAllocator's in-place growth.
+    var backing: testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
     // Capabilities are replaced rather than accumulated (`sync.rs:407-411`),
     // so the second receive above frees a list that is still readable. Both
     // the read and the release have to survive the copy failing.
     // The sweep walks the receive's own setup as well, so the message has to
     // be owned before its **first** fallible step: the one that used to be
     // `getHeads` handed the caller a message it could not free.
-    try testing.checkAllAllocationFailures(gpa, receiveTwiceWithFlags, .{});
+    try testing.checkAllAllocationFailures(backing.allocator(), receiveTwiceWithFlags, .{});
 }
 
 /// One generation with `needs_reset` set, against a peer that understands
@@ -3571,8 +3572,7 @@ fn replayStep(
     defer gpa.free(theirs);
     // **A message that carries a whole document is a `save()` on the wire, and
     // `save()` bytes are not a compatibility contract.**
-    // [AGENTS.md](AGENTS.md) says so in as many words — DEFLATE is not
-    // reproducible across implementations — and the whole-document arm
+    // DEFLATE is not reproducible across implementations, and the whole-document arm
     // (`sync.rs:213-215`, `sync.rs:225-228`) is `save()`'s bytes exactly. So
     // that message is pinned by its **type byte** and by what it does to the
     // receiving document, which is checked after the loop, and every other
@@ -3754,8 +3754,7 @@ test "a Zig and a Rust document sync in both directions, byte for byte" {
         // The whole document goes over the wire once, as a document chunk: the
         // peer missing more than a third of it is sent the document
         // (`sync.rs:225-228`), and a V1-typed message cannot carry one. That one
-        // message is a `save()`, and `save()` bytes are not the contract
-        // ([AGENTS.md](AGENTS.md)), so it is pinned by its type byte and by the
+        // message is a `save()`, so it is pinned by its type byte and by the
         // convergence below rather than by equality.
         try testing.expectEqual(@as(usize, 1), log.document_chunks);
         // **The other three are byte-identical, and the number says so** — a
@@ -4001,7 +4000,7 @@ test "the in-flight bit does not sabotage a concurrent change" {
 
 /// One `(total, prefix)` case, exactly as the reference measured it.
 ///
-/// **Every number below came out of `zig build conformance -- third`**
+/// Every number below came out of `zig build oracle -- third`
 /// (`tools/oracle/src/third.rs`), not out of reading the Rust. That
 /// subcommand builds this same sender and this same peer, hands the peer's own
 /// first message to the sender, and reports three facts the port cannot be
@@ -4014,8 +4013,7 @@ const ThirdCase = struct {
     /// **This is the divisor, and it is the sender's change count, not the
     /// peer's.** `sync.rs:225` divides `self.change_graph.len()`, and
     /// `change_graph.rs:188-190` returns `self.actors.len()` where `actors` is
-    /// one `ActorIdx` per change — the survey makes the same point at
-    /// `docs/survey/04-sync.md:829`, and it is what makes `total - prefix`
+    /// one `ActorIdx` per change, which makes `total - prefix`
     /// irrelevant to the threshold.
     total: usize,
     /// How many of the sender's changes, taken as a **prefix**, the peer
@@ -4485,7 +4483,7 @@ test "a generated message records every hash it carried, once, in order" {
 // the test that pins the arm and changes no behaviour.
 //
 // **The numbers in `third_cases` are measurements, not inferences.** They came
-// from `zig build conformance -- third`, the oracle subcommand in
+// from `zig build oracle -- third`, the oracle subcommand in
 // `tools/oracle/src/third.rs`, which builds the same sender and the same peer,
 // lets the peer's own first message fill the sender's `their_have` and
 // `their_heads`, and then reports the divisor, the number of hashes the
@@ -4995,6 +4993,8 @@ test "duplicate encoded peer need retains exact frames and counts occurrences at
     // The wire encoder accepts sorted lists with repeats; decoding must keep every repeat.
     std.mem.sort(ChangeHash, &equal, {}, ChangeHash.lessThan);
     std.mem.sort(ChangeHash, &above, {}, ChangeHash.lessThan);
+    // Keep failure indices independent of SafeAllocator's in-place growth.
+    var backing: testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
     for ([_]bool{ false, true }) |v2| {
         for ([_]bool{ false, true }) |with_have| {
             for ([_][]const ChangeHash{ &equal, &above }) |requested| {
@@ -5009,7 +5009,7 @@ test "duplicate encoded peer need retains exact frames and counts occurrences at
                     document,
                 );
                 try testing.checkAllAllocationFailures(
-                    gpa,
+                    backing.allocator(),
                     generateDuplicateNeedAndFree,
                     .{ &sender, requested, framed[0..], v2, with_have, document },
                 );

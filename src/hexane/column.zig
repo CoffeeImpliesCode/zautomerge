@@ -9833,7 +9833,7 @@ test "prefix cursors refuse malformed and overflowing wire contributions" {
     try testing.expectError(error.UnexpectedEnd, truncated_stream.finalize());
 
     // The tenth payload exceeds the one remaining unsigned bit.
-    const tenth = [_]u8{0x7f} ++ ([_]u8{0x80} ** 9) ++ [_]u8{0x02};
+    const tenth = [_]u8{0x7f} ++ (@as([9]u8, @splat(0x80))) ++ [_]u8{0x02};
     try testing.expectError(error.Overflow, C.load(gpa, &tenth));
     const tenth_stream = try C.loadIter(gpa, &tenth, .{});
     try testing.expectError(error.Overflow, tenth_stream.finalize());
@@ -10123,14 +10123,16 @@ test "column multi-edit overlay preserves delta and prefix base metadata" {
 }
 
 test "column multi-edit overlay survives every allocation failure without poisoning source" {
+    // Keep failure indices independent of SafeAllocator's in-place growth.
+    var backing: testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
     // Observe the source with an independent allocator after each aborted stage.
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        backing.allocator(),
         columnOverlayAllocationFailure,
         .{true},
     );
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        backing.allocator(),
         columnOverlayAllocationFailure,
         .{false},
     );
@@ -11139,7 +11141,7 @@ test "a row cursor positions through every way a window is moved" {
     try testing.expectEqual(model.len, past.pos());
 }
 
-//  An iterator is a value, not a heap object (`docs/plan.md` §3): a column
+//  An iterator is a value, not a heap object: a column
 //  built through a counting allocator allocates nothing more once every
 //  cursor over it — the whole-column one, a range one, a run walk, a run
 //  adapter — has been built and walked.
@@ -11695,8 +11697,7 @@ test "a prefix cursor is a value, and its descent allocates nothing" {
 //   `iterator`, `iter_range` is `iterRange`, `to_vec` is `toSlice`.
 // * Upstream's `proptest!` cases are ported as **seeded deterministic sweeps**
 //   over the same generator domain. A property test draws at random; a
-//   regression test over a fixed seed list is reproducible, which is what
-//   `docs/plan.md` §4 asks for (`proptest-regressions/tests.txt`).
+//   regression test over a fixed seed list is reproducible (`proptest-regressions/tests.txt`).
 // * Upstream's `from_values_with_max_segments(n)`, `with_max_segments(n)` and
 //   `LoadOpts::with_max_segments(n)` are the port's `fromValues`,
 //   `initWithBudget` and `LoadOpts.withMaxSegments`, so a case that tunes the
@@ -11961,7 +11962,7 @@ test "load_roundtrip_bool_all_true" {
     const gpa = testing.allocator;
     var original = try Column(bool, Bool).init(gpa);
     defer original.deinit();
-    try original.extend(gpa, &([_]bool{true} ** 100));
+    try original.extend(gpa, &(@as([100]bool, @splat(true))));
     const bytes = try original.encode(gpa);
     defer gpa.free(bytes);
     var loaded = try Column(bool, Bool).load(gpa, bytes);
@@ -11974,7 +11975,7 @@ test "load_roundtrip_bool_all_false" {
     const gpa = testing.allocator;
     var original = try Column(bool, Bool).init(gpa);
     defer original.deinit();
-    try original.extend(gpa, &([_]bool{false} ** 100));
+    try original.extend(gpa, &(@as([100]bool, @splat(false))));
     const bytes = try original.encode(gpa);
     defer gpa.free(bytes);
     var loaded = try Column(bool, Bool).load(gpa, bytes);
@@ -12083,7 +12084,7 @@ test "load_truncated_at_a_run_boundary_is_a_shorter_column" {
 //  Eleven 0xff bytes are an overlong LEB128 and then some (`tests.rs:1902`).
 test "load_garbage_data_is_error" {
     const gpa = testing.allocator;
-    try testing.expectError(error.InvalidLeb128, Column(u64, Rle(u64)).load(gpa, &([_]u8{0xff} ** 11)));
+    try testing.expectError(error.InvalidLeb128, Column(u64, Rle(u64)).load(gpa, &(@as([11]u8, @splat(0xff)))));
 }
 test "minimum signed literal count remains total without overflow" {
     const gpa = testing.allocator;
@@ -12433,7 +12434,7 @@ test "load_empty_and_fill_and_length" {
     defer col.deinit();
     const filled = try col.toSlice(gpa);
     defer gpa.free(filled);
-    try testing.expectEqualSlices(u64, &([_]u64{7} ** 5), filled);
+    try testing.expectEqualSlices(u64, &(@as([5]u64, @splat(7))), filled);
     try testing.expectError(error.InvalidValue, C.loadWith(gpa, &.{}, C.LoadOpts.new().withLength(5)));
 
     var full = try v1Build(gpa, &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 });
@@ -14698,7 +14699,7 @@ test "prefix_column_load_with_length_mismatch" {
 //  refuses the same bytes a plain one does (`tests.rs:5490-5495`).
 test "prefix_load_rejects_non_canonical_input" {
     const gpa = testing.allocator;
-    const bytes: []const u8 = &([_]u8{ 0x02, 0x05 } ** 200);
+    const bytes: []const u8 = &@as([400]u8, @bitCast(@as([200][2]u8, @splat(.{ 0x02, 0x05 }))));
     try testing.expectError(error.InvalidValue, Column(u64, Prefix(u64)).load(gpa, bytes));
     try testing.expectError(error.InvalidValue, Rle(u64).canonicalSlab(bytes));
 }
@@ -14724,7 +14725,7 @@ test "build_with_repeats" {
 
 test "build_all_same" {
     const gpa = testing.allocator;
-    const vals = [_]u64{7} ** 10;
+    const vals = @as([10]u64, @splat(7));
     var col = try v1Build(gpa, &vals);
     defer col.deinit();
     try assertCol(u64, Rle(u64), &col, &vals);
@@ -14788,7 +14789,7 @@ test "nullable_all_null" {
     var col = try Column(?u64, RleOption(u64)).init(gpa);
     defer col.deinit();
     for (0..5) |i| try insertAt(Column(?u64, RleOption(u64)), gpa, &col, i, null);
-    try assertCol(?u64, RleOption(u64), &col, &([_]?u64{null} ** 5));
+    try assertCol(?u64, RleOption(u64), &col, &(@as([5]?u64, @splat(null))));
 }
 
 test "bool_basic" {
@@ -14806,7 +14807,7 @@ test "bool_all_same" {
     var col = try Column(bool, Bool).init(gpa);
     defer col.deinit();
     for (0..10) |i| try insertAt(Column(bool, Bool), gpa, &col, i, true);
-    try assertCol(bool, Bool, &col, &([_]bool{true} ** 10));
+    try assertCol(bool, Bool, &col, &(@as([10]bool, @splat(true))));
 }
 
 //  A column long enough to split into several slabs (`tests.rs:194`;
@@ -14957,7 +14958,7 @@ test "scan_to_consumes_through" {
     {
         var col = try Column(u64, Rle(u64)).init(gpa);
         defer col.deinit();
-        try col.extend(gpa, &([_]u64{0} ** 100));
+        try col.extend(gpa, &(@as([100]u64, @splat(0))));
         for (0..100) |i| try col.set(gpa, i, @intCast(i));
         var it = try col.iterator();
         try testing.expectEqual(@as(?u64, 10), try it.seekTo(10));
@@ -18608,7 +18609,7 @@ test "string_and_bool_columns_leb128" {
     // boolean columns over its test-local `BeLen` and is declared under that
     // name further down; the third occurrence (`tests.rs:5676`) is inside
     // `#[cfg(feature = "bijou64")] mod bijou64_codec` (`tests.rs:5551-5552`),
-    // which is dead feature code (`AGENTS.md:50-52`). What is held here is the
+    // which is unused feature code. What is held here is the
     // default wire: the byte payload's length prefix and the boolean codec's
     // run counts, each round-tripped through its own bytes.
     const gpa = testing.allocator;
@@ -20038,14 +20039,14 @@ test "fill_nullable_types" {
         defer col.deinit();
         try testing.expectEqual(@as(usize, 10), col.len());
         try testing.expect((try col.get(0)).? == null);
-        try expectBytesRoundTrip(OptStrCol, &col, &([_]?[]const u8{null} ** 10), optTextEql);
+        try expectBytesRoundTrip(OptStrCol, &col, &(@as([10]?[]const u8, @splat(null))), optTextEql);
     }
     {
         var col = try OptBytesCol.fill(gpa, 10, null);
         defer col.deinit();
         try testing.expectEqual(@as(usize, 10), col.len());
         try testing.expect((try col.get(0)).? == null);
-        try expectBytesRoundTrip(OptBytesCol, &col, &([_]?[]const u8{null} ** 10), optTextEql);
+        try expectBytesRoundTrip(OptBytesCol, &col, &(@as([10]?[]const u8, @splat(null))), optTextEql);
     }
 }
 
@@ -20196,8 +20197,7 @@ test "next_run_never_yields_adjacent_equal_runs_at_default_config" {
     const boundary = col.slabAt(0).?.len;
     // **`after` is copied before the edit, because `get` borrows the
     // column's own slab bytes and the splice rewrites them.** Holding the
-    // borrow across the mutation is the use-after-free AGENTS.md calls out:
-    // a slice into a document's storage is valid until the next mutation.
+    // borrow across the mutation would use freed storage.
     const after_src = (try col.get(boundary)).?.?;
     const after = try gpa.dupe(u8, after_src);
     defer gpa.free(after);

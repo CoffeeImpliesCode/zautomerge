@@ -1000,7 +1000,7 @@ const chunk_type_offset = 8;
 fn carriesDocument(m: *const Message) bool {
     for (m.changes.iter()) |chunk| {
         if (chunk.len > chunk_type_offset and
-            chunk[chunk_type_offset] == @intFromEnum(chunkmod.ChunkType.document))
+            chunk[chunk_type_offset] == @backingInt(chunkmod.ChunkType.document))
         {
             return true;
         }
@@ -1704,7 +1704,8 @@ fn generateV1ResetArm(gpa: Allocator) !void {
 }
 
 test "the v1 reset arm releases its lists once under every allocation failure" {
-    const gpa = testing.allocator;
+    // Keep failure indices independent of SafeAllocator's in-place growth.
+    var backing: testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
     // `v1Reset` borrows `our_heads` and allocates twice itself, so the arm has
     // two returns that each release all three locals and one failure path that
     // must release them exactly once. The `errdefer`s handle the failure path
@@ -1712,7 +1713,7 @@ test "the v1 reset arm releases its lists once under every allocation failure" {
     // well freed them twice, and one that emptied the locals instead leaked all
     // three. Neither shows up in a test that only ever succeeds, because the
     // failure path needs an allocation to fail first.
-    try testing.checkAllAllocationFailures(gpa, generateV1ResetArm, .{});
+    try testing.checkAllAllocationFailures(backing.allocator(), generateV1ResetArm, .{});
 }
 
 /// Generation for a peer that has said what it has and what it wants, which is
@@ -1743,13 +1744,14 @@ fn generateV1WithPayload(gpa: Allocator) !void {
 }
 
 test "the v1 generator releases the heads it moves into the builder under every allocation failure" {
-    const gpa = testing.allocator;
+    // Keep failure indices independent of SafeAllocator's in-place growth.
+    var backing: testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
     // `our_heads` is **moved** into the builder, so a guard on it that is not
     // emptied at the hand-over frees what the builder owns on every error path
     // after it, and a run with no guard at all leaks it on the five fallible
     // steps between the `getHeads` and the `setHeads`. Neither is visible to a
     // test that only ever succeeds.
-    try testing.checkAllAllocationFailures(gpa, generateV1WithPayload, .{});
+    try testing.checkAllAllocationFailures(backing.allocator(), generateV1WithPayload, .{});
 }
 
 test "a v1 peer's heads are stored as a set, whatever order the peer wrote them" {
@@ -1992,9 +1994,7 @@ fn handMessageV2(gpa: Allocator, heads: []const ChangeHash) !Message {
 // awkward case the merge has still has to come out the same.
 //
 // **The reader of the base document is written twice rather than shared.** The
-// two files are two slices of the port and a public helper only one of them
-// needs would put a test fixture in a module's public surface, which is the one
-// thing the layout in `AGENTS.md` is for.
+// two files need their own private fixture readers.
 
 const converge_golden_paths = [_][]const u8{
     "test/golden/converge.jsonl",
@@ -2234,8 +2234,8 @@ fn noDocumentChunks(m: *const Message) bool {
     for (m.changes.iter()) |chunk| {
         if (chunk.len <= chunk_type_offset) return false;
         switch (chunk[chunk_type_offset]) {
-            @intFromEnum(chunkmod.ChunkType.change),
-            @intFromEnum(chunkmod.ChunkType.compressed),
+            @backingInt(chunkmod.ChunkType.change),
+            @backingInt(chunkmod.ChunkType.compressed),
             => {},
             else => return false,
         }

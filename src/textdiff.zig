@@ -6,7 +6,7 @@
 //! `automerge` carries (`text_diff/myers.rs:1-8`, `text_diff/replace.rs:1-6`,
 //! `text_diff/utils.rs:1-7`). Those files are **Apache-2.0**; the notice is
 //! `src/textdiff/LICENSE`, beside this file. Upstream `automerge` is MIT and the
-//! two notices are kept separate, never merged (`AGENTS.md`, §Licensing).
+//! two notices are kept separate.
 //!
 //! | this module | upstream |
 //! | --- | --- |
@@ -30,16 +30,13 @@
 //! methods with the same arguments called in the same order, and binds the
 //! hook by `anytype` instead of through a vtable: one static call per event, no
 //! indirection, and `Replace` is a generic struct rather than a generic over a
-//! trait object. `docs/plan.md` §3.2 reserves a vtable for the one dispatch that
-//! is polymorphic at runtime, `ReadDoc`/`Transactable`; this one is monomorphic
-//! at comptime, so it is not that case.
+//! trait object. Each instantiation resolves its hook at compile time.
 //!
 //! The associated `Error` type of the Rust trait exists only so `TxHook` and
-//! `BlockDiffHook` can share one driver
-//! (`docs/survey/05-iter-query-patch.md:739`, `:769`). Zig infers one error set
+//! `BlockDiffHook` can share one driver. Zig infers one error set
 //! per instantiation instead, and every hook here returns `err.Error`.
 //!
-//! Not ported, per `AGENTS.md` §Invariants (do not port upstream dead code):
+//! Unused upstream helpers are not ported:
 //! `UniqueItem`, `IdentifyDistinct` and `unique`, which `automerge` removed
 //! from its copy of `similar` as unused (`text_diff/utils.rs:5-7`);
 //! `Replace::into_inner` and its `AsRef`/`AsMut` impls
@@ -274,7 +271,7 @@ const V = struct {
 /// The width `maxD` computes the midpoint in: twice `usize`, so the sum of
 /// two lengths and the two `+ 1`s after the division all fit with room to
 /// spare however large the two lengths are.
-const MidpointWidth = std.meta.Int(.unsigned, 2 * @bitSizeOf(usize));
+const MidpointWidth = @Int(.unsigned, 2 * @bitSizeOf(usize));
 
 /// `max_d` (`text_diff/myers.rs:124-127`): the number of edit-distance rounds
 /// the middle-snake search explores, `ceil((N + M) / 2) + 1`.
@@ -785,7 +782,7 @@ pub fn spanAsGrapheme(
 /// It reaches the document through `Sink`, which carries the operations
 /// upstream splits between `&mut Automerge` and `&mut TransactionInner`
 /// (`text_diff.rs:47-48`). This port's transaction owns its document and its
-/// patch log (`docs/plan.md` §5.4), so one pointer carries both. `Sink` must
+/// patch log, so one pointer carries both. `Sink` must
 /// provide:
 ///
 /// | method | upstream |

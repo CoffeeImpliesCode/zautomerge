@@ -845,7 +845,7 @@ pub const Action = enum(u8) {
     /// defines is `error.InvalidAction`.
     pub fn fromCode(code: u8) ParseError!Action {
         return switch (code) {
-            0...7 => @enumFromInt(code),
+            0...7 => @fromBackingInt(@intCast(code)),
             else => error.InvalidAction,
         };
     }

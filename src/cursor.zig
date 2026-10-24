@@ -70,11 +70,8 @@
 //! **The offset is not on the wire.** This port's [`OpCursor`] is an
 //! `ElemId` plus the offset within the element (see "The offset" below), and
 //! the v1 grammar has no field for an offset: `opid` is a tag, an actor, a
-//! counter and a move. Widening the grammar is forbidden by
-//! [`AGENTS.md`](../../AGENTS.md) ("Never change the document format, the
-//! change encoding, the column ids, the column order, or the sync message
-//! bytes") and by this slice's own instruction that the codec is FORMAT, so
-//! the offset is a **resolution refinement that lives in memory only**.
+//! counter and a move. The wire grammar must remain unchanged, so
+//! the offset is a resolution refinement that lives in memory only.
 //! [`toBytes`] of a cursor at offset 2 inside an element is byte-identical to
 //! [`toBytes`] of one at offset 0 in the same element, and [`fromBytes`]
 //! yields offset `0`. That is a pinned behaviour with a test, not a silent
@@ -131,10 +128,8 @@
 //!
 //! # Where a cursor is resolved: the op set, not a b-tree
 //!
-//! Upstream's `sequence_tree.rs` is a positional b-tree with **no cursors** at
-//! all ([docs/STATUS.md](../../docs/STATUS.md) defect 7), and an earlier
-//! attempt at this slice invented a cursor API over it. This file resolves
-//! through the op set instead, with three queries and nothing of its own:
+//! Upstream's `sequence_tree.rs` is a positional b-tree without cursors.
+//! This file resolves through the op set with three queries:
 //! [`OpSet.seekOpsByIndex`](opset/op_set.zig) to make a cursor from a
 //! position, [`OpSet.seekListOpid`](opset/op_set.zig) to resolve one, and
 //! [`OpSet.seqLength`](opset/op_set.zig) for `Cursor.end`.
@@ -1699,7 +1694,7 @@ test "every byte string is refused, never trapped on, and trailing bytes are ign
     try testing.expectError(error.UnexpectedEnd, fromBytes(&.{ 0x01, 0x03, 0x00, 0x80, 0x80 }));
     try testing.expectError(
         error.InvalidLeb128,
-        fromBytes(&([_]u8{ 0x01, 0x03, 0x00 } ++ ([_]u8{0x80} ** 11))),
+        fromBytes(&([_]u8{ 0x01, 0x03, 0x00 } ++ (@as([11]u8, @splat(0x80))))),
     );
     // A missing move byte, and a move byte that is neither tag
     // (`cursor.rs:247-248`, `:256`).
@@ -1785,7 +1780,7 @@ test "a malformed version-0 cursor is refused, never crashed on" {
     // The actor's length itself is truncated: every byte continues.
     try testing.expectError(error.UnexpectedEnd, fromBytes(&.{ 0, 0x80, 0x80 }));
     // The actor's length is overlong.
-    try testing.expectError(error.InvalidLeb128, fromBytes(&([_]u8{0} ++ ([_]u8{0x80} ** 11))));
+    try testing.expectError(error.InvalidLeb128, fromBytes(&([_]u8{0} ++ (@as([11]u8, @splat(0x80))))));
     // The actor is there and the counter is not.
     try testing.expectError(error.UnexpectedEnd, fromBytes(&.{ 0, 2, 'a', 'b' }));
     // The counter is truncated.
@@ -2365,9 +2360,9 @@ test "an object that is not there, an actor that is not there, and a clock that 
 fn errorSetHas(comptime set: anytype, comptime name: []const u8) bool {
     // `null` is the *global* error set, which carries no name list; neither
     // of the two sets asked about here is global.
-    const names = @typeInfo(set).error_set orelse return false;
+    const names = @typeInfo(set).error_set.error_names orelse return false;
     for (names) |n| {
-        if (std.mem.eql(u8, n.name, name)) return true;
+        if (std.mem.eql(u8, n, name)) return true;
     }
     return false;
 }
@@ -2922,7 +2917,7 @@ test "a cursor comes back to the position it was taken at, and the mark there is
     try testing.expectEqual(@as(usize, 11), len);
 
     // Reader one: the span walk, turned into a per-position table.
-    var mark_at: [32][2]AtPosition = .{.{ null, null }} ** 32;
+    var mark_at: [32][2]AtPosition = @splat(.{ null, null });
     // Keep the owned mark payloads alive while the position table borrows them.
     var retained_spans: std.ArrayList(cspans.Span) = .empty;
     defer {

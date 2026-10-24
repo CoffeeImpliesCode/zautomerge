@@ -7,9 +7,7 @@
 //! lookahead wrappers can have their lookahead repositioned**, which is the
 //! property the whole iteration phase rests on: a walk visits one object, the
 //! reader moves it into the next object with `shiftNext`, and nothing is
-//! allocated between the two objects. [`docs/plan.md` §3](../../docs/plan.md)
-//! calls that out — an iterator is a value, and *constructing* one allocates
-//! nothing.
+//! allocated between the two objects. Constructing an iterator allocates nothing.
 //!
 //! # The two lookahead wrappers, and why both exist
 //!
@@ -1415,8 +1413,7 @@ test "Unshift draws its lookahead in init, and peeking never consumes" {
 }
 
 test "Unshift keeps 'the walk is over' apart from 'this row carries nothing'" {
-    // The recorded trap (`docs/STATUS.md:211-221`,
-    // `MarkIndexColumn.ValueIter.next` at `mark_index.zig:488-496`): a cursor
+    // `MarkIndexColumn.ValueIter.next` at `mark_index.zig:488-496`: a cursor
     // over a nullable column answers `null` for a row that carries no value
     // *and* for the end of the window, and a walk flattened over it stops at
     // the first absent row.
@@ -1471,8 +1468,7 @@ test "Unshift keeps 'the walk is over' apart from 'this row carries nothing'" {
     // And *now* the walk is over: the outer layer is null, and it is a
     // *different* value from the four absent rows above. The flattened shape
     // would have answered `over()` at row 0, and rows 1 to 7 would never have
-    // been handed out at all — which is exactly the trap `docs/STATUS.md`
-    // records for `MarkIndexColumn.ValueIter`.
+    // been handed out at all.
     try testing.expect(u.exhausted());
     try testing.expectEqual(carries.over(), u.peek());
     try testing.expectEqual(carries.over(), try u.next());
@@ -1954,7 +1950,7 @@ fn diffOverValues(gpa: Allocator, before: []const bool, after: []const bool) !Di
 
 test "a diff over two equal states is all Same and reproduces the state" {
     const gpa = testing.allocator;
-    const all = [_]bool{true} ** 6;
+    const all = @as([6]bool, @splat(true));
     var run = try diffOverValues(gpa, &all, &all);
     defer run.deinit(gpa);
 
@@ -1971,7 +1967,7 @@ test "a diff over two equal states is all Same and reproduces the state" {
 
 test "one differing row diffs to one entry, wherever it sits" {
     const gpa = testing.allocator;
-    const all = [_]bool{true} ** 5;
+    const all = @as([5]bool, @splat(true));
     var head = all;
     head[0] = false;
     var tail = all;
@@ -2017,7 +2013,7 @@ test "one differing row diffs to one entry, wherever it sits" {
 
 test "a run of differing rows diffs to a run" {
     const gpa = testing.allocator;
-    const all7 = [_]bool{true} ** 7;
+    const all7 = @as([7]bool, @splat(true));
     const Cases = [_]struct {
         name: []const u8,
         before: []const bool,
@@ -2059,9 +2055,9 @@ test "a run of differing rows diffs to a run" {
 
 test "a state shorter than the other diffs to the missing tail" {
     const gpa = testing.allocator;
-    const all4 = [_]bool{true} ** 4;
-    const all5 = [_]bool{true} ** 5;
-    const none4 = [_]bool{false} ** 4;
+    const all4 = @as([4]bool, @splat(true));
+    const all5 = @as([5]bool, @splat(true));
+    const none4 = @as([4]bool, @splat(false));
     const Cases = [_]struct {
         name: []const u8,
         before: []const bool,
@@ -2109,7 +2105,7 @@ test "a state shorter than the other diffs to the missing tail" {
 
 test "a difference at the very first and the very last position" {
     const gpa = testing.allocator;
-    const all = [_]bool{true} ** 5;
+    const all = @as([5]bool, @splat(true));
     // The three shapes a difference at an end can take: the first row alone,
     // the last row alone, and the last two together.
     var head = all;
@@ -2201,8 +2197,8 @@ test "the diff applied to the earlier state produces the later state" {
     // walk's kept entries in order are the later state's values.
     const gpa = testing.allocator;
     const n: usize = 9;
-    const all = [_]bool{true} ** n;
-    const none = [_]bool{false} ** n;
+    const all = @as([n]bool, @splat(true));
+    const none = @as([n]bool, @splat(false));
     const Cases = [_]struct { before: []const bool, after: []const bool }{
         .{ .before = &all, .after = &all },
         .{ .before = &none, .after = &all },
@@ -2358,7 +2354,7 @@ const PairWalk = struct {
 test "a shifted multi-column diff yields the requested row tuple" {
     // Ordinary reads after a shift must observe both columns on the new row.
     const gpa = testing.allocator;
-    const flags = [_]bool{true} ** 4;
+    const flags = @as([4]bool, @splat(true));
     var values = try buildValues(gpa, flags.len);
     defer values.deinit();
     var kept = try buildFlags(gpa, &flags);
@@ -2383,7 +2379,7 @@ test "a diff over a multi-column walk is the same type as one over a single colu
     // only `Q` differs.
     const gpa = testing.allocator;
     const before = [_]bool{ true, true, false, true, true, false };
-    const after = [_]bool{true} ** before.len;
+    const after = @as([before.len]bool, @splat(true));
     var values = try buildValues(gpa, before.len);
     defer values.deinit();
     var fb = try buildFlags(gpa, &before);
@@ -2450,7 +2446,7 @@ test "a shifted diff answers a defined row, and null past the end" {
 }
 
 test "constructing any of these allocates nothing" {
-    // `docs/plan.md` §3: an iterator is a value. The count is compared across
+    // An iterator is a value. The count is compared across
     // the whole block, so a constructor that allocated would move it.
     var failing: testing.FailingAllocator = .init(testing.allocator, .{});
     const gpa = failing.allocator();
