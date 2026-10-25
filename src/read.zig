@@ -2702,12 +2702,12 @@ const c_map_specs = [_]OpSpec{
 ///
 /// Used to **mutate a document a read has already answered from**, which is the
 /// only way the ownership rules can be tested rather than asserted.
-fn mutate(gpa: Allocator, doc: *Document) !void {
+fn mutate(gpa: Allocator, doc: *Document, ctr: u32, key: []const u8) !void {
     const a = try doc.putActorRef(gpa, actor_a);
     const specs = [_]OpSpec{
         .{
-            .ctr = 30,
-            .key = mkey("zzz"),
+            .ctr = ctr,
+            .key = mkey(key),
             // **A long value, so the op set's raw value column has to grow** and
             // the mutation cannot be a no-op on the storage a read borrowed.
             .value = .{ .str = "a value long enough to move the raw column's block" },
@@ -2716,11 +2716,8 @@ fn mutate(gpa: Allocator, doc: *Document) !void {
     const ops = try buildOps(gpa, a, &specs);
     defer docmod.freeChangeOps(gpa, ops);
     const root_rows = try mutableOps(doc).scopeToObj(.root);
-    // **At the end**, because `"zzz"` sorts after every key the root holds and
-    // rule **R2** orders map registers by key string
-    // ([op_set.rs:1059-1060](../opset/op_set.zig)). A mutation at the front
-    // would be a row out of order, and a fixture that had one would be refused
-    // by the checker rather than read back plausibly wrong.
+    // Each mutation adds a fresh key after all existing root keys, so the
+    // register order stays canonical without duplicate operation ids.
     _ = try mutableOps(doc).splice(root_rows.end, ops);
     try mutableOps(doc).rebuildIndex();
 }
@@ -3448,7 +3445,7 @@ test "a map key is the document's own bytes, and a mutation does not move them" 
 
     // **A mutation that makes the value column grow**, so it cannot be a no-op
     // on the storage.
-    try mutate(gpa, &doc);
+    try mutate(gpa, &doc, 30, "zzz");
 
     // The held slice is still the document's own bytes and still says what it
     // said. **Asserting this is the point**: the alternative — re-reading and
@@ -3477,7 +3474,7 @@ test "a borrowed value is the document's, and the copy is the caller's" {
     // nothing in it is copied.
     const item = (try get(&doc, .root, .{ .key = "hello" })).?;
     try testing.expectEqualStrings("world", item.value.scalar.str);
-    try mutate(gpa, &doc);
+    try mutate(gpa, &doc, 30, "zzz");
     // The contract is "valid until the next mutation", so the **re-read** is
     // the only thing asserted here: the earlier slice's bytes are the
     // document's, and a test that asserted on them would be pinning what the
@@ -3488,12 +3485,14 @@ test "a borrowed value is the document's, and the copy is the caller's" {
     // **The copy is the caller's, and it outlives the mutations.** This is the
     // shape a caller reaches for when it has to keep a value across one, and
     // it is what `intoOwned` is for ([iter/map_range.zig:265-277](../iter/map_range.zig)).
-    var walk = try mapRange(&doc, .root, .{ .start = .{ .included = "hello" } });
-    const raw = (try walk.next()).?;
-    var owned = try raw.intoOwned(gpa);
+    var owned = blk: {
+        var walk = try mapRange(&doc, .root, .{ .start = .{ .included = "hello" } });
+        const raw = (try walk.next()).?;
+        break :blk try raw.intoOwned(gpa);
+    };
     defer owned.deinit(gpa);
-    try mutate(gpa, &doc);
-    try mutate(gpa, &doc);
+    try mutate(gpa, &doc, 31, "zzzz");
+    try mutate(gpa, &doc, 32, "zzzzz");
     try testing.expectEqualStrings("hello", owned.key);
     try testing.expectEqualStrings("world", owned.value.value.scalar.str);
 }
