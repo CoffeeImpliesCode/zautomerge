@@ -12,6 +12,7 @@ const TextIndexing = enum {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const test_filter = b.option([]const u8, "test-filter", "Run only tests whose names contain this text");
     const text_indexing = b.option(
         TextIndexing,
         "text-indexing",
@@ -106,7 +107,7 @@ pub fn build(b: *std.Build) void {
         "slow-path",
         "Run the unit tests with -Dslow-path forced on",
     );
-    timedTest(b, slow_lib_tests, "library-slow-path", null, &.{slow_path_step});
+    timedTest(b, test_filter, slow_lib_tests, "library-slow-path", null, &.{slow_path_step});
 
     const library_test_root = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
@@ -118,7 +119,7 @@ pub fn build(b: *std.Build) void {
     const lib_tests = b.addTest(.{ .root_module = library_test_root });
 
     const test_step = b.step("test", "Run unit tests");
-    timedTest(b, lib_tests, "library", null, &.{test_step});
+    timedTest(b, test_filter, lib_tests, "library", null, &.{test_step});
 
     // The fixture corpus lives in test/fixtures and the test reads it through
     // a path relative to the build root, which is the process working
@@ -130,7 +131,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    timedTest(b, fixtures_tests, "fixtures", b.path("."), &.{test_step});
+    timedTest(b, test_filter, fixtures_tests, "fixtures", b.path("."), &.{test_step});
 
     // The crate-root address-book example, run the way a consumer runs it: a
     // module of its own that imports `zautomerge` by name, so nothing below
@@ -155,7 +156,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    timedTest(b, example_tests, "example", null, &.{test_step});
+    timedTest(b, test_filter, example_tests, "example", null, &.{test_step});
 
     // `rust/automerge/tests/test.rs` — the document's own 140-case suite —
     // ported case for case into `test/upstream_doc_test.zig`, and run the way
@@ -174,7 +175,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    timedTest(b, upstream_doc_tests, "upstream-doc", null, &.{test_step});
+    timedTest(b, test_filter, upstream_doc_tests, "upstream-doc", null, &.{test_step});
 
     // Public document consumers embed their Rust-generated vectors.
     const clock_tests = b.addTest(.{
@@ -186,7 +187,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const clock_test_step = b.step("clock-test", "Check document frontiers against the Rust clock corpus");
-    timedTest(b, clock_tests, "upstream-clock", null, &.{ test_step, clock_test_step });
+    timedTest(b, test_filter, clock_tests, "upstream-clock", null, &.{ test_step, clock_test_step });
 
     const metadata_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -197,7 +198,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const metadata_test_step = b.step("metadata-test", "Check owned change metadata against Rust");
-    timedTest(b, metadata_tests, "upstream-metadata", null, &.{ test_step, metadata_test_step });
+    timedTest(b, test_filter, metadata_tests, "upstream-metadata", null, &.{ test_step, metadata_test_step });
 
     // `rust/automerge/tests/test_mark_patches.rs` — a file holding **exactly
     // one** `#[test]` — ported case for case into `test/mark_patches_test.zig`.
@@ -222,7 +223,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    timedTest(b, mark_patches_tests, "mark-patches", null, &.{test_step});
+    timedTest(b, test_filter, mark_patches_tests, "mark-patches", null, &.{test_step});
 
     // `rust/hexane/src/tests.rs`, ported case for case where the port's public
     // API reaches the case, into `src/hexane/hexane_test.zig`. **Its own step
@@ -247,7 +248,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    timedTest(b, hexane_tests, "hexane", null, &.{test_step});
+    timedTest(b, test_filter, hexane_tests, "hexane", null, &.{test_step});
 
     // The C ABI's Zig tests need libc and a root under src/ so imports stay
     // inside the module. The published `mod` stays pure Zig; its normal and
@@ -265,7 +266,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{ "c.doc.", "c.sync." },
     });
     const c_abi_step = b.step("c-abi-test", "Run the C ABI's own Zig test sections");
-    timedTest(b, c_abi_tests, "c-abi", b.path("."), &.{ test_step, c_abi_step });
+    timedTest(b, test_filter, c_abi_tests, "c-abi", b.path("."), &.{ test_step, c_abi_step });
 
     // `test/upstream_doc_more.zig` is the **remainder** of the same upstream
     // file: the 23 of `tests/test.rs`'s 140 `#[test]` cases that
@@ -292,7 +293,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    timedTest(b, upstream_doc_more_tests, "upstream-doc-more", b.path("."), &.{test_step});
+    timedTest(b, test_filter, upstream_doc_more_tests, "upstream-doc-more", b.path("."), &.{test_step});
 
     // `test/upstream_text_more.zig` is the **remainder** of the upstream text
     // suites: the three `#[test]` cases in `rust/automerge/tests/text.rs` and
@@ -317,7 +318,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    timedTest(b, upstream_text_more_tests, "upstream-text-more", null, &.{test_step});
+    timedTest(b, test_filter, upstream_text_more_tests, "upstream-text-more", null, &.{test_step});
     // `test/upstream_batch_insert.zig` is `$AUTOMERGE_REF/rust/automerge/tests/
     // batch_insert.rs` — all 46 of its `#[test]` cases, ported case for case
     // and in upstream's order, and nothing else. It is the **whole** of a file
@@ -345,7 +346,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    timedTest(b, upstream_batch_insert_tests, "upstream-batch-insert", null, &.{test_step});
+    timedTest(b, test_filter, upstream_batch_insert_tests, "upstream-batch-insert", null, &.{test_step});
 
     // `test/upstream_save_load_orphans.zig` is `$AUTOMERGE_REF/rust/automerge/
     // tests/test_save_load_orphans.rs` — all 3 of its `#[test]` cases, ported
@@ -376,7 +377,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    timedTest(b, upstream_save_load_orphans_tests, "upstream-save-load-orphans", null, &.{test_step});
+    timedTest(b, test_filter, upstream_save_load_orphans_tests, "upstream-save-load-orphans", null, &.{test_step});
 
     // `test/upstream_block_tests.zig` is `$AUTOMERGE_REF/rust/automerge/tests/
     // block_tests.rs` — **all nineteen of its `#[test]` cases**, ported case
@@ -411,7 +412,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    timedTest(b, upstream_block_tests, "upstream-block", null, &.{test_step});
+    timedTest(b, test_filter, upstream_block_tests, "upstream-block", null, &.{test_step});
 
     // `test/upstream_convert_string.zig` is
     // `$AUTOMERGE_REF/rust/automerge/tests/convert_string_to_text.rs` — **all
@@ -449,7 +450,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    timedTest(b, upstream_convert_string_tests, "upstream-convert-string", null, &.{test_step});
+    timedTest(b, test_filter, upstream_convert_string_tests, "upstream-convert-string", null, &.{test_step});
 
     // `test/upstream_rich_text_fuzz.zig` is `$AUTOMERGE_REF/rust/automerge/
     // tests/rich_text_fuzz_crash.rs` — all nine `#[test]` cases, ported
@@ -484,7 +485,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    timedTest(b, upstream_rich_text_fuzz_tests, "upstream-rich-text-fuzz", null, &.{test_step});
+    timedTest(b, test_filter, upstream_rich_text_fuzz_tests, "upstream-rich-text-fuzz", null, &.{test_step});
 
     // `test/save_interop_test.zig` is the **permanent** half of the save
     // interoperability gate: it reads `test/golden/save-interop.jsonl` — the
@@ -515,7 +516,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    timedTest(b, save_interop_tests, "save-interop", b.path("."), &.{test_step});
+    timedTest(b, test_filter, save_interop_tests, "save-interop", b.path("."), &.{test_step});
 
     // Every api-parity vector is replayed by native public consumers, while
     // ordinary conformance independently checks the reference's determinism.
@@ -527,7 +528,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zautomerge", .module = mod }},
         }),
     });
-    timedTest(b, api_parity_tests, "api-parity", null, &.{test_step});
+    timedTest(b, test_filter, api_parity_tests, "api-parity", null, &.{test_step});
 
     // `zig build ctest` builds the upstream C conformance suite — the cmocka
     // suite from `rust/automerge-c/test/`, copied verbatim into
@@ -1062,7 +1063,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const bench_test_step = b.step("bench-test", "Check benchmark counter validity");
-    timedTest(b, bench_counter_tests, "bench-counter", null, &.{ test_step, bench_test_step });
+    timedTest(b, test_filter, bench_counter_tests, "bench-counter", null, &.{ test_step, bench_test_step });
 }
 
 /// Run one test root under `test/verification_runner.zig` and put that root's
@@ -1104,11 +1105,14 @@ pub fn build(b: *std.Build) void {
 ///   reporting step must never be able to turn a passing run red.
 fn timedTest(
     b: *std.Build,
+    test_filter: ?[]const u8,
     test_artifact: *std.Build.Step.Compile,
     label: []const u8,
     cwd: ?std.Build.LazyPath,
     steps: []const *std.Build.Step,
 ) void {
+    if (test_filter) |filter| test_artifact.filters = &.{filter};
+
     test_artifact.test_runner = .{ .path = b.path("test/verification_runner.zig"), .mode = .server };
 
     const run = b.addRunArtifact(test_artifact);
