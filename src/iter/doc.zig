@@ -1983,7 +1983,7 @@ test "the walk's objects are the op set's own, and a long run is one boundary" {
     const gpa = testing.allocator;
     // **A document with many objects and one object with a long run**, so
     // that "one object per step" and "one row per step" cannot both look
-    // right: 200 objects and 700 rows, of which one object holds 300.
+    // right: 200 child objects and 699 rows, of which one object holds 300.
     // `long_run` rows of one object are one segment however long it is
     // ([`slab.zig:906-912`](../hexane/slab.zig), which is why the layout cuts
     // at run boundaries and never inside one), and that is why an object's
@@ -1992,7 +1992,7 @@ test "the walk's objects are the op set's own, and a long run is one boundary" {
     const long_run = 300;
     const root_rows = child_count;
     const list_rows = 1;
-    const total_rows = root_rows + long_run + (child_count - 1) + list_rows;
+    const total_rows = root_rows + long_run + (child_count - 1);
 
     // The keys are comptime strings, so the rows that name them borrow
     // storage that outlives the op set and the walk.
@@ -2042,7 +2042,7 @@ test "the walk's objects are the op set's own, and a long run is one boundary" {
     at += long_run;
     // The rest of the children, one row each, and a list at the end so the
     // last object is a sequence's.
-    for (1..child_count) |i| {
+    for (1..child_count - 1) |i| {
         rows[at] = row(
             opId(@intCast(at + 1), 0),
             made(@intCast(i + 1), 0),
