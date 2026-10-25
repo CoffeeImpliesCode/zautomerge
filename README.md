@@ -71,6 +71,8 @@ Additional steps:
 | `zig build bench-matched -Doptimize=fast -- insert-growth small` | Run one matched workload | libc |
 | `zig build bench-test` | Test benchmark counter validation | None |
 
+Use `zig build test -Dtest-filter="test name"` to run matching cases across test roots.
+
 Set `AUTOMERGE_REF` to the reference checkout root for Rust-backed steps.
 `tools/link-oracle.sh` also supports a sibling checkout named `github-automerge-automerge`.
 It creates ignored Cargo dependency links without modifying the reference source.
@@ -79,17 +81,6 @@ It creates ignored Cargo dependency links without modifying the reference source
 See [C test usage](test/c/README.md), [benchmark usage](bench/README.md), and [oracle tools](tools/README.md).
 Tests consume `test/fixtures`, `test/golden`, and `docs/hexane-cases.json` as project data.
 Compressed save bytes can differ from the reference. Compare loaded state and heads instead.
-
-## Known issues
-
-`zig build test` has six pre-existing failing tests:
-
-- `hexane_test.test.fuzz_slab_merge_invariant`: adjacent mergeable slabs violate the slab merge invariant.
-- `iter.spans.test.empty text reads as nothing, and a text holding only a block reads as that block`: invalid synthetic operation fixture.
-- `iter.keys.test.a map key that is a sequence anchor is rendered, not dropped`: invalid synthetic operation fixture.
-- `iter.values.test.a clock changes the answer, and the scoped read is a prefix of the unscoped one`: invalid synthetic operation fixture.
-- `iter.doc.test.the walk's objects are the op set's own, and a long run is one boundary`: invalid synthetic operation fixture.
-- `read.test.a borrowed value is the document's, and the copy is the caller's`: invalid synthetic operation fixture.
 
 ## License
 

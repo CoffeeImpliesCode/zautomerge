@@ -85,6 +85,7 @@
 const std = @import("std");
 
 const colmod = @import("zautomerge").hexane.column;
+const slabmod = @import("zautomerge").hexane.slab;
 const testing = std.testing;
 
 /// **The leak arbiter for the whole file.** One allocator, named once.
@@ -519,7 +520,7 @@ test "fuzz_slab_merge_invariant" {
             }
             var line: [96]u8 = undefined;
             const where = trialLine(&line, trial, op);
-            try expectSlabMergePolicy(RleU64, &col, where);
+            try expectSlabMergePolicy(RleU64, colmod.Rle(u64), &col, where);
             try expectColumn(RleU64, gpa, &col, model.items, where);
         }
     }
@@ -765,28 +766,25 @@ fn validateColumn(comptime Col: type, col: *const Col, context: []const u8) !voi
     }
 }
 
-/// Upstream's `check_slab_merge_invariant`
-/// ([`tests.rs`:4022-4054](../github-automerge-automerge/rust/hexane/src/tests.rs)):
-/// **no slab under a quarter of the budget may sit beside a neighbour the pair
-/// would still fit inside** — checked on *both* sides of every such slab, and
-/// the report names which side.
+/// The merge policy, checked independently on both sides of each short slab.
 ///
-/// **The budget is the constant, not the column's own.** Upstream reads
-/// `DEFAULT_MAX_SEG` and the case builds its column with the default budget,
-/// so a column under some other budget is not this predicate's business; the
-/// port reads [`colmod.default_max_segments`] and says so. `Column.mergeableNeighbours`
-/// states the same rule over the column's own budget — the two are one
-/// predicate with one knob between them, and which knob is in force is what
-/// upstream's constant records.
-fn expectSlabMergePolicy(comptime Col: type, col: *const Col, context: []const u8) !void {
-    const segs = try col.slabSegments(gpa);
+/// Upstream's predicate uses its maintenance segment count, not the number of
+/// wire headers. This port keeps those quantities separate: literal rows cost
+/// one decode unit each, while a compressed run costs one (`slab.decodeBudget`).
+/// Counting headers here would label a full literal slab undersized and demand
+/// merges that the production split/merge budget correctly refuses.
+fn expectSlabMergePolicy(comptime Col: type, comptime E: type, col: *const Col, context: []const u8) !void {
+    const segs = try gpa.alloc(usize, col.slabCount());
     defer gpa.free(segs);
+    for (segs, 0..) |*units, i| {
+        units.* = try slabmod.decodeBudget(gpa, E, col.slabAt(i).?);
+    }
     const max_runs = colmod.default_max_segments;
     const min_runs = max_runs / 4;
     for (segs, 0..) |n, i| {
         if (n >= min_runs) continue;
         if (i > 0 and n + segs[i - 1] <= max_runs) {
-            std.debug.print("{s}: slab[{d}] holds {d} run(s) and its left neighbour {d} — mergeable ({d} + {d} = {d} <= {d}) but not merged\n", .{
+            std.debug.print("{s}: slab[{d}] holds {d} decode unit(s) and its left neighbour {d} — mergeable ({d} + {d} = {d} <= {d}) but not merged\n", .{
                 context,
                 i,
                 n,
@@ -799,7 +797,7 @@ fn expectSlabMergePolicy(comptime Col: type, col: *const Col, context: []const u
             return error.TestUnexpectedResult;
         }
         if (i + 1 < segs.len and n + segs[i + 1] <= max_runs) {
-            std.debug.print("{s}: slab[{d}] holds {d} run(s) and its right neighbour {d} — mergeable ({d} + {d} = {d} <= {d}) but not merged\n", .{
+            std.debug.print("{s}: slab[{d}] holds {d} decode unit(s) and its right neighbour {d} — mergeable ({d} + {d} = {d} <= {d}) but not merged\n", .{
                 context,
                 i,
                 n,
