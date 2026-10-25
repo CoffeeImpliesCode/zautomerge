@@ -335,9 +335,8 @@ pub fn Keys(comptime O: type) type {
         /// ([`automerge.rs:1662-1667`](../../github-automerge-automerge/rust/automerge/src/automerge.rs)),
         /// so refusing one would empty `keys()` on every list and text. A
         /// register whose key is an anchor rather than a string is therefore
-        /// **rendered**, and the test "a map key that is a sequence anchor is
-        /// rendered, not dropped" says so over a **map** object, which is where
-        /// it is not expected and where stopping would go unnoticed.
+        /// **rendered**. The anchor-rendering test uses a valid list child
+        /// beside map keys, since a map cannot hold sequence registers.
         fn render(self: *Self, key: KeyRef) KeysError![]const u8 {
             switch (key) {
                 .map => |text| return text,
@@ -693,36 +692,25 @@ test "an empty object has no keys, and an empty range is a walk" {
 
 test "a map key that is a sequence anchor is rendered, not dropped" {
     const gpa = testing.allocator;
-    // A **map** object holding a register whose key is an anchor. The row is an
-    // insert, so `elemid_or_key` answers the element it made rather than the
-    // property it was written under (`op.rs:1040-1046`), and that is the only
-    // way a map walk meets a `KeyRef::Seq` — a real document never writes one,
-    // because a map property op is never an insert (`op.rs:323-324`).
-    //
-    // The answer is upstream's: `OpSet::to_string` renders an `Export::Id` as
-    // `"{}@{}"` over the counter and the actor's bytes (`op_set.rs:1093-1096`),
-    // and `read.rs:49-50` says a sequence's keys *are* those strings. **Stopping
-    // here would answer "c", "a"** and would look right to a reader that only
-    // checked the map keys came out — so this test says the anchor is present
-    // and says what it says.
-    //
-    // `KeyRef::order` has **no answer** for a map key against an anchor
-    // ([`types.zig:155-166`](../opset/types.zig)), which is rule R2's "a map row
-    // and a sequence row are never adjacent" stated as a comparison
-    // ([`op.zig:2258-2269`](../opset/op.zig)), so **this object is not one a
-    // real document can hold** and the order the fixture is written in is the
-    // order the walk answers. That is the point: the walk does not stop at the
-    // anchor, and it does not reorder around it either.
+    // The root remains a valid map. Its list child supplies the sequence
+    // anchor to the same Keys adapter: a real map cannot mix map and sequence
+    // registers. Check the map on both sides of the child as well, so the
+    // rendered anchor is not mistaken for iterator exhaustion.
+    const list = made(2, 0);
     const doc = try Fixture.build(gpa, &.{actor_a}, &.{
         mapRow(opId(1, 0), .root, "a", .{ .int = 1 }, &.{}),
-        row(opId(2, 0), .root, anchor(opId(2, 0)), true, .set, .{ .int = 2 }, &.{}),
+        row(opId(2, 0), .root, .{ .map = "b" }, false, .make_list, .null_value, &.{}),
         mapRow(opId(3, 0), .root, "c", .{ .int = 3 }, &.{}),
+        row(opId(4, 0), list, .{ .seq = types.ElemId.head() }, true, .set, .{ .int = 2 }, &.{}),
     });
     defer doc.destroy();
 
-    var walk = try Keys(opmod.Op).ofObj(&doc.set, .root, null);
+    var map_walk = try Keys(opmod.Op).ofObj(&doc.set, .root, null);
+    defer map_walk.deinit(gpa);
+    try expectKeys(&map_walk, &.{ "a", "b", "c" });
+    var walk = try Keys(opmod.Op).ofObj(&doc.set, list, null);
     defer walk.deinit(gpa);
-    try expectKeys(&walk, &.{ "a", "2@6161616161616161", "c" });
+    try expectKeys(&walk, &.{"4@6161616161616161"});
 }
 
 test "a sequence's keys are its element ids, one per register" {
