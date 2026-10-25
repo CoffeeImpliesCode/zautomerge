@@ -3472,7 +3472,6 @@ const SuccFixture = struct {
     actor: SuccActorColumn,
     counter: SuccCounterColumn,
     increment: IncColumn,
-    cols: SuccColumns,
 
     fn init(gpa: Allocator, per_row: []const []const SuccEntry) !SuccFixture {
         var self = SuccFixture{
@@ -3480,7 +3479,6 @@ const SuccFixture = struct {
             .actor = try SuccActorColumn.init(gpa),
             .counter = try SuccCounterColumn.init(gpa),
             .increment = try IncColumn.init(gpa),
-            .cols = undefined,
         };
         errdefer self.deinit(gpa);
         for (per_row) |entries| {
@@ -3491,12 +3489,6 @@ const SuccFixture = struct {
                 try self.increment.append(gpa, e.inc);
             }
         }
-        self.cols = .{
-            .count = &self.count,
-            .actor = &self.actor,
-            .counter = &self.counter,
-            .increment = &self.increment,
-        };
         return self;
     }
 
@@ -3508,9 +3500,20 @@ const SuccFixture = struct {
         self.increment.deinit();
     }
 
+    // Build the borrowed view after the fixture reaches its final address.
+    // Returning pointers to init's local columns leaves dangling pointers.
+    fn columns(self: *const SuccFixture) SuccColumns {
+        return .{
+            .count = &self.count,
+            .actor = &self.actor,
+            .counter = &self.counter,
+            .increment = &self.increment,
+        };
+    }
+
     /// Row `row`'s successors, read through the columns.
     fn succs(self: *const SuccFixture, row: usize, into: []SuccEntry) !SuccCursors {
-        return loadSuccWindow(&self.cols, row, into);
+        return loadSuccWindow(&self.columns(), row, into);
     }
 };
 
@@ -3552,7 +3555,7 @@ test "loadSuccWindow reads a row's successors out of the four columns" {
 
     // A buffer that cannot hold the row is refused rather than truncated.
     var small: [1]SuccEntry = undefined;
-    try testing.expectError(error.TooLarge, loadSuccWindow(&f.cols, 1, &small));
+    try testing.expectError(error.TooLarge, loadSuccWindow(&f.columns(), 1, &small));
 }
 
 test "the successor cursors walk a row's successors in order" {
