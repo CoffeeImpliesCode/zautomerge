@@ -1873,6 +1873,7 @@ const Fixture = struct {
             self.table.deinit();
             return e;
         };
+        errdefer self.table.deinit();
         errdefer self.set.deinit();
         _ = try self.set.splice(0, rows);
         // The index is **derived**, never declared: a row carries no statement
@@ -1909,6 +1910,14 @@ fn twoObjectDoc(gpa: Allocator) !*Fixture {
         row(opId(2, 0), .root, .{ .map = "l" }, false, .make_list, .null_value, null),
         row(opId(3, 0), list, head(), true, .set, .{ .str = "x" }, null),
     });
+}
+
+test "a refused document fixture releases its interned strings" {
+    // The second row cannot be a sequence register in the root map.
+    try testing.expectError(error.InvalidValue, Fixture.build(testing.allocator, encoding, &.{actor_a}, &.{
+        row(opId(1, 0), .root, .{ .map = "held" }, false, .set, .{ .str = "owned" }, null),
+        row(opId(2, 0), .root, head(), true, .set, .{ .int = 2 }, null),
+    }));
 }
 
 test "a document's objects are walked once each, in row order, and the walk stops" {

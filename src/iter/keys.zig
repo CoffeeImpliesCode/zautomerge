@@ -486,6 +486,7 @@ const Fixture = struct {
             self.table.deinit();
             return e;
         };
+        errdefer self.table.deinit();
         errdefer self.set.deinit();
         _ = try self.set.splice(0, rows);
         // The index is **derived**, never declared: a row carries no statement
@@ -519,6 +520,14 @@ fn expectKeys(walk: *Keys(opmod.Op), want: []const []const u8) !void {
 }
 
 // ── The tests ───────────────────────────────────────────────────────────────
+
+test "a refused keys fixture releases its interned strings" {
+    // The second row cannot be a sequence register in the root map.
+    try testing.expectError(error.InvalidValue, Fixture.build(testing.allocator, &.{actor_a}, &.{
+        mapRow(opId(1, 0), .root, "held", .{ .int = 1 }, &.{}),
+        row(opId(2, 0), .root, .{ .seq = types.ElemId.head() }, true, .set, .{ .int = 2 }, &.{}),
+    }));
+}
 
 test "a map's three keys come out in row order, and the walk then stops" {
     const gpa = testing.allocator;
