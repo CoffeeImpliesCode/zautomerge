@@ -2743,8 +2743,8 @@ test "empty text reads as nothing, and a text holding only a block reads as that
     const only_block = made(2, 0);
     const block = made(3, 0);
     const doc = try Fixture.build(gpa, &.{actor_a}, &.{
-        row(opId(1, 0), .root, .{ .map = "e" }, false, .make_text, .null_value, false, null, &.{}),
         row(opId(2, 0), .root, .{ .map = "b" }, false, .make_text, .null_value, false, null, &.{}),
+        row(opId(1, 0), .root, .{ .map = "e" }, false, .make_text, .null_value, false, null, &.{}),
         row(opId(3, 0), only_block, head(), true, .make_map, .null_value, false, null, &.{}),
         row(opId(4, 0), block, .{ .map = "kind" }, false, .set, .{ .str = "paragraph" }, false, null, &.{}),
     });
