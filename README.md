@@ -84,6 +84,4 @@ Compressed save bytes can differ from the reference. Compare loaded state and he
 
 ## License
 
-The root [LICENSE](LICENSE) is MIT.
-The Myers text-diff code has a separate [Apache-2.0 license](src/textdiff/LICENSE).
-The vendored C suite retains its own [license and notices](test/c/suite/LICENSE).
+MIT, see [LICENSE](LICENSE). Third-party components keep their own licenses: see THIRD_PARTY_NOTICES.md.

@@ -15,5 +15,6 @@
         "src",
         "include",
         "LICENSE",
+        "THIRD_PARTY_NOTICES.md",
     },
 }
