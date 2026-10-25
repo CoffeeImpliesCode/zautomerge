@@ -1123,21 +1123,19 @@ test "a sub-range yields exactly its rows, and a range that starts mid-register 
 
 test "a clock changes the answer, and the scoped read is a prefix of the unscoped one" {
     const gpa = testing.allocator;
-    // Two objects. The list has three elements, one per register, ids 1..3. The
-    // map's key "a" has two rows and the second wins.
-    const list = made(2, 0);
+    // One list with three elements. Operation ids are unique, and each insert
+    // is anchored to the element immediately before it.
+    const list = made(1, 0);
     const doc = try Fixture.build(gpa, &.{actor_a}, &.{
-        mapRow(opId(1, 0), .root, "l", .null_value, &shadows(opId(2, 0))),
-        row(opId(2, 0), .root, .{ .map = "l" }, false, .make_list, .null_value, &.{}),
-        row(opId(1, 0), list, anchor(opId(1, 0)), true, .set, .{ .str = "x" }, &.{}),
-        row(opId(2, 0), list, anchor(opId(2, 0)), true, .set, .{ .str = "y" }, &.{}),
-        row(opId(3, 0), list, anchor(opId(3, 0)), true, .set, .{ .str = "z" }, &.{}),
+        row(opId(1, 0), .root, .{ .map = "l" }, false, .make_list, .null_value, &.{}),
+        row(opId(2, 0), list, .{ .seq = types.ElemId.head() }, true, .set, .{ .str = "x" }, &.{}),
+        row(opId(3, 0), list, anchor(opId(2, 0)), true, .set, .{ .str = "y" }, &.{}),
+        row(opId(4, 0), list, anchor(opId(3, 0)), true, .set, .{ .str = "z" }, &.{}),
     });
     defer doc.destroy();
 
-    // A clock over counters 1 and 2 of actor 0: the document as it stood just
-    // after the second operation of this fixture.
-    var clock = try clockUpTo(gpa, 2);
+    // The list creation and its first two inserts, before "z" was inserted.
+    var clock = try clockUpTo(gpa, 3);
     defer clock.deinit();
 
     // **A list, where the clock hides a whole register.** Unscoped the read is
